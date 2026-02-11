@@ -24,6 +24,12 @@
       }
     },
     {
+      "name": "write-notes",
+      "match": "/write notes\\s+(\\w+)\\s+(\\d+)/i",
+      "type": "notes",
+      "reply": false
+    },
+    {
       "name": "proofread-complete",
       "match": "proofed and up to master",
       "pipeline": "./pipelines/next-step.sh",

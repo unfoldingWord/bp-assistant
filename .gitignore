@@ -1,3 +1,4 @@
 node_modules/
 .env
+door43-users.json
 logs/

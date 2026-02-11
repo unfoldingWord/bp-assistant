@@ -68,6 +68,10 @@ async function runPipeline(route, message) {
     console.log(`[pipeline] Running SDK pipeline (route: ${route.name})`);
     const { generatePipeline } = require('./generate-pipeline');
     await generatePipeline(route, message);
+  } else if (route.type === 'notes') {
+    console.log(`[pipeline] Running notes pipeline (route: ${route.name})`);
+    const { notesPipeline } = require('./notes-pipeline');
+    await notesPipeline(route, message);
   } else {
     await runShellPipeline(route, message);
   }

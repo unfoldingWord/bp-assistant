@@ -15,7 +15,7 @@ async function getQuery() {
 const DEFAULT_TIMEOUT_MS = 10 * 60 * 1000;
 const DEFAULT_MAX_TURNS = 200;
 
-async function runClaude({ prompt, cwd, model, allowedTools, skill, maxTurns, timeoutMs }) {
+async function runClaude({ prompt, cwd, model, allowedTools, skill, maxTurns, timeoutMs, appendSystemPrompt }) {
   const query = await getQuery();
 
   const fullPrompt = skill ? `/${skill} ${prompt}` : prompt;
@@ -42,6 +42,10 @@ async function runClaude({ prompt, cwd, model, allowedTools, skill, maxTurns, ti
 
   if (model) {
     options.model = model;
+  }
+
+  if (appendSystemPrompt) {
+    options.systemPrompt = appendSystemPrompt;
   }
 
   console.log(`[claude-runner] Starting query in ${cwd}`);
