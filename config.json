@@ -14,6 +14,8 @@
     {
       "name": "generate-content",
       "match": "/generate\\s+(\\w+)\\s+(\\d+)(?:\\s*[-–—to]+\\s*(\\d+))?/i",
+      "type": "sdk",
+      "skill": "initial-pipeline --lite",
       "pipeline": "./pipelines/generate.sh",
       "reply": false,
       "tokenEstimate": {

@@ -2,7 +2,7 @@ const { spawn } = require('child_process');
 const path = require('path');
 const { sendMessage, sendDM } = require('./zulip-client');
 
-function runPipeline(route, message) {
+function runShellPipeline(route, message) {
   return new Promise((resolve) => {
     const scriptPath = path.resolve(route.pipeline);
 
@@ -61,6 +61,16 @@ function runPipeline(route, message) {
       resolve();
     });
   });
+}
+
+async function runPipeline(route, message) {
+  if (route.type === 'sdk') {
+    console.log(`[pipeline] Running SDK pipeline (route: ${route.name})`);
+    const { generatePipeline } = require('./generate-pipeline');
+    await generatePipeline(route, message);
+  } else {
+    await runShellPipeline(route, message);
+  }
 }
 
 module.exports = { runPipeline };

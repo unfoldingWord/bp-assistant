@@ -11,6 +11,7 @@
   "author": "",
   "license": "ISC",
   "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "^0.2.39",
     "dotenv": "^17.2.4",
     "zulip-js": "^2.1.0"
   }
