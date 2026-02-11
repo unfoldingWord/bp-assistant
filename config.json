@@ -1,0 +1,32 @@
+{
+  "adminUserId": 249849,
+  "channel": "CONTENT - UR",
+  "topics": [
+    "Psalms BP",
+    "AI Work",
+    "Workflow",
+    "BP Proofreading",
+    "Proofreading Queue",
+    "Jeremiah BP"
+  ],
+  "watchDMs": true,
+  "routes": [
+    {
+      "name": "generate-content",
+      "match": "/generate\\s+(\\w+)\\s+(\\d+)(?:\\s*[-–—to]+\\s*(\\d+))?/i",
+      "pipeline": "./pipelines/generate.sh",
+      "reply": false,
+      "tokenEstimate": {
+        "perChapter": 5000000,
+        "sessionBudget": 45000000
+      }
+    },
+    {
+      "name": "proofread-complete",
+      "match": "proofed and up to master",
+      "pipeline": "./pipelines/next-step.sh",
+      "reply": false
+    }
+  ],
+  "defaultPipeline": null
+}
