@@ -17,14 +17,20 @@ const SKILL_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes per skill
 const POST_EDIT_REVIEW_HINT =
   'Use Task subagents for the Diff Analyzer and Issue Reconciler. Do NOT use TeamCreate or SendMessage.';
 
-// --- Parse "write notes BOOK CH" ---
+// --- Parse "write notes BOOK CH" or "write notes BOOK CH:VS-VS" ---
 function parseWriteNotesCommand(content) {
-  const match = content.match(/write notes\s+(\w+)\s+(\d+)/i);
+  // Match: write notes PSA 119:169-176  or  write notes PSA 117
+  const match = content.match(/write notes(?:\s+for)?\s+(\w+)\s+(\d+)(?::(\d+)[-–—](\d+))?/i);
   if (!match) return null;
-  return {
+  const result = {
     book: match[1].toUpperCase(),
     chapter: parseInt(match[2], 10),
   };
+  if (match[3] && match[4]) {
+    result.verseStart = parseInt(match[3], 10);
+    result.verseEnd = parseInt(match[4], 10);
+  }
+  return result;
 }
 
 // --- Look up Door43 username from sender email ---
@@ -52,6 +58,21 @@ function checkExistingBranch(username) {
   }
 }
 
+// --- Resolve an output file that may live in either output/X/ or output/X/BOOK/ ---
+function resolveOutputFile(relPath, book) {
+  const direct = path.join(CSKILLBP_DIR, relPath);
+  if (fs.existsSync(direct)) return relPath;
+
+  // Try output/subdir/BOOK/filename  (e.g. output/issues/PSA/PSA-117.tsv)
+  const parts = relPath.split('/');
+  const filename = parts.pop();
+  const altPath = [...parts, book, filename].join('/');
+  const alt = path.join(CSKILLBP_DIR, altPath);
+  if (fs.existsSync(alt)) return altPath;
+
+  return null;
+}
+
 // --- Verify prerequisite files exist ---
 function checkPrerequisites(book, chapter) {
   const tag = `${book}-${chapter}`;
@@ -62,13 +83,16 @@ function checkPrerequisites(book, chapter) {
   ];
 
   const missing = [];
+  const resolved = {};
   for (const f of required) {
-    const full = path.join(CSKILLBP_DIR, f.path);
-    if (!fs.existsSync(full)) {
+    const found = resolveOutputFile(f.path, book);
+    if (!found) {
       missing.push(f.label);
+    } else {
+      resolved[f.label] = found;
     }
   }
-  return missing;
+  return { missing, resolved };
 }
 
 // --- Main pipeline ---
@@ -106,19 +130,22 @@ async function notesPipeline(route, message) {
     return;
   }
 
-  const { book, chapter } = parsed;
+  const { book, chapter, verseStart, verseEnd } = parsed;
   const tag = `${book}-${chapter}`;
+  const verseRange = verseStart != null ? `:${verseStart}-${verseEnd}` : '';
+  const ref = `${book} ${chapter}${verseRange}`;  // e.g. "PSA 119:169-176" or "PSA 117"
+  const skillRef = verseStart != null ? `${book} ${chapter}:${verseStart}-${verseEnd}` : `${book} ${chapter}`;
 
   // --- Look up Door43 username ---
   const username = getDoor43Username(message.sender_email);
   if (!username) {
     await addReaction(msgId, 'cross_mark');
-    await status(`No Door43 username mapped for ${message.sender_email}. Add it to config.json door43Users.`);
+    await status(`No Door43 username mapped for ${message.sender_email}. Add it to door43-users.json.`);
     return;
   }
 
   await addReaction(msgId, 'working_on_it');
-  await status(`Starting notes pipeline for **${book} ${chapter}** (user: ${username})`);
+  await status(`Starting notes pipeline for **${ref}** (user: ${username})`);
 
   // --- Pre-check: existing branch ---
   const existingBranch = checkExistingBranch(username);
@@ -127,22 +154,24 @@ async function notesPipeline(route, message) {
     await addReaction(msgId, 'stop_sign');
     await reply(
       `You have an existing TN branch \`${existingBranch}\`. ` +
-      `Please merge it using gatewayEdit or tcCreate, then run \`write notes ${book} ${chapter}\` again.`
+      `Please merge it using gatewayEdit or tcCreate, then run \`write notes ${ref}\` again.`
     );
     return;
   }
 
   // --- Pre-check: prerequisite files ---
-  const missing = checkPrerequisites(book, chapter);
+  const { missing, resolved } = checkPrerequisites(book, chapter);
   if (missing.length > 0) {
     await removeReaction(msgId, 'working_on_it');
     await addReaction(msgId, 'cross_mark');
     await reply(
-      `Missing prerequisite files for ${book} ${chapter}: **${missing.join(', ')}**. ` +
+      `Missing prerequisite files for ${ref}: **${missing.join(', ')}**. ` +
       `Run \`generate ${book} ${chapter}\` first and ensure human-edited ULT/UST are available.`
     );
     return;
   }
+
+  const issuesPath = resolved['issues TSV'];
 
   // Ensure log directory
   fs.mkdirSync(LOG_DIR, { recursive: true });
@@ -156,23 +185,23 @@ async function notesPipeline(route, message) {
   const skills = [
     {
       name: 'post-edit-review',
-      prompt: `${book} ${chapter}`,
+      prompt: `${skillRef} --issues ${issuesPath}`,
       appendSystemPrompt: POST_EDIT_REVIEW_HINT,
-      expectedOutput: `output/issues/${tag}.tsv`,
+      expectedOutput: issuesPath,
     },
     {
       name: 'chapter-intro',
-      prompt: `${book} ${chapter}`,
-      expectedOutput: `output/issues/${tag}.tsv`,
+      prompt: `${skillRef} --issues ${issuesPath}`,
+      expectedOutput: issuesPath,
     },
     {
       name: 'tn-writer',
-      prompt: `${book} ${chapter}`,
+      prompt: `${skillRef} --issues ${issuesPath}`,
       expectedOutput: `output/notes/${tag}.tsv`,
     },
     {
       name: 'repo-insert',
-      prompt: `tn ${book} ${chapter} ${username} --no-pr --source output/notes/${tag}.tsv`,
+      prompt: `tn ${skillRef} ${username} --no-pr --source output/notes/${tag}.tsv`,
       expectedOutput: null, // side effect: git push
     },
   ];
@@ -180,7 +209,7 @@ async function notesPipeline(route, message) {
   // --- Run skills sequentially ---
   for (const skill of skills) {
     const skillStart = Date.now();
-    await status(`Running **${skill.name}** for ${book} ${chapter}...`);
+    await status(`Running **${skill.name}** for ${ref}...`);
     console.log(`[notes] Running ${skill.name}: ${skill.prompt}`);
 
     let result = null;
@@ -209,7 +238,7 @@ async function notesPipeline(route, message) {
       const outputPath = path.join(CSKILLBP_DIR, skill.expectedOutput);
       if (!fs.existsSync(outputPath)) {
         failedSkill = skill.name;
-        await status(`**${skill.name}** failed for ${book} ${chapter} — expected output not found: ${skill.expectedOutput} (${duration}s)`);
+        await status(`**${skill.name}** failed for ${ref} — expected output not found: ${skill.expectedOutput} (${duration}s)`);
         break;
       }
     }
@@ -233,7 +262,7 @@ async function notesPipeline(route, message) {
 
   if (failedSkill) {
     await addReaction(msgId, 'warning');
-    await reply(`Notes pipeline for **${book} ${chapter}** failed at **${failedSkill}** after ${totalDuration}s. Check admin DMs for details.`);
+    await reply(`Notes pipeline for **${ref}** failed at **${failedSkill}** after ${totalDuration}s. Check admin DMs for details.`);
     return;
   }
 
@@ -254,12 +283,12 @@ async function notesPipeline(route, message) {
   const branchName = `${username}-tc-create-1`;
   await addReaction(msgId, 'check');
   await reply(
-    `Notes pipeline complete for **${book} ${chapter}** (${totalDuration}s).\n` +
+    `Notes pipeline complete for **${ref}** (${totalDuration}s).\n` +
     `Branch: \`${branchName}\` on en_tn` +
     downloadLink
   );
 
-  await status(`Notes pipeline complete for **${book} ${chapter}** in ${totalDuration}s.`);
+  await status(`Notes pipeline complete for **${ref}** in ${totalDuration}s.`);
 }
 
 module.exports = { notesPipeline };

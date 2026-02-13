@@ -25,7 +25,7 @@
     },
     {
       "name": "write-notes",
-      "match": "/write notes\\s+(\\w+)\\s+(\\d+)/i",
+      "match": "/write notes(?:\\s+for)?\\s+(\\w+)\\s+(\\d+(?::\\d+[-–—]\\d+)?)/i",
       "type": "notes",
       "reply": false
     },
