@@ -15,6 +15,43 @@ async function getQuery() {
 const DEFAULT_TIMEOUT_MS = 10 * 60 * 1000;
 const DEFAULT_MAX_TURNS = 200;
 
+const DEFAULT_ALLOWED_TOOLS = [
+  'Read', 'Write', 'Edit', 'Glob', 'Grep', 'Bash',
+  'Task', 'Skill', 'SendMessage',
+];
+
+function buildOptions({
+  cwd,
+  resume,
+  model,
+  allowedTools,
+  maxTurns,
+  timeoutMs,
+  appendSystemPrompt,
+  abortController,
+}) {
+  const options = {
+    cwd: cwd || process.cwd(),
+    abortController: abortController || new AbortController(),
+    maxTurns: maxTurns || DEFAULT_MAX_TURNS,
+    allowedTools: allowedTools || DEFAULT_ALLOWED_TOOLS,
+    permissionMode: 'bypassPermissions',
+    allowDangerouslySkipPermissions: true,
+    settingSources: ['user', 'project', 'local'],
+    persistSession: true,
+  };
+  if (resume) {
+    options.resume = resume;
+  }
+  if (model) {
+    options.model = model;
+  }
+  if (appendSystemPrompt) {
+    options.systemPrompt = appendSystemPrompt;
+  }
+  return options;
+}
+
 async function runClaude({ prompt, cwd, model, allowedTools, skill, maxTurns, timeoutMs, appendSystemPrompt }) {
   const query = await getQuery();
 
@@ -27,26 +64,14 @@ async function runClaude({ prompt, cwd, model, allowedTools, skill, maxTurns, ti
     abortController.abort();
   }, timeout);
 
-  const options = {
+  const options = buildOptions({
     cwd,
+    model,
+    allowedTools,
+    maxTurns,
+    appendSystemPrompt,
     abortController,
-    maxTurns: maxTurns || DEFAULT_MAX_TURNS,
-    allowedTools: allowedTools || [
-      'Read', 'Write', 'Edit', 'Glob', 'Grep', 'Bash',
-      'Task', 'Skill', 'SendMessage',
-    ],
-    permissionMode: 'bypassPermissions',
-    allowDangerouslySkipPermissions: true,
-    settingSources: ['user', 'project', 'local'],
-  };
-
-  if (model) {
-    options.model = model;
-  }
-
-  if (appendSystemPrompt) {
-    options.systemPrompt = appendSystemPrompt;
-  }
+  });
 
   console.log(`[claude-runner] Starting query in ${cwd}`);
   console.log(`[claude-runner] Prompt: ${fullPrompt.slice(0, 200)}`);
@@ -78,7 +103,6 @@ async function runClaude({ prompt, cwd, model, allowedTools, skill, maxTurns, ti
     }
   } finally {
     clearTimeout(timer);
-    // Ensure the query is cleaned up even if the loop didn't finish naturally
     try { conversation.close(); } catch (_) {}
   }
 
@@ -91,4 +115,41 @@ async function runClaude({ prompt, cwd, model, allowedTools, skill, maxTurns, ti
   return result;
 }
 
-module.exports = { runClaude };
+/**
+ * Start a resumable query and return the async generator so the caller can consume
+ * events, capture session_id from the first message that has it, and collect assistant text.
+ * Caller must call cleanup() in a finally block.
+ *
+ * @param {{ prompt: string, cwd?: string, resume?: string, model?: string, maxTurns?: number, timeoutMs?: number, appendSystemPrompt?: string }}
+ * @returns {{ conversation: AsyncGenerator, abortController: AbortController, cleanup: () => void }}
+ */
+async function runClaudeStream({ prompt, cwd, resume, model, maxTurns, timeoutMs, appendSystemPrompt }) {
+  const query = await getQuery();
+  const abortController = new AbortController();
+  const timeout = timeoutMs || DEFAULT_TIMEOUT_MS;
+  const timer = setTimeout(() => {
+    console.warn(`[claude-runner] Timeout reached (${timeout / 1000}s) — aborting stream`);
+    abortController.abort();
+  }, timeout);
+
+  const options = buildOptions({
+    cwd,
+    resume,
+    model,
+    maxTurns,
+    appendSystemPrompt,
+    abortController,
+  });
+
+  console.log(`[claude-runner] Starting stream in ${cwd}${resume ? ` (resume: ${resume.slice(0, 8)}…)` : ''}`);
+  const conversation = query({ prompt, options });
+
+  function cleanup() {
+    clearTimeout(timer);
+    try { conversation.close(); } catch (_) {}
+  }
+
+  return { conversation, abortController, cleanup };
+}
+
+module.exports = { runClaude, runClaudeStream, buildOptions };

@@ -36,5 +36,10 @@
       "reply": false
     }
   ],
-  "defaultPipeline": null
+  "defaultPipeline": null,
+  "dmDefaultPipeline": {
+    "name": "interactive-dm",
+    "type": "interactive-dm",
+    "reply": true
+  }
 }

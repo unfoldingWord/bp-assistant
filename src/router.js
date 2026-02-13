@@ -25,6 +25,9 @@ async function routeMessage(message) {
   if (route) {
     console.log(`[router] Matched route "${route.name}" for message ${message.id}`);
     await runPipeline(route, message);
+  } else if (message.type === 'private' && message.sender_id === config.adminUserId && config.dmDefaultPipeline) {
+    console.log(`[router] No match — running interactive DM pipeline for admin message ${message.id}`);
+    await runPipeline(config.dmDefaultPipeline, message);
   } else if (config.defaultPipeline) {
     console.log(`[router] No match — running default pipeline for message ${message.id}`);
     await runPipeline({ name: 'default', pipeline: config.defaultPipeline, reply: false }, message);
