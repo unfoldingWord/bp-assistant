@@ -40,6 +40,7 @@
   "dmDefaultPipeline": {
     "name": "interactive-dm",
     "type": "interactive-dm",
-    "reply": true
+    "reply": true,
+    "cwd": "~/Documents/dev/cSkillBP-prompt-over-code"
   }
 }
