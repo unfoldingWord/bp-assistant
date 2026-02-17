@@ -22,6 +22,7 @@ async function pollEvents(client, queueId, lastEventId) {
 
 async function handleEvents(events) {
   for (const event of events) {
+    console.log(`[bot] EVENT: ${event.type}`);
     if (event.type !== 'message') continue;
 
     const msg = event.message;
@@ -36,7 +37,7 @@ async function handleEvents(events) {
       if (msg.display_recipient !== config.channel) continue;
       if (!config.topics.includes(msg.subject)) continue;
       if (!flags.includes('mentioned')) continue;
-      console.log(`[bot] Stream message in "${msg.display_recipient}" > "${msg.subject}" from ${msg.sender_full_name}`);
+      console.log(`[bot] Stream message in "${msg.display_recipient}" > "${msg.subject}" from ${msg.sender_full_name}: ${msg.content}`);
     } else if (msg.type === 'private') {
       if (!config.watchDMs) continue;
       console.log(`[bot] DM from ${msg.sender_full_name}`);

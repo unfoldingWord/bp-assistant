@@ -43,7 +43,7 @@ function buildOptions({
   if (resume) {
     options.resume = resume;
   }
-  options.model = model || 'haiku';
+  options.model = model || 'opus';
   if (appendSystemPrompt) {
     options.systemPrompt = appendSystemPrompt;
   }
@@ -150,125 +150,8 @@ async function runClaudeStream({ prompt, cwd, resume, model, maxTurns, timeoutMs
   return { conversation, abortController, cleanup };
 }
 
-// --- V2 session (long-lived process): one session, send/stream per message ---
-let _v2Create = null;
-let _v2Resume = null;
-
-async function getV2SessionAPI() {
-  if (!_v2Create) {
-    const sdk = await import('@anthropic-ai/claude-agent-sdk');
-    _v2Create = sdk.unstable_v2_createSession;
-    _v2Resume = sdk.unstable_v2_resumeSession;
-  }
-  return { createSession: _v2Create, resumeSession: _v2Resume };
-}
-
-/**
- * Long-lived session for interactive DM: one Claude process, send() + stream() per message.
- * Call getOrCreateSession() then sendSessionMessage(); on process exit we clear and next message creates fresh.
- */
-let _liveSession = null;
-let _liveSessionModel = null;
-
-async function getOrCreateSession({ cwd, model, maxTurns, storedSessionId }) {
-  const { createSession, resumeSession } = await getV2SessionAPI();
-  const effectiveModel = model || 'haiku';
-  const opts = {
-    model: effectiveModel,
-    cwd: cwd || process.cwd(),
-    allowedTools: DEFAULT_ALLOWED_TOOLS,
-    permissionMode: 'acceptEdits',
-  };
-
-  if (_liveSession && _liveSessionModel === effectiveModel) {
-    return { session: _liveSession, isNew: false };
-  }
-
-  if (_liveSession) {
-    try { _liveSession.close(); } catch (_) {}
-    _liveSession = null;
-    _liveSessionModel = null;
-  }
-
-  if (storedSessionId) {
-    try {
-      const session = resumeSession(storedSessionId, opts);
-      _liveSession = session;
-      _liveSessionModel = effectiveModel;
-      console.log(`[claude-runner] Resumed v2 session ${storedSessionId.slice(0, 8)}… (${effectiveModel})`);
-      return { session, isNew: false };
-    } catch (err) {
-      console.warn(`[claude-runner] v2 resume failed: ${err.message}, creating new session`);
-      _liveSession = null;
-      _liveSessionModel = null;
-    }
-  }
-
-  const session = createSession(opts);
-  _liveSession = session;
-  _liveSessionModel = effectiveModel;
-  console.log(`[claude-runner] Created new v2 session (${effectiveModel})`);
-  return { session, isNew: true };
-}
-
-function clearLiveSession() {
-  if (_liveSession) {
-    try { _liveSession.close(); } catch (_) {}
-    _liveSession = null;
-    _liveSessionModel = null;
-  }
-}
-
-/**
- * Send one message to the long-lived session and collect reply. Uses AbortController for timeout.
- * On failure (e.g. process died), clears live session so next call creates/resumes fresh.
- */
-async function sendSessionMessage(session, prompt, { timeoutMs, setSession }) {
-  const abortController = new AbortController();
-  const timeout = timeoutMs || DEFAULT_TIMEOUT_MS;
-  const timer = setTimeout(() => {
-    abortController.abort();
-  }, timeout);
-
-  let replyText = '';
-  let result = null;
-  let streamedSessionId = null;
-
-  try {
-    await session.send(prompt);
-    for await (const event of session.stream()) {
-      if (abortController.signal.aborted) break;
-      if (event.session_id && !streamedSessionId) {
-        streamedSessionId = event.session_id;
-        if (setSession) setSession(event.session_id);
-      }
-      if (event.type === 'assistant' && event.message?.content) {
-        for (const block of event.message.content) {
-          if (block && typeof block.text === 'string') replyText += block.text;
-        }
-      }
-      if (event.type === 'result') result = event;
-    }
-    if (abortController.signal.aborted) {
-      const e = new Error('Request timed out');
-      e.name = 'AbortError';
-      throw e;
-    }
-  } catch (err) {
-    clearLiveSession();
-    throw err;
-  } finally {
-    clearTimeout(timer);
-  }
-
-  return { replyText: replyText.trim(), result };
-}
-
 module.exports = {
   runClaude,
   runClaudeStream,
   buildOptions,
-  getOrCreateSession,
-  clearLiveSession,
-  sendSessionMessage,
 };
