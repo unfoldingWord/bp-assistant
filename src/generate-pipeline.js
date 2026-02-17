@@ -11,7 +11,7 @@ const path = require('path');
 const config = require('../config.json');
 const { sendMessage, sendDM, addReaction, removeReaction, uploadFile } = require('./zulip-client');
 const { runClaude } = require('./claude-runner');
-const { getDoor43Username, checkExistingBranch, calcSkillTimeout, CSKILLBP_DIR } = require('./pipeline-utils');
+const { getDoor43Username, checkExistingBranch, resolveOutputFile, calcSkillTimeout, CSKILLBP_DIR } = require('./pipeline-utils');
 const { verifyRepoPush } = require('./repo-verify');
 const { setPendingMerge } = require('./pending-merges');
 
@@ -195,10 +195,11 @@ async function generatePipeline(route, message) {
     const sdkSuccess = claudeResult?.subtype === 'success';
 
     // UST is the last artifact the pipeline produces
-    const ultFile = path.join(CSKILLBP_DIR, 'output', 'AI-ULT', `${book}-${ch}.usfm`);
-    const ustFile = path.join(CSKILLBP_DIR, 'output', 'AI-UST', `${book}-${ch}.usfm`);
-    const hasUlt = fs.existsSync(ultFile);
-    const hasUst = fs.existsSync(ustFile);
+    // Check both flat (output/AI-ULT/PSA-133.usfm) and subfolder (output/AI-ULT/PSA/PSA-133.usfm) paths
+    const ultRel = resolveOutputFile(`output/AI-ULT/${book}-${ch}.usfm`, book);
+    const ustRel = resolveOutputFile(`output/AI-UST/${book}-${ch}.usfm`, book);
+    const hasUlt = !!ultRel;
+    const hasUst = !!ustRel;
 
     // Log timing
     const logLine = `${new Date().toISOString()} | ${book} ${ch} | sdk=${sdkSuccess} | ult=${hasUlt} | ust=${hasUst} | duration=${duration}s\n`;
@@ -232,7 +233,7 @@ async function generatePipeline(route, message) {
 
       if (hasUlt) {
         try {
-          const ultUri = await uploadFile(ultFile, `${book} ${ch} ULT.usfm`);
+          const ultUri = await uploadFile(path.join(CSKILLBP_DIR, ultRel), `${book} ${ch} ULT.usfm`);
           links.push(`[${book} ${ch} ULT.usfm](${ultUri})`);
         } catch (err) {
           console.error(`[generate] Failed to upload ULT: ${err.message}`);
@@ -242,7 +243,7 @@ async function generatePipeline(route, message) {
 
       if (hasUst) {
         try {
-          const ustUri = await uploadFile(ustFile, `${book} ${ch} UST.usfm`);
+          const ustUri = await uploadFile(path.join(CSKILLBP_DIR, ustRel), `${book} ${ch} UST.usfm`);
           links.push(`[${book} ${ch} UST.usfm](${ustUri})`);
         } catch (err) {
           console.error(`[generate] Failed to upload UST: ${err.message}`);
