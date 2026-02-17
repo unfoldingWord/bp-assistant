@@ -4,9 +4,14 @@ const { sendMessage, addReaction } = require('./zulip-client');
 const { getSession, clearSession } = require('./session-store');
 const { getTotalVerses } = require('./verse-counts');
 const { classifyIntent } = require('./intent-classifier');
+const { getPendingMerge, clearPendingMerge } = require('./pending-merges');
+const { resumeInsertion } = require('./insertion-resume');
 
 // In-memory pending confirmations for stream messages
 const pendingConfirmations = new Map();
+
+// Track running pipelines to block duplicate chapter runs
+const activePipelines = new Set();
 
 const MIN_TIMEOUT_MS = 10 * 60 * 1000; // 10 min floor
 const MS_PER_VERSE_OP = 5 * 60 * 1000; // 5 min per verse per operation
@@ -19,6 +24,16 @@ function isYes(content) {
 function isNo(content) {
   const t = content.trim().toLowerCase().replace(/^@\*\*[^*]+\*\*\s*/, '');
   return /^(n|no|nope|nah|cancel|wrong|never ?mind)[\s.!]*$/.test(t);
+}
+
+function isMerged(content) {
+  const t = content.trim().toLowerCase().replace(/^@\*\*[^*]+\*\*\s*/, '');
+  return /^(merged|done|i merged|it'?s merged|branches? merged|go ahead)[\s.!]*$/.test(t);
+}
+
+function isCancelMerge(content) {
+  const t = content.trim().toLowerCase().replace(/^@\*\*[^*]+\*\*\s*/, '');
+  return /^(cancel|discard|nevermind|never ?mind|forget it|start over)[\s.!]*$/.test(t);
 }
 
 function buildConfirmMessage(template, captures) {
@@ -138,6 +153,64 @@ function buildSyntheticRoute(intent) {
   };
 }
 
+/**
+ * Extract pipeline conflict keys (routeName-BOOK-CH) for a route+message.
+ * Returns an array of keys, or null for route types that don't need conflict detection.
+ */
+function getPipelineKeys(route, message) {
+  if (route.type !== 'sdk' && route.type !== 'notes') return null;
+
+  let book, chapters;
+
+  if (route._synthetic) {
+    book = route._book;
+    const start = route._startChapter;
+    const end = route._endChapter;
+    chapters = [];
+    for (let i = start; i <= end; i++) chapters.push(i);
+  } else {
+    const { captures } = matchRoute(message.content);
+    const parsed = parseBookChapters(captures);
+    book = parsed.book;
+    chapters = parsed.chapters;
+  }
+
+  if (!book || !chapters.length) return null;
+  return chapters.map(ch => `${route.name}-${book}-${ch}`);
+}
+
+/**
+ * Fire-and-forget pipeline wrapper with conflict detection.
+ * Launches the pipeline without awaiting it so the event loop stays responsive.
+ */
+function firePipeline(route, message) {
+  const keys = getPipelineKeys(route, message);
+
+  if (keys) {
+    const conflicts = keys.filter(k => activePipelines.has(k));
+    if (conflicts.length > 0) {
+      const [, book, ch] = conflicts[0].match(/^[^-]+-(.+)-(\d+)$/);
+      const label = route.name.replace(/-/g, ' ');
+      const text = `A **${label}** pipeline is already running for **${book} ${ch}**. Please wait for it to finish.`;
+
+      if (message.type === 'stream') {
+        sendMessage(message.display_recipient, message.subject, text).catch(err =>
+          console.error(`[router] Failed to send conflict message: ${err.message}`));
+      }
+      return;
+    }
+    for (const k of keys) activePipelines.add(k);
+  }
+
+  runPipeline(route, message)
+    .catch(err => console.error(`[router] Pipeline "${route.name}" failed: ${err.message}`))
+    .finally(() => {
+      if (keys) {
+        for (const k of keys) activePipelines.delete(k);
+      }
+    });
+}
+
 const HELP_TEXT = `I can help with:\n` +
   `- **generate PSA 79** -- run the initial pipeline for a chapter\n` +
   `- **write notes for PSA 82** -- generate translation notes\n` +
@@ -175,7 +248,7 @@ async function routeMessage(message) {
       try { await addReaction(message.id, 'working_on_it'); } catch (_) {}
       const routeWithTimeout = { ...pending.route, timeoutMs: pending.timeoutMs };
       console.log(`[router] Confirmed -- running "${pending.route.name}" for ${sessionKey} (timeout: ${pending.timeoutMs / 60000}min)`);
-      await runPipeline(routeWithTimeout, pending.message);
+      firePipeline(routeWithTimeout, pending.message);
       return;
     } else if (isNo(message.content)) {
       pendingConfirmations.delete(sessionKey);
@@ -187,6 +260,35 @@ async function routeMessage(message) {
       // Not yes/no -- clear pending and re-route the new message
       pendingConfirmations.delete(sessionKey);
       console.log(`[router] New message while pending -- re-routing for ${sessionKey}`);
+    }
+  }
+
+  // Check for pending merge (deferred repo-insert waiting for user to merge branches)
+  if (isStream) {
+    const pendingMerge = getPendingMerge(sessionKey);
+    if (pendingMerge) {
+      if (isMerged(message.content)) {
+        try { await addReaction(message.id, 'working_on_it'); } catch (_) {}
+        console.log(`[router] User said merged -- resuming insertion for ${sessionKey}`);
+        resumeInsertion(sessionKey, message).catch(err =>
+          console.error(`[router] resumeInsertion failed: ${err.message}`));
+        return;
+      }
+      if (isCancelMerge(message.content)) {
+        clearPendingMerge(sessionKey);
+        console.log(`[router] User cancelled pending merge for ${sessionKey}`);
+        await sendMessage(message.display_recipient, message.subject,
+          `Pending insertion discarded. Generated files are still in the output folder if you need them later.`);
+        return;
+      }
+      // Check if this is a new generate/notes command for the same book
+      const { route: newRoute } = matchRoute(message.content);
+      if (newRoute && (newRoute.name === 'generate-content' || newRoute.name === 'write-notes')) {
+        await sendMessage(message.display_recipient, message.subject,
+          `There's a pending insertion waiting for you to merge branches. Say **merged** when done, or **cancel** to discard it.`);
+        return;
+      }
+      // Other messages pass through to normal routing
     }
   }
 
@@ -204,16 +306,16 @@ async function routeMessage(message) {
       return;
     }
     console.log(`[router] Running route "${route.name}" for message ${message.id}`);
-    await runPipeline(route, message);
+    firePipeline(route, message);
   } else if (!isStream && isAdmin && config.dmDefaultPipeline) {
     // Admin DMs get interactive session if no route matches
     console.log(`[router] No match -- running interactive DM pipeline for admin ${message.id}`);
-    await runPipeline(config.dmDefaultPipeline, message);
+    firePipeline(config.dmDefaultPipeline, message);
   } else if (isStream) {
     const session = getSession(sessionKey);
     if (session && session.sessionId) {
       console.log(`[router] Resuming stream session for ${sessionKey}`);
-      await runPipeline(config.dmDefaultPipeline, message);
+      firePipeline(config.dmDefaultPipeline, message);
     } else {
       // No regex match — try haiku intent classification as fallback
       console.log(`[router] No regex match — trying haiku intent classification`);

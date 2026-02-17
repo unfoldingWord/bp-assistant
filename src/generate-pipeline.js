@@ -1,6 +1,10 @@
 // generate-pipeline.js — SDK-based generation pipeline
 // Replaces generate.sh: parses command, loops chapters, calls Claude SDK, posts results to Zulip
 // Chris (chrisUserId) gets files uploaded; others get align + repo-insert + repo-verify
+//
+// Two-phase design for non-Chris users:
+//   Phase 1: Generate + align (always runs, expensive)
+//   Phase 2: Branch check → pause-for-merge or repo-insert (cheap, may defer)
 
 const fs = require('fs');
 const path = require('path');
@@ -9,13 +13,14 @@ const { sendMessage, sendDM, addReaction, removeReaction, uploadFile } = require
 const { runClaude } = require('./claude-runner');
 const { getDoor43Username, checkExistingBranch, calcSkillTimeout, CSKILLBP_DIR } = require('./pipeline-utils');
 const { verifyRepoPush } = require('./repo-verify');
+const { setPendingMerge } = require('./pending-merges');
 
 const LOG_DIR = path.resolve(__dirname, '../logs');
 
 function parseGenerateCommand(content) {
   const input = content.toLowerCase();
 
-  // Range: generate psa 79-89, generate psa 79–89, generate psa 79 to 89
+  // Range: generate psa 79-89, generate psa 79\u201389, generate psa 79 to 89
   const rangeMatch = input.match(/generate\s+([a-z0-9]+)\s+(\d+)\s*[-\u2013\u2014to]+\s*(\d+)/);
   if (rangeMatch) {
     return {
@@ -71,7 +76,7 @@ async function generatePipeline(route, message) {
     }
   }
 
-  // Parse command — support both regex-parsed and synthetic routes from intent classifier
+  // Parse command \u2014 support both regex-parsed and synthetic routes from intent classifier
   let parsed;
   if (route._synthetic) {
     parsed = {
@@ -109,28 +114,13 @@ async function generatePipeline(route, message) {
     return;
   }
 
-  // --- Non-Chris pre-checks: Door43 username and existing branches ---
+  // --- Non-Chris pre-checks: Door43 username ---
   let username = null;
   if (!isChris) {
     username = getDoor43Username(message.sender_email);
     if (!username) {
       await addReaction(msgId, 'cross_mark');
       await status(`No Door43 username mapped for ${message.sender_email}. Add it to door43-users.json.`);
-      return;
-    }
-
-    // Check for existing ULT/UST branches
-    const ultBranch = checkExistingBranch(username, 'en_ult', 'auto-{username}-{BOOK}', book);
-    const ustBranch = checkExistingBranch(username, 'en_ust', 'auto-{username}-{BOOK}', book);
-    const existingBranches = [ultBranch, ustBranch].filter(Boolean);
-
-    if (existingBranches.length > 0) {
-      await addReaction(msgId, 'stop_sign');
-      await reply(
-        `You have existing branches that need merging first:\n` +
-        existingBranches.map(b => `- \`${b}\``).join('\n') +
-        `\nPlease merge them in gatewayEdit or tcCreate, then try again.`
-      );
       return;
     }
   }
@@ -152,7 +142,11 @@ async function generatePipeline(route, message) {
 
   let success = 0;
   let fail = 0;
+  const completedChapters = []; // Phase 1 results for non-Chris users
 
+  // =========================================================================
+  // Phase 1: Generate + Align (always runs)
+  // =========================================================================
   for (let ch = start; ch <= end; ch++) {
     console.log(`[generate] Processing ${book} chapter ${ch}...`);
     await status(`Processing **${book} ${ch}**...`);
@@ -217,7 +211,7 @@ async function generatePipeline(route, message) {
     }
 
     if (!sdkSuccess) {
-      console.log(`[generate] SDK exited with ${claudeResult?.subtype || 'no result'} but UST exists — treating as success`);
+      console.log(`[generate] SDK exited with ${claudeResult?.subtype || 'no result'} but UST exists \u2014 treating as success`);
     }
 
     // DM token usage to admin if available
@@ -229,7 +223,7 @@ async function generatePipeline(route, message) {
       const cacheCreate = u.cache_creation_input_tokens ?? u.cacheCreationInputTokens ?? 0;
       const total = inTok + outTok + cacheRead + cacheCreate;
       const cost = claudeResult.total_cost_usd;
-      await status(`**${book} ${ch}** tokens: ${total.toLocaleString()} (in: ${inTok.toLocaleString()}, out: ${outTok.toLocaleString()}, cache read: ${cacheRead.toLocaleString()})${cost != null ? ` · $${cost.toFixed(4)}` : ''} · ${duration}s`);
+      await status(`**${book} ${ch}** tokens: ${total.toLocaleString()} (in: ${inTok.toLocaleString()}, out: ${outTok.toLocaleString()}, cache read: ${cacheRead.toLocaleString()})${cost != null ? ` \u00b7 $${cost.toFixed(4)}` : ''} \u00b7 ${duration}s`);
     }
 
     // --- Chris path: upload files only ---
@@ -256,19 +250,18 @@ async function generatePipeline(route, message) {
         }
       }
 
-      await reply(`**${book} ${ch}** — ${links.join(' · ')}`);
+      await reply(`**${book} ${ch}** \u2014 ${links.join(' \u00b7 ')}`);
       success++;
       continue;
     }
 
-    // --- Non-Chris path: align → repo-insert → repo-verify ---
-    let chapterFailed = false;
+    // --- Non-Chris path: Phase 1 \u2014 align and collect results ---
 
     // Step 2: align-all-parallel
     await status(`Running **align-all-parallel** for ${book} ${ch}...`);
     try {
       const alignTimeout = calcSkillTimeout(book, ch, 2);
-      const alignResult = await runClaude({
+      await runClaude({
         prompt: `${book} ${ch}`,
         cwd: CSKILLBP_DIR,
         model,
@@ -288,7 +281,7 @@ async function generatePipeline(route, message) {
       const hasAlignedUst = fs.existsSync(alignedUst) || fs.existsSync(alignedUstFlat);
 
       if (!hasAlignedUlt || !hasAlignedUst) {
-        await status(`**align-all-parallel** failed for ${book} ${ch} — aligned files not found (${alignDuration}s)`);
+        await status(`**align-all-parallel** failed for ${book} ${ch} \u2014 aligned files not found (${alignDuration}s)`);
         fail++;
         continue;
       }
@@ -309,68 +302,118 @@ async function generatePipeline(route, message) {
     const ultSourceRel = resolveAligned('AI-ULT');
     const ustSourceRel = resolveAligned('AI-UST');
 
-    // Step 3: repo-insert ULT
-    await status(`Running **repo-insert** (ULT) for ${book} ${ch}...`);
-    try {
-      const riTimeout = calcSkillTimeout(book, ch, 1);
-      await runClaude({
-        prompt: `ult ${book} ${ch} ${username} --no-pr --source ${ultSourceRel}`,
-        cwd: CSKILLBP_DIR,
-        model,
-        skill: 'repo-insert',
-        timeoutMs: riTimeout,
+    // Collect for Phase 2 insertion
+    completedChapters.push({ ch, ultAligned: ultSourceRel, ustAligned: ustSourceRel });
+    success++;
+  }
+
+  // =========================================================================
+  // Phase 2: Branch check \u2192 pause or insert (non-Chris users only)
+  // =========================================================================
+  if (!isChris && completedChapters.length > 0) {
+    // Check for existing ULT/UST branches
+    const ultBranch = checkExistingBranch(username, 'en_ult', 'auto-{username}-{BOOK}', book);
+    const ustBranch = checkExistingBranch(username, 'en_ust', 'auto-{username}-{BOOK}', book);
+    const existingBranches = [ultBranch, ustBranch].filter(Boolean);
+
+    if (existingBranches.length > 0) {
+      // Pause: save state, swap reaction, ask user to merge
+      const sessionKey = `stream-${stream}-${topic}`;
+      setPendingMerge(sessionKey, {
+        sessionKey,
+        pipelineType: 'generate',
+        username,
+        book,
+        startChapter: start,
+        endChapter: end,
+        completedChapters,
+        blockingBranches: [
+          { repo: 'en_ult', branchPattern: 'auto-{username}-{BOOK}' },
+          { repo: 'en_ust', branchPattern: 'auto-{username}-{BOOK}' },
+        ],
+        originalMessage: {
+          id: msgId,
+          sender_id: message.sender_id,
+          sender_full_name: message.sender_full_name,
+          type: message.type,
+          display_recipient: stream,
+          subject: topic,
+        },
+        createdAt: new Date().toISOString(),
+        retryCount: 0,
       });
-      await status(`**repo-insert** (ULT) done for ${book} ${ch}`);
-    } catch (err) {
-      console.error(`[generate] repo-insert ULT error for ${book} ${ch}: ${err.message}`);
-      await status(`**repo-insert** (ULT) failed for ${book} ${ch}: ${err.message}`);
-      chapterFailed = true;
+
+      await removeReaction(msgId, 'working_on_it');
+      await addReaction(msgId, 'hourglass');
+      const rangeLabel = start === end ? `${book} ${start}` : `${book} ${start}\u2013${end}`;
+      await reply(
+        `Generation complete for **${rangeLabel}** (${completedChapters.length} chapter(s)), but you have branches that need merging first:\n` +
+        existingBranches.map(b => `- \`${b}\``).join('\n') +
+        `\nPlease merge them in gatewayEdit or tcCreate, then say **merged**.`
+      );
+      await status(`Generation done for ${book} ${start}\u2013${end}, paused waiting for branch merge.`);
+      return;
     }
 
-    // Step 4: repo-insert UST
-    if (!chapterFailed) {
-      await status(`Running **repo-insert** (UST) for ${book} ${ch}...`);
+    // No blocking branches \u2014 run insertion inline
+    for (const chData of completedChapters) {
+      let chapterFailed = false;
+
+      // repo-insert ULT
+      await status(`Running **repo-insert** (ULT) for ${book} ${chData.ch}...`);
       try {
-        const riTimeout = calcSkillTimeout(book, ch, 1);
+        const riTimeout = calcSkillTimeout(book, chData.ch, 1);
         await runClaude({
-          prompt: `ust ${book} ${ch} ${username} --no-pr --source ${ustSourceRel}`,
+          prompt: `ult ${book} ${chData.ch} ${username} --no-pr --source ${chData.ultAligned}`,
           cwd: CSKILLBP_DIR,
           model,
           skill: 'repo-insert',
           timeoutMs: riTimeout,
         });
-        await status(`**repo-insert** (UST) done for ${book} ${ch}`);
+        await status(`**repo-insert** (ULT) done for ${book} ${chData.ch}`);
       } catch (err) {
-        console.error(`[generate] repo-insert UST error for ${book} ${ch}: ${err.message}`);
-        await status(`**repo-insert** (UST) failed for ${book} ${ch}: ${err.message}`);
+        console.error(`[generate] repo-insert ULT error for ${book} ${chData.ch}: ${err.message}`);
+        await status(`**repo-insert** (ULT) failed for ${book} ${chData.ch}: ${err.message}`);
         chapterFailed = true;
       }
-    }
 
-    // Step 5: repo-verify
-    if (!chapterFailed) {
-      const branchName = `auto-${username}-${book}`;
-      await status(`Verifying pushes for ${book} ${ch}...`);
-
-      const ultVerify = await verifyRepoPush({ repo: 'en_ult', branch: branchName });
-      const ustVerify = await verifyRepoPush({ repo: 'en_ust', branch: branchName });
-
-      if (!ultVerify.success) {
-        await status(`Repo verify warning (ULT) for ${book} ${ch}: ${ultVerify.details}`);
+      // repo-insert UST
+      if (!chapterFailed) {
+        await status(`Running **repo-insert** (UST) for ${book} ${chData.ch}...`);
+        try {
+          const riTimeout = calcSkillTimeout(book, chData.ch, 1);
+          await runClaude({
+            prompt: `ust ${book} ${chData.ch} ${username} --no-pr --source ${chData.ustAligned}`,
+            cwd: CSKILLBP_DIR,
+            model,
+            skill: 'repo-insert',
+            timeoutMs: riTimeout,
+          });
+          await status(`**repo-insert** (UST) done for ${book} ${chData.ch}`);
+        } catch (err) {
+          console.error(`[generate] repo-insert UST error for ${book} ${chData.ch}: ${err.message}`);
+          await status(`**repo-insert** (UST) failed for ${book} ${chData.ch}: ${err.message}`);
+          chapterFailed = true;
+        }
       }
-      if (!ustVerify.success) {
-        await status(`Repo verify warning (UST) for ${book} ${ch}: ${ustVerify.details}`);
+
+      // repo-verify
+      if (!chapterFailed) {
+        const branchName = `auto-${username}-${book}`;
+        await status(`Verifying pushes for ${book} ${chData.ch}...`);
+        const ultVerify = await verifyRepoPush({ repo: 'en_ult', branch: branchName });
+        const ustVerify = await verifyRepoPush({ repo: 'en_ust', branch: branchName });
+
+        if (!ultVerify.success) await status(`Repo verify warning (ULT) for ${book} ${chData.ch}: ${ultVerify.details}`);
+        if (!ustVerify.success) await status(`Repo verify warning (UST) for ${book} ${chData.ch}: ${ustVerify.details}`);
+        if (ultVerify.success && ustVerify.success) await status(`Repo verify OK for ${book} ${chData.ch}: ULT and UST branches confirmed`);
       }
 
-      if (ultVerify.success && ustVerify.success) {
-        await status(`Repo verify OK for ${book} ${ch}: ULT and UST branches confirmed`);
+      if (chapterFailed) {
+        // Move from success to fail (was counted as success during Phase 1)
+        success--;
+        fail++;
       }
-    }
-
-    if (chapterFailed) {
-      fail++;
-    } else {
-      success++;
     }
   }
 
@@ -385,11 +428,11 @@ async function generatePipeline(route, message) {
   // Final message
   if (!isChris && success > 0) {
     const branchName = `auto-${username}-${book}`;
-    const rangeLabel = start === end ? `${book} ${start}` : `${book} ${start}–${end}`;
+    const rangeLabel = start === end ? `${book} ${start}` : `${book} ${start}\u2013${end}`;
     await reply(
       `Content for **${rangeLabel}** is on your branch \`${branchName}\` in en_ult and en_ust. ` +
       `You can now work on it in gatewayEdit or tcCreate.` +
-      (fail > 0 ? `\n(${fail} chapter(s) had errors — check admin DMs for details.)` : '')
+      (fail > 0 ? `\n(${fail} chapter(s) had errors \u2014 check admin DMs for details.)` : '')
     );
   }
 

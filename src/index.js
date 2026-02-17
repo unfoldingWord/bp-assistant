@@ -1,7 +1,8 @@
 const config = require('../config.json');
-const { getClient } = require('./zulip-client');
+const { getClient, sendMessage } = require('./zulip-client');
 const { routeMessage } = require('./router');
 const { ensureFreshToken } = require('./auth-refresh');
+const { getAllPendingMerges } = require('./pending-merges');
 
 let myUserId = null;
 
@@ -102,6 +103,29 @@ async function main() {
 
   console.log('[bot] Listening for messages...');
 
+  // Send reminders for any pending merges that survived a restart
+  try {
+    const pendingMerges = getAllPendingMerges();
+    if (pendingMerges.length > 0) {
+      console.log(`[bot] Found ${pendingMerges.length} pending merge(s) from previous session`);
+      for (const pm of pendingMerges) {
+        const msg = pm.originalMessage;
+        if (msg && msg.type === 'stream' && msg.display_recipient && msg.subject) {
+          const rangeLabel = pm.startChapter === pm.endChapter
+            ? `${pm.book} ${pm.startChapter}`
+            : `${pm.book} ${pm.startChapter}\u2013${pm.endChapter}`;
+          const typeLabel = pm.pipelineType === 'generate' ? 'ULT/UST content' : 'translation notes';
+          await sendMessage(msg.display_recipient, msg.subject,
+            `Reminder: I have ${typeLabel} for **${rangeLabel}** ready to push, ` +
+            `but your branches need merging first. Say **merged** when done, or **cancel** to discard.`
+          );
+        }
+      }
+    }
+  } catch (err) {
+    console.error(`[bot] Failed to send pending merge reminders: ${err.message}`);
+  }
+
   // If the loop exits (queue expired), restart everything
   while (true) {
     const result = await pollLoop(client, queue.queueId, queue.lastEventId);
@@ -111,6 +135,10 @@ async function main() {
     }
   }
 }
+
+process.on('unhandledRejection', (reason) => {
+  console.error('[bot] Unhandled promise rejection:', reason);
+});
 
 main().catch((err) => {
   console.error(`[bot] Fatal error: ${err.message}`);

@@ -1,6 +1,10 @@
 // notes-pipeline.js — Multi-skill sequential pipeline for translation note writing
 // Triggered by: "write notes <book> <chapter>" or "write notes <book> <start>-<end>"
-// Skills: [post-edit-review OR deep-issue-id] → chapter-intro → tn-writer → tn-quality-check → repo-insert → repo-verify
+// Skills: [post-edit-review OR deep-issue-id] -> chapter-intro -> tn-writer -> tn-quality-check
+//
+// Two-phase design:
+//   Phase 1: Run all skills except repo-insert (always runs, expensive)
+//   Phase 2: Branch check -> pause-for-merge or repo-insert + repo-verify (cheap, may defer)
 
 const fs = require('fs');
 const path = require('path');
@@ -9,6 +13,7 @@ const { sendMessage, sendDM, addReaction, removeReaction, uploadFile } = require
 const { runClaude } = require('./claude-runner');
 const { getDoor43Username, checkExistingBranch, resolveOutputFile, checkPrerequisites, calcSkillTimeout, CSKILLBP_DIR } = require('./pipeline-utils');
 const { verifyRepoPush } = require('./repo-verify');
+const { setPendingMerge } = require('./pending-merges');
 
 const LOG_DIR = path.resolve(__dirname, '../logs');
 
@@ -18,7 +23,7 @@ const POST_EDIT_REVIEW_HINT =
 // --- Parse "write notes BOOK CH" or "write notes BOOK CH:VS-VS" or "write notes BOOK CH1-CH2" ---
 function parseWriteNotesCommand(content) {
   // Range: write notes PSA 66-72 or write notes for PSA 66-72
-  const rangeMatch = content.match(/write notes(?:\s+for)?\s+(\w+)\s+(\d+)\s*[-–—to]+\s*(\d+)/i);
+  const rangeMatch = content.match(/write notes(?:\s+for)?\s+(\w+)\s+(\d+)\s*[-\u2013\u2014to]+\s*(\d+)/i);
   if (rangeMatch) {
     return {
       book: rangeMatch[1].toUpperCase(),
@@ -28,7 +33,7 @@ function parseWriteNotesCommand(content) {
   }
 
   // Single with verse range: write notes PSA 119:169-176
-  const verseMatch = content.match(/write notes(?:\s+for)?\s+(\w+)\s+(\d+):(\d+)[-–—](\d+)/i);
+  const verseMatch = content.match(/write notes(?:\s+for)?\s+(\w+)\s+(\d+):(\d+)[-\u2013\u2014](\d+)/i);
   if (verseMatch) {
     const ch = parseInt(verseMatch[2], 10);
     return {
@@ -104,7 +109,7 @@ async function notesPipeline(route, message) {
   const chapterCount = endChapter - startChapter + 1;
   const rangeLabel = startChapter === endChapter
     ? `${book} ${startChapter}`
-    : `${book} ${startChapter}–${endChapter}`;
+    : `${book} ${startChapter}\u2013${endChapter}`;
 
   // --- Look up Door43 username ---
   const username = getDoor43Username(message.sender_email);
@@ -117,18 +122,6 @@ async function notesPipeline(route, message) {
   await addReaction(msgId, 'working_on_it');
   await status(`Starting notes pipeline for **${rangeLabel}** (${chapterCount} chapter(s), user: ${username})`);
 
-  // --- Pre-check: existing TN branch ---
-  const existingBranch = checkExistingBranch(username, 'en_tn', '{username}-tc-create-1');
-  if (existingBranch) {
-    await removeReaction(msgId, 'working_on_it');
-    await addReaction(msgId, 'stop_sign');
-    await reply(
-      `You have an existing TN branch \`${existingBranch}\`. ` +
-      `Please merge it using gatewayEdit or tcCreate, then run \`write notes ${rangeLabel}\` again.`
-    );
-    return;
-  }
-
   // Ensure log directory
   fs.mkdirSync(LOG_DIR, { recursive: true });
   const logFile = path.join(LOG_DIR, 'notes.log');
@@ -137,8 +130,11 @@ async function notesPipeline(route, message) {
   const pipelineStart = Date.now();
   let totalSuccess = 0;
   let totalFail = 0;
+  const completedChapters = []; // Phase 1 results for deferred insertion
 
-  // --- Chapter loop ---
+  // =========================================================================
+  // Phase 1: Run all skills except repo-insert (always runs)
+  // =========================================================================
   for (let ch = startChapter; ch <= endChapter; ch++) {
     const tag = `${book}-${ch}`;
     const verseRange = verseStart != null && startChapter === endChapter
@@ -158,13 +154,13 @@ async function notesPipeline(route, message) {
     let failedSkill = null;
     const chapterStart = Date.now();
 
-    // --- Build skill chain based on prerequisite availability ---
+    // --- Build skill chain based on prerequisite availability (NO repo-insert) ---
     const skills = [];
 
     if (hasAIArtifacts) {
-      // AI artifacts found → post-edit-review path
+      // AI artifacts found -> post-edit-review path
       issuesPath = resolved['issues TSV'];
-      await status(`**${ref}**: AI artifacts found → post-edit-review path`);
+      await status(`**${ref}**: AI artifacts found \u2192 post-edit-review path`);
 
       skills.push({
         name: 'post-edit-review',
@@ -174,9 +170,9 @@ async function notesPipeline(route, message) {
         ops: 1,
       });
     } else {
-      // No AI artifacts → deep-issue-id path (fetches from Door43 master)
+      // No AI artifacts -> deep-issue-id path (fetches from Door43 master)
       issuesPath = `output/issues/${tag}.tsv`;
-      await status(`**${ref}**: No AI artifacts (missing: ${missing.join(', ')}) → deep-issue-id --lite path`);
+      await status(`**${ref}**: No AI artifacts (missing: ${missing.join(', ')}) \u2192 deep-issue-id --lite path`);
 
       skills.push({
         name: 'deep-issue-id --lite',
@@ -186,7 +182,7 @@ async function notesPipeline(route, message) {
       });
     }
 
-    // Common tail: chapter-intro → tn-writer → tn-quality-check → repo-insert
+    // Common tail: chapter-intro -> tn-writer -> tn-quality-check
     skills.push({
       name: 'chapter-intro',
       prompt: `${skillRef} --issues ${issuesPath}`,
@@ -205,13 +201,6 @@ async function notesPipeline(route, message) {
       name: 'tn-quality-check',
       prompt: `${skillRef}`,
       expectedOutput: `output/quality/${book}/${tag}-quality.md`,
-      ops: 1,
-    });
-
-    skills.push({
-      name: 'repo-insert',
-      prompt: `tn ${skillRef} ${username} --no-pr --source output/notes/${tag}.tsv`,
-      expectedOutput: null, // side effect: git push
       ops: 1,
     });
 
@@ -250,7 +239,7 @@ async function notesPipeline(route, message) {
         const altOutputPath = resolveOutputFile(skill.expectedOutput, book);
         if (!fs.existsSync(outputPath) && !altOutputPath) {
           failedSkill = skill.name;
-          await status(`**${skill.name}** failed for ${ref} — expected output not found: ${skill.expectedOutput} (${duration}s)`);
+          await status(`**${skill.name}** failed for ${ref} \u2014 expected output not found: ${skill.expectedOutput} (${duration}s)`);
           break;
         }
         // Update issuesPath if deep-issue-id produced it in a subdirectory
@@ -277,24 +266,6 @@ async function notesPipeline(route, message) {
       }
     }
 
-    // --- Repo verify (JS-level, not a Claude skill) ---
-    if (!failedSkill) {
-      const branchName = `${username}-tc-create-1`;
-      await status(`Verifying push for ${ref}...`);
-      const verify = await verifyRepoPush({
-        repo: 'en_tn',
-        branch: branchName,
-        expectedFiles: [],  // Just check branch existence for now
-      });
-      if (!verify.success) {
-        await status(`Repo verify warning for ${ref}: ${verify.details}`);
-        console.warn(`[notes] Repo verify failed for ${ref}: ${verify.details}`);
-        // Don't fail the pipeline — just warn. repo-insert may still have worked.
-      } else {
-        await status(`Repo verify OK for ${ref}: ${verify.details}`);
-      }
-    }
-
     const chapterDuration = ((Date.now() - chapterStart) / 1000).toFixed(1);
 
     if (failedSkill) {
@@ -315,17 +286,111 @@ async function notesPipeline(route, message) {
     if (actualNotesTsv) {
       try {
         const uri = await uploadFile(actualNotesTsv, `${tag} notes.tsv`);
-        downloadLink = ` · [Download](${uri})`;
+        downloadLink = ` \u00b7 [Download](${uri})`;
       } catch (err) {
         console.error(`[notes] Failed to upload notes TSV: ${err.message}`);
-        downloadLink = ' · (file upload failed)';
+        downloadLink = ' \u00b7 (file upload failed)';
       }
     }
 
-    if (chapterCount === 1) {
-      // Single chapter — give full reply at end
-    } else {
+    // Collect for Phase 2 insertion
+    completedChapters.push({
+      ch,
+      skillRef,
+      repoInsertPrompt: `tn ${skillRef} ${username} --no-pr --source output/notes/${tag}.tsv`,
+    });
+
+    if (chapterCount > 1) {
       await reply(`**${ref}** notes complete (${chapterDuration}s)${downloadLink}`);
+    }
+  }
+
+  // =========================================================================
+  // Phase 2: Branch check -> pause or insert + verify
+  // =========================================================================
+  if (completedChapters.length > 0) {
+    const existingBranch = checkExistingBranch(username, 'en_tn', '{username}-tc-create-1');
+
+    if (existingBranch) {
+      // Pause: save state, swap reaction, ask user to merge
+      const sessionKey = `stream-${stream}-${topic}`;
+      setPendingMerge(sessionKey, {
+        sessionKey,
+        pipelineType: 'notes',
+        username,
+        book,
+        startChapter,
+        endChapter,
+        completedChapters,
+        blockingBranches: [
+          { repo: 'en_tn', branchPattern: '{username}-tc-create-1' },
+        ],
+        originalMessage: {
+          id: msgId,
+          sender_id: message.sender_id,
+          sender_full_name: message.sender_full_name,
+          type: message.type,
+          display_recipient: stream,
+          subject: topic,
+        },
+        createdAt: new Date().toISOString(),
+        retryCount: 0,
+      });
+
+      await removeReaction(msgId, 'working_on_it');
+      await addReaction(msgId, 'hourglass');
+      await reply(
+        `Notes generation complete for **${rangeLabel}** (${completedChapters.length} chapter(s)), but you have a branch that needs merging first:\n` +
+        `- \`${existingBranch}\`\n` +
+        `Please merge it in gatewayEdit or tcCreate, then say **merged**.`
+      );
+      await status(`Notes done for ${rangeLabel}, paused waiting for branch merge.`);
+      return;
+    }
+
+    // No blocking branch -- run insertion inline
+    for (const chData of completedChapters) {
+      let chapterFailed = false;
+
+      await status(`Running **repo-insert** (TN) for ${book} ${chData.ch}...`);
+      try {
+        const riTimeout = calcSkillTimeout(book, chData.ch, 1);
+        await runClaude({
+          prompt: chData.repoInsertPrompt,
+          cwd: CSKILLBP_DIR,
+          model,
+          skill: 'repo-insert',
+          timeoutMs: riTimeout,
+        });
+        await status(`**repo-insert** (TN) done for ${book} ${chData.ch}`);
+      } catch (err) {
+        console.error(`[notes] repo-insert TN error for ${book} ${chData.ch}: ${err.message}`);
+        await status(`**repo-insert** (TN) failed for ${book} ${chData.ch}: ${err.message}`);
+        chapterFailed = true;
+      }
+
+      // repo-verify
+      if (!chapterFailed) {
+        const branchName = `${username}-tc-create-1`;
+        await status(`Verifying push for ${book} ${chData.ch}...`);
+        const verify = await verifyRepoPush({
+          repo: 'en_tn',
+          branch: branchName,
+          expectedFiles: [],
+        });
+        if (!verify.success) {
+          await status(`Repo verify warning for ${book} ${chData.ch}: ${verify.details}`);
+          console.warn(`[notes] Repo verify failed for ${book} ${chData.ch}: ${verify.details}`);
+        } else {
+          await status(`Repo verify OK for ${book} ${chData.ch}: ${verify.details}`);
+        }
+      }
+
+      if (chapterFailed) {
+        // Move from success to fail
+        totalSuccess--;
+        totalFail++;
+      }
     }
   }
 
@@ -336,7 +401,7 @@ async function notesPipeline(route, message) {
 
   if (totalFail > 0 && totalSuccess === 0) {
     await addReaction(msgId, 'warning');
-    await reply(`Notes pipeline for **${rangeLabel}** failed — all ${totalFail} chapter(s) had errors. Check admin DMs for details.`);
+    await reply(`Notes pipeline for **${rangeLabel}** failed \u2014 all ${totalFail} chapter(s) had errors. Check admin DMs for details.`);
   } else if (totalFail > 0) {
     await addReaction(msgId, 'warning');
     await reply(
@@ -379,7 +444,7 @@ async function notesPipeline(route, message) {
     }
   }
 
-  await status(`Notes pipeline complete for **${rangeLabel}** in ${totalDuration}s — ${totalSuccess} ok, ${totalFail} failed.`);
+  await status(`Notes pipeline complete for **${rangeLabel}** in ${totalDuration}s \u2014 ${totalSuccess} ok, ${totalFail} failed.`);
 }
 
 module.exports = { notesPipeline };
