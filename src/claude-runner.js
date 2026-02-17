@@ -1,6 +1,8 @@
 // claude-runner.js — SDK wrapper for Claude Agent SDK query()
 // Replaces `claude -p` subprocess calls with programmatic SDK usage
 
+const { ensureFreshToken } = require('./auth-refresh');
+
 let _query = null;
 
 async function getQuery() {
@@ -51,6 +53,7 @@ function buildOptions({
 }
 
 async function runClaude({ prompt, cwd, model, allowedTools, skill, maxTurns, timeoutMs, appendSystemPrompt }) {
+  await ensureFreshToken();
   const query = await getQuery();
 
   const fullPrompt = skill ? `/${skill} ${prompt}` : prompt;
@@ -122,6 +125,7 @@ async function runClaude({ prompt, cwd, model, allowedTools, skill, maxTurns, ti
  * @returns {{ conversation: AsyncGenerator, abortController: AbortController, cleanup: () => void }}
  */
 async function runClaudeStream({ prompt, cwd, resume, model, maxTurns, timeoutMs, appendSystemPrompt }) {
+  await ensureFreshToken();
   const query = await getQuery();
   const abortController = new AbortController();
   const timeout = timeoutMs || DEFAULT_TIMEOUT_MS;

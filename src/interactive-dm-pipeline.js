@@ -6,6 +6,7 @@ const os = require('os');
 const config = require('../config.json');
 const { getSession, setSession, setModel, clearSession, incrementExchanges } = require('./session-store');
 const { buildOptions } = require('./claude-runner');
+const { ensureFreshToken } = require('./auth-refresh');
 const { sendDM, sendMessage, addReaction, removeReaction } = require('./zulip-client');
 
 let _query = null;
@@ -72,6 +73,7 @@ function modelToPrefix(model) {
  * Run one query() call, collecting reply text and session ID.
  */
 async function runInteractiveQuery({ prompt, cwd, resume, model, maxTurns, timeoutMs, appendSystemPrompt }) {
+  await ensureFreshToken();
   const queryFn = await getQuery();
   const abortController = new AbortController();
   const timeout = timeoutMs || DEFAULT_TIMEOUT_MS;
