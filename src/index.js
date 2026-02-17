@@ -1,6 +1,7 @@
 const config = require('../config.json');
 const { getClient } = require('./zulip-client');
 const { routeMessage } = require('./router');
+const { ensureFreshToken } = require('./auth-refresh');
 
 let myUserId = null;
 
@@ -85,6 +86,20 @@ async function main() {
   console.log(`[bot] Watching channel: "${config.channel}"`);
   console.log(`[bot] Watching topics: ${config.topics.join(', ')}`);
   if (config.watchDMs) console.log('[bot] Watching DMs');
+
+  // Proactive token refresh every 6 hours (tokens last 8h, refresh at 30min margin)
+  const REFRESH_INTERVAL_MS = 6 * 60 * 60 * 1000;
+  ensureFreshToken().then(ok => {
+    console.log(`[bot] Initial token check: ${ok ? 'OK' : 'FAILED — run claude login in container'}`);
+  });
+  setInterval(() => {
+    ensureFreshToken().then(ok => {
+      if (!ok) console.error('[bot] Scheduled token refresh FAILED');
+    }).catch(err => {
+      console.error(`[bot] Scheduled token refresh error: ${err.message}`);
+    });
+  }, REFRESH_INTERVAL_MS);
+
   console.log('[bot] Listening for messages...');
 
   // If the loop exits (queue expired), restart everything
