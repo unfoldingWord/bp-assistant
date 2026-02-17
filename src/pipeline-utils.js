@@ -57,6 +57,14 @@ function resolveOutputFile(relPath, book) {
   const alt = path.join(CSKILLBP_DIR, altPath);
   if (fs.existsSync(alt)) return altPath;
 
+  // Try with zero-padded chapter number (e.g. PSA-68.tsv -> PSA-068.tsv)
+  const paddedFilename = filename.replace(/-(\d+)\./, (_, n) => `-${n.padStart(3, '0')}.`);
+  if (paddedFilename !== filename) {
+    const paddedAltPath = [...parts, book, paddedFilename].join('/');
+    const paddedAlt = path.join(CSKILLBP_DIR, paddedAltPath);
+    if (fs.existsSync(paddedAlt)) return paddedAltPath;
+  }
+
   return null;
 }
 
