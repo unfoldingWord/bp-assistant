@@ -3,7 +3,7 @@
 
 const path = require('path');
 const os = require('os');
-const config = require('../config.json');
+const config = require('./config');
 const { getSession, setSession, setModel, clearSession, incrementExchanges } = require('./session-store');
 const { buildOptions } = require('./claude-runner');
 const { ensureFreshToken } = require('./auth-refresh');

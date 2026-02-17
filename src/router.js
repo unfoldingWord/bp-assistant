@@ -1,4 +1,4 @@
-const config = require('../config.json');
+const config = require('./config');
 const { runPipeline } = require('./pipeline-runner');
 const { sendMessage, addReaction } = require('./zulip-client');
 const { getSession, clearSession } = require('./session-store');

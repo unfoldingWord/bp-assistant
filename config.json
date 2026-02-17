@@ -1,16 +1,6 @@
 {
-  "adminUserId": 249849,
-  "chrisUserId": 294293,
-  "authorizedUserIds": [
-    237089,
-    294293,
-    342880,
-    623672,
-    363784,
-    258382,
-    249849,
-    889674
-  ],
+  "adminUserId": null,
+  "authorizedUserIds": [],
   "channel": "CONTENT - UR",
   "topics": [
     "Psalms BP",
@@ -63,5 +53,5 @@
     "reply": true,
     "cwd": "/workspace"
   },
-  "unauthorizedReply": "You're not on the authorized list, ask and mention @**Benjamin|249849** in the response."
+  "unauthorizedReply": "You're not on the authorized list, ask the admin in the response."
 }

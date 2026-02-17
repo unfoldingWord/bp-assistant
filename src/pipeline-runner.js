@@ -10,7 +10,7 @@ function runShellPipeline(route, message) {
       ...process.env,
       ZULIP_MSG_ID: String(message.id),
       ZULIP_MSG_CONTENT: message.content,
-      ZULIP_ADMIN_USER_ID: String(require('../config.json').adminUserId),
+      ZULIP_ADMIN_USER_ID: String(require('./config').adminUserId),
       ZULIP_MSG_SENDER: message.sender_email,
       ZULIP_MSG_SENDER_NAME: message.sender_full_name,
       ZULIP_MSG_STREAM: message.type === 'stream' ? message.display_recipient : 'dm',

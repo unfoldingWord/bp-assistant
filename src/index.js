@@ -1,4 +1,4 @@
-const config = require('../config.json');
+const config = require('./config');
 const { getClient, sendMessage } = require('./zulip-client');
 const { routeMessage } = require('./router');
 const { ensureFreshToken } = require('./auth-refresh');

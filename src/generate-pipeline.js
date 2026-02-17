@@ -8,7 +8,7 @@
 
 const fs = require('fs');
 const path = require('path');
-const config = require('../config.json');
+const config = require('./config');
 const { sendMessage, sendDM, addReaction, removeReaction, uploadFile } = require('./zulip-client');
 const { runClaude } = require('./claude-runner');
 const { getDoor43Username, checkExistingBranch, resolveOutputFile, calcSkillTimeout, CSKILLBP_DIR } = require('./pipeline-utils');

@@ -3,7 +3,7 @@
 
 const fs = require('fs');
 const path = require('path');
-const config = require('../config.json');
+const config = require('./config');
 const { sendMessage, sendDM, addReaction, removeReaction } = require('./zulip-client');
 const { runClaude } = require('./claude-runner');
 const { checkExistingBranch, calcSkillTimeout, CSKILLBP_DIR } = require('./pipeline-utils');

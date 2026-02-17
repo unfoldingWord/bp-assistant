@@ -1,0 +1,30 @@
+services:
+  zulip-bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: zulip-bot
+    restart: unless-stopped
+    env_file:
+      - ../config/.env
+    volumes:
+      - ../workspace:/workspace
+      - ../config:/config
+      - ./data:/app/data
+      - claude-config:/claude-config
+    working_dir: /app
+    networks:
+      - work-net
+    deploy:
+      resources:
+        limits:
+          memory: 4g
+
+volumes:
+  claude-config:
+    external: true
+    name: bot_claude-config
+
+networks:
+  work-net:
+    external: true
