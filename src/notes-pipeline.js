@@ -4,16 +4,15 @@
 //
 // Two-phase design:
 //   Phase 1: Run all skills except repo-insert (always runs, expensive)
-//   Phase 2: Branch check -> pause-for-merge or repo-insert + repo-verify (cheap, may defer)
+//   Phase 2: Repo insert — push to master (cheap, always runs inline)
 
 const fs = require('fs');
 const path = require('path');
 const config = require('./config');
 const { sendMessage, sendDM, addReaction, removeReaction, uploadFile } = require('./zulip-client');
 const { runClaude } = require('./claude-runner');
-const { getDoor43Username, checkExistingBranch, resolveOutputFile, checkPrerequisites, calcSkillTimeout, CSKILLBP_DIR } = require('./pipeline-utils');
+const { getDoor43Username, buildBranchName, resolveOutputFile, checkPrerequisites, calcSkillTimeout, CSKILLBP_DIR } = require('./pipeline-utils');
 const { verifyRepoPush } = require('./repo-verify');
-const { setPendingMerge } = require('./pending-merges');
 
 const LOG_DIR = path.resolve(__dirname, '../logs');
 
@@ -297,7 +296,7 @@ async function notesPipeline(route, message) {
     completedChapters.push({
       ch,
       skillRef,
-      repoInsertPrompt: `tn ${skillRef} ${username} --no-pr --source output/notes/${tag}.tsv`,
+      repoInsertPrompt: `tn ${skillRef} ${username} --no-pr --branch ${buildBranchName(book, ch)} --source output/notes/${tag}.tsv`,
     });
 
     if (chapterCount > 1) {
@@ -306,49 +305,9 @@ async function notesPipeline(route, message) {
   }
 
   // =========================================================================
-  // Phase 2: Branch check -> pause or insert + verify
+  // Phase 2: Repo insert \u2014 push to master
   // =========================================================================
   if (completedChapters.length > 0) {
-    const existingBranch = checkExistingBranch(username, 'en_tn', '{username}-tc-create-1');
-
-    if (existingBranch) {
-      // Pause: save state, swap reaction, ask user to merge
-      const sessionKey = `stream-${stream}-${topic}`;
-      setPendingMerge(sessionKey, {
-        sessionKey,
-        pipelineType: 'notes',
-        username,
-        book,
-        startChapter,
-        endChapter,
-        completedChapters,
-        blockingBranches: [
-          { repo: 'en_tn', branchPattern: '{username}-tc-create-1' },
-        ],
-        originalMessage: {
-          id: msgId,
-          sender_id: message.sender_id,
-          sender_full_name: message.sender_full_name,
-          type: message.type,
-          display_recipient: stream,
-          subject: topic,
-        },
-        createdAt: new Date().toISOString(),
-        retryCount: 0,
-      });
-
-      await removeReaction(msgId, 'working_on_it');
-      await addReaction(msgId, 'hourglass');
-      await reply(
-        `Notes generation complete for **${rangeLabel}** (${completedChapters.length} chapter(s)), but you have a branch that needs merging first:\n` +
-        `- \`${existingBranch}\`\n` +
-        `Please merge it in gatewayEdit or tcCreate, then say **merged**.`
-      );
-      await status(`Notes done for ${rangeLabel}, paused waiting for branch merge.`);
-      return;
-    }
-
-    // No blocking branch -- run insertion inline
     for (const chData of completedChapters) {
       let chapterFailed = false;
 
@@ -369,13 +328,12 @@ async function notesPipeline(route, message) {
         chapterFailed = true;
       }
 
-      // repo-verify
+      // repo-verify against master
       if (!chapterFailed) {
-        const branchName = `${username}-tc-create-1`;
         await status(`Verifying push for ${book} ${chData.ch}...`);
         const verify = await verifyRepoPush({
           repo: 'en_tn',
-          branch: branchName,
+          branch: 'master',
           expectedFiles: [],
         });
         if (!verify.success) {
@@ -429,17 +387,15 @@ async function notesPipeline(route, message) {
         }
       }
 
-      const branchName = `${username}-tc-create-1`;
       await reply(
         `Notes pipeline complete for **${rangeLabel}** (${totalDuration}s).\n` +
-        `Branch: \`${branchName}\` on en_tn` +
+        `Content pushed to master on en_tn` +
         downloadLink
       );
     } else {
-      const branchName = `${username}-tc-create-1`;
       await reply(
         `Notes pipeline complete for **${rangeLabel}**: all ${totalSuccess} chapter(s) succeeded (${totalDuration}s).\n` +
-        `Branch: \`${branchName}\` on en_tn`
+        `Content pushed to master on en_tn`
       );
     }
   }

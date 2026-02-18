@@ -60,6 +60,12 @@ function resolveOutputFile(relPath, book) {
   // Try with zero-padded chapter number (e.g. PSA-68.tsv -> PSA-068.tsv)
   const paddedFilename = filename.replace(/-(\d+)\./, (_, n) => `-${n.padStart(3, '0')}.`);
   if (paddedFilename !== filename) {
+    // Try zero-padded at same directory level (no extra book subdir)
+    const paddedDirectPath = [...parts, paddedFilename].join('/');
+    const paddedDirect = path.join(CSKILLBP_DIR, paddedDirectPath);
+    if (fs.existsSync(paddedDirect)) return paddedDirectPath;
+
+    // Try zero-padded with book subdir added
     const paddedAltPath = [...parts, book, paddedFilename].join('/');
     const paddedAlt = path.join(CSKILLBP_DIR, paddedAltPath);
     if (fs.existsSync(paddedAlt)) return paddedAltPath;
@@ -105,9 +111,30 @@ function calcSkillTimeout(book, chapters, ops) {
   return Math.min(Math.max(total, MIN_TIMEOUT_MS), MAX_TIMEOUT_MS);
 }
 
+/**
+ * Build a standardized AI branch name for repo-insert.
+ * Single chapter: AI-PSA-030, AI-ISA-33
+ * Range: AI-PSA-030-031, AI-ISA-33-34
+ * PSA uses 3-digit padding, all other books use 2-digit.
+ * @param {string} book - 3-letter book code (e.g. 'PSA')
+ * @param {number} startCh - starting chapter
+ * @param {number} [endCh] - ending chapter (omit or same as startCh for single chapter)
+ * @returns {string} branch name
+ */
+function buildBranchName(book, startCh, endCh) {
+  const width = book.toUpperCase() === 'PSA' ? 3 : 2;
+  const padStart = String(startCh).padStart(width, '0');
+  if (endCh != null && endCh !== startCh) {
+    const padEnd = String(endCh).padStart(width, '0');
+    return `AI-${book.toUpperCase()}-${padStart}-${padEnd}`;
+  }
+  return `AI-${book.toUpperCase()}-${padStart}`;
+}
+
 module.exports = {
   getDoor43Username,
   checkExistingBranch,
+  buildBranchName,
   resolveOutputFile,
   checkPrerequisites,
   calcSkillTimeout,

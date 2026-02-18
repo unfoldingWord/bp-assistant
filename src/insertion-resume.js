@@ -1,12 +1,14 @@
 // insertion-resume.js — Resume deferred repo-insert after user merges branches
 // Called by the router when user says "merged" and there's a pending merge state.
+// Note: No new pending merges are created (push-to-master workflow eliminated them).
+// This file is kept for transition safety in case pending merges exist from before the change.
 
 const fs = require('fs');
 const path = require('path');
 const config = require('./config');
 const { sendMessage, sendDM, addReaction, removeReaction } = require('./zulip-client');
 const { runClaude } = require('./claude-runner');
-const { checkExistingBranch, calcSkillTimeout, CSKILLBP_DIR } = require('./pipeline-utils');
+const { checkExistingBranch, buildBranchName, calcSkillTimeout, CSKILLBP_DIR } = require('./pipeline-utils');
 const { verifyRepoPush } = require('./repo-verify');
 const { getPendingMerge, setPendingMerge, clearPendingMerge } = require('./pending-merges');
 
@@ -66,7 +68,7 @@ async function resumeInsertion(sessionKey, triggerMessage) {
     return;
   }
 
-  // Branches are clear -- run insertion
+  // Branches are clear -- run insertion (pushes to master now)
   await status(`[insertion-resume] Branches clear for ${sessionKey}, running deferred insertion...`);
 
   const isTestFast = process.env.TEST_FAST === '1';
@@ -102,10 +104,8 @@ async function resumeInsertion(sessionKey, triggerMessage) {
 
   if (pipelineType === 'generate') {
     if (success > 0) {
-      const branchName = `auto-${username}-${book}`;
       await replyTo(triggerMessage,
-        `Content for **${rangeLabel}** is on your branch \`${branchName}\` in en_ult and en_ust. ` +
-        `You can now work on it in gatewayEdit or tcCreate.` +
+        `Content for **${rangeLabel}** pushed to master in en_ult and en_ust.` +
         (fail > 0 ? `\n(${fail} chapter(s) had insertion errors -- check admin DMs for details.)` : '')
       );
     } else {
@@ -113,10 +113,9 @@ async function resumeInsertion(sessionKey, triggerMessage) {
     }
   } else {
     if (success > 0) {
-      const branchName = `${username}-tc-create-1`;
       await replyTo(triggerMessage,
         `Notes insertion complete for **${rangeLabel}**.\n` +
-        `Branch: \`${branchName}\` on en_tn` +
+        `Content pushed to master on en_tn` +
         (fail > 0 ? `\n(${fail} chapter(s) had insertion errors -- check admin DMs for details.)` : '')
       );
     } else {
@@ -129,6 +128,7 @@ async function resumeInsertion(sessionKey, triggerMessage) {
 
 /**
  * Run repo-insert + repo-verify for ULT and UST per chapter.
+ * Pushes to master via the repo-insert skill's merge-to-master workflow.
  */
 async function runGenerateInsertPhase(completedChapters, username, book, model) {
   let success = 0;
@@ -142,7 +142,7 @@ async function runGenerateInsertPhase(completedChapters, username, book, model) 
     try {
       const riTimeout = calcSkillTimeout(book, ch.ch, 1);
       await runClaude({
-        prompt: `ult ${book} ${ch.ch} ${username} --no-pr --source ${ch.ultAligned}`,
+        prompt: `ult ${book} ${ch.ch} ${username} --no-pr --branch ${buildBranchName(book, ch.ch)} --source ${ch.ultAligned}`,
         cwd: CSKILLBP_DIR,
         model,
         skill: 'repo-insert',
@@ -161,7 +161,7 @@ async function runGenerateInsertPhase(completedChapters, username, book, model) 
       try {
         const riTimeout = calcSkillTimeout(book, ch.ch, 1);
         await runClaude({
-          prompt: `ust ${book} ${ch.ch} ${username} --no-pr --source ${ch.ustAligned}`,
+          prompt: `ust ${book} ${ch.ch} ${username} --no-pr --branch ${buildBranchName(book, ch.ch)} --source ${ch.ustAligned}`,
           cwd: CSKILLBP_DIR,
           model,
           skill: 'repo-insert',
@@ -175,12 +175,11 @@ async function runGenerateInsertPhase(completedChapters, username, book, model) 
       }
     }
 
-    // repo-verify
+    // repo-verify against master
     if (!chapterFailed) {
-      const branchName = `auto-${username}-${book}`;
       await status(`Verifying pushes for ${book} ${ch.ch}...`);
-      const ultVerify = await verifyRepoPush({ repo: 'en_ult', branch: branchName });
-      const ustVerify = await verifyRepoPush({ repo: 'en_ust', branch: branchName });
+      const ultVerify = await verifyRepoPush({ repo: 'en_ult', branch: 'master' });
+      const ustVerify = await verifyRepoPush({ repo: 'en_ust', branch: 'master' });
 
       if (!ultVerify.success) await status(`Repo verify warning (ULT) for ${book} ${ch.ch}: ${ultVerify.details}`);
       if (!ustVerify.success) await status(`Repo verify warning (UST) for ${book} ${ch.ch}: ${ustVerify.details}`);
@@ -196,6 +195,7 @@ async function runGenerateInsertPhase(completedChapters, username, book, model) 
 
 /**
  * Run repo-insert + repo-verify for TN per chapter.
+ * Pushes to master via the repo-insert skill's merge-to-master workflow.
  */
 async function runNotesInsertPhase(completedChapters, username, book, model) {
   let success = 0;
@@ -221,11 +221,10 @@ async function runNotesInsertPhase(completedChapters, username, book, model) {
       chapterFailed = true;
     }
 
-    // repo-verify
+    // repo-verify against master
     if (!chapterFailed) {
-      const branchName = `${username}-tc-create-1`;
       await status(`Verifying push for ${book} ${ch.ch}...`);
-      const verify = await verifyRepoPush({ repo: 'en_tn', branch: branchName });
+      const verify = await verifyRepoPush({ repo: 'en_tn', branch: 'master' });
       if (!verify.success) {
         await status(`Repo verify warning for ${book} ${ch.ch}: ${verify.details}`);
       } else {

@@ -4,16 +4,15 @@
 //
 // Two-phase design for non-Chris users:
 //   Phase 1: Generate + align (always runs, expensive)
-//   Phase 2: Branch check → pause-for-merge or repo-insert (cheap, may defer)
+//   Phase 2: Repo insert — push to master (cheap, always runs inline)
 
 const fs = require('fs');
 const path = require('path');
 const config = require('./config');
 const { sendMessage, sendDM, addReaction, removeReaction, uploadFile } = require('./zulip-client');
 const { runClaude } = require('./claude-runner');
-const { getDoor43Username, checkExistingBranch, resolveOutputFile, calcSkillTimeout, CSKILLBP_DIR } = require('./pipeline-utils');
+const { getDoor43Username, buildBranchName, resolveOutputFile, calcSkillTimeout, CSKILLBP_DIR } = require('./pipeline-utils');
 const { verifyRepoPush } = require('./repo-verify');
-const { setPendingMerge } = require('./pending-merges');
 
 const LOG_DIR = path.resolve(__dirname, '../logs');
 
@@ -309,54 +308,9 @@ async function generatePipeline(route, message) {
   }
 
   // =========================================================================
-  // Phase 2: Branch check \u2192 pause or insert (non-Chris users only)
+  // Phase 2: Repo insert \u2014 push to master (non-Chris users only)
   // =========================================================================
   if (!isChris && completedChapters.length > 0) {
-    // Check for existing ULT/UST branches
-    const ultBranch = checkExistingBranch(username, 'en_ult', 'auto-{username}-{BOOK}', book);
-    const ustBranch = checkExistingBranch(username, 'en_ust', 'auto-{username}-{BOOK}', book);
-    const existingBranches = [ultBranch, ustBranch].filter(Boolean);
-
-    if (existingBranches.length > 0) {
-      // Pause: save state, swap reaction, ask user to merge
-      const sessionKey = `stream-${stream}-${topic}`;
-      setPendingMerge(sessionKey, {
-        sessionKey,
-        pipelineType: 'generate',
-        username,
-        book,
-        startChapter: start,
-        endChapter: end,
-        completedChapters,
-        blockingBranches: [
-          { repo: 'en_ult', branchPattern: 'auto-{username}-{BOOK}' },
-          { repo: 'en_ust', branchPattern: 'auto-{username}-{BOOK}' },
-        ],
-        originalMessage: {
-          id: msgId,
-          sender_id: message.sender_id,
-          sender_full_name: message.sender_full_name,
-          type: message.type,
-          display_recipient: stream,
-          subject: topic,
-        },
-        createdAt: new Date().toISOString(),
-        retryCount: 0,
-      });
-
-      await removeReaction(msgId, 'working_on_it');
-      await addReaction(msgId, 'hourglass');
-      const rangeLabel = start === end ? `${book} ${start}` : `${book} ${start}\u2013${end}`;
-      await reply(
-        `Generation complete for **${rangeLabel}** (${completedChapters.length} chapter(s)), but you have branches that need merging first:\n` +
-        existingBranches.map(b => `- \`${b}\``).join('\n') +
-        `\nPlease merge them in gatewayEdit or tcCreate, then say **merged**.`
-      );
-      await status(`Generation done for ${book} ${start}\u2013${end}, paused waiting for branch merge.`);
-      return;
-    }
-
-    // No blocking branches \u2014 run insertion inline
     for (const chData of completedChapters) {
       let chapterFailed = false;
 
@@ -365,7 +319,7 @@ async function generatePipeline(route, message) {
       try {
         const riTimeout = calcSkillTimeout(book, chData.ch, 1);
         await runClaude({
-          prompt: `ult ${book} ${chData.ch} ${username} --no-pr --source ${chData.ultAligned}`,
+          prompt: `ult ${book} ${chData.ch} ${username} --no-pr --branch ${buildBranchName(book, chData.ch)} --source ${chData.ultAligned}`,
           cwd: CSKILLBP_DIR,
           model,
           skill: 'repo-insert',
@@ -384,7 +338,7 @@ async function generatePipeline(route, message) {
         try {
           const riTimeout = calcSkillTimeout(book, chData.ch, 1);
           await runClaude({
-            prompt: `ust ${book} ${chData.ch} ${username} --no-pr --source ${chData.ustAligned}`,
+            prompt: `ust ${book} ${chData.ch} ${username} --no-pr --branch ${buildBranchName(book, chData.ch)} --source ${chData.ustAligned}`,
             cwd: CSKILLBP_DIR,
             model,
             skill: 'repo-insert',
@@ -398,16 +352,15 @@ async function generatePipeline(route, message) {
         }
       }
 
-      // repo-verify
+      // repo-verify against master
       if (!chapterFailed) {
-        const branchName = `auto-${username}-${book}`;
         await status(`Verifying pushes for ${book} ${chData.ch}...`);
-        const ultVerify = await verifyRepoPush({ repo: 'en_ult', branch: branchName });
-        const ustVerify = await verifyRepoPush({ repo: 'en_ust', branch: branchName });
+        const ultVerify = await verifyRepoPush({ repo: 'en_ult', branch: 'master' });
+        const ustVerify = await verifyRepoPush({ repo: 'en_ust', branch: 'master' });
 
         if (!ultVerify.success) await status(`Repo verify warning (ULT) for ${book} ${chData.ch}: ${ultVerify.details}`);
         if (!ustVerify.success) await status(`Repo verify warning (UST) for ${book} ${chData.ch}: ${ustVerify.details}`);
-        if (ultVerify.success && ustVerify.success) await status(`Repo verify OK for ${book} ${chData.ch}: ULT and UST branches confirmed`);
+        if (ultVerify.success && ustVerify.success) await status(`Repo verify OK for ${book} ${chData.ch}: ULT and UST on master confirmed`);
       }
 
       if (chapterFailed) {
@@ -428,11 +381,9 @@ async function generatePipeline(route, message) {
 
   // Final message
   if (!isChris && success > 0) {
-    const branchName = `auto-${username}-${book}`;
     const rangeLabel = start === end ? `${book} ${start}` : `${book} ${start}\u2013${end}`;
     await reply(
-      `Content for **${rangeLabel}** is on your branch \`${branchName}\` in en_ult and en_ust. ` +
-      `You can now work on it in gatewayEdit or tcCreate.` +
+      `Content for **${rangeLabel}** pushed to master in en_ult and en_ust.` +
       (fail > 0 ? `\n(${fail} chapter(s) had errors \u2014 check admin DMs for details.)` : '')
     );
   }
