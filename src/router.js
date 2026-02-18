@@ -411,42 +411,54 @@ async function routeMessage(message) {
     console.log(`[router] No match -- running interactive DM pipeline for admin ${message.id}`);
     firePipeline(config.dmDefaultPipeline, message);
   } else if (isStream) {
-    const session = getSession(sessionKey);
-    if (session && session.sessionId) {
-      console.log(`[router] Resuming stream session for ${sessionKey}`);
-      firePipeline(config.dmDefaultPipeline, message);
-    } else {
-      // No regex match — try haiku intent classification as fallback
-      console.log(`[router] No regex match — trying haiku intent classification`);
-      try {
-        const intent = await classifyIntent(message.content);
-        console.log(`[router] Haiku classified as: ${JSON.stringify(intent)}`);
+    // Try Haiku classification first — a recognized intent always wins over session resume
+    console.log(`[router] No regex match — trying haiku intent classification`);
+    let haikuMatched = false;
+    try {
+      const intent = await classifyIntent(message.content);
+      console.log(`[router] Haiku classified as: ${JSON.stringify(intent)}`);
 
-        if (intent.intent !== 'unknown' && intent.book && intent.startChapter) {
-          const syntheticRoute = buildSyntheticRoute(intent);
-          if (syntheticRoute) {
-            const captures = intent.startChapter === intent.endChapter
-              ? [intent.book, String(intent.startChapter)]
-              : [intent.book, String(intent.startChapter), String(intent.endChapter)];
-            const confirmText = buildConfirmMessage(syntheticRoute.confirmMessage, captures);
-            const timeoutMs = calcTimeout(syntheticRoute, captures);
-            pendingConfirmations.set(sessionKey, { route: syntheticRoute, message, timeoutMs });
-            console.log(`[router] Haiku → awaiting confirmation for synthetic "${syntheticRoute.name}" in ${sessionKey}`);
-            await sendMessage(message.display_recipient, message.subject,
-              `@**${message.sender_full_name}** ${confirmText}`);
-            return;
-          }
+      if (intent.intent !== 'unknown' && intent.book && intent.startChapter) {
+        const syntheticRoute = buildSyntheticRoute(intent);
+        if (syntheticRoute) {
+          const captures = intent.startChapter === intent.endChapter
+            ? [intent.book, String(intent.startChapter)]
+            : [intent.book, String(intent.startChapter), String(intent.endChapter)];
+          const confirmText = buildConfirmMessage(syntheticRoute.confirmMessage, captures);
+          const timeoutMs = calcTimeout(syntheticRoute, captures);
+          pendingConfirmations.set(sessionKey, { route: syntheticRoute, message, timeoutMs });
+          console.log(`[router] Haiku → awaiting confirmation for synthetic "${syntheticRoute.name}" in ${sessionKey}`);
+          await sendMessage(message.display_recipient, message.subject,
+            `@**${message.sender_full_name}** ${confirmText}`);
+          haikuMatched = true;
         }
-      } catch (err) {
-        console.error(`[router] Haiku classification failed: ${err.message}`);
       }
+    } catch (err) {
+      console.error(`[router] Haiku classification failed: ${err.message}`);
+    }
 
-      console.log(`[router] Haiku fallback didn't match — sending help`);
-      await sendMessage(message.display_recipient, message.subject, HELP_TEXT);
+    if (!haikuMatched) {
+      // Fall back to session resume for genuine follow-up messages
+      const session = getSession(sessionKey);
+      if (session && session.sessionId) {
+        console.log(`[router] Resuming stream session for ${sessionKey}`);
+        firePipeline(config.dmDefaultPipeline, message);
+      } else {
+        console.log(`[router] Haiku fallback didn't match — sending help`);
+        await sendMessage(message.display_recipient, message.subject, HELP_TEXT);
+      }
     }
   } else {
     console.log(`[router] No match for message ${message.id}, skipping`);
   }
 }
 
-module.exports = { routeMessage };
+/**
+ * Check if a stream topic has a pending confirmation or pending merge.
+ */
+function hasPendingAction(channel, topic) {
+  const sessionKey = `stream-${channel}-${topic}`;
+  return pendingConfirmations.has(sessionKey) || !!getPendingMerge(sessionKey);
+}
+
+module.exports = { routeMessage, hasPendingAction };

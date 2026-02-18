@@ -194,7 +194,14 @@ async function interactiveDmPipeline(route, message) {
       appendSystemPrompt: route.systemPrompt,
     });
 
-    if (sessionId) setSession(sessionKey, sessionId, model);
+    if (sessionId) {
+      if (route.singleShot) {
+        clearSession(sessionKey);
+        console.log(`[interactive] Single-shot route "${route.name}" — session cleared after completion`);
+      } else {
+        setSession(sessionKey, sessionId, model);
+      }
+    }
 
     if (finalReply) {
       const prefix = modelToPrefix(model);

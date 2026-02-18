@@ -42,6 +42,7 @@
       "cwd": "/workspace",
       "reply": true,
       "operations": 2,
+      "singleShot": true,
       "confirmMessage": "I'll compare the human-edited **$1 $2** ULT & UST against what the AI generated and identify improvements. Sound right? (yes/no)"
     }
   ],

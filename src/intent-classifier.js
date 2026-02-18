@@ -1,25 +1,18 @@
 // intent-classifier.js — Haiku-based NLU for routing natural language messages
+// Uses claude-agent-sdk (OAuth) rather than @anthropic-ai/sdk (API key).
 
-const Anthropic = require('@anthropic-ai/sdk');
+const { ensureFreshToken } = require('./auth-refresh');
 
-let client = null;
-function getClient() {
-  if (!client) client = new Anthropic();  // uses ANTHROPIC_API_KEY from env
-  return client;
+let _query = null;
+async function getQuery() {
+  if (!_query) {
+    const sdk = await import('@anthropic-ai/claude-agent-sdk');
+    _query = sdk.query;
+  }
+  return _query;
 }
 
-/**
- * Classify a Zulip message into a pipeline intent.
- * Only called when regex routes don't match — cost ~$0.001 per call.
- *
- * @param {string} messageContent - Raw message text
- * @returns {Promise<{intent: string, book: string, startChapter: number, endChapter: number, contentTypes: string[]}>}
- */
-async function classifyIntent(messageContent) {
-  const response = await getClient().messages.create({
-    model: 'claude-haiku-4-5-20251001',
-    max_tokens: 200,
-    system: `You classify Zulip messages about Bible translation work.
+const SYSTEM_PROMPT = `You classify Zulip messages about Bible translation work.
 Extract the intent and parameters as JSON. Valid intents:
 - "generate": user wants ULT and/or UST generated for chapters
 - "notes": user wants translation notes produced for chapters
@@ -32,15 +25,58 @@ If you can't determine the book or chapters, use intent "unknown".
 
 For editor-review, also extract contentTypes: ["ult"] if user mentions only ULT, ["ust"] if only UST, ["ult","ust"] if both or neither specified.
 
-Respond ONLY with JSON, no other text: {"intent":"...","book":"...","startChapter":N,"endChapter":N,"contentTypes":["ult","ust"]}`,
-    messages: [{ role: 'user', content: messageContent }],
-  });
+Respond ONLY with valid JSON, no other text: {"intent":"...","book":"...","startChapter":N,"endChapter":N,"contentTypes":["ult","ust"]}`;
 
-  const text = response.content[0].text.trim();
+/**
+ * Classify a Zulip message into a pipeline intent.
+ * Only called when regex routes don't match.
+ *
+ * @param {string} messageContent - Raw message text
+ * @returns {Promise<{intent: string, book: string, startChapter: number, endChapter: number, contentTypes: string[]}>}
+ */
+async function classifyIntent(messageContent) {
+  await ensureFreshToken();
+  const queryFn = await getQuery();
+
+  const abortController = new AbortController();
+  const timer = setTimeout(() => abortController.abort(), 30000);
+
+  const options = {
+    cwd: process.cwd(),
+    abortController,
+    maxTurns: 1,
+    allowedTools: [],
+    permissionMode: 'bypassPermissions',
+    allowDangerouslySkipPermissions: true,
+    persistSession: false,
+    model: 'haiku',
+    systemPrompt: SYSTEM_PROMPT,
+  };
+
+  const prompt = `Classify this message and respond with JSON only:\n\n${messageContent}`;
+  const conversation = queryFn({ prompt, options });
+
+  let replyText = '';
+  try {
+    for await (const event of conversation) {
+      if (abortController.signal.aborted) break;
+      if (event.type === 'assistant' && event.message?.content) {
+        for (const block of event.message.content) {
+          if (block && typeof block.text === 'string') replyText += block.text;
+        }
+      }
+    }
+  } finally {
+    clearTimeout(timer);
+    try { conversation.close(); } catch (_) {}
+  }
+
+  // Extract JSON from response (may be wrapped in markdown code fences)
+  const jsonMatch = replyText.match(/\{[\s\S]*\}/);
+  const text = jsonMatch ? jsonMatch[0] : replyText.trim();
 
   try {
     const parsed = JSON.parse(text);
-    // Validate shape
     if (!parsed.intent || !['generate', 'notes', 'editor-review', 'unknown'].includes(parsed.intent)) {
       return { intent: 'unknown', book: null, startChapter: null, endChapter: null, contentTypes: ['ult', 'ust'] };
     }
@@ -55,7 +91,7 @@ Respond ONLY with JSON, no other text: {"intent":"...","book":"...","startChapte
       contentTypes,
     };
   } catch (err) {
-    console.error(`[intent-classifier] Failed to parse haiku response: ${text}`);
+    console.error(`[intent-classifier] Failed to parse response: ${replyText.slice(0, 200)}`);
     return { intent: 'unknown', book: null, startChapter: null, endChapter: null, contentTypes: ['ult', 'ust'] };
   }
 }
