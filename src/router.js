@@ -10,6 +10,48 @@ const { resumeInsertion } = require('./insertion-resume');
 // In-memory pending confirmations for stream messages
 const pendingConfirmations = new Map();
 
+/**
+ * Detect whether the user asked for ULT only, UST only, or both.
+ */
+function extractContentTypes(text) {
+  const upper = text.toUpperCase();
+  const hasUlt = /\bULT\b/.test(upper);
+  const hasUst = /\bUST\b/.test(upper);
+  if (hasUlt && !hasUst) return ['ult'];
+  if (hasUst && !hasUlt) return ['ust'];
+  return ['ult', 'ust'];
+}
+
+/**
+ * Build the editor-review system prompt dynamically based on content types.
+ */
+function buildEditorReviewSystemPrompt(contentTypes) {
+  const types = contentTypes || ['ult', 'ust'];
+  const typeLabel = types.map(t => t.toUpperCase()).join(' and ');
+  const typeInstruction = types.length === 1
+    ? `Run prepare_compare.py for ${types[0].toUpperCase()} only.`
+    : `Run prepare_compare.py for both ULT and UST (skip if no AI output for a type).`;
+
+  return `This is an editor-review request. Use the editor-compare skill (.claude/skills/editor-compare/). Extract the book and all chapter numbers from the user's message.
+
+For MULTIPLE chapters: spawn a subagent (Task tool) per chapter to run in parallel. Each subagent runs ${typeInstruction} analyzes the diffs, and writes its detailed analysis to tmp/editor-compare/<BOOK>-<CH>.md. Wait for all subagents, then read all summaries and do a cross-chapter analysis.
+
+For a SINGLE chapter: run the comparison directly, no subagent needed. ${typeInstruction}
+
+OUTPUT FORMAT -- this is critical:
+1. Write the FULL verse-by-verse analysis (every change, Hebrew references, before/after) to output/editor-compare/<BOOK>/<BOOK>-<CH>-review.md
+2. In your Zulip reply, ONLY send a short summary:
+   - One line per pattern found, grouped as ${typeLabel} sections
+   - Each line: what changed, how many times, which verses (e.g., 'Present tense for Hebrew perfects -- v.1, v.5 (2x)')
+   - Flag any conflicts with existing guidance
+   - End with the file path and: 'Want me to save these as guidance for future chapters? (yes/no)'
+   - Keep the reply UNDER 2000 characters total
+
+Do NOT include verse-by-verse details, Hebrew words, before/after examples, or bracketed implied word lists in the Zulip message. All of that goes in the file.
+
+Do NOT write to any guidance or memory files yet. Only write after the user approves.`;
+}
+
 // Track running pipelines to block duplicate chapter runs
 const activePipelines = new Set();
 
@@ -45,6 +87,28 @@ function buildConfirmMessage(template, captures) {
 }
 
 /**
+ * Normalize common book names/variants to 3-letter codes.
+ */
+const BOOK_NAME_MAP = {
+  PSALMS: 'PSA', PSALM: 'PSA',
+  GENESIS: 'GEN', EXODUS: 'EXO', LEVITICUS: 'LEV', NUMBERS: 'NUM',
+  DEUTERONOMY: 'DEU', JOSHUA: 'JOS', JUDGES: 'JDG', RUTH: 'RUT',
+  SAMUEL: 'SAM', KINGS: 'KIN', CHRONICLES: 'CHR',
+  EZRA: 'EZR', NEHEMIAH: 'NEH', ESTHER: 'EST', JOB: 'JOB',
+  PROVERBS: 'PRO', ECCLESIASTES: 'ECC', SONG: 'SNG',
+  ISAIAH: 'ISA', JEREMIAH: 'JER', LAMENTATIONS: 'LAM',
+  EZEKIEL: 'EZK', DANIEL: 'DAN', HOSEA: 'HOS', JOEL: 'JOL',
+  AMOS: 'AMO', OBADIAH: 'OBA', JONAH: 'JON', MICAH: 'MIC',
+  NAHUM: 'NAM', HABAKKUK: 'HAB', ZEPHANIAH: 'ZEP',
+  HAGGAI: 'HAG', ZECHARIAH: 'ZEC', MALACHI: 'MAL',
+};
+
+function normalizeBookName(name) {
+  const upper = name.toUpperCase();
+  return BOOK_NAME_MAP[upper] || upper;
+}
+
+/**
  * Parse book and chapter numbers from regex captures.
  * Returns { book, chapters[] }.
  */
@@ -57,9 +121,7 @@ function parseBookChapters(captures) {
     const s = String(c).trim();
     // Book name: all letters
     if (/^[a-zA-Z]+$/.test(s)) {
-      book = s.toUpperCase();
-      // Normalize psalm variants
-      if (/^PSALMS?$/i.test(s)) book = 'PSA';
+      book = normalizeBookName(s);
     } else {
       // Extract all numbers
       const nums = s.match(/\d+/g);
@@ -130,15 +192,33 @@ function matchRoute(content) {
  * Reuses existing route config (confirmMessage, operations, etc.) with extracted params.
  */
 function buildSyntheticRoute(intent) {
-  const baseRoute = config.routes.find(r =>
-    (intent.intent === 'generate' && r.name === 'generate-content') ||
-    (intent.intent === 'notes' && r.name === 'write-notes')
-  );
+  const routeNameMap = {
+    'generate': 'generate-content',
+    'notes': 'write-notes',
+    'editor-review': 'editor-review',
+  };
+  const targetName = routeNameMap[intent.intent];
+  const baseRoute = targetName ? config.routes.find(r => r.name === targetName) : null;
   if (!baseRoute) return null;
 
   const rangeLabel = intent.startChapter === intent.endChapter
     ? `${intent.book} ${intent.startChapter}`
     : `${intent.book} ${intent.startChapter}–${intent.endChapter}`;
+
+  if (intent.intent === 'editor-review') {
+    const types = intent.contentTypes || ['ult', 'ust'];
+    const typeLabel = types.map(t => t.toUpperCase()).join(' & ');
+    return {
+      ...baseRoute,
+      _synthetic: true,
+      _book: intent.book,
+      _startChapter: intent.startChapter,
+      _endChapter: intent.endChapter,
+      _contentTypes: types,
+      confirmMessage: `I'll compare the human-edited **${rangeLabel}** ${typeLabel} against what the AI generated and identify improvements. Sound right? (yes/no)`,
+      systemPrompt: buildEditorReviewSystemPrompt(types),
+    };
+  }
 
   return {
     ...baseRoute,
@@ -146,7 +226,6 @@ function buildSyntheticRoute(intent) {
     _book: intent.book,
     _startChapter: intent.startChapter,
     _endChapter: intent.endChapter,
-    // Override confirmMessage with the extracted parameters baked in
     confirmMessage: intent.intent === 'generate'
       ? `I'll generate the initial content (ULT & UST, issues draft) for **${rangeLabel}**. Sound right? (yes/no)`
       : `I'll write translation notes for **${rangeLabel}**. Sound right? (yes/no)`,
@@ -214,7 +293,9 @@ function firePipeline(route, message) {
 const HELP_TEXT = `I can help with:\n` +
   `- **generate PSA 79** -- run the initial pipeline for a chapter\n` +
   `- **write notes for PSA 82** -- generate translation notes\n` +
-  `- **PSA 82 DCS review** -- review editor changes (also works with "master")`;
+  `- **PSA 82 review** -- review editor changes (ULT & UST)\n` +
+  `- **PSA 82 ULT review** -- review only ULT changes\n` +
+  `- **review Psalm 82 UST** -- also works with natural phrasing`;
 
 async function routeMessage(message) {
   const isAdmin = message.sender_id === config.adminUserId;
@@ -295,18 +376,36 @@ async function routeMessage(message) {
   const { route, captures } = matchRoute(message.content);
 
   if (route) {
+    // For editor-review, enrich with content types and dynamic system prompt
+    let activeRoute = route;
+    if (route.name === 'editor-review') {
+      const types = extractContentTypes(message.content);
+      const typeLabel = types.map(t => t.toUpperCase()).join(' & ');
+      const { book } = parseBookChapters(captures);
+      const chapterPart = captures[1] || '';
+      activeRoute = {
+        ...route,
+        _contentTypes: types,
+        confirmMessage: `I'll compare the human-edited **${book || captures[0]} ${chapterPart}** ${typeLabel} against what the AI generated and identify improvements. Sound right? (yes/no)`,
+        systemPrompt: buildEditorReviewSystemPrompt(types),
+      };
+    }
+
     // Stream messages get confirmation before running (if route has confirmMessage)
-    if (isStream && route.confirmMessage) {
-      const confirmText = buildConfirmMessage(route.confirmMessage, captures);
-      const timeoutMs = calcTimeout(route, captures);
-      pendingConfirmations.set(sessionKey, { route, message, timeoutMs });
-      console.log(`[router] Awaiting confirmation for "${route.name}" in ${sessionKey}`);
+    if (isStream && activeRoute.confirmMessage) {
+      // editor-review confirmMessage is already baked in; others need placeholder substitution
+      const confirmText = activeRoute._contentTypes
+        ? activeRoute.confirmMessage
+        : buildConfirmMessage(activeRoute.confirmMessage, captures);
+      const timeoutMs = calcTimeout(activeRoute, captures);
+      pendingConfirmations.set(sessionKey, { route: activeRoute, message, timeoutMs });
+      console.log(`[router] Awaiting confirmation for "${activeRoute.name}" in ${sessionKey}`);
       await sendMessage(message.display_recipient, message.subject,
         `@**${message.sender_full_name}** ${confirmText}`);
       return;
     }
-    console.log(`[router] Running route "${route.name}" for message ${message.id}`);
-    firePipeline(route, message);
+    console.log(`[router] Running route "${activeRoute.name}" for message ${message.id}`);
+    firePipeline(activeRoute, message);
   } else if (!isStream && isAdmin && config.dmDefaultPipeline) {
     // Admin DMs get interactive session if no route matches
     console.log(`[router] No match -- running interactive DM pipeline for admin ${message.id}`);

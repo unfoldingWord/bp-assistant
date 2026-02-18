@@ -37,13 +37,12 @@
     },
     {
       "name": "editor-review",
-      "match": "/(psalms?|psa)\\D*?(\\d+(?:\\s*,\\s*\\d+)*(?:\\s*,?\\s*and\\s+\\d+)?).*(?:dcs|master).*review/i",
+      "match": "/(\\w+)\\s+(\\d+(?:\\s*,\\s*\\d+)*(?:\\s*,?\\s*and\\s+\\d+)?).*?(?:review|compare)/i",
       "type": "interactive-dm",
       "cwd": "/workspace",
       "reply": true,
       "operations": 2,
-      "confirmMessage": "I'll compare the human-edited **$1 $2** ULT & UST against what the AI generated and identify improvements. Sound right? (yes/no)",
-      "systemPrompt": "This is an editor-review request. Use the editor-compare skill (.claude/skills/editor-compare/). Extract the book and all chapter numbers from the user's message.\n\nFor MULTIPLE chapters: spawn a subagent (Task tool) per chapter to run in parallel. Each subagent runs prepare_compare.py for both ULT and UST (skip if no AI output), analyzes the diffs, and writes its detailed analysis to tmp/editor-compare/<BOOK>-<CH>.md. Wait for all subagents, then read all summaries and do a cross-chapter analysis.\n\nFor a SINGLE chapter: run the comparison directly, no subagent needed.\n\nOUTPUT FORMAT -- this is critical:\n1. Write the FULL verse-by-verse analysis (every change, Hebrew references, before/after) to output/editor-compare/<BOOK>/<BOOK>-<CH>-review.md\n2. In your Zulip reply, ONLY send a short summary:\n   - One line per pattern found, grouped as ULT and UST sections\n   - Each line: what changed, how many times, which verses (e.g., 'Present tense for Hebrew perfects -- v.1, v.5 (2x)')\n   - Flag any conflicts with existing guidance\n   - End with the file path and: 'Want me to save these as guidance for future chapters? (yes/no)'\n   - Keep the reply UNDER 2000 characters total\n\nDo NOT include verse-by-verse details, Hebrew words, before/after examples, or bracketed implied word lists in the Zulip message. All of that goes in the file.\n\nDo NOT write to any guidance or memory files yet. Only write after the user approves."
+      "confirmMessage": "I'll compare the human-edited **$1 $2** ULT & UST against what the AI generated and identify improvements. Sound right? (yes/no)"
     }
   ],
   "defaultPipeline": null,
