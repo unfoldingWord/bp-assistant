@@ -8,6 +8,10 @@ const { getVerseCount, getTotalVerses } = require('./verse-counts');
 
 const METRICS_DIR = path.resolve(__dirname, '../data/metrics');
 const METRICS_FILE = path.join(METRICS_DIR, 'usage.jsonl');
+const CALIBRATION_FILE = path.join(METRICS_DIR, 'calibration.json');
+
+// Safety margin: use 95% of observed limit to avoid re-hitting the edge
+const CALIBRATION_SAFETY = 0.95;
 
 // Load config once -- fallback to defaults if usageTracking section missing
 let _config = null;
@@ -20,6 +24,65 @@ function getConfig() {
     _config = {};
   }
   return _config;
+}
+
+// ---------------------------------------------------------------------------
+// Calibration -- auto-tune windowBudget from observed rate limit hits
+// ---------------------------------------------------------------------------
+
+/**
+ * Load calibration data from disk.
+ * Returns { observations: [{ ts, windowUsed, source }], calibratedBudget: number|null }
+ */
+function loadCalibration() {
+  try {
+    if (fs.existsSync(CALIBRATION_FILE)) {
+      return JSON.parse(fs.readFileSync(CALIBRATION_FILE, 'utf8'));
+    }
+  } catch { /* ignore */ }
+  return { observations: [], calibratedBudget: null };
+}
+
+/**
+ * Record a rate limit event. windowUsed is the combined token count at the moment of failure.
+ * Updates calibratedBudget to the minimum observed, with a safety margin.
+ */
+function recordRateLimit({ windowUsed, source }) {
+  try {
+    fs.mkdirSync(METRICS_DIR, { recursive: true });
+    const cal = loadCalibration();
+    cal.observations = cal.observations || [];
+    cal.observations.push({ ts: new Date().toISOString(), windowUsed, source: source || 'unknown' });
+
+    // Calibrated budget = min(observed hits) * safety margin
+    const minObserved = Math.min(...cal.observations.map(o => o.windowUsed));
+    const newBudget = Math.round(minObserved * CALIBRATION_SAFETY);
+    const oldBudget = cal.calibratedBudget;
+
+    cal.calibratedBudget = newBudget;
+
+    if (oldBudget !== null) {
+      const pctChange = ((newBudget - oldBudget) / oldBudget * 100).toFixed(1);
+      console.log(`[usage-tracker] Calibrated budget updated: ${formatTokens(oldBudget)} -> ${formatTokens(newBudget)} (${pctChange > 0 ? '+' : ''}${pctChange}%)`);
+    } else {
+      console.log(`[usage-tracker] Calibrated budget set: ${formatTokens(newBudget)} (from observed limit ${formatTokens(minObserved)})`);
+    }
+
+    fs.writeFileSync(CALIBRATION_FILE, JSON.stringify(cal, null, 2));
+  } catch (err) {
+    console.error(`[usage-tracker] Failed to record rate limit calibration: ${err.message}`);
+  }
+}
+
+/**
+ * Get the effective window budget: calibrated value if available, else config default.
+ */
+function getEffectiveBudget() {
+  const cal = loadCalibration();
+  if (cal.calibratedBudget && cal.calibratedBudget > 0) {
+    return cal.calibratedBudget;
+  }
+  return getConfig().windowBudgetTokens || 220000;
 }
 
 function windowBudget() { return getConfig().windowBudgetTokens || 220000; }
@@ -201,7 +264,8 @@ function estimateTokens({ pipeline, book, startCh, endCh }) {
 // getHeadroom -- combine ccusage + bot log for full 5h window picture
 // ---------------------------------------------------------------------------
 function getHeadroom() {
-  const budget = windowBudget();
+  const budget = getEffectiveBudget();
+  const configBudget = windowBudget();
   const hours = windowHours();
 
   // Source 1: ccusage (CLI/desktop usage)
@@ -252,8 +316,12 @@ function getHeadroom() {
     windowEnds = new Date(windowStart.getTime() + hours * 2 * 3600 * 1000).toISOString();
   }
 
+  const cal = loadCalibration();
   return {
     budget,
+    configBudget,
+    calibrated: cal.calibratedBudget != null,
+    calibrationObservations: cal.observations?.length || 0,
     used: totalUsed,
     headroom,
     ccusageTokens,
@@ -325,7 +393,16 @@ function preflightCheck({ pipeline, book, startCh, endCh }) {
 function getUsageSummary() {
   const room = getHeadroom();
   const pct = room.budget > 0 ? Math.round(room.used / room.budget * 100) : 0;
-  return `5h window: ${formatTokens(room.used)} / ${formatTokens(room.budget)} tokens used (${pct}% of budget, ${room.botSkillRuns} bot skill runs). Headroom: ~${formatTokens(room.headroom)} tokens.${room.ccusageOk ? '' : ' (ccusage unavailable, bot-log only)'}`;
+
+  let budgetLabel = formatTokens(room.budget);
+  if (room.calibrated) {
+    const pctOfConfig = Math.round(room.budget / room.configBudget * 100);
+    budgetLabel += ` (calibrated, ${pctOfConfig}% of config ${formatTokens(room.configBudget)}, ${room.calibrationObservations} obs)`;
+  } else {
+    budgetLabel += ' (config default, not yet calibrated)';
+  }
+
+  return `5h window: ${formatTokens(room.used)} / ${budgetLabel} -- ${pct}% used, ${room.botSkillRuns} bot skill runs. Headroom: ~${formatTokens(room.headroom)}.${room.ccusageOk ? '' : ' (ccusage unavailable, bot-log only)'}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -339,6 +416,7 @@ function formatTokens(n) {
 
 module.exports = {
   recordMetrics,
+  recordRateLimit,
   estimateTokens,
   preflightCheck,
   getHeadroom,

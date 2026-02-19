@@ -2,6 +2,7 @@
 // Replaces `claude -p` subprocess calls with programmatic SDK usage
 
 const { ensureFreshToken } = require('./auth-refresh');
+const { recordRateLimit, getHeadroom } = require('./usage-tracker');
 
 let _query = null;
 
@@ -100,6 +101,16 @@ async function runClaude({ prompt, cwd, model, allowedTools, skill, maxTurns, ti
     if (err.name === 'AbortError' || abortController.signal.aborted) {
       console.warn(`[claude-runner] Query aborted (timeout or manual abort)`);
     } else {
+      // Detect rate limit errors and calibrate the window budget
+      const msg = (err.message || '').toLowerCase();
+      const isRateLimit = msg.includes('rate limit') || msg.includes('429') || msg.includes('too many requests');
+      if (isRateLimit) {
+        console.warn(`[claude-runner] Rate limit detected -- calibrating window budget`);
+        try {
+          const room = getHeadroom();
+          recordRateLimit({ windowUsed: room.used, source: 'claude-runner-error' });
+        } catch { /* non-fatal */ }
+      }
       throw err;
     }
   } finally {
@@ -109,6 +120,16 @@ async function runClaude({ prompt, cwd, model, allowedTools, skill, maxTurns, ti
 
   if (result) {
     console.log(`[claude-runner] Finished — subtype: ${result.subtype}, turns: ${result.num_turns}, cost: $${result.total_cost_usd?.toFixed(4) || '?'}, duration: ${(result.duration_ms / 1000).toFixed(1)}s`);
+    // Detect rate limit in result subtype or error message
+    const resultMsg = (result.subtype || '') + ' ' + (result.error || '');
+    const isRateLimit = /rate.?limit|429|too.many.requests/i.test(resultMsg);
+    if (isRateLimit) {
+      console.warn(`[claude-runner] Rate limit in result subtype -- calibrating window budget`);
+      try {
+        const room = getHeadroom();
+        recordRateLimit({ windowUsed: room.used, source: 'claude-runner-result' });
+      } catch { /* non-fatal */ }
+    }
   } else {
     console.warn(`[claude-runner] Query ended without a result message (timeout or abort)`);
   }
