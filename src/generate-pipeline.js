@@ -13,6 +13,7 @@ const { sendMessage, sendDM, addReaction, removeReaction, uploadFile } = require
 const { runClaude } = require('./claude-runner');
 const { getDoor43Username, buildBranchName, resolveOutputFile, calcSkillTimeout, CSKILLBP_DIR } = require('./pipeline-utils');
 const { verifyRepoPush } = require('./repo-verify');
+const { recordMetrics } = require('./usage-tracker');
 
 const LOG_DIR = path.resolve(__dirname, '../logs');
 
@@ -226,6 +227,12 @@ async function generatePipeline(route, message) {
       await status(`**${book} ${ch}** tokens: ${total.toLocaleString()} (in: ${inTok.toLocaleString()}, out: ${outTok.toLocaleString()}, cache read: ${cacheRead.toLocaleString()})${cost != null ? ` \u00b7 $${cost.toFixed(4)}` : ''} \u00b7 ${duration}s`);
     }
 
+    // Record metrics for initial-pipeline
+    recordMetrics({
+      pipeline: 'generate', skill: route.skill || 'initial-pipeline --lite',
+      book, chapter: ch, result: claudeResult, success: hasUst, userId: message.sender_id,
+    });
+
     // --- Chris path: upload files only ---
     if (isChris) {
       const links = [];
@@ -261,7 +268,7 @@ async function generatePipeline(route, message) {
     await status(`Running **align-all-parallel** for ${book} ${ch}...`);
     try {
       const alignTimeout = calcSkillTimeout(book, ch, 2);
-      await runClaude({
+      const alignResult = await runClaude({
         prompt: `${book} ${ch}`,
         cwd: CSKILLBP_DIR,
         model,
@@ -269,6 +276,13 @@ async function generatePipeline(route, message) {
         timeoutMs: alignTimeout,
       });
       const alignDuration = ((Date.now() - chapterStart) / 1000).toFixed(1);
+
+      // Record metrics for align-all-parallel
+      recordMetrics({
+        pipeline: 'generate', skill: 'align-all-parallel',
+        book, chapter: ch, result: alignResult,
+        success: alignResult?.subtype === 'success', userId: message.sender_id,
+      });
 
       // Check aligned output files exist
       const alignedUlt = path.join(CSKILLBP_DIR, 'output', 'AI-ULT', book, `${book}-${ch}-aligned.usfm`);
@@ -318,12 +332,17 @@ async function generatePipeline(route, message) {
       await status(`Running **repo-insert** (ULT) for ${book} ${chData.ch}...`);
       try {
         const riTimeout = calcSkillTimeout(book, chData.ch, 1);
-        await runClaude({
+        const riUltResult = await runClaude({
           prompt: `ult ${book} ${chData.ch} ${username} --no-pr --branch ${buildBranchName(book, chData.ch)} --source ${chData.ultAligned}`,
           cwd: CSKILLBP_DIR,
           model,
           skill: 'repo-insert',
           timeoutMs: riTimeout,
+        });
+        recordMetrics({
+          pipeline: 'generate', skill: 'repo-insert',
+          book, chapter: chData.ch, result: riUltResult,
+          success: riUltResult?.subtype === 'success', userId: message.sender_id,
         });
         await status(`**repo-insert** (ULT) done for ${book} ${chData.ch}`);
       } catch (err) {
@@ -337,12 +356,17 @@ async function generatePipeline(route, message) {
         await status(`Running **repo-insert** (UST) for ${book} ${chData.ch}...`);
         try {
           const riTimeout = calcSkillTimeout(book, chData.ch, 1);
-          await runClaude({
+          const riUstResult = await runClaude({
             prompt: `ust ${book} ${chData.ch} ${username} --no-pr --branch ${buildBranchName(book, chData.ch)} --source ${chData.ustAligned}`,
             cwd: CSKILLBP_DIR,
             model,
             skill: 'repo-insert',
             timeoutMs: riTimeout,
+          });
+          recordMetrics({
+            pipeline: 'generate', skill: 'repo-insert',
+            book, chapter: chData.ch, result: riUstResult,
+            success: riUstResult?.subtype === 'success', userId: message.sender_id,
           });
           await status(`**repo-insert** (UST) done for ${book} ${chData.ch}`);
         } catch (err) {

@@ -4,6 +4,7 @@ const { sendMessage, addReaction } = require('./zulip-client');
 const { getSession, clearSession, hasActiveStreamSession } = require('./session-store');
 const { getTotalVerses } = require('./verse-counts');
 const { classifyIntent } = require('./intent-classifier');
+const { preflightCheck, estimateTokens } = require('./usage-tracker');
 const { getPendingMerge, clearPendingMerge } = require('./pending-merges');
 const { resumeInsertion } = require('./insertion-resume');
 
@@ -180,6 +181,27 @@ function calcTimeout(route, captures) {
   const result = Math.max(total, MIN_TIMEOUT_MS);
   console.log(`[router] Timeout: ${totalVerses} verses x ${ops} ops x 5min = ${result / 60000}min`);
   return result;
+}
+
+/**
+ * Determine the pipeline type for a route (for usage tracking).
+ */
+function getPipelineType(route) {
+  if (route.type === 'sdk') return 'generate';
+  if (route.type === 'notes') return 'notes';
+  return null;
+}
+
+/**
+ * Build an enriched confirmation message with token/time estimates.
+ */
+function buildEstimateLabel(estimate, book, startCh, endCh) {
+  const chCount = endCh - startCh + 1;
+  const totalVerses = estimate.perChapter.reduce((s, c) => s + c.verses, 0);
+  const tokLabel = estimate.totalTokens >= 1000000
+    ? `~${(estimate.totalTokens / 1000000).toFixed(0)}M`
+    : `~${(estimate.totalTokens / 1000).toFixed(0)}K`;
+  return `(${chCount} ch, ~${totalVerses} verses). Est: ${tokLabel} tokens, ~${estimate.estimatedMinutes} min`;
 }
 
 function matchRoute(content) {
@@ -420,10 +442,36 @@ async function routeMessage(message) {
     // Stream messages get confirmation before running (if route has confirmMessage)
     if (isStream && activeRoute.confirmMessage) {
       // editor-review confirmMessage is already baked in; others need placeholder substitution
-      const confirmText = activeRoute._contentTypes
+      let confirmText = activeRoute._contentTypes
         ? activeRoute.confirmMessage
         : buildConfirmMessage(activeRoute.confirmMessage, captures);
       const timeoutMs = calcTimeout(activeRoute, captures);
+
+      // Pre-flight usage check for generate/notes pipelines
+      const pipelineType = getPipelineType(activeRoute);
+      if (pipelineType) {
+        const { book: pfBook, chapters: pfChapters } = parseBookChapters(captures);
+        if (pfBook && pfChapters.length) {
+          const pfStart = Math.min(...pfChapters);
+          const pfEnd = Math.max(...pfChapters);
+          const preflight = preflightCheck({ pipeline: pipelineType, book: pfBook, startCh: pfStart, endCh: pfEnd });
+
+          if (preflight.decision === 'reject') {
+            await sendMessage(message.display_recipient, message.subject,
+              `@**${message.sender_full_name}** ${preflight.reason}`);
+            return;
+          }
+
+          // Enrich confirmation with estimate
+          const estLabel = buildEstimateLabel(preflight.estimate, pfBook, pfStart, pfEnd);
+          confirmText = confirmText.replace(/\. Sound right\?/, ` ${estLabel}. Sound right?`);
+
+          if (preflight.decision === 'warn') {
+            confirmText += `\n\n**Warning:** ${preflight.reason}`;
+          }
+        }
+      }
+
       pendingConfirmations.set(sessionKey, { route: activeRoute, message, timeoutMs });
       console.log(`[router] Awaiting confirmation for "${activeRoute.name}" in ${sessionKey}`);
       await sendMessage(message.display_recipient, message.subject,
@@ -458,8 +506,32 @@ async function routeMessage(message) {
           const captures = intent.startChapter === intent.endChapter
             ? [intent.book, String(intent.startChapter)]
             : [intent.book, String(intent.startChapter), String(intent.endChapter)];
-          const confirmText = buildConfirmMessage(syntheticRoute.confirmMessage, captures);
+          let confirmText = buildConfirmMessage(syntheticRoute.confirmMessage, captures);
           const timeoutMs = calcTimeout(syntheticRoute, captures);
+
+          // Pre-flight usage check for generate/notes pipelines
+          const pipelineType = getPipelineType(syntheticRoute);
+          if (pipelineType) {
+            const preflight = preflightCheck({
+              pipeline: pipelineType, book: intent.book,
+              startCh: intent.startChapter, endCh: intent.endChapter,
+            });
+
+            if (preflight.decision === 'reject') {
+              await sendMessage(message.display_recipient, message.subject,
+                `@**${message.sender_full_name}** ${preflight.reason}`);
+              return; // Exit routeMessage -- rejection sent
+            }
+
+            // Enrich confirmation with estimate
+            const estLabel = buildEstimateLabel(preflight.estimate, intent.book, intent.startChapter, intent.endChapter);
+            confirmText = confirmText.replace(/\. Sound right\?/, ` ${estLabel}. Sound right?`);
+
+            if (preflight.decision === 'warn') {
+              confirmText += `\n\n**Warning:** ${preflight.reason}`;
+            }
+          }
+
           pendingConfirmations.set(sessionKey, { route: syntheticRoute, message, timeoutMs });
           console.log(`[router] Haiku → awaiting confirmation for synthetic "${syntheticRoute.name}" in ${sessionKey}`);
           await sendMessage(message.display_recipient, message.subject,

@@ -14,6 +14,7 @@ const { sendMessage, sendDM, addReaction, removeReaction, uploadFile } = require
 const { runClaude } = require('./claude-runner');
 const { getDoor43Username, buildBranchName, resolveOutputFile, checkPrerequisites, calcSkillTimeout, CSKILLBP_DIR } = require('./pipeline-utils');
 const { verifyRepoPush } = require('./repo-verify');
+const { recordMetrics } = require('./usage-tracker');
 
 const LOG_DIR = path.resolve(__dirname, '../logs');
 
@@ -277,6 +278,12 @@ async function notesPipeline(route, message) {
         }
       }
 
+      // Record metrics for this skill
+      recordMetrics({
+        pipeline: 'notes', skill: skill.name,
+        book, chapter: ch, result, success: !failedSkill, userId: message.sender_id,
+      });
+
       // Report token usage if available
       if (result?.usage) {
         const u = result.usage;
@@ -338,12 +345,17 @@ async function notesPipeline(route, message) {
       await status(`Running **repo-insert** (TN) for ${book} ${chData.ch}...`);
       try {
         const riTimeout = calcSkillTimeout(book, chData.ch, 1);
-        await runClaude({
+        const riResult = await runClaude({
           prompt: chData.repoInsertPrompt,
           cwd: CSKILLBP_DIR,
           model,
           skill: 'repo-insert',
           timeoutMs: riTimeout,
+        });
+        recordMetrics({
+          pipeline: 'notes', skill: 'repo-insert',
+          book, chapter: chData.ch, result: riResult,
+          success: riResult?.subtype === 'success', userId: message.sender_id,
         });
         await status(`**repo-insert** (TN) done for ${book} ${chData.ch}`);
       } catch (err) {
