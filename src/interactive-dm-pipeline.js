@@ -8,6 +8,7 @@ const { getSession, setSession, setModel, clearSession, incrementExchanges } = r
 const { buildOptions } = require('./claude-runner');
 const { ensureFreshToken } = require('./auth-refresh');
 const { sendDM, sendMessage, addReaction, removeReaction } = require('./zulip-client');
+const { recordMetrics } = require('./usage-tracker');
 
 let _query = null;
 async function getQuery() {
@@ -199,6 +200,15 @@ async function interactiveDmPipeline(route, message) {
       timeoutMs,
       appendSystemPrompt: route.systemPrompt,
     });
+
+    // Record metrics for interactive queries
+    if (result) {
+      recordMetrics({
+        pipeline: 'interactive', skill: route.name || 'interactive-dm',
+        book: null, chapter: null, result, success: result?.subtype === 'success',
+        userId: message.sender_id,
+      });
+    }
 
     if (sessionId) {
       setSession(sessionKey, sessionId, model, {

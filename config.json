@@ -53,5 +53,11 @@
     "reply": true,
     "cwd": "/workspace"
   },
-  "unauthorizedReply": "You're not on the authorized list, ask the admin in the response."
+  "unauthorizedReply": "You're not on the authorized list, ask the admin in the response.",
+  "usageTracking": {
+    "windowBudgetTokens": 220000,
+    "windowHours": 5,
+    "warnThreshold": 0.7,
+    "ccusagePath": "npx ccusage@latest"
+  }
 }
