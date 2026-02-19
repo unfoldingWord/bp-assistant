@@ -1,7 +1,7 @@
 const config = require('./config');
 const { runPipeline } = require('./pipeline-runner');
 const { sendMessage, addReaction } = require('./zulip-client');
-const { getSession, clearSession } = require('./session-store');
+const { getSession, clearSession, hasActiveStreamSession } = require('./session-store');
 const { getTotalVerses } = require('./verse-counts');
 const { classifyIntent } = require('./intent-classifier');
 const { getPendingMerge, clearPendingMerge } = require('./pending-merges');
@@ -24,32 +24,56 @@ function extractContentTypes(text) {
 
 /**
  * Build the editor-review system prompt dynamically based on content types.
+ * @param {string[]} contentTypes
+ * @param {string} [senderName] the Zulip sender's display name
  */
-function buildEditorReviewSystemPrompt(contentTypes) {
+function buildEditorReviewSystemPrompt(contentTypes, senderName) {
   const types = contentTypes || ['ult', 'ust'];
   const typeLabel = types.map(t => t.toUpperCase()).join(' and ');
   const typeInstruction = types.length === 1
     ? `Run prepare_compare.py for ${types[0].toUpperCase()} only.`
     : `Run prepare_compare.py for both ULT and UST (skip if no AI output for a type).`;
 
+  const senderLine = senderName
+    ? `Responding to user: ${senderName}. Use this name if you need to address them.\n`
+    : '';
+
   return `This is an editor-review request. Use the editor-compare skill (.claude/skills/editor-compare/). Extract the book and all chapter numbers from the user's message.
+
+${senderLine}Do NOT generate @**Name** mentions -- the system handles that automatically.
 
 For MULTIPLE chapters: spawn a subagent (Task tool) per chapter to run in parallel. Each subagent runs ${typeInstruction} analyzes the diffs, and writes its detailed analysis to tmp/editor-compare/<BOOK>-<CH>.md. Wait for all subagents, then read all summaries and do a cross-chapter analysis.
 
 For a SINGLE chapter: run the comparison directly, no subagent needed. ${typeInstruction}
 
-OUTPUT FORMAT -- this is critical:
-1. Write the FULL verse-by-verse analysis (every change, Hebrew references, before/after) to output/editor-compare/<BOOK>/<BOOK>-<CH>-review.md
-2. In your Zulip reply, ONLY send a short summary:
-   - One line per pattern found, grouped as ${typeLabel} sections
-   - Each line: what changed, how many times, which verses (e.g., 'Present tense for Hebrew perfects -- v.1, v.5 (2x)')
-   - Flag any conflicts with existing guidance
-   - End with the file path and: 'Want me to save these as guidance for future chapters? (yes/no)'
-   - Keep the reply UNDER 2000 characters total
+This is a MULTI-TURN conversation. Follow this protocol:
 
-Do NOT include verse-by-verse details, Hebrew words, before/after examples, or bracketed implied word lists in the Zulip message. All of that goes in the file.
+TURN 1 -- Present discrepancy list:
+1. Write the FULL verse-by-verse analysis to output/editor-compare/<BOOK>/<BOOK>-<CH>-review.md
+2. In your Zulip reply, present a NUMBERED discrepancy list:
+   - Rank by frequency/impact: patterns in 3+ verses first, then 2, then 1
+   - Each item shows: number, verse ref (ch:vs), side-by-side (AI original | Editor edit -- relevant phrase only), one-line hypothesis, category tag (vocabulary / structure / brackets / voice)
+   - Use a compact markdown table or numbered list -- keep UNDER 4000 characters
+   - End with: "Reply with which items to ignore (e.g. 'not 2, 8'), mark as situational (e.g. '10 is situational'), or say 'all good' to accept all. No @-mention needed."
+   - Do NOT write to glossary, quick-ref, or any memory files yet.
 
-Do NOT write to any guidance or memory files yet. Only write after the user approves.`;
+TURN 2 -- Parse editor response and confirm:
+- Parse natural language responses flexibly. Examples: "don't do 2, 8", "ai was right on 2, 8", "yes to all", "all good", "for 10, that's situational", "1, 3-7, 9 only"
+- Default: if an item is NOT mentioned as ignored/situational, the human edit is accepted
+- Confirm back in plain language, e.g.: "Applying human edits for 1, 3-7, 9. Ignoring 2, 8 (keeping AI version). Item 10 flagged as situational. Anything to adjust?"
+- Wait for approval before executing.
+
+TURN 3 -- Execute after approval:
+- For ACCEPTED items: update glossary/quick-ref per the editor-compare skill Steps 4-5
+- For IGNORED items (AI was right): log to data/editor-feedback/proofreader_patterns.csv with columns: Date,Book,Chapter,Verse,Strong,Hebrew,ProofreaderEdit,AIOriginal,Hypothesis,EditorVerdict
+- For SITUATIONAL items: add conditional entries with context notes ("use X when Y, use Z when W")
+- Report what was done. End with "Review complete."
+
+OUTPUT CONSTRAINTS:
+- Keep each Zulip message under 4000 characters
+- Use markdown tables for the discrepancy list where practical
+- Do NOT include full verse text in the Zulip reply -- only the changed phrase
+- Full analysis goes in the output file`;
 }
 
 // Track running pipelines to block duplicate chapter runs
@@ -190,8 +214,10 @@ function matchRoute(content) {
 /**
  * Build a synthetic route from haiku intent classification.
  * Reuses existing route config (confirmMessage, operations, etc.) with extracted params.
+ * @param {{ intent: string, book: string, startChapter: number, endChapter: number, contentTypes?: string[] }} intent
+ * @param {string} [senderName] the Zulip sender's display name
  */
-function buildSyntheticRoute(intent) {
+function buildSyntheticRoute(intent, senderName) {
   const routeNameMap = {
     'generate': 'generate-content',
     'notes': 'write-notes',
@@ -216,7 +242,7 @@ function buildSyntheticRoute(intent) {
       _endChapter: intent.endChapter,
       _contentTypes: types,
       confirmMessage: `I'll compare the human-edited **${rangeLabel}** ${typeLabel} against what the AI generated and identify improvements. Sound right? (yes/no)`,
-      systemPrompt: buildEditorReviewSystemPrompt(types),
+      systemPrompt: buildEditorReviewSystemPrompt(types, senderName),
     };
   }
 
@@ -387,7 +413,7 @@ async function routeMessage(message) {
         ...route,
         _contentTypes: types,
         confirmMessage: `I'll compare the human-edited **${book || captures[0]} ${chapterPart}** ${typeLabel} against what the AI generated and identify improvements. Sound right? (yes/no)`,
-        systemPrompt: buildEditorReviewSystemPrompt(types),
+        systemPrompt: buildEditorReviewSystemPrompt(types, message.sender_full_name),
       };
     }
 
@@ -411,15 +437,23 @@ async function routeMessage(message) {
     console.log(`[router] No match -- running interactive DM pipeline for admin ${message.id}`);
     firePipeline(config.dmDefaultPipeline, message);
   } else if (isStream) {
-    // Try Haiku classification first — a recognized intent always wins over session resume
-    console.log(`[router] No regex match — trying haiku intent classification`);
+    // Check for active session first -- follow-up messages go directly to session resume
+    const session = getSession(sessionKey);
+    if (session && session.sessionId) {
+      console.log(`[router] Active session found — resuming for ${sessionKey}`);
+      firePipeline(config.dmDefaultPipeline, message);
+      return;
+    }
+
+    // No active session -- try Haiku classification for new commands
+    console.log(`[router] No regex match, no active session — trying haiku intent classification`);
     let haikuMatched = false;
     try {
       const intent = await classifyIntent(message.content);
       console.log(`[router] Haiku classified as: ${JSON.stringify(intent)}`);
 
       if (intent.intent !== 'unknown' && intent.book && intent.startChapter) {
-        const syntheticRoute = buildSyntheticRoute(intent);
+        const syntheticRoute = buildSyntheticRoute(intent, message.sender_full_name);
         if (syntheticRoute) {
           const captures = intent.startChapter === intent.endChapter
             ? [intent.book, String(intent.startChapter)]
@@ -438,15 +472,8 @@ async function routeMessage(message) {
     }
 
     if (!haikuMatched) {
-      // Fall back to session resume for genuine follow-up messages
-      const session = getSession(sessionKey);
-      if (session && session.sessionId) {
-        console.log(`[router] Resuming stream session for ${sessionKey}`);
-        firePipeline(config.dmDefaultPipeline, message);
-      } else {
-        console.log(`[router] Haiku fallback didn't match — sending help`);
-        await sendMessage(message.display_recipient, message.subject, HELP_TEXT);
-      }
+      console.log(`[router] Haiku fallback didn't match — sending help`);
+      await sendMessage(message.display_recipient, message.subject, HELP_TEXT);
     }
   } else {
     console.log(`[router] No match for message ${message.id}, skipping`);
@@ -461,4 +488,11 @@ function hasPendingAction(channel, topic) {
   return pendingConfirmations.has(sessionKey) || !!getPendingMerge(sessionKey);
 }
 
-module.exports = { routeMessage, hasPendingAction };
+/**
+ * Check if a stream topic has an active interactive session for a specific sender.
+ */
+function hasActiveSession(channel, topic, senderId) {
+  return hasActiveStreamSession(channel, topic, senderId);
+}
+
+module.exports = { routeMessage, hasPendingAction, hasActiveSession };

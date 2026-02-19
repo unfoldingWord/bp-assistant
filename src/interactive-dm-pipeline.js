@@ -180,7 +180,13 @@ async function interactiveDmPipeline(route, message) {
   
   // If this is the start of an editor review, we can prefix the prompt with a command if needed
   let promptToSend = switchModel != null && switchPrompt !== '' ? switchPrompt : cleanMessage;
-  
+
+  // Inject sender name context so Claude addresses the right person and skips @-mentions
+  if (isStream && message.sender_full_name) {
+    const senderContext = `[Replying to: ${message.sender_full_name}. Do not generate @-mentions.]\n\n`;
+    promptToSend = senderContext + promptToSend;
+  }
+
   if (switchModel) setModel(sessionKey, switchModel);
 
   try {
@@ -195,25 +201,26 @@ async function interactiveDmPipeline(route, message) {
     });
 
     if (sessionId) {
-      if (route.singleShot) {
-        clearSession(sessionKey);
-        console.log(`[interactive] Single-shot route "${route.name}" — session cleared after completion`);
-      } else {
-        setSession(sessionKey, sessionId, model);
-      }
+      setSession(sessionKey, sessionId, model, {
+        startedBy: message.sender_id,
+        maxExchanges: route.maxExchanges,
+      });
     }
 
     if (finalReply) {
+      // Strip any @-mentions Claude may have generated (wrong name problem)
+      const cleanReply = finalReply.replace(/^@\*\*[^*]+\*\*\s*/, '');
       const prefix = modelToPrefix(model);
-      const withPrefix = prefix + finalReply;
+      const withPrefix = prefix + cleanReply;
       let toSend = withPrefix.length > ZULIP_MAX_MESSAGE_LENGTH
-        ? withPrefix.slice(0, ZULIP_MAX_MESSAGE_LENGTH - 50) + '\n\n… (truncated)'
+        ? withPrefix.slice(0, ZULIP_MAX_MESSAGE_LENGTH - 50) + '\n\n... (truncated)'
         : withPrefix;
 
       // For stream sessions, track exchanges and auto-clear at limit
       if (isStream) {
         const count = incrementExchanges(sessionKey);
-        const MAX_STREAM_EXCHANGES = 3;
+        const currentSession = getSession(sessionKey);
+        const MAX_STREAM_EXCHANGES = currentSession?.maxExchanges || 3;
         if (count >= MAX_STREAM_EXCHANGES) {
           clearSession(sessionKey);
           toSend += '\n\n*(Session limit reached — start a new request to continue.)*';

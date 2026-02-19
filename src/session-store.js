@@ -23,7 +23,7 @@ function getSessionFile(key) {
 
 /**
  * @param {string} key
- * @returns {{ sessionId?: string, updatedAt: string, model?: string } | null}
+ * @returns {{ sessionId?: string, updatedAt: string, model?: string, startedBy?: number, maxExchanges?: number } | null}
  */
 function getSession(key = 'default') {
   const file = getSessionFile(key);
@@ -37,6 +37,8 @@ function getSession(key = 'default') {
           updatedAt: data.updatedAt || new Date().toISOString(),
           model: typeof data.model === 'string' ? data.model : undefined,
           exchanges: typeof data.exchanges === 'number' ? data.exchanges : 0,
+          startedBy: typeof data.startedBy === 'number' ? data.startedBy : undefined,
+          maxExchanges: typeof data.maxExchanges === 'number' ? data.maxExchanges : undefined,
         };
       }
     }
@@ -50,8 +52,9 @@ function getSession(key = 'default') {
  * @param {string} key
  * @param {string} sessionId
  * @param {string} [model] optional model to persist (merged, does not clear if omitted)
+ * @param {{ startedBy?: number, maxExchanges?: number }} [extra] optional extra fields
  */
-function setSession(key = 'default', sessionId, model) {
+function setSession(key = 'default', sessionId, model, extra) {
   try {
     ensureDirs();
     const existing = getSession(key);
@@ -59,9 +62,13 @@ function setSession(key = 'default', sessionId, model) {
       sessionId,
       updatedAt: new Date().toISOString(),
       model: model !== undefined ? model : (existing && existing.model) || undefined,
-      exchanges: 0,
+      exchanges: (existing && typeof existing.exchanges === 'number') ? existing.exchanges : 0,
     };
     if (data.model === undefined) delete data.model;
+    if (extra && typeof extra.startedBy === 'number') data.startedBy = extra.startedBy;
+    else if (existing && typeof existing.startedBy === 'number') data.startedBy = existing.startedBy;
+    if (extra && typeof extra.maxExchanges === 'number') data.maxExchanges = extra.maxExchanges;
+    else if (existing && typeof existing.maxExchanges === 'number') data.maxExchanges = existing.maxExchanges;
     fs.writeFileSync(getSessionFile(key), JSON.stringify(data, null, 2), 'utf8');
   } catch (err) {
     console.warn(`[session-store] Failed to write session ${key}: ${err.message}`);
@@ -124,4 +131,17 @@ function incrementExchanges(key) {
   }
 }
 
-module.exports = { getSession, setSession, setModel, clearSession, incrementExchanges };
+/**
+ * Check if a stream topic has an active session started by a specific user.
+ * @param {string} channel
+ * @param {string} topic
+ * @param {number} senderId
+ * @returns {boolean}
+ */
+function hasActiveStreamSession(channel, topic, senderId) {
+  const key = `stream-${channel}-${topic}`;
+  const session = getSession(key);
+  return !!(session && session.sessionId && session.startedBy === senderId);
+}
+
+module.exports = { getSession, setSession, setModel, clearSession, incrementExchanges, hasActiveStreamSession };

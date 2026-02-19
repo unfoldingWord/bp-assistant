@@ -1,6 +1,6 @@
 const config = require('./config');
 const { getClient, sendMessage } = require('./zulip-client');
-const { routeMessage, hasPendingAction } = require('./router');
+const { routeMessage, hasPendingAction, hasActiveSession } = require('./router');
 const { ensureFreshToken } = require('./auth-refresh');
 const { getAllPendingMerges } = require('./pending-merges');
 
@@ -38,8 +38,10 @@ async function handleEvents(events) {
       // Filter to watched channel and topics
       if (msg.display_recipient !== config.channel) continue;
       if (!config.topics.includes(msg.subject)) continue;
-      // Require @-mention unless we're waiting for a yes/no confirmation
-      if (!flags.includes('mentioned') && !hasPendingAction(msg.display_recipient, msg.subject)) continue;
+      // Require @-mention unless we're waiting for a yes/no confirmation or have an active session
+      if (!flags.includes('mentioned')
+        && !hasPendingAction(msg.display_recipient, msg.subject)
+        && !hasActiveSession(msg.display_recipient, msg.subject, msg.sender_id)) continue;
       console.log(`[bot] Stream message in "${msg.display_recipient}" > "${msg.subject}" from ${msg.sender_full_name}: ${msg.content}`);
     } else if (msg.type === 'private') {
       if (!config.watchDMs) continue;
