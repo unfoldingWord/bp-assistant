@@ -427,6 +427,17 @@ async function routeMessage(message) {
     // For editor-review, enrich with content types and dynamic system prompt
     let activeRoute = route;
     if (route.name === 'editor-review') {
+      // Editor-review only handles ULT/UST — reject if user asked about notes/TN
+      if (/\b(notes?|tn|translation[\s-]?notes?)\b/i.test(message.content)) {
+        if (isStream) {
+          await sendMessage(message.display_recipient, message.subject,
+            'Editor-review only handles ULT and UST. Translation notes review is done manually.');
+        } else {
+          await sendDM(message.sender_id,
+            'Editor-review only handles ULT and UST. Translation notes review is done manually.');
+        }
+        return;
+      }
       const types = extractContentTypes(message.content);
       const typeLabel = types.map(t => t.toUpperCase()).join(' & ');
       const { book } = parseBookChapters(captures);

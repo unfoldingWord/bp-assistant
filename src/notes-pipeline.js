@@ -1,7 +1,7 @@
 // notes-pipeline.js — Multi-skill sequential pipeline for translation note writing
 // Triggered by: "write notes <book> <chapter>" or "write notes <book> <start>-<end>"
 // Skills: [post-edit-review OR deep-issue-id] -> [chapter-intro] -> tn-writer -> tn-quality-check
-// chapter-intro is skipped when --no-intro is passed or auto-exclusion applies (PSA 42-123)
+// chapter-intro is skipped by default; enabled when "with intro" is passed (unless auto-exclusion applies)
 //
 // Two-phase design:
 //   Phase 1: Run all skills except repo-insert (always runs, expensive)
@@ -27,13 +27,15 @@ const SKIP_INTRO_RANGES = [
   { book: 'PSA', start: 42, end: 123 },
 ];
 
-function shouldSkipIntro(book, chapter, noIntroFlag) {
-  if (noIntroFlag) return true;
-  return SKIP_INTRO_RANGES.some(r => r.book === book && chapter >= r.start && chapter <= r.end);
+function shouldRunIntro(book, chapter, withIntroFlag) {
+  if (!withIntroFlag) return false;
+  // Auto-exclusion ranges still override even if "with intro" is requested
+  if (SKIP_INTRO_RANGES.some(r => r.book === book && chapter >= r.start && chapter <= r.end)) return false;
+  return true;
 }
 
-function hasNoIntroFlag(content) {
-  return /--no-?intro\b/i.test(content) || /\bno[\s-]intro\b/i.test(content);
+function hasWithIntroFlag(content) {
+  return /--with-?intro\b/i.test(content) || /\bwith[\s-]intro\b/i.test(content);
 }
 
 // --- Parse "write notes BOOK CH" or "write notes BOOK CH:VS-VS" or "write notes BOOK CH1-CH2" ---
@@ -45,7 +47,7 @@ function parseWriteNotesCommand(content) {
       book: rangeMatch[1].toUpperCase(),
       startChapter: parseInt(rangeMatch[2], 10),
       endChapter: parseInt(rangeMatch[3], 10),
-      noIntro: hasNoIntroFlag(content),
+      withIntro: hasWithIntroFlag(content),
     };
   }
 
@@ -59,7 +61,7 @@ function parseWriteNotesCommand(content) {
       endChapter: ch,
       verseStart: parseInt(verseMatch[3], 10),
       verseEnd: parseInt(verseMatch[4], 10),
-      noIntro: hasNoIntroFlag(content),
+      withIntro: hasWithIntroFlag(content),
     };
   }
 
@@ -71,7 +73,7 @@ function parseWriteNotesCommand(content) {
       book: singleMatch[1].toUpperCase(),
       startChapter: ch,
       endChapter: ch,
-      noIntro: hasNoIntroFlag(content),
+      withIntro: hasWithIntroFlag(content),
     };
   }
 
@@ -114,7 +116,7 @@ async function notesPipeline(route, message) {
       book: route._book,
       startChapter: route._startChapter,
       endChapter: route._endChapter,
-      noIntro: hasNoIntroFlag(message.content),
+      withIntro: hasWithIntroFlag(message.content),
     };
   } else {
     parsed = parseWriteNotesCommand(message.content);
@@ -126,7 +128,7 @@ async function notesPipeline(route, message) {
     return;
   }
 
-  const { book, startChapter, endChapter, verseStart, verseEnd, noIntro } = parsed;
+  const { book, startChapter, endChapter, verseStart, verseEnd, withIntro } = parsed;
   const chapterCount = endChapter - startChapter + 1;
   const rangeLabel = startChapter === endChapter
     ? `${book} ${startChapter}`
@@ -204,16 +206,16 @@ async function notesPipeline(route, message) {
       });
     }
 
-    // chapter-intro: skip if --no-intro flag or auto-exclusion range
-    if (!shouldSkipIntro(book, ch, noIntro)) {
+    // chapter-intro: only runs when "with intro" is requested (and not in auto-exclusion range)
+    if (shouldRunIntro(book, ch, withIntro)) {
       skills.push({
         name: 'chapter-intro',
         prompt: `${skillRef} --issues ${issuesPath}`,
         expectedOutput: issuesPath,
         ops: 1,
       });
-    } else {
-      await status(`**${ref}**: skipping chapter-intro (${noIntro ? '--no-intro flag' : 'auto-excluded range'})`);
+    } else if (withIntro) {
+      await status(`**${ref}**: skipping chapter-intro (auto-excluded range)`);
     }
 
     skills.push({

@@ -16,8 +16,10 @@ const SYSTEM_PROMPT = `You classify Zulip messages about Bible translation work.
 Extract the intent and parameters as JSON. Valid intents:
 - "generate": user wants ULT and/or UST generated for chapters
 - "notes": user wants translation notes produced for chapters
-- "editor-review": user wants to review/compare editor changes against AI output
+- "editor-review": user wants to review/compare editor changes against AI output (ULT/UST ONLY — never for translation notes/TN)
 - "unknown": doesn't match any pattern
+
+If the user asks to review or compare translation notes (TN), classify as "unknown" — editor-review only handles ULT and UST.
 
 Always extract book as a 3-letter code (PSA for Psalms, GEN for Genesis, EXO for Exodus, JER for Jeremiah, etc.) and chapter range.
 If only one chapter is mentioned, startChapter and endChapter should be the same.
