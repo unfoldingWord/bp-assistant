@@ -58,7 +58,7 @@ function resolveOutputFile(relPath, book) {
   if (fs.existsSync(alt)) return altPath;
 
   // Try with zero-padded chapter number (e.g. PSA-68.tsv -> PSA-068.tsv)
-  const paddedFilename = filename.replace(/-(\d+)\./, (_, n) => `-${n.padStart(3, '0')}.`);
+  const paddedFilename = filename.replace(/-(\d+)([-.])/, (_, n, sep) => `-${n.padStart(3, '0')}${sep}`);
   if (paddedFilename !== filename) {
     // Try zero-padded at same directory level (no extra book subdir)
     const paddedDirectPath = [...parts, paddedFilename].join('/');
