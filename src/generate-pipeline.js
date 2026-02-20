@@ -67,7 +67,8 @@ async function generatePipeline(route, message) {
   async function reply(text) {
     try {
       if (stream) {
-        await sendMessage(stream, topic, text);
+        const mention = message.sender_full_name ? `@**${message.sender_full_name}** ` : '';
+        await sendMessage(stream, topic, mention + text);
       } else {
         await sendDM(message.sender_id, text);
       }
