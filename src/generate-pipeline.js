@@ -13,7 +13,7 @@ const { sendMessage, sendDM, addReaction, removeReaction, uploadFile } = require
 const { runClaude } = require('./claude-runner');
 const { getDoor43Username, buildBranchName, resolveOutputFile, calcSkillTimeout, CSKILLBP_DIR } = require('./pipeline-utils');
 const { verifyRepoPush } = require('./repo-verify');
-const { recordMetrics } = require('./usage-tracker');
+const { recordMetrics, getCumulativeTokens, recordRunSummary } = require('./usage-tracker');
 
 const LOG_DIR = path.resolve(__dirname, '../logs');
 
@@ -103,16 +103,9 @@ async function generatePipeline(route, message) {
     return;
   }
 
-  // Token estimate check
+  // Token estimate (informational only — no hard rejection based on estimates)
   const perChapter = (route.tokenEstimate && route.tokenEstimate.perChapter) || 5000000;
-  const sessionBudget = (route.tokenEstimate && route.tokenEstimate.sessionBudget) || 45000000;
   const estimatedTotal = chapterCount * perChapter;
-
-  if (estimatedTotal > sessionBudget) {
-    await addReaction(msgId, 'cross_mark');
-    await status(`Estimated token usage (~${estimatedTotal}) exceeds session budget (~${sessionBudget}). Try a smaller range (max ~${Math.floor(sessionBudget / perChapter)} chapters).`);
-    return;
-  }
 
   // --- Non-Chris pre-checks: Door43 username ---
   let username = null;
@@ -140,6 +133,7 @@ async function generatePipeline(route, message) {
   // Determine skill from route config
   const skill = route.skill || 'initial-pipeline --lite';
 
+  const tokensBefore = getCumulativeTokens();
   let success = 0;
   let fail = 0;
   const completedChapters = []; // Phase 1 results for non-Chris users
@@ -333,7 +327,7 @@ async function generatePipeline(route, message) {
       try {
         const riTimeout = calcSkillTimeout(book, chData.ch, 1);
         const riUltResult = await runClaude({
-          prompt: `ult ${book} ${chData.ch} ${username} --no-pr --branch ${buildBranchName(book, chData.ch)} --source ${chData.ultAligned}`,
+          prompt: `ult ${book} ${chData.ch} ${username} --branch ${buildBranchName(book, chData.ch)} --source ${chData.ultAligned}`,
           cwd: CSKILLBP_DIR,
           model,
           skill: 'repo-insert',
@@ -357,7 +351,7 @@ async function generatePipeline(route, message) {
         try {
           const riTimeout = calcSkillTimeout(book, chData.ch, 1);
           const riUstResult = await runClaude({
-            prompt: `ust ${book} ${chData.ch} ${username} --no-pr --branch ${buildBranchName(book, chData.ch)} --source ${chData.ustAligned}`,
+            prompt: `ust ${book} ${chData.ch} ${username} --branch ${buildBranchName(book, chData.ch)} --source ${chData.ustAligned}`,
             cwd: CSKILLBP_DIR,
             model,
             skill: 'repo-insert',
@@ -376,15 +370,22 @@ async function generatePipeline(route, message) {
         }
       }
 
-      // repo-verify against master
+      // repo-verify: check staging branch was merged (deleted from remote)
       if (!chapterFailed) {
-        await status(`Verifying pushes for ${book} ${chData.ch}...`);
-        const ultVerify = await verifyRepoPush({ repo: 'en_ult', branch: 'master' });
-        const ustVerify = await verifyRepoPush({ repo: 'en_ust', branch: 'master' });
+        const stagingBranch = buildBranchName(book, chData.ch);
+        await status(`Verifying merges for ${book} ${chData.ch}...`);
+        const ultVerify = await verifyRepoPush({ repo: 'en_ult', stagingBranch });
+        const ustVerify = await verifyRepoPush({ repo: 'en_ust', stagingBranch });
 
-        if (!ultVerify.success) await status(`Repo verify warning (ULT) for ${book} ${chData.ch}: ${ultVerify.details}`);
-        if (!ustVerify.success) await status(`Repo verify warning (UST) for ${book} ${chData.ch}: ${ustVerify.details}`);
-        if (ultVerify.success && ustVerify.success) await status(`Repo verify OK for ${book} ${chData.ch}: ULT and UST on master confirmed`);
+        if (!ultVerify.success) {
+          await status(`Repo verify FAILED (ULT) for ${book} ${chData.ch}: ${ultVerify.details}`);
+          chapterFailed = true;
+        }
+        if (!ustVerify.success) {
+          await status(`Repo verify FAILED (UST) for ${book} ${chData.ch}: ${ustVerify.details}`);
+          chapterFailed = true;
+        }
+        if (ultVerify.success && ustVerify.success) await status(`Repo verify OK for ${book} ${chData.ch}: ULT and UST merged to master`);
       }
 
       if (chapterFailed) {
@@ -411,6 +412,11 @@ async function generatePipeline(route, message) {
       (fail > 0 ? `\n(${fail} chapter(s) had errors \u2014 check admin DMs for details.)` : '')
     );
   }
+
+  recordRunSummary({
+    pipeline: 'generate', book, startCh: start, endCh: end,
+    tokensBefore, success: fail === 0, userId: message.sender_id,
+  });
 
   await status(`Generation complete for **${book} ${start}\u2013${end}**: ${success} succeeded, ${fail} failed.`);
 }

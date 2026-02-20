@@ -90,23 +90,24 @@ function windowHours() { return getConfig().windowHours || 5; }
 function warnThreshold() { return getConfig().warnThreshold || 0.7; }
 function ccusagePath() { return getConfig().ccusagePath || 'npx ccusage@latest'; }
 
-// Bootstrap defaults: conservative tokens/verse for each skill
+// Bootstrap defaults: tokens/verse for each skill
+// Measured 2026-02-20 on PSA 129 (8 verses, 17 notes, 8.2M total tokens).
+// Will be replaced by median-based estimates once >=3 data points exist per skill.
 const BOOTSTRAP_DEFAULTS = {
   'generate|initial-pipeline --lite': 250000,
   'generate|align-all-parallel':     100000,
-  'notes|deep-issue-id --lite':      200000,
-  'notes|post-edit-review':          200000,
-  'notes|tn-writer':                 200000,
-  'notes|tn-quality-check':           80000,
-  'notes|chapter-intro':              50000,
-  'notes|post-edit-review':          150000,
-  '*|repo-insert':                    10000,
+  'notes|post-edit-review':          145000,  // observed: 1.16M / 8v
+  'notes|tn-writer':                 725000,  // observed: 5.80M / 8v
+  'notes|tn-quality-check':           87000,  // observed: 695K / 8v
+  'notes|chapter-intro':              50000,  // not yet measured
+  'notes|deep-issue-id --lite':      200000,  // not yet measured
+  '*|repo-insert':                    74000,  // observed: 589K / 8v
 };
 
 // Skill chains: which skills run for each pipeline type
 const SKILL_CHAINS = {
   generate: ['initial-pipeline --lite', 'align-all-parallel', 'repo-insert'],
-  notes: ['deep-issue-id --lite', 'chapter-intro', 'tn-writer', 'tn-quality-check', 'repo-insert'],
+  notes: ['post-edit-review', 'tn-writer', 'tn-quality-check', 'repo-insert'],
 };
 
 // ---------------------------------------------------------------------------
@@ -165,6 +166,7 @@ function readRecentEntries(hours) {
     for (const line of lines) {
       try {
         const entry = JSON.parse(line);
+        if (entry.type === 'run_summary') continue; // skip summaries
         if (new Date(entry.ts).getTime() >= cutoff) {
           entries.push(entry);
         }
@@ -343,35 +345,13 @@ function preflightCheck({ pipeline, book, startCh, endCh }) {
   const budget = room.budget;
   const headroom = room.headroom;
 
-  // If estimated usage exceeds the entire window budget, suggest smaller batches
-  if (estimate.totalTokens > budget) {
-    const maxChapters = Math.max(1, Math.floor((budget / estimate.totalTokens) * (endCh - startCh + 1)));
-    return {
-      decision: 'reject',
-      reason: `Estimated ${formatTokens(estimate.totalTokens)} exceeds the full ${formatTokens(budget)} window budget. Try ${maxChapters} chapter(s) at a time.`,
-      estimate,
-      headroom: room,
-      retryAt: null,
-    };
-  }
-
-  // If estimated usage exceeds remaining headroom, suggest retry time
-  if (estimate.totalTokens > headroom) {
-    const retryAt = room.windowEnds || new Date(Date.now() + 60 * 60 * 1000).toISOString();
-    return {
-      decision: 'reject',
-      reason: `Not enough headroom right now. ~${formatTokens(room.used)} of ~${formatTokens(budget)} 5h budget used. Try again at <time:${retryAt}> or try fewer chapters.`,
-      estimate,
-      headroom: room,
-      retryAt,
-    };
-  }
-
-  // If estimated usage > 70% of remaining headroom, warn
-  if (estimate.totalTokens > headroom * threshold) {
+  // Never reject based on estimates alone — only warn.
+  // Rejection should only happen when we actually hit rate limits (handled by calibration).
+  // Warn if estimated usage is high relative to remaining headroom
+  if (headroom > 0 && estimate.totalTokens > headroom * threshold) {
     return {
       decision: 'warn',
-      reason: `This will use ~${formatTokens(estimate.totalTokens)} of ${formatTokens(headroom)} remaining headroom (${Math.round(estimate.totalTokens / headroom * 100)}%).`,
+      reason: `Heads up: est ~${formatTokens(estimate.totalTokens)}, ~${formatTokens(headroom)} headroom remaining (${Math.round(estimate.totalTokens / headroom * 100)}%).`,
       estimate,
       headroom: room,
       retryAt: null,
@@ -406,6 +386,53 @@ function getUsageSummary() {
 }
 
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// getCumulativeTokens -- sum of all total_tokens in the JSONL log
+// ---------------------------------------------------------------------------
+function getCumulativeTokens() {
+  if (!fs.existsSync(METRICS_FILE)) return 0;
+  try {
+    const lines = fs.readFileSync(METRICS_FILE, 'utf8').split('\n').filter(Boolean);
+    let sum = 0;
+    for (const line of lines) {
+      try {
+        const e = JSON.parse(line);
+        if (e.type === 'run_summary') continue;
+        sum += e.total_tokens || 0;
+      } catch { /* skip */ }
+    }
+    return sum;
+  } catch { return 0; }
+}
+
+// ---------------------------------------------------------------------------
+// recordRunSummary -- append a summary line after a full pipeline run
+// ---------------------------------------------------------------------------
+function recordRunSummary({ pipeline, book, startCh, endCh, tokensBefore, success, userId }) {
+  try {
+    fs.mkdirSync(METRICS_DIR, { recursive: true });
+    const tokensAfter = getCumulativeTokens();
+    const entry = {
+      ts: new Date().toISOString(),
+      type: 'run_summary',
+      pipeline,
+      book,
+      start_ch: startCh,
+      end_ch: endCh,
+      chapters: endCh - startCh + 1,
+      tokens_before: tokensBefore,
+      tokens_after: tokensAfter,
+      run_tokens: tokensAfter - tokensBefore,
+      success,
+      user_id: userId ?? null,
+    };
+    fs.appendFileSync(METRICS_FILE, JSON.stringify(entry) + '\n');
+    console.log(`[usage-tracker] Run summary: ${pipeline} ${book} ${startCh}-${endCh} -- ${formatTokens(tokensAfter - tokensBefore)} tokens this run (cumulative: ${formatTokens(tokensAfter)})`);
+  } catch (err) {
+    console.error(`[usage-tracker] Failed to record run summary: ${err.message}`);
+  }
+}
+
 // Helpers
 // ---------------------------------------------------------------------------
 function formatTokens(n) {
@@ -421,4 +448,6 @@ module.exports = {
   preflightCheck,
   getHeadroom,
   getUsageSummary,
+  getCumulativeTokens,
+  recordRunSummary,
 };

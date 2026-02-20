@@ -142,7 +142,7 @@ async function runGenerateInsertPhase(completedChapters, username, book, model) 
     try {
       const riTimeout = calcSkillTimeout(book, ch.ch, 1);
       await runClaude({
-        prompt: `ult ${book} ${ch.ch} ${username} --no-pr --branch ${buildBranchName(book, ch.ch)} --source ${ch.ultAligned}`,
+        prompt: `ult ${book} ${ch.ch} ${username} --branch ${buildBranchName(book, ch.ch)} --source ${ch.ultAligned}`,
         cwd: CSKILLBP_DIR,
         model,
         skill: 'repo-insert',
@@ -161,7 +161,7 @@ async function runGenerateInsertPhase(completedChapters, username, book, model) 
       try {
         const riTimeout = calcSkillTimeout(book, ch.ch, 1);
         await runClaude({
-          prompt: `ust ${book} ${ch.ch} ${username} --no-pr --branch ${buildBranchName(book, ch.ch)} --source ${ch.ustAligned}`,
+          prompt: `ust ${book} ${ch.ch} ${username} --branch ${buildBranchName(book, ch.ch)} --source ${ch.ustAligned}`,
           cwd: CSKILLBP_DIR,
           model,
           skill: 'repo-insert',
@@ -175,14 +175,21 @@ async function runGenerateInsertPhase(completedChapters, username, book, model) 
       }
     }
 
-    // repo-verify against master
+    // repo-verify: check staging branch was merged (deleted from remote)
     if (!chapterFailed) {
-      await status(`Verifying pushes for ${book} ${ch.ch}...`);
-      const ultVerify = await verifyRepoPush({ repo: 'en_ult', branch: 'master' });
-      const ustVerify = await verifyRepoPush({ repo: 'en_ust', branch: 'master' });
+      const stagingBranch = buildBranchName(book, ch.ch);
+      await status(`Verifying merges for ${book} ${ch.ch}...`);
+      const ultVerify = await verifyRepoPush({ repo: 'en_ult', stagingBranch });
+      const ustVerify = await verifyRepoPush({ repo: 'en_ust', stagingBranch });
 
-      if (!ultVerify.success) await status(`Repo verify warning (ULT) for ${book} ${ch.ch}: ${ultVerify.details}`);
-      if (!ustVerify.success) await status(`Repo verify warning (UST) for ${book} ${ch.ch}: ${ustVerify.details}`);
+      if (!ultVerify.success) {
+        await status(`Repo verify FAILED (ULT) for ${book} ${ch.ch}: ${ultVerify.details}`);
+        chapterFailed = true;
+      }
+      if (!ustVerify.success) {
+        await status(`Repo verify FAILED (UST) for ${book} ${ch.ch}: ${ustVerify.details}`);
+        chapterFailed = true;
+      }
       if (ultVerify.success && ustVerify.success) await status(`Repo verify OK for ${book} ${ch.ch}`);
     }
 
@@ -221,12 +228,14 @@ async function runNotesInsertPhase(completedChapters, username, book, model) {
       chapterFailed = true;
     }
 
-    // repo-verify against master
+    // repo-verify: check staging branch was merged (deleted from remote)
     if (!chapterFailed) {
-      await status(`Verifying push for ${book} ${ch.ch}...`);
-      const verify = await verifyRepoPush({ repo: 'en_tn', branch: 'master' });
+      const stagingBranch = buildBranchName(book, ch.ch);
+      await status(`Verifying merge for ${book} ${ch.ch}...`);
+      const verify = await verifyRepoPush({ repo: 'en_tn', stagingBranch });
       if (!verify.success) {
-        await status(`Repo verify warning for ${book} ${ch.ch}: ${verify.details}`);
+        await status(`Repo verify FAILED for ${book} ${ch.ch}: ${verify.details}`);
+        chapterFailed = true;
       } else {
         await status(`Repo verify OK for ${book} ${ch.ch}`);
       }

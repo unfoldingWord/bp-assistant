@@ -173,6 +173,50 @@ See `pipelines/example.sh` for a working template.
 }
 ```
 
+## Token usage & rate limits
+
+Usage is logged to `data/metrics/usage.jsonl` (one JSON line per skill invocation). To check cumulative totals:
+
+```bash
+cat /srv/bot/app/data/metrics/usage.jsonl | python3 -c "
+import sys, json
+entries = [json.loads(l) for l in sys.stdin if l.strip()]
+skills = [e for e in entries if e.get('type') != 'run_summary']
+runs = [e for e in entries if e.get('type') == 'run_summary']
+print(f'Skill entries: {len(skills)}  |  Run summaries: {len(runs)}')
+print(f'Total tokens (all time): {sum(e[\"total_tokens\"] for e in skills):,}')
+if runs:
+    print(f'\nRun summaries:')
+    for r in runs[-10:]:
+        print(f'  {r[\"ts\"][:16]}  {r[\"pipeline\"]} {r[\"book\"]} {r[\"start_ch\"]}-{r[\"end_ch\"]}  {r[\"run_tokens\"]:,} tokens')
+"
+```
+
+### Observed costs (notes pipeline)
+
+Measured on PSA 129 (8 verses, 17 notes):
+
+| Skill | Tokens | Per verse |
+|---|---|---|
+| `post-edit-review` | 1,156,842 | ~145K |
+| `tn-writer` | 5,804,328 | ~725K |
+| `tn-quality-check` | 694,677 | ~87K |
+| `repo-insert` | 588,858 | ~74K |
+| **Total** | **8,244,705** | **~1.03M** |
+
+~485K tokens per note. ~2.1 notes per verse.
+
+### Rate limit mapping
+
+| Limit | Tokens per 1% | Estimated total budget |
+|---|---|---|
+| Session (5h) | ~1.4M | ~137M tokens |
+| Weekly | ~8.2M | ~824M tokens |
+
+Rough capacity: ~16 note jobs per session, ~100 per week.
+
+These bootstrap estimates are in `src/usage-tracker.js` (`BOOTSTRAP_DEFAULTS`). The `estimateTokens()` function blends them with observed medians as more data accumulates (needs >=3 runs per skill to start blending, >10 to rely purely on observed data).
+
 ## File structure
 
 ```
