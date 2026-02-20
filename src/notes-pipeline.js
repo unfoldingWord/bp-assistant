@@ -10,11 +10,11 @@
 const fs = require('fs');
 const path = require('path');
 const config = require('./config');
-const { sendMessage, sendDM, addReaction, removeReaction, uploadFile } = require('./zulip-client');
+const { sendMessage, sendDM, addReaction, removeReaction } = require('./zulip-client');
 const { runClaude } = require('./claude-runner');
 const { getDoor43Username, buildBranchName, resolveOutputFile, checkPrerequisites, calcSkillTimeout, CSKILLBP_DIR } = require('./pipeline-utils');
 const { verifyRepoPush } = require('./repo-verify');
-const { recordMetrics } = require('./usage-tracker');
+const { recordMetrics, getCumulativeTokens, recordRunSummary } = require('./usage-tracker');
 
 const LOG_DIR = path.resolve(__dirname, '../logs');
 
@@ -96,7 +96,8 @@ async function notesPipeline(route, message) {
   async function reply(text) {
     try {
       if (stream) {
-        await sendMessage(stream, topic, text);
+        const mention = message.sender_full_name ? `@**${message.sender_full_name}** ` : '';
+        await sendMessage(stream, topic, mention + text);
       } else {
         await sendDM(message.sender_id, text);
       }
@@ -148,6 +149,7 @@ async function notesPipeline(route, message) {
   const model = isTestFast ? 'haiku' : undefined;
 
   const pipelineStart = Date.now();
+  const tokensBefore = getCumulativeTokens();
   let totalSuccess = 0;
   let totalFail = 0;
   const completedChapters = []; // Phase 1 results for deferred insertion
@@ -307,31 +309,15 @@ async function notesPipeline(route, message) {
 
     totalSuccess++;
 
-    // --- Upload notes TSV for this chapter ---
-    const notesTsv = path.join(CSKILLBP_DIR, 'output', 'notes', `${tag}.tsv`);
-    const altNotesTsv = path.join(CSKILLBP_DIR, 'output', 'notes', book, `${tag}.tsv`);
-    const actualNotesTsv = fs.existsSync(notesTsv) ? notesTsv : fs.existsSync(altNotesTsv) ? altNotesTsv : null;
-    let downloadLink = '';
-
-    if (actualNotesTsv) {
-      try {
-        const uri = await uploadFile(actualNotesTsv, `${tag} notes.tsv`);
-        downloadLink = ` \u00b7 [Download](${uri})`;
-      } catch (err) {
-        console.error(`[notes] Failed to upload notes TSV: ${err.message}`);
-        downloadLink = ' \u00b7 (file upload failed)';
-      }
-    }
-
     // Collect for Phase 2 insertion
     completedChapters.push({
       ch,
       skillRef,
-      repoInsertPrompt: `tn ${skillRef} ${username} --no-pr --branch ${buildBranchName(book, ch)} --source output/notes/${tag}.tsv`,
+      repoInsertPrompt: `tn ${skillRef} ${username} --branch ${buildBranchName(book, ch)} --source output/notes/${tag}.tsv`,
     });
 
     if (chapterCount > 1) {
-      await reply(`**${ref}** notes complete (${chapterDuration}s)${downloadLink}`);
+      await reply(`**${ref}** notes complete (${chapterDuration}s)`);
     }
   }
 
@@ -367,14 +353,15 @@ async function notesPipeline(route, message) {
       // repo-verify against master
       if (!chapterFailed) {
         await status(`Verifying push for ${book} ${chData.ch}...`);
+        const stagingBranch = buildBranchName(book, chData.ch);
         const verify = await verifyRepoPush({
           repo: 'en_tn',
-          branch: 'master',
-          expectedFiles: [],
+          stagingBranch,
         });
         if (!verify.success) {
-          await status(`Repo verify warning for ${book} ${chData.ch}: ${verify.details}`);
+          await status(`Repo verify FAILED for ${book} ${chData.ch}: ${verify.details}`);
           console.warn(`[notes] Repo verify failed for ${book} ${chData.ch}: ${verify.details}`);
+          chapterFailed = true;
         } else {
           await status(`Repo verify OK for ${book} ${chData.ch}: ${verify.details}`);
         }
@@ -405,28 +392,10 @@ async function notesPipeline(route, message) {
   } else {
     await addReaction(msgId, 'check');
 
-    // For single chapter, upload file link in the final message
     if (chapterCount === 1) {
-      const tag = `${book}-${startChapter}`;
-      const notesTsv = path.join(CSKILLBP_DIR, 'output', 'notes', `${tag}.tsv`);
-      const altNotesTsv = path.join(CSKILLBP_DIR, 'output', 'notes', book, `${tag}.tsv`);
-      const actualNotesTsv = fs.existsSync(notesTsv) ? notesTsv : fs.existsSync(altNotesTsv) ? altNotesTsv : null;
-      let downloadLink = '';
-
-      if (actualNotesTsv) {
-        try {
-          const uri = await uploadFile(actualNotesTsv, `${tag} notes.tsv`);
-          downloadLink = `\nDownload: [${tag} notes.tsv](${uri})`;
-        } catch (err) {
-          console.error(`[notes] Failed to upload notes TSV: ${err.message}`);
-          downloadLink = '\n(File upload failed)';
-        }
-      }
-
       await reply(
         `Notes pipeline complete for **${rangeLabel}** (${totalDuration}s).\n` +
-        `Content pushed to master on en_tn` +
-        downloadLink
+        `Content pushed to master on en_tn`
       );
     } else {
       await reply(
@@ -435,6 +404,11 @@ async function notesPipeline(route, message) {
       );
     }
   }
+
+  recordRunSummary({
+    pipeline: 'notes', book, startCh: startChapter, endCh: endChapter,
+    tokensBefore, success: totalFail === 0, userId: message.sender_id,
+  });
 
   await status(`Notes pipeline complete for **${rangeLabel}** in ${totalDuration}s \u2014 ${totalSuccess} ok, ${totalFail} failed.`);
 }
