@@ -260,19 +260,18 @@ async function notesPipeline(route, message) {
       const logLine = `${new Date().toISOString()} | ${tag} | ${skill.name} | sdk=${sdkSuccess} | duration=${duration}s\n`;
       fs.appendFileSync(logFile, logLine);
 
-      // Check expected output
+      // Check expected output (resolveOutputFile handles padding + subdirs)
       if (skill.expectedOutput) {
-        const outputPath = path.join(CSKILLBP_DIR, skill.expectedOutput);
-        // Also check with book subdirectory
-        const altOutputPath = resolveOutputFile(skill.expectedOutput, book);
-        if (!fs.existsSync(outputPath) && !altOutputPath) {
+        const resolved = resolveOutputFile(skill.expectedOutput, book);
+        if (!resolved) {
           failedSkill = skill.name;
           await status(`**${skill.name}** failed for ${ref} \u2014 expected output not found: ${skill.expectedOutput} (${duration}s)`);
           break;
         }
+        skill.resolvedOutput = resolved;
         // Update issuesPath if deep-issue-id produced it in a subdirectory
-        if (skill.name === 'deep-issue-id --lite' && altOutputPath) {
-          issuesPath = altOutputPath;
+        if (skill.name === 'deep-issue-id --lite') {
+          issuesPath = resolved;
           // Update subsequent skill prompts that reference issuesPath
           for (const s of skills) {
             if (s.prompt && s.prompt.includes(`output/issues/${tag}.tsv`)) {
@@ -311,11 +310,13 @@ async function notesPipeline(route, message) {
 
     totalSuccess++;
 
-    // Collect for Phase 2 insertion
+    // Collect for Phase 2 insertion — use resolved path from tn-writer if available
+    const tnWriterSkill = skills.find(s => s.name === 'tn-writer');
+    const notesSource = tnWriterSkill?.resolvedOutput || `output/notes/${tag}.tsv`;
     completedChapters.push({
       ch,
       skillRef,
-      repoInsertPrompt: `tn ${skillRef} ${username} --branch ${buildBranchName(book, ch)} --source output/notes/${tag}.tsv`,
+      repoInsertPrompt: `tn ${skillRef} ${username} --branch ${buildBranchName(book, ch)} --source ${notesSource}`,
     });
 
     if (chapterCount > 1) {

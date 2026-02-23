@@ -46,29 +46,30 @@ function checkExistingBranch(username, repo = 'en_tn', branchPattern = '{usernam
 }
 
 // --- Resolve an output file that may live in either output/X/ or output/X/BOOK/ ---
+// Tries all combos: {unpadded, 2-digit, 3-digit} × {flat, subdirectory}
 function resolveOutputFile(relPath, book) {
   const direct = path.join(CSKILLBP_DIR, relPath);
   if (fs.existsSync(direct)) return relPath;
 
-  // Try output/subdir/BOOK/filename  (e.g. output/issues/PSA/PSA-117.tsv)
   const parts = relPath.split('/');
   const filename = parts.pop();
+
+  // Try with book subdirectory (unpadded)
   const altPath = [...parts, book, filename].join('/');
-  const alt = path.join(CSKILLBP_DIR, altPath);
-  if (fs.existsSync(alt)) return altPath;
+  if (fs.existsSync(path.join(CSKILLBP_DIR, altPath))) return altPath;
 
-  // Try with zero-padded chapter number (e.g. PSA-68.tsv -> PSA-068.tsv)
-  const paddedFilename = filename.replace(/-(\d+)([-.])/, (_, n, sep) => `-${n.padStart(3, '0')}${sep}`);
-  if (paddedFilename !== filename) {
-    // Try zero-padded at same directory level (no extra book subdir)
-    const paddedDirectPath = [...parts, paddedFilename].join('/');
-    const paddedDirect = path.join(CSKILLBP_DIR, paddedDirectPath);
-    if (fs.existsSync(paddedDirect)) return paddedDirectPath;
+  // Try zero-padded chapter numbers — 2-digit and 3-digit
+  for (const width of [2, 3]) {
+    const padded = filename.replace(/-(\d+)([-.])/, (_, n, sep) => `-${n.padStart(width, '0')}${sep}`);
+    if (padded === filename) continue;
 
-    // Try zero-padded with book subdir added
-    const paddedAltPath = [...parts, book, paddedFilename].join('/');
-    const paddedAlt = path.join(CSKILLBP_DIR, paddedAltPath);
-    if (fs.existsSync(paddedAlt)) return paddedAltPath;
+    // Flat
+    const paddedDirect = [...parts, padded].join('/');
+    if (fs.existsSync(path.join(CSKILLBP_DIR, paddedDirect))) return paddedDirect;
+
+    // Subdirectory
+    const paddedAlt = [...parts, book, padded].join('/');
+    if (fs.existsSync(path.join(CSKILLBP_DIR, paddedAlt))) return paddedAlt;
   }
 
   return null;

@@ -279,17 +279,11 @@ async function generatePipeline(route, message) {
         success: alignResult?.subtype === 'success', userId: message.sender_id,
       });
 
-      // Check aligned output files exist
-      const alignedUlt = path.join(CSKILLBP_DIR, 'output', 'AI-ULT', book, `${book}-${ch}-aligned.usfm`);
-      const alignedUst = path.join(CSKILLBP_DIR, 'output', 'AI-UST', book, `${book}-${ch}-aligned.usfm`);
-      // Also check flat path
-      const alignedUltFlat = path.join(CSKILLBP_DIR, 'output', 'AI-ULT', `${book}-${ch}-aligned.usfm`);
-      const alignedUstFlat = path.join(CSKILLBP_DIR, 'output', 'AI-UST', `${book}-${ch}-aligned.usfm`);
+      // Check aligned output files via resolveOutputFile (handles padding + subdirs)
+      const alignedUltRel = resolveOutputFile(`output/AI-ULT/${book}-${ch}-aligned.usfm`, book);
+      const alignedUstRel = resolveOutputFile(`output/AI-UST/${book}-${ch}-aligned.usfm`, book);
 
-      const hasAlignedUlt = fs.existsSync(alignedUlt) || fs.existsSync(alignedUltFlat);
-      const hasAlignedUst = fs.existsSync(alignedUst) || fs.existsSync(alignedUstFlat);
-
-      if (!hasAlignedUlt || !hasAlignedUst) {
+      if (!alignedUltRel || !alignedUstRel) {
         await status(`**align-all-parallel** failed for ${book} ${ch} \u2014 aligned files not found (${alignDuration}s)`);
         fail++;
         continue;
@@ -302,17 +296,8 @@ async function generatePipeline(route, message) {
       continue;
     }
 
-    // Resolve aligned file paths (prefer subdirectory, fall back to flat)
-    const resolveAligned = (type) => {
-      const sub = path.join(CSKILLBP_DIR, 'output', type, book, `${book}-${ch}-aligned.usfm`);
-      if (fs.existsSync(sub)) return `output/${type}/${book}/${book}-${ch}-aligned.usfm`;
-      return `output/${type}/${book}-${ch}-aligned.usfm`;
-    };
-    const ultSourceRel = resolveAligned('AI-ULT');
-    const ustSourceRel = resolveAligned('AI-UST');
-
     // Collect for Phase 2 insertion
-    completedChapters.push({ ch, ultAligned: ultSourceRel, ustAligned: ustSourceRel });
+    completedChapters.push({ ch, ultAligned: alignedUltRel, ustAligned: alignedUstRel });
     success++;
   }
 
