@@ -104,6 +104,20 @@ const BOOTSTRAP_DEFAULTS = {
   '*|repo-insert':                    74000,  // observed: 589K / 8v
 };
 
+// Bootstrap defaults: seconds/verse for each skill (for time estimates)
+// Derived from observed durations across PSA 128-132 runs.
+// Will be replaced by median-based estimates once >=3 data points exist per skill.
+const TIME_BOOTSTRAP_DEFAULTS = {
+  'generate|initial-pipeline --lite': 150,  // observed: 63-207 s/v
+  'generate|align-all-parallel':      35,   // observed: 35 s/v (1 data point)
+  'notes|post-edit-review':           40,   // observed: 22-49 s/v
+  'notes|tn-writer':                  65,   // observed: 41-102 s/v
+  'notes|tn-quality-check':           25,   // observed: 17-32 s/v
+  'notes|chapter-intro':              10,   // observed: 7-9 s/v
+  'notes|deep-issue-id --lite':       30,   // not yet measured well
+  '*|repo-insert':                    15,   // observed: 6-35 s/v
+};
+
 // Skill chains: which skills run for each pipeline type
 const SKILL_CHAINS = {
   generate: ['initial-pipeline --lite', 'align-all-parallel', 'repo-insert'],
@@ -187,6 +201,12 @@ function getBootstrapDefault(pipeline, skill) {
     || 150000; // generic fallback
 }
 
+function getTimeBootstrapDefault(pipeline, skill) {
+  return TIME_BOOTSTRAP_DEFAULTS[`${pipeline}|${skill}`]
+    || TIME_BOOTSTRAP_DEFAULTS[`*|${skill}`]
+    || 60; // generic fallback: 60 s/verse
+}
+
 // ---------------------------------------------------------------------------
 // estimateTokens -- predict cost for a pipeline run
 // ---------------------------------------------------------------------------
@@ -207,8 +227,9 @@ function estimateTokens({ pipeline, book, startCh, endCh }) {
     } catch { /* ignore */ }
   }
 
-  // For each skill, compute median tokens/verse from history
+  // For each skill, compute median tokens/verse and seconds/verse from history
   const skillMedians = {};
+  const skillTimeMedians = {};
   let anyBootstrapped = false;
 
   for (const skill of chain) {
@@ -217,6 +238,7 @@ function estimateTokens({ pipeline, book, startCh, endCh }) {
     );
     const perVerseValues = matching.map(e => e.total_tokens / e.verses);
 
+    // Token estimation (for headroom checks)
     const bootstrap = getBootstrapDefault(pipeline, skill);
     let tokensPerVerse;
 
@@ -235,29 +257,53 @@ function estimateTokens({ pipeline, book, startCh, endCh }) {
     }
 
     skillMedians[skill] = tokensPerVerse;
+
+    // Time estimation from actual durations (seconds/verse)
+    const timeMatching = matching.filter(e => e.duration_s > 0);
+    const secsPerVerseValues = timeMatching.map(e => e.duration_s / e.verses);
+
+    const timeBootstrap = getTimeBootstrapDefault(pipeline, skill);
+    let secsPerVerse;
+
+    if (secsPerVerseValues.length < 3) {
+      secsPerVerse = timeBootstrap;
+    } else if (secsPerVerseValues.length <= 10) {
+      const sorted = secsPerVerseValues.sort((a, b) => a - b);
+      const median = sorted[Math.floor(sorted.length / 2)];
+      secsPerVerse = (median + timeBootstrap) / 2;
+    } else {
+      const sorted = secsPerVerseValues.sort((a, b) => a - b);
+      secsPerVerse = sorted[Math.floor(sorted.length / 2)];
+    }
+
+    skillTimeMedians[skill] = secsPerVerse;
   }
 
   // Calculate per-chapter estimates
   const perChapter = [];
   let totalTokens = 0;
+  let totalSeconds = 0;
 
   for (let ch = startCh; ch <= endCh; ch++) {
     let verses;
     try { verses = getVerseCount(book, ch); } catch { verses = 20; }
 
     let chapterTokens = 0;
+    let chapterSeconds = 0;
     for (const skill of chain) {
       chapterTokens += skillMedians[skill] * verses;
+      chapterSeconds += skillTimeMedians[skill] * verses;
     }
 
     perChapter.push({ chapter: ch, verses, tokens: Math.round(chapterTokens) });
     totalTokens += chapterTokens;
+    totalSeconds += chapterSeconds;
   }
 
   totalTokens = Math.round(totalTokens);
 
-  // Rough time estimate: ~1M tokens per 10 minutes (from observed bot throughput)
-  const estimatedMinutes = Math.round(totalTokens / 100000);
+  // Time estimate from per-skill duration data (much more accurate than token-based)
+  const estimatedMinutes = Math.round(totalSeconds / 60);
 
   return { totalTokens, perChapter, estimatedMinutes, bootstrapped: anyBootstrapped };
 }

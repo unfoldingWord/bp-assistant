@@ -198,10 +198,7 @@ function getPipelineType(route) {
 function buildEstimateLabel(estimate, book, startCh, endCh) {
   const chCount = endCh - startCh + 1;
   const totalVerses = estimate.perChapter.reduce((s, c) => s + c.verses, 0);
-  const tokLabel = estimate.totalTokens >= 1000000
-    ? `~${(estimate.totalTokens / 1000000).toFixed(0)}M`
-    : `~${(estimate.totalTokens / 1000).toFixed(0)}K`;
-  return `(${chCount} ch, ~${totalVerses} verses). Est: ${tokLabel} tokens, ~${estimate.estimatedMinutes} min`;
+  return `(${chCount} ch, ~${totalVerses} verses). Est: ~${estimate.estimatedMinutes} min`;
 }
 
 function matchRoute(content) {
