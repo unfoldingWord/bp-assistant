@@ -1,6 +1,6 @@
 // notes-pipeline.js — Multi-skill sequential pipeline for translation note writing
 // Triggered by: "write notes <book> <chapter>" or "write notes <book> <start>-<end>"
-// Skills: [post-edit-review OR deep-issue-id] -> [chapter-intro] -> tn-writer
+// Skills: [post-edit-review OR deep-issue-id] -> [chapter-intro] -> tn-writer -> tn-quality-check (Sonnet)
 // chapter-intro is skipped by default; enabled when "with intro" is passed (unless auto-exclusion applies)
 //
 // Two-phase design:
@@ -225,7 +225,14 @@ async function notesPipeline(route, message) {
       ops: 1,
     });
 
-    // tn-quality-check removed — deep QC now runs inline inside tn-writer (Step 11)
+    // tn-quality-check runs as a separate Sonnet invocation for independent review
+    skills.push({
+      name: 'tn-quality-check',
+      prompt: `${skillRef}`,
+      expectedOutput: `output/quality/${book}/${tag}-quality.md`,
+      ops: 1,
+      model: 'sonnet',
+    });
 
     // --- Run skills sequentially ---
     for (const skill of skills) {
@@ -239,7 +246,7 @@ async function notesPipeline(route, message) {
         result = await runClaude({
           prompt: skill.prompt,
           cwd: CSKILLBP_DIR,
-          model,
+          model: model || skill.model, // TEST_FAST haiku overrides per-skill model
           skill: skill.name,
           timeoutMs,
           appendSystemPrompt: skill.appendSystemPrompt,
