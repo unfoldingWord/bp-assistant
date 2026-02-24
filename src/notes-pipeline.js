@@ -1,6 +1,6 @@
 // notes-pipeline.js — Multi-skill sequential pipeline for translation note writing
 // Triggered by: "write notes <book> <chapter>" or "write notes <book> <start>-<end>"
-// Skills: [post-edit-review OR deep-issue-id] -> [chapter-intro] -> tn-writer -> tn-quality-check (Sonnet)
+// Skills: [post-edit-review OR deep-issue-id] -> [chapter-intro] -> tn-writer (Opus) -> tn-quality-check (Sonnet) -> repo-insert (Haiku)
 // chapter-intro is skipped by default; enabled when "with intro" is passed (unless auto-exclusion applies)
 //
 // Two-phase design:
@@ -339,7 +339,7 @@ async function notesPipeline(route, message) {
         const riResult = await runClaude({
           prompt: chData.repoInsertPrompt,
           cwd: CSKILLBP_DIR,
-          model,
+          model: model || 'haiku', // mechanical git/PR work; no judgment needed
           skill: 'repo-insert',
           timeoutMs: riTimeout,
         });
