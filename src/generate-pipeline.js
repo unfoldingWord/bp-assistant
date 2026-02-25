@@ -1,8 +1,8 @@
 // generate-pipeline.js — SDK-based generation pipeline
 // Replaces generate.sh: parses command, loops chapters, calls Claude SDK, posts results to Zulip
-// Chris (chrisUserId) gets files uploaded; others get align + repo-insert + repo-verify
+// fileResponseUserIds get files uploaded; others get align + repo-insert + repo-verify
 //
-// Two-phase design for non-Chris users:
+// Two-phase design for non-file-response users:
 //   Phase 1: Generate + align (always runs, expensive)
 //   Phase 2: Repo insert — push to master (cheap, always runs inline)
 
@@ -52,7 +52,8 @@ async function generatePipeline(route, message) {
 
   const isDryRun = process.env.DRY_RUN === '1';
   const isTestFast = process.env.TEST_FAST === '1';
-  const isChris = message.sender_id === config.chrisUserId;
+  const fileUserIds = config.fileResponseUserIds || [config.chrisUserId];
+  const isFileResponse = fileUserIds.includes(message.sender_id);
 
   // Helper: DM status to admin
   async function status(text) {
@@ -108,9 +109,9 @@ async function generatePipeline(route, message) {
   const perChapter = (route.tokenEstimate && route.tokenEstimate.perChapter) || 5000000;
   const estimatedTotal = chapterCount * perChapter;
 
-  // --- Non-Chris pre-checks: Door43 username ---
+  // --- Non-file-response pre-checks: Door43 username ---
   let username = null;
-  if (!isChris) {
+  if (!isFileResponse) {
     username = getDoor43Username(message.sender_email);
     if (!username) {
       await addReaction(msgId, 'cross_mark');
@@ -121,7 +122,7 @@ async function generatePipeline(route, message) {
 
   // Signal working
   await addReaction(msgId, 'working_on_it');
-  const modeLabel = isChris ? 'files-only' : 'full pipeline (align + repo-insert)';
+  const modeLabel = isFileResponse ? 'files-only' : 'full pipeline (align + repo-insert)';
   await status(`Starting generation for **${book}** chapters ${start}\u2013${end} (${chapterCount} chapter(s), mode: ${modeLabel}, ~${estimatedTotal} tokens estimated)`);
 
   // Ensure log directory
@@ -137,7 +138,7 @@ async function generatePipeline(route, message) {
   const tokensBefore = getCumulativeTokens();
   let success = 0;
   let fail = 0;
-  const completedChapters = []; // Phase 1 results for non-Chris users
+  const completedChapters = []; // Phase 1 results for non-file-response users
 
   // =========================================================================
   // Phase 1: Generate + Align (always runs)
@@ -228,8 +229,8 @@ async function generatePipeline(route, message) {
       book, chapter: ch, result: claudeResult, success: hasUst, userId: message.sender_id,
     });
 
-    // --- Chris path: upload files only ---
-    if (isChris) {
+    // --- File-response path: upload files only ---
+    if (isFileResponse) {
       const links = [];
 
       if (hasUlt) {
@@ -257,7 +258,7 @@ async function generatePipeline(route, message) {
       continue;
     }
 
-    // --- Non-Chris path: Phase 1 \u2014 align and collect results ---
+    // --- Non-file-response path: Phase 1 \u2014 align and collect results ---
 
     // Step 2: align-all-parallel
     await status(`Running **align-all-parallel** for ${book} ${ch}...`);
@@ -302,9 +303,9 @@ async function generatePipeline(route, message) {
   }
 
   // =========================================================================
-  // Phase 2: Repo insert \u2014 push to master (non-Chris users only)
+  // Phase 2: Repo insert \u2014 push to master (non-file-response users only)
   // =========================================================================
-  if (!isChris && completedChapters.length > 0) {
+  if (!isFileResponse && completedChapters.length > 0) {
     for (const chData of completedChapters) {
       let chapterFailed = false;
 
@@ -391,7 +392,7 @@ async function generatePipeline(route, message) {
   }
 
   // Final message
-  if (!isChris && success > 0) {
+  if (!isFileResponse && success > 0) {
     const rangeLabel = start === end ? `${book} ${start}` : `${book} ${start}\u2013${end}`;
     await reply(
       `Content for **${rangeLabel}** pushed to master in en_ult and en_ust.` +
