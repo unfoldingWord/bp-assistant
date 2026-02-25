@@ -7,6 +7,7 @@ const { classifyIntent } = require('./intent-classifier');
 const { preflightCheck, estimateTokens } = require('./usage-tracker');
 const { getPendingMerge, clearPendingMerge } = require('./pending-merges');
 const { resumeInsertion } = require('./insertion-resume');
+const { normalizeBookName } = require('./pipeline-utils');
 
 // In-memory pending confirmations for stream messages
 const pendingConfirmations = new Map();
@@ -109,28 +110,6 @@ function buildConfirmMessage(template, captures) {
     const val = captures[parseInt(idx) - 1] || '';
     return /^[a-zA-Z]+$/.test(val) ? val.toUpperCase() : val;
   });
-}
-
-/**
- * Normalize common book names/variants to 3-letter codes.
- */
-const BOOK_NAME_MAP = {
-  PSALMS: 'PSA', PSALM: 'PSA',
-  GENESIS: 'GEN', EXODUS: 'EXO', LEVITICUS: 'LEV', NUMBERS: 'NUM',
-  DEUTERONOMY: 'DEU', JOSHUA: 'JOS', JUDGES: 'JDG', RUTH: 'RUT',
-  SAMUEL: 'SAM', KINGS: 'KIN', CHRONICLES: 'CHR',
-  EZRA: 'EZR', NEHEMIAH: 'NEH', ESTHER: 'EST', JOB: 'JOB',
-  PROVERBS: 'PRO', ECCLESIASTES: 'ECC', SONG: 'SNG',
-  ISAIAH: 'ISA', JEREMIAH: 'JER', LAMENTATIONS: 'LAM',
-  EZEKIEL: 'EZK', DANIEL: 'DAN', HOSEA: 'HOS', JOEL: 'JOL',
-  AMOS: 'AMO', OBADIAH: 'OBA', JONAH: 'JON', MICAH: 'MIC',
-  NAHUM: 'NAM', HABAKKUK: 'HAB', ZEPHANIAH: 'ZEP',
-  HAGGAI: 'HAG', ZECHARIAH: 'ZEC', MALACHI: 'MAL',
-};
-
-function normalizeBookName(name) {
-  const upper = name.toUpperCase();
-  return BOOK_NAME_MAP[upper] || upper;
 }
 
 /**

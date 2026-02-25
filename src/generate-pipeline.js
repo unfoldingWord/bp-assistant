@@ -11,7 +11,7 @@ const path = require('path');
 const config = require('./config');
 const { sendMessage, sendDM, addReaction, removeReaction, uploadFile } = require('./zulip-client');
 const { runClaude } = require('./claude-runner');
-const { getDoor43Username, buildBranchName, resolveOutputFile, calcSkillTimeout, CSKILLBP_DIR } = require('./pipeline-utils');
+const { getDoor43Username, buildBranchName, resolveOutputFile, calcSkillTimeout, normalizeBookName, CSKILLBP_DIR } = require('./pipeline-utils');
 const { verifyRepoPush } = require('./repo-verify');
 const { recordMetrics, getCumulativeTokens, recordRunSummary } = require('./usage-tracker');
 
@@ -24,7 +24,7 @@ function parseGenerateCommand(content) {
   const rangeMatch = input.match(/generate\s+([a-z0-9]+)\s+(\d+)\s*[-\u2013\u2014to]+\s*(\d+)/);
   if (rangeMatch) {
     return {
-      book: rangeMatch[1].toUpperCase(),
+      book: normalizeBookName(rangeMatch[1]),
       start: parseInt(rangeMatch[2], 10),
       end: parseInt(rangeMatch[3], 10),
     };
@@ -35,7 +35,7 @@ function parseGenerateCommand(content) {
   if (singleMatch) {
     const ch = parseInt(singleMatch[2], 10);
     return {
-      book: singleMatch[1].toUpperCase(),
+      book: normalizeBookName(singleMatch[1]),
       start: ch,
       end: ch,
     };

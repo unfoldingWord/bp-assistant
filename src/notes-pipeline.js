@@ -12,7 +12,7 @@ const path = require('path');
 const config = require('./config');
 const { sendMessage, sendDM, addReaction, removeReaction } = require('./zulip-client');
 const { runClaude } = require('./claude-runner');
-const { getDoor43Username, buildBranchName, resolveOutputFile, checkPrerequisites, calcSkillTimeout, CSKILLBP_DIR } = require('./pipeline-utils');
+const { getDoor43Username, buildBranchName, resolveOutputFile, checkPrerequisites, calcSkillTimeout, normalizeBookName, CSKILLBP_DIR } = require('./pipeline-utils');
 const { verifyRepoPush } = require('./repo-verify');
 const { recordMetrics, getCumulativeTokens, recordRunSummary } = require('./usage-tracker');
 
@@ -44,7 +44,7 @@ function parseWriteNotesCommand(content) {
   const rangeMatch = content.match(/write notes(?:\s+for)?\s+(\w+)\s+(\d+)\s*[-\u2013\u2014to]+\s*(\d+)/i);
   if (rangeMatch) {
     return {
-      book: rangeMatch[1].toUpperCase(),
+      book: normalizeBookName(rangeMatch[1]),
       startChapter: parseInt(rangeMatch[2], 10),
       endChapter: parseInt(rangeMatch[3], 10),
       withIntro: hasWithIntroFlag(content),
@@ -56,7 +56,7 @@ function parseWriteNotesCommand(content) {
   if (verseMatch) {
     const ch = parseInt(verseMatch[2], 10);
     return {
-      book: verseMatch[1].toUpperCase(),
+      book: normalizeBookName(verseMatch[1]),
       startChapter: ch,
       endChapter: ch,
       verseStart: parseInt(verseMatch[3], 10),
@@ -70,7 +70,7 @@ function parseWriteNotesCommand(content) {
   if (singleMatch) {
     const ch = parseInt(singleMatch[2], 10);
     return {
-      book: singleMatch[1].toUpperCase(),
+      book: normalizeBookName(singleMatch[1]),
       startChapter: ch,
       endChapter: ch,
       withIntro: hasWithIntroFlag(content),
