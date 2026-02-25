@@ -44,14 +44,19 @@ function toGeminiContents(messages) {
     if (msg.role === 'user') {
       contents.push({ role: 'user', parts: [{ text: msg.content }] });
     } else if (msg.role === 'assistant') {
-      const parts = [];
-      if (msg.content) parts.push({ text: msg.content });
-      if (msg.toolCalls) {
-        for (const tc of msg.toolCalls) {
-          parts.push({ functionCall: { name: tc.name, args: tc.arguments } });
+      // Replay raw parts if available (preserves thoughtSignature on functionCall parts)
+      if (msg._rawParts) {
+        contents.push({ role: 'model', parts: msg._rawParts });
+      } else {
+        const parts = [];
+        if (msg.content) parts.push({ text: msg.content });
+        if (msg.toolCalls) {
+          for (const tc of msg.toolCalls) {
+            parts.push({ functionCall: { name: tc.name, args: tc.arguments } });
+          }
         }
+        contents.push({ role: 'model', parts });
       }
-      contents.push({ role: 'model', parts });
     } else if (msg.role === 'tool') {
       contents.push({
         role: 'user',
@@ -86,14 +91,14 @@ async function sendRequest({ model, system, messages, tools, thinking, apiKey })
     body.tools = tools;
   }
 
-  const thinkingCfg = getThinkingConfig(modelId, thinking);
-  if (thinkingCfg) {
-    Object.assign(body, thinkingCfg);
-  }
-
   body.generationConfig = {
     maxOutputTokens: 65536,
   };
+
+  const thinkingCfg = getThinkingConfig(modelId, thinking);
+  if (thinkingCfg) {
+    Object.assign(body.generationConfig, thinkingCfg);
+  }
 
   const resp = await fetch(url, {
     method: 'POST',
@@ -126,8 +131,9 @@ function parseResponse(data) {
 
   let content = '';
   const toolCalls = [];
+  const rawParts = candidate.content?.parts || [];
 
-  for (const part of candidate.content?.parts || []) {
+  for (const part of rawParts) {
     if (part.text) {
       content += part.text;
     } else if (part.functionCall) {
@@ -137,6 +143,7 @@ function parseResponse(data) {
         arguments: part.functionCall.args || {},
       });
     }
+    // thought parts and thoughtSignature fields are preserved in rawParts
   }
 
   const usage = {
@@ -146,7 +153,8 @@ function parseResponse(data) {
 
   const stopReason = candidate.finishReason || 'unknown';
 
-  return { content, toolCalls, usage, stopReason };
+  // rawParts carries thoughtSignature — needed for 3.x thinking models
+  return { content, toolCalls, usage, stopReason, _rawParts: rawParts };
 }
 
 function formatToolResult(toolCallId, name, result, isError) {
@@ -156,8 +164,8 @@ function formatToolResult(toolCallId, name, result, isError) {
   };
 }
 
-function formatAssistantMessage(content, toolCalls) {
-  return { role: 'assistant', content, toolCalls };
+function formatAssistantMessage(content, toolCalls, _rawParts) {
+  return { role: 'assistant', content, toolCalls, _rawParts };
 }
 
 function estimateCost(model, usage) {

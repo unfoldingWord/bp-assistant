@@ -110,19 +110,32 @@ async function runAgentLoop({
     console.log(`[agent-loop] Turn ${turns}...`);
 
     let response;
-    try {
-      response = await providerMod.sendRequest({
-        model: resolvedModel,
-        system,
-        messages,
-        tools,
-        thinking: resolvedThinking,
-        apiKey,
-        baseUrl,
-      });
-    } catch (err) {
-      console.error(`[agent-loop] API error on turn ${turns}: ${err.message}`);
-      throw err;
+    const maxRetries = 3;
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+      try {
+        response = await providerMod.sendRequest({
+          model: resolvedModel,
+          system,
+          messages,
+          tools,
+          thinking: resolvedThinking,
+          apiKey,
+          baseUrl,
+        });
+        break; // success
+      } catch (err) {
+        const isTransient = /503|502|500|529|overloaded|unavailable|service\s+temporarily|fetch\s+failed|network|ECONNRESET|ETIMEDOUT|ENOTFOUND/i.test(err.message);
+        const isRateLimit = /429|rate.?limit|too.many.requests/i.test(err.message);
+        const shouldRetry = (isTransient || isRateLimit) && attempt < maxRetries;
+        if (shouldRetry) {
+          const delayMs = isRateLimit ? 60000 : 15000 * attempt;
+          console.warn(`[agent-loop] Turn ${turns} attempt ${attempt} failed (${err.message.slice(0, 80)}...) — retrying in ${delayMs / 1000}s`);
+          await new Promise(r => setTimeout(r, delayMs));
+        } else {
+          console.error(`[agent-loop] API error on turn ${turns}: ${err.message}`);
+          throw err;
+        }
+      }
     }
 
     totalInputTokens += response.usage.inputTokens;
@@ -144,7 +157,7 @@ async function runAgentLoop({
     }
 
     // Record assistant message with tool calls
-    messages.push(providerMod.formatAssistantMessage(response.content, response.toolCalls));
+    messages.push(providerMod.formatAssistantMessage(response.content, response.toolCalls, response._rawParts));
 
     // Execute tool calls
     const results = [];

@@ -8,7 +8,7 @@ const path = require('path');
 
 // Load env from bot config
 try {
-  require('dotenv').config({ path: path.resolve(__dirname, '../../config/.env') });
+  require('dotenv').config({ path: path.resolve(__dirname, '../../../config/.env') });
 } catch {
   // dotenv not critical if env vars are set in shell
 }
