@@ -3,9 +3,9 @@
 // Skills: [post-edit-review OR deep-issue-id] -> [chapter-intro] -> tn-writer (Opus) -> tn-quality-check (Sonnet) -> repo-insert (Haiku)
 // chapter-intro is skipped by default; enabled when "with intro" is passed (unless auto-exclusion applies)
 //
-// Two-phase design:
-//   Phase 1: Run all skills except repo-insert (always runs, expensive)
-//   Phase 2: Repo insert — push to master (cheap, always runs inline)
+// Each chapter is fully processed (skills + repo-insert + repo-verify) before
+// moving to the next, so the editor gets access as soon as a chapter merges.
+// The user is only notified after the merge to master is confirmed.
 
 const fs = require('fs');
 const path = require('path');
@@ -154,10 +154,11 @@ async function notesPipeline(route, message) {
   const tokensBefore = getCumulativeTokens();
   let totalSuccess = 0;
   let totalFail = 0;
-  const completedChapters = []; // Phase 1 results for deferred insertion
 
   // =========================================================================
-  // Phase 1: Run all skills except repo-insert (always runs)
+  // Per-chapter loop: skills -> repo-insert -> repo-verify -> notify user
+  // Each chapter is merged before the next one starts, so the editor gets
+  // access immediately and isn't told a chapter is done until it's on master.
   // =========================================================================
   for (let ch = startChapter; ch <= endChapter; ch++) {
     const tag = `${book}-${ch}`;
@@ -178,7 +179,7 @@ async function notesPipeline(route, message) {
     let failedSkill = null;
     const chapterStart = Date.now();
 
-    // --- Build skill chain based on prerequisite availability (NO repo-insert) ---
+    // --- Build skill chain based on prerequisite availability ---
     const skills = [];
 
     if (hasAIArtifacts) {
@@ -310,73 +311,58 @@ async function notesPipeline(route, message) {
       continue;
     }
 
-    totalSuccess++;
-
-    // Collect for Phase 2 insertion — use resolved path from tn-writer if available
+    // --- Repo insert + verify inline so editor gets access immediately ---
     const tnWriterSkill = skills.find(s => s.name === 'tn-writer');
     const notesSource = tnWriterSkill?.resolvedOutput || `output/notes/${tag}.tsv`;
-    completedChapters.push({
-      ch,
-      skillRef,
-      repoInsertPrompt: `tn ${skillRef} ${username} --branch ${buildBranchName(book, ch)} --source ${notesSource}`,
-    });
+    const repoInsertPrompt = `tn ${skillRef} ${username} --branch ${buildBranchName(book, ch)} --source ${notesSource}`;
+    let chapterFailed = false;
 
-    if (chapterCount > 1) {
-      await reply(`**${ref}** notes complete (${chapterDuration}s)`);
+    await status(`Running **repo-insert** (TN) for ${ref}...`);
+    try {
+      const riTimeout = calcSkillTimeout(book, ch, 1);
+      const riResult = await runClaude({
+        prompt: repoInsertPrompt,
+        cwd: CSKILLBP_DIR,
+        model: model || 'sonnet',
+        skill: 'repo-insert',
+        timeoutMs: riTimeout,
+      });
+      recordMetrics({
+        pipeline: 'notes', skill: 'repo-insert',
+        book, chapter: ch, result: riResult,
+        success: riResult?.subtype === 'success', userId: message.sender_id,
+      });
+      await status(`**repo-insert** (TN) done for ${ref}`);
+    } catch (err) {
+      console.error(`[notes] repo-insert TN error for ${ref}: ${err.message}`);
+      await status(`**repo-insert** (TN) failed for ${ref}: ${err.message}`);
+      chapterFailed = true;
     }
-  }
 
-  // =========================================================================
-  // Phase 2: Repo insert \u2014 push to master
-  // =========================================================================
-  if (completedChapters.length > 0) {
-    for (const chData of completedChapters) {
-      let chapterFailed = false;
-
-      await status(`Running **repo-insert** (TN) for ${book} ${chData.ch}...`);
-      try {
-        const riTimeout = calcSkillTimeout(book, chData.ch, 1);
-        const riResult = await runClaude({
-          prompt: chData.repoInsertPrompt,
-          cwd: CSKILLBP_DIR,
-          model: model || 'haiku', // mechanical git/PR work; no judgment needed
-          skill: 'repo-insert',
-          timeoutMs: riTimeout,
-        });
-        recordMetrics({
-          pipeline: 'notes', skill: 'repo-insert',
-          book, chapter: chData.ch, result: riResult,
-          success: riResult?.subtype === 'success', userId: message.sender_id,
-        });
-        await status(`**repo-insert** (TN) done for ${book} ${chData.ch}`);
-      } catch (err) {
-        console.error(`[notes] repo-insert TN error for ${book} ${chData.ch}: ${err.message}`);
-        await status(`**repo-insert** (TN) failed for ${book} ${chData.ch}: ${err.message}`);
+    if (!chapterFailed) {
+      await status(`Verifying push for ${ref}...`);
+      const stagingBranch = buildBranchName(book, ch);
+      const verify = await verifyRepoPush({ repo: 'en_tn', stagingBranch });
+      if (!verify.success) {
+        await status(`Repo verify FAILED for ${ref}: ${verify.details}`);
+        console.warn(`[notes] Repo verify failed for ${ref}: ${verify.details}`);
         chapterFailed = true;
+      } else {
+        await status(`Repo verify OK for ${ref}: ${verify.details}`);
       }
+    }
 
-      // repo-verify against master
-      if (!chapterFailed) {
-        await status(`Verifying push for ${book} ${chData.ch}...`);
-        const stagingBranch = buildBranchName(book, chData.ch);
-        const verify = await verifyRepoPush({
-          repo: 'en_tn',
-          stagingBranch,
-        });
-        if (!verify.success) {
-          await status(`Repo verify FAILED for ${book} ${chData.ch}: ${verify.details}`);
-          console.warn(`[notes] Repo verify failed for ${book} ${chData.ch}: ${verify.details}`);
-          chapterFailed = true;
-        } else {
-          await status(`Repo verify OK for ${book} ${chData.ch}: ${verify.details}`);
-        }
-      }
+    if (chapterFailed) {
+      totalFail++;
+      await status(`Chapter ${ref} failed at **repo-insert/verify** after ${chapterDuration}s`);
+      continue;
+    }
 
-      if (chapterFailed) {
-        // Move from success to fail
-        totalSuccess--;
-        totalFail++;
-      }
+    totalSuccess++;
+
+    // Notify user only after merge to master is confirmed
+    if (chapterCount > 1) {
+      await reply(`**${ref}** notes merged to master on en_tn (${chapterDuration}s)`);
     }
   }
 

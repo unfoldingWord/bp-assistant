@@ -290,6 +290,9 @@ async function generatePipeline(route, message) {
         continue;
       }
       await status(`**align-all-parallel** done for ${book} ${ch} (${alignDuration}s)`);
+
+      // Collect for Phase 2 insertion (must be inside try block — alignedUltRel/alignedUstRel are block-scoped)
+      completedChapters.push({ ch, ultAligned: alignedUltRel, ustAligned: alignedUstRel });
     } catch (err) {
       console.error(`[generate] align-all-parallel error for ${book} ${ch}: ${err.message}`);
       await status(`**align-all-parallel** error for ${book} ${ch}: ${err.message}`);
@@ -297,8 +300,6 @@ async function generatePipeline(route, message) {
       continue;
     }
 
-    // Collect for Phase 2 insertion
-    completedChapters.push({ ch, ultAligned: alignedUltRel, ustAligned: alignedUstRel });
     success++;
   }
 
@@ -316,7 +317,7 @@ async function generatePipeline(route, message) {
         const riUltResult = await runClaude({
           prompt: `ult ${book} ${chData.ch} ${username} --branch ${buildBranchName(book, chData.ch)} --source ${chData.ultAligned}`,
           cwd: CSKILLBP_DIR,
-          model,
+          model: model || 'sonnet',
           skill: 'repo-insert',
           timeoutMs: riTimeout,
         });
@@ -340,7 +341,7 @@ async function generatePipeline(route, message) {
           const riUstResult = await runClaude({
             prompt: `ust ${book} ${chData.ch} ${username} --branch ${buildBranchName(book, chData.ch)} --source ${chData.ustAligned}`,
             cwd: CSKILLBP_DIR,
-            model,
+            model: model || 'sonnet',
             skill: 'repo-insert',
             timeoutMs: riTimeout,
           });
