@@ -3,6 +3,7 @@ const { getClient, sendMessage } = require('./zulip-client');
 const { routeMessage, hasPendingAction, hasActiveSession } = require('./router');
 const { ensureFreshToken } = require('./auth-refresh');
 const { getAllPendingMerges } = require('./pending-merges');
+const { verifyDcsToken } = require('./repo-verify');
 
 let myUserId = null;
 
@@ -95,6 +96,9 @@ async function main() {
   const REFRESH_INTERVAL_MS = 6 * 60 * 60 * 1000;
   ensureFreshToken().then(ok => {
     console.log(`[bot] Initial token check: ${ok ? 'OK' : 'FAILED — run claude login in container'}`);
+  });
+  verifyDcsToken().then(res => {
+    console.log(`[bot] DCS token check: ${res.details}`);
   });
   setInterval(() => {
     ensureFreshToken().then(ok => {

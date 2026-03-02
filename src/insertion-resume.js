@@ -9,7 +9,7 @@ const config = require('./config');
 const { sendMessage, sendDM, addReaction, removeReaction } = require('./zulip-client');
 const { runClaude } = require('./claude-runner');
 const { checkExistingBranch, buildBranchName, calcSkillTimeout, CSKILLBP_DIR } = require('./pipeline-utils');
-const { verifyRepoPush } = require('./repo-verify');
+const { verifyRepoPush, verifyDcsToken } = require('./repo-verify');
 const { getPendingMerge, setPendingMerge, clearPendingMerge } = require('./pending-merges');
 
 const adminUserId = config.adminUserId;

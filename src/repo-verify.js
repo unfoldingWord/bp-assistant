@@ -132,4 +132,27 @@ async function verifyRepoPush({ repo, stagingBranch }) {
   }
 }
 
-module.exports = { verifyRepoPush };
+/**
+ * Quick token validation — call before expensive pipeline work.
+ * Returns { valid: boolean, details: string }.
+ */
+async function verifyDcsToken() {
+  const token = process.env.DOOR43_TOKEN || process.env.GITEA_TOKEN;
+  if (!token) {
+    return { valid: false, details: 'No DCS token set (DOOR43_TOKEN / GITEA_TOKEN)' };
+  }
+  try {
+    const res = await apiGet(`/repos/${ORG}/en_tn`, token);
+    if (res.status === 401 || res.status === 403) {
+      return { valid: false, details: `DCS token is invalid or expired (HTTP ${res.status}). Regenerate at https://git.door43.org/user/settings/applications` };
+    }
+    if (res.status === 200) {
+      return { valid: true, details: 'DCS token OK' };
+    }
+    return { valid: false, details: `DCS token check returned unexpected HTTP ${res.status}` };
+  } catch (err) {
+    return { valid: false, details: `DCS token check failed: ${err.message}` };
+  }
+}
+
+module.exports = { verifyRepoPush, verifyDcsToken };

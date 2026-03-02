@@ -12,7 +12,7 @@ const config = require('./config');
 const { sendMessage, sendDM, addReaction, removeReaction, uploadFile } = require('./zulip-client');
 const { runClaude } = require('./claude-runner');
 const { getDoor43Username, buildBranchName, resolveOutputFile, calcSkillTimeout, normalizeBookName, CSKILLBP_DIR } = require('./pipeline-utils');
-const { verifyRepoPush } = require('./repo-verify');
+const { verifyRepoPush, verifyDcsToken } = require('./repo-verify');
 const { recordMetrics, getCumulativeTokens, recordRunSummary } = require('./usage-tracker');
 
 const LOG_DIR = path.resolve(__dirname, '../logs');
@@ -307,30 +307,53 @@ async function generatePipeline(route, message) {
   // Phase 2: Repo insert \u2014 push to master (non-file-response users only)
   // =========================================================================
   if (!isFileResponse && completedChapters.length > 0) {
+    // Pre-flight: verify DCS token before spending time on repo-insert
+    const dcsCheck = await verifyDcsToken();
+    if (!dcsCheck.valid) {
+      await status(`**ABORTING repo-insert phase**: ${dcsCheck.details}`);
+      await reply(`Generation complete but repo-insert skipped — DCS token invalid. Content is in output/ but not pushed.`);
+      fail += completedChapters.length;
+      success -= completedChapters.length;
+    } else {
+
     for (const chData of completedChapters) {
       let chapterFailed = false;
 
-      // repo-insert ULT
-      await status(`Running **repo-insert** (ULT) for ${book} ${chData.ch}...`);
-      try {
-        const riTimeout = calcSkillTimeout(book, chData.ch, 1);
-        const riUltResult = await runClaude({
-          prompt: `ult ${book} ${chData.ch} ${username} --branch ${buildBranchName(book, chData.ch)} --source ${chData.ultAligned}`,
-          cwd: CSKILLBP_DIR,
-          model: model || 'sonnet',
-          skill: 'repo-insert',
-          timeoutMs: riTimeout,
-        });
-        recordMetrics({
-          pipeline: 'generate', skill: 'repo-insert',
-          book, chapter: chData.ch, result: riUltResult,
-          success: riUltResult?.subtype === 'success', userId: message.sender_id,
-        });
-        await status(`**repo-insert** (ULT) done for ${book} ${chData.ch}`);
-      } catch (err) {
-        console.error(`[generate] repo-insert ULT error for ${book} ${chData.ch}: ${err.message}`);
-        await status(`**repo-insert** (ULT) failed for ${book} ${chData.ch}: ${err.message}`);
+      // Pre-flight: verify source files exist before calling Claude
+      const ultPath = path.resolve(CSKILLBP_DIR, chData.ultAligned);
+      const ustPath = path.resolve(CSKILLBP_DIR, chData.ustAligned);
+      if (!fs.existsSync(ultPath)) {
+        await status(`**repo-insert** SKIPPED (ULT) for ${book} ${chData.ch}: source file missing: ${chData.ultAligned}`);
         chapterFailed = true;
+      }
+      if (!chapterFailed && !fs.existsSync(ustPath)) {
+        await status(`**repo-insert** SKIPPED (UST) for ${book} ${chData.ch}: source file missing: ${chData.ustAligned}`);
+        chapterFailed = true;
+      }
+
+      // repo-insert ULT
+      if (!chapterFailed) {
+        await status(`Running **repo-insert** (ULT) for ${book} ${chData.ch}...`);
+        try {
+          const riTimeout = calcSkillTimeout(book, chData.ch, 1);
+          const riUltResult = await runClaude({
+            prompt: `ult ${book} ${chData.ch} ${username} --branch ${buildBranchName(book, chData.ch)} --source ${chData.ultAligned}`,
+            cwd: CSKILLBP_DIR,
+            model: model || 'sonnet',
+            skill: 'repo-insert',
+            timeoutMs: riTimeout,
+          });
+          recordMetrics({
+            pipeline: 'generate', skill: 'repo-insert',
+            book, chapter: chData.ch, result: riUltResult,
+            success: riUltResult?.subtype === 'success', userId: message.sender_id,
+          });
+          await status(`**repo-insert** (ULT) done for ${book} ${chData.ch}`);
+        } catch (err) {
+          console.error(`[generate] repo-insert ULT error for ${book} ${chData.ch}: ${err.message}`);
+          await status(`**repo-insert** (ULT) failed for ${book} ${chData.ch}: ${err.message}`);
+          chapterFailed = true;
+        }
       }
 
       // repo-insert UST
@@ -382,6 +405,7 @@ async function generatePipeline(route, message) {
         fail++;
       }
     }
+    } // end DCS token valid else block
   }
 
   // Swap emoji and send final status

@@ -13,7 +13,7 @@ const config = require('./config');
 const { sendMessage, sendDM, addReaction, removeReaction } = require('./zulip-client');
 const { runClaude } = require('./claude-runner');
 const { getDoor43Username, buildBranchName, resolveOutputFile, checkPrerequisites, calcSkillTimeout, normalizeBookName, CSKILLBP_DIR } = require('./pipeline-utils');
-const { verifyRepoPush } = require('./repo-verify');
+const { verifyRepoPush, verifyDcsToken } = require('./repo-verify');
 const { recordMetrics, getCumulativeTokens, recordRunSummary } = require('./usage-tracker');
 
 const LOG_DIR = path.resolve(__dirname, '../logs');
@@ -317,8 +317,24 @@ async function notesPipeline(route, message) {
     const repoInsertPrompt = `tn ${skillRef} ${username} --branch ${buildBranchName(book, ch)} --source ${notesSource}`;
     let chapterFailed = false;
 
-    await status(`Running **repo-insert** (TN) for ${ref}...`);
-    try {
+    // Pre-flight: verify DCS token before repo-insert
+    const dcsCheck = await verifyDcsToken();
+    if (!dcsCheck.valid) {
+      await status(`**repo-insert SKIPPED** for ${ref}: ${dcsCheck.details}`);
+      chapterFailed = true;
+    }
+
+    // Pre-flight: verify source file exists
+    if (!chapterFailed) {
+      const notesPath = path.resolve(CSKILLBP_DIR, notesSource);
+      if (!fs.existsSync(notesPath)) {
+        await status(`**repo-insert SKIPPED** for ${ref}: source file missing: ${notesSource}`);
+        chapterFailed = true;
+      }
+    }
+
+    if (!chapterFailed) await status(`Running **repo-insert** (TN) for ${ref}...`);
+    if (!chapterFailed) try {
       const riTimeout = calcSkillTimeout(book, ch, 1);
       const riResult = await runClaude({
         prompt: repoInsertPrompt,
