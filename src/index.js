@@ -36,9 +36,8 @@ async function handleEvents(events) {
     const flags = event.flags || [];
 
     if (msg.type === 'stream') {
-      // Filter to watched channel and topics
+      // Filter to watched channel (respond to all topics within it)
       if (msg.display_recipient !== config.channel) continue;
-      if (!config.topics.includes(msg.subject)) continue;
       // Require @-mention unless we're waiting for a yes/no confirmation or have an active session
       if (!flags.includes('mentioned')
         && !hasPendingAction(msg.display_recipient, msg.subject)
@@ -88,8 +87,7 @@ async function main() {
   const queue = await registerQueue(client);
   console.log(`[bot] Registered event queue`);
 
-  console.log(`[bot] Watching channel: "${config.channel}"`);
-  console.log(`[bot] Watching topics: ${config.topics.join(', ')}`);
+  console.log(`[bot] Watching channel: "${config.channel}" (all topics)`);
   if (config.watchDMs) console.log('[bot] Watching DMs');
 
   // Proactive token refresh every 6 hours (tokens last 8h, refresh at 30min margin)
