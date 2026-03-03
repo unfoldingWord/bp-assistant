@@ -14,6 +14,7 @@ const { runClaude } = require('./claude-runner');
 const { getDoor43Username, buildBranchName, resolveOutputFile, calcSkillTimeout, normalizeBookName, CSKILLBP_DIR } = require('./pipeline-utils');
 const { verifyRepoPush, verifyDcsToken } = require('./repo-verify');
 const { recordMetrics, getCumulativeTokens, recordRunSummary } = require('./usage-tracker');
+const { door43Push } = require('./door43-push');
 
 const LOG_DIR = path.resolve(__dirname, '../logs');
 
@@ -319,74 +320,72 @@ async function generatePipeline(route, message) {
     for (const chData of completedChapters) {
       let chapterFailed = false;
 
-      // Pre-flight: verify source files exist before calling Claude
+      // Pre-flight: verify source files exist
       const ultPath = path.resolve(CSKILLBP_DIR, chData.ultAligned);
       const ustPath = path.resolve(CSKILLBP_DIR, chData.ustAligned);
       if (!fs.existsSync(ultPath)) {
-        await status(`**repo-insert** SKIPPED (ULT) for ${book} ${chData.ch}: source file missing: ${chData.ultAligned}`);
+        await status(`**door43-push** SKIPPED (ULT) for ${book} ${chData.ch}: source file missing: ${chData.ultAligned}`);
         chapterFailed = true;
       }
       if (!chapterFailed && !fs.existsSync(ustPath)) {
-        await status(`**repo-insert** SKIPPED (UST) for ${book} ${chData.ch}: source file missing: ${chData.ustAligned}`);
+        await status(`**door43-push** SKIPPED (UST) for ${book} ${chData.ch}: source file missing: ${chData.ustAligned}`);
         chapterFailed = true;
       }
 
-      // repo-insert ULT
+      const pushStartTime = new Date().toISOString();
+
+      // door43-push ULT
       if (!chapterFailed) {
-        await status(`Running **repo-insert** (ULT) for ${book} ${chData.ch}...`);
+        await status(`Running **door43-push** (ULT) for ${book} ${chData.ch}...`);
         try {
-          const riTimeout = calcSkillTimeout(book, chData.ch, 1);
-          const riUltResult = await runClaude({
-            prompt: `ult ${book} ${chData.ch} ${username} --branch ${buildBranchName(book, chData.ch)} --source ${chData.ultAligned}`,
-            cwd: CSKILLBP_DIR,
-            model: model || 'sonnet',
-            skill: 'repo-insert',
-            timeoutMs: riTimeout,
+          const pushResultUlt = await door43Push({
+            type: 'ult', book, chapter: chData.ch,
+            username, branch: buildBranchName(book, chData.ch),
+            source: chData.ultAligned,
           });
-          recordMetrics({
-            pipeline: 'generate', skill: 'repo-insert',
-            book, chapter: chData.ch, result: riUltResult,
-            success: riUltResult?.subtype === 'success', userId: message.sender_id,
-          });
-          await status(`**repo-insert** (ULT) done for ${book} ${chData.ch}`);
+          if (!pushResultUlt.success) {
+            console.error(`[generate] door43-push ULT failed for ${book} ${chData.ch}: ${pushResultUlt.details}`);
+            await status(`**door43-push** (ULT) failed for ${book} ${chData.ch}: ${pushResultUlt.details}`);
+            chapterFailed = true;
+          } else {
+            await status(`**door43-push** (ULT) done for ${book} ${chData.ch}: ${pushResultUlt.details}`);
+          }
         } catch (err) {
-          console.error(`[generate] repo-insert ULT error for ${book} ${chData.ch}: ${err.message}`);
-          await status(`**repo-insert** (ULT) failed for ${book} ${chData.ch}: ${err.message}`);
+          console.error(`[generate] door43-push ULT error for ${book} ${chData.ch}: ${err.message}`);
+          await status(`**door43-push** (ULT) failed for ${book} ${chData.ch}: ${err.message}`);
           chapterFailed = true;
         }
       }
 
-      // repo-insert UST
+      // door43-push UST
       if (!chapterFailed) {
-        await status(`Running **repo-insert** (UST) for ${book} ${chData.ch}...`);
+        await status(`Running **door43-push** (UST) for ${book} ${chData.ch}...`);
         try {
-          const riTimeout = calcSkillTimeout(book, chData.ch, 1);
-          const riUstResult = await runClaude({
-            prompt: `ust ${book} ${chData.ch} ${username} --branch ${buildBranchName(book, chData.ch)} --source ${chData.ustAligned}`,
-            cwd: CSKILLBP_DIR,
-            model: model || 'sonnet',
-            skill: 'repo-insert',
-            timeoutMs: riTimeout,
+          const pushResultUst = await door43Push({
+            type: 'ust', book, chapter: chData.ch,
+            username, branch: buildBranchName(book, chData.ch),
+            source: chData.ustAligned,
           });
-          recordMetrics({
-            pipeline: 'generate', skill: 'repo-insert',
-            book, chapter: chData.ch, result: riUstResult,
-            success: riUstResult?.subtype === 'success', userId: message.sender_id,
-          });
-          await status(`**repo-insert** (UST) done for ${book} ${chData.ch}`);
+          if (!pushResultUst.success) {
+            console.error(`[generate] door43-push UST failed for ${book} ${chData.ch}: ${pushResultUst.details}`);
+            await status(`**door43-push** (UST) failed for ${book} ${chData.ch}: ${pushResultUst.details}`);
+            chapterFailed = true;
+          } else {
+            await status(`**door43-push** (UST) done for ${book} ${chData.ch}: ${pushResultUst.details}`);
+          }
         } catch (err) {
-          console.error(`[generate] repo-insert UST error for ${book} ${chData.ch}: ${err.message}`);
-          await status(`**repo-insert** (UST) failed for ${book} ${chData.ch}: ${err.message}`);
+          console.error(`[generate] door43-push UST error for ${book} ${chData.ch}: ${err.message}`);
+          await status(`**door43-push** (UST) failed for ${book} ${chData.ch}: ${err.message}`);
           chapterFailed = true;
         }
       }
 
-      // repo-verify: check staging branch was merged (deleted from remote)
+      // repo-verify: belt-and-suspenders check
       if (!chapterFailed) {
         const stagingBranch = buildBranchName(book, chData.ch);
         await status(`Verifying merges for ${book} ${chData.ch}...`);
-        const ultVerify = await verifyRepoPush({ repo: 'en_ult', stagingBranch });
-        const ustVerify = await verifyRepoPush({ repo: 'en_ust', stagingBranch });
+        const ultVerify = await verifyRepoPush({ repo: 'en_ult', stagingBranch, since: pushStartTime });
+        const ustVerify = await verifyRepoPush({ repo: 'en_ust', stagingBranch, since: pushStartTime });
 
         if (!ultVerify.success) {
           await status(`Repo verify FAILED (ULT) for ${book} ${chData.ch}: ${ultVerify.details}`);

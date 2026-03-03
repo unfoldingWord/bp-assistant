@@ -7,12 +7,19 @@ const fs = require('fs');
 const path = require('path');
 const config = require('./config');
 const { sendMessage, sendDM, addReaction, removeReaction } = require('./zulip-client');
-const { runClaude } = require('./claude-runner');
-const { checkExistingBranch, buildBranchName, calcSkillTimeout, CSKILLBP_DIR } = require('./pipeline-utils');
-const { verifyRepoPush, verifyDcsToken } = require('./repo-verify');
+const { checkExistingBranch, buildBranchName, CSKILLBP_DIR } = require('./pipeline-utils');
+const { verifyRepoPush } = require('./repo-verify');
+const { door43Push } = require('./door43-push');
 const { getPendingMerge, setPendingMerge, clearPendingMerge } = require('./pending-merges');
 
 const adminUserId = config.adminUserId;
+
+// Extract --source value from legacy repoInsertPrompt strings
+function extractSourceFromPrompt(prompt) {
+  if (!prompt) return '';
+  const m = prompt.match(/--source\s+(\S+)/);
+  return m ? m[1] : '';
+}
 
 async function status(text) {
   try { await sendDM(adminUserId, text); } catch (err) {
@@ -71,16 +78,13 @@ async function resumeInsertion(sessionKey, triggerMessage) {
   // Branches are clear -- run insertion (pushes to master now)
   await status(`[insertion-resume] Branches clear for ${sessionKey}, running deferred insertion...`);
 
-  const isTestFast = process.env.TEST_FAST === '1';
-  const model = isTestFast ? 'haiku' : undefined;
-
   let success = 0;
   let fail = 0;
 
   if (pipelineType === 'generate') {
-    ({ success, fail } = await runGenerateInsertPhase(completedChapters, username, book, model));
+    ({ success, fail } = await runGenerateInsertPhase(completedChapters, username, book));
   } else if (pipelineType === 'notes') {
-    ({ success, fail } = await runNotesInsertPhase(completedChapters, username, book, model));
+    ({ success, fail } = await runNotesInsertPhase(completedChapters, username, book));
   }
 
   // Clear pending state
@@ -130,57 +134,64 @@ async function resumeInsertion(sessionKey, triggerMessage) {
  * Run repo-insert + repo-verify for ULT and UST per chapter.
  * Pushes to master via the repo-insert skill's merge-to-master workflow.
  */
-async function runGenerateInsertPhase(completedChapters, username, book, model) {
+async function runGenerateInsertPhase(completedChapters, username, book) {
   let success = 0;
   let fail = 0;
 
   for (const ch of completedChapters) {
     let chapterFailed = false;
+    const pushStartTime = new Date().toISOString();
 
-    // repo-insert ULT
-    await status(`Running deferred **repo-insert** (ULT) for ${book} ${ch.ch}...`);
+    // door43-push ULT
+    await status(`Running deferred **door43-push** (ULT) for ${book} ${ch.ch}...`);
     try {
-      const riTimeout = calcSkillTimeout(book, ch.ch, 1);
-      await runClaude({
-        prompt: `ult ${book} ${ch.ch} ${username} --branch ${buildBranchName(book, ch.ch)} --source ${ch.ultAligned}`,
-        cwd: CSKILLBP_DIR,
-        model,
-        skill: 'repo-insert',
-        timeoutMs: riTimeout,
+      const pushResultUlt = await door43Push({
+        type: 'ult', book, chapter: ch.ch,
+        username, branch: buildBranchName(book, ch.ch),
+        source: ch.ultAligned,
       });
-      await status(`**repo-insert** (ULT) done for ${book} ${ch.ch}`);
+      if (!pushResultUlt.success) {
+        console.error(`[insertion-resume] door43-push ULT failed for ${book} ${ch.ch}: ${pushResultUlt.details}`);
+        await status(`**door43-push** (ULT) failed for ${book} ${ch.ch}: ${pushResultUlt.details}`);
+        chapterFailed = true;
+      } else {
+        await status(`**door43-push** (ULT) done for ${book} ${ch.ch}: ${pushResultUlt.details}`);
+      }
     } catch (err) {
-      console.error(`[insertion-resume] repo-insert ULT error for ${book} ${ch.ch}: ${err.message}`);
-      await status(`**repo-insert** (ULT) failed for ${book} ${ch.ch}: ${err.message}`);
+      console.error(`[insertion-resume] door43-push ULT error for ${book} ${ch.ch}: ${err.message}`);
+      await status(`**door43-push** (ULT) failed for ${book} ${ch.ch}: ${err.message}`);
       chapterFailed = true;
     }
 
-    // repo-insert UST
+    // door43-push UST
     if (!chapterFailed) {
-      await status(`Running deferred **repo-insert** (UST) for ${book} ${ch.ch}...`);
+      await status(`Running deferred **door43-push** (UST) for ${book} ${ch.ch}...`);
       try {
-        const riTimeout = calcSkillTimeout(book, ch.ch, 1);
-        await runClaude({
-          prompt: `ust ${book} ${ch.ch} ${username} --branch ${buildBranchName(book, ch.ch)} --source ${ch.ustAligned}`,
-          cwd: CSKILLBP_DIR,
-          model,
-          skill: 'repo-insert',
-          timeoutMs: riTimeout,
+        const pushResultUst = await door43Push({
+          type: 'ust', book, chapter: ch.ch,
+          username, branch: buildBranchName(book, ch.ch),
+          source: ch.ustAligned,
         });
-        await status(`**repo-insert** (UST) done for ${book} ${ch.ch}`);
+        if (!pushResultUst.success) {
+          console.error(`[insertion-resume] door43-push UST failed for ${book} ${ch.ch}: ${pushResultUst.details}`);
+          await status(`**door43-push** (UST) failed for ${book} ${ch.ch}: ${pushResultUst.details}`);
+          chapterFailed = true;
+        } else {
+          await status(`**door43-push** (UST) done for ${book} ${ch.ch}: ${pushResultUst.details}`);
+        }
       } catch (err) {
-        console.error(`[insertion-resume] repo-insert UST error for ${book} ${ch.ch}: ${err.message}`);
-        await status(`**repo-insert** (UST) failed for ${book} ${ch.ch}: ${err.message}`);
+        console.error(`[insertion-resume] door43-push UST error for ${book} ${ch.ch}: ${err.message}`);
+        await status(`**door43-push** (UST) failed for ${book} ${ch.ch}: ${err.message}`);
         chapterFailed = true;
       }
     }
 
-    // repo-verify: check staging branch was merged (deleted from remote)
+    // repo-verify: belt-and-suspenders check
     if (!chapterFailed) {
       const stagingBranch = buildBranchName(book, ch.ch);
       await status(`Verifying merges for ${book} ${ch.ch}...`);
-      const ultVerify = await verifyRepoPush({ repo: 'en_ult', stagingBranch });
-      const ustVerify = await verifyRepoPush({ repo: 'en_ust', stagingBranch });
+      const ultVerify = await verifyRepoPush({ repo: 'en_ult', stagingBranch, since: pushStartTime });
+      const ustVerify = await verifyRepoPush({ repo: 'en_ust', stagingBranch, since: pushStartTime });
 
       if (!ultVerify.success) {
         await status(`Repo verify FAILED (ULT) for ${book} ${ch.ch}: ${ultVerify.details}`);
@@ -204,35 +215,39 @@ async function runGenerateInsertPhase(completedChapters, username, book, model) 
  * Run repo-insert + repo-verify for TN per chapter.
  * Pushes to master via the repo-insert skill's merge-to-master workflow.
  */
-async function runNotesInsertPhase(completedChapters, username, book, model) {
+async function runNotesInsertPhase(completedChapters, username, book) {
   let success = 0;
   let fail = 0;
 
   for (const ch of completedChapters) {
     let chapterFailed = false;
+    const pushStartTime = new Date().toISOString();
 
-    await status(`Running deferred **repo-insert** (TN) for ${book} ${ch.ch}...`);
+    await status(`Running deferred **door43-push** (TN) for ${book} ${ch.ch}...`);
     try {
-      const riTimeout = calcSkillTimeout(book, ch.ch, 1);
-      await runClaude({
-        prompt: ch.repoInsertPrompt,
-        cwd: CSKILLBP_DIR,
-        model,
-        skill: 'repo-insert',
-        timeoutMs: riTimeout,
+      const pushResult = await door43Push({
+        type: 'tn', book, chapter: ch.ch,
+        username, branch: buildBranchName(book, ch.ch),
+        source: ch.notesSource || extractSourceFromPrompt(ch.repoInsertPrompt),
       });
-      await status(`**repo-insert** (TN) done for ${book} ${ch.ch}`);
+      if (!pushResult.success) {
+        console.error(`[insertion-resume] door43-push TN failed for ${book} ${ch.ch}: ${pushResult.details}`);
+        await status(`**door43-push** (TN) failed for ${book} ${ch.ch}: ${pushResult.details}`);
+        chapterFailed = true;
+      } else {
+        await status(`**door43-push** (TN) done for ${book} ${ch.ch}: ${pushResult.details}`);
+      }
     } catch (err) {
-      console.error(`[insertion-resume] repo-insert TN error for ${book} ${ch.ch}: ${err.message}`);
-      await status(`**repo-insert** (TN) failed for ${book} ${ch.ch}: ${err.message}`);
+      console.error(`[insertion-resume] door43-push TN error for ${book} ${ch.ch}: ${err.message}`);
+      await status(`**door43-push** (TN) failed for ${book} ${ch.ch}: ${err.message}`);
       chapterFailed = true;
     }
 
-    // repo-verify: check staging branch was merged (deleted from remote)
+    // repo-verify: belt-and-suspenders check
     if (!chapterFailed) {
       const stagingBranch = buildBranchName(book, ch.ch);
       await status(`Verifying merge for ${book} ${ch.ch}...`);
-      const verify = await verifyRepoPush({ repo: 'en_tn', stagingBranch });
+      const verify = await verifyRepoPush({ repo: 'en_tn', stagingBranch, since: pushStartTime });
       if (!verify.success) {
         await status(`Repo verify FAILED for ${book} ${ch.ch}: ${verify.details}`);
         chapterFailed = true;

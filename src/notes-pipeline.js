@@ -15,6 +15,7 @@ const { runClaude } = require('./claude-runner');
 const { getDoor43Username, buildBranchName, resolveOutputFile, checkPrerequisites, calcSkillTimeout, normalizeBookName, CSKILLBP_DIR } = require('./pipeline-utils');
 const { verifyRepoPush, verifyDcsToken } = require('./repo-verify');
 const { recordMetrics, getCumulativeTokens, recordRunSummary } = require('./usage-tracker');
+const { door43Push } = require('./door43-push');
 
 const LOG_DIR = path.resolve(__dirname, '../logs');
 
@@ -314,13 +315,12 @@ async function notesPipeline(route, message) {
     // --- Repo insert + verify inline so editor gets access immediately ---
     const tnWriterSkill = skills.find(s => s.name === 'tn-writer');
     const notesSource = tnWriterSkill?.resolvedOutput || `output/notes/${tag}.tsv`;
-    const repoInsertPrompt = `tn ${skillRef} ${username} --branch ${buildBranchName(book, ch)} --source ${notesSource}`;
     let chapterFailed = false;
 
-    // Pre-flight: verify DCS token before repo-insert
+    // Pre-flight: verify DCS token before push
     const dcsCheck = await verifyDcsToken();
     if (!dcsCheck.valid) {
-      await status(`**repo-insert SKIPPED** for ${ref}: ${dcsCheck.details}`);
+      await status(`**door43-push SKIPPED** for ${ref}: ${dcsCheck.details}`);
       chapterFailed = true;
     }
 
@@ -328,37 +328,36 @@ async function notesPipeline(route, message) {
     if (!chapterFailed) {
       const notesPath = path.resolve(CSKILLBP_DIR, notesSource);
       if (!fs.existsSync(notesPath)) {
-        await status(`**repo-insert SKIPPED** for ${ref}: source file missing: ${notesSource}`);
+        await status(`**door43-push SKIPPED** for ${ref}: source file missing: ${notesSource}`);
         chapterFailed = true;
       }
     }
 
-    if (!chapterFailed) await status(`Running **repo-insert** (TN) for ${ref}...`);
+    if (!chapterFailed) await status(`Running **door43-push** (TN) for ${ref}...`);
+    const pushStartTime = new Date().toISOString();
     if (!chapterFailed) try {
-      const riTimeout = calcSkillTimeout(book, ch, 1);
-      const riResult = await runClaude({
-        prompt: repoInsertPrompt,
-        cwd: CSKILLBP_DIR,
-        model: model || 'sonnet',
-        skill: 'repo-insert',
-        timeoutMs: riTimeout,
+      const pushResult = await door43Push({
+        type: 'tn', book, chapter: ch,
+        username, branch: buildBranchName(book, ch),
+        source: notesSource,
       });
-      recordMetrics({
-        pipeline: 'notes', skill: 'repo-insert',
-        book, chapter: ch, result: riResult,
-        success: riResult?.subtype === 'success', userId: message.sender_id,
-      });
-      await status(`**repo-insert** (TN) done for ${ref}`);
+      if (!pushResult.success) {
+        console.error(`[notes] door43-push TN failed for ${ref}: ${pushResult.details}`);
+        await status(`**door43-push** (TN) failed for ${ref}: ${pushResult.details}`);
+        chapterFailed = true;
+      } else {
+        await status(`**door43-push** (TN) done for ${ref}: ${pushResult.details}`);
+      }
     } catch (err) {
-      console.error(`[notes] repo-insert TN error for ${ref}: ${err.message}`);
-      await status(`**repo-insert** (TN) failed for ${ref}: ${err.message}`);
+      console.error(`[notes] door43-push TN error for ${ref}: ${err.message}`);
+      await status(`**door43-push** (TN) failed for ${ref}: ${err.message}`);
       chapterFailed = true;
     }
 
     if (!chapterFailed) {
       await status(`Verifying push for ${ref}...`);
       const stagingBranch = buildBranchName(book, ch);
-      const verify = await verifyRepoPush({ repo: 'en_tn', stagingBranch });
+      const verify = await verifyRepoPush({ repo: 'en_tn', stagingBranch, since: pushStartTime });
       if (!verify.success) {
         await status(`Repo verify FAILED for ${ref}: ${verify.details}`);
         console.warn(`[notes] Repo verify failed for ${ref}: ${verify.details}`);

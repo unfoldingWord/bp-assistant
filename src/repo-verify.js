@@ -54,9 +54,10 @@ function apiGet(path, token) {
  * @param {object} opts
  * @param {string} opts.repo - Repo name (en_tn, en_ult, en_ust)
  * @param {string} opts.stagingBranch - The staging branch name that should have been merged+deleted
+ * @param {string} [opts.since] - ISO timestamp; only accept PRs merged after this time
  * @returns {{ success: boolean, details: string }}
  */
-async function verifyRepoPush({ repo, stagingBranch }) {
+async function verifyRepoPush({ repo, stagingBranch, since }) {
   const token = process.env.DOOR43_TOKEN || process.env.GITEA_TOKEN;
 
   if (!token) {
@@ -97,7 +98,15 @@ async function verifyRepoPush({ repo, stagingBranch }) {
     }
 
     const pulls = Array.isArray(res.data) ? res.data : [];
-    const merged = pulls.find(pr => pr.merged === true || pr.merged_by != null);
+    const merged = pulls.find(pr => {
+      const isMerged = pr.merged === true || pr.merged_by != null;
+      if (!isMerged) return false;
+      // If 'since' provided, only accept PRs merged after that time
+      if (since && pr.merged_at) {
+        return new Date(pr.merged_at) >= new Date(since);
+      }
+      return true;
+    });
 
     if (merged) {
       return {
