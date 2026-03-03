@@ -91,37 +91,38 @@ function warnThreshold() { return getConfig().warnThreshold || 0.7; }
 function ccusagePath() { return getConfig().ccusagePath || 'npx ccusage@latest'; }
 
 // Bootstrap defaults: tokens/verse for each skill
-// Measured 2026-02-20 on PSA 129 (8 verses, 17 notes, 8.2M total tokens).
-// Will be replaced by median-based estimates once >=3 data points exist per skill.
+// Updated 2026-03-03 from 101 actual skill runs (medians).
+// Will be replaced by median-based estimates once >=2 data points exist per skill.
 const BOOTSTRAP_DEFAULTS = {
-  'generate|initial-pipeline --lite': 250000,
-  'generate|align-all-parallel':     100000,
-  'notes|post-edit-review':          145000,  // observed: 1.16M / 8v
-  'notes|tn-writer':                 725000,  // observed: 5.80M / 8v
-  'notes|tn-quality-check':           87000,  // observed: 695K / 8v
-  'notes|chapter-intro':              50000,  // not yet measured
-  'notes|deep-issue-id --lite':      200000,  // not yet measured
-  '*|repo-insert':                    74000,  // observed: 589K / 8v
+  'generate|initial-pipeline --lite': 118000,  // 17 runs, median 117,987
+  'generate|align-all-parallel':      12000,   // 7 runs, median 12,342
+  'notes|post-edit-review':          124000,   // 15 runs, median 123,921
+  'notes|tn-writer':                 467000,   // 15 runs, median 466,667
+  'notes|tn-quality-check':           95000,   // 15 runs, median 94,570
+  'notes|chapter-intro':             124000,   // 2 runs, median 123,795
+  'notes|deep-issue-id --lite':       36000,   // 1 run, 36,438
+  '*|repo-insert':                    47000,   // 23 runs, blended gen+notes median
 };
 
 // Bootstrap defaults: seconds/verse for each skill (for time estimates)
-// Derived from observed durations across PSA 128-132 runs.
-// Will be replaced by median-based estimates once >=3 data points exist per skill.
+// Updated 2026-03-03 from 101 actual skill runs (medians).
+// Will be replaced by median-based estimates once >=2 data points exist per skill.
 const TIME_BOOTSTRAP_DEFAULTS = {
-  'generate|initial-pipeline --lite': 150,  // observed: 63-207 s/v
-  'generate|align-all-parallel':      35,   // observed: 35 s/v (1 data point)
-  'notes|post-edit-review':           40,   // observed: 22-49 s/v
-  'notes|tn-writer':                  65,   // observed: 41-102 s/v
-  'notes|tn-quality-check':           25,   // observed: 17-32 s/v
-  'notes|chapter-intro':              10,   // observed: 7-9 s/v
-  'notes|deep-issue-id --lite':       30,   // not yet measured well
-  '*|repo-insert':                    15,   // observed: 6-35 s/v
+  'generate|initial-pipeline --lite': 73,   // 17 runs, median 72.9
+  'generate|align-all-parallel':      56,   // 7 runs, median 55.6
+  'notes|post-edit-review':           40,   // 15 runs, median 39.6
+  'notes|tn-writer':                  73,   // 15 runs, median 73.3
+  'notes|tn-quality-check':           23,   // 15 runs, median 23.2
+  'notes|chapter-intro':              25,   // 2 runs, median 24.6
+  'notes|deep-issue-id --lite':       14,   // 1 run, 13.9
+  '*|repo-insert':                    12,   // 23 runs, blended gen+notes median
 };
 
 // Skill chains: which skills run for each pipeline type
+// notes uses deep-issue-id --lite (no AI artifacts available for new chapters)
 const SKILL_CHAINS = {
   generate: ['initial-pipeline --lite', 'align-all-parallel', 'repo-insert'],
-  notes: ['post-edit-review', 'tn-writer', 'tn-quality-check', 'repo-insert'],
+  notes: ['deep-issue-id --lite', 'tn-writer', 'tn-quality-check', 'repo-insert'],
 };
 
 // ---------------------------------------------------------------------------
@@ -242,11 +243,11 @@ function estimateTokens({ pipeline, book, startCh, endCh }) {
     const bootstrap = getBootstrapDefault(pipeline, skill);
     let tokensPerVerse;
 
-    if (perVerseValues.length < 3) {
+    if (perVerseValues.length < 2) {
       tokensPerVerse = bootstrap;
       anyBootstrapped = true;
-    } else if (perVerseValues.length <= 10) {
-      // Blend 50% historical + 50% bootstrap
+    } else if (perVerseValues.length <= 5) {
+      // Blend 50% historical + 50% bootstrap until we have enough data
       const sorted = perVerseValues.sort((a, b) => a - b);
       const median = sorted[Math.floor(sorted.length / 2)];
       tokensPerVerse = (median + bootstrap) / 2;
@@ -265,9 +266,9 @@ function estimateTokens({ pipeline, book, startCh, endCh }) {
     const timeBootstrap = getTimeBootstrapDefault(pipeline, skill);
     let secsPerVerse;
 
-    if (secsPerVerseValues.length < 3) {
+    if (secsPerVerseValues.length < 2) {
       secsPerVerse = timeBootstrap;
-    } else if (secsPerVerseValues.length <= 10) {
+    } else if (secsPerVerseValues.length <= 5) {
       const sorted = secsPerVerseValues.sort((a, b) => a - b);
       const median = sorted[Math.floor(sorted.length / 2)];
       secsPerVerse = (median + timeBootstrap) / 2;
