@@ -162,7 +162,8 @@ async function notesPipeline(route, message) {
   // access immediately and isn't told a chapter is done until it's on master.
   // =========================================================================
   for (let ch = startChapter; ch <= endChapter; ch++) {
-    const tag = `${book}-${ch}`;
+    const width = book.toUpperCase() === 'PSA' ? 3 : 2;
+    const tag = `${book}-${String(ch).padStart(width, '0')}`;
     const verseRange = verseStart != null && startChapter === endChapter
       ? `:${verseStart}-${verseEnd}` : '';
     const ref = `${book} ${ch}${verseRange}`;
