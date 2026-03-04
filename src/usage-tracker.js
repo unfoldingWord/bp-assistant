@@ -94,13 +94,13 @@ function ccusagePath() { return getConfig().ccusagePath || 'npx ccusage@latest';
 // Updated 2026-03-03 from 101 actual skill runs (medians).
 // Will be replaced by median-based estimates once >=2 data points exist per skill.
 const BOOTSTRAP_DEFAULTS = {
-  'generate|initial-pipeline --lite': 118000,  // 17 runs, median 117,987
+  'generate|initial-pipeline': 118000,  // 17 runs, median 117,987
   'generate|align-all-parallel':      12000,   // 7 runs, median 12,342
   'notes|post-edit-review':          124000,   // 15 runs, median 123,921
   'notes|tn-writer':                 467000,   // 15 runs, median 466,667
   'notes|tn-quality-check':           95000,   // 15 runs, median 94,570
   'notes|chapter-intro':             124000,   // 2 runs, median 123,795
-  'notes|deep-issue-id --lite':       36000,   // 1 run, 36,438
+  'notes|deep-issue-id':       36000,   // 1 run, 36,438
   '*|repo-insert':                    47000,   // 23 runs, blended gen+notes median
 };
 
@@ -108,21 +108,21 @@ const BOOTSTRAP_DEFAULTS = {
 // Updated 2026-03-03 from 101 actual skill runs (medians).
 // Will be replaced by median-based estimates once >=2 data points exist per skill.
 const TIME_BOOTSTRAP_DEFAULTS = {
-  'generate|initial-pipeline --lite': 73,   // 17 runs, median 72.9
+  'generate|initial-pipeline': 73,   // 17 runs, median 72.9
   'generate|align-all-parallel':      56,   // 7 runs, median 55.6
   'notes|post-edit-review':           40,   // 15 runs, median 39.6
   'notes|tn-writer':                  73,   // 15 runs, median 73.3
   'notes|tn-quality-check':           23,   // 15 runs, median 23.2
   'notes|chapter-intro':              25,   // 2 runs, median 24.6
-  'notes|deep-issue-id --lite':       14,   // 1 run, 13.9
+  'notes|deep-issue-id':       14,   // 1 run, 13.9
   '*|repo-insert':                    12,   // 23 runs, blended gen+notes median
 };
 
 // Skill chains: which skills run for each pipeline type
-// notes uses deep-issue-id --lite (no AI artifacts available for new chapters)
+// notes uses deep-issue-id (no AI artifacts available for new chapters)
 const SKILL_CHAINS = {
-  generate: ['initial-pipeline --lite', 'align-all-parallel', 'repo-insert'],
-  notes: ['deep-issue-id --lite', 'tn-writer', 'tn-quality-check', 'repo-insert'],
+  generate: ['initial-pipeline', 'align-all-parallel', 'repo-insert'],
+  notes: ['deep-issue-id', 'tn-writer', 'tn-quality-check', 'repo-insert'],
 };
 
 // ---------------------------------------------------------------------------

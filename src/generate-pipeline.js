@@ -134,7 +134,7 @@ async function generatePipeline(route, message) {
   const model = isTestFast ? 'haiku' : undefined;
 
   // Determine skill from route config
-  const skill = route.skill || 'initial-pipeline --lite';
+  const skill = route.skill || 'initial-pipeline';
 
   const tokensBefore = getCumulativeTokens();
   let success = 0;
@@ -226,7 +226,7 @@ async function generatePipeline(route, message) {
 
     // Record metrics for initial-pipeline
     recordMetrics({
-      pipeline: 'generate', skill: route.skill || 'initial-pipeline --lite',
+      pipeline: 'generate', skill: route.skill || 'initial-pipeline',
       book, chapter: ch, result: claudeResult, success: hasUst, userId: message.sender_id,
     });
 

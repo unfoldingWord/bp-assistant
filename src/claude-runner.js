@@ -21,6 +21,9 @@ const DEFAULT_MAX_TURNS = 200;
 const DEFAULT_ALLOWED_TOOLS = [
   'Read', 'Write', 'Edit', 'Glob', 'Grep', 'Bash',
   'Task', 'Skill', 'SendMessage',
+  'Agent', 'TeamCreate', 'TeamDelete',
+  'TaskCreate', 'TaskUpdate', 'TaskList', 'TaskGet',
+  'NotebookEdit', 'WebFetch', 'WebSearch',
 ];
 
 function buildOptions({

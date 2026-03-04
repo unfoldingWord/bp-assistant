@@ -199,14 +199,12 @@ async function notesPipeline(route, message) {
     } else {
       // No AI artifacts -> deep-issue-id path (fetches from Door43 master)
       issuesPath = `output/issues/${tag}.tsv`;
-      await status(`**${ref}**: No AI artifacts (missing: ${missing.join(', ')}) \u2192 deep-issue-id --lite path`);
+      await status(`**${ref}**: No AI artifacts (missing: ${missing.join(', ')}) \u2192 deep-issue-id path`);
 
       const hasVerseRange = verseStart != null && startChapter === endChapter;
       const verseFlag = hasVerseRange ? ` --verses ${verseStart}-${verseEnd}` : '';
-      // deep-issue-id outputs to a verse-suffixed file when --verses is used,
-      // then concatenates to the base filename
       skills.push({
-        name: 'deep-issue-id --lite',
+        name: 'deep-issue-id',
         prompt: `${book} ${ch}${verseFlag}`,
         expectedOutput: `output/issues/${tag}.tsv`,
         ops: 3, // 2 analysts + challenger/merge
@@ -279,7 +277,7 @@ async function notesPipeline(route, message) {
         }
         skill.resolvedOutput = resolved;
         // Update issuesPath if deep-issue-id produced it in a subdirectory
-        if (skill.name === 'deep-issue-id --lite') {
+        if (skill.name === 'deep-issue-id') {
           issuesPath = resolved;
           // Update subsequent skill prompts that reference issuesPath
           for (const s of skills) {
