@@ -201,9 +201,13 @@ async function notesPipeline(route, message) {
       issuesPath = `output/issues/${tag}.tsv`;
       await status(`**${ref}**: No AI artifacts (missing: ${missing.join(', ')}) \u2192 deep-issue-id --lite path`);
 
+      const hasVerseRange = verseStart != null && startChapter === endChapter;
+      const verseFlag = hasVerseRange ? ` --verses ${verseStart}-${verseEnd}` : '';
+      // deep-issue-id outputs to a verse-suffixed file when --verses is used,
+      // then concatenates to the base filename
       skills.push({
         name: 'deep-issue-id --lite',
-        prompt: `${book} ${ch}`,
+        prompt: `${book} ${ch}${verseFlag}`,
         expectedOutput: `output/issues/${tag}.tsv`,
         ops: 3, // 2 analysts + challenger/merge
       });

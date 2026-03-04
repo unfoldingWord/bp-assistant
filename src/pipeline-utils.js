@@ -77,7 +77,8 @@ function resolveOutputFile(relPath, book) {
 
 // --- Verify prerequisite files exist (AI-ULT, AI-UST, issues) ---
 function checkPrerequisites(book, chapter) {
-  const tag = `${book}-${chapter}`;
+  const width = book.toUpperCase() === 'PSA' ? 3 : 2;
+  const tag = `${book}-${String(chapter).padStart(width, '0')}`;
   const required = [
     { path: `output/AI-ULT/${tag}.usfm`, label: 'AI-ULT' },
     { path: `output/AI-UST/${tag}.usfm`, label: 'AI-UST' },
