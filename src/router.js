@@ -229,6 +229,23 @@ function buildSyntheticRoute(intent, senderName) {
     ? `${intent.book} ${intent.startChapter}`
     : `${intent.book} ${intent.startChapter}–${intent.endChapter}`;
 
+  if (intent.intent === 'editor-note') {
+    const bookLabel = intent.book || 'unknown';
+    const chapterLabel = intent.startChapter ? ` ${intent.startChapter}` : '';
+    const scopeLabel = intent.startChapter ? `**${bookLabel} ${intent.startChapter}**` : `**${bookLabel}** (book-wide)`;
+    const notePreview = intent.noteText ? `: '${intent.noteText}'` : '';
+    return {
+      name: 'editor-note',
+      type: 'editor-note',
+      reply: true,
+      _synthetic: true,
+      _book: bookLabel,
+      _chapter: intent.startChapter || null,
+      _noteText: intent.noteText || '',
+      confirmMessage: `I'll file this note for ${scopeLabel}${notePreview}. Sound right? (yes/no)`,
+    };
+  }
+
   if (intent.intent === 'editor-review') {
     const types = intent.contentTypes || ['ult', 'ust'];
     const typeLabel = types.map(t => t.toUpperCase()).join(' & ');
@@ -319,7 +336,8 @@ const HELP_TEXT = `I can help with:\n` +
   `- **write notes for PSA 82** -- generate translation notes\n` +
   `- **PSA 82 review** -- review editor changes (ULT & UST)\n` +
   `- **PSA 82 ULT review** -- review only ULT changes\n` +
-  `- **review Psalm 82 UST** -- also works with natural phrasing`;
+  `- **review Psalm 82 UST** -- also works with natural phrasing\n` +
+  `- **note JER lots of implicit info** -- file an observation for a book`;
 
 async function routeMessage(message) {
   const isAdmin = message.sender_id === config.adminUserId;
@@ -426,6 +444,29 @@ async function routeMessage(message) {
       };
     }
 
+    // Editor-note: enrich with captures, simple confirmation (no timeout/usage tracking)
+    if (route.name === 'editor-note') {
+      const book = normalizeBookName(captures[0] || '');
+      const chapter = captures[1] || null;
+      const chapterLabel = chapter ? ` ${chapter}` : ' (book-wide)';
+      activeRoute = {
+        ...route,
+        _captures: captures,
+        _book: book,
+        confirmMessage: `I'll file this note for **${book}${chapterLabel}**. Sound right? (yes/no)`,
+      };
+
+      if (isStream && activeRoute.confirmMessage) {
+        pendingConfirmations.set(sessionKey, { route: activeRoute, message, timeoutMs: MIN_TIMEOUT_MS });
+        console.log(`[router] Awaiting confirmation for "${activeRoute.name}" in ${sessionKey}`);
+        await sendMessage(message.display_recipient, message.subject,
+          `@**${message.sender_full_name}** ${activeRoute.confirmMessage}`);
+        return;
+      }
+      firePipeline(activeRoute, message);
+      return;
+    }
+
     // Stream messages get confirmation before running (if route has confirmMessage)
     if (isStream && activeRoute.confirmMessage) {
       // editor-review confirmMessage is already baked in; others need placeholder substitution
@@ -487,7 +528,18 @@ async function routeMessage(message) {
       const intent = await classifyIntent(message.content);
       console.log(`[router] Haiku classified as: ${JSON.stringify(intent)}`);
 
-      if (intent.intent !== 'unknown' && intent.book && intent.startChapter) {
+      // editor-note only needs book, not startChapter
+      if (intent.intent === 'editor-note' && intent.book) {
+        const syntheticRoute = buildSyntheticRoute(intent, message.sender_full_name);
+        if (syntheticRoute) {
+          const confirmText = syntheticRoute.confirmMessage;
+          pendingConfirmations.set(sessionKey, { route: syntheticRoute, message, timeoutMs: MIN_TIMEOUT_MS });
+          console.log(`[router] Haiku → awaiting confirmation for synthetic "editor-note" in ${sessionKey}`);
+          await sendMessage(message.display_recipient, message.subject,
+            `@**${message.sender_full_name}** ${confirmText}`);
+          haikuMatched = true;
+        }
+      } else if (intent.intent !== 'unknown' && intent.book && intent.startChapter) {
         const syntheticRoute = buildSyntheticRoute(intent, message.sender_full_name);
         if (syntheticRoute) {
           const captures = intent.startChapter === intent.endChapter

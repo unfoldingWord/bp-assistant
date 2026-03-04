@@ -17,6 +17,7 @@ Extract the intent and parameters as JSON. Valid intents:
 - "generate": user wants ULT and/or UST generated for chapters
 - "notes": user wants translation notes produced for chapters
 - "editor-review": user wants to review/compare editor changes against AI output (ULT/UST ONLY — never for translation notes/TN)
+- "editor-note": user wants to file an observation or note about a book/passage for future reference
 - "unknown": doesn't match any pattern
 
 If the user asks to review or compare translation notes (TN), classify as "unknown" — editor-review only handles ULT and UST.
@@ -27,7 +28,9 @@ If you can't determine the book or chapters, use intent "unknown".
 
 For editor-review, also extract contentTypes: ["ult"] if user mentions only ULT, ["ust"] if only UST, ["ult","ust"] if both or neither specified.
 
-Respond ONLY with valid JSON, no other text: {"intent":"...","book":"...","startChapter":N,"endChapter":N,"contentTypes":["ult","ust"]}`;
+For editor-note, also extract noteText: a concise summary of the observation the user wants to file.
+
+Respond ONLY with valid JSON, no other text: {"intent":"...","book":"...","startChapter":N,"endChapter":N,"contentTypes":["ult","ust"],"noteText":"..."}`;
 
 /**
  * Classify a Zulip message into a pipeline intent.
@@ -79,7 +82,7 @@ async function classifyIntent(messageContent) {
 
   try {
     const parsed = JSON.parse(text);
-    if (!parsed.intent || !['generate', 'notes', 'editor-review', 'unknown'].includes(parsed.intent)) {
+    if (!parsed.intent || !['generate', 'notes', 'editor-review', 'editor-note', 'unknown'].includes(parsed.intent)) {
       return { intent: 'unknown', book: null, startChapter: null, endChapter: null, contentTypes: ['ult', 'ust'] };
     }
     const contentTypes = Array.isArray(parsed.contentTypes) && parsed.contentTypes.length > 0
@@ -91,6 +94,7 @@ async function classifyIntent(messageContent) {
       startChapter: parsed.startChapter ?? null,
       endChapter: parsed.endChapter ?? null,
       contentTypes,
+      noteText: parsed.noteText || null,
     };
   } catch (err) {
     console.error(`[intent-classifier] Failed to parse response: ${replyText.slice(0, 200)}`);
