@@ -177,6 +177,10 @@ function syncRepo(repoDir, repoName, branch) {
     execSync(`git remote set-url origin ${authUrl}`, { cwd: repoDir, timeout: 5000, stdio: 'pipe' });
   }
 
+  // Ensure git identity is configured (prevents "Author identity unknown" errors)
+  execFileSync('git', ['config', 'user.email', 'bot@unfoldingword.org'], { cwd: repoDir, timeout: 5000, stdio: 'pipe' });
+  execFileSync('git', ['config', 'user.name', 'BW Bot'], { cwd: repoDir, timeout: 5000, stdio: 'pipe' });
+
   // Fetch latest
   console.log(`${LOG_PREFIX} Fetching origin for ${repoName}...`);
   execSync('git fetch origin', { cwd: repoDir, timeout: 60000, stdio: 'pipe' });
