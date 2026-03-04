@@ -286,6 +286,14 @@ async function notesPipeline(route, message) {
             }
           }
         }
+        // Pass resolved notes path to quality-check so it can find the file
+        if (skill.name === 'tn-writer') {
+          for (const s of skills) {
+            if (s.name === 'tn-quality-check') {
+              s.prompt = `${skillRef} --notes ${resolved}`;
+            }
+          }
+        }
       }
 
       // Record metrics for this skill
