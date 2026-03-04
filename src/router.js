@@ -118,6 +118,8 @@ function buildConfirmMessage(template, captures) {
  */
 function parseBookChapters(captures) {
   let book = null;
+  let verseStart = null;
+  let verseEnd = null;
   const chapterNums = [];
 
   for (const c of captures) {
@@ -128,9 +130,11 @@ function parseBookChapters(captures) {
       book = normalizeBookName(s);
     } else {
       // Verse-range format "CH:VS-VS" — only the chapter matters here
-      const verseRange = s.match(/^(\d+):\d+[-–—]\d+$/);
+      const verseRange = s.match(/^(\d+):(\d+)[-–—](\d+)$/);
       if (verseRange) {
         chapterNums.push(Number(verseRange[1]));
+        verseStart = Number(verseRange[2]);
+        verseEnd = Number(verseRange[3]);
       } else {
         // Extract all numbers
         const nums = s.match(/\d+/g);
@@ -146,11 +150,11 @@ function parseBookChapters(captures) {
       const [a, b] = chapterNums.sort((x, y) => x - y);
       const range = [];
       for (let i = a; i <= b; i++) range.push(i);
-      return { book, chapters: range };
+      return { book, chapters: range, verseStart, verseEnd };
     }
   }
 
-  return { book, chapters: chapterNums.length ? chapterNums : [1] };
+  return { book, chapters: chapterNums.length ? chapterNums : [1], verseStart, verseEnd };
 }
 
 /**
@@ -180,9 +184,13 @@ function getPipelineType(route) {
 /**
  * Build an enriched confirmation message with token/time estimates.
  */
-function buildEstimateLabel(estimate, book, startCh, endCh) {
+function buildEstimateLabel(estimate, book, startCh, endCh, verseStart, verseEnd) {
   const chCount = endCh - startCh + 1;
-  const totalVerses = estimate.perChapter.reduce((s, c) => s + c.verses, 0);
+  let totalVerses = estimate.perChapter.reduce((s, c) => s + c.verses, 0);
+  // If verse range specified, override verse count
+  if (verseStart != null && verseEnd != null && chCount === 1) {
+    totalVerses = verseEnd - verseStart + 1;
+  }
   return `(${chCount} ch, ~${totalVerses} verses). Est: ~${estimate.estimatedMinutes} min`;
 }
 
@@ -484,7 +492,7 @@ async function routeMessage(message) {
       // Pre-flight usage check for generate/notes pipelines
       const pipelineType = getPipelineType(activeRoute);
       if (pipelineType) {
-        const { book: pfBook, chapters: pfChapters } = parseBookChapters(captures);
+        const { book: pfBook, chapters: pfChapters, verseStart: pfVS, verseEnd: pfVE } = parseBookChapters(captures);
         if (pfBook && pfChapters.length) {
           const pfStart = Math.min(...pfChapters);
           const pfEnd = Math.max(...pfChapters);
@@ -497,7 +505,7 @@ async function routeMessage(message) {
           }
 
           // Enrich confirmation with estimate
-          const estLabel = buildEstimateLabel(preflight.estimate, pfBook, pfStart, pfEnd);
+          const estLabel = buildEstimateLabel(preflight.estimate, pfBook, pfStart, pfEnd, pfVS, pfVE);
           confirmText = confirmText.replace(/\. Sound right\?/, ` ${estLabel}. Sound right?`);
 
           if (preflight.decision === 'warn') {
