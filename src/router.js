@@ -127,9 +127,15 @@ function parseBookChapters(captures) {
     if (/^[a-zA-Z]+$/.test(s)) {
       book = normalizeBookName(s);
     } else {
-      // Extract all numbers
-      const nums = s.match(/\d+/g);
-      if (nums) chapterNums.push(...nums.map(Number));
+      // Verse-range format "CH:VS-VS" — only the chapter matters here
+      const verseRange = s.match(/^(\d+):\d+[-–—]\d+$/);
+      if (verseRange) {
+        chapterNums.push(Number(verseRange[1]));
+      } else {
+        // Extract all numbers
+        const nums = s.match(/\d+/g);
+        if (nums) chapterNums.push(...nums.map(Number));
+      }
     }
   }
 
