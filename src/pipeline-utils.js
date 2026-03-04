@@ -72,6 +72,22 @@ function resolveOutputFile(relPath, book) {
     if (fs.existsSync(path.join(CSKILLBP_DIR, paddedAlt))) return paddedAlt;
   }
 
+  // Try verse-suffixed variants (e.g. HAB-03.tsv -> HAB-03-v1-2.tsv)
+  // Skills may append -vN-M when working on a verse range
+  const ext = path.extname(filename);
+  const base = filename.slice(0, -ext.length);
+  const globPattern = `${base}-v*${ext}`;
+  for (const dir of [parts.join('/'), [...parts, book].join('/')]) {
+    const searchDir = path.join(CSKILLBP_DIR, dir);
+    if (!fs.existsSync(searchDir)) continue;
+    const matches = fs.readdirSync(searchDir)
+      .filter(f => f.startsWith(base + '-v') && f.endsWith(ext))
+      .sort();
+    if (matches.length > 0) {
+      return path.join(dir, matches[0]);
+    }
+  }
+
   return null;
 }
 
