@@ -349,10 +349,9 @@ function firePipeline(route, message) {
 const HELP_TEXT = `I can help with:\n` +
   `- **generate PSA 79** -- run the initial pipeline for a chapter\n` +
   `- **write notes for PSA 82** -- generate translation notes\n` +
-  `- **PSA 82 review** -- review editor changes (ULT & UST)\n` +
-  `- **PSA 82 ULT review** -- review only ULT changes\n` +
-  `- **review Psalm 82 UST** -- also works with natural phrasing\n` +
-  `- **note JER lots of implicit info** -- file an observation for a book`;
+  `- **PSA 82 review** -- review editor changes against AI output\n` +
+  `  - add **ULT** or **UST** to review just one (default: both)\n` +
+  `- **note HAB 3 lots of parallelism** -- file an observation for a book/chapter`;
 
 async function routeMessage(message) {
   const isAdmin = message.sender_id === config.adminUserId;
