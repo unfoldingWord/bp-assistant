@@ -7,7 +7,7 @@ const { classifyIntent } = require('./intent-classifier');
 const { preflightCheck, estimateTokens } = require('./usage-tracker');
 const { getPendingMerge, clearPendingMerge } = require('./pending-merges');
 const { resumeInsertion } = require('./insertion-resume');
-const { normalizeBookName } = require('./pipeline-utils');
+const { normalizeBookName, isValidBook } = require('./pipeline-utils');
 
 // In-memory pending confirmations for stream messages
 const pendingConfirmations = new Map();
@@ -429,7 +429,13 @@ async function routeMessage(message) {
     }
   }
 
-  const { route, captures } = matchRoute(message.content);
+  let { route, captures } = matchRoute(message.content);
+
+  // Validate book name for editor-note regex matches — reject bogus captures early
+  if (route && route.name === 'editor-note' && captures[0] && !isValidBook(captures[0])) {
+    console.log(`[router] editor-note regex matched but "${captures[0]}" is not a valid book — falling through to Haiku`);
+    route = null;
+  }
 
   if (route) {
     // For editor-review, enrich with content types and dynamic system prompt

@@ -227,9 +227,16 @@ const BOOK_NAME_MAP = {
   REVELATION: 'REV', REVELATIONS: 'REV', REVE: 'REV',
 };
 
+const VALID_BOOK_CODES = new Set(Object.values(BOOK_NAME_MAP));
+
 function normalizeBookName(name) {
   const upper = name.toUpperCase();
   return BOOK_NAME_MAP[upper] || upper;
+}
+
+function isValidBook(name) {
+  const upper = name.toUpperCase();
+  return BOOK_NAME_MAP.hasOwnProperty(upper) || VALID_BOOK_CODES.has(upper);
 }
 
 module.exports = {
@@ -240,5 +247,6 @@ module.exports = {
   checkPrerequisites,
   calcSkillTimeout,
   normalizeBookName,
+  isValidBook,
   CSKILLBP_DIR,
 };
