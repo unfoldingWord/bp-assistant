@@ -47,7 +47,9 @@ function checkExistingBranch(username, repo = 'en_tn', branchPattern = '{usernam
 
 // --- Resolve an output file that may live in either output/X/ or output/X/BOOK/ ---
 // Tries all combos: {unpadded, 2-digit, 3-digit} × {flat, subdirectory}
-function resolveOutputFile(relPath, book) {
+// When verseSuffix is provided (e.g. "-v3-4"), only match that specific suffix
+// in the verse-range fallback — prevents returning a v1-2 file for a v3-4 request.
+function resolveOutputFile(relPath, book, verseSuffix) {
   const direct = path.join(CSKILLBP_DIR, relPath);
   if (fs.existsSync(direct)) return relPath;
 
@@ -76,12 +78,15 @@ function resolveOutputFile(relPath, book) {
   // Skills may append -vN-M when working on a verse range
   const ext = path.extname(filename);
   const base = filename.slice(0, -ext.length);
-  const globPattern = `${base}-v*${ext}`;
+  // When verseSuffix is given, look for that exact suffix only
+  const suffixFilter = verseSuffix
+    ? (f) => f === `${base}${verseSuffix}${ext}`
+    : (f) => f.startsWith(base + '-v') && f.endsWith(ext);
   for (const dir of [parts.join('/'), [...parts, book].join('/')]) {
     const searchDir = path.join(CSKILLBP_DIR, dir);
     if (!fs.existsSync(searchDir)) continue;
     const matches = fs.readdirSync(searchDir)
-      .filter(f => f.startsWith(base + '-v') && f.endsWith(ext))
+      .filter(suffixFilter)
       .sort();
     if (matches.length > 0) {
       return path.join(dir, matches[0]);
@@ -92,19 +97,25 @@ function resolveOutputFile(relPath, book) {
 }
 
 // --- Verify prerequisite files exist (AI-ULT, AI-UST, issues) ---
-function checkPrerequisites(book, chapter) {
+// When verseStart/verseEnd are provided, the issues TSV must match that
+// specific verse range (e.g. HAB-03-v3-4.tsv), not just any verse-suffixed
+// file for the chapter. AI-ULT/UST are full-chapter files and don't need
+// verse-range matching.
+function checkPrerequisites(book, chapter, verseStart, verseEnd) {
   const width = book.toUpperCase() === 'PSA' ? 3 : 2;
   const tag = `${book}-${String(chapter).padStart(width, '0')}`;
+  const verseSuffix = verseStart != null ? `-v${verseStart}-${verseEnd}` : null;
+
   const required = [
     { path: `output/AI-ULT/${tag}.usfm`, label: 'AI-ULT' },
     { path: `output/AI-UST/${tag}.usfm`, label: 'AI-UST' },
-    { path: `output/issues/${tag}.tsv`,   label: 'issues TSV' },
+    { path: `output/issues/${tag}.tsv`,   label: 'issues TSV', verseSuffix },
   ];
 
   const missing = [];
   const resolved = {};
   for (const f of required) {
-    const found = resolveOutputFile(f.path, book);
+    const found = resolveOutputFile(f.path, book, f.verseSuffix);
     if (!found) {
       missing.push(f.label);
     } else {

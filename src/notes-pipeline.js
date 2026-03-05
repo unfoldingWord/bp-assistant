@@ -174,7 +174,10 @@ async function notesPipeline(route, message) {
     console.log(`[notes] Processing ${ref}...`);
 
     // --- Check prerequisites to decide branch ---
-    const { missing, resolved } = checkPrerequisites(book, ch);
+    const hasVerseRange = verseStart != null && startChapter === endChapter;
+    const { missing, resolved } = checkPrerequisites(book, ch,
+      hasVerseRange ? verseStart : undefined,
+      hasVerseRange ? verseEnd : undefined);
     const hasAIArtifacts = missing.length === 0;
 
     let issuesPath;
@@ -201,12 +204,12 @@ async function notesPipeline(route, message) {
       issuesPath = `output/issues/${tag}.tsv`;
       await status(`**${ref}**: No AI artifacts (missing: ${missing.join(', ')}) \u2192 deep-issue-id path`);
 
-      const hasVerseRange = verseStart != null && startChapter === endChapter;
       const verseFlag = hasVerseRange ? ` --verses ${verseStart}-${verseEnd}` : '';
+      const issuesVTag = hasVerseRange ? `${tag}-v${verseStart}-${verseEnd}` : tag;
       skills.push({
         name: 'deep-issue-id',
         prompt: `${book} ${ch}${verseFlag}`,
-        expectedOutput: `output/issues/${tag}.tsv`,
+        expectedOutput: `output/issues/${issuesVTag}.tsv`,
         ops: 3, // 2 analysts + challenger/merge
       });
     }
@@ -223,10 +226,11 @@ async function notesPipeline(route, message) {
       await status(`**${ref}**: skipping chapter-intro (auto-excluded range)`);
     }
 
+    const vTag = hasVerseRange ? `${tag}-v${verseStart}-${verseEnd}` : tag;
     skills.push({
       name: 'tn-writer',
       prompt: `${skillRef} --issues ${issuesPath}`,
-      expectedOutput: `output/notes/${tag}.tsv`,
+      expectedOutput: `output/notes/${vTag}.tsv`,
       ops: 1,
     });
 
@@ -234,7 +238,7 @@ async function notesPipeline(route, message) {
     skills.push({
       name: 'tn-quality-check',
       prompt: `${skillRef}`,
-      expectedOutput: `output/quality/${book}/${tag}-quality.md`,
+      expectedOutput: `output/quality/${book}/${vTag}-quality.md`,
       ops: 1,
       model: 'sonnet',
     });
