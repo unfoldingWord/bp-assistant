@@ -93,11 +93,24 @@ async function runClaude({ prompt, cwd, model, allowedTools, skill, maxTurns, ti
           if ('text' in block) {
             console.log(`[claude] ${block.text.slice(0, 200)}`);
           } else if ('name' in block) {
-            console.log(`[claude] Tool: ${block.name}`);
+            console.log(`[claude] Tool: ${block.name}(${JSON.stringify(block.input || {}).slice(0, 150)})`);
           }
         }
       } else if (message.type === 'result') {
         result = message;
+      } else if (message.type === 'user') {
+        const text = typeof message.message?.content === 'string'
+          ? message.message.content
+          : JSON.stringify(message.message?.content || '');
+        if (text.includes('command-stderr') || text.includes('Error')) {
+          console.error(`[claude-runner] SDK user message (error): ${text.slice(0, 500)}`);
+        } else {
+          console.log(`[claude-runner] SDK user message: ${text.slice(0, 300)}`);
+        }
+      } else if (message.type === 'system') {
+        console.log(`[claude-runner] SDK system: ${message.subtype || 'unknown'} ${JSON.stringify(message).slice(0, 200)}`);
+      } else {
+        console.log(`[claude-runner] SDK event: ${message.type}${message.subtype ? '/' + message.subtype : ''}`);
       }
     }
   } catch (err) {
@@ -123,6 +136,9 @@ async function runClaude({ prompt, cwd, model, allowedTools, skill, maxTurns, ti
 
   if (result) {
     console.log(`[claude-runner] Finished — subtype: ${result.subtype}, turns: ${result.num_turns}, cost: $${result.total_cost_usd?.toFixed(4) || '?'}, duration: ${(result.duration_ms / 1000).toFixed(1)}s`);
+    if (result.subtype !== 'success' && result.result) {
+      console.error(`[claude-runner] Result text: ${result.result.slice(0, 500)}`);
+    }
     // Detect rate limit in result subtype or error message
     const resultMsg = (result.subtype || '') + ' ' + (result.error || '');
     const isRateLimit = /rate.?limit|429|too.many.requests/i.test(resultMsg);
