@@ -1,11 +1,12 @@
-# Zulip Bot — Message Monitor + Pipeline Router
+# Zulip Bot -- Pipeline Router & Claude SDK Runner
 
-Monitors specific topics in a Zulip channel (and your DMs), matches incoming messages against keyword rules, and runs shell scripts in response. Runs as **you** using your personal API key.
+Monitors a Zulip channel and DMs, matches messages against routes via regex + NLU fallback, and dispatches to Claude SDK pipelines for book package generation. Runs inside Docker on an OCI ARM64 server.
 
 ## Quick start
 
 ```bash
-# Make sure .env has your credentials (see .env.example)
+# Copy .env.example to .env and fill in credentials
+cp .env.example .env
 npm install
 npm start
 ```
@@ -25,212 +26,180 @@ You should see:
 Configured in `config.json`:
 
 - **Channel:** `CONTENT - UR`
-- **Topics:** Psalms BP, AI Work, Workflow, BP Proofreading, Proofreading Queue, Jeremiah BP
-- **DMs:** yes (any direct message to you)
+- **Topics:** Psalms BP, AI Work, Workflow, BP Proofreading, Proofreading Queue, Jeremiah BP, Habakkuk BP, Bot testing
+- **DMs:** Admin only (configured in `config.local.json`)
 
 Messages in other channels/topics are ignored. Messages you send yourself are always ignored (no echo loops).
 
+## Authorization
+
+- `config.local.json` (gitignored) holds `adminUserId` and `authorizedUserIds`
+- Stream @-mentions from unauthorized users get a canned reply
+- Only admin can DM the bot
+- All stream commands require an @-mention plus confirmation before running
+
 ## How routing works
 
-When someone posts a message in a watched topic (or DMs you), the bot checks `config.json` routes **top to bottom**. The first match wins.
+When someone posts a message in a watched topic (or DMs you), the bot checks `config.json` routes top to bottom. The first regex match wins.
+
+If no regex matches, the **Haiku NLU fallback** (`intent-classifier.js`) classifies the natural-language request into `generate / notes / editor-review / editor-note / unknown`. Unknown sends a help message.
 
 ### Current routes
 
-| Route | Trigger | Script | Replies? |
+| Route | Trigger | Pipeline | Description |
 |---|---|---|---|
-| `generate-content` | `/generate\s+(\w+)\s+(\d+)(?:\s*[-–—to]+\s*(\d+))?/i` | `./pipelines/generate.sh` | No — script posts its own replies incrementally via Zulip API |
-| `proofread-complete` | Message contains "proofed and up to master" | `./pipelines/next-step.sh` | No — runs silently |
+| `editor-note` | `note BOOK [CH] text` | `editor-note` | File an editor observation to `data/editor-notes/BOOK.md` |
+| `generate-content` | `generate BOOK CH[-CH]` | `sdk` | Run initial-pipeline (ULT + issues + UST) + alignment + Door43 push |
+| `write-notes` | `write notes [for] BOOK CH` | `notes` | Run post-edit-review/deep-issue-id, tn-writer, tn-quality-check + Door43 push |
+| `editor-review` | `BOOK CH review/compare` | `interactive-dm` | Multi-turn session running editor-compare skill |
+| DM default | any unmatched DM from admin | `interactive-dm` | Open-ended Claude conversation in /workspace context |
 
-If nothing matches, the message is logged and skipped (no `defaultPipeline` is set).
+### Confirmation flow
 
-### generate-content route
+All stream commands show a confirmation message with a token/time estimate before running:
 
-Triggered by messages like `generate psa 79` or `generate psa 79-89`. The script:
+> I'll generate the initial content (ULT & UST, issues draft) for **PSA 79**. Sound right? (yes/no)
 
-1. Parses the book code and chapter range from the message
-2. Estimates token usage (chapters × 5M tokens) and checks it against the session budget (45M)
-3. Loops through each chapter, running `claude -p "/initial-pipeline BOOK CH"` in the `../cSkillBP` directory
-4. After each chapter, reads the output USFM files and posts ULT + UST back to the Zulip thread
-5. Posts a summary when done
+The user must reply `yes` (or variants like `y`, `yep`, `go ahead`) to proceed. `no` cancels.
 
-Token estimates and durations are logged to `logs/generate.log` for calibration.
+### Multi-turn interactive sessions
 
-### Testing with example.sh
+DMs to admin and `editor-review` channel commands maintain conversation state across messages using `session-store.js` (file-backed in `data/sessions/`).
 
-To test the basic round-trip, point a route at the included example script:
+- `/reset` or `reset conversation` clears the session
+- `switch to sonnet/haiku/opus` changes the model mid-conversation
+- Messages are prefixed with `O:`, `S:`, or `H:` to indicate which model replied
+- Stream sessions auto-clear after `maxExchanges` (default 6 for editor-review)
 
-```json
-{
-  "name": "test",
-  "match": "hello bot",
-  "pipeline": "./pipelines/example.sh",
-  "reply": true
-}
-```
+## Pipeline types
 
-Then send "hello bot" in a watched topic. The bot will run `example.sh` and post its stdout back:
+### `sdk` (generate-content)
+Uses the Claude Agent SDK `query()` to run skills in `/workspace`. The `generate-pipeline.js` module:
+1. Runs `initial-pipeline --lite` for each chapter (ULT + issues + UST)
+2. Runs `align-all-parallel` for ULT and UST alignment
+3. Pushes to Door43 via deterministic JS code (`door43-push.js`)
+4. Verifies each push via Gitea API (`repo-verify.js`)
 
-> Hello from the example pipeline! Message from Some User in CONTENT - UR > AI Work
+### `notes` (write-notes)
+The `notes-pipeline.js` module runs a skill chain per chapter:
+1. `post-edit-review` or `deep-issue-id` (reconcile/find issues)
+2. `tn-writer` (generate notes from issues)
+3. `tn-quality-check` (validate notes)
+4. Door43 push + verify
 
-## Testing scenarios
+### `editor-note`
+Appends an observation to `data/editor-notes/BOOK.md`. Simple file-append operation via `note-pipeline.js`.
 
-| You send... | Where | What happens |
-|---|---|---|
-| "generate psa 79" | `CONTENT - UR` > `AI Work` | Matches `generate-content`, runs generate pipeline for PSA chapter 79 |
-| "generate psa 79-82" | `CONTENT - UR` > `Psalms BP` | Matches `generate-content`, loops through chapters 79–82 |
-| "generate blah" | `CONTENT - UR` > `AI Work` | Matches route regex but fails parse — bot replies with a usage hint |
-| "proofed and up to master" | `CONTENT - UR` > `Psalms BP` | Matches `proofread-complete` route, runs `next-step.sh`, no reply |
-| "just a normal message" | `CONTENT - UR` > `Workflow` | No route matches, logs `[router] No match for message ..., skipping` |
-| anything | `CONTENT - UR` > `Some Other Topic` | Ignored entirely (topic not in watch list) |
-| anything | A different channel | Ignored entirely (not subscribed to that channel's events) |
-| anything | DM to you | Checked against routes like a stream message |
-| you send a message yourself | anywhere | Skipped (self-message filtering) |
+### `interactive-dm`
+Multi-turn Claude sessions via SDK `resume`. Used for editor-review and admin DMs. See "Multi-turn interactive sessions" above.
 
-## Dry-run mode (testing without Claude)
+## Door43 integration
 
-You can test `generate.sh` without actually running `claude` or posting to Zulip by setting `DRY_RUN=1`. This prints all Zulip messages to stderr and creates stub USFM files instead of invoking the pipeline.
+Content is pushed to Door43/Gitea repos via deterministic JS code -- no Claude involved in the push itself.
 
-```bash
-# Single chapter
-DRY_RUN=1 ZULIP_MSG_CONTENT="generate psa 79" \
-  ZULIP_MSG_STREAM="test" ZULIP_MSG_TOPIC="test" \
-  ZULIP_EMAIL=x ZULIP_API_KEY=x ZULIP_REALM=x \
-  bash pipelines/generate.sh
+- `door43-push.js` / `door43-push-cli.js` -- Git operations + Gitea API PR creation
+- `repo-verify.js` -- Confirms PR merged to master by querying Gitea API
+- `door43-users.json` (gitignored) -- Maps email addresses to Door43 usernames
+- Requires `DCS_TOKEN` env var for Gitea API access
 
-# Range
-DRY_RUN=1 ZULIP_MSG_CONTENT="generate psa 79-81" \
-  ZULIP_MSG_STREAM="test" ZULIP_MSG_TOPIC="test" \
-  ZULIP_EMAIL=x ZULIP_API_KEY=x ZULIP_REALM=x \
-  bash pipelines/generate.sh
+## Usage tracking
 
-# Bad input (should print parse error)
-DRY_RUN=1 ZULIP_MSG_CONTENT="generate blah" \
-  ZULIP_MSG_STREAM="test" ZULIP_MSG_TOPIC="test" \
-  ZULIP_EMAIL=x ZULIP_API_KEY=x ZULIP_REALM=x \
-  bash pipelines/generate.sh
-```
+Every SDK call writes to `data/metrics/usage.jsonl`. Pre-flight checks combine `ccusage` (CLI/desktop usage) with the bot's JSONL log to estimate headroom in the 5-hour token window.
 
-You'll see each Zulip message that *would* be posted, the stub file contents, and the final summary — all on stderr.
+- Auto-calibrates budget when rate limits are hit
+- Verse-based timeout scaling: `verses x operations x 5min/op`, clamped 10-60 min
+- Verse counts from `verse-counts.js`
 
-## Writing a pipeline script
+Bootstrap cost estimates (from 101+ observed runs) are in `src/usage-tracker.js` (`BOOTSTRAP_DEFAULTS`). The `estimateTokens()` function blends bootstrap with observed medians as data accumulates.
 
-Pipeline scripts are shell scripts in the `pipelines/` directory. They receive message context as environment variables:
+## Environment variables
+
+See `.env.example`:
 
 | Variable | Description |
 |---|---|
-| `ZULIP_MSG_ID` | Message ID |
-| `ZULIP_MSG_CONTENT` | Raw message text |
-| `ZULIP_MSG_SENDER` | Sender's email |
-| `ZULIP_MSG_SENDER_NAME` | Sender's full name |
-| `ZULIP_MSG_STREAM` | Stream name, or `dm` for direct messages |
-| `ZULIP_MSG_TOPIC` | Topic name (empty for DMs) |
-| `ZULIP_MSG_TIMESTAMP` | Message timestamp |
-| `ZULIP_ROUTE_NAME` | Which route was matched |
+| `ZULIP_API_KEY` | Your Zulip API key |
+| `ZULIP_EMAIL` | Your Zulip email |
+| `ZULIP_REALM` | Zulip server URL |
+| `PORT` | (optional) HTTP port |
+| `DCS_TOKEN` | Door43/Gitea API token for repo pushes |
+| `ANTHROPIC_API_KEY` | API key for Haiku NLU classifier |
 
-- **stdout** is captured. If the route has `"reply": true`, stdout gets posted back to the same Zulip thread (or DM).
-- **stderr** is logged to the bot's console for debugging.
-- If the script exits non-zero, the error is logged but the bot keeps running.
+## File structure
 
-See `pipelines/example.sh` for a working template.
-
-## Adding a new route
-
-1. Write your script in `pipelines/` and make it executable (`chmod +x`)
-2. Add a route entry to the `routes` array in `config.json`:
-
-```json
-{
-  "name": "my-route",
-  "match": "trigger phrase",
-  "pipeline": "./pipelines/my-script.sh",
-  "reply": true
-}
 ```
+.env                        <- Credentials (not committed)
+.env.example                <- Template
+config.json                 <- Channel, topics, routes, usage tracking config
+config.local.json           <- Admin/authorized user IDs (gitignored)
+door43-users.json           <- Email-to-Door43 username map (gitignored)
+Dockerfile                  <- node:22-slim + Python + Claude CLI, runs as botuser
+docker-compose.yml          <- Mounts workspace, config, data, claude-config
+package.json                <- Dependencies: claude-agent-sdk, anthropic, zulip-js
 
-3. Restart the bot (`Ctrl+C`, then `npm start`) — config is loaded at startup
+src/
+  index.js                  <- Event loop: auth, poll Zulip events, filter, call router
+  router.js                 <- Route matching, confirmation flow, pending merges, Haiku fallback
+  config.js                 <- Merges config.json + config.local.json
+  pipeline-runner.js        <- Dispatcher: sdk / notes / editor-note / interactive-dm
+  claude-runner.js          <- SDK query() wrapper with timeout, abort, metrics hooks
+  generate-pipeline.js      <- ULT+UST generation + alignment + Door43 push
+  notes-pipeline.js         <- TN skill chain (issue-id -> tn-writer -> quality-check) + Door43 push
+  note-pipeline.js          <- Editor note filing (appends to data/editor-notes/BOOK.md)
+  interactive-dm-pipeline.js <- Multi-turn Claude sessions (admin DMs + stream sessions)
+  intent-classifier.js      <- Haiku NLU fallback for natural-language commands
+  usage-tracker.js          <- JSONL metrics, token estimates, preflight checks, ccusage
+  door43-push.js            <- Deterministic Git+Gitea API push
+  door43-push-cli.js        <- CLI wrapper for door43-push
+  repo-verify.js            <- Gitea API verification that PR merged to master
+  session-store.js          <- File-backed Claude session persistence
+  auth-refresh.js           <- Proactive OAuth token refresh (8h tokens, 30min margin)
+  pending-merges.js         <- File-backed pending merge state
+  zulip-client.js           <- Zulip API wrapper (send, DM, reactions, file upload)
+  pipeline-utils.js         <- Book name normalization, output file resolution, timeouts
+  verse-counts.js           <- Verse count lookup for timeout/estimate calculations
 
-### Match patterns
+pipelines/
+  example.sh                <- Legacy shell pipeline template
+  generate.sh               <- Legacy shell generator (superseded by generate-pipeline.js)
+  zulip-helpers.sh          <- curl helpers for shell pipelines
 
-- **Substring:** `"match": "please generate"` — case-insensitive substring match
-- **Regex:** `"match": "/^generate\\s+\\w+/i"` — wrap in `/slashes/` with optional flags
+data/
+  metrics/usage.jsonl       <- Token usage log (auto-created)
+  sessions/                 <- Multi-turn session state (auto-created)
+```
 
 ## Config reference
 
 ```jsonc
 {
-  "channel": "CONTENT - UR",       // Stream to monitor
-  "topics": ["Topic A", "Topic B"], // Only these topics (exact match)
-  "watchDMs": true,                 // Also monitor direct messages
-  "routes": [                       // Checked top-to-bottom, first match wins
+  "adminUserId": null,            // Set in config.local.json
+  "authorizedUserIds": [],        // Set in config.local.json
+  "channel": "CONTENT - UR",      // Stream to monitor
+  "topics": ["Topic A", ...],     // Only these topics (exact match)
+  "watchDMs": true,               // Monitor direct messages (admin only)
+  "routes": [                     // Checked top-to-bottom, first match wins
     {
-      "name": "route-name",         // Label for logging
-      "match": "keyword or /regex/",// Trigger pattern
-      "pipeline": "./pipelines/x.sh", // Script to run
-      "reply": true                 // Post stdout back to Zulip?
+      "name": "route-name",       // Label for logging
+      "match": "/regex/i",        // Trigger pattern
+      "type": "sdk|notes|editor-note|interactive-dm",
+      "reply": true,              // Post output back to Zulip?
+      "confirmMessage": "...",    // Shown before running (supports $1, $2 captures)
+      "operations": 3,            // For timeout calculation (verses x ops x 5min)
+      "maxExchanges": 6,          // For interactive sessions
+      "cwd": "/workspace"         // Working directory for Claude
     }
   ],
-  "defaultPipeline": null           // Script for unmatched messages (null = skip)
+  "defaultPipeline": null,        // Script for unmatched stream messages (null = skip)
+  "dmDefaultPipeline": {          // Pipeline for unmatched admin DMs
+    "type": "interactive-dm",
+    "cwd": "/workspace"
+  },
+  "usageTracking": {
+    "windowBudgetTokens": 220000,
+    "windowHours": 5,
+    "warnThreshold": 0.7,
+    "ccusagePath": "npx ccusage@latest"
+  }
 }
-```
-
-## Token usage & rate limits
-
-Usage is logged to `data/metrics/usage.jsonl` (one JSON line per skill invocation). To check cumulative totals:
-
-```bash
-cat /srv/bot/app/data/metrics/usage.jsonl | python3 -c "
-import sys, json
-entries = [json.loads(l) for l in sys.stdin if l.strip()]
-skills = [e for e in entries if e.get('type') != 'run_summary']
-runs = [e for e in entries if e.get('type') == 'run_summary']
-print(f'Skill entries: {len(skills)}  |  Run summaries: {len(runs)}')
-print(f'Total tokens (all time): {sum(e[\"total_tokens\"] for e in skills):,}')
-if runs:
-    print(f'\nRun summaries:')
-    for r in runs[-10:]:
-        print(f'  {r[\"ts\"][:16]}  {r[\"pipeline\"]} {r[\"book\"]} {r[\"start_ch\"]}-{r[\"end_ch\"]}  {r[\"run_tokens\"]:,} tokens')
-"
-```
-
-### Observed costs (notes pipeline)
-
-Measured on PSA 129 (8 verses, 17 notes):
-
-| Skill | Tokens | Per verse |
-|---|---|---|
-| `post-edit-review` | 1,156,842 | ~145K |
-| `tn-writer` | 5,804,328 | ~725K |
-| `tn-quality-check` | 694,677 | ~87K |
-| `repo-insert` | 588,858 | ~74K |
-| **Total** | **8,244,705** | **~1.03M** |
-
-~485K tokens per note. ~2.1 notes per verse.
-
-### Rate limit mapping
-
-| Limit | Tokens per 1% | Estimated total budget |
-|---|---|---|
-| Session (5h) | ~1.4M | ~137M tokens |
-| Weekly | ~8.2M | ~824M tokens |
-
-Rough capacity: ~16 note jobs per session, ~100 per week.
-
-These bootstrap estimates are in `src/usage-tracker.js` (`BOOTSTRAP_DEFAULTS`). The `estimateTokens()` function blends them with observed medians as more data accumulates (needs >=3 runs per skill to start blending, >10 to rely purely on observed data).
-
-## File structure
-
-```
-.env                    ← Zulip credentials (not committed)
-config.json             ← What to watch, routing rules
-src/
-  index.js              ← Event loop: connect, poll, filter
-  router.js             ← Match messages to routes
-  zulip-client.js       ← Zulip API wrapper
-  pipeline-runner.js    ← Run scripts, capture output, reply
-pipelines/
-  example.sh            ← Working template for testing
-  zulip-helpers.sh      ← Shared curl helpers (zulip_reply, zulip_dm)
-  generate.sh           ← Generation pipeline (cSkillBP /initial-pipeline)
-logs/
-  generate.log          ← Timing + exit codes per chapter (auto-created)
 ```
