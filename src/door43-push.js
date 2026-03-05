@@ -472,6 +472,36 @@ async function door43Push(opts) {
     // Step 3: Insert content via Python script
     insertContent({ type, book, chapter, source, verses, repoDir, repoFilename });
 
+    // Step 3b: Door43 CI validation gate (TN only)
+    // TEMPORARILY DISABLED — Door43 CI workflow (validate_tn_files.py) is not
+    // finalized yet. Re-enable once the remote CI script is stable.
+    // if (type === 'tn') {
+    //   const bookFilePath = path.join(repoDir, repoFilename);
+    //   const validateScript = path.join(CSKILLBP_DIR, '.claude/skills/tn-quality-check/scripts/validate_tn_tsv.py');
+    //   const jsonOut = path.join(repoDir, '.validation-result.json');
+    //   try {
+    //     execFileSync('python3', [validateScript, bookFilePath, '--json', jsonOut], {
+    //       encoding: 'utf8', timeout: 60000, cwd: CSKILLBP_DIR, stdio: 'pipe',
+    //     });
+    //     console.log(`${LOG_PREFIX} Door43 CI validation passed for ${repoFilename}`);
+    //   } catch (valErr) {
+    //     let details = `Door43 CI validation failed for ${repoFilename}`;
+    //     try {
+    //       const result = JSON.parse(fs.readFileSync(jsonOut, 'utf8'));
+    //       const errorSummary = result.errors.slice(0, 10).map(e =>
+    //         `  Line ${e.line}: [${e.rule}] ${e.message}`
+    //       ).join('\n');
+    //       details += ` (${result.error_count} error(s)):\n${errorSummary}`;
+    //       if (result.error_count > 10) details += `\n  ... and ${result.error_count - 10} more`;
+    //     } catch {
+    //       details += `: ${valErr.stderr || valErr.message}`;
+    //     }
+    //     execFileSync('git', ['checkout', '--', repoFilename], { cwd: repoDir, timeout: 5000, stdio: 'pipe' });
+    //     console.error(`${LOG_PREFIX} ${details}`);
+    //     throw new Error(details);
+    //   }
+    // }
+
     // Step 4: Commit and push
     const commitMsg = `${type.toUpperCase()}: ${book} ${chapter} [${username}]`;
     const pushResult = await commitAndPush(repoDir, branch, repoFilename, commitMsg);
