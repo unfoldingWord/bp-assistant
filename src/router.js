@@ -230,19 +230,7 @@ function matchRoute(content) {
  * @param {string} [senderName] the Zulip sender's display name
  */
 function buildSyntheticRoute(intent, senderName) {
-  const routeNameMap = {
-    'generate': 'generate-content',
-    'notes': 'write-notes',
-    'editor-review': 'editor-review',
-  };
-  const targetName = routeNameMap[intent.intent];
-  const baseRoute = targetName ? config.routes.find(r => r.name === targetName) : null;
-  if (!baseRoute) return null;
-
-  const rangeLabel = intent.startChapter === intent.endChapter
-    ? `${intent.book} ${intent.startChapter}`
-    : `${intent.book} ${intent.startChapter}–${intent.endChapter}`;
-
+  // editor-note doesn't need a base route from config — handle it first
   if (intent.intent === 'editor-note') {
     const bookLabel = intent.book || 'unknown';
     const chapterLabel = intent.startChapter ? ` ${intent.startChapter}` : '';
@@ -259,6 +247,19 @@ function buildSyntheticRoute(intent, senderName) {
       confirmMessage: `I'll file this note for ${scopeLabel}${notePreview}. Sound right? (yes/no)`,
     };
   }
+
+  const routeNameMap = {
+    'generate': 'generate-content',
+    'notes': 'write-notes',
+    'editor-review': 'editor-review',
+  };
+  const targetName = routeNameMap[intent.intent];
+  const baseRoute = targetName ? config.routes.find(r => r.name === targetName) : null;
+  if (!baseRoute) return null;
+
+  const rangeLabel = intent.startChapter === intent.endChapter
+    ? `${intent.book} ${intent.startChapter}`
+    : `${intent.book} ${intent.startChapter}–${intent.endChapter}`;
 
   if (intent.intent === 'editor-review') {
     const types = intent.contentTypes || ['ult', 'ust'];
