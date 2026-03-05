@@ -420,7 +420,8 @@ async function generatePipeline(route, message) {
     const rangeLabel = start === end ? `${book} ${start}` : `${book} ${start}\u2013${end}`;
     await reply(
       `Content for **${rangeLabel}** pushed to master in en_ult and en_ust.` +
-      (fail > 0 ? `\n(${fail} chapter(s) had errors \u2014 check admin DMs for details.)` : '')
+      (fail > 0 ? `\n(${fail} chapter(s) had errors \u2014 check admin DMs for details.)` : '') +
+      `\nYou may need to refresh the tcCreate or gatewayEdit page to see the new content.`
     );
   }
 

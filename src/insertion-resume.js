@@ -110,7 +110,8 @@ async function resumeInsertion(sessionKey, triggerMessage) {
     if (success > 0) {
       await replyTo(triggerMessage,
         `Content for **${rangeLabel}** pushed to master in en_ult and en_ust.` +
-        (fail > 0 ? `\n(${fail} chapter(s) had insertion errors -- check admin DMs for details.)` : '')
+        (fail > 0 ? `\n(${fail} chapter(s) had insertion errors -- check admin DMs for details.)` : '') +
+        `\nYou may need to refresh the tcCreate or gatewayEdit page to see the new content.`
       );
     } else {
       await replyTo(triggerMessage, `Insertion failed for all chapters of **${rangeLabel}**. Check admin DMs for details.`);
@@ -120,7 +121,8 @@ async function resumeInsertion(sessionKey, triggerMessage) {
       await replyTo(triggerMessage,
         `Notes insertion complete for **${rangeLabel}**.\n` +
         `Content pushed to master on en_tn` +
-        (fail > 0 ? `\n(${fail} chapter(s) had insertion errors -- check admin DMs for details.)` : '')
+        (fail > 0 ? `\n(${fail} chapter(s) had insertion errors -- check admin DMs for details.)` : '') +
+        `\nYou may need to refresh the tcCreate or gatewayEdit page to see the new content.`
       );
     } else {
       await replyTo(triggerMessage, `Notes insertion failed for all chapters of **${rangeLabel}**. Check admin DMs for details.`);

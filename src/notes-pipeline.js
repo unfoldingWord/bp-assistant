@@ -418,12 +418,14 @@ async function notesPipeline(route, message) {
     if (chapterCount === 1) {
       await reply(
         `Notes pipeline complete for **${rangeLabel}** (${totalDuration}s).\n` +
-        `Content pushed to ${finalBranch} on en_tn`
+        `Content pushed to ${finalBranch} on en_tn\n` +
+        `You may need to refresh the tcCreate or gatewayEdit page to see the new content.`
       );
     } else {
       await reply(
         `Notes pipeline complete for **${rangeLabel}**: all ${totalSuccess} chapter(s) succeeded (${totalDuration}s).\n` +
-        `Content pushed to ${finalBranch} on en_tn`
+        `Content pushed to ${finalBranch} on en_tn\n` +
+        `You may need to refresh the tcCreate or gatewayEdit page to see the new content.`
       );
     }
   }
