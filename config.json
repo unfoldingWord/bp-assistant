@@ -9,13 +9,14 @@
     "BP Proofreading",
     "Proofreading Queue",
     "Jeremiah BP",
+    "Habakkuk BP",
     "Bot testing"
   ],
   "watchDMs": true,
   "routes": [
     {
       "name": "editor-note",
-      "match": "/note\\s+(\\w+)(?:\\s+(\\d+))?\\s+(.+)/i",
+      "match": "/^note\\s+(\\w+)(?:\\s+(?:ch\\.?\\s*)?(\\d+))?\\s+(.+)/i",
       "type": "editor-note",
       "reply": true,
       "confirmMessage": "I'll file this note for **$1**. Sound right? (yes/no)"

@@ -15,7 +15,7 @@ async function editorNotePipeline(route, message) {
 
   if (route._noteText) {
     // Haiku NLU path — fields pre-extracted
-    book = route._book;
+    book = route._book ? normalizeBookName(route._book) : null;
     chapter = route._chapter || null;
     noteText = route._noteText;
   } else {
