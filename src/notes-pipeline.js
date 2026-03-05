@@ -15,7 +15,7 @@ const { runClaude } = require('./claude-runner');
 const { getDoor43Username, buildBranchName, resolveOutputFile, checkPrerequisites, calcSkillTimeout, normalizeBookName, CSKILLBP_DIR } = require('./pipeline-utils');
 const { verifyRepoPush, verifyDcsToken } = require('./repo-verify');
 const { recordMetrics, getCumulativeTokens, recordRunSummary } = require('./usage-tracker');
-const { door43Push } = require('./door43-push');
+const { door43Push, getUserBranch } = require('./door43-push');
 
 const LOG_DIR = path.resolve(__dirname, '../logs');
 
@@ -390,9 +390,10 @@ async function notesPipeline(route, message) {
 
     totalSuccess++;
 
-    // Notify user only after merge to master is confirmed
+    // Notify user only after merge is confirmed
+    const tnUserBranch = getUserBranch('tn', username, book);
     if (chapterCount > 1) {
-      await reply(`**${ref}** notes merged to master on en_tn (${chapterDuration}s)`);
+      await reply(`**${ref}** notes merged to ${tnUserBranch} on en_tn (${chapterDuration}s)`);
     }
   }
 
@@ -413,15 +414,16 @@ async function notesPipeline(route, message) {
   } else {
     await addReaction(msgId, 'check');
 
+    const finalBranch = getUserBranch('tn', username, book);
     if (chapterCount === 1) {
       await reply(
         `Notes pipeline complete for **${rangeLabel}** (${totalDuration}s).\n` +
-        `Content pushed to master on en_tn`
+        `Content pushed to ${finalBranch} on en_tn`
       );
     } else {
       await reply(
         `Notes pipeline complete for **${rangeLabel}**: all ${totalSuccess} chapter(s) succeeded (${totalDuration}s).\n` +
-        `Content pushed to master on en_tn`
+        `Content pushed to ${finalBranch} on en_tn`
       );
     }
   }

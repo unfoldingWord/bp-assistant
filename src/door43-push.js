@@ -39,6 +39,58 @@ const BOOK_NUMBERS = {
 const LOG_PREFIX = '[door43-push]';
 
 // ---------------------------------------------------------------------------
+// User branch naming conventions (from Door43 / tcCreate)
+// ---------------------------------------------------------------------------
+
+/**
+ * Derive the user's working branch name for a given content type.
+ * @param {string} type - 'tn', 'tq', 'ult', or 'ust'
+ * @param {string} username - Door43 username (e.g. 'deferredreward')
+ * @param {string} book - 3-letter book code (e.g. 'PSA')
+ * @returns {string} user branch name
+ */
+function getUserBranch(type, username, book) {
+  const bookUpper = book.toUpperCase();
+  if (type === 'tn' || type === 'tq') {
+    return `${username}-tc-create-1`;
+  }
+  // ULT / UST
+  return `auto-${username}-${bookUpper}`;
+}
+
+/**
+ * Ensure a branch exists on the remote repo. If missing, create from master.
+ * @param {string} token - Gitea API token
+ * @param {string} repo - repo name (e.g. 'en_tn')
+ * @param {string} branch - branch to ensure exists
+ */
+async function ensureRemoteBranch(token, repo, branch) {
+  const checkRes = await apiRequest('GET', `/repos/${ORG}/${repo}/branches/${encodeURIComponent(branch)}`, token);
+  if (checkRes.status === 200) {
+    console.log(`${LOG_PREFIX} User branch '${branch}' exists on ${repo}`);
+    return;
+  }
+
+  console.log(`${LOG_PREFIX} Creating user branch '${branch}' from master on ${repo}`);
+  const createRes = await apiRequest('POST', `/repos/${ORG}/${repo}/branches`, token, {
+    new_branch_name: branch,
+    old_branch_name: 'master',
+  });
+
+  if (createRes.status === 201 || createRes.status === 200) {
+    console.log(`${LOG_PREFIX} Created user branch '${branch}' from master`);
+    return;
+  }
+  // 409 = branch already exists (race condition) — that's fine
+  if (createRes.status === 409) {
+    console.log(`${LOG_PREFIX} User branch '${branch}' already exists (409 race)`);
+    return;
+  }
+
+  throw new Error(`Failed to create branch '${branch}' on ${repo}: HTTP ${createRes.status} — ${JSON.stringify(createRes.data)}`);
+}
+
+// ---------------------------------------------------------------------------
 // Generic retry utility
 // ---------------------------------------------------------------------------
 
@@ -145,10 +197,10 @@ function getRepoFilename(type, book) {
 }
 
 // ---------------------------------------------------------------------------
-// syncRepo — clone if needed, create fresh branch from origin/master
+// syncRepo — clone if needed, create fresh branch from origin/{baseBranch}
 // ---------------------------------------------------------------------------
 
-function syncRepo(repoDir, repoName, branch) {
+function syncRepo(repoDir, repoName, branch, baseBranch = 'master') {
   const repoUrl = `https://git.door43.org/${ORG}/${repoName}.git`;
 
   // Clone if missing
@@ -185,15 +237,15 @@ function syncRepo(repoDir, repoName, branch) {
   console.log(`${LOG_PREFIX} Fetching origin for ${repoName}...`);
   execSync('git fetch origin', { cwd: repoDir, timeout: 60000, stdio: 'pipe' });
 
-  // Detach HEAD, delete local branch if it exists, create fresh from origin/master
+  // Detach HEAD, delete local branch if it exists, create fresh from origin/{baseBranch}
   execSync('git checkout --detach', { cwd: repoDir, timeout: 10000, stdio: 'pipe' });
   try {
-    execSync(`git branch -D ${branch}`, { cwd: repoDir, timeout: 5000, stdio: 'pipe' });
+    execFileSync('git', ['branch', '-D', branch], { cwd: repoDir, timeout: 5000, stdio: 'pipe' });
   } catch {
     // Branch didn't exist locally — fine
   }
-  execSync(`git checkout -b ${branch} origin/master`, { cwd: repoDir, timeout: 10000, stdio: 'pipe' });
-  console.log(`${LOG_PREFIX} On branch ${branch} (from origin/master) in ${repoDir}`);
+  execFileSync('git', ['checkout', '-b', branch, `origin/${baseBranch}`], { cwd: repoDir, timeout: 10000, stdio: 'pipe' });
+  console.log(`${LOG_PREFIX} On branch ${branch} (from origin/${baseBranch}) in ${repoDir}`);
 }
 
 // ---------------------------------------------------------------------------
@@ -214,12 +266,15 @@ function insertContent({ type, book, chapter, source, verses, repoDir, repoFilen
   if (type === 'tn') {
     const script = path.join(SCRIPTS_DIR, 'insert_tn_rows.py');
     console.log(`${LOG_PREFIX} Inserting TN rows: ${source} → ${repoFilename}`);
-    const output = execFileSync('python3', [
+    const args = [
       script,
       '--book-file', bookFilePath,
       '--source-file', sourcePath,
+      '--chapter', String(chapter),
       '--backup',
-    ], { encoding: 'utf8', timeout: 60000, cwd: CSKILLBP_DIR });
+    ];
+    if (book.toUpperCase() === 'PSA') args.push('--skip-intro');
+    const output = execFileSync('python3', args, { encoding: 'utf8', timeout: 60000, cwd: CSKILLBP_DIR });
     if (output.trim()) console.log(`${LOG_PREFIX} insert_tn_rows: ${output.trim()}`);
   } else {
     // ULT or UST
@@ -273,7 +328,7 @@ async function commitAndPush(repoDir, branch, filename, commitMsg) {
 // createAndMergePR — Gitea API: create PR, merge, delete branch
 // ---------------------------------------------------------------------------
 
-async function createAndMergePR(token, repo, branch, title) {
+async function createAndMergePR(token, repo, branch, title, baseBranch = 'master') {
   // Validate token
   const tokenCheck = await apiRequest('GET', `/repos/${ORG}/${repo}`, token);
   if (tokenCheck.status === 401 || tokenCheck.status === 403) {
@@ -293,7 +348,7 @@ async function createAndMergePR(token, repo, branch, title) {
       const res = await apiRequest('POST', `/repos/${ORG}/${repo}/pulls`, token, {
         title,
         head: branch,
-        base: 'master',
+        base: baseBranch,
         body: '',
       });
 
@@ -365,7 +420,7 @@ async function createAndMergePR(token, repo, branch, title) {
     console.warn(`${LOG_PREFIX} Branch deletion failed (non-critical): ${err.message}`);
   }
 
-  return { success: true, details: `PR #${prNumber} merged ${branch} into master on ${repo}`, prNumber };
+  return { success: true, details: `PR #${prNumber} merged ${branch} into ${baseBranch} on ${repo}`, prNumber };
 }
 
 // ---------------------------------------------------------------------------
@@ -401,26 +456,32 @@ async function door43Push(opts) {
   const repoFilename = getRepoFilename(type, book);
   const prTitle = `AI ${type.toUpperCase()} for ${book} ${chapter} [${username}]`;
 
-  console.log(`${LOG_PREFIX} Starting push: ${type.toUpperCase()} ${book} ${chapter} → ${repo}/${branch}`);
+  // Derive user branch (PR target) from content type + username + book
+  const userBranch = getUserBranch(type, username, book);
+
+  console.log(`${LOG_PREFIX} Starting push: ${type.toUpperCase()} ${book} ${chapter} → ${repo}/${branch} (target: ${userBranch})`);
   const startTime = Date.now();
 
   try {
-    // Step 1: Sync repo (clone/fetch, create branch)
-    syncRepo(repoDir, repo, branch);
+    // Step 1: Ensure user branch exists on remote (create from master if not)
+    await ensureRemoteBranch(config.token, repo, userBranch);
 
-    // Step 2: Insert content via Python script
+    // Step 2: Sync repo (clone/fetch, create staging branch from user branch)
+    syncRepo(repoDir, repo, branch, userBranch);
+
+    // Step 3: Insert content via Python script
     insertContent({ type, book, chapter, source, verses, repoDir, repoFilename });
 
-    // Step 3: Commit and push
+    // Step 4: Commit and push
     const commitMsg = `${type.toUpperCase()}: ${book} ${chapter} [${username}]`;
     const pushResult = await commitAndPush(repoDir, branch, repoFilename, commitMsg);
 
     if (pushResult.noChanges) {
-      return { success: true, details: `No changes detected for ${type.toUpperCase()} ${book} ${chapter} — content already matches master` };
+      return { success: true, details: `No changes detected for ${type.toUpperCase()} ${book} ${chapter} — content already matches ${userBranch}` };
     }
 
-    // Step 4: Create PR, merge, delete branch
-    const prResult = await createAndMergePR(config.token, repo, branch, prTitle);
+    // Step 5: Create PR targeting user branch, merge, delete staging branch
+    const prResult = await createAndMergePR(config.token, repo, branch, prTitle, userBranch);
     const duration = ((Date.now() - startTime) / 1000).toFixed(1);
 
     if (prResult.success) {
@@ -437,4 +498,4 @@ async function door43Push(opts) {
   }
 }
 
-module.exports = { door43Push, BOOK_NUMBERS, getRepoFilename };
+module.exports = { door43Push, BOOK_NUMBERS, getRepoFilename, getUserBranch };
