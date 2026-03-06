@@ -182,7 +182,7 @@ const BOOK_NAME_MAP = {
   NEHEMIAH: 'NEH', NEHE: 'NEH',
   ESTHER: 'EST', ESTH: 'EST',
   JOB: 'JOB',
-  PSALM: 'PSA', PSALMS: 'PSA',
+  PSALM: 'PSA', PSALMS: 'PSA', PS: 'PSA',
   PROVERBS: 'PRO', PROV: 'PRO',
   ECCLESIASTES: 'ECC', ECCL: 'ECC', ECCLES: 'ECC',
   SONG: 'SNG',
@@ -231,7 +231,14 @@ const VALID_BOOK_CODES = new Set(Object.values(BOOK_NAME_MAP));
 
 function normalizeBookName(name) {
   const upper = name.toUpperCase();
-  return BOOK_NAME_MAP[upper] || upper;
+  // Direct match (full name or known alias)
+  if (BOOK_NAME_MAP[upper]) return BOOK_NAME_MAP[upper];
+  // Already a valid 3-letter code
+  if (VALID_BOOK_CODES.has(upper)) return upper;
+  // Prefix match: find map keys that start with the input (e.g. "PS" -> "PSALM" -> "PSA")
+  const prefixMatch = Object.keys(BOOK_NAME_MAP).find(k => k.startsWith(upper));
+  if (prefixMatch) return BOOK_NAME_MAP[prefixMatch];
+  return upper;
 }
 
 function isValidBook(name) {
