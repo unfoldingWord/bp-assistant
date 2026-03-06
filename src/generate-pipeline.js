@@ -13,6 +13,7 @@ const { sendMessage, sendDM, addReaction, removeReaction, uploadFile } = require
 const { runClaude } = require('./claude-runner');
 const { getDoor43Username, buildBranchName, resolveOutputFile, calcSkillTimeout, normalizeBookName, CSKILLBP_DIR } = require('./pipeline-utils');
 const { verifyRepoPush, verifyDcsToken } = require('./repo-verify');
+const { ensureFreshToken, isAuthError } = require('./auth-refresh');
 const { recordMetrics, getCumulativeTokens, recordRunSummary } = require('./usage-tracker');
 const { door43Push } = require('./door43-push');
 
@@ -184,6 +185,19 @@ async function generatePipeline(route, message) {
         });
       } catch (err) {
         console.error(`[generate] Claude SDK error for ${book} ${ch}: ${err.message}`);
+        if (isAuthError(err)) {
+          await reply('Claude auth expired. Waiting for re-authentication...');
+          await status(`Auth error on ${book} ${ch} — waiting for reauth`);
+          const restored = await ensureFreshToken();
+          if (restored) {
+            await status(`Auth restored — retrying ${book} ${ch}`);
+            ch--;
+            continue;
+          }
+          await status(`Auth could not be restored — aborting remaining chapters`);
+          fail += (end - ch + 1);
+          break;
+        }
         claudeResult = null;
       }
     }
