@@ -392,19 +392,6 @@ function preflightCheck({ pipeline, book, startCh, endCh }) {
   const budget = room.budget;
   const headroom = room.headroom;
 
-  // Never reject based on estimates alone — only warn.
-  // Rejection should only happen when we actually hit rate limits (handled by calibration).
-  // Warn if estimated usage is high relative to remaining headroom
-  if (headroom > 0 && estimate.totalTokens > headroom * threshold) {
-    return {
-      decision: 'warn',
-      reason: `Heads up: est ~${formatTokens(estimate.totalTokens)}, ~${formatTokens(headroom)} headroom remaining (${Math.round(estimate.totalTokens / headroom * 100)}%).`,
-      estimate,
-      headroom: room,
-      retryAt: null,
-    };
-  }
-
   return {
     decision: 'proceed',
     reason: null,

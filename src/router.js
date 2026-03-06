@@ -514,9 +514,6 @@ async function routeMessage(message) {
           const estLabel = buildEstimateLabel(preflight.estimate, pfBook, pfStart, pfEnd, pfVS, pfVE);
           confirmText = confirmText.replace(/\. Sound right\?/, ` ${estLabel}. Sound right?`);
 
-          if (preflight.decision === 'warn') {
-            confirmText += `\n\n**Warning:** ${preflight.reason}`;
-          }
         }
       }
 
