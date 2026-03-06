@@ -1,7 +1,7 @@
 const config = require('./config');
 const { getClient, sendMessage } = require('./zulip-client');
 const { routeMessage, hasPendingAction, hasActiveSession } = require('./router');
-const { ensureFreshToken, setReauthNotifier, attemptReauth } = require('./auth-refresh');
+const { ensureFreshToken } = require('./auth-refresh');
 const { getAllPendingMerges } = require('./pending-merges');
 const { verifyDcsToken } = require('./repo-verify');
 
@@ -47,22 +47,6 @@ async function handleEvents(events) {
       if (!config.watchDMs) continue;
       console.log(`[bot] DM from ${msg.sender_full_name}`);
 
-      // Handle "reauth" DM command from admin
-      if (msg.sender_id === config.adminUserId) {
-        const trimmed = msg.content.replace(/^@\*\*[^*]+\*\*\s*/, '').trim().toLowerCase();
-        if (trimmed === 'reauth' || trimmed === 'retry auth') {
-          console.log('[bot] Admin requested reauth via DM');
-          await sendMessage(null, null, 'Starting re-authentication...');
-          sendDM(msg.sender_id, 'Starting re-authentication...').catch(() => {});
-          attemptReauth().then(ok => {
-            sendDM(msg.sender_id, ok
-              ? 'Re-authentication successful. Token refreshed.'
-              : 'Re-authentication failed. Try `claude auth login` inside the container.'
-            ).catch(() => {});
-          });
-          continue;
-        }
-      }
     }
 
     await routeMessage(msg);
@@ -107,17 +91,7 @@ async function main() {
   console.log(`[bot] Watching channel: "${config.channel}" (all topics)`);
   if (config.watchDMs) console.log('[bot] Watching DMs');
 
-  // Register reauth notifier — sends OAuth URL to admin via Zulip DM
-  if (config.adminUserId) {
-    setReauthNotifier(async (url) => {
-      console.log(`[bot] Sending reauth URL to admin via DM`);
-      await sendDM(config.adminUserId,
-        `Claude auth expired. Please approve in browser:\n${url}\n\nThe bot will resume automatically once approved.`
-      );
-    });
-  }
-
-  // Proactive token refresh every 6 hours (tokens last 8h, refresh at 30min margin)
+  // Proactive token refresh (no-op when CLAUDE_CODE_OAUTH_TOKEN is set)
   const REFRESH_INTERVAL_MS = 6 * 60 * 60 * 1000;
   ensureFreshToken().then(ok => {
     console.log(`[bot] Initial token check: ${ok ? 'OK' : 'FAILED — run claude login in container'}`);
