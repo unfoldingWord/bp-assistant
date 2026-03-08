@@ -4,7 +4,7 @@ const path = require('path');
 const { sendMessage, sendDM } = require('./zulip-client');
 const { normalizeBookName } = require('./pipeline-utils');
 
-const NOTES_DIR = '/workspace/data/editor-notes';
+const NOTES_DIR = '/srv/bot/workspace/data/editor-notes';
 
 /**
  * Run the editor-note pipeline: parse, append to file, reply with count.

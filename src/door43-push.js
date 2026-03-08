@@ -12,7 +12,7 @@ const { getVerseCount } = require('./verse-counts');
 const GITEA_API = 'https://git.door43.org/api/v1';
 const ORG = 'unfoldingWord';
 
-const CSKILLBP_DIR = path.resolve(__dirname, '../../cSkillBP');
+const CSKILLBP_DIR = process.env.CSKILLBP_DIR || '/srv/bot/workspace';
 const SCRIPTS_DIR = path.join(CSKILLBP_DIR, '.claude/skills/repo-insert/scripts');
 
 // Repo name for each content type
@@ -176,7 +176,7 @@ function getConfig() {
     }
   }
 
-  const reposPath = process.env.DOOR43_REPOS_PATH || '/workspace/door43-repos';
+  const reposPath = process.env.DOOR43_REPOS_PATH || '/srv/bot/workspace/door43-repos';
   return { token, username, reposPath };
 }
 

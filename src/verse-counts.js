@@ -4,7 +4,7 @@
 const fs = require('fs');
 const path = require('path');
 
-const HEBREW_DIR = process.env.HEBREW_DIR || '/workspace/data/hebrew_bible';
+const HEBREW_DIR = process.env.HEBREW_DIR || '/srv/bot/workspace/data/hebrew_bible';
 const cache = new Map();
 
 // Map 3-letter book codes to their Hebrew Bible filenames
