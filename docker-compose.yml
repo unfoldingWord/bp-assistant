@@ -13,12 +13,21 @@ services:
       - ./data:/app/data
       - claude-config:/claude-config
     working_dir: /app
+    ports:
+      - "127.0.0.1:3001:3001"
+    secrets:
+      - bt_mcp_api_token
     networks:
       - work-net
+      - home-net
     deploy:
       resources:
         limits:
           memory: 4g
+
+secrets:
+  bt_mcp_api_token:
+    file: ../config/secrets/bt_mcp_api_token
 
 volumes:
   claude-config:
@@ -27,4 +36,6 @@ volumes:
 
 networks:
   work-net:
+    external: true
+  home-net:
     external: true

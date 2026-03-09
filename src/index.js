@@ -1,4 +1,5 @@
 const config = require('./config');
+const { startMcpServer } = require('./mcp-server');
 const { getClient, sendMessage } = require('./zulip-client');
 const { routeMessage, hasPendingAction, hasActiveSession } = require('./router');
 const { ensureFreshToken } = require('./auth-refresh');
@@ -141,6 +142,8 @@ async function main() {
     }
   }
 }
+
+startMcpServer();
 
 process.on('unhandledRejection', (reason) => {
   console.error('[bot] Unhandled promise rejection:', reason);
