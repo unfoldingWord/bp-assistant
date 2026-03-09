@@ -39,58 +39,6 @@ const BOOK_NUMBERS = {
 const LOG_PREFIX = '[door43-push]';
 
 // ---------------------------------------------------------------------------
-// User branch naming conventions (from Door43 / tcCreate)
-// ---------------------------------------------------------------------------
-
-/**
- * Derive the user's working branch name for a given content type.
- * @param {string} type - 'tn', 'tq', 'ult', or 'ust'
- * @param {string} username - Door43 username (e.g. 'deferredreward')
- * @param {string} book - 3-letter book code (e.g. 'PSA')
- * @returns {string} user branch name
- */
-function getUserBranch(type, username, book) {
-  const bookUpper = book.toUpperCase();
-  if (type === 'tn' || type === 'tq') {
-    return `${username}-tc-create-1`;
-  }
-  // ULT / UST
-  return `auto-${username}-${bookUpper}`;
-}
-
-/**
- * Ensure a branch exists on the remote repo. If missing, create from master.
- * @param {string} token - Gitea API token
- * @param {string} repo - repo name (e.g. 'en_tn')
- * @param {string} branch - branch to ensure exists
- */
-async function ensureRemoteBranch(token, repo, branch) {
-  const checkRes = await apiRequest('GET', `/repos/${ORG}/${repo}/branches/${encodeURIComponent(branch)}`, token);
-  if (checkRes.status === 200) {
-    console.log(`${LOG_PREFIX} User branch '${branch}' exists on ${repo}`);
-    return;
-  }
-
-  console.log(`${LOG_PREFIX} Creating user branch '${branch}' from master on ${repo}`);
-  const createRes = await apiRequest('POST', `/repos/${ORG}/${repo}/branches`, token, {
-    new_branch_name: branch,
-    old_branch_name: 'master',
-  });
-
-  if (createRes.status === 201 || createRes.status === 200) {
-    console.log(`${LOG_PREFIX} Created user branch '${branch}' from master`);
-    return;
-  }
-  // 409 = branch already exists (race condition) — that's fine
-  if (createRes.status === 409) {
-    console.log(`${LOG_PREFIX} User branch '${branch}' already exists (409 race)`);
-    return;
-  }
-
-  throw new Error(`Failed to create branch '${branch}' on ${repo}: HTTP ${createRes.status} — ${JSON.stringify(createRes.data)}`);
-}
-
-// ---------------------------------------------------------------------------
 // Generic retry utility
 // ---------------------------------------------------------------------------
 
@@ -456,62 +404,78 @@ async function door43Push(opts) {
   const repoFilename = getRepoFilename(type, book);
   const prTitle = `AI ${type.toUpperCase()} for ${book} ${chapter} [${username}]`;
 
-  // Derive user branch (PR target) from content type + username + book
-  const userBranch = getUserBranch(type, username, book);
-
-  console.log(`${LOG_PREFIX} Starting push: ${type.toUpperCase()} ${book} ${chapter} → ${repo}/${branch} (target: ${userBranch})`);
+  console.log(`${LOG_PREFIX} Starting push: ${type.toUpperCase()} ${book} ${chapter} → ${repo}/${branch} (target: master)`);
   const startTime = Date.now();
 
   try {
-    // Step 1: Ensure user branch exists on remote (create from master if not)
-    await ensureRemoteBranch(config.token, repo, userBranch);
-
-    // Step 2: Sync repo (clone/fetch, create staging branch from user branch)
-    syncRepo(repoDir, repo, branch, userBranch);
+    // Step 1: Sync repo (clone/fetch, create staging branch from master)
+    syncRepo(repoDir, repo, branch);
 
     // Step 3: Insert content via Python script
     insertContent({ type, book, chapter, source, verses, repoDir, repoFilename });
 
     // Step 3b: Door43 CI validation gate (TN only)
-    // TEMPORARILY DISABLED — Door43 CI workflow (validate_tn_files.py) is not
-    // finalized yet. Re-enable once the remote CI script is stable.
-    // if (type === 'tn') {
-    //   const bookFilePath = path.join(repoDir, repoFilename);
-    //   const validateScript = path.join(CSKILLBP_DIR, '.claude/skills/tn-quality-check/scripts/validate_tn_tsv.py');
-    //   const jsonOut = path.join(repoDir, '.validation-result.json');
-    //   try {
-    //     execFileSync('python3', [validateScript, bookFilePath, '--json', jsonOut], {
-    //       encoding: 'utf8', timeout: 60000, cwd: CSKILLBP_DIR, stdio: 'pipe',
-    //     });
-    //     console.log(`${LOG_PREFIX} Door43 CI validation passed for ${repoFilename}`);
-    //   } catch (valErr) {
-    //     let details = `Door43 CI validation failed for ${repoFilename}`;
-    //     try {
-    //       const result = JSON.parse(fs.readFileSync(jsonOut, 'utf8'));
-    //       const errorSummary = result.errors.slice(0, 10).map(e =>
-    //         `  Line ${e.line}: [${e.rule}] ${e.message}`
-    //       ).join('\n');
-    //       details += ` (${result.error_count} error(s)):\n${errorSummary}`;
-    //       if (result.error_count > 10) details += `\n  ... and ${result.error_count - 10} more`;
-    //     } catch {
-    //       details += `: ${valErr.stderr || valErr.message}`;
-    //     }
-    //     execFileSync('git', ['checkout', '--', repoFilename], { cwd: repoDir, timeout: 5000, stdio: 'pipe' });
-    //     console.error(`${LOG_PREFIX} ${details}`);
-    //     throw new Error(details);
-    //   }
-    // }
+    // Uses the repo's own validate_tn_files.py from .gitea/workflows/
+    if (type === 'tn') {
+      const validateScript = path.join(repoDir, '.gitea/workflows/validate_tn_files.py');
+      if (fs.existsSync(validateScript)) {
+        const bookLower = book.toLowerCase();
+        // Skip checks 1-2 (manifest/project-level); run checks 3-15
+        const checkArgs = [];
+        for (let i = 3; i <= 15; i++) checkArgs.push('--check', String(i));
+        try {
+          const valOutput = execFileSync('python3', [
+            validateScript, '--book', bookLower, '--json', ...checkArgs,
+          ], { encoding: 'utf8', timeout: 60000, cwd: repoDir, stdio: 'pipe' });
+          const valResult = JSON.parse(valOutput);
+          if (valResult.errors && valResult.errors.length > 0) {
+            const errorSummary = valResult.errors.slice(0, 10).map(e =>
+              `  ${e.message || JSON.stringify(e)}`
+            ).join('\n');
+            let details = `Door43 CI validation failed for ${repoFilename} (${valResult.errors.length} error(s)):\n${errorSummary}`;
+            if (valResult.errors.length > 10) details += `\n  ... and ${valResult.errors.length - 10} more`;
+            execFileSync('git', ['checkout', '--', repoFilename], { cwd: repoDir, timeout: 5000, stdio: 'pipe' });
+            console.error(`${LOG_PREFIX} ${details}`);
+            throw new Error(details);
+          }
+          console.log(`${LOG_PREFIX} Door43 CI validation passed for ${repoFilename}`);
+        } catch (valErr) {
+          if (valErr.message.includes('Door43 CI validation failed')) throw valErr;
+          // Script execution error — try parsing stderr for JSON
+          let details = `Door43 CI validation failed for ${repoFilename}`;
+          try {
+            const errResult = JSON.parse(valErr.stdout || '{}');
+            if (errResult.errors && errResult.errors.length > 0) {
+              const errorSummary = errResult.errors.slice(0, 10).map(e =>
+                `  ${e.message || JSON.stringify(e)}`
+              ).join('\n');
+              details += ` (${errResult.errors.length} error(s)):\n${errorSummary}`;
+              if (errResult.errors.length > 10) details += `\n  ... and ${errResult.errors.length - 10} more`;
+            } else {
+              details += `: ${valErr.stderr || valErr.message}`;
+            }
+          } catch {
+            details += `: ${valErr.stderr || valErr.message}`;
+          }
+          execFileSync('git', ['checkout', '--', repoFilename], { cwd: repoDir, timeout: 5000, stdio: 'pipe' });
+          console.error(`${LOG_PREFIX} ${details}`);
+          throw new Error(details);
+        }
+      } else {
+        console.log(`${LOG_PREFIX} Validation script not found at ${validateScript} — skipping validation`);
+      }
+    }
 
     // Step 4: Commit and push
     const commitMsg = `${type.toUpperCase()}: ${book} ${chapter} [${username}]`;
     const pushResult = await commitAndPush(repoDir, branch, repoFilename, commitMsg);
 
     if (pushResult.noChanges) {
-      return { success: true, details: `No changes detected for ${type.toUpperCase()} ${book} ${chapter} — content already matches ${userBranch}` };
+      return { success: true, details: `No changes detected for ${type.toUpperCase()} ${book} ${chapter} — content already matches master` };
     }
 
-    // Step 5: Create PR targeting user branch, merge, delete staging branch
-    const prResult = await createAndMergePR(config.token, repo, branch, prTitle, userBranch);
+    // Step 5: Create PR targeting master, merge, delete staging branch
+    const prResult = await createAndMergePR(config.token, repo, branch, prTitle);
     const duration = ((Date.now() - startTime) / 1000).toFixed(1);
 
     if (prResult.success) {
@@ -528,4 +492,4 @@ async function door43Push(opts) {
   }
 }
 
-module.exports = { door43Push, BOOK_NUMBERS, getRepoFilename, getUserBranch };
+module.exports = { door43Push, BOOK_NUMBERS, getRepoFilename };

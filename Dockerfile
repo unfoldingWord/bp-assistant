@@ -7,7 +7,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # Python deps (requests is the only non-stdlib import in skills-BP scripts)
-RUN pip3 install --break-system-packages requests
+RUN pip3 install --break-system-packages requests pyyaml
 
 # Create non-root user with uid 1001 (matches host ubuntu user for volume permissions)
 # Claude Code refuses bypassPermissions as root
