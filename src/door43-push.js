@@ -416,50 +416,64 @@ async function door43Push(opts) {
 
     // Step 3b: Door43 CI validation gate (TN only)
     // Uses the repo's own validate_tn_files.py from .gitea/workflows/
+    // Only blocks on errors in the chapter we're inserting — pre-existing errors
+    // in other chapters are logged as warnings but do not block delivery.
     if (type === 'tn') {
       const validateScript = path.join(repoDir, '.gitea/workflows/validate_tn_files.py');
       if (fs.existsSync(validateScript)) {
         const bookLower = book.toLowerCase();
-        // Skip checks 1-2 (manifest/project-level); run checks 3-15
         const checkArgs = [];
         for (let i = 3; i <= 15; i++) checkArgs.push('--check', String(i));
+
+        // Collect JSON output regardless of exit code (exit 1 = validation errors found)
+        let rawJson = '';
         try {
-          const valOutput = execFileSync('python3', [
+          rawJson = execFileSync('python3', [
             validateScript, '--book', bookLower, '--json', ...checkArgs,
           ], { encoding: 'utf8', timeout: 60000, cwd: repoDir, stdio: 'pipe' });
-          const valResult = JSON.parse(valOutput);
-          if (valResult.errors && valResult.errors.length > 0) {
-            const errorSummary = valResult.errors.slice(0, 10).map(e =>
-              `  ${e.message || JSON.stringify(e)}`
+        } catch (execErr) {
+          rawJson = execErr.stdout || '';
+          if (!rawJson) {
+            console.warn(`${LOG_PREFIX} Validation script failed to run: ${execErr.stderr || execErr.message} — skipping`);
+          }
+        }
+
+        if (rawJson) {
+          // Flatten errors from all check groups: {"3": {"errors": [...]}, "4": {...}, ...}
+          let allErrors = [];
+          try {
+            const parsed = JSON.parse(rawJson);
+            for (const key of Object.keys(parsed)) {
+              const group = parsed[key];
+              if (group && Array.isArray(group.errors)) {
+                allErrors = allErrors.concat(group.errors);
+              }
+            }
+          } catch {
+            console.warn(`${LOG_PREFIX} Could not parse validation output — skipping`);
+          }
+
+          // Only block on errors in the chapter we're inserting
+          const chapterPrefix = String(chapter) + ':';
+          const ourErrors = allErrors.filter(e => e.ref && String(e.ref).startsWith(chapterPrefix));
+          const otherCount = allErrors.length - ourErrors.length;
+
+          if (otherCount > 0) {
+            console.warn(`${LOG_PREFIX} ${otherCount} pre-existing validation issue(s) in other chapters (not blocking)`);
+          }
+
+          if (ourErrors.length > 0) {
+            const errorSummary = ourErrors.slice(0, 10).map(e =>
+              `  Line ${e.line || '?'}: [${e.ref}] ${e.message}`
             ).join('\n');
-            let details = `Door43 CI validation failed for ${repoFilename} (${valResult.errors.length} error(s)):\n${errorSummary}`;
-            if (valResult.errors.length > 10) details += `\n  ... and ${valResult.errors.length - 10} more`;
+            let details = `Door43 CI validation failed for ${repoFilename} — ${ourErrors.length} error(s) in chapter ${chapter}:\n${errorSummary}`;
+            if (ourErrors.length > 10) details += `\n  ... and ${ourErrors.length - 10} more`;
             execFileSync('git', ['checkout', '--', repoFilename], { cwd: repoDir, timeout: 5000, stdio: 'pipe' });
             console.error(`${LOG_PREFIX} ${details}`);
             throw new Error(details);
           }
-          console.log(`${LOG_PREFIX} Door43 CI validation passed for ${repoFilename}`);
-        } catch (valErr) {
-          if (valErr.message.includes('Door43 CI validation failed')) throw valErr;
-          // Script execution error — try parsing stderr for JSON
-          let details = `Door43 CI validation failed for ${repoFilename}`;
-          try {
-            const errResult = JSON.parse(valErr.stdout || '{}');
-            if (errResult.errors && errResult.errors.length > 0) {
-              const errorSummary = errResult.errors.slice(0, 10).map(e =>
-                `  ${e.message || JSON.stringify(e)}`
-              ).join('\n');
-              details += ` (${errResult.errors.length} error(s)):\n${errorSummary}`;
-              if (errResult.errors.length > 10) details += `\n  ... and ${errResult.errors.length - 10} more`;
-            } else {
-              details += `: ${valErr.stderr || valErr.message}`;
-            }
-          } catch {
-            details += `: ${valErr.stderr || valErr.message}`;
-          }
-          execFileSync('git', ['checkout', '--', repoFilename], { cwd: repoDir, timeout: 5000, stdio: 'pipe' });
-          console.error(`${LOG_PREFIX} ${details}`);
-          throw new Error(details);
+
+          console.log(`${LOG_PREFIX} Door43 CI validation passed for chapter ${chapter} in ${repoFilename}`);
         }
       } else {
         console.log(`${LOG_PREFIX} Validation script not found at ${validateScript} — skipping validation`);

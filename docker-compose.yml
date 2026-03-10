@@ -7,6 +7,9 @@ services:
     restart: unless-stopped
     env_file:
       - ../config/.env
+    environment:
+      - CSKILLBP_DIR=/workspace
+      - DOOR43_REPOS_PATH=/workspace/door43-repos
     volumes:
       - ../workspace:/workspace
       - ../config:/config
