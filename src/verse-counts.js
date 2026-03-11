@@ -32,12 +32,17 @@ function buildFileIndex() {
  * @returns {number} verse count, or 20 as default
  */
 function getVerseCount(book, chapter) {
-  const key = `${book.toUpperCase()}-${chapter}`;
+  // Lazy require to avoid circular dependency (pipeline-utils imports verse-counts)
+  const { normalizeBookName } = require('./pipeline-utils');
+  book = normalizeBookName(book);
+
+  const key = `${book}-${chapter}`;
   if (cache.has(key)) return cache.get(key);
 
   const index = buildFileIndex();
-  const filePath = index[book.toUpperCase()];
+  const filePath = index[book];
   if (!filePath) {
+    console.warn(`[verse-counts] Book "${book}" not found in file index, defaulting to 20`);
     cache.set(key, 20);
     return 20;
   }

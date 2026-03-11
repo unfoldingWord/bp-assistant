@@ -2,6 +2,7 @@
 // Uses claude-agent-sdk (OAuth) rather than @anthropic-ai/sdk (API key).
 
 const { ensureFreshToken } = require('./auth-refresh');
+const { normalizeBookName } = require('./pipeline-utils');
 
 let _query = null;
 async function getQuery() {
@@ -90,7 +91,7 @@ async function classifyIntent(messageContent) {
       : ['ult', 'ust'];
     return {
       intent: parsed.intent,
-      book: parsed.book ? parsed.book.toUpperCase() : null,
+      book: parsed.book ? normalizeBookName(parsed.book) : null,
       startChapter: parsed.startChapter ?? null,
       endChapter: parsed.endChapter ?? null,
       contentTypes,
