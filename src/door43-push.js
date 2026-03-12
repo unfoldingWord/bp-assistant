@@ -95,6 +95,60 @@ function apiRequest(method, apiPath, token, data = null, timeoutMs = 30000) {
 }
 
 // ---------------------------------------------------------------------------
+// Check for user branches that modify the same file we're about to merge
+// ---------------------------------------------------------------------------
+
+async function checkConflictingBranches(repo, targetFile) {
+  const { token } = getConfig();
+  if (!token) return [];
+
+  try {
+    // List all branches
+    const res = await apiRequest('GET', `/repos/${ORG}/${repo}/branches?limit=50`, token);
+    if (res.status !== 200 || !Array.isArray(res.data)) {
+      console.warn(`${LOG_PREFIX} Could not list branches for ${repo}: HTTP ${res.status}`);
+      return [];
+    }
+
+    // Filter to human branches (not master, not AI-*)
+    const humanBranches = res.data
+      .map(b => b.name)
+      .filter(name => name !== 'master' && !name.startsWith('AI-'));
+
+    if (humanBranches.length === 0) return [];
+
+    console.log(`${LOG_PREFIX} Checking ${humanBranches.length} user branch(es) for conflicts with ${targetFile} on ${repo}...`);
+
+    // Check each for changes to our target file
+    const conflicting = [];
+    for (const branch of humanBranches) {
+      try {
+        const cmp = await apiRequest('GET',
+          `/repos/${ORG}/${repo}/compare/master...${encodeURIComponent(branch)}`, token);
+        if (cmp.status === 200 && Array.isArray(cmp.data?.files)) {
+          const touchesFile = cmp.data.files.some(f => f.filename === targetFile);
+          if (touchesFile) {
+            console.log(`${LOG_PREFIX} Branch '${branch}' modifies ${targetFile} — potential conflict`);
+            conflicting.push({ branch });
+          }
+        }
+      } catch (err) {
+        console.warn(`${LOG_PREFIX} compare check failed for ${branch}: ${err.message}`);
+      }
+    }
+
+    if (conflicting.length === 0) {
+      console.log(`${LOG_PREFIX} No conflicting branches found for ${targetFile} on ${repo}`);
+    }
+
+    return conflicting;
+  } catch (err) {
+    console.warn(`${LOG_PREFIX} checkConflictingBranches failed (proceeding without check): ${err.message}`);
+    return [];
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Get token and config from environment / .env files
 // ---------------------------------------------------------------------------
 
@@ -506,4 +560,4 @@ async function door43Push(opts) {
   }
 }
 
-module.exports = { door43Push, BOOK_NUMBERS, getRepoFilename };
+module.exports = { door43Push, checkConflictingBranches, BOOK_NUMBERS, REPO_MAP, getRepoFilename };

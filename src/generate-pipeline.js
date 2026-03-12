@@ -11,11 +11,12 @@ const path = require('path');
 const config = require('./config');
 const { sendMessage, sendDM, addReaction, removeReaction, uploadFile } = require('./zulip-client');
 const { runClaude } = require('./claude-runner');
-const { getDoor43Username, buildBranchName, resolveOutputFile, calcSkillTimeout, normalizeBookName, CSKILLBP_DIR } = require('./pipeline-utils');
+const { getDoor43Username, buildBranchName, resolveOutputFile, calcSkillTimeout, normalizeBookName, resolveConflictMention, CSKILLBP_DIR } = require('./pipeline-utils');
 const { verifyRepoPush, verifyDcsToken } = require('./repo-verify');
 const { ensureFreshToken, isAuthError } = require('./auth-refresh');
 const { recordMetrics, getCumulativeTokens, recordRunSummary } = require('./usage-tracker');
-const { door43Push } = require('./door43-push');
+const { door43Push, checkConflictingBranches, REPO_MAP, getRepoFilename } = require('./door43-push');
+const { setPendingMerge } = require('./pending-merges');
 
 const LOG_DIR = path.resolve(__dirname, '../logs');
 
@@ -330,6 +331,68 @@ async function generatePipeline(route, message) {
       fail += completedChapters.length;
       success -= completedChapters.length;
     } else {
+
+    // Pre-flight: check for conflicting user branches on target files
+    const ultFile = getRepoFilename('ult', book);
+    const ustFile = getRepoFilename('ust', book);
+    const ultConflicts = await checkConflictingBranches('en_ult', ultFile);
+    const ustConflicts = await checkConflictingBranches('en_ust', ustFile);
+    const allConflicts = [
+      ...ultConflicts.map(c => ({ ...c, repo: 'en_ult', file: ultFile })),
+      ...ustConflicts.map(c => ({ ...c, repo: 'en_ust', file: ustFile })),
+    ];
+
+    if (allConflicts.length > 0) {
+      const sessionKey = stream
+        ? `stream-${stream}-${topic}`
+        : `dm-${message.sender_id}`;
+      const branchList = allConflicts.map(c => `\`${c.branch}\` (${c.repo})`).join(', ');
+      const fileList = [...new Set(allConflicts.map(c => `\`${c.file}\``))].join(', ');
+
+      setPendingMerge(sessionKey, {
+        sessionKey,
+        pipelineType: 'generate',
+        username,
+        book,
+        startChapter: start,
+        endChapter: end,
+        completedChapters,
+        blockingBranches: allConflicts.map(c => ({ repo: c.repo, branchPattern: c.branch })),
+        originalMessage: message,
+        createdAt: new Date().toISOString(),
+        retryCount: 0,
+      });
+
+      const mention = await resolveConflictMention(
+        allConflicts[0].branch,
+        message.sender_full_name
+      );
+
+      const deferredRange = completedChapters.length === 1
+        ? `${book} ${completedChapters[0].ch}`
+        : `${book} ${completedChapters[0].ch}\u2013${completedChapters[completedChapters.length - 1].ch}`;
+
+      await removeReaction(msgId, 'working_on_it');
+      await addReaction(msgId, 'hourglass');
+      // Use sendMessage directly to control the @-mention (reply() auto-prepends sender)
+      const conflictMsg = `${mention} I have content ready for **${deferredRange}**, but ${branchList} ` +
+        `has edits to ${fileList}. Please merge your branch first, then say **merged** or **done** ` +
+        `so I can proceed with the insertion.`;
+      if (stream) {
+        await sendMessage(stream, topic, conflictMsg);
+      } else {
+        await sendDM(message.sender_id, conflictMsg);
+      }
+
+      const deferLabel = start === end ? `${book} ${start}` : `${book} ${start}\u2013${end}`;
+      await status(`Generate pipeline for **${deferLabel}**: generation done, push deferred — waiting for branch merge`);
+
+      recordRunSummary({
+        pipeline: 'generate', book, startCh: start, endCh: end,
+        tokensBefore, success: fail === 0, userId: message.sender_id,
+      });
+      return;
+    }
 
     for (const chData of completedChapters) {
       let chapterFailed = false;

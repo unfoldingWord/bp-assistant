@@ -1,7 +1,5 @@
 // insertion-resume.js — Resume deferred repo-insert after user merges branches
 // Called by the router when user says "merged" and there's a pending merge state.
-// Note: No new pending merges are created (push-to-master workflow eliminated them).
-// This file is kept for transition safety in case pending merges exist from before the change.
 
 const fs = require('fs');
 const path = require('path');
@@ -9,7 +7,7 @@ const config = require('./config');
 const { sendMessage, sendDM, addReaction, removeReaction } = require('./zulip-client');
 const { checkExistingBranch, buildBranchName, CSKILLBP_DIR } = require('./pipeline-utils');
 const { verifyRepoPush } = require('./repo-verify');
-const { door43Push } = require('./door43-push');
+const { door43Push, checkConflictingBranches, getRepoFilename } = require('./door43-push');
 const { getPendingMerge, setPendingMerge, clearPendingMerge } = require('./pending-merges');
 
 const adminUserId = config.adminUserId;
@@ -54,12 +52,16 @@ async function resumeInsertion(sessionKey, triggerMessage) {
   const { pipelineType, username, book, completedChapters, originalMessage } = pending;
   const msg = originalMessage;
 
-  // Re-check blocking branches
+  // Re-check: are there still user branches modifying the target files?
+  const repos = pipelineType === 'notes'
+    ? [{ type: 'tn', repo: 'en_tn' }]
+    : [{ type: 'ult', repo: 'en_ult' }, { type: 'ust', repo: 'en_ust' }];
+
   const stillBlocking = [];
-  for (const branchInfo of pending.blockingBranches) {
-    const { repo, branchPattern } = branchInfo;
-    const result = checkExistingBranch(username, repo, branchPattern, book);
-    if (result) stillBlocking.push(result);
+  for (const { type, repo } of repos) {
+    const targetFile = getRepoFilename(type, book);
+    const conflicts = await checkConflictingBranches(repo, targetFile);
+    stillBlocking.push(...conflicts.map(c => `${c.branch} (${repo})`));
   }
 
   if (stillBlocking.length > 0) {

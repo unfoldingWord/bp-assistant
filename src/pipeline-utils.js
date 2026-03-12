@@ -246,6 +246,47 @@ function isValidBook(name) {
   return BOOK_NAME_MAP.hasOwnProperty(upper) || VALID_BOOK_CODES.has(upper);
 }
 
+/**
+ * Resolve a Door43 branch name to a Zulip @-mention for the branch owner.
+ * Tries to identify the Door43 username from the branch name, reverse-looks up
+ * door43-users.json to find the email, then uses Zulip API to get the full name.
+ * Falls back to the provided fallback name if lookup fails.
+ *
+ * @param {string} branchName - e.g. "deferredreward-tc-create-1"
+ * @param {string} fallbackSenderName - Zulip full name to use if lookup fails
+ * @returns {Promise<string>} Zulip @-mention string, e.g. '@**John Smith**'
+ */
+async function resolveConflictMention(branchName, fallbackSenderName) {
+  try {
+    // Extract Door43 username from branch name
+    // Common pattern: {username}-tc-create-{n}
+    const tcMatch = branchName.match(/^(.+?)-tc-create/);
+    const d43Username = tcMatch ? tcMatch[1] : branchName.split('-')[0];
+
+    // Reverse-lookup door43-users.json (email → d43username) to find email
+    const usersFile = path.resolve(__dirname, '../door43-users.json');
+    if (!fs.existsSync(usersFile)) return `@**${fallbackSenderName}**`;
+
+    const users = JSON.parse(fs.readFileSync(usersFile, 'utf8'));
+    const entry = Object.entries(users).find(([_, u]) => u === d43Username);
+    if (!entry) return `@**${fallbackSenderName}**`;
+
+    const email = entry[0];
+
+    // Use Zulip API to get full name from email
+    const { getClient } = require('./zulip-client');
+    const z = await getClient();
+    const res = await z.callEndpoint(`/users/${encodeURIComponent(email)}`, 'GET');
+    if (res.result === 'success' && res.user?.full_name) {
+      return `@**${res.user.full_name}**`;
+    }
+  } catch (err) {
+    console.warn(`[pipeline-utils] resolveConflictMention failed for '${branchName}': ${err.message}`);
+  }
+
+  return `@**${fallbackSenderName}**`;
+}
+
 module.exports = {
   getDoor43Username,
   checkExistingBranch,
@@ -255,5 +296,6 @@ module.exports = {
   calcSkillTimeout,
   normalizeBookName,
   isValidBook,
+  resolveConflictMention,
   CSKILLBP_DIR,
 };

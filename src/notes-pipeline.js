@@ -12,10 +12,11 @@ const path = require('path');
 const config = require('./config');
 const { sendMessage, sendDM, addReaction, removeReaction } = require('./zulip-client');
 const { runClaude } = require('./claude-runner');
-const { getDoor43Username, buildBranchName, resolveOutputFile, checkPrerequisites, calcSkillTimeout, normalizeBookName, CSKILLBP_DIR } = require('./pipeline-utils');
+const { getDoor43Username, buildBranchName, resolveOutputFile, checkPrerequisites, calcSkillTimeout, normalizeBookName, resolveConflictMention, CSKILLBP_DIR } = require('./pipeline-utils');
 const { verifyRepoPush, verifyDcsToken } = require('./repo-verify');
 const { recordMetrics, getCumulativeTokens, recordRunSummary } = require('./usage-tracker');
-const { door43Push } = require('./door43-push');
+const { door43Push, checkConflictingBranches, REPO_MAP, getRepoFilename } = require('./door43-push');
+const { setPendingMerge } = require('./pending-merges');
 
 const LOG_DIR = path.resolve(__dirname, '../logs');
 
@@ -155,6 +156,12 @@ async function notesPipeline(route, message) {
   const tokensBefore = getCumulativeTokens();
   let totalSuccess = 0;
   let totalFail = 0;
+
+  // Conflict-deferred push state: when a user branch modifies the same file,
+  // we continue generating but defer all pushes until the user says "merged".
+  let deferredPush = false;
+  let deferredConflicts = [];   // [{ branch }]
+  const deferredChapters = [];  // [{ ch, notesSource }]
 
   // =========================================================================
   // Per-chapter loop: skills -> repo-insert -> repo-verify -> notify user
@@ -332,6 +339,14 @@ async function notesPipeline(route, message) {
     const notesSource = tnWriterSkill?.resolvedOutput || `output/notes/${tag}.tsv`;
     let chapterFailed = false;
 
+    // If push is already deferred due to conflicting branches, collect and skip
+    if (deferredPush) {
+      deferredChapters.push({ ch, notesSource });
+      await status(`**door43-push deferred** for ${ref} (waiting for conflicting branches to be merged)`);
+      totalSuccess++;
+      continue;
+    }
+
     // Pre-flight: verify DCS token before push
     const dcsCheck = await verifyDcsToken();
     if (!dcsCheck.valid) {
@@ -345,6 +360,21 @@ async function notesPipeline(route, message) {
       if (!fs.existsSync(notesPath)) {
         await status(`**door43-push SKIPPED** for ${ref}: source file missing: ${notesSource}`);
         chapterFailed = true;
+      }
+    }
+
+    // Pre-flight: check for conflicting user branches on the target file
+    if (!chapterFailed) {
+      const repoName = REPO_MAP['tn'];
+      const targetFile = getRepoFilename('tn', book);
+      const conflicts = await checkConflictingBranches(repoName, targetFile);
+      if (conflicts.length > 0) {
+        deferredPush = true;
+        deferredConflicts = conflicts;
+        deferredChapters.push({ ch, notesSource });
+        await status(`**door43-push deferred** for ${ref}: conflicting branches found — ${conflicts.map(c => c.branch).join(', ')}`);
+        totalSuccess++;
+        continue;
       }
     }
 
@@ -397,6 +427,60 @@ async function notesPipeline(route, message) {
   }
 
   const totalDuration = ((Date.now() - pipelineStart) / 1000).toFixed(1);
+
+  // --- Handle deferred pushes: save to pending-merges and notify user ---
+  if (deferredChapters.length > 0) {
+    const sessionKey = stream
+      ? `stream-${stream}-${topic}`
+      : `dm-${message.sender_id}`;
+    const repoName = REPO_MAP['tn'];
+    const targetFile = getRepoFilename('tn', book);
+    const branchList = deferredConflicts.map(c => `\`${c.branch}\``).join(', ');
+
+    setPendingMerge(sessionKey, {
+      sessionKey,
+      pipelineType: 'notes',
+      username,
+      book,
+      startChapter: deferredChapters[0].ch,
+      endChapter: deferredChapters[deferredChapters.length - 1].ch,
+      completedChapters: deferredChapters,
+      blockingBranches: deferredConflicts.map(c => ({ repo: repoName, branchPattern: c.branch })),
+      originalMessage: message,
+      createdAt: new Date().toISOString(),
+      retryCount: 0,
+    });
+
+    // Try to tag the branch owner; fall back to requesting user
+    const mention = await resolveConflictMention(
+      deferredConflicts[0].branch,
+      message.sender_full_name
+    );
+
+    const deferredRange = deferredChapters.length === 1
+      ? `${book} ${deferredChapters[0].ch}`
+      : `${book} ${deferredChapters[0].ch}\u2013${deferredChapters[deferredChapters.length - 1].ch}`;
+
+    await removeReaction(msgId, 'working_on_it');
+    await addReaction(msgId, 'hourglass');
+    // Use sendMessage directly to control the @-mention (reply() auto-prepends sender)
+    const conflictMsg = `${mention} I have notes ready for **${deferredRange}**, but ${branchList} on ${repoName} ` +
+      `has edits to \`${targetFile}\`. Please merge your branch first, then say **merged** or **done** ` +
+      `so I can proceed with the insertion.`;
+    if (stream) {
+      await sendMessage(stream, topic, conflictMsg);
+    } else {
+      await sendDM(message.sender_id, conflictMsg);
+    }
+
+    await status(`Notes pipeline for **${rangeLabel}**: generation done, push deferred — waiting for branch merge (${totalDuration}s)`);
+
+    recordRunSummary({
+      pipeline: 'notes', book, startCh: startChapter, endCh: endChapter,
+      tokensBefore, success: totalFail === 0, userId: message.sender_id,
+    });
+    return;
+  }
 
   // --- Final reaction and report ---
   await removeReaction(msgId, 'working_on_it');
