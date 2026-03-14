@@ -95,7 +95,7 @@ function apiRequest(method, apiPath, token, data = null, timeoutMs = 30000) {
 }
 
 // ---------------------------------------------------------------------------
-// Check for user branches that modify the same file we're about to merge
+// Check for open user PRs that modify the same file we're about to merge
 // ---------------------------------------------------------------------------
 
 async function checkConflictingBranches(repo, targetFile) {
@@ -103,42 +103,49 @@ async function checkConflictingBranches(repo, targetFile) {
   if (!token) return [];
 
   try {
-    // List all branches
-    const res = await apiRequest('GET', `/repos/${ORG}/${repo}/branches?limit=50`, token);
-    if (res.status !== 200 || !Array.isArray(res.data)) {
-      console.warn(`${LOG_PREFIX} Could not list branches for ${repo}: HTTP ${res.status}`);
+    // List open PRs (more reliable than branch compare for stale branches)
+    let page = 1;
+    const allPRs = [];
+    while (true) {
+      const res = await apiRequest('GET',
+        `/repos/${ORG}/${repo}/pulls?state=open&limit=50&page=${page}`, token);
+      if (res.status !== 200 || !Array.isArray(res.data) || res.data.length === 0) break;
+      allPRs.push(...res.data);
+      if (res.data.length < 50) break;
+      page++;
+    }
+
+    // Filter to human PRs (not AI-*)
+    const humanPRs = allPRs.filter(pr =>
+      pr.head?.label && !pr.head.label.startsWith('AI-'));
+
+    if (humanPRs.length === 0) {
+      console.log(`${LOG_PREFIX} No open user PRs on ${repo}`);
       return [];
     }
 
-    // Filter to human branches (not master, not AI-*)
-    const humanBranches = res.data
-      .map(b => b.name)
-      .filter(name => name !== 'master' && !name.startsWith('AI-'));
+    console.log(`${LOG_PREFIX} Checking ${humanPRs.length} open user PR(s) for conflicts with ${targetFile} on ${repo}...`);
 
-    if (humanBranches.length === 0) return [];
-
-    console.log(`${LOG_PREFIX} Checking ${humanBranches.length} user branch(es) for conflicts with ${targetFile} on ${repo}...`);
-
-    // Check each for changes to our target file
+    // Check each PR's files via the PR files endpoint (reliable even for stale branches)
     const conflicting = [];
-    for (const branch of humanBranches) {
+    for (const pr of humanPRs) {
       try {
-        const cmp = await apiRequest('GET',
-          `/repos/${ORG}/${repo}/compare/master...${encodeURIComponent(branch)}`, token);
-        if (cmp.status === 200 && Array.isArray(cmp.data?.files)) {
-          const touchesFile = cmp.data.files.some(f => f.filename === targetFile);
+        const filesRes = await apiRequest('GET',
+          `/repos/${ORG}/${repo}/pulls/${pr.number}/files?limit=100`, token);
+        if (filesRes.status === 200 && Array.isArray(filesRes.data)) {
+          const touchesFile = filesRes.data.some(f => f.filename === targetFile);
           if (touchesFile) {
-            console.log(`${LOG_PREFIX} Branch '${branch}' modifies ${targetFile} — potential conflict`);
-            conflicting.push({ branch });
+            console.log(`${LOG_PREFIX} PR #${pr.number} (branch '${pr.head.label}') modifies ${targetFile} — potential conflict`);
+            conflicting.push({ branch: pr.head.label, pr: pr.number });
           }
         }
       } catch (err) {
-        console.warn(`${LOG_PREFIX} compare check failed for ${branch}: ${err.message}`);
+        console.warn(`${LOG_PREFIX} PR files check failed for #${pr.number}: ${err.message}`);
       }
     }
 
     if (conflicting.length === 0) {
-      console.log(`${LOG_PREFIX} No conflicting branches found for ${targetFile} on ${repo}`);
+      console.log(`${LOG_PREFIX} No conflicting PRs found for ${targetFile} on ${repo}`);
     }
 
     return conflicting;
