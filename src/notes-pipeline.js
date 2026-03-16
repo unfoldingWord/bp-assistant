@@ -23,6 +23,9 @@ const LOG_DIR = path.resolve(__dirname, '../logs');
 const POST_EDIT_REVIEW_HINT =
   'Use Task subagents for the Diff Analyzer and Issue Reconciler. Do NOT use TeamCreate or SendMessage.';
 
+const DEEP_ISSUE_ID_HINT =
+  'Use Task subagents for Wave 2 analysts and Wave 3 challenger. After spawning each batch of tasks, immediately poll with TaskGet in a loop until all tasks show completed status — do NOT output text without a tool call or the session will end prematurely. Do NOT use TeamCreate or SendMessage.';
+
 // Ranges where the chapter intro is written by the human editor — skip automatically.
 // PSA 42-123: Books 2-4 handled by Benjamin; 119-123 is a subset but listed explicitly.
 const SKIP_INTRO_RANGES = [
@@ -216,6 +219,7 @@ async function notesPipeline(route, message) {
       skills.push({
         name: 'deep-issue-id',
         prompt: `${book} ${ch}${verseFlag}`,
+        appendSystemPrompt: DEEP_ISSUE_ID_HINT,
         expectedOutput: `output/issues/${issuesVTag}.tsv`,
         ops: 3, // 2 analysts + challenger/merge
       });
