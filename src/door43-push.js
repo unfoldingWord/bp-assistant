@@ -350,6 +350,15 @@ function insertContent({ type, book, chapter, source, verses, repoDir, repoFilen
       '--backup',
     ];
     if (book.toUpperCase() === 'PSA') args.push('--skip-intro');
+    // Pass English ULT for intra-verse ordering of KEEP-tagged notes
+    const bookNum = BOOK_NUMBERS[book.toUpperCase()];
+    if (bookNum) {
+      const ultFile = path.join(CSKILLBP_DIR, 'data', 'published_ult_english',
+                                `${bookNum}-${book.toUpperCase()}.usfm`);
+      if (fs.existsSync(ultFile)) {
+        args.push('--ult-file', ultFile);
+      }
+    }
     const output = execFileSync('python3', args, { encoding: 'utf8', timeout: 60000, cwd: CSKILLBP_DIR });
     if (output.trim()) console.log(`${LOG_PREFIX} insert_tn_rows: ${output.trim()}`);
   } else {
