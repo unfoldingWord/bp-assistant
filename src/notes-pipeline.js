@@ -371,7 +371,7 @@ async function notesPipeline(route, message) {
     if (!chapterFailed) {
       const repoName = REPO_MAP['tn'];
       const targetFile = getRepoFilename('tn', book);
-      const conflicts = await checkConflictingBranches(repoName, targetFile);
+      const conflicts = await checkConflictingBranches(repoName, targetFile, ch);
       if (conflicts.length > 0) {
         deferredPush = true;
         deferredConflicts = conflicts;

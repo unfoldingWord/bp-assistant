@@ -333,21 +333,34 @@ async function generatePipeline(route, message) {
     } else {
 
     // Pre-flight: check for conflicting user branches on target files
+    // Pass chapter numbers so we only flag PRs that actually touch our chapters
     const ultFile = getRepoFilename('ult', book);
     const ustFile = getRepoFilename('ust', book);
-    const ultConflicts = await checkConflictingBranches('en_ult', ultFile);
-    const ustConflicts = await checkConflictingBranches('en_ust', ustFile);
-    const allConflicts = [
-      ...ultConflicts.map(c => ({ ...c, repo: 'en_ult', file: ultFile })),
-      ...ustConflicts.map(c => ({ ...c, repo: 'en_ust', file: ustFile })),
-    ];
+    const chapters = completedChapters.map(c => c.ch);
+    const allConflicts = [];
+    for (const ch of chapters) {
+      const ultConflicts = await checkConflictingBranches('en_ult', ultFile, ch);
+      const ustConflicts = await checkConflictingBranches('en_ust', ustFile, ch);
+      allConflicts.push(
+        ...ultConflicts.map(c => ({ ...c, repo: 'en_ult', file: ultFile })),
+        ...ustConflicts.map(c => ({ ...c, repo: 'en_ust', file: ustFile })),
+      );
+    }
+    // Deduplicate (same PR could appear for multiple chapters)
+    const seen = new Set();
+    const dedupedConflicts = allConflicts.filter(c => {
+      const key = `${c.pr}-${c.repo}`;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
 
-    if (allConflicts.length > 0) {
+    if (dedupedConflicts.length > 0) {
       const sessionKey = stream
         ? `stream-${stream}-${topic}`
         : `dm-${message.sender_id}`;
-      const branchList = allConflicts.map(c => `\`${c.branch}\` (${c.repo})`).join(', ');
-      const fileList = [...new Set(allConflicts.map(c => `\`${c.file}\``))].join(', ');
+      const branchList = dedupedConflicts.map(c => `\`${c.branch}\` (${c.repo})`).join(', ');
+      const fileList = [...new Set(dedupedConflicts.map(c => `\`${c.file}\``))].join(', ');
 
       setPendingMerge(sessionKey, {
         sessionKey,
@@ -357,14 +370,14 @@ async function generatePipeline(route, message) {
         startChapter: start,
         endChapter: end,
         completedChapters,
-        blockingBranches: allConflicts.map(c => ({ repo: c.repo, branchPattern: c.branch })),
+        blockingBranches: dedupedConflicts.map(c => ({ repo: c.repo, branchPattern: c.branch })),
         originalMessage: message,
         createdAt: new Date().toISOString(),
         retryCount: 0,
       });
 
       const mention = await resolveConflictMention(
-        allConflicts[0].branch,
+        dedupedConflicts[0].branch,
         message.sender_full_name
       );
 

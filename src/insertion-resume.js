@@ -57,21 +57,26 @@ async function resumeInsertion(sessionKey, triggerMessage) {
     ? [{ type: 'tn', repo: 'en_tn' }]
     : [{ type: 'ult', repo: 'en_ult' }, { type: 'ust', repo: 'en_ust' }];
 
+  const chapters = completedChapters.map(c => c.ch);
   const stillBlocking = [];
   for (const { type, repo } of repos) {
     const targetFile = getRepoFilename(type, book);
-    const conflicts = await checkConflictingBranches(repo, targetFile);
-    stillBlocking.push(...conflicts.map(c => `${c.branch} (${repo})`));
+    for (const ch of chapters) {
+      const conflicts = await checkConflictingBranches(repo, targetFile, ch);
+      stillBlocking.push(...conflicts.map(c => `${c.branch} (${repo})`));
+    }
   }
+  // Deduplicate
+  const uniqueBlocking = [...new Set(stillBlocking)];
 
-  if (stillBlocking.length > 0) {
+  if (uniqueBlocking.length > 0) {
     // Update retry count
     pending.retryCount = (pending.retryCount || 0) + 1;
     setPendingMerge(sessionKey, pending);
 
     await replyTo(triggerMessage,
       `Branches still exist -- please merge them first:\n` +
-      stillBlocking.map(b => `- \`${b}\``).join('\n') +
+      uniqueBlocking.map(b => `- \`${b}\``).join('\n') +
       `\nSay **merged** when done.`
     );
     return;

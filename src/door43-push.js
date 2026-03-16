@@ -96,9 +96,13 @@ function apiRequest(method, apiPath, token, data = null, timeoutMs = 30000) {
 
 // ---------------------------------------------------------------------------
 // Check for open user PRs that modify the same file we're about to merge
+//
+// When `chapter` is provided, inspects the PR diff to see if it actually
+// touches that chapter's content — avoids false positives when two people
+// work on different chapters of the same book file (e.g. PSA 130 vs 148).
 // ---------------------------------------------------------------------------
 
-async function checkConflictingBranches(repo, targetFile) {
+async function checkConflictingBranches(repo, targetFile, chapter) {
   const { token } = getConfig();
   if (!token) return [];
 
@@ -124,7 +128,7 @@ async function checkConflictingBranches(repo, targetFile) {
       return [];
     }
 
-    console.log(`${LOG_PREFIX} Checking ${humanPRs.length} open user PR(s) for conflicts with ${targetFile} on ${repo}...`);
+    console.log(`${LOG_PREFIX} Checking ${humanPRs.length} open user PR(s) for conflicts with ${targetFile}${chapter ? ` ch ${chapter}` : ''} on ${repo}...`);
 
     // Check each PR's files via the PR files endpoint (reliable even for stale branches)
     const conflicting = [];
@@ -132,12 +136,24 @@ async function checkConflictingBranches(repo, targetFile) {
       try {
         const filesRes = await apiRequest('GET',
           `/repos/${ORG}/${repo}/pulls/${pr.number}/files?limit=100`, token);
-        if (filesRes.status === 200 && Array.isArray(filesRes.data)) {
-          const touchesFile = filesRes.data.some(f => f.filename === targetFile);
-          if (touchesFile) {
-            console.log(`${LOG_PREFIX} PR #${pr.number} (branch '${pr.head.label}') modifies ${targetFile} — potential conflict`);
-            conflicting.push({ branch: pr.head.label, pr: pr.number });
-          }
+        if (filesRes.status !== 200 || !Array.isArray(filesRes.data)) continue;
+
+        const fileEntry = filesRes.data.find(f => f.filename === targetFile);
+        if (!fileEntry) continue;
+
+        // If no chapter specified, any touch on the file is a conflict (old behaviour)
+        if (chapter == null) {
+          console.log(`${LOG_PREFIX} PR #${pr.number} (branch '${pr.head.label}') modifies ${targetFile} — potential conflict`);
+          conflicting.push({ branch: pr.head.label, pr: pr.number });
+          continue;
+        }
+
+        // Chapter-level check: inspect the patch to see if it touches our chapter
+        if (diffTouchesChapter(fileEntry.patch || '', targetFile, chapter)) {
+          console.log(`${LOG_PREFIX} PR #${pr.number} (branch '${pr.head.label}') modifies ${targetFile} chapter ${chapter} — conflict`);
+          conflicting.push({ branch: pr.head.label, pr: pr.number });
+        } else {
+          console.log(`${LOG_PREFIX} PR #${pr.number} (branch '${pr.head.label}') modifies ${targetFile} but not chapter ${chapter} — no conflict`);
         }
       } catch (err) {
         console.warn(`${LOG_PREFIX} PR files check failed for #${pr.number}: ${err.message}`);
@@ -145,7 +161,7 @@ async function checkConflictingBranches(repo, targetFile) {
     }
 
     if (conflicting.length === 0) {
-      console.log(`${LOG_PREFIX} No conflicting PRs found for ${targetFile} on ${repo}`);
+      console.log(`${LOG_PREFIX} No conflicting PRs found for ${targetFile}${chapter ? ` ch ${chapter}` : ''} on ${repo}`);
     }
 
     return conflicting;
@@ -153,6 +169,57 @@ async function checkConflictingBranches(repo, targetFile) {
     console.warn(`${LOG_PREFIX} checkConflictingBranches failed (proceeding without check): ${err.message}`);
     return [];
   }
+}
+
+/**
+ * Inspect a unified diff patch to determine if it touches a specific chapter.
+ *
+ * For TN files (TSV): changed lines contain refs like "148:1" — check if any
+ * added/removed line starts with "<chapter>:".
+ * For USFM files (ULT/UST): look for \c markers in diff context to determine
+ * which chapter the changed lines belong to.
+ */
+function diffTouchesChapter(patch, filename, chapter) {
+  if (!patch) return true; // No patch data — be conservative, assume conflict
+
+  const chStr = String(chapter);
+  const isTSV = filename.endsWith('.tsv');
+
+  if (isTSV) {
+    // TN TSV: each data row starts with "Book <chapter>:<verse>" or just "<chapter>:<verse>"
+    // In the diff, added/removed lines start with +/- followed by the row content.
+    // Match lines where the reference column contains our chapter.
+    const chapterRef = new RegExp(`^[+-].*?\\b${chStr}:`);
+    for (const line of patch.split('\n')) {
+      if ((line.startsWith('+') || line.startsWith('-')) && !line.startsWith('+++') && !line.startsWith('---')) {
+        if (chapterRef.test(line)) return true;
+      }
+    }
+    return false;
+  }
+
+  // USFM: track which chapter context we're in by watching \c markers
+  // in both context lines (space-prefixed) and changed lines (+/-).
+  let currentChapter = null;
+  for (const line of patch.split('\n')) {
+    // Strip diff prefix to get the actual content
+    const content = line.startsWith('+') || line.startsWith('-') || line.startsWith(' ')
+      ? line.slice(1)
+      : line;
+
+    // Track \c markers
+    const cMatch = content.match(/^\\c\s+(\d+)/);
+    if (cMatch) {
+      currentChapter = cMatch[1];
+    }
+
+    // If this is a changed line and we're in our target chapter, it's a conflict
+    if ((line.startsWith('+') || line.startsWith('-')) && !line.startsWith('+++') && !line.startsWith('---')) {
+      if (currentChapter === chStr) return true;
+    }
+  }
+
+  return false;
 }
 
 // ---------------------------------------------------------------------------
