@@ -1,16 +1,25 @@
 const config = require('./config');
 const { runPipeline } = require('./pipeline-runner');
-const { sendMessage, addReaction } = require('./zulip-client');
+const { sendMessage, sendDM, addReaction, removeReaction } = require('./zulip-client');
 const { getSession, clearSession, hasActiveStreamSession } = require('./session-store');
 const { getTotalVerses } = require('./verse-counts');
 const { classifyIntent } = require('./intent-classifier');
 const { preflightCheck, estimateTokens } = require('./usage-tracker');
 const { getPendingMerge, clearPendingMerge } = require('./pending-merges');
+const { getCheckpoint } = require('./pipeline-checkpoints');
+const { listCheckpoints } = require('./pipeline-checkpoints');
 const { resumeInsertion } = require('./insertion-resume');
 const { normalizeBookName, isValidBook } = require('./pipeline-utils');
+const { isTransientOutageError } = require('./claude-runner');
 
 // In-memory pending confirmations for stream messages
 const pendingConfirmations = new Map();
+
+// TEMPORARY TEST LOCK:
+// Restrict bot interactions to admin user during branch validation.
+// Flip to false (or remove) after testing is complete.
+const TEMP_SINGLE_USER_TEST_MODE = false;
+const TEMP_TEST_LOCK_REPLY = 'I am temporarily in maintenance/testing mode for about an hour while we validate an update. Please retry shortly.';
 
 /**
  * Detect whether the user asked for ULT only, UST only, or both.
@@ -29,7 +38,7 @@ function extractContentTypes(text) {
  * @param {string[]} contentTypes
  * @param {string} [senderName] the Zulip sender's display name
  */
-function buildEditorReviewSystemPrompt(contentTypes, senderName) {
+function buildEditorReviewSystemPrompt(contentTypes, senderName, scopeText) {
   const types = contentTypes || ['ult', 'ust'];
   const typeLabel = types.map(t => t.toUpperCase()).join(' and ');
   const typeInstruction = types.length === 1
@@ -40,13 +49,21 @@ function buildEditorReviewSystemPrompt(contentTypes, senderName) {
     ? `Responding to user: ${senderName}. Use this name if you need to address them.\n`
     : '';
 
+  const scopeLine = scopeText
+    ? `Requested scope from user: ${scopeText}. If this includes verse ranges (for example 1:1-6 or 2:10-3:5), restrict analysis strictly to that scope and DO NOT expand to the whole chapter/book.\n`
+    : '';
+
   return `This is an editor-review request. Use the editor-compare skill (.claude/skills/editor-compare/). Extract the book and all chapter numbers from the user's message.
 
-${senderLine}Do NOT generate @**Name** mentions -- the system handles that automatically.
+${senderLine}${scopeLine}Do NOT generate @**Name** mentions -- the system handles that automatically.
 
 For MULTIPLE chapters: spawn a subagent (Task tool) per chapter to run in parallel. Each subagent runs ${typeInstruction} analyzes the diffs, and writes its detailed analysis to tmp/editor-compare/<BOOK>-<CH>.md. Wait for all subagents, then read all summaries and do a cross-chapter analysis.
 
 For a SINGLE chapter: run the comparison directly, no subagent needed. ${typeInstruction}
+
+When using prepare_compare:
+- Pass verse filtering when the user asked for verse scope (verses argument, e.g. "1-6").
+- Treat differences that are only curly braces/quote marks as formatting noise unless substantive wording differs.
 
 This is a MULTI-TURN conversation. Follow this protocol:
 
@@ -110,6 +127,42 @@ function buildConfirmMessage(template, captures) {
     const val = captures[parseInt(idx) - 1] || '';
     return /^[a-zA-Z]+$/.test(val) ? val.toUpperCase() : val;
   });
+}
+
+function normalizeScopeText(scopeText) {
+  if (!scopeText) return null;
+  return scopeText
+    .replace(/\s*[-–—]\s*/g, '-')
+    .replace(/\s*:\s*/g, ':')
+    .replace(/\s*,\s*/g, ', ')
+    .trim();
+}
+
+function parseEditorNoteRemainder(remainder) {
+  const raw = (remainder || '').trim();
+  if (!raw) return { scope: null, noteText: '' };
+  const withoutCh = raw.replace(/^ch\.?\s+/i, '');
+
+  // Ordered from most specific to most general
+  const scopePatterns = [
+    /^(\d+:\d+\s*[-–—]\s*\d+:\d+)\s+(.+)$/i,                      // 2:10-3:5
+    /^(\d+:\d+(?:\s*,\s*\d+:\d+(?:\s*[-–—]\s*\d+)?)*)\s+(.+)$/i, // 2:4, 2:6, 3:1-3
+    /^(\d+:\d+(?:\s*[-–—]\s*\d+)?(?:\s*,\s*\d+(?:\s*[-–—]\s*\d+)?)*)\s+(.+)$/i, // 2:4,6-8
+    /^(\d+(?:\s*[-–—]\s*\d+)?(?:\s*,\s*\d+(?:\s*[-–—]\s*\d+)?)*)\s+(.+)$/i,      // 2 / 2-4 / 2,4,6
+  ];
+
+  for (const re of scopePatterns) {
+    const m = withoutCh.match(re);
+    if (m) {
+      return {
+        scope: normalizeScopeText(m[1]),
+        noteText: (m[2] || '').trim(),
+      };
+    }
+  }
+
+  // No recognized scope prefix -> treat as book-wide note text.
+  return { scope: null, noteText: raw };
 }
 
 /**
@@ -181,6 +234,35 @@ function getPipelineType(route) {
   return null;
 }
 
+function getResumeCheckpoint(route, sessionKey, captures) {
+  const pipelineType = getPipelineType(route);
+  if (!pipelineType) return null;
+  const parsed = route._synthetic
+    ? {
+        book: route._book,
+        chapters: [route._startChapter, route._endChapter].filter((n) => Number.isFinite(n)),
+        verseStart: null,
+        verseEnd: null,
+      }
+    : parseBookChapters(captures || []);
+  if (!parsed.book || !parsed.chapters || parsed.chapters.length === 0) return null;
+  const startChapter = Math.min(...parsed.chapters);
+  const endChapter = Math.max(...parsed.chapters);
+  const checkpoint = getCheckpoint({
+    sessionKey,
+    pipelineType,
+    scope: {
+      book: parsed.book,
+      startChapter,
+      endChapter,
+      verseStart: parsed.verseStart ?? null,
+      verseEnd: parsed.verseEnd ?? null,
+    },
+  });
+  if (checkpoint?.state !== 'paused_for_outage') return null;
+  return checkpoint;
+}
+
 /**
  * Build an enriched confirmation message with token/time estimates.
  */
@@ -192,6 +274,23 @@ function buildEstimateLabel(estimate, book, startCh, endCh, verseStart, verseEnd
     totalVerses = verseEnd - verseStart + 1;
   }
   return `(${chCount} ch, ~${totalVerses} verses). Est: ~${estimate.estimatedMinutes} min`;
+}
+
+function isResumeStatusCommand(content) {
+  const t = String(content || '').trim().toLowerCase();
+  return t === 'status resume' || t === 'resume status' || t === 'operator status';
+}
+
+function formatCheckpointScope(cp) {
+  const scope = cp?.scope || {};
+  const book = scope.book || '?';
+  const s = scope.startChapter;
+  const e = scope.endChapter;
+  const vs = scope.verseStart;
+  const ve = scope.verseEnd;
+  if (vs != null && ve != null && s === e) return `${book} ${s}:${vs}-${ve}`;
+  if (s === e) return `${book} ${s}`;
+  return `${book} ${s}-${e}`;
 }
 
 function matchRoute(content) {
@@ -233,8 +332,12 @@ function buildSyntheticRoute(intent, senderName) {
   // editor-note doesn't need a base route from config — handle it first
   if (intent.intent === 'editor-note') {
     const bookLabel = intent.book || 'unknown';
-    const chapterLabel = intent.startChapter ? ` ${intent.startChapter}` : '';
-    const scopeLabel = intent.startChapter ? `**${bookLabel} ${intent.startChapter}**` : `**${bookLabel}** (book-wide)`;
+      const chapterLabel = intent.scopeText
+        ? ` ${intent.scopeText}`
+        : (intent.startChapter ? ` ${intent.startChapter}` : '');
+      const scopeLabel = chapterLabel
+        ? `**${bookLabel}${chapterLabel}**`
+        : `**${bookLabel}** (book-wide)`;
     const notePreview = intent.noteText ? `: '${intent.noteText}'` : '';
     return {
       name: 'editor-note',
@@ -242,6 +345,7 @@ function buildSyntheticRoute(intent, senderName) {
       reply: true,
       _synthetic: true,
       _book: bookLabel,
+        _scope: intent.scopeText || (intent.startChapter ? String(intent.startChapter) : null),
       _chapter: intent.startChapter || null,
       _noteText: intent.noteText || '',
       confirmMessage: `I'll file this note for ${scopeLabel}${notePreview}. Sound right? (yes/no)`,
@@ -257,9 +361,11 @@ function buildSyntheticRoute(intent, senderName) {
   const baseRoute = targetName ? config.routes.find(r => r.name === targetName) : null;
   if (!baseRoute) return null;
 
-  const rangeLabel = intent.startChapter === intent.endChapter
-    ? `${intent.book} ${intent.startChapter}`
-    : `${intent.book} ${intent.startChapter}–${intent.endChapter}`;
+  const rangeLabel = intent.scopeText
+    ? `${intent.book} ${intent.scopeText}`
+    : (intent.startChapter === intent.endChapter
+      ? `${intent.book} ${intent.startChapter}`
+      : `${intent.book} ${intent.startChapter}–${intent.endChapter}`);
 
   if (intent.intent === 'editor-review') {
     const types = intent.contentTypes || ['ult', 'ust'];
@@ -270,9 +376,10 @@ function buildSyntheticRoute(intent, senderName) {
       _book: intent.book,
       _startChapter: intent.startChapter,
       _endChapter: intent.endChapter,
+      _scopeText: intent.scopeText || null,
       _contentTypes: types,
       confirmMessage: `I'll compare the human-edited **${rangeLabel}** ${typeLabel} against what the AI generated and identify improvements. Sound right? (yes/no)`,
-      systemPrompt: buildEditorReviewSystemPrompt(types, senderName),
+        systemPrompt: buildEditorReviewSystemPrompt(types, senderName, intent.scopeText),
     };
   }
 
@@ -282,6 +389,7 @@ function buildSyntheticRoute(intent, senderName) {
     _book: intent.book,
     _startChapter: intent.startChapter,
     _endChapter: intent.endChapter,
+    _scopeText: intent.scopeText || null,
     confirmMessage: intent.intent === 'generate'
       ? `I'll generate the initial content (ULT & UST, issues draft) for **${rangeLabel}**. Sound right? (yes/no)`
       : `I'll write translation notes for **${rangeLabel}**. Sound right? (yes/no)`,
@@ -362,10 +470,39 @@ async function routeMessage(message) {
     ? `stream-${message.display_recipient}-${message.subject}`
     : `dm-${message.sender_id}`;
 
+  if (TEMP_SINGLE_USER_TEST_MODE && !isAdmin) {
+    if (isStream) {
+      console.log(`[router] Temporary test lock active — blocking user ${message.sender_id} (${message.sender_full_name})`);
+      await sendMessage(message.display_recipient, message.subject, TEMP_TEST_LOCK_REPLY);
+    } else {
+      console.log(`[router] Temporary test lock active — ignoring DM from ${message.sender_id} (${message.sender_full_name})`);
+    }
+    return;
+  }
+
   if (!isStream) {
     // ONLY admin can DM the bot
     if (!isAdmin) {
       console.log(`[router] Ignoring DM from unauthorized user ${message.sender_id} (${message.sender_full_name})`);
+      return;
+    }
+    if (isResumeStatusCommand(message.content)) {
+      const paused = listCheckpoints()
+        .filter((cp) => cp && cp.state === 'paused_for_outage')
+        .sort((a, b) => String(b.updatedAt || '').localeCompare(String(a.updatedAt || '')));
+      if (paused.length === 0) {
+        await sendDM(message.sender_id, 'No paused outage checkpoints found.');
+        return;
+      }
+      const lines = paused.slice(0, 25).map((cp, idx) => {
+        const skill = cp?.resume?.skill || cp?.current?.skill || 'unknown-skill';
+        const chapter = cp?.resume?.chapter || cp?.current?.chapter || '?';
+        return `${idx + 1}. ${cp.pipelineType} | ${formatCheckpointScope(cp)} | resume ${chapter} (${skill}) | updated ${cp.updatedAt || 'unknown'}`;
+      });
+      await sendDM(
+        message.sender_id,
+        `Paused outage checkpoints (${paused.length}):\n${lines.join('\n')}`
+      );
       return;
     }
   } else {
@@ -385,7 +522,19 @@ async function routeMessage(message) {
       try { await addReaction(message.id, 'working_on_it'); } catch (_) {}
       const routeWithTimeout = { ...pending.route, timeoutMs: pending.timeoutMs };
       console.log(`[router] Confirmed -- running "${pending.route.name}" for ${sessionKey} (timeout: ${pending.timeoutMs / 60000}min)`);
-      firePipeline(routeWithTimeout, pending.message);
+      if (pending.route.name === 'editor-note') {
+        try {
+          await runPipeline(routeWithTimeout, pending.message);
+          try { await removeReaction(message.id, 'working_on_it'); } catch (_) {}
+          try { await addReaction(message.id, 'check'); } catch (_) {}
+        } catch (err) {
+          console.error(`[router] Pipeline "${pending.route.name}" failed: ${err.message}`);
+          try { await removeReaction(message.id, 'working_on_it'); } catch (_) {}
+          try { await addReaction(message.id, 'warning'); } catch (_) {}
+        }
+      } else {
+        firePipeline(routeWithTimeout, pending.message);
+      }
       return;
     } else if (isNo(message.content)) {
       pendingConfirmations.delete(sessionKey);
@@ -460,21 +609,32 @@ async function routeMessage(message) {
         ...route,
         _contentTypes: types,
         confirmMessage: `I'll compare the human-edited **${book || captures[0]} ${chapterPart}** ${typeLabel} against what the AI generated and identify improvements. Sound right? (yes/no)`,
-        systemPrompt: buildEditorReviewSystemPrompt(types, message.sender_full_name),
+        systemPrompt: buildEditorReviewSystemPrompt(types, message.sender_full_name, captures[1]),
       };
     }
 
     // Editor-note: enrich with captures, simple confirmation (no timeout/usage tracking)
     if (route.name === 'editor-note') {
       const book = normalizeBookName(captures[0] || '');
-      const chapter = captures[1] || null;
-      const chapterLabel = chapter ? ` ${chapter}` : ' (book-wide)';
+      const parsed = parseEditorNoteRemainder(captures[1] || '');
+      const scopeLabel = parsed.scope ? ` ${parsed.scope}` : ' (book-wide)';
       activeRoute = {
         ...route,
         _captures: captures,
         _book: book,
-        confirmMessage: `I'll file this note for **${book}${chapterLabel}**. Sound right? (yes/no)`,
+        _scope: parsed.scope,
+        _noteText: parsed.noteText,
+        confirmMessage: `I'll file this note for **${book}${scopeLabel}**. Sound right? (yes/no)`,
       };
+
+      if (!parsed.noteText) {
+        await sendMessage(
+          message.display_recipient,
+          message.subject,
+          `@**${message.sender_full_name}** Please include note text after the scope. Example: \`note ${book} 2:10-3:5 your note here\``
+        );
+        return;
+      }
 
       if (isStream && activeRoute.confirmMessage) {
         pendingConfirmations.set(sessionKey, { route: activeRoute, message, timeoutMs: MIN_TIMEOUT_MS });
@@ -515,6 +675,11 @@ async function routeMessage(message) {
           confirmText = confirmText.replace(/\. Sound right\?/, ` ${estLabel}. Sound right?`);
 
         }
+      }
+      const resumeCheckpoint = getResumeCheckpoint(activeRoute, sessionKey, captures);
+      if (resumeCheckpoint?.resume?.chapter) {
+        const resumeSkill = resumeCheckpoint.resume.skill ? ` (${resumeCheckpoint.resume.skill})` : '';
+        confirmText += `\n\nI found paused progress and will resume from **${resumeCheckpoint.scope.book} ${resumeCheckpoint.resume.chapter}**${resumeSkill} after you confirm.`;
       }
 
       pendingConfirmations.set(sessionKey, { route: activeRoute, message, timeoutMs });
@@ -559,9 +724,11 @@ async function routeMessage(message) {
       } else if (intent.intent !== 'unknown' && intent.book && intent.startChapter) {
         const syntheticRoute = buildSyntheticRoute(intent, message.sender_full_name);
         if (syntheticRoute) {
-          const captures = intent.startChapter === intent.endChapter
-            ? [intent.book, String(intent.startChapter)]
-            : [intent.book, String(intent.startChapter), String(intent.endChapter)];
+          const captures = intent.scopeText
+            ? [intent.book, intent.scopeText]
+            : (intent.startChapter === intent.endChapter
+              ? [intent.book, String(intent.startChapter)]
+              : [intent.book, String(intent.startChapter), String(intent.endChapter)]);
           let confirmText = buildConfirmMessage(syntheticRoute.confirmMessage, captures);
           const timeoutMs = calcTimeout(syntheticRoute, captures);
 
@@ -587,6 +754,11 @@ async function routeMessage(message) {
               confirmText += `\n\n**Warning:** ${preflight.reason}`;
             }
           }
+          const resumeCheckpoint = getResumeCheckpoint(syntheticRoute, sessionKey, captures);
+          if (resumeCheckpoint?.resume?.chapter) {
+            const resumeSkill = resumeCheckpoint.resume.skill ? ` (${resumeCheckpoint.resume.skill})` : '';
+            confirmText += `\n\nI found paused progress and will resume from **${resumeCheckpoint.scope.book} ${resumeCheckpoint.resume.chapter}**${resumeSkill} after you confirm.`;
+          }
 
           pendingConfirmations.set(sessionKey, { route: syntheticRoute, message, timeoutMs });
           console.log(`[router] Haiku → awaiting confirmation for synthetic "${syntheticRoute.name}" in ${sessionKey}`);
@@ -597,6 +769,10 @@ async function routeMessage(message) {
       }
     } catch (err) {
       console.error(`[router] Haiku classification failed: ${err.message}`);
+      if (isTransientOutageError(err)) {
+        await sendMessage(message.display_recipient, message.subject, `@**${message.sender_full_name}** Claude is temporarily down, you'll need to re-trigger.`);
+        return;
+      }
     }
 
     if (!haikuMatched) {

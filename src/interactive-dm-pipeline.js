@@ -5,7 +5,7 @@ const path = require('path');
 const os = require('os');
 const config = require('./config');
 const { getSession, setSession, setModel, clearSession, incrementExchanges } = require('./session-store');
-const { buildOptions } = require('./claude-runner');
+const { buildOptions, DEFAULT_RESTRICTED_TOOLS, getWorkspaceToolsServer } = require('./claude-runner');
 const { ensureFreshToken } = require('./auth-refresh');
 const { sendDM, sendMessage, addReaction, removeReaction } = require('./zulip-client');
 const { recordMetrics } = require('./usage-tracker');
@@ -29,6 +29,9 @@ const DEFAULT_TIMEOUT_MS = 10 * 60 * 1000;
 const DEFAULT_MAX_TURNS = 200;
 const DEFAULT_MODEL = 'opus';
 const ZULIP_MAX_MESSAGE_LENGTH = 10000;
+const TRANSIENT_RETRY_WINDOW_MS = 10 * 60 * 1000;
+const RETRY_BASE_DELAY_MS = 5000;
+const RETRY_MAX_DELAY_MS = 60000;
 
 // Global lock to prevent overlapping Claude processes
 let inFlight = false;
@@ -70,59 +73,176 @@ function modelToPrefix(model) {
   return 'H: ';
 }
 
+function isUsageLimitError(text) {
+  return /hit your limit|usage limit|rate limit|too many requests|429/i.test(String(text || ''));
+}
+
+function isTransientDowntimeError(text) {
+  const t = String(text || '').toLowerCase();
+  if (!t || isUsageLimitError(t)) return false;
+  return (
+    t.includes('internal server error') ||
+    t.includes('api error: 500') ||
+    t.includes('api_error') ||
+    t.includes('http 500') ||
+    t.includes('http 502') ||
+    t.includes('http 503') ||
+    t.includes('http 504') ||
+    t.includes('service unavailable') ||
+    t.includes('temporarily unavailable') ||
+    t.includes('gateway timeout') ||
+    t.includes('bad gateway') ||
+    t.includes('overloaded') ||
+    t.includes('connection reset') ||
+    t.includes('socket hang up') ||
+    t.includes('econnreset') ||
+    t.includes('etimedout')
+  );
+}
+
+function backoffDelayMs(attempt) {
+  const exp = Math.min(RETRY_MAX_DELAY_MS, RETRY_BASE_DELAY_MS * Math.pow(2, Math.max(0, attempt - 1)));
+  const jitter = Math.floor(Math.random() * 2000);
+  return exp + jitter;
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function chicagoIsoFromUtcDate(date) {
+  const wall = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'America/Chicago',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: false,
+  }).formatToParts(date);
+  const byType = Object.fromEntries(wall.map((p) => [p.type, p.value]));
+  const tzName = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'America/Chicago',
+    timeZoneName: 'shortOffset',
+  }).formatToParts(date).find((p) => p.type === 'timeZoneName')?.value || 'GMT-6';
+  const offsetMatch = tzName.match(/^GMT([+-])(\d{1,2})(?::?(\d{2}))?$/);
+  let offset = '-06:00';
+  if (offsetMatch) {
+    const sign = offsetMatch[1];
+    const hh = String(offsetMatch[2]).padStart(2, '0');
+    const mm = String(offsetMatch[3] || '00').padStart(2, '0');
+    offset = `${sign}${hh}:${mm}`;
+  }
+  return `${byType.year}-${byType.month}-${byType.day}T${byType.hour}:${byType.minute}:${byType.second}${offset}`;
+}
+
+function buildUsageLimitResetTag(errorText) {
+  const m = String(errorText || '').match(/resets?\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)\s*\(UTC\)/i);
+  if (!m) return null;
+  let hour = parseInt(m[1], 10);
+  const minute = parseInt(m[2] || '0', 10);
+  const ampm = m[3].toLowerCase();
+  if (ampm === 'pm' && hour !== 12) hour += 12;
+  if (ampm === 'am' && hour === 12) hour = 0;
+  const now = new Date();
+  const resetUtc = new Date(Date.UTC(
+    now.getUTCFullYear(),
+    now.getUTCMonth(),
+    now.getUTCDate(),
+    hour,
+    minute,
+    0,
+  ));
+  if (resetUtc.getTime() <= now.getTime()) resetUtc.setUTCDate(resetUtc.getUTCDate() + 1);
+  return `<time:${chicagoIsoFromUtcDate(resetUtc)}>`;
+}
+
 /**
  * Run one query() call, collecting reply text and session ID.
  */
 async function runInteractiveQuery({ prompt, cwd, resume, model, maxTurns, timeoutMs, appendSystemPrompt }) {
-  await ensureFreshToken();
-  const queryFn = await getQuery();
-  const abortController = new AbortController();
-  const timeout = timeoutMs || DEFAULT_TIMEOUT_MS;
-  const timer = setTimeout(() => {
-    console.warn(`[interactive] Timeout (${timeout / 1000}s) — aborting`);
-    abortController.abort();
-  }, timeout);
+  const startedAt = Date.now();
+  let attempt = 0;
 
-  const options = buildOptions({
-    cwd,
-    resume,
-    model,
-    maxTurns,
-    abortController,
-    appendSystemPrompt,
-  });
+  while (true) {
+    attempt++;
+    await ensureFreshToken();
+    const queryFn = await getQuery();
+    const wsTools = await getWorkspaceToolsServer();
+    const abortController = new AbortController();
+    const timeout = timeoutMs || DEFAULT_TIMEOUT_MS;
+    const timer = setTimeout(() => {
+      console.warn(`[interactive] Timeout (${timeout / 1000}s) — aborting`);
+      abortController.abort();
+    }, timeout);
 
-  console.log(`[interactive] query() cwd=${cwd} model=${model}${resume ? ` resume=${resume.slice(0, 8)}…` : ''}`);
-  const conversation = queryFn({ prompt, options });
+    const options = buildOptions({
+      cwd,
+      resume,
+      model,
+      maxTurns,
+      abortController,
+      appendSystemPrompt,
+      tools: DEFAULT_RESTRICTED_TOOLS,
+      disallowedTools: ['Bash'],
+      disableLocalSettings: true,
+      forceNoAutoBashSandbox: true,
+      mcpServers: { 'workspace-tools': wsTools },
+    });
 
-  let replyText = '';
-  let result = null;
-  let sessionId = null;
+    console.log(`[interactive] query() cwd=${cwd} model=${model}${resume ? ` resume=${resume.slice(0, 8)}…` : ''}`);
+    const conversation = queryFn({ prompt, options });
 
-  try {
-    for await (const event of conversation) {
-      if (abortController.signal.aborted) break;
-      if (event.session_id && !sessionId) {
-        sessionId = event.session_id;
-      }
-      if (event.type === 'assistant' && event.message?.content) {
-        for (const block of event.message.content) {
-          if (block && typeof block.text === 'string') replyText += block.text;
+    let replyText = '';
+    let result = null;
+    let sessionId = null;
+
+    try {
+      for await (const event of conversation) {
+        if (abortController.signal.aborted) break;
+        if (event.session_id && !sessionId) {
+          sessionId = event.session_id;
         }
+        if (event.type === 'assistant' && event.message?.content) {
+          for (const block of event.message.content) {
+            if (block && typeof block.text === 'string') replyText += block.text;
+          }
+        }
+        if (event.type === 'result') result = event;
       }
-      if (event.type === 'result') result = event;
+      if (abortController.signal.aborted) {
+        const e = new Error('Request timed out');
+        e.name = 'AbortError';
+        throw e;
+      }
+      if (!result || result.subtype !== 'success') {
+        const errText = result?.error || result?.result || `Claude returned subtype "${result?.subtype || 'unknown'}"`;
+        const e = new Error(errText);
+        e.name = 'ClaudeRunError';
+        throw e;
+      }
+      return { replyText: replyText.trim(), result, sessionId };
+    } catch (err) {
+      const errText = err?.message || String(err);
+      const elapsed = Date.now() - startedAt;
+      if (isTransientDowntimeError(errText) && elapsed < TRANSIENT_RETRY_WINDOW_MS) {
+        const delay = backoffDelayMs(attempt);
+        console.warn(`[interactive] Transient SDK error, retrying in ${Math.round(delay / 1000)}s (attempt ${attempt}): ${errText.slice(0, 200)}`);
+        await sleep(delay);
+        continue;
+      }
+      if (isTransientDowntimeError(errText) && elapsed >= TRANSIENT_RETRY_WINDOW_MS) {
+        const outageErr = new Error('Claude is temporarily down after retry attempts');
+        outageErr.name = 'ClaudeTransientOutageError';
+        throw outageErr;
+      }
+      throw err;
+    } finally {
+      clearTimeout(timer);
+      try { conversation.close(); } catch (_) {}
     }
-    if (abortController.signal.aborted) {
-      const e = new Error('Request timed out');
-      e.name = 'AbortError';
-      throw e;
-    }
-  } finally {
-    clearTimeout(timer);
-    try { conversation.close(); } catch (_) {}
   }
-
-  return { replyText: replyText.trim(), result, sessionId };
 }
 
 async function interactiveDmPipeline(route, message) {
@@ -250,6 +370,12 @@ async function interactiveDmPipeline(route, message) {
     clearSession(sessionKey);
     if (err.name === 'AbortError') {
       await reply('Request timed out. You can send another message to continue.');
+    } else if (err.name === 'ClaudeTransientOutageError') {
+      await reply('Claude is temporarily down, you\'ll need to re-trigger.');
+    } else if (isUsageLimitError(err.message || '')) {
+      const resetTag = buildUsageLimitResetTag(err.message || '');
+      const when = resetTag ? ` around ${resetTag}` : ' after the limit resets';
+      await reply(`I hit our Claude usage limit for this request. Please try again${when}.`);
     } else {
       await reply(`Something went wrong: ${err.message}. Send another message to try again or /reset to start fresh.`);
     }

@@ -110,14 +110,16 @@ sudo docker compose down && sudo docker compose build && sudo docker compose up 
 | **bash** | `pipeline-runner.js:24` | `spawn('bash', [script])` — runs shell pipelines. **Already dead code** — all routes use `sdk`, `notes`, `editor-note`, or `interactive-dm` types. |
 | **git** (14 ops) | `door43-push.js` | clone, fetch, checkout, branch, add, commit, push to Door43 |
 | **git** (1 op) | `pipeline-utils.js:37` | `git ls-remote --heads` to check branch existence |
-| **python3** (3 scripts) | `door43-push.js` | `insert_tn_rows.py`, `insert_usfm_verses.py`, `validate_tn_files.py` |
+| **python3** (2 scripts) | `door43-push.js` | `insert_tn_rows.py`, `insert_usfm_verses.py` (Note: `validate_tn_files.py` lives in cloned Door43 repo `.gitea/workflows/`, not our codebase — does not need porting) |
 | **python3** (2 scripts) | `parallel-batch.js` | `split_tsv.py`, `merge_tsvs.py` |
 | **ccusage CLI** | `usage-tracker.js:324` | `npx ccusage@latest blocks --json --offline` — optional, already has graceful fallback |
-| **shell** (various) | `api-runner/tools.js` | Generic Bash/Glob/Grep tool executors for multi-provider runner |
+| ~~**shell** (various)~~ | ~~`api-runner/tools.js`~~ | ~~Generic Bash/Glob/Grep tool executors~~ — **Removed** (commit `080562f`) |
+
+> **`/cSkillBP` symlink:** `pipeline-utils.js:8` resolves `CSKILLBP_DIR` via `path.resolve(__dirname, '../../cSkillBP')`. Seven live modules depend on this. The Dockerfile symlink (`ln -s /workspace /cSkillBP`) must remain until `pipeline-utils.js` is updated to use `process.env.CSKILLBP_DIR` (fits naturally into Phase 1 or 2).
 
 ### Workspace Skills (Claude invokes via Bash tool at runtime)
 
-**41 Python scripts** across skills. Claude's Bash tool calls `python3 script.py` during agentic execution. The Bash tool itself requires `/bin/sh` to function (uses Node child_process under the hood).
+**~43 Python scripts** across skills (includes 2 archived `.old/` files). Claude's Bash tool calls `python3 script.py` during agentic execution. The Bash tool itself requires `/bin/sh` to function (uses Node child_process under the hood).
 
 Key script groups:
 - **Fetch scripts** (8): HTTP downloads from Door43 — trivial to port
@@ -133,7 +135,7 @@ All use Python stdlib only (no pip packages except optional `requests` in 4 scri
 
 Even after rewriting all Python to Node.js, Claude's Bash tool needs `/bin/sh` to run `node script.js`. In a truly distroless container, no shell exists, so Bash tool calls fail.
 
-**Solution: `createSdkMcpServer()`.** The Claude Agent SDK (confirmed in v0.2.39 installed in this project) has a first-class API for defining custom tools that run **in the same Node.js process** — no shell, no subprocess. Claude calls them as MCP tools; the handler is just an async function.
+**Solution: `createSdkMcpServer()`.** The Claude Agent SDK (confirmed in v0.2.77 installed in this project) has a first-class API for defining custom tools that run **in the same Node.js process** — no shell, no subprocess. Claude calls them as MCP tools; the handler is just an async function.
 
 ---
 
@@ -172,7 +174,7 @@ Replace `git ls-remote` in `pipeline-utils.js` with Gitea API call (`GET /repos/
 
 ### Phase 2: Port Bot-App Python Scripts to Node.js (1-2 weeks)
 
-Rewrite 5 Python scripts called directly by Node.js code:
+Rewrite 4 Python scripts called directly by Node.js code:
 
 | Script | Lines | Difficulty | Called from |
 |---|---|---|---|
@@ -180,7 +182,8 @@ Rewrite 5 Python scripts called directly by Node.js code:
 | `merge_tsvs.py` | 132 | Easy | `parallel-batch.js` |
 | `insert_tn_rows.py` | 449 | Hard | `door43-push.js` |
 | `insert_usfm_verses.py` | 313 | Hard | `door43-push.js` |
-| `validate_tn_files.py` | ~200 | Moderate | `door43-push.js` (lives in cloned repo — reimplement the validation checks) |
+
+> **Note:** `validate_tn_files.py` lives in the cloned Door43 repo's `.gitea/workflows/` directory, not our codebase. It does not need porting.
 
 All are pure string/file operations. The Node.js ports replace `execFileSync('python3', ...)` calls with direct function calls.
 
@@ -193,7 +196,7 @@ All are pure string/file operations. The Node.js ports replace `execFileSync('py
 
 ### Phase 3: Port Workspace Python Scripts to Node.js (8-12 weeks, incremental)
 
-Port all 41 workspace Python scripts. Each batch is independently shippable — update the SKILL.md to reference `node script.js` instead of `python3 script.py`.
+Port all ~43 workspace Python scripts. Each batch is independently shippable — update the SKILL.md to reference `node script.js` instead of `python3 script.py`.
 
 | Batch | Scripts | Est. | Notes |
 |---|---|---|---|
@@ -261,10 +264,6 @@ Claude sees these as MCP tools (e.g., `mcp__workspace-tools__build_strongs_index
 2. Update `claude-runner.js` `buildOptions()` to inject the MCP server into every SDK session
 3. Update all SKILL.md files — replace `python3 .claude/skills/.../script.py` instructions with `mcp__workspace-tools__tool_name` tool references
 4. Remove `Bash` from `DEFAULT_ALLOWED_TOOLS` in `claude-runner.js:22`
-
-**Decision point:** The `api-runner/tools.js` Bash/Glob/Grep implementations also shell out. Options:
-- Port the api-runner to use the same custom tools
-- Or accept that the api-runner path still needs a shell (could run in a separate `-dev` sidecar)
 
 **Files:** `claude-runner.js`, new `src/workspace-tools/`, all `SKILL.md` files
 **Branch:** `phase-4/sdk-mcp-tools` -> PR to `feat/chainguard-migration`. This phase does NOT merge to `main` independently — it's coupled with Phase 5 (removing Bash tool only makes sense when the image has no shell).

@@ -3,18 +3,21 @@
 // Calls Python insertion scripts directly, then runs git + Gitea API operations
 // with retry logic. No AI layer — fully deterministic, structured success/failure.
 
-const { execSync, execFileSync } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 const https = require('https');
+const git = require('isomorphic-git');
+const gitHttp = require('isomorphic-git/http/node');
 const { getVerseCount } = require('./verse-counts');
+const { insertTnRows } = require('./lib/insert-tn-rows');
+const { insertUsfmVerses } = require('./lib/insert-usfm-verses');
+const { validateTnTsv } = require('./workspace-tools/quality-tools');
+const { readSecret } = require('./secrets');
 
 const GITEA_API = 'https://git.door43.org/api/v1';
 const ORG = 'unfoldingWord';
 
 const CSKILLBP_DIR = process.env.CSKILLBP_DIR || '/srv/bot/workspace';
-const SCRIPTS_DIR = path.join(CSKILLBP_DIR, '.claude/skills/repo-insert/scripts');
-
 // Repo name for each content type
 const REPO_MAP = { tn: 'en_tn', ult: 'en_ult', ust: 'en_ust' };
 
@@ -57,6 +60,23 @@ async function withRetry(fn, { maxAttempts = 3, baseDelayMs = 2000, label = '' }
     }
   }
   throw lastErr;
+}
+
+// ---------------------------------------------------------------------------
+// isomorphic-git helpers
+// ---------------------------------------------------------------------------
+
+function makeOnAuth(token) {
+  return () => ({ username: token, password: '' });
+}
+
+function withTimeout(promise, ms, label) {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) =>
+      setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms)
+    ),
+  ]);
 }
 
 // ---------------------------------------------------------------------------
@@ -315,11 +335,10 @@ async function rawContentTouchesChapter(repo, filePath, baseBranch, headBranch, 
 // ---------------------------------------------------------------------------
 
 function getConfig() {
-  // Try workspace .env first (same logic as gitea_pr.py)
-  let token = process.env.DOOR43_TOKEN || process.env.GITEA_TOKEN;
-  let username = process.env.DOOR43_USERNAME || process.env.GITEA_USERNAME;
+  let token = readSecret('door43_token', 'DOOR43_TOKEN') || readSecret('gitea_token', 'GITEA_TOKEN');
+  let username = readSecret('door43_username', 'DOOR43_USERNAME') || readSecret('gitea_username', 'GITEA_USERNAME');
 
-  // Try loading from workspace .env if env vars missing
+  // Legacy compatibility: fallback to .env values if not provided via secrets or env vars.
   const envPaths = [
     path.join(CSKILLBP_DIR, '.env'),
     '/srv/bot/config/.env',
@@ -364,51 +383,50 @@ function getRepoFilename(type, book) {
 // syncRepo — clone if needed, create fresh branch from origin/{baseBranch}
 // ---------------------------------------------------------------------------
 
-function syncRepo(repoDir, repoName, branch, baseBranch = 'master') {
+async function syncRepo(repoDir, repoName, branch, baseBranch = 'master') {
   const repoUrl = `https://git.door43.org/${ORG}/${repoName}.git`;
+  const { token } = getConfig();
+  const onAuth = token ? makeOnAuth(token) : undefined;
 
   // Clone if missing
   if (!fs.existsSync(path.join(repoDir, '.git'))) {
     console.log(`${LOG_PREFIX} Cloning ${repoName} into ${repoDir}...`);
     fs.mkdirSync(path.dirname(repoDir), { recursive: true });
-    execSync(`git clone ${repoUrl} ${repoDir}`, { timeout: 120000, stdio: 'pipe' });
+    await withTimeout(
+      git.clone({ fs, http: gitHttp, dir: repoDir, url: repoUrl, singleBranch: false }),
+      120000, `clone ${repoName}`
+    );
   }
 
   // Verify remote URL points to unfoldingWord
-  try {
-    const remoteUrl = execSync('git remote get-url origin', { cwd: repoDir, encoding: 'utf8', timeout: 5000 }).trim();
-    if (!remoteUrl.includes('unfoldingWord') && !remoteUrl.includes('door43.org')) {
-      throw new Error(`Remote URL does not point to unfoldingWord: ${remoteUrl}`);
-    }
-  } catch (err) {
-    if (err.message.includes('Remote URL')) throw err;
-    // If remote check fails, set it
-    execSync(`git remote set-url origin ${repoUrl}`, { cwd: repoDir, timeout: 5000, stdio: 'pipe' });
+  const remoteUrl = await git.getConfig({ fs, dir: repoDir, path: 'remote.origin.url' });
+  if (remoteUrl && !remoteUrl.includes('unfoldingWord') && !remoteUrl.includes('door43.org')) {
+    throw new Error(`Remote URL does not point to unfoldingWord: ${remoteUrl}`);
   }
+  // Ensure remote URL is set correctly (clean URL — auth via onAuth callback, not embedded)
+  await git.setConfig({ fs, dir: repoDir, path: 'remote.origin.url', value: repoUrl });
 
-  // Update token in remote URL for authenticated push
-  const { token } = getConfig();
-  if (token) {
-    const authUrl = `https://${token}@git.door43.org/${ORG}/${repoName}.git`;
-    execSync(`git remote set-url origin ${authUrl}`, { cwd: repoDir, timeout: 5000, stdio: 'pipe' });
-  }
-
-  // Ensure git identity is configured (prevents "Author identity unknown" errors)
-  execFileSync('git', ['config', 'user.email', 'bot@unfoldingword.org'], { cwd: repoDir, timeout: 5000, stdio: 'pipe' });
-  execFileSync('git', ['config', 'user.name', 'BW Bot'], { cwd: repoDir, timeout: 5000, stdio: 'pipe' });
+  // Set git identity
+  await git.setConfig({ fs, dir: repoDir, path: 'user.email', value: 'bot@unfoldingword.org' });
+  await git.setConfig({ fs, dir: repoDir, path: 'user.name', value: 'BW Bot' });
 
   // Fetch latest
   console.log(`${LOG_PREFIX} Fetching origin for ${repoName}...`);
-  execSync('git fetch origin', { cwd: repoDir, timeout: 60000, stdio: 'pipe' });
+  await withTimeout(
+    git.fetch({ fs, http: gitHttp, dir: repoDir, remote: 'origin', onAuth }),
+    60000, `fetch ${repoName}`
+  );
 
-  // Detach HEAD, delete local branch if it exists, create fresh from origin/{baseBranch}
-  execSync('git checkout --detach', { cwd: repoDir, timeout: 10000, stdio: 'pipe' });
+  // Delete local branch if it exists (ignore errors if it doesn't)
   try {
-    execFileSync('git', ['branch', '-D', branch], { cwd: repoDir, timeout: 5000, stdio: 'pipe' });
+    await git.deleteBranch({ fs, dir: repoDir, ref: branch });
   } catch {
     // Branch didn't exist locally — fine
   }
-  execFileSync('git', ['checkout', '-b', branch, `origin/${baseBranch}`], { cwd: repoDir, timeout: 10000, stdio: 'pipe' });
+
+  // Create fresh branch from origin/{baseBranch} and check it out
+  await git.branch({ fs, dir: repoDir, ref: branch, object: `origin/${baseBranch}` });
+  await git.checkout({ fs, dir: repoDir, ref: branch });
   console.log(`${LOG_PREFIX} On branch ${branch} (from origin/${baseBranch}) in ${repoDir}`);
 }
 
@@ -428,40 +446,34 @@ function insertContent({ type, book, chapter, source, verses, repoDir, repoFilen
   }
 
   if (type === 'tn') {
-    const script = path.join(SCRIPTS_DIR, 'insert_tn_rows.py');
     console.log(`${LOG_PREFIX} Inserting TN rows: ${source} → ${repoFilename}`);
-    const args = [
-      script,
-      '--book-file', bookFilePath,
-      '--source-file', sourcePath,
-      '--chapter', String(chapter),
-      '--backup',
-    ];
-    if (book.toUpperCase() === 'PSA') args.push('--skip-intro');
-    // Pass English ULT for intra-verse ordering of KEEP-tagged notes
+    let ultFile;
     const bookNum = BOOK_NUMBERS[book.toUpperCase()];
     if (bookNum) {
-      const ultFile = path.join(CSKILLBP_DIR, 'data', 'published_ult_english',
-                                `${bookNum}-${book.toUpperCase()}.usfm`);
-      if (fs.existsSync(ultFile)) {
-        args.push('--ult-file', ultFile);
-      }
+      const candidate = path.join(CSKILLBP_DIR, 'data', 'published_ult_english',
+                                  `${bookNum}-${book.toUpperCase()}.usfm`);
+      if (fs.existsSync(candidate)) ultFile = candidate;
     }
-    const output = execFileSync('python3', args, { encoding: 'utf8', timeout: 60000, cwd: CSKILLBP_DIR });
+    const output = insertTnRows({
+      bookFile: bookFilePath,
+      sourceFile: sourcePath,
+      chapter,
+      skipIntro: book.toUpperCase() === 'PSA',
+      ultFile,
+      backup: true,
+    });
     if (output.trim()) console.log(`${LOG_PREFIX} insert_tn_rows: ${output.trim()}`);
   } else {
     // ULT or UST
-    const script = path.join(SCRIPTS_DIR, 'insert_usfm_verses.py');
     const verseRange = verses || `1-${getVerseCount(book, chapter)}`;
     console.log(`${LOG_PREFIX} Inserting ${type.toUpperCase()} verses ${verseRange} for ${book} ${chapter}: ${source} → ${repoFilename}`);
-    const output = execFileSync('python3', [
-      script,
-      '--book-file', bookFilePath,
-      '--source-file', sourcePath,
-      '--chapter', String(chapter),
-      '--verses', verseRange,
-      '--backup',
-    ], { encoding: 'utf8', timeout: 60000, cwd: CSKILLBP_DIR });
+    const output = insertUsfmVerses({
+      bookFile: bookFilePath,
+      sourceFile: sourcePath,
+      chapter,
+      verses: verseRange,
+      backup: true,
+    });
     if (output.trim()) console.log(`${LOG_PREFIX} insert_usfm_verses: ${output.trim()}`);
   }
 }
@@ -471,25 +483,36 @@ function insertContent({ type, book, chapter, source, verses, repoDir, repoFilen
 // ---------------------------------------------------------------------------
 
 async function commitAndPush(repoDir, branch, filename, commitMsg) {
-  execSync(`git add ${filename}`, { cwd: repoDir, timeout: 10000, stdio: 'pipe' });
+  const { token } = getConfig();
+  const onAuth = token ? makeOnAuth(token) : undefined;
+
+  // Stage the file
+  await git.add({ fs, dir: repoDir, filepath: filename });
 
   // Check if there are actually changes to commit
-  try {
-    execSync('git diff --cached --quiet', { cwd: repoDir, timeout: 5000, stdio: 'pipe' });
-    // No error = no changes
+  const matrix = await git.statusMatrix({ fs, dir: repoDir, filepaths: [filename] });
+  // statusMatrix returns [filepath, HEAD, WORKDIR, STAGE]
+  // If HEAD === STAGE for all files, there are no staged changes
+  const hasChanges = matrix.some(([, head, , stage]) => head !== stage);
+
+  if (!hasChanges) {
     console.warn(`${LOG_PREFIX} No changes to commit for ${filename} — content may already match master`);
     return { noChanges: true };
-  } catch {
-    // Has changes — proceed with commit
   }
 
-  execSync(`git commit -m "${commitMsg.replace(/"/g, '\\"')}"`, { cwd: repoDir, timeout: 10000, stdio: 'pipe' });
+  // Commit
+  await git.commit({
+    fs, dir: repoDir,
+    message: commitMsg,
+    author: { name: 'BW Bot', email: 'bot@unfoldingword.org' },
+  });
 
   // Push with retry
   await withRetry(
-    () => {
-      execSync(`git push origin ${branch}`, { cwd: repoDir, timeout: 60000, stdio: 'pipe' });
-    },
+    () => withTimeout(
+      git.push({ fs, http: gitHttp, dir: repoDir, remote: 'origin', ref: branch, onAuth }),
+      60000, `push ${branch}`
+    ),
     { maxAttempts: 3, baseDelayMs: 2000, label: `push ${branch}` }
   );
 
@@ -634,74 +657,54 @@ async function door43Push(opts) {
 
   try {
     // Step 1: Sync repo (clone/fetch, create staging branch from master)
-    syncRepo(repoDir, repo, branch);
+    await syncRepo(repoDir, repo, branch);
 
     // Step 3: Insert content via Python script
     insertContent({ type, book, chapter, source, verses, repoDir, repoFilename });
 
     // Step 3b: Door43 CI validation gate (TN only)
-    // Uses the repo's own validate_tn_files.py from .gitea/workflows/
+    // JS port of TN TSV validation checks (distroless-safe; no python dependency).
     // Only blocks on errors in the chapter we're inserting — pre-existing errors
     // in other chapters are logged as warnings but do not block delivery.
     if (type === 'tn') {
-      const validateScript = path.join(repoDir, '.gitea/workflows/validate_tn_files.py');
-      if (fs.existsSync(validateScript)) {
-        const bookLower = book.toLowerCase();
-        const checkArgs = [];
-        for (let i = 3; i <= 15; i++) checkArgs.push('--check', String(i));
+      const relFile = path.posix.join(config.reposPath, repo, repoFilename).replace(/\\/g, '/');
+      let parsed = null;
+      try {
+        // Keep check coverage aligned with implemented JS validator rules.
+        const rawJson = validateTnTsv({ file: relFile, checks: [3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13], maxErrors: 1000 });
+        parsed = JSON.parse(rawJson);
+      } catch (validationErr) {
+        console.warn(`${LOG_PREFIX} JS validation failed to run: ${validationErr.message} — skipping`);
+      }
 
-        // Collect JSON output regardless of exit code (exit 1 = validation errors found)
-        let rawJson = '';
-        try {
-          rawJson = execFileSync('python3', [
-            validateScript, '--book', bookLower, '--json', ...checkArgs,
-          ], { encoding: 'utf8', timeout: 60000, cwd: repoDir, stdio: 'pipe' });
-        } catch (execErr) {
-          rawJson = execErr.stdout || '';
-          if (!rawJson) {
-            console.warn(`${LOG_PREFIX} Validation script failed to run: ${execErr.stderr || execErr.message} — skipping`);
-          }
+      if (parsed && Array.isArray(parsed.findings)) {
+        const allErrors = parsed.findings.map((f) => ({
+          line: f.line,
+          ref: f.reference,
+          message: f.message,
+        }));
+
+        // Only block on errors in the chapter we're inserting
+        const chapterPrefix = String(chapter) + ':';
+        const ourErrors = allErrors.filter(e => e.ref && String(e.ref).startsWith(chapterPrefix));
+        const otherCount = allErrors.length - ourErrors.length;
+
+        if (otherCount > 0) {
+          console.warn(`${LOG_PREFIX} ${otherCount} pre-existing validation issue(s) in other chapters (not blocking)`);
         }
 
-        if (rawJson) {
-          // Flatten errors from all check groups: {"3": {"errors": [...]}, "4": {...}, ...}
-          let allErrors = [];
-          try {
-            const parsed = JSON.parse(rawJson);
-            for (const key of Object.keys(parsed)) {
-              const group = parsed[key];
-              if (group && Array.isArray(group.errors)) {
-                allErrors = allErrors.concat(group.errors);
-              }
-            }
-          } catch {
-            console.warn(`${LOG_PREFIX} Could not parse validation output — skipping`);
-          }
-
-          // Only block on errors in the chapter we're inserting
-          const chapterPrefix = String(chapter) + ':';
-          const ourErrors = allErrors.filter(e => e.ref && String(e.ref).startsWith(chapterPrefix));
-          const otherCount = allErrors.length - ourErrors.length;
-
-          if (otherCount > 0) {
-            console.warn(`${LOG_PREFIX} ${otherCount} pre-existing validation issue(s) in other chapters (not blocking)`);
-          }
-
-          if (ourErrors.length > 0) {
-            const errorSummary = ourErrors.slice(0, 10).map(e =>
-              `  Line ${e.line || '?'}: [${e.ref}] ${e.message}`
-            ).join('\n');
-            let details = `Door43 CI validation failed for ${repoFilename} — ${ourErrors.length} error(s) in chapter ${chapter}:\n${errorSummary}`;
-            if (ourErrors.length > 10) details += `\n  ... and ${ourErrors.length - 10} more`;
-            execFileSync('git', ['checkout', '--', repoFilename], { cwd: repoDir, timeout: 5000, stdio: 'pipe' });
-            console.error(`${LOG_PREFIX} ${details}`);
-            throw new Error(details);
-          }
-
-          console.log(`${LOG_PREFIX} Door43 CI validation passed for chapter ${chapter} in ${repoFilename}`);
+        if (ourErrors.length > 0) {
+          const errorSummary = ourErrors.slice(0, 10).map(e =>
+            `  Line ${e.line || '?'}: [${e.ref}] ${e.message}`
+          ).join('\n');
+          let details = `Door43 CI validation failed for ${repoFilename} — ${ourErrors.length} error(s) in chapter ${chapter}:\n${errorSummary}`;
+          if (ourErrors.length > 10) details += `\n  ... and ${ourErrors.length - 10} more`;
+          await git.checkout({ fs, dir: repoDir, filepaths: [repoFilename], force: true });
+          console.error(`${LOG_PREFIX} ${details}`);
+          throw new Error(details);
         }
-      } else {
-        console.log(`${LOG_PREFIX} Validation script not found at ${validateScript} — skipping validation`);
+
+        console.log(`${LOG_PREFIX} Door43 CI validation passed for chapter ${chapter} in ${repoFilename}`);
       }
     }
 

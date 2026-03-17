@@ -16,17 +16,17 @@
   "routes": [
     {
       "name": "editor-note",
-      "match": "/^note\\s+(\\w+)(?:\\s+(?:ch\\.?\\s*)?(\\d+))?\\s+(.+)/i",
+      "match": "/^note\\s+(\\w+)\\s+(.+)/i",
       "type": "editor-note",
       "reply": true,
       "confirmMessage": "I'll file this note for **$1**. Sound right? (yes/no)"
     },
     {
       "name": "generate-content",
-      "match": "/generate\\s+(\\w+)\\s+(\\d+)(?:\\s*[-–—to]+\\s*(\\d+))?/i",
+      "match": "/generate\\s+(\\w+)\\s+(\\d+(?::\\d+[-–—]\\d+)?(?:\\s*[-–—to]+\\s*\\d+)?)/i",
       "type": "sdk",
       "skill": "initial-pipeline --lite",
-      "pipeline": "./pipelines/generate.sh",
+
       "reply": false,
       "confirmMessage": "I'll generate the initial content (ULT & UST, issues draft) for **$1 $2**. Sound right? (yes/no)",
       "operations": 3,

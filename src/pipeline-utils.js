@@ -1,11 +1,11 @@
 // pipeline-utils.js — Shared utilities for notes and generate pipelines
 
-const { execSync } = require('child_process');
+const https = require('https');
 const fs = require('fs');
 const path = require('path');
 const { getVerseCount, getTotalVerses } = require('./verse-counts');
 
-const CSKILLBP_DIR = path.resolve(__dirname, '../../cSkillBP');
+const CSKILLBP_DIR = process.env.CSKILLBP_DIR || path.resolve(__dirname, '../../cSkillBP');
 
 const MIN_TIMEOUT_MS = 10 * 60 * 1000;   // 10 min floor
 const MAX_TIMEOUT_MS = 60 * 60 * 1000;   // 60 min cap
@@ -27,20 +27,24 @@ function getDoor43Username(senderEmail) {
  * @param {string} [book] - Book code for {BOOK} placeholder
  * @returns {string|null} Branch name if exists, null otherwise
  */
-function checkExistingBranch(username, repo = 'en_tn', branchPattern = '{username}-tc-create-1', book = '') {
+async function checkExistingBranch(username, repo = 'en_tn', branchPattern = '{username}-tc-create-1', book = '') {
   const branchName = branchPattern
     .replace('{username}', username)
     .replace('{BOOK}', book);
-  const repoUrl = `https://git.door43.org/unfoldingWord/${repo}.git`;
 
   try {
-    const result = execSync(
-      `git ls-remote --heads ${repoUrl} ${branchName}`,
-      { encoding: 'utf8', timeout: 15000 }
-    ).trim();
-    return result.length > 0 ? branchName : null;
+    const status = await new Promise((resolve, reject) => {
+      const url = `https://git.door43.org/api/v1/repos/unfoldingWord/${repo}/branches/${encodeURIComponent(branchName)}`;
+      const req = https.get(url, { timeout: 15000 }, (res) => {
+        res.resume(); // drain response body
+        resolve(res.statusCode);
+      });
+      req.on('error', reject);
+      req.on('timeout', () => { req.destroy(); reject(new Error('timeout')); });
+    });
+    return status === 200 ? branchName : null;
   } catch (err) {
-    console.error(`[pipeline-utils] git ls-remote failed for ${repo}/${branchName}: ${err.message}`);
+    console.error(`[pipeline-utils] Gitea branch check failed for ${repo}/${branchName}: ${err.message}`);
     return null; // Assume no branch on error — don't block the pipeline
   }
 }

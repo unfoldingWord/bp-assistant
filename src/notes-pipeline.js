@@ -11,12 +11,14 @@ const fs = require('fs');
 const path = require('path');
 const config = require('./config');
 const { sendMessage, sendDM, addReaction, removeReaction } = require('./zulip-client');
-const { runClaude } = require('./claude-runner');
+const { runClaude, DEFAULT_RESTRICTED_TOOLS, isTransientOutageError } = require('./claude-runner');
 const { getDoor43Username, buildBranchName, resolveOutputFile, checkPrerequisites, calcSkillTimeout, normalizeBookName, resolveConflictMention, CSKILLBP_DIR } = require('./pipeline-utils');
 const { verifyRepoPush, verifyDcsToken } = require('./repo-verify');
 const { recordMetrics, getCumulativeTokens, recordRunSummary } = require('./usage-tracker');
 const { door43Push, checkConflictingBranches, REPO_MAP, getRepoFilename } = require('./door43-push');
 const { setPendingMerge } = require('./pending-merges');
+const { mergeTsvs } = require('./workspace-tools/tsv-tools');
+const { getCheckpoint, setCheckpoint, clearCheckpoint } = require('./pipeline-checkpoints');
 
 const LOG_DIR = path.resolve(__dirname, '../logs');
 
@@ -45,6 +47,81 @@ function shouldRunIntro(book, chapter, withIntroFlag) {
 
 function hasWithIntroFlag(content) {
   return /--with-?intro\b/i.test(content) || /\bwith[\s-]intro\b/i.test(content);
+}
+
+function buildNotesPaths(book, tag, hasVerseRange, verseStart, verseEnd) {
+  const chapterRel = `output/notes/${book}/${tag}.tsv`;
+  const shardRel = hasVerseRange
+    ? `output/notes/${book}/${tag}-v${verseStart}-${verseEnd}.tsv`
+    : chapterRel;
+  return { chapterRel, shardRel };
+}
+
+function refreshChapterNotesFromShards(book, tag, chapterRel) {
+  const shardGlob = `output/notes/${book}/${tag}-v*.tsv`;
+  const merged = mergeTsvs({ globPattern: shardGlob, output: chapterRel });
+  if (!merged.startsWith('Merged')) return null;
+  return chapterRel;
+}
+
+function isUsageLimitError(text) {
+  return /hit your limit|usage limit|rate limit|too many requests|429/i.test(String(text || ''));
+}
+
+function chicagoIsoFromUtcDate(date) {
+  const wall = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'America/Chicago',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: false,
+  }).formatToParts(date);
+  const byType = Object.fromEntries(wall.map((p) => [p.type, p.value]));
+
+  const tzName = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'America/Chicago',
+    timeZoneName: 'shortOffset',
+  }).formatToParts(date).find((p) => p.type === 'timeZoneName')?.value || 'GMT-6';
+
+  const offsetMatch = tzName.match(/^GMT([+-])(\d{1,2})(?::?(\d{2}))?$/);
+  let offset = '-06:00';
+  if (offsetMatch) {
+    const sign = offsetMatch[1];
+    const hh = String(offsetMatch[2]).padStart(2, '0');
+    const mm = String(offsetMatch[3] || '00').padStart(2, '0');
+    offset = `${sign}${hh}:${mm}`;
+  }
+
+  return `${byType.year}-${byType.month}-${byType.day}T${byType.hour}:${byType.minute}:${byType.second}${offset}`;
+}
+
+function buildUsageLimitResetTag(errorText) {
+  // Example: "You've hit your limit · resets 8pm (UTC)"
+  const m = String(errorText || '').match(/resets?\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)\s*\(UTC\)/i);
+  if (!m) return null;
+
+  let hour = parseInt(m[1], 10);
+  const minute = parseInt(m[2] || '0', 10);
+  const ampm = m[3].toLowerCase();
+  if (ampm === 'pm' && hour !== 12) hour += 12;
+  if (ampm === 'am' && hour === 12) hour = 0;
+
+  const now = new Date();
+  const resetUtc = new Date(Date.UTC(
+    now.getUTCFullYear(),
+    now.getUTCMonth(),
+    now.getUTCDate(),
+    hour,
+    minute,
+    0,
+  ));
+  if (resetUtc.getTime() <= now.getTime()) {
+    resetUtc.setUTCDate(resetUtc.getUTCDate() + 1);
+  }
+  return `<time:${chicagoIsoFromUtcDate(resetUtc)}>`;
 }
 
 // --- Parse "write notes BOOK CH" or "write notes BOOK CH:VS-VS" or "write notes BOOK CH1-CH2" ---
@@ -138,10 +215,20 @@ async function notesPipeline(route, message) {
   }
 
   const { book, startChapter, endChapter, verseStart, verseEnd, withIntro } = parsed;
+  const sessionKey = stream ? `stream-${stream}-${topic}` : `dm-${message.sender_id}`;
+  const checkpointRef = {
+    sessionKey,
+    pipelineType: 'notes',
+    scope: { book, startChapter, endChapter, verseStart: verseStart ?? null, verseEnd: verseEnd ?? null },
+  };
+  const existingCheckpoint = getCheckpoint(checkpointRef);
   const chapterCount = endChapter - startChapter + 1;
-  const rangeLabel = startChapter === endChapter
-    ? `${book} ${startChapter}`
-    : `${book} ${startChapter}\u2013${endChapter}`;
+  const hasGlobalVerseRange = verseStart != null && verseEnd != null && startChapter === endChapter;
+  const rangeLabel = hasGlobalVerseRange
+    ? `${book} ${startChapter}:${verseStart}-${verseEnd}`
+    : (startChapter === endChapter
+      ? `${book} ${startChapter}`
+      : `${book} ${startChapter}\u2013${endChapter}`);
 
   // --- Look up Door43 username ---
   const username = getDoor43Username(message.sender_email);
@@ -161,14 +248,33 @@ async function notesPipeline(route, message) {
 
   const pipelineStart = Date.now();
   const tokensBefore = getCumulativeTokens();
-  let totalSuccess = 0;
-  let totalFail = 0;
+  let totalSuccess = Number(existingCheckpoint?.totalSuccess || 0);
+  let totalFail = Number(existingCheckpoint?.totalFail || 0);
 
   // Conflict-deferred push state: when a user branch modifies the same file,
   // we continue generating but defer all pushes until the user says "merged".
   let deferredPush = false;
   let deferredConflicts = [];   // [{ branch }]
   const deferredChapters = [];  // [{ ch, notesSource }]
+  let abortForUsageLimit = false;
+  let abortForOutage = false;
+  let usageLimitTag = null;
+  let resumeChapter = Number(existingCheckpoint?.resume?.chapter || startChapter);
+  let resumeSkill = existingCheckpoint?.resume?.skill || null;
+
+  if (existingCheckpoint?.state === 'paused_for_outage' && resumeChapter >= startChapter) {
+    await status(`Resuming notes from checkpoint at **${book} ${resumeChapter}** (${resumeSkill || 'chapter start'}).`);
+    await reply(`Resuming notes run for **${rangeLabel}** from **${book} ${resumeChapter}** (${resumeSkill || 'chapter start'}).`);
+  } else {
+    resumeChapter = startChapter;
+    resumeSkill = null;
+  }
+  setCheckpoint(checkpointRef, {
+    state: 'running',
+    totalSuccess,
+    totalFail,
+    resume: { chapter: resumeChapter, skill: resumeSkill },
+  });
 
   // =========================================================================
   // Per-chapter loop: skills -> repo-insert -> repo-verify -> notify user
@@ -176,6 +282,7 @@ async function notesPipeline(route, message) {
   // access immediately and isn't told a chapter is done until it's on master.
   // =========================================================================
   for (let ch = startChapter; ch <= endChapter; ch++) {
+    if (ch < resumeChapter) continue;
     const width = book.toUpperCase() === 'PSA' ? 3 : 2;
     const tag = `${book}-${String(ch).padStart(width, '0')}`;
     const verseRange = verseStart != null && startChapter === endChapter
@@ -241,11 +348,13 @@ async function notesPipeline(route, message) {
       await status(`**${ref}**: skipping chapter-intro (auto-excluded range)`);
     }
 
-    const vTag = hasVerseRange ? `${tag}-v${verseStart}-${verseEnd}` : tag;
+    const { chapterRel: notesChapterRel, shardRel: notesShardRel } = buildNotesPaths(
+      book, tag, hasVerseRange, verseStart, verseEnd
+    );
     skills.push({
       name: 'tn-writer',
       prompt: `${skillRef} --issues ${issuesPath}`,
-      expectedOutput: `output/notes/${vTag}.tsv`,
+      expectedOutput: notesChapterRel,
       ops: 1,
     });
 
@@ -253,29 +362,51 @@ async function notesPipeline(route, message) {
     skills.push({
       name: 'tn-quality-check',
       prompt: `${skillRef}`,
-      expectedOutput: `output/quality/${book}/${vTag}-quality.md`,
+      expectedOutput: `output/quality/${book}/${tag}-quality.md`,
       ops: 1,
       model: 'sonnet',
     });
 
     // --- Run skills sequentially ---
-    for (const skill of skills) {
+    let startSkillIndex = 0;
+    if (ch === resumeChapter && resumeSkill) {
+      const idx = skills.findIndex((s) => s.name === resumeSkill);
+      startSkillIndex = idx >= 0 ? idx : 0;
+      if (idx < 0) {
+        await status(`Checkpoint resume skill "${resumeSkill}" not found for ${ref}; restarting chapter skill chain.`);
+      }
+    }
+    for (let si = startSkillIndex; si < skills.length; si++) {
+      const skill = skills[si];
       const skillStart = Date.now();
       const timeoutMs = calcSkillTimeout(book, ch, skill.ops);
       await status(`Running **${skill.name}** for ${ref} (timeout: ${Math.round(timeoutMs / 60000)}min)...`);
       console.log(`[notes] Running ${skill.name}: ${skill.prompt} (timeout: ${Math.round(timeoutMs / 60000)}min)`);
+      setCheckpoint(checkpointRef, {
+        state: 'running',
+        totalSuccess,
+        totalFail,
+        current: { chapter: ch, skill: skill.name, status: 'running', startedAt: new Date(skillStart).toISOString() },
+        resume: { chapter: ch, skill: skill.name },
+      });
 
       let result = null;
+      let skillError = null;
       try {
         result = await runClaude({
           prompt: skill.prompt,
           cwd: CSKILLBP_DIR,
           model: model || skill.model, // TEST_FAST haiku overrides per-skill model
           skill: skill.name,
+          tools: DEFAULT_RESTRICTED_TOOLS,
+          disallowedTools: ['Bash'],
+          disableLocalSettings: true,
+          forceNoAutoBashSandbox: true,
           timeoutMs,
           appendSystemPrompt: skill.appendSystemPrompt,
         });
       } catch (err) {
+        skillError = err;
         console.error(`[notes] ${skill.name} error: ${err.message}`);
       }
 
@@ -286,12 +417,95 @@ async function notesPipeline(route, message) {
       const logLine = `${new Date().toISOString()} | ${tag} | ${skill.name} | sdk=${sdkSuccess} | duration=${duration}s\n`;
       fs.appendFileSync(logFile, logLine);
 
+      // Hard fail on thrown SDK errors (including usage/rate limits).
+      if (skillError) {
+        failedSkill = skill.name;
+        const errText = skillError.message || String(skillError);
+        if (isTransientOutageError(skillError)) {
+          abortForOutage = true;
+          setCheckpoint(checkpointRef, {
+            state: 'paused_for_outage',
+            totalSuccess,
+            totalFail,
+            current: { chapter: ch, skill: skill.name, status: 'failed', errorKind: 'transient_outage', error: errText },
+            resume: { chapter: ch, skill: skill.name },
+          });
+          await status(`**${skill.name}** paused for ${ref}: Claude transient outage persisted for 10 minutes.`);
+          break;
+        }
+        if (isUsageLimitError(errText)) {
+          abortForUsageLimit = true;
+          usageLimitTag = buildUsageLimitResetTag(errText);
+          const when = usageLimitTag ? ` around ${usageLimitTag}` : ' after the limit resets';
+          await status(`**${skill.name}** failed for ${ref}: usage limit reached. Retry${when}.`);
+        } else {
+          await status(`**${skill.name}** failed for ${ref}: ${errText}`);
+        }
+        setCheckpoint(checkpointRef, {
+          state: 'failed',
+          totalSuccess,
+          totalFail,
+          current: { chapter: ch, skill: skill.name, status: 'failed', errorKind: 'sdk_error', error: errText },
+          resume: { chapter: ch, skill: skill.name },
+        });
+        break;
+      }
+
+      // Hard fail on non-success result payloads, even if old output files exist.
+      if (!result || result.subtype !== 'success') {
+        failedSkill = skill.name;
+        const errText = result?.error || result?.result || `Claude returned subtype "${result?.subtype || 'unknown'}"`;
+        if (isUsageLimitError(errText)) {
+          abortForUsageLimit = true;
+          usageLimitTag = buildUsageLimitResetTag(errText);
+          const when = usageLimitTag ? ` around ${usageLimitTag}` : ' after the limit resets';
+          await status(`**${skill.name}** failed for ${ref}: usage limit reached. Retry${when}.`);
+        } else {
+          await status(`**${skill.name}** failed for ${ref}: ${errText}`);
+        }
+        setCheckpoint(checkpointRef, {
+          state: 'failed',
+          totalSuccess,
+          totalFail,
+          current: { chapter: ch, skill: skill.name, status: 'failed', errorKind: 'non_success_result', error: errText },
+          resume: { chapter: ch, skill: skill.name },
+        });
+        break;
+      }
+
       // Check expected output (resolveOutputFile handles padding + subdirs)
       if (skill.expectedOutput) {
         const resolved = resolveOutputFile(skill.expectedOutput, book);
         if (!resolved) {
           failedSkill = skill.name;
           await status(`**${skill.name}** failed for ${ref} \u2014 expected output not found: ${skill.expectedOutput} (${duration}s)`);
+          setCheckpoint(checkpointRef, {
+            state: 'failed',
+            totalSuccess,
+            totalFail,
+            current: { chapter: ch, skill: skill.name, status: 'failed', errorKind: 'missing_output', outputStatus: 'missing' },
+            resume: { chapter: ch, skill: skill.name },
+          });
+          break;
+        }
+        // Guard against stale artifacts from previous runs being treated as success.
+        const absResolvedFreshness = path.resolve(CSKILLBP_DIR, resolved);
+        let mtimeMs = 0;
+        try {
+          mtimeMs = fs.statSync(absResolvedFreshness).mtimeMs;
+        } catch (_) {
+          mtimeMs = 0;
+        }
+        if (mtimeMs < skillStart - 2000) {
+          failedSkill = skill.name;
+          await status(`**${skill.name}** failed for ${ref} \u2014 output file is stale from an earlier run: ${resolved}`);
+          setCheckpoint(checkpointRef, {
+            state: 'failed',
+            totalSuccess,
+            totalFail,
+            current: { chapter: ch, skill: skill.name, status: 'failed', errorKind: 'stale_output', outputStatus: 'stale', outputPath: resolved },
+            resume: { chapter: ch, skill: skill.name },
+          });
           break;
         }
         skill.resolvedOutput = resolved;
@@ -307,9 +521,23 @@ async function notesPipeline(route, message) {
         }
         // Pass resolved notes path to quality-check so it can find the file
         if (skill.name === 'tn-writer') {
+          if (hasVerseRange) {
+            // Canonical output for partial runs is verse-scoped shard file.
+            const absResolved = path.resolve(CSKILLBP_DIR, resolved);
+            const absShard = path.resolve(CSKILLBP_DIR, notesShardRel);
+            fs.mkdirSync(path.dirname(absShard), { recursive: true });
+            fs.copyFileSync(absResolved, absShard);
+            skill.resolvedOutput = notesShardRel;
+            console.log(`[notes] Wrote verse shard: ${notesShardRel}`);
+            // Keep a chapter-level assembled view up-to-date for future checks/runs.
+            const assembledRel = refreshChapterNotesFromShards(book, tag, notesChapterRel);
+            if (assembledRel) {
+              console.log(`[notes] Refreshed chapter aggregate from shards: ${assembledRel}`);
+            }
+          }
           for (const s of skills) {
             if (s.name === 'tn-quality-check') {
-              s.prompt = `${skillRef} --notes ${resolved}`;
+              s.prompt = `${skillRef} --notes ${skill.resolvedOutput || resolved}`;
             }
           }
         }
@@ -331,13 +559,27 @@ async function notesPipeline(route, message) {
       } else {
         await status(`**${skill.name}** done (${duration}s)`);
       }
+      setCheckpoint(checkpointRef, {
+        state: 'running',
+        totalSuccess,
+        totalFail,
+        current: { chapter: ch, skill: skill.name, status: 'succeeded' },
+        resume: null,
+      });
     }
 
     const chapterDuration = ((Date.now() - chapterStart) / 1000).toFixed(1);
 
     if (failedSkill) {
       totalFail++;
+      setCheckpoint(checkpointRef, {
+        state: abortForOutage ? 'paused_for_outage' : 'failed',
+        totalSuccess,
+        totalFail,
+        resume: { chapter: ch, skill: failedSkill },
+      });
       await status(`Chapter ${ref} failed at **${failedSkill}** after ${chapterDuration}s`);
+      if (abortForUsageLimit || abortForOutage) break;
       // Continue to next chapter instead of aborting the whole pipeline
       continue;
     }
@@ -427,6 +669,13 @@ async function notesPipeline(route, message) {
     }
 
     totalSuccess++;
+    setCheckpoint(checkpointRef, {
+      state: 'running',
+      totalSuccess,
+      totalFail,
+      current: { chapter: ch, status: 'chapter_succeeded' },
+      resume: null,
+    });
 
     // Notify user only after merge is confirmed
     if (chapterCount > 1) {
@@ -487,11 +736,35 @@ async function notesPipeline(route, message) {
       pipeline: 'notes', book, startCh: startChapter, endCh: endChapter,
       tokensBefore, success: totalFail === 0, userId: message.sender_id,
     });
+    clearCheckpoint(checkpointRef);
     return;
   }
 
   // --- Final reaction and report ---
   await removeReaction(msgId, 'working_on_it');
+
+  if (abortForOutage) {
+    await addReaction(msgId, 'warning');
+    await reply('Claude is temporarily down, you\'ll need to re-trigger. I saved progress and will resume from the failed skill.');
+    await status(`Notes pipeline paused for **${rangeLabel}** due to transient Claude outage; waiting for re-trigger to resume.`);
+    return;
+  }
+
+  if (abortForUsageLimit) {
+    await addReaction(msgId, 'warning');
+    const when = usageLimitTag ? ` around ${usageLimitTag}` : ' after the limit resets';
+    await reply(
+      `Notes pipeline paused: I hit our Claude usage limit and stopped before push/verify for unfinished work. ` +
+      `I can resume${when}.`
+    );
+    recordRunSummary({
+      pipeline: 'notes', book, startCh: startChapter, endCh: endChapter,
+      tokensBefore, success: false, userId: message.sender_id,
+    });
+    await status(`Notes pipeline paused for **${rangeLabel}** due to usage limit.`);
+    clearCheckpoint(checkpointRef);
+    return;
+  }
 
   if (totalFail > 0 && totalSuccess === 0) {
     await addReaction(msgId, 'warning');
@@ -526,6 +799,7 @@ async function notesPipeline(route, message) {
   });
 
   await status(`Notes pipeline complete for **${rangeLabel}** in ${totalDuration}s \u2014 ${totalSuccess} ok, ${totalFail} failed.`);
+  clearCheckpoint(checkpointRef);
 }
 
 module.exports = { notesPipeline };
