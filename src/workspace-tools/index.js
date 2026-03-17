@@ -7,6 +7,8 @@ const {
   fetchHebrewBible, fetchUlt, fetchUst, fetchT4t, fetchDoor43,
   fetchGlossary, fetchIssuesResolved, fetchTemplates,
 } = require('./fetch-tools');
+const { splitTsv, mergeTsvs, fixTrailingNewlines } = require('./tsv-tools');
+const { extractUltEnglish, filterPsalms, curlyQuotes, checkUstPassives } = require('./usfm-tools');
 
 /**
  * Create the SDK MCP server config. Must be called after the SDK is loaded
@@ -109,6 +111,89 @@ function createWorkspaceTools(createSdkMcpServer, tool, z) {
         },
         async (args) => ({
           content: [{ type: 'text', text: await fetchTemplates(args) }],
+        })
+      ),
+
+      // --- TSV tools ---
+      tool(
+        'split_tsv',
+        'Split a verse-based issue TSV into chunks for parallel processing. Returns absolute paths of chunk files.',
+        {
+          inputTsv: z.string().describe('Path to input issue TSV (relative to workspace)'),
+          chunkSize: z.number().int().optional().describe('Target verses per chunk (default: 40)'),
+          ranges: z.string().optional().describe('Explicit ranges like "1-8,9-16,17-24"'),
+          outputDir: z.string().optional().describe('Output directory (default: same as input)'),
+        },
+        async (args) => ({
+          content: [{ type: 'text', text: splitTsv(args) }],
+        })
+      ),
+      tool(
+        'merge_tsvs',
+        'Merge multiple notes TSVs with deduplication and verse sorting. Returns path to merged file.',
+        {
+          files: z.array(z.string()).optional().describe('Input TSV file paths (relative to workspace)'),
+          globPattern: z.string().optional().describe('Glob pattern for input files (e.g. "output/notes/PSA/PSA-119-v*.tsv")'),
+          output: z.string().describe('Output file path (relative to workspace)'),
+          noSort: z.boolean().optional().describe('Preserve chunk order instead of re-sorting'),
+        },
+        async (args) => ({
+          content: [{ type: 'text', text: mergeTsvs(args) }],
+        })
+      ),
+      tool(
+        'fix_trailing_newlines',
+        'Fix trailing literal \\n in Note column of a TSV file (in-place)',
+        {
+          file: z.string().describe('TSV file path (relative to workspace)'),
+        },
+        async (args) => ({
+          content: [{ type: 'text', text: fixTrailingNewlines(args) }],
+        })
+      ),
+
+      // --- USFM tools ---
+      tool(
+        'extract_ult_english',
+        'Strip alignment markers from ULT USFM files to produce clean English text in data/published_ult_english/',
+        {
+          books: z.array(z.string()).optional().describe('Specific book codes. Omit for all files.'),
+          force: z.boolean().optional().describe('Force re-process even if cached today'),
+          inputDir: z.string().optional().describe('Input directory (default: data/published_ult)'),
+          outputDir: z.string().optional().describe('Output directory (default: data/published_ult_english)'),
+        },
+        async (args) => ({
+          content: [{ type: 'text', text: extractUltEnglish(args) }],
+        })
+      ),
+      tool(
+        'filter_psalms',
+        'Filter Psalms USFM files to keep only chapters 1-29, 42-57, 90-118 (modifies files in-place)',
+        {},
+        async () => ({
+          content: [{ type: 'text', text: filterPsalms() }],
+        })
+      ),
+      tool(
+        'curly_quotes',
+        'Convert straight quotes to typographic curly quotes in text/USFM files',
+        {
+          input: z.string().describe('Input file path (relative to workspace)'),
+          output: z.string().optional().describe('Output file path. Omit to return content.'),
+          inPlace: z.boolean().optional().describe('Modify input file in-place'),
+        },
+        async (args) => ({
+          content: [{ type: 'text', text: curlyQuotes(args) }],
+        })
+      ),
+      tool(
+        'check_ust_passives',
+        'Detect passive voice constructions in UST USFM text',
+        {
+          file: z.string().describe('UST USFM file path (relative to workspace)'),
+        },
+        async (args) => ({
+          content: [{ type: 'text', text: checkUstPassives(args) }],
         })
       ),
     ],
