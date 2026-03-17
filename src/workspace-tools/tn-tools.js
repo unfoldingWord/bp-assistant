@@ -1,0 +1,318 @@
+// tn-tools.js — Node.js ports of TN writer pipeline scripts
+//
+// Replaces: extract_alignment_data.py, fix_hebrew_quotes.py, flag_narrow_quotes.py,
+//           generate_ids.py, resolve_gl_quotes.py, verify_at_fit.py,
+//           assemble_notes.py, prepare_notes.py
+
+const fs = require('fs');
+const path = require('path');
+const https = require('https');
+const crypto = require('crypto');
+
+const CSKILLBP_DIR = process.env.CSKILLBP_DIR || '/srv/bot/workspace';
+
+function httpsGet(url) {
+  return new Promise((resolve, reject) => {
+    https.get(url, { timeout: 30000 }, (res) => {
+      if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location)
+        return httpsGet(res.headers.location).then(resolve, reject);
+      if (res.statusCode !== 200) { res.resume(); return reject(new Error(`HTTP ${res.statusCode}`)); }
+      const chunks = [];
+      res.on('data', c => chunks.push(c));
+      res.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
+      res.on('error', reject);
+    }).on('error', reject);
+  });
+}
+
+function extractAlignmentData({ alignedUsfm, output }) {
+  const filePath = path.resolve(CSKILLBP_DIR, alignedUsfm);
+  const content = fs.readFileSync(filePath, 'utf8');
+  const result = {};
+  let chapter = 0, verse = '0';
+  const milestones = [];
+
+  for (const line of content.split('\n')) {
+    const trimmed = line.trim();
+    const cm = trimmed.match(/^\\c\s+(\d+)/);
+    if (cm) { chapter = parseInt(cm[1], 10); verse = '0'; milestones.length = 0; continue; }
+    const vm = trimmed.match(/^\\v\s+(\d+[-\d]*|front)\s*/);
+    if (vm) { verse = vm[1].split('-')[0]; milestones.length = 0; continue; }
+
+    const ZALN_S = /\\zaln-s\s+\|([^\\]*?)\\?\*/g;
+    const ZALN_E = /\\zaln-e\\?\*/g;
+    const WORD = /\\w\s+([^|\\]+)\|[^\\]*\\w\*/g;
+    const key = `${chapter}:${verse}`;
+    if (!result[key]) result[key] = [];
+
+    const tokens = [];
+    let m;
+    ZALN_S.lastIndex = 0;
+    while ((m = ZALN_S.exec(trimmed)) !== null) tokens.push({ type: 's', idx: m.index, attrs: m[1] });
+    ZALN_E.lastIndex = 0;
+    while ((m = ZALN_E.exec(trimmed)) !== null) tokens.push({ type: 'e', idx: m.index });
+    WORD.lastIndex = 0;
+    while ((m = WORD.exec(trimmed)) !== null) tokens.push({ type: 'w', idx: m.index, word: m[1].trim() });
+    tokens.sort((a, b) => a.idx - b.idx);
+
+    for (const tok of tokens) {
+      if (tok.type === 's') {
+        const sM = tok.attrs.match(/x-strong="([^"]*)"/);
+        const cM = tok.attrs.match(/x-content="([^"]*)"/);
+        milestones.push({ heb: cM ? cM[1] : '', strong: sM ? sM[1] : '', heb_pos: milestones.length });
+      } else if (tok.type === 'e') { milestones.pop(); }
+      else if (tok.type === 'w' && milestones.length > 0) {
+        const top = milestones[milestones.length - 1];
+        result[key].push({ eng: tok.word, heb: top.heb, heb_pos: top.heb_pos, strong: top.strong });
+      }
+    }
+  }
+
+  const json = JSON.stringify(result, null, 2);
+  if (output) {
+    const outPath = path.resolve(CSKILLBP_DIR, output);
+    fs.mkdirSync(path.dirname(outPath), { recursive: true });
+    fs.writeFileSync(outPath, json);
+    return `Extracted alignment data to ${outPath}`;
+  }
+  return json;
+}
+
+function fixHebrewQuotes({ book, chapter, hebrewUsfm }) {
+  let filePath;
+  if (hebrewUsfm) filePath = path.resolve(CSKILLBP_DIR, hebrewUsfm);
+  else {
+    const dir = path.join(CSKILLBP_DIR, 'data/hebrew_bible');
+    if (!fs.existsSync(dir)) return '[]';
+    const files = fs.readdirSync(dir).filter(f => f.toUpperCase().includes(book.toUpperCase()) && f.endsWith('.usfm'));
+    if (!files.length) return '[]';
+    filePath = path.join(dir, files[0]);
+  }
+  const content = fs.readFileSync(filePath, 'utf8');
+  const ch = parseInt(chapter, 10);
+  let inChapter = false, inSuper = false;
+  const words = [];
+  for (const line of content.split('\n')) {
+    const trimmed = line.trim();
+    const cm = trimmed.match(/^\\c\s+(\d+)/);
+    if (cm) { if (inChapter) break; inChapter = parseInt(cm[1], 10) === ch; continue; }
+    if (!inChapter) continue;
+    if (trimmed.startsWith('\\d')) { inSuper = true; continue; }
+    if ((trimmed.startsWith('\\v') || trimmed.startsWith('\\p')) && inSuper) break;
+    if (inSuper) {
+      const WRE = /\\w\s+([^|]+)\|([^\\]*?)\\w\*/g;
+      let m;
+      while ((m = WRE.exec(trimmed)) !== null) {
+        const sM = m[2].match(/strong="([^"]*)"/);
+        const lM = m[2].match(/lemma="([^"]*)"/);
+        words.push({ word: m[1].trim(), strong: sM ? sM[1] : '', lemma: lM ? lM[1] : '' });
+      }
+    }
+  }
+  return JSON.stringify(words);
+}
+
+function flagNarrowQuotes({ preparedJson }) {
+  const data = JSON.parse(fs.readFileSync(path.resolve(CSKILLBP_DIR, preparedJson), 'utf8'));
+  const PRONOUNS = new Set(['he','she','they','it','we','you','him','her','them','us','my','his','her','their','our','your','its','mine','hers','theirs','ours','yours','i','me','myself','himself','herself','itself','themselves','ourselves','yourself','yourselves']);
+  const NARROW = new Set(['figs-abstractnouns', 'figs-activepassive']);
+  const flagged = [];
+  for (const item of (data.items || [])) {
+    const q = (item.gl_quote || '').trim();
+    if (!q) continue;
+    const words = q.split(/\s+/);
+    let reason = null;
+    if (words.length === 1) {
+      if (PRONOUNS.has(words[0].toLowerCase())) reason = 'single pronoun';
+      else if (NARROW.has(item.sref)) reason = `single word with ${item.sref}`;
+      else reason = 'single non-pronoun word';
+    } else if (words.length === 2 && PRONOUNS.has(words[0].toLowerCase())) reason = 'two-word quote starting with pronoun';
+    if (reason) flagged.push(`${item.id}  ${item.reference}  [${item.sref}]\n  gl_quote: ${q}\n  reason: ${reason}`);
+  }
+  return flagged.length ? `${flagged.length} narrow quote(s) flagged:\n\n${flagged.join('\n\n')}` : 'No narrow quotes flagged';
+}
+
+async function generateIds({ book, count }) {
+  const upstreamIds = new Set();
+  try {
+    const url = `https://git.door43.org/unfoldingWord/en_tn/raw/branch/master/tn_${book.toUpperCase()}.tsv`;
+    const content = await httpsGet(url);
+    for (const line of content.split('\n')) {
+      const cols = line.split('\t');
+      if (cols.length > 1 && /^[a-z][a-z0-9]{3}$/.test(cols[1])) upstreamIds.add(cols[1]);
+    }
+  } catch { /* proceed */ }
+  const ids = [];
+  const chars = 'abcdefghijklmnopqrstuvwxyz0123456789';
+  const letters = 'abcdefghijklmnopqrstuvwxyz';
+  for (let i = 0; i < count; i++) {
+    let id, attempts = 0;
+    do {
+      id = letters[Math.floor(Math.random() * 26)];
+      for (let j = 0; j < 3; j++) id += chars[Math.floor(Math.random() * 36)];
+      attempts++;
+    } while ((upstreamIds.has(id) || ids.includes(id)) && attempts < 100);
+    if (attempts >= 100) { const h = crypto.createHash('md5').update(Date.now().toString() + i).digest('hex'); id = 'x' + h.slice(0, 3); }
+    ids.push(id);
+  }
+  return ids.join('\n');
+}
+
+function resolveGlQuotes({ preparedJson, alignmentJson, dryRun }) {
+  const data = JSON.parse(fs.readFileSync(path.resolve(CSKILLBP_DIR, preparedJson), 'utf8'));
+  const alignData = JSON.parse(fs.readFileSync(path.resolve(CSKILLBP_DIR, alignmentJson), 'utf8'));
+  const CANT = /[\u0591-\u05AF\u2060\u05BE]/g;
+  const PUNC = /[{},;:.!?'""\u2018\u2019\u201C\u201D\u2014\u2013]/g;
+  let updated = 0;
+  const log = [];
+  for (const item of (data.items || [])) {
+    if (!item.orig_quote) continue;
+    const entries = alignData[item.reference] || [];
+    if (!entries.length) continue;
+    const hebWords = item.orig_quote.split(/\s+/);
+    const matchedEng = [];
+    for (const hw of hebWords) {
+      const stripped = hw.replace(CANT, '');
+      const found = entries.find(e => e.heb === hw) || entries.find(e => e.heb.replace(CANT, '') === stripped);
+      if (found) matchedEng.push(found.eng);
+    }
+    if (!matchedEng.length) continue;
+    const ultTokens = (item.ult_verse || '').split(/\s+/);
+    const ultClean = ultTokens.map(t => t.replace(PUNC, '').toLowerCase());
+    const positions = [];
+    for (const eng of matchedEng) { const idx = ultClean.indexOf(eng.replace(PUNC, '').toLowerCase()); if (idx >= 0) positions.push(idx); }
+    if (!positions.length) continue;
+    let start = Math.min(...positions), end = Math.max(...positions);
+    while (start > 0 && ultTokens[start - 1].startsWith('{')) start--;
+    const span = ultTokens.slice(start, end + 1).join(' ');
+    if (span !== item.gl_quote) { log.push(`${item.reference}: "${item.gl_quote}" -> "${span}"`); if (!dryRun) item.gl_quote = span; updated++; }
+  }
+  if (!dryRun) fs.writeFileSync(path.resolve(CSKILLBP_DIR, preparedJson), JSON.stringify(data, null, 2));
+  log.unshift(`${dryRun ? '[DRY RUN] ' : ''}Updated ${updated} gl_quotes`);
+  return log.join('\n');
+}
+
+function verifyAtFit({ preparedJson, generatedJson }) {
+  const prepared = JSON.parse(fs.readFileSync(path.resolve(CSKILLBP_DIR, preparedJson), 'utf8'));
+  const generated = JSON.parse(fs.readFileSync(path.resolve(CSKILLBP_DIR, generatedJson), 'utf8'));
+  const itemById = {};
+  for (const item of (prepared.items || [])) itemById[item.id] = item;
+  const results = [], errors = [];
+  for (const [id, noteText] of Object.entries(generated)) {
+    const item = itemById[id];
+    if (!item) continue;
+    const atMatches = noteText.match(/\[([^\]]+)\]/g) || [];
+    for (const atRaw of atMatches) {
+      const at = atRaw.slice(1, -1);
+      const ult = item.ult_verse || '';
+      const glq = (item.gl_quote || '').replace(/\{[^}]*\}/g, '').trim();
+      let idx = ult.indexOf(glq);
+      if (idx < 0) idx = ult.toLowerCase().indexOf(glq.toLowerCase());
+      if (idx >= 0) { results.push(`${item.reference} (${id}) [${item.sref}]\n  [${at}]\n  -> ${(ult.slice(0, idx) + at + ult.slice(idx + glq.length)).slice(0, 150)}`); }
+      else errors.push(`${item.reference} (${id}): gl_quote "${glq}" not found in ULT`);
+    }
+  }
+  const lines = [`AT check: ${results.length} OK, ${errors.length} errors`];
+  if (errors.length) { lines.push('\nErrors:'); lines.push(...errors.slice(0, 10)); }
+  return lines.join('\n');
+}
+
+function assembleNotes({ preparedJson, generatedJson, output }) {
+  const prepared = JSON.parse(fs.readFileSync(path.resolve(CSKILLBP_DIR, preparedJson), 'utf8'));
+  const generated = JSON.parse(fs.readFileSync(path.resolve(CSKILLBP_DIR, generatedJson), 'utf8'));
+  const outPath = path.resolve(CSKILLBP_DIR, output);
+  function refKey(ref) {
+    const p = ref.split(':', 2);
+    if (p.length < 2) return [999999, 999999];
+    const ch = p[0] === 'front' ? -1 : parseInt(p[0], 10) || 999999;
+    const vs = p[1] === 'intro' ? -2 : p[1] === 'front' ? -1 : parseInt(p[1].split('-')[0], 10) || 999999;
+    return [ch, vs];
+  }
+  function intraKey(item) {
+    const ult = (item.ult_verse || '').toLowerCase();
+    const glq = (item.gl_quote || '').replace(/\{[^}]*\}/g, '').trim().toLowerCase();
+    if (!ult || !glq) return [9998, 0];
+    let pos = ult.indexOf(glq);
+    if (pos < 0) pos = 9999;
+    return [pos, -glq.length];
+  }
+  const rows = [];
+  const missing = [];
+  for (const item of (prepared.items || [])) {
+    const noteText = generated[item.id];
+    if (!noteText) { missing.push(item.id); continue; }
+    const quote = item.orig_quote || '';
+    const note = noteText.replace(/\.\.\./g, '\u2026');
+    const sref = item.sref ? `rc://*/ta/man/translate/${item.sref}` : '';
+    rows.push({ ref: item.reference, id: item.id, tags: '', sref, quote, occurrence: quote ? '1' : '', note, _rk: refKey(item.reference), _ik: intraKey(item) });
+  }
+  rows.sort((a, b) => { const r = a._rk[0] - b._rk[0] || a._rk[1] - b._rk[1]; return r !== 0 ? r : a._ik[0] - b._ik[0] || a._ik[1] - b._ik[1]; });
+  const lines = ['Reference\tID\tTags\tSupportReference\tQuote\tOccurrence\tNote'];
+  for (const intro of (prepared.intro_rows || [])) lines.push(intro.replace(/\r\n|\r|\n/g, '\\n'));
+  for (const row of rows) lines.push(`${row.ref}\t${row.id}\t${row.tags}\t${row.sref}\t${row.quote}\t${row.occurrence}\t${row.note}`);
+  fs.mkdirSync(path.dirname(outPath), { recursive: true });
+  fs.writeFileSync(outPath, lines.join('\n') + '\n');
+  const res = [`Assembled ${rows.length} notes to ${outPath}`];
+  if (missing.length) res.push(`Missing: ${missing.length}`);
+  res.push(outPath);
+  return res.join('\n');
+}
+
+function prepareNotes({ inputTsv, ultUsfm, ustUsfm, output, alignedUsfm, alignmentJson }) {
+  const inputPath = path.resolve(CSKILLBP_DIR, inputTsv);
+  const content = fs.readFileSync(inputPath, 'utf8');
+  const lines = content.split('\n').filter(l => l.trim());
+  const items = [];
+  const introRows = [];
+  for (const line of lines) {
+    const cols = line.split('\t');
+    if (cols[0].toLowerCase() === 'book') continue;
+    while (cols.length < 7) cols.push('');
+    const rawRef = cols[1] || cols[0];
+    if (rawRef.includes(':intro') || rawRef === 'intro') { introRows.push(line); continue; }
+    items.push({
+      index: items.length,
+      reference: rawRef.includes(':') ? rawRef : `${cols[0]}:${cols[1]}`,
+      sref: (cols[2] || '').replace(/^rc:\/\/\*\/ta\/man\/translate\//, ''),
+      gl_quote: cols[3] || '', needs_at: (cols[4] || '').toLowerCase() === 'yes' || cols[4] === '1',
+      at_provided: cols[5] || '', explanation: cols[6] || '',
+      id: '', orig_quote: '', ult_verse: '', ust_verse: '',
+      note_type: '', hebrew_front_words: [],
+    });
+  }
+  function parseVerses(fp) {
+    if (!fp) return {};
+    const full = path.resolve(CSKILLBP_DIR, fp);
+    if (!fs.existsSync(full)) return {};
+    const text = fs.readFileSync(full, 'utf8');
+    const verses = {};
+    let ch = 0;
+    for (const l of text.split('\n')) {
+      const cm = l.trim().match(/^\\c\s+(\d+)/);
+      if (cm) { ch = parseInt(cm[1], 10); continue; }
+      const vm = l.trim().match(/^\\v\s+(\d+[-\d]*)\s*(.*)/);
+      if (vm) {
+        let txt = vm[2] || '';
+        txt = txt.replace(/\\zaln-[se][^*]*\*/g, '').replace(/\\w\s+([^|]*?)\|[^\\]*?\\w\*/g, '$1')
+          .replace(/\\[a-z]+\d?\s+/g, ' ').replace(/\\[a-z]+\d?\*/g, '').replace(/\s+/g, ' ').trim();
+        verses[`${ch}:${vm[1].split('-')[0]}`] = txt;
+      }
+    }
+    return verses;
+  }
+  const ultV = parseVerses(ultUsfm);
+  const ustV = parseVerses(ustUsfm);
+  for (const item of items) {
+    item.ult_verse = ultV[item.reference] || '';
+    item.ust_verse = ustV[item.reference] || '';
+    item.note_type = item.at_provided ? 'given_at' : item.needs_at ? 'writes_at' : 'see_how';
+  }
+  const fnM = path.basename(inputPath).match(/([A-Z0-9]+)-(\d+)/i);
+  const result = { book: fnM ? fnM[1].toUpperCase() : '', chapter: fnM ? fnM[2] : '', source_file: inputTsv, item_count: items.length, items, intro_rows: introRows, alignment_data_path: alignmentJson || '' };
+  const outPath = path.resolve(CSKILLBP_DIR, output || '/tmp/claude/prepared_notes.json');
+  fs.mkdirSync(path.dirname(outPath), { recursive: true });
+  fs.writeFileSync(outPath, JSON.stringify(result, null, 2));
+  return `Prepared ${items.length} items\n${outPath}`;
+}
+
+module.exports = { extractAlignmentData, fixHebrewQuotes, flagNarrowQuotes, generateIds, resolveGlQuotes, verifyAtFit, assembleNotes, prepareNotes };

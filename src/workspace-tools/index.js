@@ -9,6 +9,11 @@ const {
 } = require('./fetch-tools');
 const { splitTsv, mergeTsvs, fixTrailingNewlines } = require('./tsv-tools');
 const { extractUltEnglish, filterPsalms, curlyQuotes, checkUstPassives } = require('./usfm-tools');
+const { buildStrongsIndex, buildTnIndex, buildUstIndex } = require('./index-tools');
+const { checkTwHeadwords, compareUltUst, detectAbstractNouns } = require('./issue-tools');
+const { extractAlignmentData, fixHebrewQuotes, flagNarrowQuotes, generateIds, resolveGlQuotes, verifyAtFit, assembleNotes, prepareNotes } = require('./tn-tools');
+const { validateTnTsv, checkTnQuality } = require('./quality-tools');
+const { giteaPr, prepareCompare, prepareTq, verifyTq } = require('./misc-tools');
 
 /**
  * Create the SDK MCP server config. Must be called after the SDK is loaded
@@ -196,6 +201,87 @@ function createWorkspaceTools(createSdkMcpServer, tool, z) {
           content: [{ type: 'text', text: checkUstPassives(args) }],
         })
       ),
+
+      // --- Index builders ---
+      tool('build_strongs_index', "Build Strong's concordance index from aligned ULT USFM", {
+        force: z.boolean().optional(), lookup: z.string().optional().describe("Strong's number to look up"), stats: z.boolean().optional(),
+      }, async (args) => ({ content: [{ type: 'text', text: await buildStrongsIndex(args) }] })),
+      tool('build_tn_index', 'Build translation notes index from published TN TSV files', {
+        force: z.boolean().optional(), lookup: z.string().optional().describe('Keyword to search'), issue: z.string().optional().describe('Issue type to query'), stats: z.boolean().optional(),
+      }, async (args) => ({ content: [{ type: 'text', text: await buildTnIndex(args) }] })),
+      tool('build_ust_index', 'Build UST concordance index from aligned UST USFM', {
+        force: z.boolean().optional(), lookup: z.string().optional(), stats: z.boolean().optional(),
+      }, async (args) => ({ content: [{ type: 'text', text: await buildUstIndex(args) }] })),
+
+      // --- Issue identification ---
+      tool('check_tw_headwords', 'Check terms against Translation Words headwords index', {
+        terms: z.array(z.string()).describe('Terms to check'),
+      }, async (args) => ({ content: [{ type: 'text', text: checkTwHeadwords(args) }] })),
+      tool('compare_ult_ust', 'Compare ULT and UST verse-by-verse to identify translation differences', {
+        ultFile: z.string().describe('ULT USFM path'), ustFile: z.string().describe('UST USFM path'),
+        chapter: z.number().int().optional(), format: z.enum(['tsv', 'json']).optional(),
+      }, async (args) => ({ content: [{ type: 'text', text: compareUltUst(args) }] })),
+      tool('detect_abstract_nouns', 'Detect abstract nouns in alignment data or text', {
+        alignmentJson: z.string().optional().describe('Alignment JSON path'), text: z.string().optional().describe('Text to check'),
+        format: z.enum(['json', 'tsv']).optional(),
+      }, async (args) => ({ content: [{ type: 'text', text: detectAbstractNouns(args) }] })),
+
+      // --- TN writer pipeline ---
+      tool('extract_alignment_data', 'Extract word-level alignment data from aligned USFM', {
+        alignedUsfm: z.string().describe('Aligned USFM file path'), output: z.string().optional().describe('Output JSON path'),
+      }, async (args) => ({ content: [{ type: 'text', text: extractAlignmentData(args) }] })),
+      tool('fix_hebrew_quotes', 'Extract Hebrew superscription words for a chapter', {
+        book: z.string().describe('Book code'), chapter: z.string().describe('Chapter number'), hebrewUsfm: z.string().optional(),
+      }, async (args) => ({ content: [{ type: 'text', text: fixHebrewQuotes(args) }] })),
+      tool('flag_narrow_quotes', 'Flag gl_quotes that are too narrow for AT substitution', {
+        preparedJson: z.string().describe('Prepared notes JSON path'),
+      }, async (args) => ({ content: [{ type: 'text', text: flagNarrowQuotes(args) }] })),
+      tool('generate_ids', 'Generate unique 4-char TN IDs avoiding upstream collisions', {
+        book: z.string().describe('Book code'), count: z.number().int().describe('Number of IDs'),
+      }, async (args) => ({ content: [{ type: 'text', text: await generateIds(args) }] })),
+      tool('resolve_gl_quotes', 'Resolve gl_quotes using alignment data to find ULT spans', {
+        preparedJson: z.string().describe('Prepared notes JSON path'), alignmentJson: z.string().describe('Alignment data JSON path'),
+        dryRun: z.boolean().optional(),
+      }, async (args) => ({ content: [{ type: 'text', text: resolveGlQuotes(args) }] })),
+      tool('verify_at_fit', 'Verify AT substitutions fit correctly in ULT verses', {
+        preparedJson: z.string().describe('Prepared notes JSON'), generatedJson: z.string().describe('Generated notes JSON'),
+      }, async (args) => ({ content: [{ type: 'text', text: verifyAtFit(args) }] })),
+      tool('assemble_notes', 'Assemble generated notes into final TN TSV format', {
+        preparedJson: z.string().describe('Prepared notes JSON'), generatedJson: z.string().describe('Generated notes JSON'),
+        output: z.string().describe('Output TSV path'),
+      }, async (args) => ({ content: [{ type: 'text', text: assembleNotes(args) }] })),
+      tool('prepare_notes', 'Prepare issue TSV into structured JSON for note generation', {
+        inputTsv: z.string().describe('Issue TSV path'), ultUsfm: z.string().optional(), ustUsfm: z.string().optional(),
+        output: z.string().optional(), alignedUsfm: z.string().optional(), alignmentJson: z.string().optional(),
+      }, async (args) => ({ content: [{ type: 'text', text: prepareNotes(args) }] })),
+
+      // --- Quality checks ---
+      tool('validate_tn_tsv', 'Validate TN TSV against Door43 CI rules (checks 3-13)', {
+        file: z.string().describe('TSV file path'), checks: z.array(z.number()).optional().describe('Check numbers to run'),
+        maxErrors: z.number().optional(),
+      }, async (args) => ({ content: [{ type: 'text', text: validateTnTsv(args) }] })),
+      tool('check_tn_quality', 'Run semantic quality checks on generated translation notes', {
+        tsvPath: z.string().describe('Notes TSV path'), preparedJson: z.string().optional(), ultUsfm: z.string().optional(),
+        ustUsfm: z.string().optional(), book: z.string().optional(), hebrewUsfm: z.string().optional(), output: z.string().optional(),
+      }, async (args) => ({ content: [{ type: 'text', text: checkTnQuality(args) }] })),
+
+      // --- Misc tools ---
+      tool('gitea_pr', 'Create (and optionally merge) a PR on Door43 Gitea', {
+        repo: z.string().describe('Repo name (en_tn, en_ult, en_ust)'), head: z.string().describe('Source branch'),
+        base: z.string().describe('Target branch'), title: z.string().describe('PR title'),
+        body: z.string().optional(), merge: z.boolean().optional(), noDelete: z.boolean().optional(), ensureBase: z.boolean().optional(),
+      }, async (args) => ({ content: [{ type: 'text', text: await giteaPr(args) }] })),
+      tool('prepare_compare', 'Prepare AI vs editor verse-by-verse comparison data', {
+        book: z.string().describe('Book code'), chapter: z.number().int().describe('Chapter number'),
+        type: z.enum(['ult', 'ust']).optional(), editorUsfm: z.string().optional(), output: z.string().optional(),
+      }, async (args) => ({ content: [{ type: 'text', text: prepareCompare(args) }] })),
+      tool('prepare_tq', 'Prepare translation questions data for a book/chapter', {
+        book: z.string().describe('Book code'), chapter: z.number().int().optional(), wholeBook: z.boolean().optional(),
+        tqRepo: z.string().optional(), ultPath: z.string().optional(), ustPath: z.string().optional(), output: z.string().optional(),
+      }, async (args) => ({ content: [{ type: 'text', text: prepareTq(args) }] })),
+      tool('verify_tq', 'Verify translation questions TSV format and content', {
+        tsvFile: z.string().describe('TQ TSV file path'), inputJson: z.string().optional(),
+      }, async (args) => ({ content: [{ type: 'text', text: verifyTq(args) }] })),
     ],
   });
 }
