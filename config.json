@@ -26,7 +26,7 @@
       "match": "/generate\\s+(\\w+)\\s+(\\d+)(?:\\s*[-–—to]+\\s*(\\d+))?/i",
       "type": "sdk",
       "skill": "initial-pipeline --lite",
-      "pipeline": "./pipelines/generate.sh",
+
       "reply": false,
       "confirmMessage": "I'll generate the initial content (ULT & UST, issues draft) for **$1 $2**. Sound right? (yes/no)",
       "operations": 3,

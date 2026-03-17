@@ -35,7 +35,7 @@ COPY . .
 # The workspace (skills-BP) is mounted as a volume at /workspace
 # The config (.env, config.json overrides) is mounted at /config
 
-# generate.sh resolves workspace as ../../cSkillBP relative to /app/pipelines/
+# pipeline-utils.js resolves CSKILLBP_DIR as ../../cSkillBP relative to /app/src/
 # That resolves to /cSkillBP — symlink it to the mounted workspace
 RUN ln -s /workspace /cSkillBP
 
