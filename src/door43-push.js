@@ -10,13 +10,13 @@ const https = require('https');
 const git = require('isomorphic-git');
 const gitHttp = require('isomorphic-git/http/node');
 const { getVerseCount } = require('./verse-counts');
+const { insertTnRows } = require('./lib/insert-tn-rows');
+const { insertUsfmVerses } = require('./lib/insert-usfm-verses');
 
 const GITEA_API = 'https://git.door43.org/api/v1';
 const ORG = 'unfoldingWord';
 
 const CSKILLBP_DIR = process.env.CSKILLBP_DIR || '/srv/bot/workspace';
-const SCRIPTS_DIR = path.join(CSKILLBP_DIR, '.claude/skills/repo-insert/scripts');
-
 // Repo name for each content type
 const REPO_MAP = { tn: 'en_tn', ult: 'en_ult', ust: 'en_ust' };
 
@@ -358,40 +358,34 @@ function insertContent({ type, book, chapter, source, verses, repoDir, repoFilen
   }
 
   if (type === 'tn') {
-    const script = path.join(SCRIPTS_DIR, 'insert_tn_rows.py');
     console.log(`${LOG_PREFIX} Inserting TN rows: ${source} → ${repoFilename}`);
-    const args = [
-      script,
-      '--book-file', bookFilePath,
-      '--source-file', sourcePath,
-      '--chapter', String(chapter),
-      '--backup',
-    ];
-    if (book.toUpperCase() === 'PSA') args.push('--skip-intro');
-    // Pass English ULT for intra-verse ordering of KEEP-tagged notes
+    let ultFile;
     const bookNum = BOOK_NUMBERS[book.toUpperCase()];
     if (bookNum) {
-      const ultFile = path.join(CSKILLBP_DIR, 'data', 'published_ult_english',
-                                `${bookNum}-${book.toUpperCase()}.usfm`);
-      if (fs.existsSync(ultFile)) {
-        args.push('--ult-file', ultFile);
-      }
+      const candidate = path.join(CSKILLBP_DIR, 'data', 'published_ult_english',
+                                  `${bookNum}-${book.toUpperCase()}.usfm`);
+      if (fs.existsSync(candidate)) ultFile = candidate;
     }
-    const output = execFileSync('python3', args, { encoding: 'utf8', timeout: 60000, cwd: CSKILLBP_DIR });
+    const output = insertTnRows({
+      bookFile: bookFilePath,
+      sourceFile: sourcePath,
+      chapter,
+      skipIntro: book.toUpperCase() === 'PSA',
+      ultFile,
+      backup: true,
+    });
     if (output.trim()) console.log(`${LOG_PREFIX} insert_tn_rows: ${output.trim()}`);
   } else {
     // ULT or UST
-    const script = path.join(SCRIPTS_DIR, 'insert_usfm_verses.py');
     const verseRange = verses || `1-${getVerseCount(book, chapter)}`;
     console.log(`${LOG_PREFIX} Inserting ${type.toUpperCase()} verses ${verseRange} for ${book} ${chapter}: ${source} → ${repoFilename}`);
-    const output = execFileSync('python3', [
-      script,
-      '--book-file', bookFilePath,
-      '--source-file', sourcePath,
-      '--chapter', String(chapter),
-      '--verses', verseRange,
-      '--backup',
-    ], { encoding: 'utf8', timeout: 60000, cwd: CSKILLBP_DIR });
+    const output = insertUsfmVerses({
+      bookFile: bookFilePath,
+      sourceFile: sourcePath,
+      chapter,
+      verses: verseRange,
+      backup: true,
+    });
     if (output.trim()) console.log(`${LOG_PREFIX} insert_usfm_verses: ${output.trim()}`);
   }
 }
