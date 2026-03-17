@@ -3,10 +3,12 @@
 // Calls Python insertion scripts directly, then runs git + Gitea API operations
 // with retry logic. No AI layer — fully deterministic, structured success/failure.
 
-const { execSync, execFileSync } = require('child_process');
+const { execFileSync } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 const https = require('https');
+const git = require('isomorphic-git');
+const gitHttp = require('isomorphic-git/http/node');
 const { getVerseCount } = require('./verse-counts');
 
 const GITEA_API = 'https://git.door43.org/api/v1';
@@ -57,6 +59,23 @@ async function withRetry(fn, { maxAttempts = 3, baseDelayMs = 2000, label = '' }
     }
   }
   throw lastErr;
+}
+
+// ---------------------------------------------------------------------------
+// isomorphic-git helpers
+// ---------------------------------------------------------------------------
+
+function makeOnAuth(token) {
+  return () => ({ username: token, password: '' });
+}
+
+function withTimeout(promise, ms, label) {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) =>
+      setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms)
+    ),
+  ]);
 }
 
 // ---------------------------------------------------------------------------
@@ -276,51 +295,50 @@ function getRepoFilename(type, book) {
 // syncRepo — clone if needed, create fresh branch from origin/{baseBranch}
 // ---------------------------------------------------------------------------
 
-function syncRepo(repoDir, repoName, branch, baseBranch = 'master') {
+async function syncRepo(repoDir, repoName, branch, baseBranch = 'master') {
   const repoUrl = `https://git.door43.org/${ORG}/${repoName}.git`;
+  const { token } = getConfig();
+  const onAuth = token ? makeOnAuth(token) : undefined;
 
   // Clone if missing
   if (!fs.existsSync(path.join(repoDir, '.git'))) {
     console.log(`${LOG_PREFIX} Cloning ${repoName} into ${repoDir}...`);
     fs.mkdirSync(path.dirname(repoDir), { recursive: true });
-    execSync(`git clone ${repoUrl} ${repoDir}`, { timeout: 120000, stdio: 'pipe' });
+    await withTimeout(
+      git.clone({ fs, http: gitHttp, dir: repoDir, url: repoUrl, singleBranch: false }),
+      120000, `clone ${repoName}`
+    );
   }
 
   // Verify remote URL points to unfoldingWord
-  try {
-    const remoteUrl = execSync('git remote get-url origin', { cwd: repoDir, encoding: 'utf8', timeout: 5000 }).trim();
-    if (!remoteUrl.includes('unfoldingWord') && !remoteUrl.includes('door43.org')) {
-      throw new Error(`Remote URL does not point to unfoldingWord: ${remoteUrl}`);
-    }
-  } catch (err) {
-    if (err.message.includes('Remote URL')) throw err;
-    // If remote check fails, set it
-    execSync(`git remote set-url origin ${repoUrl}`, { cwd: repoDir, timeout: 5000, stdio: 'pipe' });
+  const remoteUrl = await git.getConfig({ fs, dir: repoDir, path: 'remote.origin.url' });
+  if (remoteUrl && !remoteUrl.includes('unfoldingWord') && !remoteUrl.includes('door43.org')) {
+    throw new Error(`Remote URL does not point to unfoldingWord: ${remoteUrl}`);
   }
+  // Ensure remote URL is set correctly (clean URL — auth via onAuth callback, not embedded)
+  await git.setConfig({ fs, dir: repoDir, path: 'remote.origin.url', value: repoUrl });
 
-  // Update token in remote URL for authenticated push
-  const { token } = getConfig();
-  if (token) {
-    const authUrl = `https://${token}@git.door43.org/${ORG}/${repoName}.git`;
-    execSync(`git remote set-url origin ${authUrl}`, { cwd: repoDir, timeout: 5000, stdio: 'pipe' });
-  }
-
-  // Ensure git identity is configured (prevents "Author identity unknown" errors)
-  execFileSync('git', ['config', 'user.email', 'bot@unfoldingword.org'], { cwd: repoDir, timeout: 5000, stdio: 'pipe' });
-  execFileSync('git', ['config', 'user.name', 'BW Bot'], { cwd: repoDir, timeout: 5000, stdio: 'pipe' });
+  // Set git identity
+  await git.setConfig({ fs, dir: repoDir, path: 'user.email', value: 'bot@unfoldingword.org' });
+  await git.setConfig({ fs, dir: repoDir, path: 'user.name', value: 'BW Bot' });
 
   // Fetch latest
   console.log(`${LOG_PREFIX} Fetching origin for ${repoName}...`);
-  execSync('git fetch origin', { cwd: repoDir, timeout: 60000, stdio: 'pipe' });
+  await withTimeout(
+    git.fetch({ fs, http: gitHttp, dir: repoDir, remote: 'origin', onAuth }),
+    60000, `fetch ${repoName}`
+  );
 
-  // Detach HEAD, delete local branch if it exists, create fresh from origin/{baseBranch}
-  execSync('git checkout --detach', { cwd: repoDir, timeout: 10000, stdio: 'pipe' });
+  // Delete local branch if it exists (ignore errors if it doesn't)
   try {
-    execFileSync('git', ['branch', '-D', branch], { cwd: repoDir, timeout: 5000, stdio: 'pipe' });
+    await git.deleteBranch({ fs, dir: repoDir, ref: branch });
   } catch {
     // Branch didn't exist locally — fine
   }
-  execFileSync('git', ['checkout', '-b', branch, `origin/${baseBranch}`], { cwd: repoDir, timeout: 10000, stdio: 'pipe' });
+
+  // Create fresh branch from origin/{baseBranch} and check it out
+  await git.branch({ fs, dir: repoDir, ref: branch, object: `origin/${baseBranch}` });
+  await git.checkout({ fs, dir: repoDir, ref: branch });
   console.log(`${LOG_PREFIX} On branch ${branch} (from origin/${baseBranch}) in ${repoDir}`);
 }
 
@@ -383,25 +401,36 @@ function insertContent({ type, book, chapter, source, verses, repoDir, repoFilen
 // ---------------------------------------------------------------------------
 
 async function commitAndPush(repoDir, branch, filename, commitMsg) {
-  execSync(`git add ${filename}`, { cwd: repoDir, timeout: 10000, stdio: 'pipe' });
+  const { token } = getConfig();
+  const onAuth = token ? makeOnAuth(token) : undefined;
+
+  // Stage the file
+  await git.add({ fs, dir: repoDir, filepath: filename });
 
   // Check if there are actually changes to commit
-  try {
-    execSync('git diff --cached --quiet', { cwd: repoDir, timeout: 5000, stdio: 'pipe' });
-    // No error = no changes
+  const matrix = await git.statusMatrix({ fs, dir: repoDir, filepaths: [filename] });
+  // statusMatrix returns [filepath, HEAD, WORKDIR, STAGE]
+  // If HEAD === STAGE for all files, there are no staged changes
+  const hasChanges = matrix.some(([, head, , stage]) => head !== stage);
+
+  if (!hasChanges) {
     console.warn(`${LOG_PREFIX} No changes to commit for ${filename} — content may already match master`);
     return { noChanges: true };
-  } catch {
-    // Has changes — proceed with commit
   }
 
-  execSync(`git commit -m "${commitMsg.replace(/"/g, '\\"')}"`, { cwd: repoDir, timeout: 10000, stdio: 'pipe' });
+  // Commit
+  await git.commit({
+    fs, dir: repoDir,
+    message: commitMsg,
+    author: { name: 'BW Bot', email: 'bot@unfoldingword.org' },
+  });
 
   // Push with retry
   await withRetry(
-    () => {
-      execSync(`git push origin ${branch}`, { cwd: repoDir, timeout: 60000, stdio: 'pipe' });
-    },
+    () => withTimeout(
+      git.push({ fs, http: gitHttp, dir: repoDir, remote: 'origin', ref: branch, onAuth }),
+      60000, `push ${branch}`
+    ),
     { maxAttempts: 3, baseDelayMs: 2000, label: `push ${branch}` }
   );
 
@@ -546,7 +575,7 @@ async function door43Push(opts) {
 
   try {
     // Step 1: Sync repo (clone/fetch, create staging branch from master)
-    syncRepo(repoDir, repo, branch);
+    await syncRepo(repoDir, repo, branch);
 
     // Step 3: Insert content via Python script
     insertContent({ type, book, chapter, source, verses, repoDir, repoFilename });
@@ -605,7 +634,7 @@ async function door43Push(opts) {
             ).join('\n');
             let details = `Door43 CI validation failed for ${repoFilename} — ${ourErrors.length} error(s) in chapter ${chapter}:\n${errorSummary}`;
             if (ourErrors.length > 10) details += `\n  ... and ${ourErrors.length - 10} more`;
-            execFileSync('git', ['checkout', '--', repoFilename], { cwd: repoDir, timeout: 5000, stdio: 'pipe' });
+            await git.checkout({ fs, dir: repoDir, filepaths: [repoFilename], force: true });
             console.error(`${LOG_PREFIX} ${details}`);
             throw new Error(details);
           }
