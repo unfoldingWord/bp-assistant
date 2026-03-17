@@ -13,6 +13,47 @@ async function getQuery() {
   return _query;
 }
 
+const TRANSIENT_RETRY_WINDOW_MS = 10 * 60 * 1000;
+const RETRY_BASE_DELAY_MS = 3000;
+const RETRY_MAX_DELAY_MS = 30000;
+
+function isUsageLimitError(text) {
+  return /hit your limit|usage limit|rate limit|too many requests|429/i.test(String(text || ''));
+}
+
+function isTransientDowntimeError(text) {
+  const t = String(text || '').toLowerCase();
+  if (!t || isUsageLimitError(t)) return false;
+  return (
+    t.includes('internal server error') ||
+    t.includes('api error: 500') ||
+    t.includes('api_error') ||
+    t.includes('http 500') ||
+    t.includes('http 502') ||
+    t.includes('http 503') ||
+    t.includes('http 504') ||
+    t.includes('service unavailable') ||
+    t.includes('temporarily unavailable') ||
+    t.includes('gateway timeout') ||
+    t.includes('bad gateway') ||
+    t.includes('overloaded') ||
+    t.includes('connection reset') ||
+    t.includes('socket hang up') ||
+    t.includes('econnreset') ||
+    t.includes('etimedout')
+  );
+}
+
+function backoffDelayMs(attempt) {
+  const exp = Math.min(RETRY_MAX_DELAY_MS, RETRY_BASE_DELAY_MS * Math.pow(2, Math.max(0, attempt - 1)));
+  const jitter = Math.floor(Math.random() * 1000);
+  return exp + jitter;
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 const SYSTEM_PROMPT = `You classify Zulip messages about Bible translation work.
 Extract the intent and parameters as JSON. Valid intents:
 - "generate": user wants ULT and/or UST generated for chapters
@@ -43,40 +84,63 @@ Respond ONLY with valid JSON, no other text: {"intent":"...","book":"...","start
  * @returns {Promise<{intent: string, book: string, startChapter: number, endChapter: number, contentTypes: string[]}>}
  */
 async function classifyIntent(messageContent) {
-  await ensureFreshToken();
-  const queryFn = await getQuery();
-
-  const abortController = new AbortController();
-  const timer = setTimeout(() => abortController.abort(), 30000);
-
-  const options = {
-    cwd: process.cwd(),
-    abortController,
-    maxTurns: 1,
-    allowedTools: [],
-    permissionMode: 'bypassPermissions',
-    allowDangerouslySkipPermissions: true,
-    persistSession: false,
-    model: 'haiku',
-    systemPrompt: SYSTEM_PROMPT,
-  };
-
-  const prompt = `Classify this message and respond with JSON only:\n\n${messageContent}`;
-  const conversation = queryFn({ prompt, options });
-
+  const startedAt = Date.now();
+  let attempt = 0;
   let replyText = '';
-  try {
-    for await (const event of conversation) {
-      if (abortController.signal.aborted) break;
-      if (event.type === 'assistant' && event.message?.content) {
-        for (const block of event.message.content) {
-          if (block && typeof block.text === 'string') replyText += block.text;
+
+  while (true) {
+    attempt++;
+    await ensureFreshToken();
+    const queryFn = await getQuery();
+
+    const abortController = new AbortController();
+    const timer = setTimeout(() => abortController.abort(), 30000);
+
+    const options = {
+      cwd: process.cwd(),
+      abortController,
+      maxTurns: 1,
+      allowedTools: [],
+      permissionMode: 'bypassPermissions',
+      allowDangerouslySkipPermissions: true,
+      persistSession: false,
+      model: 'haiku',
+      systemPrompt: SYSTEM_PROMPT,
+    };
+
+    const prompt = `Classify this message and respond with JSON only:\n\n${messageContent}`;
+    const conversation = queryFn({ prompt, options });
+    replyText = '';
+
+    try {
+      for await (const event of conversation) {
+        if (abortController.signal.aborted) break;
+        if (event.type === 'assistant' && event.message?.content) {
+          for (const block of event.message.content) {
+            if (block && typeof block.text === 'string') replyText += block.text;
+          }
         }
       }
+      break;
+    } catch (err) {
+      const errText = err?.message || String(err);
+      const elapsed = Date.now() - startedAt;
+      if (isTransientDowntimeError(errText) && elapsed < TRANSIENT_RETRY_WINDOW_MS) {
+        const delay = backoffDelayMs(attempt);
+        console.warn(`[intent-classifier] Transient SDK error, retrying in ${Math.round(delay / 1000)}s (attempt ${attempt}): ${errText.slice(0, 200)}`);
+        await sleep(delay);
+        continue;
+      }
+      if (isTransientDowntimeError(errText) && elapsed >= TRANSIENT_RETRY_WINDOW_MS) {
+        const outageErr = new Error('Claude is temporarily down after retry attempts');
+        outageErr.name = 'ClaudeTransientOutageError';
+        throw outageErr;
+      }
+      throw err;
+    } finally {
+      clearTimeout(timer);
+      try { conversation.close(); } catch (_) {}
     }
-  } finally {
-    clearTimeout(timer);
-    try { conversation.close(); } catch (_) {}
   }
 
   // Extract JSON from response (may be wrapped in markdown code fences)

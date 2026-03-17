@@ -1,13 +1,16 @@
 const config = require('./config');
 const { runPipeline } = require('./pipeline-runner');
-const { sendMessage, addReaction, removeReaction } = require('./zulip-client');
+const { sendMessage, sendDM, addReaction, removeReaction } = require('./zulip-client');
 const { getSession, clearSession, hasActiveStreamSession } = require('./session-store');
 const { getTotalVerses } = require('./verse-counts');
 const { classifyIntent } = require('./intent-classifier');
 const { preflightCheck, estimateTokens } = require('./usage-tracker');
 const { getPendingMerge, clearPendingMerge } = require('./pending-merges');
+const { getCheckpoint } = require('./pipeline-checkpoints');
+const { listCheckpoints } = require('./pipeline-checkpoints');
 const { resumeInsertion } = require('./insertion-resume');
 const { normalizeBookName, isValidBook } = require('./pipeline-utils');
+const { isTransientOutageError } = require('./claude-runner');
 
 // In-memory pending confirmations for stream messages
 const pendingConfirmations = new Map();
@@ -15,7 +18,7 @@ const pendingConfirmations = new Map();
 // TEMPORARY TEST LOCK:
 // Restrict bot interactions to admin user during branch validation.
 // Flip to false (or remove) after testing is complete.
-const TEMP_SINGLE_USER_TEST_MODE = true;
+const TEMP_SINGLE_USER_TEST_MODE = false;
 const TEMP_TEST_LOCK_REPLY = 'I am temporarily in maintenance/testing mode for about an hour while we validate an update. Please retry shortly.';
 
 /**
@@ -231,6 +234,35 @@ function getPipelineType(route) {
   return null;
 }
 
+function getResumeCheckpoint(route, sessionKey, captures) {
+  const pipelineType = getPipelineType(route);
+  if (!pipelineType) return null;
+  const parsed = route._synthetic
+    ? {
+        book: route._book,
+        chapters: [route._startChapter, route._endChapter].filter((n) => Number.isFinite(n)),
+        verseStart: null,
+        verseEnd: null,
+      }
+    : parseBookChapters(captures || []);
+  if (!parsed.book || !parsed.chapters || parsed.chapters.length === 0) return null;
+  const startChapter = Math.min(...parsed.chapters);
+  const endChapter = Math.max(...parsed.chapters);
+  const checkpoint = getCheckpoint({
+    sessionKey,
+    pipelineType,
+    scope: {
+      book: parsed.book,
+      startChapter,
+      endChapter,
+      verseStart: parsed.verseStart ?? null,
+      verseEnd: parsed.verseEnd ?? null,
+    },
+  });
+  if (checkpoint?.state !== 'paused_for_outage') return null;
+  return checkpoint;
+}
+
 /**
  * Build an enriched confirmation message with token/time estimates.
  */
@@ -242,6 +274,23 @@ function buildEstimateLabel(estimate, book, startCh, endCh, verseStart, verseEnd
     totalVerses = verseEnd - verseStart + 1;
   }
   return `(${chCount} ch, ~${totalVerses} verses). Est: ~${estimate.estimatedMinutes} min`;
+}
+
+function isResumeStatusCommand(content) {
+  const t = String(content || '').trim().toLowerCase();
+  return t === 'status resume' || t === 'resume status' || t === 'operator status';
+}
+
+function formatCheckpointScope(cp) {
+  const scope = cp?.scope || {};
+  const book = scope.book || '?';
+  const s = scope.startChapter;
+  const e = scope.endChapter;
+  const vs = scope.verseStart;
+  const ve = scope.verseEnd;
+  if (vs != null && ve != null && s === e) return `${book} ${s}:${vs}-${ve}`;
+  if (s === e) return `${book} ${s}`;
+  return `${book} ${s}-${e}`;
 }
 
 function matchRoute(content) {
@@ -437,6 +486,25 @@ async function routeMessage(message) {
       console.log(`[router] Ignoring DM from unauthorized user ${message.sender_id} (${message.sender_full_name})`);
       return;
     }
+    if (isResumeStatusCommand(message.content)) {
+      const paused = listCheckpoints()
+        .filter((cp) => cp && cp.state === 'paused_for_outage')
+        .sort((a, b) => String(b.updatedAt || '').localeCompare(String(a.updatedAt || '')));
+      if (paused.length === 0) {
+        await sendDM(message.sender_id, 'No paused outage checkpoints found.');
+        return;
+      }
+      const lines = paused.slice(0, 25).map((cp, idx) => {
+        const skill = cp?.resume?.skill || cp?.current?.skill || 'unknown-skill';
+        const chapter = cp?.resume?.chapter || cp?.current?.chapter || '?';
+        return `${idx + 1}. ${cp.pipelineType} | ${formatCheckpointScope(cp)} | resume ${chapter} (${skill}) | updated ${cp.updatedAt || 'unknown'}`;
+      });
+      await sendDM(
+        message.sender_id,
+        `Paused outage checkpoints (${paused.length}):\n${lines.join('\n')}`
+      );
+      return;
+    }
   } else {
     if (!isAuthorized) {
       console.log(`[router] Unauthorized stream mention from ${message.sender_id} (${message.sender_full_name})`);
@@ -608,6 +676,11 @@ async function routeMessage(message) {
 
         }
       }
+      const resumeCheckpoint = getResumeCheckpoint(activeRoute, sessionKey, captures);
+      if (resumeCheckpoint?.resume?.chapter) {
+        const resumeSkill = resumeCheckpoint.resume.skill ? ` (${resumeCheckpoint.resume.skill})` : '';
+        confirmText += `\n\nI found paused progress and will resume from **${resumeCheckpoint.scope.book} ${resumeCheckpoint.resume.chapter}**${resumeSkill} after you confirm.`;
+      }
 
       pendingConfirmations.set(sessionKey, { route: activeRoute, message, timeoutMs });
       console.log(`[router] Awaiting confirmation for "${activeRoute.name}" in ${sessionKey}`);
@@ -681,6 +754,11 @@ async function routeMessage(message) {
               confirmText += `\n\n**Warning:** ${preflight.reason}`;
             }
           }
+          const resumeCheckpoint = getResumeCheckpoint(syntheticRoute, sessionKey, captures);
+          if (resumeCheckpoint?.resume?.chapter) {
+            const resumeSkill = resumeCheckpoint.resume.skill ? ` (${resumeCheckpoint.resume.skill})` : '';
+            confirmText += `\n\nI found paused progress and will resume from **${resumeCheckpoint.scope.book} ${resumeCheckpoint.resume.chapter}**${resumeSkill} after you confirm.`;
+          }
 
           pendingConfirmations.set(sessionKey, { route: syntheticRoute, message, timeoutMs });
           console.log(`[router] Haiku → awaiting confirmation for synthetic "${syntheticRoute.name}" in ${sessionKey}`);
@@ -691,6 +769,10 @@ async function routeMessage(message) {
       }
     } catch (err) {
       console.error(`[router] Haiku classification failed: ${err.message}`);
+      if (isTransientOutageError(err)) {
+        await sendMessage(message.display_recipient, message.subject, `@**${message.sender_full_name}** Claude is temporarily down, you'll need to re-trigger.`);
+        return;
+      }
     }
 
     if (!haikuMatched) {

@@ -46,6 +46,18 @@ const DEFAULT_RESTRICTED_TOOLS = [
   'NotebookEdit', 'WebFetch', 'WebSearch',
 ];
 
+const TRANSIENT_RETRY_WINDOW_MS = 10 * 60 * 1000;
+const RETRY_BASE_DELAY_MS = 5000;
+const RETRY_MAX_DELAY_MS = 60000;
+
+class ClaudeTransientOutageError extends Error {
+  constructor(message, details = {}) {
+    super(message);
+    this.name = 'ClaudeTransientOutageError';
+    this.details = details;
+  }
+}
+
 function buildOptions({
   cwd,
   resume,
@@ -98,7 +110,7 @@ function buildOptions({
   return options;
 }
 
-async function runClaude({
+async function runClaudeOnce({
   prompt,
   cwd,
   model,
@@ -220,6 +232,99 @@ async function runClaude({
   return result;
 }
 
+function isUsageCapMessage(text) {
+  return /hit your limit|resets?\s+\d{1,2}(?::\d{2})?\s*(am|pm)\s*\(utc\)/i.test(String(text || ''));
+}
+
+function isTransientSdkMessage(text) {
+  const t = String(text || '').toLowerCase();
+  if (!t) return false;
+  if (isUsageCapMessage(t)) return false;
+  return (
+    t.includes('internal server error') ||
+    t.includes('api error: 500') ||
+    t.includes('api_error') ||
+    t.includes('http 500') ||
+    t.includes('http 502') ||
+    t.includes('http 503') ||
+    t.includes('http 504') ||
+    t.includes('service unavailable') ||
+    t.includes('temporarily unavailable') ||
+    t.includes('gateway timeout') ||
+    t.includes('bad gateway') ||
+    t.includes('overloaded') ||
+    t.includes('connection reset') ||
+    t.includes('socket hang up') ||
+    t.includes('econnreset') ||
+    t.includes('etimedout')
+  );
+}
+
+function isTransientOutageError(err) {
+  if (!err) return false;
+  if (err.name === 'ClaudeTransientOutageError') return true;
+  return false;
+}
+
+function backoffDelayMs(attempt) {
+  const exp = Math.min(RETRY_MAX_DELAY_MS, RETRY_BASE_DELAY_MS * Math.pow(2, Math.max(0, attempt - 1)));
+  const jitter = Math.floor(Math.random() * 2000);
+  return exp + jitter;
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function runClaude(args) {
+  const startedAt = Date.now();
+  let attempt = 0;
+  let lastTransientMessage = '';
+
+  while (true) {
+    attempt++;
+    try {
+      const result = await runClaudeOnce(args);
+      if (result?.subtype === 'success') return result;
+
+      const resultMsg = `${result?.subtype || ''} ${result?.error || ''} ${result?.result || ''}`.trim();
+      const elapsed = Date.now() - startedAt;
+      if (isTransientSdkMessage(resultMsg) && elapsed < TRANSIENT_RETRY_WINDOW_MS) {
+        lastTransientMessage = resultMsg;
+        const delay = backoffDelayMs(attempt);
+        console.warn(`[claude-runner] Transient non-success result, retrying in ${Math.round(delay / 1000)}s (attempt ${attempt})`);
+        await sleep(delay);
+        continue;
+      }
+      if (isTransientSdkMessage(resultMsg) && elapsed >= TRANSIENT_RETRY_WINDOW_MS) {
+        throw new ClaudeTransientOutageError(
+          'Claude is temporarily down after retry attempts',
+          { elapsedMs: elapsed, attempts: attempt, lastMessage: resultMsg.slice(0, 500) || lastTransientMessage.slice(0, 500) }
+        );
+      }
+
+      return result;
+    } catch (err) {
+      const msg = err?.message || String(err);
+      const elapsed = Date.now() - startedAt;
+      if (isTransientSdkMessage(msg) && elapsed < TRANSIENT_RETRY_WINDOW_MS) {
+        lastTransientMessage = msg;
+        const delay = backoffDelayMs(attempt);
+        console.warn(`[claude-runner] Transient SDK error, retrying in ${Math.round(delay / 1000)}s (attempt ${attempt}): ${msg.slice(0, 200)}`);
+        await sleep(delay);
+        continue;
+      }
+      if (isTransientSdkMessage(msg) && elapsed >= TRANSIENT_RETRY_WINDOW_MS) {
+        throw new ClaudeTransientOutageError(
+          'Claude is temporarily down after retry attempts',
+          { elapsedMs: elapsed, attempts: attempt, lastMessage: msg.slice(0, 500) || lastTransientMessage.slice(0, 500) }
+        );
+      }
+      throw err;
+    }
+  }
+}
+
 /**
  * Start a resumable query and return the async generator so the caller can consume
  * events, capture session_id from the first message that has it, and collect assistant text.
@@ -284,4 +389,6 @@ module.exports = {
   buildOptions,
   getWorkspaceToolsServer,
   DEFAULT_RESTRICTED_TOOLS,
+  ClaudeTransientOutageError,
+  isTransientOutageError,
 };

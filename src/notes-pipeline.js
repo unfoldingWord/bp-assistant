@@ -11,13 +11,14 @@ const fs = require('fs');
 const path = require('path');
 const config = require('./config');
 const { sendMessage, sendDM, addReaction, removeReaction } = require('./zulip-client');
-const { runClaude, DEFAULT_RESTRICTED_TOOLS } = require('./claude-runner');
+const { runClaude, DEFAULT_RESTRICTED_TOOLS, isTransientOutageError } = require('./claude-runner');
 const { getDoor43Username, buildBranchName, resolveOutputFile, checkPrerequisites, calcSkillTimeout, normalizeBookName, resolveConflictMention, CSKILLBP_DIR } = require('./pipeline-utils');
 const { verifyRepoPush, verifyDcsToken } = require('./repo-verify');
 const { recordMetrics, getCumulativeTokens, recordRunSummary } = require('./usage-tracker');
 const { door43Push, checkConflictingBranches, REPO_MAP, getRepoFilename } = require('./door43-push');
 const { setPendingMerge } = require('./pending-merges');
 const { mergeTsvs } = require('./workspace-tools/tsv-tools');
+const { getCheckpoint, setCheckpoint, clearCheckpoint } = require('./pipeline-checkpoints');
 
 const LOG_DIR = path.resolve(__dirname, '../logs');
 
@@ -214,6 +215,13 @@ async function notesPipeline(route, message) {
   }
 
   const { book, startChapter, endChapter, verseStart, verseEnd, withIntro } = parsed;
+  const sessionKey = stream ? `stream-${stream}-${topic}` : `dm-${message.sender_id}`;
+  const checkpointRef = {
+    sessionKey,
+    pipelineType: 'notes',
+    scope: { book, startChapter, endChapter, verseStart: verseStart ?? null, verseEnd: verseEnd ?? null },
+  };
+  const existingCheckpoint = getCheckpoint(checkpointRef);
   const chapterCount = endChapter - startChapter + 1;
   const hasGlobalVerseRange = verseStart != null && verseEnd != null && startChapter === endChapter;
   const rangeLabel = hasGlobalVerseRange
@@ -240,8 +248,8 @@ async function notesPipeline(route, message) {
 
   const pipelineStart = Date.now();
   const tokensBefore = getCumulativeTokens();
-  let totalSuccess = 0;
-  let totalFail = 0;
+  let totalSuccess = Number(existingCheckpoint?.totalSuccess || 0);
+  let totalFail = Number(existingCheckpoint?.totalFail || 0);
 
   // Conflict-deferred push state: when a user branch modifies the same file,
   // we continue generating but defer all pushes until the user says "merged".
@@ -249,7 +257,24 @@ async function notesPipeline(route, message) {
   let deferredConflicts = [];   // [{ branch }]
   const deferredChapters = [];  // [{ ch, notesSource }]
   let abortForUsageLimit = false;
+  let abortForOutage = false;
   let usageLimitTag = null;
+  let resumeChapter = Number(existingCheckpoint?.resume?.chapter || startChapter);
+  let resumeSkill = existingCheckpoint?.resume?.skill || null;
+
+  if (existingCheckpoint?.state === 'paused_for_outage' && resumeChapter >= startChapter) {
+    await status(`Resuming notes from checkpoint at **${book} ${resumeChapter}** (${resumeSkill || 'chapter start'}).`);
+    await reply(`Resuming notes run for **${rangeLabel}** from **${book} ${resumeChapter}** (${resumeSkill || 'chapter start'}).`);
+  } else {
+    resumeChapter = startChapter;
+    resumeSkill = null;
+  }
+  setCheckpoint(checkpointRef, {
+    state: 'running',
+    totalSuccess,
+    totalFail,
+    resume: { chapter: resumeChapter, skill: resumeSkill },
+  });
 
   // =========================================================================
   // Per-chapter loop: skills -> repo-insert -> repo-verify -> notify user
@@ -257,6 +282,7 @@ async function notesPipeline(route, message) {
   // access immediately and isn't told a chapter is done until it's on master.
   // =========================================================================
   for (let ch = startChapter; ch <= endChapter; ch++) {
+    if (ch < resumeChapter) continue;
     const width = book.toUpperCase() === 'PSA' ? 3 : 2;
     const tag = `${book}-${String(ch).padStart(width, '0')}`;
     const verseRange = verseStart != null && startChapter === endChapter
@@ -342,11 +368,27 @@ async function notesPipeline(route, message) {
     });
 
     // --- Run skills sequentially ---
-    for (const skill of skills) {
+    let startSkillIndex = 0;
+    if (ch === resumeChapter && resumeSkill) {
+      const idx = skills.findIndex((s) => s.name === resumeSkill);
+      startSkillIndex = idx >= 0 ? idx : 0;
+      if (idx < 0) {
+        await status(`Checkpoint resume skill "${resumeSkill}" not found for ${ref}; restarting chapter skill chain.`);
+      }
+    }
+    for (let si = startSkillIndex; si < skills.length; si++) {
+      const skill = skills[si];
       const skillStart = Date.now();
       const timeoutMs = calcSkillTimeout(book, ch, skill.ops);
       await status(`Running **${skill.name}** for ${ref} (timeout: ${Math.round(timeoutMs / 60000)}min)...`);
       console.log(`[notes] Running ${skill.name}: ${skill.prompt} (timeout: ${Math.round(timeoutMs / 60000)}min)`);
+      setCheckpoint(checkpointRef, {
+        state: 'running',
+        totalSuccess,
+        totalFail,
+        current: { chapter: ch, skill: skill.name, status: 'running', startedAt: new Date(skillStart).toISOString() },
+        resume: { chapter: ch, skill: skill.name },
+      });
 
       let result = null;
       let skillError = null;
@@ -379,6 +421,18 @@ async function notesPipeline(route, message) {
       if (skillError) {
         failedSkill = skill.name;
         const errText = skillError.message || String(skillError);
+        if (isTransientOutageError(skillError)) {
+          abortForOutage = true;
+          setCheckpoint(checkpointRef, {
+            state: 'paused_for_outage',
+            totalSuccess,
+            totalFail,
+            current: { chapter: ch, skill: skill.name, status: 'failed', errorKind: 'transient_outage', error: errText },
+            resume: { chapter: ch, skill: skill.name },
+          });
+          await status(`**${skill.name}** paused for ${ref}: Claude transient outage persisted for 10 minutes.`);
+          break;
+        }
         if (isUsageLimitError(errText)) {
           abortForUsageLimit = true;
           usageLimitTag = buildUsageLimitResetTag(errText);
@@ -387,6 +441,13 @@ async function notesPipeline(route, message) {
         } else {
           await status(`**${skill.name}** failed for ${ref}: ${errText}`);
         }
+        setCheckpoint(checkpointRef, {
+          state: 'failed',
+          totalSuccess,
+          totalFail,
+          current: { chapter: ch, skill: skill.name, status: 'failed', errorKind: 'sdk_error', error: errText },
+          resume: { chapter: ch, skill: skill.name },
+        });
         break;
       }
 
@@ -402,6 +463,13 @@ async function notesPipeline(route, message) {
         } else {
           await status(`**${skill.name}** failed for ${ref}: ${errText}`);
         }
+        setCheckpoint(checkpointRef, {
+          state: 'failed',
+          totalSuccess,
+          totalFail,
+          current: { chapter: ch, skill: skill.name, status: 'failed', errorKind: 'non_success_result', error: errText },
+          resume: { chapter: ch, skill: skill.name },
+        });
         break;
       }
 
@@ -411,6 +479,13 @@ async function notesPipeline(route, message) {
         if (!resolved) {
           failedSkill = skill.name;
           await status(`**${skill.name}** failed for ${ref} \u2014 expected output not found: ${skill.expectedOutput} (${duration}s)`);
+          setCheckpoint(checkpointRef, {
+            state: 'failed',
+            totalSuccess,
+            totalFail,
+            current: { chapter: ch, skill: skill.name, status: 'failed', errorKind: 'missing_output', outputStatus: 'missing' },
+            resume: { chapter: ch, skill: skill.name },
+          });
           break;
         }
         // Guard against stale artifacts from previous runs being treated as success.
@@ -424,6 +499,13 @@ async function notesPipeline(route, message) {
         if (mtimeMs < skillStart - 2000) {
           failedSkill = skill.name;
           await status(`**${skill.name}** failed for ${ref} \u2014 output file is stale from an earlier run: ${resolved}`);
+          setCheckpoint(checkpointRef, {
+            state: 'failed',
+            totalSuccess,
+            totalFail,
+            current: { chapter: ch, skill: skill.name, status: 'failed', errorKind: 'stale_output', outputStatus: 'stale', outputPath: resolved },
+            resume: { chapter: ch, skill: skill.name },
+          });
           break;
         }
         skill.resolvedOutput = resolved;
@@ -477,14 +559,27 @@ async function notesPipeline(route, message) {
       } else {
         await status(`**${skill.name}** done (${duration}s)`);
       }
+      setCheckpoint(checkpointRef, {
+        state: 'running',
+        totalSuccess,
+        totalFail,
+        current: { chapter: ch, skill: skill.name, status: 'succeeded' },
+        resume: null,
+      });
     }
 
     const chapterDuration = ((Date.now() - chapterStart) / 1000).toFixed(1);
 
     if (failedSkill) {
       totalFail++;
+      setCheckpoint(checkpointRef, {
+        state: abortForOutage ? 'paused_for_outage' : 'failed',
+        totalSuccess,
+        totalFail,
+        resume: { chapter: ch, skill: failedSkill },
+      });
       await status(`Chapter ${ref} failed at **${failedSkill}** after ${chapterDuration}s`);
-      if (abortForUsageLimit) break;
+      if (abortForUsageLimit || abortForOutage) break;
       // Continue to next chapter instead of aborting the whole pipeline
       continue;
     }
@@ -574,6 +669,13 @@ async function notesPipeline(route, message) {
     }
 
     totalSuccess++;
+    setCheckpoint(checkpointRef, {
+      state: 'running',
+      totalSuccess,
+      totalFail,
+      current: { chapter: ch, status: 'chapter_succeeded' },
+      resume: null,
+    });
 
     // Notify user only after merge is confirmed
     if (chapterCount > 1) {
@@ -634,11 +736,19 @@ async function notesPipeline(route, message) {
       pipeline: 'notes', book, startCh: startChapter, endCh: endChapter,
       tokensBefore, success: totalFail === 0, userId: message.sender_id,
     });
+    clearCheckpoint(checkpointRef);
     return;
   }
 
   // --- Final reaction and report ---
   await removeReaction(msgId, 'working_on_it');
+
+  if (abortForOutage) {
+    await addReaction(msgId, 'warning');
+    await reply('Claude is temporarily down, you\'ll need to re-trigger. I saved progress and will resume from the failed skill.');
+    await status(`Notes pipeline paused for **${rangeLabel}** due to transient Claude outage; waiting for re-trigger to resume.`);
+    return;
+  }
 
   if (abortForUsageLimit) {
     await addReaction(msgId, 'warning');
@@ -652,6 +762,7 @@ async function notesPipeline(route, message) {
       tokensBefore, success: false, userId: message.sender_id,
     });
     await status(`Notes pipeline paused for **${rangeLabel}** due to usage limit.`);
+    clearCheckpoint(checkpointRef);
     return;
   }
 
@@ -688,6 +799,7 @@ async function notesPipeline(route, message) {
   });
 
   await status(`Notes pipeline complete for **${rangeLabel}** in ${totalDuration}s \u2014 ${totalSuccess} ok, ${totalFail} failed.`);
+  clearCheckpoint(checkpointRef);
 }
 
 module.exports = { notesPipeline };

@@ -10,13 +10,14 @@ const fs = require('fs');
 const path = require('path');
 const config = require('./config');
 const { sendMessage, sendDM, addReaction, removeReaction, uploadFile } = require('./zulip-client');
-const { runClaude, DEFAULT_RESTRICTED_TOOLS } = require('./claude-runner');
+const { runClaude, DEFAULT_RESTRICTED_TOOLS, isTransientOutageError } = require('./claude-runner');
 const { getDoor43Username, buildBranchName, resolveOutputFile, calcSkillTimeout, normalizeBookName, resolveConflictMention, CSKILLBP_DIR } = require('./pipeline-utils');
 const { verifyRepoPush, verifyDcsToken } = require('./repo-verify');
 const { ensureFreshToken, isAuthError } = require('./auth-refresh');
 const { recordMetrics, getCumulativeTokens, recordRunSummary } = require('./usage-tracker');
 const { door43Push, checkConflictingBranches, REPO_MAP, getRepoFilename } = require('./door43-push');
 const { setPendingMerge } = require('./pending-merges');
+const { getCheckpoint, setCheckpoint, clearCheckpoint } = require('./pipeline-checkpoints');
 
 const LOG_DIR = path.resolve(__dirname, '../logs');
 const REQUIRED_INITIAL_PIPELINE_FILES = [
@@ -192,6 +193,13 @@ async function generatePipeline(route, message) {
   }
 
   const { book, start, end, verseStart, verseEnd } = parsed;
+  const sessionKey = stream ? `stream-${stream}-${topic}` : `dm-${message.sender_id}`;
+  const checkpointRef = {
+    sessionKey,
+    pipelineType: 'generate',
+    scope: { book, startChapter: start, endChapter: end, verseStart: verseStart ?? null, verseEnd: verseEnd ?? null },
+  };
+  const existingCheckpoint = getCheckpoint(checkpointRef);
   const chapterCount = end - start + 1;
   const hasVerseRange = verseStart != null && verseEnd != null && start === end;
 
@@ -251,16 +259,35 @@ async function generatePipeline(route, message) {
   }
 
   const tokensBefore = getCumulativeTokens();
-  let success = 0;
-  let fail = 0;
-  const completedChapters = []; // Phase 1 results for non-file-response users
+  let success = Number(existingCheckpoint?.success || 0);
+  let fail = Number(existingCheckpoint?.fail || 0);
+  const completedChapters = Array.isArray(existingCheckpoint?.completedChapters) ? [...existingCheckpoint.completedChapters] : []; // Phase 1 results for non-file-response users
   let abortForUsageLimit = false;
+  let abortForOutage = false;
   let usageLimitTag = null;
+  let resumeChapter = Number(existingCheckpoint?.resume?.chapter || start);
+  let resumeSkill = existingCheckpoint?.resume?.skill || null;
+
+  if (existingCheckpoint?.state === 'paused_for_outage' && resumeChapter >= start) {
+    await status(`Resuming generation from checkpoint at **${book} ${resumeChapter}** (${resumeSkill || 'chapter start'}).`);
+    await reply(`Resuming generation for **${refLabel}** from **${book} ${resumeChapter}** (${resumeSkill || 'chapter start'}).`);
+  } else {
+    resumeChapter = start;
+    resumeSkill = null;
+  }
+  setCheckpoint(checkpointRef, {
+    state: 'running',
+    success,
+    fail,
+    completedChapters,
+    resume: { chapter: resumeChapter, skill: resumeSkill },
+  });
 
   // =========================================================================
   // Phase 1: Generate + Align (always runs)
   // =========================================================================
   for (let ch = start; ch <= end; ch++) {
+    if (ch < resumeChapter) continue;
     console.log(`[generate] Processing ${book} chapter ${ch}...`);
     const chapterRef = hasVerseRange ? `${book} ${ch}:${verseStart}-${verseEnd}` : `${book} ${ch}`;
     await status(`Processing **${chapterRef}**...`);
@@ -268,8 +295,11 @@ async function generatePipeline(route, message) {
     const chapterStart = Date.now();
     let claudeResult = null;
     let sdkError = null;
+    const runInitialSkill = !(ch === resumeChapter && resumeSkill === 'align-all-parallel');
 
-    if (isDryRun) {
+    if (!runInitialSkill) {
+      await status(`Resuming ${chapterRef} at **align-all-parallel**.`);
+    } else if (isDryRun) {
       const dryRunRef = hasVerseRange ? `${book} ${ch}:${verseStart}-${verseEnd}` : `${book} ${ch}`;
       console.log(`[dry-run] Would run Claude SDK: /${skill} ${dryRunRef} (in ${CSKILLBP_DIR})`);
 
@@ -292,23 +322,47 @@ async function generatePipeline(route, message) {
       await new Promise((r) => setTimeout(r, 200));
       claudeResult = { subtype: 'success', num_turns: 0, duration_ms: 200, total_cost_usd: 0 };
     } else {
+      setCheckpoint(checkpointRef, {
+        state: 'running',
+        success,
+        fail,
+        completedChapters,
+        current: { chapter: ch, skill: skill, status: 'running', startedAt: new Date(chapterStart).toISOString() },
+        resume: { chapter: ch, skill },
+      });
       try {
         const timeoutMs = calcSkillTimeout(book, ch, 3); // 3 ops for initial-pipeline
         const skillRef = hasVerseRange ? `${book} ${ch}:${verseStart}-${verseEnd}` : `${book} ${ch}`;
-        claudeResult = await runClaude({
-          prompt: skillRef,
-          cwd: CSKILLBP_DIR,
-          model,
-          skill,
-          tools: DEFAULT_RESTRICTED_TOOLS,
-          disallowedTools: ['Bash'],
-          disableLocalSettings: true,
-          forceNoAutoBashSandbox: true,
-          timeoutMs,
-        });
+        if (runInitialSkill) {
+          claudeResult = await runClaude({
+            prompt: skillRef,
+            cwd: CSKILLBP_DIR,
+            model,
+            skill,
+            tools: DEFAULT_RESTRICTED_TOOLS,
+            disallowedTools: ['Bash'],
+            disableLocalSettings: true,
+            forceNoAutoBashSandbox: true,
+            timeoutMs,
+          });
+        } else {
+          claudeResult = { subtype: 'success', resumed: true };
+        }
       } catch (err) {
         sdkError = err;
         console.error(`[generate] Claude SDK error for ${book} ${ch}: ${err.message}`);
+        if (isTransientOutageError(err)) {
+          abortForOutage = true;
+          setCheckpoint(checkpointRef, {
+            state: 'paused_for_outage',
+            success,
+            fail,
+            completedChapters,
+            current: { chapter: ch, skill, status: 'failed', errorKind: 'transient_outage', error: err.message },
+            resume: { chapter: ch, skill },
+          });
+          break;
+        }
         if (isAuthError(err)) {
           await reply('Claude auth expired. Waiting for re-authentication...');
           await status(`Auth error on ${book} ${ch} — waiting for reauth`);
@@ -320,6 +374,14 @@ async function generatePipeline(route, message) {
           }
           await status(`Auth could not be restored — aborting remaining chapters`);
           fail += (end - ch + 1);
+          setCheckpoint(checkpointRef, {
+            state: 'failed',
+            success,
+            fail,
+            completedChapters,
+            current: { chapter: ch, skill, status: 'failed', errorKind: 'auth_error', error: err.message },
+            resume: { chapter: ch, skill },
+          });
           break;
         }
       }
@@ -344,10 +406,26 @@ async function generatePipeline(route, message) {
       if (isUsageLimitError(errText)) {
         abortForUsageLimit = true;
         usageLimitTag = buildUsageLimitResetTag(errText);
+        setCheckpoint(checkpointRef, {
+          state: 'failed',
+          success,
+          fail,
+          completedChapters,
+          current: { chapter: ch, skill, status: 'failed', errorKind: 'usage_limit', error: errText },
+          resume: { chapter: ch, skill },
+        });
         break;
       }
       await status(`Failed to generate **${book} ${ch}**: ${errText}`);
       fail++;
+      setCheckpoint(checkpointRef, {
+        state: 'failed',
+        success,
+        fail,
+        completedChapters,
+        current: { chapter: ch, skill, status: 'failed', errorKind: 'sdk_error', error: errText },
+        resume: { chapter: ch, skill },
+      });
       continue;
     }
 
@@ -356,22 +434,54 @@ async function generatePipeline(route, message) {
       if (isUsageLimitError(errText)) {
         abortForUsageLimit = true;
         usageLimitTag = buildUsageLimitResetTag(errText);
+        setCheckpoint(checkpointRef, {
+          state: 'failed',
+          success,
+          fail,
+          completedChapters,
+          current: { chapter: ch, skill, status: 'failed', errorKind: 'usage_limit', error: errText },
+          resume: { chapter: ch, skill },
+        });
         break;
       }
       await status(`Failed to generate **${book} ${ch}**: ${errText}`);
       fail++;
+      setCheckpoint(checkpointRef, {
+        state: 'failed',
+        success,
+        fail,
+        completedChapters,
+        current: { chapter: ch, skill, status: 'failed', errorKind: 'non_success_result', error: errText },
+        resume: { chapter: ch, skill },
+      });
       continue;
     }
 
     if (!hasUst) {
       await status(`Failed to generate **${book} ${ch}**. UST not produced${hasUlt ? ' (ULT exists but may be incomplete)' : ''}. Check logs for details.`);
       fail++;
+      setCheckpoint(checkpointRef, {
+        state: 'failed',
+        success,
+        fail,
+        completedChapters,
+        current: { chapter: ch, skill, status: 'failed', errorKind: 'missing_output', outputStatus: 'missing' },
+        resume: { chapter: ch, skill },
+      });
       continue;
     }
 
     if (!isFreshOutput(ustRel, chapterStart)) {
       await status(`Failed to generate **${book} ${ch}**: output appears stale from an earlier run (${ustRel}).`);
       fail++;
+      setCheckpoint(checkpointRef, {
+        state: 'failed',
+        success,
+        fail,
+        completedChapters,
+        current: { chapter: ch, skill, status: 'failed', errorKind: 'stale_output', outputStatus: 'stale', outputPath: ustRel },
+        resume: { chapter: ch, skill },
+      });
       continue;
     }
 
@@ -393,6 +503,14 @@ async function generatePipeline(route, message) {
     recordMetrics({
       pipeline: 'generate', skill: route.skill || 'initial-pipeline',
       book, chapter: ch, result: claudeResult, success: hasUst, userId: message.sender_id,
+    });
+    setCheckpoint(checkpointRef, {
+      state: 'running',
+      success,
+      fail,
+      completedChapters,
+      current: { chapter: ch, skill, status: 'succeeded' },
+      resume: null,
     });
 
     // --- File-response path: upload files only ---
@@ -421,6 +539,14 @@ async function generatePipeline(route, message) {
 
       await reply(`**${book} ${ch}** \u2014 ${links.join(' \u00b7 ')}`);
       success++;
+      setCheckpoint(checkpointRef, {
+        state: 'running',
+        success,
+        fail,
+        completedChapters,
+        current: { chapter: ch, status: 'chapter_succeeded' },
+        resume: null,
+      });
       continue;
     }
 
@@ -428,6 +554,14 @@ async function generatePipeline(route, message) {
 
     // Step 2: align-all-parallel
     await status(`Running **align-all-parallel** for ${book} ${ch}...`);
+    setCheckpoint(checkpointRef, {
+      state: 'running',
+      success,
+      fail,
+      completedChapters,
+      current: { chapter: ch, skill: 'align-all-parallel', status: 'running' },
+      resume: { chapter: ch, skill: 'align-all-parallel' },
+    });
     try {
       const alignTimeout = calcSkillTimeout(book, ch, 2);
       const alignRef = hasVerseRange ? `${book} ${ch}:${verseStart}-${verseEnd}` : `${book} ${ch}`;
@@ -449,10 +583,26 @@ async function generatePipeline(route, message) {
         if (isUsageLimitError(errText)) {
           abortForUsageLimit = true;
           usageLimitTag = buildUsageLimitResetTag(errText);
+          setCheckpoint(checkpointRef, {
+            state: 'failed',
+            success,
+            fail,
+            completedChapters,
+            current: { chapter: ch, skill: 'align-all-parallel', status: 'failed', errorKind: 'usage_limit', error: errText },
+            resume: { chapter: ch, skill: 'align-all-parallel' },
+          });
           break;
         }
         await status(`**align-all-parallel** failed for ${book} ${ch}: ${errText}`);
         fail++;
+        setCheckpoint(checkpointRef, {
+          state: 'failed',
+          success,
+          fail,
+          completedChapters,
+          current: { chapter: ch, skill: 'align-all-parallel', status: 'failed', errorKind: 'non_success_result', error: errText },
+          resume: { chapter: ch, skill: 'align-all-parallel' },
+        });
         continue;
       }
 
@@ -472,30 +622,100 @@ async function generatePipeline(route, message) {
       if (!alignedUltRel || !alignedUstRel) {
         await status(`**align-all-parallel** failed for ${book} ${ch} \u2014 aligned files not found (${alignDuration}s)`);
         fail++;
+        setCheckpoint(checkpointRef, {
+          state: 'failed',
+          success,
+          fail,
+          completedChapters,
+          current: { chapter: ch, skill: 'align-all-parallel', status: 'failed', errorKind: 'missing_output', outputStatus: 'missing' },
+          resume: { chapter: ch, skill: 'align-all-parallel' },
+        });
         continue;
       }
       if (!isFreshOutput(alignedUltRel, chapterStart) || !isFreshOutput(alignedUstRel, chapterStart)) {
         await status(`**align-all-parallel** failed for ${book} ${ch} \u2014 aligned output appears stale from an earlier run`);
         fail++;
+        setCheckpoint(checkpointRef, {
+          state: 'failed',
+          success,
+          fail,
+          completedChapters,
+          current: { chapter: ch, skill: 'align-all-parallel', status: 'failed', errorKind: 'stale_output', outputStatus: 'stale' },
+          resume: { chapter: ch, skill: 'align-all-parallel' },
+        });
         continue;
       }
       await status(`**align-all-parallel** done for ${book} ${ch} (${alignDuration}s)`);
 
       // Collect for Phase 2 insertion (must be inside try block — alignedUltRel/alignedUstRel are block-scoped)
-      completedChapters.push({ ch, ultAligned: alignedUltRel, ustAligned: alignedUstRel });
+      if (!completedChapters.some((c) => c.ch === ch)) {
+        completedChapters.push({ ch, ultAligned: alignedUltRel, ustAligned: alignedUstRel });
+      }
+      setCheckpoint(checkpointRef, {
+        state: 'running',
+        success,
+        fail,
+        completedChapters,
+        current: { chapter: ch, skill: 'align-all-parallel', status: 'succeeded' },
+        resume: null,
+      });
     } catch (err) {
       console.error(`[generate] align-all-parallel error for ${book} ${ch}: ${err.message}`);
+      if (isTransientOutageError(err)) {
+        abortForOutage = true;
+        setCheckpoint(checkpointRef, {
+          state: 'paused_for_outage',
+          success,
+          fail,
+          completedChapters,
+          current: { chapter: ch, skill: 'align-all-parallel', status: 'failed', errorKind: 'transient_outage', error: err.message },
+          resume: { chapter: ch, skill: 'align-all-parallel' },
+        });
+        break;
+      }
       if (isUsageLimitError(err.message || '')) {
         abortForUsageLimit = true;
         usageLimitTag = buildUsageLimitResetTag(err.message || '');
+        setCheckpoint(checkpointRef, {
+          state: 'failed',
+          success,
+          fail,
+          completedChapters,
+          current: { chapter: ch, skill: 'align-all-parallel', status: 'failed', errorKind: 'usage_limit', error: err.message },
+          resume: { chapter: ch, skill: 'align-all-parallel' },
+        });
         break;
       }
       await status(`**align-all-parallel** error for ${book} ${ch}: ${err.message}`);
       fail++;
+      setCheckpoint(checkpointRef, {
+        state: 'failed',
+        success,
+        fail,
+        completedChapters,
+        current: { chapter: ch, skill: 'align-all-parallel', status: 'failed', errorKind: 'sdk_error', error: err.message },
+        resume: { chapter: ch, skill: 'align-all-parallel' },
+      });
       continue;
     }
 
     success++;
+    setCheckpoint(checkpointRef, {
+      state: 'running',
+      success,
+      fail,
+      completedChapters,
+      current: { chapter: ch, status: 'chapter_succeeded' },
+      resume: null,
+    });
+  }
+
+  if (abortForOutage) {
+    await removeReaction(msgId, 'working_on_it');
+    await addReaction(msgId, 'warning');
+    await reply('Claude is temporarily down, you\'ll need to re-trigger. I saved progress and will resume from the failed skill.');
+    await status(`Generation paused for **${refLabel}** due to transient Claude outage; waiting for re-trigger to resume.`);
+    return;
   }
 
   if (abortForUsageLimit) {
@@ -511,6 +731,7 @@ async function generatePipeline(route, message) {
       tokensBefore, success: false, userId: message.sender_id,
     });
     await status(`Generation paused for **${refLabel}** due to usage limit.`);
+    clearCheckpoint(checkpointRef);
     return;
   }
 
@@ -600,6 +821,7 @@ async function generatePipeline(route, message) {
         tokensBefore, success: fail === 0, userId: message.sender_id,
       });
       console.log(`[generate] Run summary ref: ${deferLabel}`);
+      clearCheckpoint(checkpointRef);
       return;
     }
 
@@ -726,6 +948,7 @@ async function generatePipeline(route, message) {
     ? `${book} ${start}:${verseStart}-${verseEnd}`
     : `${book} ${start}\u2013${end}`;
   await status(`Generation complete for **${finalLabel}**: ${success} succeeded, ${fail} failed.`);
+  clearCheckpoint(checkpointRef);
 }
 
 module.exports = { generatePipeline };
