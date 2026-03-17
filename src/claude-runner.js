@@ -3,8 +3,10 @@
 
 const { ensureFreshToken } = require('./auth-refresh');
 const { recordRateLimit, getHeadroom } = require('./usage-tracker');
+const { createWorkspaceTools } = require('./workspace-tools');
 
 let _query = null;
+let _workspaceToolsServer = null;
 
 async function getQuery() {
   if (!_query) {
@@ -12,6 +14,15 @@ async function getQuery() {
     _query = sdk.query;
   }
   return _query;
+}
+
+async function getWorkspaceToolsServer() {
+  if (!_workspaceToolsServer) {
+    const sdk = await import('@anthropic-ai/claude-agent-sdk');
+    const { z } = require('zod');
+    _workspaceToolsServer = createWorkspaceTools(sdk.createSdkMcpServer, sdk.tool, z);
+  }
+  return _workspaceToolsServer;
 }
 
 // Default: 10 minutes per invocation, 200 turns max
@@ -35,6 +46,7 @@ function buildOptions({
   timeoutMs,
   appendSystemPrompt,
   abortController,
+  mcpServers,
 }) {
   const options = {
     cwd: cwd || process.cwd(),
@@ -46,6 +58,9 @@ function buildOptions({
     settingSources: ['user', 'project', 'local'],
     persistSession: true,
   };
+  if (mcpServers) {
+    options.mcpServers = mcpServers;
+  }
   if (resume) {
     options.resume = resume;
   }
@@ -59,6 +74,7 @@ function buildOptions({
 async function runClaude({ prompt, cwd, model, allowedTools, skill, maxTurns, timeoutMs, appendSystemPrompt }) {
   await ensureFreshToken();
   const query = await getQuery();
+  const wsTools = await getWorkspaceToolsServer();
 
   const fullPrompt = skill ? `/${skill} ${prompt}` : prompt;
 
@@ -76,6 +92,7 @@ async function runClaude({ prompt, cwd, model, allowedTools, skill, maxTurns, ti
     maxTurns,
     appendSystemPrompt,
     abortController,
+    mcpServers: { 'workspace-tools': wsTools },
   });
 
   console.log(`[claude-runner] Starting query in ${cwd}`);
@@ -167,6 +184,7 @@ async function runClaude({ prompt, cwd, model, allowedTools, skill, maxTurns, ti
 async function runClaudeStream({ prompt, cwd, resume, model, maxTurns, timeoutMs, appendSystemPrompt }) {
   await ensureFreshToken();
   const query = await getQuery();
+  const wsTools = await getWorkspaceToolsServer();
   const abortController = new AbortController();
   const timeout = timeoutMs || DEFAULT_TIMEOUT_MS;
   const timer = setTimeout(() => {
@@ -181,6 +199,7 @@ async function runClaudeStream({ prompt, cwd, resume, model, maxTurns, timeoutMs
     maxTurns,
     appendSystemPrompt,
     abortController,
+    mcpServers: { 'workspace-tools': wsTools },
   });
 
   console.log(`[claude-runner] Starting stream in ${cwd}${resume ? ` (resume: ${resume.slice(0, 8)}…)` : ''}`);
