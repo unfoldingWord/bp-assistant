@@ -3,7 +3,6 @@
 // Calls Python insertion scripts directly, then runs git + Gitea API operations
 // with retry logic. No AI layer — fully deterministic, structured success/failure.
 
-const { execFileSync } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 const https = require('https');
@@ -12,6 +11,7 @@ const gitHttp = require('isomorphic-git/http/node');
 const { getVerseCount } = require('./verse-counts');
 const { insertTnRows } = require('./lib/insert-tn-rows');
 const { insertUsfmVerses } = require('./lib/insert-usfm-verses');
+const { validateTnTsv } = require('./workspace-tools/quality-tools');
 
 const GITEA_API = 'https://git.door43.org/api/v1';
 const ORG = 'unfoldingWord';
@@ -663,68 +663,48 @@ async function door43Push(opts) {
     insertContent({ type, book, chapter, source, verses, repoDir, repoFilename });
 
     // Step 3b: Door43 CI validation gate (TN only)
-    // Uses the repo's own validate_tn_files.py from .gitea/workflows/
+    // JS port of TN TSV validation checks (distroless-safe; no python dependency).
     // Only blocks on errors in the chapter we're inserting — pre-existing errors
     // in other chapters are logged as warnings but do not block delivery.
     if (type === 'tn') {
-      const validateScript = path.join(repoDir, '.gitea/workflows/validate_tn_files.py');
-      if (fs.existsSync(validateScript)) {
-        const bookLower = book.toLowerCase();
-        const checkArgs = [];
-        for (let i = 3; i <= 15; i++) checkArgs.push('--check', String(i));
+      const relFile = path.posix.join(config.reposPath, repo, repoFilename).replace(/\\/g, '/');
+      let parsed = null;
+      try {
+        // Keep check coverage aligned with implemented JS validator rules.
+        const rawJson = validateTnTsv({ file: relFile, checks: [3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13], maxErrors: 1000 });
+        parsed = JSON.parse(rawJson);
+      } catch (validationErr) {
+        console.warn(`${LOG_PREFIX} JS validation failed to run: ${validationErr.message} — skipping`);
+      }
 
-        // Collect JSON output regardless of exit code (exit 1 = validation errors found)
-        let rawJson = '';
-        try {
-          rawJson = execFileSync('python3', [
-            validateScript, '--book', bookLower, '--json', ...checkArgs,
-          ], { encoding: 'utf8', timeout: 60000, cwd: repoDir, stdio: 'pipe' });
-        } catch (execErr) {
-          rawJson = execErr.stdout || '';
-          if (!rawJson) {
-            console.warn(`${LOG_PREFIX} Validation script failed to run: ${execErr.stderr || execErr.message} — skipping`);
-          }
+      if (parsed && Array.isArray(parsed.findings)) {
+        const allErrors = parsed.findings.map((f) => ({
+          line: f.line,
+          ref: f.reference,
+          message: f.message,
+        }));
+
+        // Only block on errors in the chapter we're inserting
+        const chapterPrefix = String(chapter) + ':';
+        const ourErrors = allErrors.filter(e => e.ref && String(e.ref).startsWith(chapterPrefix));
+        const otherCount = allErrors.length - ourErrors.length;
+
+        if (otherCount > 0) {
+          console.warn(`${LOG_PREFIX} ${otherCount} pre-existing validation issue(s) in other chapters (not blocking)`);
         }
 
-        if (rawJson) {
-          // Flatten errors from all check groups: {"3": {"errors": [...]}, "4": {...}, ...}
-          let allErrors = [];
-          try {
-            const parsed = JSON.parse(rawJson);
-            for (const key of Object.keys(parsed)) {
-              const group = parsed[key];
-              if (group && Array.isArray(group.errors)) {
-                allErrors = allErrors.concat(group.errors);
-              }
-            }
-          } catch {
-            console.warn(`${LOG_PREFIX} Could not parse validation output — skipping`);
-          }
-
-          // Only block on errors in the chapter we're inserting
-          const chapterPrefix = String(chapter) + ':';
-          const ourErrors = allErrors.filter(e => e.ref && String(e.ref).startsWith(chapterPrefix));
-          const otherCount = allErrors.length - ourErrors.length;
-
-          if (otherCount > 0) {
-            console.warn(`${LOG_PREFIX} ${otherCount} pre-existing validation issue(s) in other chapters (not blocking)`);
-          }
-
-          if (ourErrors.length > 0) {
-            const errorSummary = ourErrors.slice(0, 10).map(e =>
-              `  Line ${e.line || '?'}: [${e.ref}] ${e.message}`
-            ).join('\n');
-            let details = `Door43 CI validation failed for ${repoFilename} — ${ourErrors.length} error(s) in chapter ${chapter}:\n${errorSummary}`;
-            if (ourErrors.length > 10) details += `\n  ... and ${ourErrors.length - 10} more`;
-            await git.checkout({ fs, dir: repoDir, filepaths: [repoFilename], force: true });
-            console.error(`${LOG_PREFIX} ${details}`);
-            throw new Error(details);
-          }
-
-          console.log(`${LOG_PREFIX} Door43 CI validation passed for chapter ${chapter} in ${repoFilename}`);
+        if (ourErrors.length > 0) {
+          const errorSummary = ourErrors.slice(0, 10).map(e =>
+            `  Line ${e.line || '?'}: [${e.ref}] ${e.message}`
+          ).join('\n');
+          let details = `Door43 CI validation failed for ${repoFilename} — ${ourErrors.length} error(s) in chapter ${chapter}:\n${errorSummary}`;
+          if (ourErrors.length > 10) details += `\n  ... and ${ourErrors.length - 10} more`;
+          await git.checkout({ fs, dir: repoDir, filepaths: [repoFilename], force: true });
+          console.error(`${LOG_PREFIX} ${details}`);
+          throw new Error(details);
         }
-      } else {
-        console.log(`${LOG_PREFIX} Validation script not found at ${validateScript} — skipping validation`);
+
+        console.log(`${LOG_PREFIX} Door43 CI validation passed for chapter ${chapter} in ${repoFilename}`);
       }
     }
 

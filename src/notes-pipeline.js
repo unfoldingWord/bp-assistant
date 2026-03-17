@@ -11,12 +11,13 @@ const fs = require('fs');
 const path = require('path');
 const config = require('./config');
 const { sendMessage, sendDM, addReaction, removeReaction } = require('./zulip-client');
-const { runClaude } = require('./claude-runner');
+const { runClaude, DEFAULT_RESTRICTED_TOOLS } = require('./claude-runner');
 const { getDoor43Username, buildBranchName, resolveOutputFile, checkPrerequisites, calcSkillTimeout, normalizeBookName, resolveConflictMention, CSKILLBP_DIR } = require('./pipeline-utils');
 const { verifyRepoPush, verifyDcsToken } = require('./repo-verify');
 const { recordMetrics, getCumulativeTokens, recordRunSummary } = require('./usage-tracker');
 const { door43Push, checkConflictingBranches, REPO_MAP, getRepoFilename } = require('./door43-push');
 const { setPendingMerge } = require('./pending-merges');
+const { mergeTsvs } = require('./workspace-tools/tsv-tools');
 
 const LOG_DIR = path.resolve(__dirname, '../logs');
 
@@ -45,6 +46,21 @@ function shouldRunIntro(book, chapter, withIntroFlag) {
 
 function hasWithIntroFlag(content) {
   return /--with-?intro\b/i.test(content) || /\bwith[\s-]intro\b/i.test(content);
+}
+
+function buildNotesPaths(book, tag, hasVerseRange, verseStart, verseEnd) {
+  const chapterRel = `output/notes/${book}/${tag}.tsv`;
+  const shardRel = hasVerseRange
+    ? `output/notes/${book}/${tag}-v${verseStart}-${verseEnd}.tsv`
+    : chapterRel;
+  return { chapterRel, shardRel };
+}
+
+function refreshChapterNotesFromShards(book, tag, chapterRel) {
+  const shardGlob = `output/notes/${book}/${tag}-v*.tsv`;
+  const merged = mergeTsvs({ globPattern: shardGlob, output: chapterRel });
+  if (!merged.startsWith('Merged')) return null;
+  return chapterRel;
 }
 
 // --- Parse "write notes BOOK CH" or "write notes BOOK CH:VS-VS" or "write notes BOOK CH1-CH2" ---
@@ -139,9 +155,12 @@ async function notesPipeline(route, message) {
 
   const { book, startChapter, endChapter, verseStart, verseEnd, withIntro } = parsed;
   const chapterCount = endChapter - startChapter + 1;
-  const rangeLabel = startChapter === endChapter
-    ? `${book} ${startChapter}`
-    : `${book} ${startChapter}\u2013${endChapter}`;
+  const hasGlobalVerseRange = verseStart != null && verseEnd != null && startChapter === endChapter;
+  const rangeLabel = hasGlobalVerseRange
+    ? `${book} ${startChapter}:${verseStart}-${verseEnd}`
+    : (startChapter === endChapter
+      ? `${book} ${startChapter}`
+      : `${book} ${startChapter}\u2013${endChapter}`);
 
   // --- Look up Door43 username ---
   const username = getDoor43Username(message.sender_email);
@@ -241,11 +260,13 @@ async function notesPipeline(route, message) {
       await status(`**${ref}**: skipping chapter-intro (auto-excluded range)`);
     }
 
-    const vTag = hasVerseRange ? `${tag}-v${verseStart}-${verseEnd}` : tag;
+    const { chapterRel: notesChapterRel, shardRel: notesShardRel } = buildNotesPaths(
+      book, tag, hasVerseRange, verseStart, verseEnd
+    );
     skills.push({
       name: 'tn-writer',
       prompt: `${skillRef} --issues ${issuesPath}`,
-      expectedOutput: `output/notes/${vTag}.tsv`,
+      expectedOutput: notesChapterRel,
       ops: 1,
     });
 
@@ -253,7 +274,7 @@ async function notesPipeline(route, message) {
     skills.push({
       name: 'tn-quality-check',
       prompt: `${skillRef}`,
-      expectedOutput: `output/quality/${book}/${vTag}-quality.md`,
+      expectedOutput: `output/quality/${book}/${tag}-quality.md`,
       ops: 1,
       model: 'sonnet',
     });
@@ -272,6 +293,10 @@ async function notesPipeline(route, message) {
           cwd: CSKILLBP_DIR,
           model: model || skill.model, // TEST_FAST haiku overrides per-skill model
           skill: skill.name,
+          tools: DEFAULT_RESTRICTED_TOOLS,
+          disallowedTools: ['Bash'],
+          disableLocalSettings: true,
+          forceNoAutoBashSandbox: true,
           timeoutMs,
           appendSystemPrompt: skill.appendSystemPrompt,
         });
@@ -307,9 +332,23 @@ async function notesPipeline(route, message) {
         }
         // Pass resolved notes path to quality-check so it can find the file
         if (skill.name === 'tn-writer') {
+          if (hasVerseRange) {
+            // Canonical output for partial runs is verse-scoped shard file.
+            const absResolved = path.resolve(CSKILLBP_DIR, resolved);
+            const absShard = path.resolve(CSKILLBP_DIR, notesShardRel);
+            fs.mkdirSync(path.dirname(absShard), { recursive: true });
+            fs.copyFileSync(absResolved, absShard);
+            skill.resolvedOutput = notesShardRel;
+            console.log(`[notes] Wrote verse shard: ${notesShardRel}`);
+            // Keep a chapter-level assembled view up-to-date for future checks/runs.
+            const assembledRel = refreshChapterNotesFromShards(book, tag, notesChapterRel);
+            if (assembledRel) {
+              console.log(`[notes] Refreshed chapter aggregate from shards: ${assembledRel}`);
+            }
+          }
           for (const s of skills) {
             if (s.name === 'tn-quality-check') {
-              s.prompt = `${skillRef} --notes ${resolved}`;
+              s.prompt = `${skillRef} --notes ${skill.resolvedOutput || resolved}`;
             }
           }
         }

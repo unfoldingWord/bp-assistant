@@ -30,8 +30,10 @@ If you can't determine the book or chapters, use intent "unknown".
 For editor-review, also extract contentTypes: ["ult"] if user mentions only ULT, ["ust"] if only UST, ["ult","ust"] if both or neither specified.
 
 For editor-note, also extract noteText: a concise summary of the observation the user wants to file.
+For editor-review, generate, and notes, also extract scopeText when present. scopeText is the exact reference
+string after the book (examples: "1", "1-3", "1:1-6", "2:10-3:5", "1,3,5").
 
-Respond ONLY with valid JSON, no other text: {"intent":"...","book":"...","startChapter":N,"endChapter":N,"contentTypes":["ult","ust"],"noteText":"..."}`;
+Respond ONLY with valid JSON, no other text: {"intent":"...","book":"...","startChapter":N,"endChapter":N,"scopeText":"...","contentTypes":["ult","ust"],"noteText":"..."}`;
 
 /**
  * Classify a Zulip message into a pipeline intent.
@@ -94,6 +96,7 @@ async function classifyIntent(messageContent) {
       book: parsed.book ? normalizeBookName(parsed.book) : null,
       startChapter: parsed.startChapter ?? null,
       endChapter: parsed.endChapter ?? null,
+      scopeText: parsed.scopeText || null,
       contentTypes,
       noteText: parsed.noteText || null,
     };

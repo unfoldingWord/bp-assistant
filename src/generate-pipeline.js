@@ -31,6 +31,19 @@ const REQUIRED_INITIAL_PIPELINE_FILES = [
 function parseGenerateCommand(content) {
   const input = content.toLowerCase();
 
+  // Verse range in a single chapter: generate lam 2:1-3
+  const verseMatch = input.match(/generate\s+([a-z0-9]+)\s+(\d+):(\d+)\s*[-\u2013\u2014]\s*(\d+)/);
+  if (verseMatch) {
+    const chapter = parseInt(verseMatch[2], 10);
+    return {
+      book: normalizeBookName(verseMatch[1]),
+      start: chapter,
+      end: chapter,
+      verseStart: parseInt(verseMatch[3], 10),
+      verseEnd: parseInt(verseMatch[4], 10),
+    };
+  }
+
   // Range: generate psa 79-89, generate psa 79\u201389, generate psa 79 to 89
   const rangeMatch = input.match(/generate\s+([a-z0-9]+)\s+(\d+)\s*[-\u2013\u2014to]+\s*(\d+)/);
   if (rangeMatch) {
@@ -38,6 +51,8 @@ function parseGenerateCommand(content) {
       book: normalizeBookName(rangeMatch[1]),
       start: parseInt(rangeMatch[2], 10),
       end: parseInt(rangeMatch[3], 10),
+      verseStart: null,
+      verseEnd: null,
     };
   }
 
@@ -49,6 +64,8 @@ function parseGenerateCommand(content) {
       book: normalizeBookName(singleMatch[1]),
       start: ch,
       end: ch,
+      verseStart: null,
+      verseEnd: null,
     };
   }
 
@@ -96,6 +113,8 @@ async function generatePipeline(route, message) {
       book: route._book,
       start: route._startChapter,
       end: route._endChapter,
+      verseStart: route._verseStart ?? null,
+      verseEnd: route._verseEnd ?? null,
     };
   } else {
     parsed = parseGenerateCommand(message.content);
@@ -103,16 +122,22 @@ async function generatePipeline(route, message) {
 
   if (!parsed) {
     await addReaction(msgId, 'cross_mark');
-    await status('Could not parse command. Expected format: `generate <book> <chapter>` or `generate <book> <start>-<end>`');
+    await status('Could not parse command. Expected format: `generate <book> <chapter>`, `generate <book> <start>-<end>`, or `generate <book> <chapter>:<startVerse>-<endVerse>`');
     return;
   }
 
-  const { book, start, end } = parsed;
+  const { book, start, end, verseStart, verseEnd } = parsed;
   const chapterCount = end - start + 1;
+  const hasVerseRange = verseStart != null && verseEnd != null && start === end;
 
   if (chapterCount < 1) {
     await addReaction(msgId, 'cross_mark');
     await status(`Invalid chapter range: ${start}-${end}`);
+    return;
+  }
+  if (hasVerseRange && verseEnd < verseStart) {
+    await addReaction(msgId, 'cross_mark');
+    await status(`Invalid verse range: ${start}:${verseStart}-${verseEnd}`);
     return;
   }
 
@@ -134,7 +159,8 @@ async function generatePipeline(route, message) {
   // Signal working
   await addReaction(msgId, 'working_on_it');
   const modeLabel = isFileResponse ? 'files-only' : 'full pipeline (align + repo-insert)';
-  await status(`Starting generation for **${book}** chapters ${start}\u2013${end} (${chapterCount} chapter(s), mode: ${modeLabel}, ~${estimatedTotal} tokens estimated)`);
+  const refLabel = hasVerseRange ? `${book} ${start}:${verseStart}-${verseEnd}` : `${book} ${start}\u2013${end}`;
+  await status(`Starting generation for **${refLabel}** (${chapterCount} chapter(s), mode: ${modeLabel}, ~${estimatedTotal} tokens estimated)`);
 
   // Ensure log directory
   fs.mkdirSync(LOG_DIR, { recursive: true });
@@ -169,13 +195,15 @@ async function generatePipeline(route, message) {
   // =========================================================================
   for (let ch = start; ch <= end; ch++) {
     console.log(`[generate] Processing ${book} chapter ${ch}...`);
-    await status(`Processing **${book} ${ch}**...`);
+    const chapterRef = hasVerseRange ? `${book} ${ch}:${verseStart}-${verseEnd}` : `${book} ${ch}`;
+    await status(`Processing **${chapterRef}**...`);
 
     const chapterStart = Date.now();
     let claudeResult = null;
 
     if (isDryRun) {
-      console.log(`[dry-run] Would run Claude SDK: /${skill} ${book} ${ch} (in ${CSKILLBP_DIR})`);
+      const dryRunRef = hasVerseRange ? `${book} ${ch}:${verseStart}-${verseEnd}` : `${book} ${ch}`;
+      console.log(`[dry-run] Would run Claude SDK: /${skill} ${dryRunRef} (in ${CSKILLBP_DIR})`);
 
       // Create stub output files
       const ultDir = path.join(CSKILLBP_DIR, 'output', 'AI-ULT');
@@ -198,8 +226,9 @@ async function generatePipeline(route, message) {
     } else {
       try {
         const timeoutMs = calcSkillTimeout(book, ch, 3); // 3 ops for initial-pipeline
+        const skillRef = hasVerseRange ? `${book} ${ch}:${verseStart}-${verseEnd}` : `${book} ${ch}`;
         claudeResult = await runClaude({
-          prompt: `${book} ${ch}`,
+          prompt: skillRef,
           cwd: CSKILLBP_DIR,
           model,
           skill,
@@ -265,6 +294,8 @@ async function generatePipeline(route, message) {
     }
 
     // Record metrics for initial-pipeline
+    const metricRef = hasVerseRange ? `${book} ${ch}:${verseStart}-${verseEnd}` : `${book} ${ch}`;
+    console.log(`[generate] Metrics ref: initial-pipeline ${metricRef}`);
     recordMetrics({
       pipeline: 'generate', skill: route.skill || 'initial-pipeline',
       book, chapter: ch, result: claudeResult, success: hasUst, userId: message.sender_id,
@@ -305,8 +336,9 @@ async function generatePipeline(route, message) {
     await status(`Running **align-all-parallel** for ${book} ${ch}...`);
     try {
       const alignTimeout = calcSkillTimeout(book, ch, 2);
+      const alignRef = hasVerseRange ? `${book} ${ch}:${verseStart}-${verseEnd}` : `${book} ${ch}`;
       const alignResult = await runClaude({
-        prompt: `${book} ${ch}`,
+        prompt: alignRef,
         cwd: CSKILLBP_DIR,
         model,
         skill: 'align-all-parallel',
@@ -319,6 +351,8 @@ async function generatePipeline(route, message) {
       const alignDuration = ((Date.now() - chapterStart) / 1000).toFixed(1);
 
       // Record metrics for align-all-parallel
+      const alignMetricRef = hasVerseRange ? `${book} ${ch}:${verseStart}-${verseEnd}` : `${book} ${ch}`;
+      console.log(`[generate] Metrics ref: align-all-parallel ${alignMetricRef}`);
       recordMetrics({
         pipeline: 'generate', skill: 'align-all-parallel',
         book, chapter: ch, result: alignResult,
@@ -433,6 +467,7 @@ async function generatePipeline(route, message) {
         pipeline: 'generate', book, startCh: start, endCh: end,
         tokensBefore, success: fail === 0, userId: message.sender_id,
       });
+      console.log(`[generate] Run summary ref: ${deferLabel}`);
       return;
     }
 
@@ -461,6 +496,7 @@ async function generatePipeline(route, message) {
             type: 'ult', book, chapter: chData.ch,
             username, branch: buildBranchName(book, chData.ch),
             source: chData.ultAligned,
+            verses: hasVerseRange ? `${verseStart}-${verseEnd}` : undefined,
           });
           if (!pushResultUlt.success) {
             console.error(`[generate] door43-push ULT failed for ${book} ${chData.ch}: ${pushResultUlt.details}`);
@@ -484,6 +520,7 @@ async function generatePipeline(route, message) {
             type: 'ust', book, chapter: chData.ch,
             username, branch: buildBranchName(book, chData.ch),
             source: chData.ustAligned,
+            verses: hasVerseRange ? `${verseStart}-${verseEnd}` : undefined,
           });
           if (!pushResultUst.success) {
             console.error(`[generate] door43-push UST failed for ${book} ${chData.ch}: ${pushResultUst.details}`);
@@ -536,7 +573,9 @@ async function generatePipeline(route, message) {
 
   // Final message
   if (!isFileResponse && success > 0) {
-    const rangeLabel = start === end ? `${book} ${start}` : `${book} ${start}\u2013${end}`;
+    const rangeLabel = hasVerseRange
+      ? `${book} ${start}:${verseStart}-${verseEnd}`
+      : (start === end ? `${book} ${start}` : `${book} ${start}\u2013${end}`);
     await reply(
       `Content for **${rangeLabel}** pushed to master in en_ult and en_ust.` +
       (fail > 0 ? `\n(${fail} chapter(s) had errors \u2014 check admin DMs for details.)` : '') +
@@ -548,8 +587,13 @@ async function generatePipeline(route, message) {
     pipeline: 'generate', book, startCh: start, endCh: end,
     tokensBefore, success: fail === 0, userId: message.sender_id,
   });
+  const summaryRef = hasVerseRange ? `${book} ${start}:${verseStart}-${verseEnd}` : `${book} ${start}-${end}`;
+  console.log(`[generate] Run summary ref: ${summaryRef}`);
 
-  await status(`Generation complete for **${book} ${start}\u2013${end}**: ${success} succeeded, ${fail} failed.`);
+  const finalLabel = hasVerseRange
+    ? `${book} ${start}:${verseStart}-${verseEnd}`
+    : `${book} ${start}\u2013${end}`;
+  await status(`Generation complete for **${finalLabel}**: ${success} succeeded, ${fail} failed.`);
 }
 
 module.exports = { generatePipeline };

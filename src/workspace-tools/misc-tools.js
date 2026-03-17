@@ -111,7 +111,7 @@ async function giteaPr({ repo, head, base, title, body, merge, noDelete, ensureB
 
 // --- prepare_compare ---
 
-function prepareCompare({ book, chapter, type, editorUsfm, output }) {
+function prepareCompare({ book, chapter, type, editorUsfm, output, verses: verseScope }) {
   const contentType = type || 'ult';
   const bookUpper = book.toUpperCase();
   const width = bookUpper === 'PSA' ? 3 : 2;
@@ -139,6 +139,34 @@ function prepareCompare({ book, chapter, type, editorUsfm, output }) {
     return verses;
   }
 
+  function parseVerseScope(spec) {
+    if (!spec) return null;
+    const trimmed = String(spec).trim();
+    // Accept "1-6" or "1,3,5-7"
+    const parts = trimmed.split(',').map((p) => p.trim()).filter(Boolean);
+    const allowed = new Set();
+    for (const part of parts) {
+      const m = part.match(/^(\d+)(?:\s*[-–—]\s*(\d+))?$/);
+      if (!m) return null;
+      const start = parseInt(m[1], 10);
+      const end = m[2] ? parseInt(m[2], 10) : start;
+      const lo = Math.min(start, end);
+      const hi = Math.max(start, end);
+      for (let v = lo; v <= hi; v++) allowed.add(v);
+    }
+    return allowed;
+  }
+
+  function normalizeForCompare(text) {
+    return String(text || '')
+      // Ignore bracket/quote presentation-only differences in compare mode.
+      .replace(/[{}]/g, '')
+      .replace(/["'“”‘’]/g, '')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .toLowerCase();
+  }
+
   // AI source
   const aiPath = path.join(CSKILLBP_DIR, `output/AI-${contentType.toUpperCase()}/${bookUpper}/${tag}.usfm`);
   if (!fs.existsSync(aiPath)) return `AI file not found: ${aiPath}`;
@@ -152,19 +180,40 @@ function prepareCompare({ book, chapter, type, editorUsfm, output }) {
   }
 
   // Build comparison
-  const allVerses = [...new Set([...Object.keys(aiVerses).map(Number), ...Object.keys(editorVerses).map(Number)])].sort((a, b) => a - b);
-  const verses = [];
+  const allVersesUnfiltered = [...new Set([...Object.keys(aiVerses).map(Number), ...Object.keys(editorVerses).map(Number)])].sort((a, b) => a - b);
+  const allowedVerses = parseVerseScope(verseScope);
+  const allVerses = allowedVerses
+    ? allVersesUnfiltered.filter((v) => allowedVerses.has(v))
+    : allVersesUnfiltered;
+  const compareRows = [];
   let changed = 0;
 
   for (const v of allVerses) {
     const ai = aiVerses[v] || '';
     const editor = editorVerses[v] || '';
-    const isChanged = ai !== editor && editor !== '';
+    const aiNorm = normalizeForCompare(ai);
+    const editorNorm = normalizeForCompare(editor);
+    const isChanged = aiNorm !== editorNorm && editor !== '';
     if (isChanged) changed++;
-    verses.push({ verse: v, ai, editor, changed: isChanged });
+    compareRows.push({
+      verse: v,
+      ai,
+      editor,
+      ai_normalized: aiNorm,
+      editor_normalized: editorNorm,
+      changed: isChanged,
+      changed_raw: ai !== editor && editor !== '',
+    });
   }
 
-  const result = { book: bookUpper, chapter: parseInt(chapter, 10), type: contentType, verses, summary: { total: allVerses.length, changed, unchanged: allVerses.length - changed } };
+  const result = {
+    book: bookUpper,
+    chapter: parseInt(chapter, 10),
+    type: contentType,
+    verse_scope: verseScope || null,
+    verses: compareRows,
+    summary: { total: allVerses.length, changed, unchanged: allVerses.length - changed },
+  };
   const json = JSON.stringify(result, null, 2);
 
   if (output) {

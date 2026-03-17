@@ -4,26 +4,27 @@ const path = require('path');
 const { sendMessage, sendDM } = require('./zulip-client');
 const { normalizeBookName } = require('./pipeline-utils');
 
-const NOTES_DIR = '/srv/bot/workspace/data/editor-notes';
+const CSKILLBP_DIR = process.env.CSKILLBP_DIR || '/workspace';
+const NOTES_DIR = path.join(CSKILLBP_DIR, 'data', 'editor-notes');
 
 /**
  * Run the editor-note pipeline: parse, append to file, reply with count.
  */
 async function editorNotePipeline(route, message) {
   // Extract fields from regex captures or Haiku-extracted data
-  let book, chapter, noteText;
+  let book, scope, noteText;
 
-  if (route._noteText) {
-    // Haiku NLU path — fields pre-extracted
+  if (typeof route._noteText === 'string') {
+    // Parsed route path — fields pre-extracted
     book = route._book ? normalizeBookName(route._book) : null;
-    chapter = route._chapter || null;
+    scope = route._scope || null;
     noteText = route._noteText;
   } else {
-    // Regex path — captures: [book, chapter?, noteText]
+    // Backward-compatible regex path
     const captures = route._captures || [];
     book = captures[0] ? normalizeBookName(captures[0]) : null;
-    chapter = captures[1] || null;
-    noteText = captures[2] || '';
+    scope = null;
+    noteText = captures[1] || '';
   }
 
   if (!book) {
@@ -41,10 +42,10 @@ async function editorNotePipeline(route, message) {
 
   const filePath = path.join(NOTES_DIR, `${book}.md`);
   const date = new Date().toISOString().slice(0, 10);
-  const scope = chapter ? `Chapter ${chapter}` : 'Book-wide';
+  const scopeText = scope ? `Scope ${scope}` : 'Book-wide';
   const sender = message.sender_full_name || 'Unknown';
 
-  const entry = `## ${date} — ${sender}\n**Scope:** ${scope}\n${noteText.trim()}\n\n---\n\n`;
+  const entry = `## ${date} — ${sender}\n**Scope:** ${scopeText}\n${noteText.trim()}\n\n---\n\n`;
 
   fs.appendFileSync(filePath, entry, 'utf8');
 
@@ -60,7 +61,7 @@ async function editorNotePipeline(route, message) {
     await sendDM(message.sender_id, reply);
   }
 
-  console.log(`[editor-note] Filed note for ${book}${chapter ? ' ch' + chapter : ''} from ${sender}`);
+  console.log(`[editor-note] Filed note for ${book}${scope ? ` (${scope})` : ''} from ${sender}`);
 }
 
 module.exports = { editorNotePipeline };

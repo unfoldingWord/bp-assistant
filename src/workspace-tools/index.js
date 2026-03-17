@@ -273,7 +273,9 @@ function createWorkspaceTools(createSdkMcpServer, tool, z) {
       }, async (args) => ({ content: [{ type: 'text', text: await giteaPr(args) }] })),
       tool('prepare_compare', 'Prepare AI vs editor verse-by-verse comparison data', {
         book: z.string().describe('Book code'), chapter: z.number().int().describe('Chapter number'),
-        type: z.enum(['ult', 'ust']).optional(), editorUsfm: z.string().optional(), output: z.string().optional(),
+        type: z.enum(['ult', 'ust']).optional(),
+        verses: z.string().optional().describe('Optional verse scope within chapter, e.g. "1-6" or "1,3,5-7"'),
+        editorUsfm: z.string().optional(), output: z.string().optional(),
       }, async (args) => ({ content: [{ type: 'text', text: prepareCompare(args) }] })),
       tool('prepare_tq', 'Prepare translation questions data for a book/chapter', {
         book: z.string().describe('Book code'), chapter: z.number().int().optional(), wholeBook: z.boolean().optional(),

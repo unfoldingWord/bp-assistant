@@ -11,6 +11,7 @@ services:
     environment:
       - CSKILLBP_DIR=/workspace
       - DOOR43_REPOS_PATH=/workspace/door43-repos
+      - HEBREW_DIR=/workspace/data/hebrew_bible
     volumes:
       - ../workspace:/workspace
       - ../config:/config
