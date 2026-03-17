@@ -30,7 +30,7 @@ const DEFAULT_TIMEOUT_MS = 10 * 60 * 1000;
 const DEFAULT_MAX_TURNS = 200;
 
 const DEFAULT_ALLOWED_TOOLS = [
-  'Read', 'Write', 'Edit', 'Glob', 'Grep', 'Bash',
+  'Read', 'Write', 'Edit', 'Glob', 'Grep',
   'Task', 'Skill', 'SendMessage',
   'Agent', 'TeamCreate', 'TeamDelete',
   'TaskCreate', 'TaskUpdate', 'TaskList', 'TaskGet',
