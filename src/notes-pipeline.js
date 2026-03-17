@@ -21,10 +21,14 @@ const { setPendingMerge } = require('./pending-merges');
 const LOG_DIR = path.resolve(__dirname, '../logs');
 
 const POST_EDIT_REVIEW_HINT =
-  'Use Task subagents for the Diff Analyzer and Issue Reconciler. Do NOT use TeamCreate or SendMessage.';
+  'Use Agent teams (TeamCreate + SendMessage) for the Diff Analyzer and Issue Reconciler if available. ' +
+  'If Agent teams are not available, fall back to Task subagents and poll with TaskGet until all complete. ' +
+  'Do NOT output text without a tool call or the session will end prematurely.';
 
 const DEEP_ISSUE_ID_HINT =
-  'Use Task subagents for Wave 2 analysts and Wave 3 challenger. After spawning each batch of tasks, immediately poll with TaskGet in a loop until all tasks show completed status — do NOT output text without a tool call or the session will end prematurely. Do NOT use TeamCreate or SendMessage.';
+  'Use Agent teams (TeamCreate + SendMessage) for Wave 2 analysts and Wave 3 challenger if available. ' +
+  'If Agent teams are not available, fall back to Task subagents and poll with TaskGet in a loop until all tasks show completed status. ' +
+  'Do NOT output text without a tool call or the session will end prematurely.';
 
 // Ranges where the chapter intro is written by the human editor — skip automatically.
 // PSA 42-123: Books 2-4 handled by Benjamin; 119-123 is a subset but listed explicitly.
