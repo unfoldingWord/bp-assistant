@@ -167,8 +167,17 @@ async function checkConflictingBranches(repo, targetFile, chapter) {
           continue;
         }
 
-        // Chapter-level check: inspect the patch to see if it touches our chapter
-        if (diffTouchesChapter(fileEntry.patch || '', targetFile, chapter)) {
+        // Chapter-level check: inspect the patch to see if it touches our chapter.
+        // Gitea omits patch data for large files (e.g. 19-PSA.usfm at 43K+ lines).
+        // When that happens, fall back to fetching raw content from both branches.
+        let touchesChapter;
+        if (fileEntry.patch) {
+          touchesChapter = diffTouchesChapter(fileEntry.patch, targetFile, chapter);
+        } else {
+          console.log(`${LOG_PREFIX} PR #${pr.number}: no patch data for ${targetFile} — fetching raw content to compare`);
+          touchesChapter = await rawContentTouchesChapter(repo, targetFile, pr.base.label, pr.head.label, chapter, token);
+        }
+        if (touchesChapter) {
           console.log(`${LOG_PREFIX} PR #${pr.number} (branch '${pr.head.label}') modifies ${targetFile} chapter ${chapter} — conflict`);
           conflicting.push({ branch: pr.head.label, pr: pr.number });
         } else {
@@ -239,6 +248,85 @@ function diffTouchesChapter(patch, filename, chapter) {
   }
 
   return false;
+}
+
+/**
+ * Fetch raw file content from a specific branch via the Gitea contents API.
+ * Returns the file text, or null on failure.
+ */
+async function fetchRawContent(repo, filePath, ref, token) {
+  try {
+    const res = await apiRequest('GET',
+      `/repos/${ORG}/${repo}/raw/${encodeURIComponent(filePath)}?ref=${encodeURIComponent(ref)}`,
+      token, null, 60000);
+    if (res.status === 200 && typeof res.data === 'string') return res.data;
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Fallback for when Gitea omits patch data (large files).
+ * Fetches the raw file from both base and head branches, then compares
+ * line-by-line to determine if the changed lines fall within the target chapter.
+ */
+async function rawContentTouchesChapter(repo, filePath, baseBranch, headBranch, chapter, token) {
+  const [baseContent, headContent] = await Promise.all([
+    fetchRawContent(repo, filePath, baseBranch, token),
+    fetchRawContent(repo, filePath, headBranch, token),
+  ]);
+
+  if (!baseContent || !headContent) {
+    console.warn(`${LOG_PREFIX} Could not fetch raw content for ${filePath} — assuming conflict`);
+    return true; // Conservative fallback
+  }
+
+  const baseLines = baseContent.split('\n');
+  const headLines = headContent.split('\n');
+
+  // Build a line-number → chapter map from the base file
+  const chapterMap = new Map();
+  let currentCh = null;
+  for (let i = 0; i < baseLines.length; i++) {
+    const m = baseLines[i].match(/^\\c\s+(\d+)/);
+    if (m) currentCh = m[1];
+    chapterMap.set(i, currentCh);
+  }
+
+  const chStr = String(chapter);
+
+  // Quick length-mismatch scan: if lines were added/removed, do a full diff.
+  // For same-length files, just compare corresponding lines.
+  if (baseLines.length === headLines.length) {
+    for (let i = 0; i < baseLines.length; i++) {
+      if (baseLines[i] !== headLines[i] && chapterMap.get(i) === chStr) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  // Different lengths — use a simple LCS-based approach on chapter boundaries.
+  // Rather than a full diff (expensive for 40K+ lines), check which chapters
+  // have any content differences by comparing chapter-by-chapter.
+  const extractChapter = (lines, targetCh) => {
+    const result = [];
+    let inChapter = false;
+    for (const line of lines) {
+      const m = line.match(/^\\c\s+(\d+)/);
+      if (m) {
+        inChapter = (m[1] === targetCh);
+      }
+      if (inChapter) result.push(line);
+    }
+    return result.join('\n');
+  };
+
+  const baseChapter = extractChapter(baseLines, chStr);
+  const headChapter = extractChapter(headLines, chStr);
+
+  return baseChapter !== headChapter;
 }
 
 // ---------------------------------------------------------------------------
