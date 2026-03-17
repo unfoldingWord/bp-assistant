@@ -10,7 +10,7 @@ const fs = require('fs');
 const path = require('path');
 const config = require('./config');
 const { sendMessage, sendDM, addReaction, removeReaction, uploadFile } = require('./zulip-client');
-const { runClaude } = require('./claude-runner');
+const { runClaude, DEFAULT_RESTRICTED_TOOLS } = require('./claude-runner');
 const { getDoor43Username, buildBranchName, resolveOutputFile, calcSkillTimeout, normalizeBookName, resolveConflictMention, CSKILLBP_DIR } = require('./pipeline-utils');
 const { verifyRepoPush, verifyDcsToken } = require('./repo-verify');
 const { ensureFreshToken, isAuthError } = require('./auth-refresh');
@@ -19,6 +19,14 @@ const { door43Push, checkConflictingBranches, REPO_MAP, getRepoFilename } = requ
 const { setPendingMerge } = require('./pending-merges');
 
 const LOG_DIR = path.resolve(__dirname, '../logs');
+const REQUIRED_INITIAL_PIPELINE_FILES = [
+  '.claude/skills/initial-pipeline/SKILL.md',
+  '.claude/skills/issue-identification/orchestration-conventions.md',
+  '.claude/skills/issue-identification/analyst-domains.md',
+  '.claude/skills/issue-identification/challenger-protocol.md',
+  '.claude/skills/issue-identification/merge-procedure.md',
+  '.claude/skills/issue-identification/gemini-review-wave.md',
+];
 
 function parseGenerateCommand(content) {
   const input = content.toLowerCase();
@@ -137,6 +145,19 @@ async function generatePipeline(route, message) {
 
   // Determine skill from route config
   const skill = route.skill || 'initial-pipeline';
+  const isInitialPipelineSkill = skill.split(/\s+/)[0] === 'initial-pipeline';
+
+  if (isInitialPipelineSkill) {
+    const missingFiles = REQUIRED_INITIAL_PIPELINE_FILES.filter((relPath) => !fs.existsSync(path.join(CSKILLBP_DIR, relPath)));
+    if (missingFiles.length > 0) {
+      await addReaction(msgId, 'cross_mark');
+      await status(
+        `Generate preflight failed: required skill files are missing under ${CSKILLBP_DIR}:\n` +
+        missingFiles.map((f) => `- \`${f}\``).join('\n')
+      );
+      return;
+    }
+  }
 
   const tokensBefore = getCumulativeTokens();
   let success = 0;
@@ -182,6 +203,10 @@ async function generatePipeline(route, message) {
           cwd: CSKILLBP_DIR,
           model,
           skill,
+          tools: DEFAULT_RESTRICTED_TOOLS,
+          disallowedTools: ['Bash'],
+          disableLocalSettings: true,
+          forceNoAutoBashSandbox: true,
           timeoutMs,
         });
       } catch (err) {
@@ -285,6 +310,10 @@ async function generatePipeline(route, message) {
         cwd: CSKILLBP_DIR,
         model,
         skill: 'align-all-parallel',
+        tools: DEFAULT_RESTRICTED_TOOLS,
+        disallowedTools: ['Bash'],
+        disableLocalSettings: true,
+        forceNoAutoBashSandbox: true,
         timeoutMs: alignTimeout,
       });
       const alignDuration = ((Date.now() - chapterStart) / 1000).toFixed(1);

@@ -37,11 +37,24 @@ const DEFAULT_ALLOWED_TOOLS = [
   'NotebookEdit', 'WebFetch', 'WebSearch',
 ];
 
+// Restricted profile for shell-less runs (distroless-compatible).
+const DEFAULT_RESTRICTED_TOOLS = [
+  'Read', 'Write', 'Edit', 'Glob', 'Grep',
+  'Task', 'TaskOutput', 'Skill', 'SendMessage',
+  'Agent', 'TeamCreate', 'TeamDelete',
+  'TaskCreate', 'TaskUpdate', 'TaskList', 'TaskGet',
+  'NotebookEdit', 'WebFetch', 'WebSearch',
+];
+
 function buildOptions({
   cwd,
   resume,
   model,
   allowedTools,
+  tools,
+  disallowedTools,
+  disableLocalSettings,
+  forceNoAutoBashSandbox,
   maxTurns,
   timeoutMs,
   appendSystemPrompt,
@@ -55,9 +68,23 @@ function buildOptions({
     allowedTools: allowedTools || DEFAULT_ALLOWED_TOOLS,
     permissionMode: 'bypassPermissions',
     allowDangerouslySkipPermissions: true,
-    settingSources: ['user', 'project', 'local'],
+    settingSources: disableLocalSettings ? ['user', 'project'] : ['user', 'project', 'local'],
     persistSession: true,
   };
+  if (tools) {
+    options.tools = tools;
+  }
+  if (disallowedTools) {
+    options.disallowedTools = disallowedTools;
+  }
+  if (forceNoAutoBashSandbox) {
+    options.settings = {
+      sandbox: {
+        enabled: true,
+        autoAllowBashIfSandboxed: false,
+      },
+    };
+  }
   if (mcpServers) {
     options.mcpServers = mcpServers;
   }
@@ -71,7 +98,20 @@ function buildOptions({
   return options;
 }
 
-async function runClaude({ prompt, cwd, model, allowedTools, skill, maxTurns, timeoutMs, appendSystemPrompt }) {
+async function runClaude({
+  prompt,
+  cwd,
+  model,
+  allowedTools,
+  tools,
+  disallowedTools,
+  disableLocalSettings,
+  forceNoAutoBashSandbox,
+  skill,
+  maxTurns,
+  timeoutMs,
+  appendSystemPrompt,
+}) {
   await ensureFreshToken();
   const query = await getQuery();
   const wsTools = await getWorkspaceToolsServer();
@@ -89,6 +129,10 @@ async function runClaude({ prompt, cwd, model, allowedTools, skill, maxTurns, ti
     cwd,
     model,
     allowedTools,
+    tools,
+    disallowedTools,
+    disableLocalSettings,
+    forceNoAutoBashSandbox,
     maxTurns,
     appendSystemPrompt,
     abortController,
@@ -126,6 +170,9 @@ async function runClaude({ prompt, cwd, model, allowedTools, skill, maxTurns, ti
         }
       } else if (message.type === 'system') {
         console.log(`[claude-runner] SDK system: ${message.subtype || 'unknown'} ${JSON.stringify(message).slice(0, 200)}`);
+        if (message.subtype === 'init' && Array.isArray(message.tools)) {
+          console.log(`[claude-runner] SDK init tools: ${message.tools.join(', ')}`);
+        }
       } else {
         console.log(`[claude-runner] SDK event: ${message.type}${message.subtype ? '/' + message.subtype : ''}`);
       }
@@ -181,7 +228,20 @@ async function runClaude({ prompt, cwd, model, allowedTools, skill, maxTurns, ti
  * @param {{ prompt: string, cwd?: string, resume?: string, model?: string, maxTurns?: number, timeoutMs?: number, appendSystemPrompt?: string }}
  * @returns {{ conversation: AsyncGenerator, abortController: AbortController, cleanup: () => void }}
  */
-async function runClaudeStream({ prompt, cwd, resume, model, maxTurns, timeoutMs, appendSystemPrompt }) {
+async function runClaudeStream({
+  prompt,
+  cwd,
+  resume,
+  model,
+  allowedTools,
+  tools,
+  disallowedTools,
+  disableLocalSettings,
+  forceNoAutoBashSandbox,
+  maxTurns,
+  timeoutMs,
+  appendSystemPrompt,
+}) {
   await ensureFreshToken();
   const query = await getQuery();
   const wsTools = await getWorkspaceToolsServer();
@@ -196,6 +256,11 @@ async function runClaudeStream({ prompt, cwd, resume, model, maxTurns, timeoutMs
     cwd,
     resume,
     model,
+    allowedTools,
+    tools,
+    disallowedTools,
+    disableLocalSettings,
+    forceNoAutoBashSandbox,
     maxTurns,
     appendSystemPrompt,
     abortController,
@@ -217,4 +282,5 @@ module.exports = {
   runClaude,
   runClaudeStream,
   buildOptions,
+  DEFAULT_RESTRICTED_TOOLS,
 };
