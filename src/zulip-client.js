@@ -1,17 +1,22 @@
 require('dotenv').config();
 const zulip = require('zulip-js');
 const fs = require('fs');
+const { readSecret } = require('./secrets');
 
 let client = null;
+
+function getZulipConfig() {
+  return {
+    username: readSecret('zulip_email', 'ZULIP_EMAIL'),
+    apiKey: readSecret('zulip_api_key', 'ZULIP_API_KEY'),
+    realm: process.env.ZULIP_REALM,
+  };
+}
 
 async function getClient() {
   if (client) return client;
 
-  const config = {
-    username: process.env.ZULIP_EMAIL,
-    apiKey: process.env.ZULIP_API_KEY,
-    realm: process.env.ZULIP_REALM,
-  };
+  const config = getZulipConfig();
 
   client = await zulip(config);
   return client;
@@ -58,8 +63,9 @@ async function removeReaction(messageId, emojiName) {
 
 function uploadFile(filePath, fileName) {
   const FormData = require('form-data');
-  const realm = process.env.ZULIP_REALM;
-  const auth = Buffer.from(`${process.env.ZULIP_EMAIL}:${process.env.ZULIP_API_KEY}`).toString('base64');
+  const cfg = getZulipConfig();
+  const realm = cfg.realm;
+  const auth = Buffer.from(`${cfg.username}:${cfg.apiKey}`).toString('base64');
 
   const form = new FormData();
   form.append('filename', fs.createReadStream(filePath), { filename: fileName });

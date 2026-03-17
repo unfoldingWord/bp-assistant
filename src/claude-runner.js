@@ -282,5 +282,6 @@ module.exports = {
   runClaude,
   runClaudeStream,
   buildOptions,
+  getWorkspaceToolsServer,
   DEFAULT_RESTRICTED_TOOLS,
 };

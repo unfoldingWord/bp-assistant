@@ -12,6 +12,10 @@ services:
       - CSKILLBP_DIR=/workspace
       - DOOR43_REPOS_PATH=/workspace/door43-repos
       - HEBREW_DIR=/workspace/data/hebrew_bible
+      - DOOR43_TOKEN_FILE=/run/secrets/door43_token
+      - DOOR43_USERNAME_FILE=/run/secrets/door43_username
+      - ZULIP_EMAIL_FILE=/run/secrets/zulip_email
+      - ZULIP_API_KEY_FILE=/run/secrets/zulip_api_key
     volumes:
       - ../workspace:/workspace
       - ../config:/config
@@ -23,9 +27,17 @@ services:
     secrets:
       - bt_mcp_api_token
       - claude_oauth_token
+      - door43_token
+      - door43_username
+      - zulip_email
+      - zulip_api_key
     networks:
       - work-net
       - home-net
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
     deploy:
       resources:
         limits:
@@ -36,6 +48,14 @@ secrets:
     file: ../config/secrets/bt_mcp_api_token
   claude_oauth_token:
     file: ../config/secrets/claude_oauth_token
+  door43_token:
+    file: ../config/secrets/door43_token
+  door43_username:
+    file: ../config/secrets/door43_username
+  zulip_email:
+    file: ../config/secrets/zulip_email
+  zulip_api_key:
+    file: ../config/secrets/zulip_api_key
 
 volumes:
   claude-config:

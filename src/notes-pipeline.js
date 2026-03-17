@@ -63,6 +63,66 @@ function refreshChapterNotesFromShards(book, tag, chapterRel) {
   return chapterRel;
 }
 
+function isUsageLimitError(text) {
+  return /hit your limit|usage limit|rate limit|too many requests|429/i.test(String(text || ''));
+}
+
+function chicagoIsoFromUtcDate(date) {
+  const wall = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'America/Chicago',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: false,
+  }).formatToParts(date);
+  const byType = Object.fromEntries(wall.map((p) => [p.type, p.value]));
+
+  const tzName = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'America/Chicago',
+    timeZoneName: 'shortOffset',
+  }).formatToParts(date).find((p) => p.type === 'timeZoneName')?.value || 'GMT-6';
+
+  const offsetMatch = tzName.match(/^GMT([+-])(\d{1,2})(?::?(\d{2}))?$/);
+  let offset = '-06:00';
+  if (offsetMatch) {
+    const sign = offsetMatch[1];
+    const hh = String(offsetMatch[2]).padStart(2, '0');
+    const mm = String(offsetMatch[3] || '00').padStart(2, '0');
+    offset = `${sign}${hh}:${mm}`;
+  }
+
+  return `${byType.year}-${byType.month}-${byType.day}T${byType.hour}:${byType.minute}:${byType.second}${offset}`;
+}
+
+function buildUsageLimitResetTag(errorText) {
+  // Example: "You've hit your limit · resets 8pm (UTC)"
+  const m = String(errorText || '').match(/resets?\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)\s*\(UTC\)/i);
+  if (!m) return null;
+
+  let hour = parseInt(m[1], 10);
+  const minute = parseInt(m[2] || '0', 10);
+  const ampm = m[3].toLowerCase();
+  if (ampm === 'pm' && hour !== 12) hour += 12;
+  if (ampm === 'am' && hour === 12) hour = 0;
+
+  const now = new Date();
+  const resetUtc = new Date(Date.UTC(
+    now.getUTCFullYear(),
+    now.getUTCMonth(),
+    now.getUTCDate(),
+    hour,
+    minute,
+    0,
+  ));
+  if (resetUtc.getTime() <= now.getTime()) {
+    resetUtc.setUTCDate(resetUtc.getUTCDate() + 1);
+  }
+  return `<time:${chicagoIsoFromUtcDate(resetUtc)}>`;
+}
+
 // --- Parse "write notes BOOK CH" or "write notes BOOK CH:VS-VS" or "write notes BOOK CH1-CH2" ---
 function parseWriteNotesCommand(content) {
   // Range: write notes PSA 66-72 or write notes for PSA 66-72
@@ -188,6 +248,8 @@ async function notesPipeline(route, message) {
   let deferredPush = false;
   let deferredConflicts = [];   // [{ branch }]
   const deferredChapters = [];  // [{ ch, notesSource }]
+  let abortForUsageLimit = false;
+  let usageLimitTag = null;
 
   // =========================================================================
   // Per-chapter loop: skills -> repo-insert -> repo-verify -> notify user
@@ -287,6 +349,7 @@ async function notesPipeline(route, message) {
       console.log(`[notes] Running ${skill.name}: ${skill.prompt} (timeout: ${Math.round(timeoutMs / 60000)}min)`);
 
       let result = null;
+      let skillError = null;
       try {
         result = await runClaude({
           prompt: skill.prompt,
@@ -301,6 +364,7 @@ async function notesPipeline(route, message) {
           appendSystemPrompt: skill.appendSystemPrompt,
         });
       } catch (err) {
+        skillError = err;
         console.error(`[notes] ${skill.name} error: ${err.message}`);
       }
 
@@ -311,12 +375,55 @@ async function notesPipeline(route, message) {
       const logLine = `${new Date().toISOString()} | ${tag} | ${skill.name} | sdk=${sdkSuccess} | duration=${duration}s\n`;
       fs.appendFileSync(logFile, logLine);
 
+      // Hard fail on thrown SDK errors (including usage/rate limits).
+      if (skillError) {
+        failedSkill = skill.name;
+        const errText = skillError.message || String(skillError);
+        if (isUsageLimitError(errText)) {
+          abortForUsageLimit = true;
+          usageLimitTag = buildUsageLimitResetTag(errText);
+          const when = usageLimitTag ? ` around ${usageLimitTag}` : ' after the limit resets';
+          await status(`**${skill.name}** failed for ${ref}: usage limit reached. Retry${when}.`);
+        } else {
+          await status(`**${skill.name}** failed for ${ref}: ${errText}`);
+        }
+        break;
+      }
+
+      // Hard fail on non-success result payloads, even if old output files exist.
+      if (!result || result.subtype !== 'success') {
+        failedSkill = skill.name;
+        const errText = result?.error || result?.result || `Claude returned subtype "${result?.subtype || 'unknown'}"`;
+        if (isUsageLimitError(errText)) {
+          abortForUsageLimit = true;
+          usageLimitTag = buildUsageLimitResetTag(errText);
+          const when = usageLimitTag ? ` around ${usageLimitTag}` : ' after the limit resets';
+          await status(`**${skill.name}** failed for ${ref}: usage limit reached. Retry${when}.`);
+        } else {
+          await status(`**${skill.name}** failed for ${ref}: ${errText}`);
+        }
+        break;
+      }
+
       // Check expected output (resolveOutputFile handles padding + subdirs)
       if (skill.expectedOutput) {
         const resolved = resolveOutputFile(skill.expectedOutput, book);
         if (!resolved) {
           failedSkill = skill.name;
           await status(`**${skill.name}** failed for ${ref} \u2014 expected output not found: ${skill.expectedOutput} (${duration}s)`);
+          break;
+        }
+        // Guard against stale artifacts from previous runs being treated as success.
+        const absResolvedFreshness = path.resolve(CSKILLBP_DIR, resolved);
+        let mtimeMs = 0;
+        try {
+          mtimeMs = fs.statSync(absResolvedFreshness).mtimeMs;
+        } catch (_) {
+          mtimeMs = 0;
+        }
+        if (mtimeMs < skillStart - 2000) {
+          failedSkill = skill.name;
+          await status(`**${skill.name}** failed for ${ref} \u2014 output file is stale from an earlier run: ${resolved}`);
           break;
         }
         skill.resolvedOutput = resolved;
@@ -377,6 +484,7 @@ async function notesPipeline(route, message) {
     if (failedSkill) {
       totalFail++;
       await status(`Chapter ${ref} failed at **${failedSkill}** after ${chapterDuration}s`);
+      if (abortForUsageLimit) break;
       // Continue to next chapter instead of aborting the whole pipeline
       continue;
     }
@@ -531,6 +639,21 @@ async function notesPipeline(route, message) {
 
   // --- Final reaction and report ---
   await removeReaction(msgId, 'working_on_it');
+
+  if (abortForUsageLimit) {
+    await addReaction(msgId, 'warning');
+    const when = usageLimitTag ? ` around ${usageLimitTag}` : ' after the limit resets';
+    await reply(
+      `Notes pipeline paused: I hit our Claude usage limit and stopped before push/verify for unfinished work. ` +
+      `I can resume${when}.`
+    );
+    recordRunSummary({
+      pipeline: 'notes', book, startCh: startChapter, endCh: endChapter,
+      tokensBefore, success: false, userId: message.sender_id,
+    });
+    await status(`Notes pipeline paused for **${rangeLabel}** due to usage limit.`);
+    return;
+  }
 
   if (totalFail > 0 && totalSuccess === 0) {
     await addReaction(msgId, 'warning');

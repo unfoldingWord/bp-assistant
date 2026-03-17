@@ -5,6 +5,7 @@
 const fs = require('fs');
 const path = require('path');
 const https = require('https');
+const { readSecret } = require('../secrets');
 
 const CSKILLBP_DIR = process.env.CSKILLBP_DIR || '/srv/bot/workspace';
 const GITEA_API = 'https://git.door43.org/api/v1';
@@ -43,7 +44,7 @@ function apiRequest(method, apiPath, token, data = null) {
 }
 
 function getToken() {
-  let token = process.env.DOOR43_TOKEN || process.env.GITEA_TOKEN;
+  let token = readSecret('door43_token', 'DOOR43_TOKEN') || readSecret('gitea_token', 'GITEA_TOKEN');
   if (token) return token;
   const envPaths = [path.join(CSKILLBP_DIR, '.env'), '/srv/bot/config/.env'];
   for (const ep of envPaths) {

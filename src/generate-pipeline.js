@@ -72,6 +72,71 @@ function parseGenerateCommand(content) {
   return null;
 }
 
+function isUsageLimitError(text) {
+  return /hit your limit|usage limit|rate limit|too many requests|429/i.test(String(text || ''));
+}
+
+function chicagoIsoFromUtcDate(date) {
+  const wall = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'America/Chicago',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: false,
+  }).formatToParts(date);
+  const byType = Object.fromEntries(wall.map((p) => [p.type, p.value]));
+
+  const tzName = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'America/Chicago',
+    timeZoneName: 'shortOffset',
+  }).formatToParts(date).find((p) => p.type === 'timeZoneName')?.value || 'GMT-6';
+
+  const offsetMatch = tzName.match(/^GMT([+-])(\d{1,2})(?::?(\d{2}))?$/);
+  let offset = '-06:00';
+  if (offsetMatch) {
+    const sign = offsetMatch[1];
+    const hh = String(offsetMatch[2]).padStart(2, '0');
+    const mm = String(offsetMatch[3] || '00').padStart(2, '0');
+    offset = `${sign}${hh}:${mm}`;
+  }
+  return `${byType.year}-${byType.month}-${byType.day}T${byType.hour}:${byType.minute}:${byType.second}${offset}`;
+}
+
+function buildUsageLimitResetTag(errorText) {
+  const m = String(errorText || '').match(/resets?\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)\s*\(UTC\)/i);
+  if (!m) return null;
+  let hour = parseInt(m[1], 10);
+  const minute = parseInt(m[2] || '0', 10);
+  const ampm = m[3].toLowerCase();
+  if (ampm === 'pm' && hour !== 12) hour += 12;
+  if (ampm === 'am' && hour === 12) hour = 0;
+
+  const now = new Date();
+  const resetUtc = new Date(Date.UTC(
+    now.getUTCFullYear(),
+    now.getUTCMonth(),
+    now.getUTCDate(),
+    hour,
+    minute,
+    0,
+  ));
+  if (resetUtc.getTime() <= now.getTime()) resetUtc.setUTCDate(resetUtc.getUTCDate() + 1);
+  return `<time:${chicagoIsoFromUtcDate(resetUtc)}>`;
+}
+
+function isFreshOutput(relPath, minMs) {
+  if (!relPath) return false;
+  try {
+    const abs = path.resolve(CSKILLBP_DIR, relPath);
+    return fs.statSync(abs).mtimeMs >= (minMs - 2000);
+  } catch {
+    return false;
+  }
+}
+
 async function generatePipeline(route, message) {
   const adminUserId = config.adminUserId;
   const stream = message.type === 'stream' ? message.display_recipient : null;
@@ -189,6 +254,8 @@ async function generatePipeline(route, message) {
   let success = 0;
   let fail = 0;
   const completedChapters = []; // Phase 1 results for non-file-response users
+  let abortForUsageLimit = false;
+  let usageLimitTag = null;
 
   // =========================================================================
   // Phase 1: Generate + Align (always runs)
@@ -200,6 +267,7 @@ async function generatePipeline(route, message) {
 
     const chapterStart = Date.now();
     let claudeResult = null;
+    let sdkError = null;
 
     if (isDryRun) {
       const dryRunRef = hasVerseRange ? `${book} ${ch}:${verseStart}-${verseEnd}` : `${book} ${ch}`;
@@ -239,6 +307,7 @@ async function generatePipeline(route, message) {
           timeoutMs,
         });
       } catch (err) {
+        sdkError = err;
         console.error(`[generate] Claude SDK error for ${book} ${ch}: ${err.message}`);
         if (isAuthError(err)) {
           await reply('Claude auth expired. Waiting for re-authentication...');
@@ -253,7 +322,6 @@ async function generatePipeline(route, message) {
           fail += (end - ch + 1);
           break;
         }
-        claudeResult = null;
       }
     }
 
@@ -271,14 +339,40 @@ async function generatePipeline(route, message) {
     const logLine = `${new Date().toISOString()} | ${book} ${ch} | sdk=${sdkSuccess} | ult=${hasUlt} | ust=${hasUst} | duration=${duration}s\n`;
     fs.appendFileSync(logFile, logLine);
 
+    if (sdkError) {
+      const errText = sdkError.message || String(sdkError);
+      if (isUsageLimitError(errText)) {
+        abortForUsageLimit = true;
+        usageLimitTag = buildUsageLimitResetTag(errText);
+        break;
+      }
+      await status(`Failed to generate **${book} ${ch}**: ${errText}`);
+      fail++;
+      continue;
+    }
+
+    if (!claudeResult || claudeResult.subtype !== 'success') {
+      const errText = claudeResult?.error || claudeResult?.result || `Claude returned subtype "${claudeResult?.subtype || 'unknown'}"`;
+      if (isUsageLimitError(errText)) {
+        abortForUsageLimit = true;
+        usageLimitTag = buildUsageLimitResetTag(errText);
+        break;
+      }
+      await status(`Failed to generate **${book} ${ch}**: ${errText}`);
+      fail++;
+      continue;
+    }
+
     if (!hasUst) {
       await status(`Failed to generate **${book} ${ch}**. UST not produced${hasUlt ? ' (ULT exists but may be incomplete)' : ''}. Check logs for details.`);
       fail++;
       continue;
     }
 
-    if (!sdkSuccess) {
-      console.log(`[generate] SDK exited with ${claudeResult?.subtype || 'no result'} but UST exists \u2014 treating as success`);
+    if (!isFreshOutput(ustRel, chapterStart)) {
+      await status(`Failed to generate **${book} ${ch}**: output appears stale from an earlier run (${ustRel}).`);
+      fail++;
+      continue;
     }
 
     // DM token usage to admin if available
@@ -350,6 +444,18 @@ async function generatePipeline(route, message) {
       });
       const alignDuration = ((Date.now() - chapterStart) / 1000).toFixed(1);
 
+      if (!alignResult || alignResult.subtype !== 'success') {
+        const errText = alignResult?.error || alignResult?.result || `Claude returned subtype "${alignResult?.subtype || 'unknown'}"`;
+        if (isUsageLimitError(errText)) {
+          abortForUsageLimit = true;
+          usageLimitTag = buildUsageLimitResetTag(errText);
+          break;
+        }
+        await status(`**align-all-parallel** failed for ${book} ${ch}: ${errText}`);
+        fail++;
+        continue;
+      }
+
       // Record metrics for align-all-parallel
       const alignMetricRef = hasVerseRange ? `${book} ${ch}:${verseStart}-${verseEnd}` : `${book} ${ch}`;
       console.log(`[generate] Metrics ref: align-all-parallel ${alignMetricRef}`);
@@ -368,18 +474,44 @@ async function generatePipeline(route, message) {
         fail++;
         continue;
       }
+      if (!isFreshOutput(alignedUltRel, chapterStart) || !isFreshOutput(alignedUstRel, chapterStart)) {
+        await status(`**align-all-parallel** failed for ${book} ${ch} \u2014 aligned output appears stale from an earlier run`);
+        fail++;
+        continue;
+      }
       await status(`**align-all-parallel** done for ${book} ${ch} (${alignDuration}s)`);
 
       // Collect for Phase 2 insertion (must be inside try block — alignedUltRel/alignedUstRel are block-scoped)
       completedChapters.push({ ch, ultAligned: alignedUltRel, ustAligned: alignedUstRel });
     } catch (err) {
       console.error(`[generate] align-all-parallel error for ${book} ${ch}: ${err.message}`);
+      if (isUsageLimitError(err.message || '')) {
+        abortForUsageLimit = true;
+        usageLimitTag = buildUsageLimitResetTag(err.message || '');
+        break;
+      }
       await status(`**align-all-parallel** error for ${book} ${ch}: ${err.message}`);
       fail++;
       continue;
     }
 
     success++;
+  }
+
+  if (abortForUsageLimit) {
+    await removeReaction(msgId, 'working_on_it');
+    await addReaction(msgId, 'warning');
+    const when = usageLimitTag ? ` around ${usageLimitTag}` : ' after the limit resets';
+    await reply(
+      `Generation pipeline paused: I hit our Claude usage limit and stopped before push/verify for unfinished work. ` +
+      `I can resume${when}.`
+    );
+    recordRunSummary({
+      pipeline: 'generate', book, startCh: start, endCh: end,
+      tokensBefore, success: false, userId: message.sender_id,
+    });
+    await status(`Generation paused for **${refLabel}** due to usage limit.`);
+    return;
   }
 
   // =========================================================================

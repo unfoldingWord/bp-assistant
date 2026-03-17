@@ -5,7 +5,7 @@ const path = require('path');
 const os = require('os');
 const config = require('./config');
 const { getSession, setSession, setModel, clearSession, incrementExchanges } = require('./session-store');
-const { buildOptions } = require('./claude-runner');
+const { buildOptions, DEFAULT_RESTRICTED_TOOLS, getWorkspaceToolsServer } = require('./claude-runner');
 const { ensureFreshToken } = require('./auth-refresh');
 const { sendDM, sendMessage, addReaction, removeReaction } = require('./zulip-client');
 const { recordMetrics } = require('./usage-tracker');
@@ -70,12 +70,65 @@ function modelToPrefix(model) {
   return 'H: ';
 }
 
+function isUsageLimitError(text) {
+  return /hit your limit|usage limit|rate limit|too many requests|429/i.test(String(text || ''));
+}
+
+function chicagoIsoFromUtcDate(date) {
+  const wall = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'America/Chicago',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: false,
+  }).formatToParts(date);
+  const byType = Object.fromEntries(wall.map((p) => [p.type, p.value]));
+  const tzName = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'America/Chicago',
+    timeZoneName: 'shortOffset',
+  }).formatToParts(date).find((p) => p.type === 'timeZoneName')?.value || 'GMT-6';
+  const offsetMatch = tzName.match(/^GMT([+-])(\d{1,2})(?::?(\d{2}))?$/);
+  let offset = '-06:00';
+  if (offsetMatch) {
+    const sign = offsetMatch[1];
+    const hh = String(offsetMatch[2]).padStart(2, '0');
+    const mm = String(offsetMatch[3] || '00').padStart(2, '0');
+    offset = `${sign}${hh}:${mm}`;
+  }
+  return `${byType.year}-${byType.month}-${byType.day}T${byType.hour}:${byType.minute}:${byType.second}${offset}`;
+}
+
+function buildUsageLimitResetTag(errorText) {
+  const m = String(errorText || '').match(/resets?\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)\s*\(UTC\)/i);
+  if (!m) return null;
+  let hour = parseInt(m[1], 10);
+  const minute = parseInt(m[2] || '0', 10);
+  const ampm = m[3].toLowerCase();
+  if (ampm === 'pm' && hour !== 12) hour += 12;
+  if (ampm === 'am' && hour === 12) hour = 0;
+  const now = new Date();
+  const resetUtc = new Date(Date.UTC(
+    now.getUTCFullYear(),
+    now.getUTCMonth(),
+    now.getUTCDate(),
+    hour,
+    minute,
+    0,
+  ));
+  if (resetUtc.getTime() <= now.getTime()) resetUtc.setUTCDate(resetUtc.getUTCDate() + 1);
+  return `<time:${chicagoIsoFromUtcDate(resetUtc)}>`;
+}
+
 /**
  * Run one query() call, collecting reply text and session ID.
  */
 async function runInteractiveQuery({ prompt, cwd, resume, model, maxTurns, timeoutMs, appendSystemPrompt }) {
   await ensureFreshToken();
   const queryFn = await getQuery();
+  const wsTools = await getWorkspaceToolsServer();
   const abortController = new AbortController();
   const timeout = timeoutMs || DEFAULT_TIMEOUT_MS;
   const timer = setTimeout(() => {
@@ -90,6 +143,11 @@ async function runInteractiveQuery({ prompt, cwd, resume, model, maxTurns, timeo
     maxTurns,
     abortController,
     appendSystemPrompt,
+    tools: DEFAULT_RESTRICTED_TOOLS,
+    disallowedTools: ['Bash'],
+    disableLocalSettings: true,
+    forceNoAutoBashSandbox: true,
+    mcpServers: { 'workspace-tools': wsTools },
   });
 
   console.log(`[interactive] query() cwd=${cwd} model=${model}${resume ? ` resume=${resume.slice(0, 8)}…` : ''}`);
@@ -115,6 +173,12 @@ async function runInteractiveQuery({ prompt, cwd, resume, model, maxTurns, timeo
     if (abortController.signal.aborted) {
       const e = new Error('Request timed out');
       e.name = 'AbortError';
+      throw e;
+    }
+    if (!result || result.subtype !== 'success') {
+      const errText = result?.error || result?.result || `Claude returned subtype "${result?.subtype || 'unknown'}"`;
+      const e = new Error(errText);
+      e.name = 'ClaudeRunError';
       throw e;
     }
   } finally {
@@ -250,6 +314,10 @@ async function interactiveDmPipeline(route, message) {
     clearSession(sessionKey);
     if (err.name === 'AbortError') {
       await reply('Request timed out. You can send another message to continue.');
+    } else if (isUsageLimitError(err.message || '')) {
+      const resetTag = buildUsageLimitResetTag(err.message || '');
+      const when = resetTag ? ` around ${resetTag}` : ' after the limit resets';
+      await reply(`I hit our Claude usage limit for this request. Please try again${when}.`);
     } else {
       await reply(`Something went wrong: ${err.message}. Send another message to try again or /reset to start fresh.`);
     }

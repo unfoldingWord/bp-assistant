@@ -12,6 +12,7 @@ const { getVerseCount } = require('./verse-counts');
 const { insertTnRows } = require('./lib/insert-tn-rows');
 const { insertUsfmVerses } = require('./lib/insert-usfm-verses');
 const { validateTnTsv } = require('./workspace-tools/quality-tools');
+const { readSecret } = require('./secrets');
 
 const GITEA_API = 'https://git.door43.org/api/v1';
 const ORG = 'unfoldingWord';
@@ -334,11 +335,10 @@ async function rawContentTouchesChapter(repo, filePath, baseBranch, headBranch, 
 // ---------------------------------------------------------------------------
 
 function getConfig() {
-  // Try workspace .env first (same logic as gitea_pr.py)
-  let token = process.env.DOOR43_TOKEN || process.env.GITEA_TOKEN;
-  let username = process.env.DOOR43_USERNAME || process.env.GITEA_USERNAME;
+  let token = readSecret('door43_token', 'DOOR43_TOKEN') || readSecret('gitea_token', 'GITEA_TOKEN');
+  let username = readSecret('door43_username', 'DOOR43_USERNAME') || readSecret('gitea_username', 'GITEA_USERNAME');
 
-  // Try loading from workspace .env if env vars missing
+  // Legacy compatibility: fallback to .env values if not provided via secrets or env vars.
   const envPaths = [
     path.join(CSKILLBP_DIR, '.env'),
     '/srv/bot/config/.env',

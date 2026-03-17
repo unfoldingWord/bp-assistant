@@ -7,6 +7,7 @@
 // looks identical to "branch was merged and deleted."
 
 const https = require('https');
+const { readSecret } = require('./secrets');
 
 const GITEA_API = 'https://git.door43.org/api/v1';
 const ORG = 'unfoldingWord';
@@ -58,7 +59,7 @@ function apiGet(path, token) {
  * @returns {{ success: boolean, details: string }}
  */
 async function verifyRepoPush({ repo, stagingBranch, since }) {
-  const token = process.env.DOOR43_TOKEN || process.env.GITEA_TOKEN;
+  const token = readSecret('door43_token', 'DOOR43_TOKEN') || readSecret('gitea_token', 'GITEA_TOKEN');
 
   if (!token) {
     return {
@@ -146,7 +147,7 @@ async function verifyRepoPush({ repo, stagingBranch, since }) {
  * Returns { valid: boolean, details: string }.
  */
 async function verifyDcsToken() {
-  const token = process.env.DOOR43_TOKEN || process.env.GITEA_TOKEN;
+  const token = readSecret('door43_token', 'DOOR43_TOKEN') || readSecret('gitea_token', 'GITEA_TOKEN');
   if (!token) {
     return { valid: false, details: 'No DCS token set (DOOR43_TOKEN / GITEA_TOKEN)' };
   }
