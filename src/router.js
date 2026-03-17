@@ -12,6 +12,12 @@ const { normalizeBookName, isValidBook } = require('./pipeline-utils');
 // In-memory pending confirmations for stream messages
 const pendingConfirmations = new Map();
 
+// TEMPORARY TEST LOCK:
+// Restrict bot interactions to admin user during branch validation.
+// Flip to false (or remove) after testing is complete.
+const TEMP_SINGLE_USER_TEST_MODE = true;
+const TEMP_TEST_LOCK_REPLY = 'I am temporarily in maintenance/testing mode for about an hour while we validate an update. Please retry shortly.';
+
 /**
  * Detect whether the user asked for ULT only, UST only, or both.
  */
@@ -361,6 +367,16 @@ async function routeMessage(message) {
   const sessionKey = isStream
     ? `stream-${message.display_recipient}-${message.subject}`
     : `dm-${message.sender_id}`;
+
+  if (TEMP_SINGLE_USER_TEST_MODE && !isAdmin) {
+    if (isStream) {
+      console.log(`[router] Temporary test lock active — blocking user ${message.sender_id} (${message.sender_full_name})`);
+      await sendMessage(message.display_recipient, message.subject, TEMP_TEST_LOCK_REPLY);
+    } else {
+      console.log(`[router] Temporary test lock active — ignoring DM from ${message.sender_id} (${message.sender_full_name})`);
+    }
+    return;
+  }
 
   if (!isStream) {
     // ONLY admin can DM the bot
