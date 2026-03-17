@@ -20,6 +20,7 @@ services:
       - "127.0.0.1:3001:3001"
     secrets:
       - bt_mcp_api_token
+      - claude_oauth_token
     networks:
       - work-net
       - home-net
@@ -31,6 +32,8 @@ services:
 secrets:
   bt_mcp_api_token:
     file: ../config/secrets/bt_mcp_api_token
+  claude_oauth_token:
+    file: ../config/secrets/claude_oauth_token
 
 volumes:
   claude-config:
