@@ -497,16 +497,22 @@ async function notesPipeline(route, message) {
           mtimeMs = 0;
         }
         if (mtimeMs < skillStart - 2000) {
-          failedSkill = skill.name;
-          await status(`**${skill.name}** failed for ${ref} \u2014 output file is stale from an earlier run: ${resolved}`);
-          setCheckpoint(checkpointRef, {
-            state: 'failed',
-            totalSuccess,
-            totalFail,
-            current: { chapter: ch, skill: skill.name, status: 'failed', errorKind: 'stale_output', outputStatus: 'stale', outputPath: resolved },
-            resume: { chapter: ch, skill: skill.name },
-          });
-          break;
+          if (skill.name === 'post-edit-review') {
+            // post-edit-review can legitimately keep an unchanged issues TSV.
+            // Reuse the existing file rather than hard-failing this chapter.
+            await status(`**${skill.name}** for ${ref}: issues file unchanged in this run; reusing existing file (${resolved}).`);
+          } else {
+            failedSkill = skill.name;
+            await status(`**${skill.name}** failed for ${ref} \u2014 output file is stale from an earlier run: ${resolved}`);
+            setCheckpoint(checkpointRef, {
+              state: 'failed',
+              totalSuccess,
+              totalFail,
+              current: { chapter: ch, skill: skill.name, status: 'failed', errorKind: 'stale_output', outputStatus: 'stale', outputPath: resolved },
+              resume: { chapter: ch, skill: skill.name },
+            });
+            break;
+          }
         }
         skill.resolvedOutput = resolved;
         // Update issuesPath if deep-issue-id produced it in a subdirectory

@@ -4,6 +4,8 @@
 const { ensureFreshToken } = require('./auth-refresh');
 const { recordRateLimit, getHeadroom } = require('./usage-tracker');
 const { createWorkspaceTools } = require('./workspace-tools');
+const config = require('./config');
+const { sendDM } = require('./zulip-client');
 
 let _query = null;
 let _workspaceToolsServer = null;
@@ -276,10 +278,20 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+async function notifyAdminDowntime(text) {
+  try {
+    if (!config.adminUserId) return;
+    await sendDM(config.adminUserId, text);
+  } catch (err) {
+    console.warn(`[claude-runner] Failed to send downtime DM: ${err.message}`);
+  }
+}
+
 async function runClaude(args) {
   const startedAt = Date.now();
   let attempt = 0;
   let lastTransientMessage = '';
+  let firstDowntimeNoticeSent = false;
 
   while (true) {
     attempt++;
@@ -291,12 +303,23 @@ async function runClaude(args) {
       const elapsed = Date.now() - startedAt;
       if (isTransientSdkMessage(resultMsg) && elapsed < TRANSIENT_RETRY_WINDOW_MS) {
         lastTransientMessage = resultMsg;
+        if (!firstDowntimeNoticeSent) {
+          firstDowntimeNoticeSent = true;
+          await notifyAdminDowntime(
+            `[claude-runner] First transient Claude outage signal detected (attempt ${attempt}). ` +
+            `Starting retry/backoff window up to 10 minutes. Last error: ${resultMsg.slice(0, 300)}`
+          );
+        }
         const delay = backoffDelayMs(attempt);
         console.warn(`[claude-runner] Transient non-success result, retrying in ${Math.round(delay / 1000)}s (attempt ${attempt})`);
         await sleep(delay);
         continue;
       }
       if (isTransientSdkMessage(resultMsg) && elapsed >= TRANSIENT_RETRY_WINDOW_MS) {
+        await notifyAdminDowntime(
+          `[claude-runner] Retry window exhausted after ${Math.round(elapsed / 1000)}s and ${attempt} attempts. ` +
+          `Giving up for now. Last error: ${resultMsg.slice(0, 300)}`
+        );
         throw new ClaudeTransientOutageError(
           'Claude is temporarily down after retry attempts',
           { elapsedMs: elapsed, attempts: attempt, lastMessage: resultMsg.slice(0, 500) || lastTransientMessage.slice(0, 500) }
@@ -309,12 +332,23 @@ async function runClaude(args) {
       const elapsed = Date.now() - startedAt;
       if (isTransientSdkMessage(msg) && elapsed < TRANSIENT_RETRY_WINDOW_MS) {
         lastTransientMessage = msg;
+        if (!firstDowntimeNoticeSent) {
+          firstDowntimeNoticeSent = true;
+          await notifyAdminDowntime(
+            `[claude-runner] First transient Claude outage signal detected (attempt ${attempt}). ` +
+            `Starting retry/backoff window up to 10 minutes. Last error: ${msg.slice(0, 300)}`
+          );
+        }
         const delay = backoffDelayMs(attempt);
         console.warn(`[claude-runner] Transient SDK error, retrying in ${Math.round(delay / 1000)}s (attempt ${attempt}): ${msg.slice(0, 200)}`);
         await sleep(delay);
         continue;
       }
       if (isTransientSdkMessage(msg) && elapsed >= TRANSIENT_RETRY_WINDOW_MS) {
+        await notifyAdminDowntime(
+          `[claude-runner] Retry window exhausted after ${Math.round(elapsed / 1000)}s and ${attempt} attempts. ` +
+          `Giving up for now. Last error: ${msg.slice(0, 300)}`
+        );
         throw new ClaudeTransientOutageError(
           'Claude is temporarily down after retry attempts',
           { elapsedMs: elapsed, attempts: attempt, lastMessage: msg.slice(0, 500) || lastTransientMessage.slice(0, 500) }

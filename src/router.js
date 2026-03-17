@@ -6,7 +6,7 @@ const { getTotalVerses } = require('./verse-counts');
 const { classifyIntent } = require('./intent-classifier');
 const { preflightCheck, estimateTokens } = require('./usage-tracker');
 const { getPendingMerge, clearPendingMerge } = require('./pending-merges');
-const { getCheckpoint } = require('./pipeline-checkpoints');
+const { getCheckpoint, clearCheckpoint } = require('./pipeline-checkpoints');
 const { listCheckpoints } = require('./pipeline-checkpoints');
 const { resumeInsertion } = require('./insertion-resume');
 const { normalizeBookName, isValidBook } = require('./pipeline-utils');
@@ -14,6 +14,7 @@ const { isTransientOutageError } = require('./claude-runner');
 
 // In-memory pending confirmations for stream messages
 const pendingConfirmations = new Map();
+const PROCESS_STARTED_AT_MS = Date.now();
 
 // TEMPORARY TEST LOCK:
 // Restrict bot interactions to admin user during branch validation.
@@ -263,6 +264,42 @@ function getResumeCheckpoint(route, sessionKey, captures) {
   return checkpoint;
 }
 
+function getActiveCheckpoint(route, sessionKey, captures) {
+  const pipelineType = getPipelineType(route);
+  if (!pipelineType) return null;
+  const parsed = route._synthetic
+    ? {
+        book: route._book,
+        chapters: [route._startChapter, route._endChapter].filter((n) => Number.isFinite(n)),
+        verseStart: null,
+        verseEnd: null,
+      }
+    : parseBookChapters(captures || []);
+  if (!parsed.book || !parsed.chapters || parsed.chapters.length === 0) return null;
+  const startChapter = Math.min(...parsed.chapters);
+  const endChapter = Math.max(...parsed.chapters);
+  return getCheckpoint({
+    sessionKey,
+    pipelineType,
+    scope: {
+      book: parsed.book,
+      startChapter,
+      endChapter,
+      verseStart: parsed.verseStart ?? null,
+      verseEnd: parsed.verseEnd ?? null,
+    },
+  });
+}
+
+function isStaleRunningCheckpoint(cp) {
+  if (!cp || cp.state !== 'running') return false;
+  const updatedMs = Date.parse(cp.updatedAt || '');
+  if (!Number.isFinite(updatedMs)) return false;
+  // If checkpoint was last updated before this bot process started,
+  // it cannot represent an actively running in-memory pipeline.
+  return updatedMs < PROCESS_STARTED_AT_MS;
+}
+
 /**
  * Build an enriched confirmation message with token/time estimates.
  */
@@ -428,6 +465,43 @@ function getPipelineKeys(route, message) {
  */
 function firePipeline(route, message) {
   const keys = getPipelineKeys(route, message);
+  let activeCp = null;
+
+  // Guard against duplicate retriggers for the same scope while resume/work is in progress.
+  if (route.type === 'sdk' || route.type === 'notes') {
+    const captures = route._synthetic ? [] : matchRoute(message.content).captures;
+    const sessionKey = message.type === 'stream'
+      ? `stream-${message.display_recipient}-${message.subject}`
+      : `dm-${message.sender_id}`;
+    activeCp = getActiveCheckpoint(route, sessionKey, captures);
+    if (isStaleRunningCheckpoint(activeCp)) {
+      clearCheckpoint({
+        sessionKey: activeCp.sessionKey,
+        pipelineType: activeCp.pipelineType,
+        scope: activeCp.scope,
+      });
+      console.warn(
+        `[router] Cleared stale running checkpoint for ${activeCp.pipelineType} ${activeCp.scope?.book || ''} ` +
+        `${activeCp.scope?.startChapter || ''}-${activeCp.scope?.endChapter || ''}`.trim()
+      );
+      activeCp = null;
+    }
+    if (activeCp?.state === 'running') {
+      const skill = activeCp?.current?.skill || activeCp?.resume?.skill || 'current step';
+      const chapter = activeCp?.current?.chapter || activeCp?.resume?.chapter || '?';
+      const label = activeCp?.scope ? formatCheckpointScope(activeCp) : `${activeCp?.scope?.book || ''} ${chapter}`.trim();
+      const text = `A run is already in progress for **${label}** (currently: ${skill}). ` +
+        `Not starting another one; please wait for this run to finish.`;
+      if (message.type === 'stream') {
+        sendMessage(message.display_recipient, message.subject, text).catch(err =>
+          console.error(`[router] Failed to send active-run message: ${err.message}`));
+      } else {
+        sendDM(message.sender_id, text).catch(err =>
+          console.error(`[router] Failed to send active-run DM: ${err.message}`));
+      }
+      return;
+    }
+  }
 
   if (keys) {
     const conflicts = keys.filter(k => activePipelines.has(k));
