@@ -213,6 +213,7 @@ async function notesPipeline(route, message) {
   const msgId = message.id;
 
   const isTestFast = process.env.TEST_FAST === '1';
+  const isDryRun = process.env.DRY_RUN === '1';
 
   async function status(text) {
     try { await sendDM(adminUserId, text); } catch (err) {
@@ -463,22 +464,38 @@ async function notesPipeline(route, message) {
 
       let result = null;
       let skillError = null;
-      try {
-        result = await runClaude({
-          prompt: skill.prompt,
-          cwd: CSKILLBP_DIR,
-          model: model || skill.model, // TEST_FAST haiku overrides per-skill model
-          skill: skill.name,
-          tools: DEFAULT_RESTRICTED_TOOLS,
-          disallowedTools: ['Bash'],
-          disableLocalSettings: true,
-          forceNoAutoBashSandbox: true,
-          timeoutMs,
-          appendSystemPrompt: skill.appendSystemPrompt,
-        });
-      } catch (err) {
-        skillError = err;
-        console.error(`[notes] ${skill.name} error: ${err.message}`);
+      if (isDryRun) {
+        console.log(`[dry-run] Would run ${skill.name}: ${skill.prompt}`);
+        if (skill.expectedOutput) {
+          const absPath = path.resolve(CSKILLBP_DIR, skill.expectedOutput);
+          fs.mkdirSync(path.dirname(absPath), { recursive: true });
+          if (skill.expectedOutput.endsWith('.tsv')) {
+            fs.writeFileSync(absPath, 'Reference\tID\tTags\tSupportReference\tQuote\tOccurrence\tNote\n' +
+              `${book} ${ch}:${verseStart || 1}\tstub1\t\t\t\t1\t[Stub note for dry run]\n`);
+          } else if (skill.expectedOutput.endsWith('.md')) {
+            fs.writeFileSync(absPath, `# Stub quality check for ${ref}\n\nDry run — no Claude calls made.\n`);
+          }
+        }
+        await new Promise(r => setTimeout(r, 200));
+        result = { subtype: 'success', num_turns: 0, duration_ms: 200, total_cost_usd: 0 };
+      } else {
+        try {
+          result = await runClaude({
+            prompt: skill.prompt,
+            cwd: CSKILLBP_DIR,
+            model: model || skill.model, // TEST_FAST haiku overrides per-skill model
+            skill: skill.name,
+            tools: DEFAULT_RESTRICTED_TOOLS,
+            disallowedTools: ['Bash'],
+            disableLocalSettings: true,
+            forceNoAutoBashSandbox: true,
+            timeoutMs,
+            appendSystemPrompt: skill.appendSystemPrompt,
+          });
+        } catch (err) {
+          skillError = err;
+          console.error(`[notes] ${skill.name} error: ${err.message}`);
+        }
       }
       // #region agent log
       fetch('http://localhost:7282/ingest/190f0e90-444d-4921-920d-f208e86f8cb3',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'7de6a4'},body:JSON.stringify({sessionId:'7de6a4',runId:debugRunId,hypothesisId:'H4',location:'notes-pipeline.js:skill-result',message:'skill result/error',data:{ref,skill:skill.name,hadError:!!skillError,error:skillError?String(skillError.message||skillError):null,resultSubtype:result?.subtype||null,resultError:result?.error||null},timestamp:Date.now()})}).catch(()=>{});
@@ -692,6 +709,13 @@ async function notesPipeline(route, message) {
       current: { chapter: ch, skill: 'door43-push', status: 'running' },
       resume: { chapter: ch, skill: 'door43-push' },
     });
+
+    // Dry-run: skip the entire door43-push/verify phase
+    if (isDryRun) {
+      console.log(`[dry-run] Would run door43-push (TN) for ${ref}`);
+      totalSuccess++;
+      continue;
+    }
 
     // If push is already deferred due to conflicting branches, collect and skip
     if (deferredPush) {
