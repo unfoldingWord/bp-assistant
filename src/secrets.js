@@ -20,6 +20,10 @@ function readSecret(name, envFallback) {
   const fromDockerSecret = name ? readSecretFile(path.join('/run/secrets', name)) : null;
   if (fromDockerSecret) return fromDockerSecret;
 
+  const hostDir = process.env.BOT_SECRETS_DIR;
+  const fromHost = (name && hostDir) ? readSecretFile(path.join(hostDir, name)) : null;
+  if (fromHost) return fromHost;
+
   if (envFallback && process.env[envFallback]) {
     return process.env[envFallback];
   }

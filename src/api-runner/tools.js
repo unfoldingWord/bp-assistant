@@ -141,10 +141,29 @@ function toOpenAITools(schemas) {
     function: {
       name: schema.name,
       description: schema.description,
-      parameters: schema.parameters,
+      parameters: strictifySchema(schema.parameters),
       strict: true,
     },
   }));
+}
+
+/**
+ * OpenAI strict mode requires every property in `required`.
+ * For optional params (not in `required`), make them nullable
+ * and add them to `required` — OpenAI's documented pattern.
+ */
+function strictifySchema(params) {
+  if (!params || !params.properties) return params;
+  const props = { ...params.properties };
+  const required = new Set(params.required || []);
+  for (const key of Object.keys(props)) {
+    if (!required.has(key)) {
+      // Make optional property nullable
+      props[key] = { ...props[key], type: [props[key].type, 'null'] };
+      required.add(key);
+    }
+  }
+  return { ...params, properties: props, required: [...required], additionalProperties: false };
 }
 
 function toClaudeTools(schemas) {

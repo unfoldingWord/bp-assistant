@@ -69,7 +69,8 @@ async function sendRequest({ model, system, messages, tools, thinking, apiKey, b
     body.tools = tools;
   }
 
-  if (thinking && thinking !== 'none') {
+  // GPT-5+ doesn't support reasoning_effort with tools via chat completions
+  if (thinking && thinking !== 'none' && !(tools && tools.length > 0)) {
     body.reasoning_effort = THINKING_MAP[thinking] || 'medium';
   }
 
