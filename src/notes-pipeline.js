@@ -417,9 +417,10 @@ async function notesPipeline(route, message) {
 
     // tn-quality-check runs as a separate Sonnet invocation for independent review
     const qualityTag = hasVerseRange ? `${tag}-vv${verseStart}-${verseEnd}` : tag;
+    const defaultNotesPath = hasVerseRange ? notesShardRel : notesChapterRel;
     skills.push({
       name: 'tn-quality-check',
-      prompt: `${skillRef}`,
+      prompt: `${skillRef} --notes ${defaultNotesPath}`,
       expectedOutput: `output/quality/${book}/${qualityTag}-quality.md`,
       ops: 1,
       model: 'sonnet',
@@ -671,7 +672,7 @@ async function notesPipeline(route, message) {
 
     // --- Repo insert + verify inline so editor gets access immediately ---
     const tnWriterSkill = skills.find(s => s.name === 'tn-writer');
-    const notesSource = tnWriterSkill?.resolvedOutput || `output/notes/${tag}.tsv`;
+    const notesSource = tnWriterSkill?.resolvedOutput || (hasVerseRange ? notesShardRel : notesChapterRel);
     let chapterFailed = false;
 
     // If push is already deferred due to conflicting branches, collect and skip
