@@ -82,10 +82,28 @@ function resolveOutputFile(relPath, book, verseSuffix) {
   // Skills may append -vN-M when working on a verse range
   const ext = path.extname(filename);
   const base = filename.slice(0, -ext.length);
-  // When verseSuffix is given, look for that exact suffix only
-  const suffixFilter = verseSuffix
-    ? (f) => f === `${base}${verseSuffix}${ext}`
-    : (f) => f.startsWith(base + '-vv') && f.endsWith(ext);
+  // When verseSuffix is given, parse verse numbers and match numerically
+  // so -vv6-22 matches files named -v6-22, -06-22, -vv06-22, etc.
+  let suffixFilter;
+  if (verseSuffix) {
+    const vMatch = verseSuffix.match(/(\d+)\D+(\d+)/);
+    if (vMatch) {
+      const wantStart = parseInt(vMatch[1], 10);
+      const wantEnd = parseInt(vMatch[2], 10);
+      suffixFilter = (f) => {
+        if (!f.startsWith(base + '-') || !f.endsWith(ext)) return false;
+        const middle = f.slice(base.length + 1, -ext.length);
+        const nums = middle.match(/(\d+)\D+(\d+)/);
+        if (!nums) return false;
+        return parseInt(nums[1], 10) === wantStart && parseInt(nums[2], 10) === wantEnd;
+      };
+    } else {
+      suffixFilter = (f) => f === `${base}${verseSuffix}${ext}`;
+    }
+  } else {
+    // Match any verse-range suffix (any format: -vv, -v, bare digits after dash)
+    suffixFilter = (f) => f.startsWith(base + '-') && f.endsWith(ext) && f !== base + ext;
+  }
   for (const dir of [parts.join('/'), [...parts, book].join('/')]) {
     const searchDir = path.join(CSKILLBP_DIR, dir);
     if (!fs.existsSync(searchDir)) continue;
@@ -98,6 +116,53 @@ function resolveOutputFile(relPath, book, verseSuffix) {
   }
 
   return null;
+}
+
+/**
+ * Find the most recently written file matching a pattern in a directory.
+ * Searches both flat (output/X/) and subdirectory (output/X/BOOK/) locations.
+ * @param {string} dir - base dir relative to CSKILLBP_DIR (e.g. 'output/AI-ULT')
+ * @param {string} book - book code for subdirectory search
+ * @param {RegExp} pattern - filename pattern (e.g. /^LAM-\d+-.*-aligned\.usfm$/)
+ * @param {number} afterMs - only files modified after this timestamp (skill start time)
+ * @returns {string|null} relative path from CSKILLBP_DIR, or null
+ */
+function discoverFreshOutput(dir, book, pattern, afterMs) {
+  let best = null;
+  let bestMtime = 0;
+
+  const searchDirs = [
+    dir,
+    path.join(dir, book),
+  ];
+
+  for (const searchDir of searchDirs) {
+    const absDir = path.join(CSKILLBP_DIR, searchDir);
+    if (!fs.existsSync(absDir)) continue;
+    let entries;
+    try {
+      entries = fs.readdirSync(absDir);
+    } catch (_) {
+      continue;
+    }
+    for (const entry of entries) {
+      if (!pattern.test(entry)) continue;
+      try {
+        const absFile = path.join(absDir, entry);
+        const stat = fs.statSync(absFile);
+        if (!stat.isFile()) continue;
+        if (afterMs != null && stat.mtimeMs < (afterMs - 2000)) continue;
+        if (stat.mtimeMs > bestMtime) {
+          bestMtime = stat.mtimeMs;
+          best = path.join(searchDir, entry);
+        }
+      } catch (_) {
+        continue;
+      }
+    }
+  }
+
+  return best;
 }
 
 // --- Verify prerequisite files exist (AI-ULT, AI-UST, issues) ---
@@ -296,6 +361,7 @@ module.exports = {
   checkExistingBranch,
   buildBranchName,
   resolveOutputFile,
+  discoverFreshOutput,
   checkPrerequisites,
   calcSkillTimeout,
   normalizeBookName,
