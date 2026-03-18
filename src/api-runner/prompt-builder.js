@@ -3,7 +3,6 @@
 
 const fs = require('fs');
 const path = require('path');
-const { getToolDescriptions } = require('./tools');
 
 const DEFAULT_WORKSPACE = '/srv/bot/workspace';
 
@@ -52,26 +51,10 @@ function buildCustomPrompt(systemText, opts = {}) {
  * Build the preamble that goes at the top of every system prompt.
  */
 function assemblePreamble(cwd, date) {
-  const tools = getToolDescriptions();
-  const coreToolNames = ['Read', 'Write', 'Edit', 'Glob', 'Grep'];
-  const workspaceToolLines = tools
-    .filter((tool) => tool.name.startsWith('mcp__workspace-tools__'))
-    .map((tool) => `- ${tool.name}: ${tool.description}`);
-
   return [
     `# Environment`,
     `- Working directory: ${cwd}`,
     `- Date: ${date}`,
-    `- Core tools available: ${coreToolNames.join(', ')}`,
-    `- Workspace tools available via mcp prefix: ${workspaceToolLines.length}`,
-    ``,
-    `You have access to the tools listed above to complete your task.`,
-    `All file paths should be relative to the working directory unless absolute.`,
-    `Use Read/Write/Edit for file operations and Glob/Grep for discovery/search.`,
-    `Workspace tool aliases are available as both "<tool_name>" and "mcp__workspace-tools__<tool_name>".`,
-    ``,
-    `# Workspace Tools`,
-    ...workspaceToolLines,
   ].join('\n');
 }
 
