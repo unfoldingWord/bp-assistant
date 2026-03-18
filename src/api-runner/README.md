@@ -26,6 +26,9 @@ It is intentionally additive:
   - `type`: `api`
   - `skill`: `initial-pipeline --lite`
 
+Routing guard:
+- `api generate ...` is reserved for `type: "api"` routes. It is intentionally prevented from matching SDK `generate` routes.
+
 Example Zulip command:
 
 `api generate LAM 2:4-5 --provider openai`
@@ -89,6 +92,10 @@ Load order:
 - `xai` -> `xai_api_key` or `XAI_API_KEY`
 
 `docker-compose.yml` mounts these secret files and corresponding `*_FILE` env vars.
+
+## Workspace Path Behavior
+
+The API pipeline uses the route `cwd` (default `/workspace`) for skill resolution. In host-side local runs (for example `node src/test-pipeline.js ...`) where `/workspace` may not contain the skill tree, the pipeline falls back to `/srv/bot/workspace` if the requested skill exists there.
 
 ## Tooling Notes
 

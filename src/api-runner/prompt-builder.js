@@ -19,7 +19,8 @@ function buildSkillPrompt(skillName, opts = {}) {
   const date = opts.date || new Date().toISOString().split('T')[0];
 
   const skillPath = path.join(cwd, '.claude', 'skills', skillName, 'SKILL.md');
-  if (!fs.existsSync(skillPath)) {
+  const skillExists = fs.existsSync(skillPath);
+  if (!skillExists) {
     throw new Error(`Skill not found: ${skillPath}`);
   }
   const skillContent = fs.readFileSync(skillPath, 'utf8');

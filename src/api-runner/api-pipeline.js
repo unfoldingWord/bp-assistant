@@ -1,5 +1,7 @@
 const { runSkill } = require('./runner');
 const { sendMessage, sendDM, addReaction, removeReaction } = require('../zulip-client');
+const fs = require('fs');
+const path = require('path');
 
 function parseRegexLiteral(literal) {
   if (typeof literal !== 'string') return null;
@@ -40,6 +42,15 @@ async function apiPipeline(route, message) {
 
   const provider = parseProviderFromMessage(message.content) || route.provider || 'openai';
   const model = route.model || null;
+  let selectedCwd = route.cwd || '/workspace';
+  const primarySkillPath = path.join(selectedCwd, '.claude', 'skills', skillName, 'SKILL.md');
+  if (!fs.existsSync(primarySkillPath)) {
+    const fallbackCwd = '/srv/bot/workspace';
+    const fallbackSkillPath = path.join(fallbackCwd, '.claude', 'skills', skillName, 'SKILL.md');
+    if (fs.existsSync(fallbackSkillPath)) {
+      selectedCwd = fallbackCwd;
+    }
+  }
 
   const reply = async (text) => {
     if (stream) {
@@ -60,7 +71,7 @@ async function apiPipeline(route, message) {
       thinking: route.thinking || 'medium',
       maxTurns: route.maxTurns || 100,
       timeout: route.timeout || 30,
-      cwd: route.cwd || '/workspace',
+      cwd: selectedCwd,
       verbose: !!route.verbose,
       dryRun: isDryRun,
     });
