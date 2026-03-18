@@ -7,6 +7,11 @@ const DEFAULT_PROVIDER_CONFIGS = {
     defaultModel: 'claude-opus-4-6',
     secretName: 'anthropic_api_key',
     envName: 'ANTHROPIC_API_KEY',
+    modelAliases: {
+      opus: 'claude-opus-4-6',
+      sonnet: 'claude-sonnet-4-6',
+      haiku: 'claude-haiku-4-5-20251001',
+    },
     models: {
       'claude-opus-4-6': { label: 'Claude Opus 4.6', inputPer1M: 15.0, outputPer1M: 75.0 },
       'claude-sonnet-4-6': { label: 'Claude Sonnet 4.6', inputPer1M: 3.0, outputPer1M: 15.0 },
@@ -136,6 +141,12 @@ function mergeProvider(baseCfg, overrideCfg) {
       ...(overrideCfg?.autoModelByThinking || {}),
     };
   }
+  if (baseCfg?.modelAliases || overrideCfg?.modelAliases) {
+    merged.modelAliases = {
+      ...(baseCfg?.modelAliases || {}),
+      ...(overrideCfg?.modelAliases || {}),
+    };
+  }
   if (Array.isArray(overrideCfg?.reasoningEffortModels)) {
     merged.reasoningEffortModels = [...overrideCfg.reasoningEffortModels];
   } else if (Array.isArray(baseCfg?.reasoningEffortModels)) {
@@ -197,10 +208,18 @@ function resolveXaiModel(model, thinking) {
   return cfg.autoModelByThinking[thinking || 'medium'] || cfg.defaultModel;
 }
 
+function resolveProviderModel(provider, model) {
+  const cfg = getProviderConfig(provider);
+  const candidate = model || cfg.defaultModel;
+  if (typeof candidate !== 'string') return candidate;
+  return cfg.modelAliases?.[candidate] || candidate;
+}
+
 module.exports = {
   DEFAULT_PROVIDER_CONFIGS,
   getResolvedProviderConfigs,
   getProviderConfig,
   getProviderNames,
+  resolveProviderModel,
   resolveXaiModel,
 };

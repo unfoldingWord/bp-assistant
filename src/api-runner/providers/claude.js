@@ -2,7 +2,7 @@
 // Uses the already-installed @anthropic-ai/sdk (Messages API)
 
 let _Anthropic = null;
-const { getProviderConfig } = require('../provider-config');
+const { getProviderConfig, resolveProviderModel } = require('../provider-config');
 
 async function getAnthropicClass() {
   if (!_Anthropic) {
@@ -62,7 +62,7 @@ function toClaudeMessages(messages) {
 async function sendRequest({ model, system, messages, tools, thinking, apiKey }) {
   const Anthropic = await getAnthropicClass();
   const client = new Anthropic({ apiKey });
-  const modelId = model || DEFAULT_MODEL;
+  const modelId = resolveProviderModel('claude', model || DEFAULT_MODEL);
 
   const params = {
     model: modelId,
@@ -133,7 +133,8 @@ function formatAssistantMessage(content, toolCalls) {
 }
 
 function estimateCost(model, usage) {
-  const m = MODELS[model] || MODELS[DEFAULT_MODEL];
+  const resolved = resolveProviderModel('claude', model || DEFAULT_MODEL);
+  const m = MODELS[resolved] || MODELS[DEFAULT_MODEL];
   const inputCost = (usage.inputTokens / 1_000_000) * m.inputPer1M;
   const outputCost = (usage.outputTokens / 1_000_000) * m.outputPer1M;
   return inputCost + outputCost;

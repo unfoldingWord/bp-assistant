@@ -61,6 +61,13 @@ Edit this file to:
 - update per-model cost estimates
 - update compatible provider base URLs
 
+Claude API path also supports aliases through config:
+- `modelAliases.opus`
+- `modelAliases.sonnet`
+- `modelAliases.haiku`
+
+This alias resolution is API-runner-only and does not alter the existing Claude SDK path.
+
 Load order:
 - `MODEL_PROVIDER_CONFIG_FILE` (if set)
 - `/config/model-provider-config.json` (inside container)
@@ -98,4 +105,3 @@ node src/api-runner/cli.js --provider openai --skill ULT-gen --prompt "LAM 2:4-5
 node src/api-runner/cli.js --provider gemini --skill ULT-gen --prompt "LAM 2:4-5" --dry-run
 node src/test-pipeline.js "api generate LAM 2:4-5" --provider openai --dry-run
 ```
-
