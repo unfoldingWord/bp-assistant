@@ -10,7 +10,7 @@ function ensureDirs() {
 }
 
 function safe(value) {
-  return String(value == null ? '' : value).replace(/[^a-zA-Z0-9_-]/g, '_');
+  return String(value == null ? '' : value).replace(/[^a-zA-Z0-9_]/g, '_');
 }
 
 function buildScopeId({ book, startChapter, endChapter, verseStart, verseEnd }) {
