@@ -379,16 +379,16 @@ async function notesPipeline(route, message) {
       });
     } else {
       // No AI artifacts -> deep-issue-id path (fetches from Door43 master)
-      issuesPath = `output/issues/${tag}.tsv`;
+      const issuesVTag = hasVerseRange ? `${tag}-vv${verseStart}-${verseEnd}` : tag;
+      issuesPath = `output/issues/${issuesVTag}.tsv`;
       await status(`**${ref}**: No AI artifacts (missing: ${missing.join(', ')}) \u2192 deep-issue-id path`);
 
       const verseFlag = hasVerseRange ? ` --verses ${verseStart}-${verseEnd}` : '';
-      const issuesVTag = hasVerseRange ? `${tag}-vv${verseStart}-${verseEnd}` : tag;
       skills.push({
         name: 'deep-issue-id',
         prompt: `${book} ${ch}${verseFlag}`,
         appendSystemPrompt: DEEP_ISSUE_ID_HINT,
-        expectedOutput: `output/issues/${issuesVTag}.tsv`,
+        expectedOutput: issuesPath,
         ops: 3, // 2 analysts + challenger/merge
       });
     }
