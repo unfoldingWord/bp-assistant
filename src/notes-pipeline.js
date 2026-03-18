@@ -427,8 +427,10 @@ async function notesPipeline(route, message) {
     });
 
     // --- Run skills sequentially ---
-    let startSkillIndex = 0;
-    if (ch === resumeChapter && resumeSkill) {
+    // If resuming at door43-push, skip the entire skill chain
+    const skipAllSkills = (ch === resumeChapter && (resumeSkill === 'door43-push' || resumeSkill === 'door43-push-done'));
+    let startSkillIndex = skipAllSkills ? skills.length : 0;
+    if (!skipAllSkills && ch === resumeChapter && resumeSkill) {
       const idx = skills.findIndex((s) => s.name === resumeSkill);
       startSkillIndex = idx >= 0 ? idx : 0;
       if (idx < 0) {
@@ -671,9 +673,25 @@ async function notesPipeline(route, message) {
     }
 
     // --- Repo insert + verify inline so editor gets access immediately ---
+    // Skip if resuming past this point on a future chapter
+    const skipDoor43 = (ch === resumeChapter && resumeSkill === 'door43-push-done');
+    if (skipDoor43) {
+      await status(`Skipping **door43-push** for ${ref} (already completed in previous run).`);
+      totalSuccess++;
+      continue;
+    }
+
     const tnWriterSkill = skills.find(s => s.name === 'tn-writer');
     const notesSource = tnWriterSkill?.resolvedOutput || (hasVerseRange ? notesShardRel : notesChapterRel);
     let chapterFailed = false;
+
+    setCheckpoint(checkpointRef, {
+      state: 'running',
+      totalSuccess,
+      totalFail,
+      current: { chapter: ch, skill: 'door43-push', status: 'running' },
+      resume: { chapter: ch, skill: 'door43-push' },
+    });
 
     // If push is already deferred due to conflicting branches, collect and skip
     if (deferredPush) {
@@ -750,6 +768,13 @@ async function notesPipeline(route, message) {
 
     if (chapterFailed) {
       totalFail++;
+      setCheckpoint(checkpointRef, {
+        state: 'failed',
+        totalSuccess,
+        totalFail,
+        current: { chapter: ch, skill: 'door43-push', status: 'failed', errorKind: 'push_failed' },
+        resume: { chapter: ch, skill: 'door43-push' },
+      });
       await status(`Chapter ${ref} failed at **repo-insert/verify** after ${chapterDuration}s`);
       continue;
     }
