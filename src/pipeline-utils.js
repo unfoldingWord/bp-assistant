@@ -85,7 +85,7 @@ function resolveOutputFile(relPath, book, verseSuffix) {
   // When verseSuffix is given, look for that exact suffix only
   const suffixFilter = verseSuffix
     ? (f) => f === `${base}${verseSuffix}${ext}`
-    : (f) => f.startsWith(base + '-v') && f.endsWith(ext);
+    : (f) => f.startsWith(base + '-vv') && f.endsWith(ext);
   for (const dir of [parts.join('/'), [...parts, book].join('/')]) {
     const searchDir = path.join(CSKILLBP_DIR, dir);
     if (!fs.existsSync(searchDir)) continue;
@@ -108,7 +108,7 @@ function resolveOutputFile(relPath, book, verseSuffix) {
 function checkPrerequisites(book, chapter, verseStart, verseEnd) {
   const width = book.toUpperCase() === 'PSA' ? 3 : 2;
   const tag = `${book}-${String(chapter).padStart(width, '0')}`;
-  const verseSuffix = verseStart != null ? `-v${verseStart}-${verseEnd}` : null;
+  const verseSuffix = verseStart != null ? `-vv${verseStart}-${verseEnd}` : null;
 
   const required = [
     { path: `output/AI-ULT/${tag}.usfm`, label: 'AI-ULT' },

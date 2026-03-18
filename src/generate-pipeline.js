@@ -29,6 +29,47 @@ const REQUIRED_INITIAL_PIPELINE_FILES = [
   '.claude/skills/issue-identification/gemini-review-wave.md',
 ];
 
+function hasFreshFlag(content) {
+  return /--fresh\b/i.test(String(content || '')) || /--new\b/i.test(String(content || ''));
+}
+
+function removeIfExists(absPath) {
+  try {
+    if (fs.existsSync(absPath)) fs.unlinkSync(absPath);
+  } catch (_) {
+    // non-fatal best-effort cleanup
+  }
+}
+
+function cleanupGenerateArtifacts({ book, chapter, verseStart, verseEnd }) {
+  const width = book.toUpperCase() === 'PSA' ? 3 : 2;
+  const tag = `${book}-${String(chapter).padStart(width, '0')}`;
+  const hasVerseRange = verseStart != null && verseEnd != null;
+  const verseTag = hasVerseRange ? `${tag}-vv${verseStart}-${verseEnd}` : tag;
+
+  const candidates = [
+    // generation outputs
+    `output/AI-ULT/${tag}.usfm`,
+    `output/AI-UST/${tag}.usfm`,
+    `output/AI-ULT/${book}/${tag}.usfm`,
+    `output/AI-UST/${book}/${tag}.usfm`,
+    // aligned outputs
+    `output/AI-ULT/${tag}-aligned.usfm`,
+    `output/AI-UST/${tag}-aligned.usfm`,
+    `output/AI-ULT/${book}/${tag}-aligned.usfm`,
+    `output/AI-UST/${book}/${tag}-aligned.usfm`,
+    // issue files potentially reused by initial pipeline variants
+    `output/issues/${tag}.tsv`,
+    `output/issues/${verseTag}.tsv`,
+    `output/issues/${book}/${tag}.tsv`,
+    `output/issues/${book}/${verseTag}.tsv`,
+  ];
+
+  for (const rel of candidates) {
+    removeIfExists(path.resolve(CSKILLBP_DIR, rel));
+  }
+}
+
 function parseGenerateCommand(content) {
   const input = content.toLowerCase();
 
@@ -42,6 +83,7 @@ function parseGenerateCommand(content) {
       end: chapter,
       verseStart: parseInt(verseMatch[3], 10),
       verseEnd: parseInt(verseMatch[4], 10),
+      fresh: hasFreshFlag(content),
     };
   }
 
@@ -54,6 +96,7 @@ function parseGenerateCommand(content) {
       end: parseInt(rangeMatch[3], 10),
       verseStart: null,
       verseEnd: null,
+      fresh: hasFreshFlag(content),
     };
   }
 
@@ -67,6 +110,7 @@ function parseGenerateCommand(content) {
       end: ch,
       verseStart: null,
       verseEnd: null,
+      fresh: hasFreshFlag(content),
     };
   }
 
@@ -181,6 +225,7 @@ async function generatePipeline(route, message) {
       end: route._endChapter,
       verseStart: route._verseStart ?? null,
       verseEnd: route._verseEnd ?? null,
+      fresh: hasFreshFlag(message.content),
     };
   } else {
     parsed = parseGenerateCommand(message.content);
@@ -192,14 +237,14 @@ async function generatePipeline(route, message) {
     return;
   }
 
-  const { book, start, end, verseStart, verseEnd } = parsed;
+  const { book, start, end, verseStart, verseEnd, fresh } = parsed;
   const sessionKey = stream ? `stream-${stream}-${topic}` : `dm-${message.sender_id}`;
   const checkpointRef = {
     sessionKey,
     pipelineType: 'generate',
     scope: { book, startChapter: start, endChapter: end, verseStart: verseStart ?? null, verseEnd: verseEnd ?? null },
   };
-  const existingCheckpoint = getCheckpoint(checkpointRef);
+  let existingCheckpoint = getCheckpoint(checkpointRef);
   const chapterCount = end - start + 1;
   const hasVerseRange = verseStart != null && verseEnd != null && start === end;
 
@@ -227,6 +272,16 @@ async function generatePipeline(route, message) {
       await status(`No Door43 username mapped for ${message.sender_email}. Add it to door43-users.json.`);
       return;
     }
+  }
+
+  if (fresh) {
+    clearCheckpoint(checkpointRef);
+    for (let ch = start; ch <= end; ch++) {
+      cleanupGenerateArtifacts({ book, chapter: ch, verseStart, verseEnd });
+    }
+    existingCheckpoint = null;
+    const freshLabel = hasVerseRange ? `${book} ${start}:${verseStart}-${verseEnd}` : `${book} ${start}\u2013${end}`;
+    await status(`Fresh mode enabled for **${freshLabel}** — cleared existing checkpoint and prior artifacts.`);
   }
 
   // Signal working
@@ -268,7 +323,11 @@ async function generatePipeline(route, message) {
   let resumeChapter = Number(existingCheckpoint?.resume?.chapter || start);
   let resumeSkill = existingCheckpoint?.resume?.skill || null;
 
-  if (existingCheckpoint?.state === 'paused_for_outage' && resumeChapter >= start) {
+  const canResumeFromCheckpoint = (
+    existingCheckpoint?.resume?.chapter != null &&
+    (existingCheckpoint?.state === 'paused_for_outage' || existingCheckpoint?.state === 'failed')
+  );
+  if (!fresh && canResumeFromCheckpoint && resumeChapter >= start) {
     await status(`Resuming generation from checkpoint at **${book} ${resumeChapter}** (${resumeSkill || 'chapter start'}).`);
     await reply(`Resuming generation for **${refLabel}** from **${book} ${resumeChapter}** (${resumeSkill || 'chapter start'}).`);
   } else {
@@ -330,6 +389,13 @@ async function generatePipeline(route, message) {
         current: { chapter: ch, skill: skill, status: 'running', startedAt: new Date(chapterStart).toISOString() },
         resume: { chapter: ch, skill },
       });
+      // Delete expected outputs so Claude must recreate them (prevents stale-mtime false failures on resume)
+      for (const rel of [`output/AI-ULT/${book}-${ch}.usfm`, `output/AI-UST/${book}-${ch}.usfm`]) {
+        const resolved = resolveOutputFile(rel, book);
+        if (resolved) {
+          try { fs.unlinkSync(path.resolve(CSKILLBP_DIR, resolved)); } catch (_) { /* fine if missing */ }
+        }
+      }
       try {
         const timeoutMs = calcSkillTimeout(book, ch, 3); // 3 ops for initial-pipeline
         const skillRef = hasVerseRange ? `${book} ${ch}:${verseStart}-${verseEnd}` : `${book} ${ch}`;
@@ -562,6 +628,13 @@ async function generatePipeline(route, message) {
       current: { chapter: ch, skill: 'align-all-parallel', status: 'running' },
       resume: { chapter: ch, skill: 'align-all-parallel' },
     });
+    // Delete expected aligned outputs so Claude must recreate them (prevents stale-mtime false failures on resume)
+    for (const rel of [`output/AI-ULT/${book}-${ch}-aligned.usfm`, `output/AI-UST/${book}-${ch}-aligned.usfm`]) {
+      const resolved = resolveOutputFile(rel, book);
+      if (resolved) {
+        try { fs.unlinkSync(path.resolve(CSKILLBP_DIR, resolved)); } catch (_) { /* fine if missing */ }
+      }
+    }
     try {
       const alignTimeout = calcSkillTimeout(book, ch, 2);
       const alignRef = hasVerseRange ? `${book} ${ch}:${verseStart}-${verseEnd}` : `${book} ${ch}`;

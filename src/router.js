@@ -260,7 +260,9 @@ function getResumeCheckpoint(route, sessionKey, captures) {
       verseEnd: parsed.verseEnd ?? null,
     },
   });
-  if (checkpoint?.state !== 'paused_for_outage') return null;
+  if (!checkpoint) return null;
+  const resumable = checkpoint.state === 'paused_for_outage' || checkpoint.state === 'failed';
+  if (!resumable || checkpoint?.resume?.chapter == null) return null;
   return checkpoint;
 }
 
@@ -316,6 +318,11 @@ function buildEstimateLabel(estimate, book, startCh, endCh, verseStart, verseEnd
 function isResumeStatusCommand(content) {
   const t = String(content || '').trim().toLowerCase();
   return t === 'status resume' || t === 'resume status' || t === 'operator status';
+}
+
+function hasFreshCommandFlag(content) {
+  const t = String(content || '');
+  return /--fresh\b/i.test(t) || /--new\b/i.test(t);
 }
 
 function formatCheckpointScope(cp) {
@@ -751,9 +758,12 @@ async function routeMessage(message) {
         }
       }
       const resumeCheckpoint = getResumeCheckpoint(activeRoute, sessionKey, captures);
-      if (resumeCheckpoint?.resume?.chapter) {
+      const freshRequested = hasFreshCommandFlag(message.content);
+      if (freshRequested) {
+        confirmText += `\n\nFresh mode requested: I will clear old artifacts/checkpoint for this scope and start from scratch.`;
+      } else if (resumeCheckpoint?.resume?.chapter) {
         const resumeSkill = resumeCheckpoint.resume.skill ? ` (${resumeCheckpoint.resume.skill})` : '';
-        confirmText += `\n\nI found paused progress and will resume from **${resumeCheckpoint.scope.book} ${resumeCheckpoint.resume.chapter}**${resumeSkill} after you confirm.`;
+        confirmText += `\n\nI found saved progress and will resume from **${resumeCheckpoint.scope.book} ${resumeCheckpoint.resume.chapter}**${resumeSkill} after you confirm.`;
       }
 
       pendingConfirmations.set(sessionKey, { route: activeRoute, message, timeoutMs });
@@ -829,9 +839,12 @@ async function routeMessage(message) {
             }
           }
           const resumeCheckpoint = getResumeCheckpoint(syntheticRoute, sessionKey, captures);
-          if (resumeCheckpoint?.resume?.chapter) {
+          const freshRequested = hasFreshCommandFlag(message.content);
+          if (freshRequested) {
+            confirmText += `\n\nFresh mode requested: I will clear old artifacts/checkpoint for this scope and start from scratch.`;
+          } else if (resumeCheckpoint?.resume?.chapter) {
             const resumeSkill = resumeCheckpoint.resume.skill ? ` (${resumeCheckpoint.resume.skill})` : '';
-            confirmText += `\n\nI found paused progress and will resume from **${resumeCheckpoint.scope.book} ${resumeCheckpoint.resume.chapter}**${resumeSkill} after you confirm.`;
+            confirmText += `\n\nI found saved progress and will resume from **${resumeCheckpoint.scope.book} ${resumeCheckpoint.resume.chapter}**${resumeSkill} after you confirm.`;
           }
 
           pendingConfirmations.set(sessionKey, { route: syntheticRoute, message, timeoutMs });

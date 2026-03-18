@@ -49,16 +49,52 @@ function hasWithIntroFlag(content) {
   return /--with-?intro\b/i.test(content) || /\bwith[\s-]intro\b/i.test(content);
 }
 
+function hasFreshFlag(content) {
+  return /--fresh\b/i.test(String(content || '')) || /--new\b/i.test(String(content || ''));
+}
+
 function buildNotesPaths(book, tag, hasVerseRange, verseStart, verseEnd) {
   const chapterRel = `output/notes/${book}/${tag}.tsv`;
   const shardRel = hasVerseRange
-    ? `output/notes/${book}/${tag}-v${verseStart}-${verseEnd}.tsv`
+    ? `output/notes/${book}/${tag}-vv${verseStart}-${verseEnd}.tsv`
     : chapterRel;
   return { chapterRel, shardRel };
 }
 
+function removeIfExists(absPath) {
+  try {
+    if (fs.existsSync(absPath)) fs.unlinkSync(absPath);
+  } catch (_) {
+    // non-fatal best-effort cleanup
+  }
+}
+
+function cleanupNotesArtifacts({ book, chapter, verseStart, verseEnd }) {
+  const width = book.toUpperCase() === 'PSA' ? 3 : 2;
+  const tag = `${book}-${String(chapter).padStart(width, '0')}`;
+  const hasVerseRange = verseStart != null && verseEnd != null;
+  const verseTag = hasVerseRange ? `${tag}-vv${verseStart}-${verseEnd}` : tag;
+
+  const candidates = [
+    // issues
+    `output/issues/${tag}.tsv`,
+    `output/issues/${verseTag}.tsv`,
+    `output/issues/${book}/${tag}.tsv`,
+    `output/issues/${book}/${verseTag}.tsv`,
+    // notes
+    `output/notes/${book}/${tag}.tsv`,
+    `output/notes/${book}/${verseTag}.tsv`,
+    // quality
+    `output/quality/${book}/${tag}-quality.md`,
+  ];
+
+  for (const rel of candidates) {
+    removeIfExists(path.resolve(CSKILLBP_DIR, rel));
+  }
+}
+
 function refreshChapterNotesFromShards(book, tag, chapterRel) {
-  const shardGlob = `output/notes/${book}/${tag}-v*.tsv`;
+  const shardGlob = `output/notes/${book}/${tag}-vv*.tsv`;
   const merged = mergeTsvs({ globPattern: shardGlob, output: chapterRel });
   if (!merged.startsWith('Merged')) return null;
   return chapterRel;
@@ -134,6 +170,7 @@ function parseWriteNotesCommand(content) {
       startChapter: parseInt(rangeMatch[2], 10),
       endChapter: parseInt(rangeMatch[3], 10),
       withIntro: hasWithIntroFlag(content),
+      fresh: hasFreshFlag(content),
     };
   }
 
@@ -148,6 +185,7 @@ function parseWriteNotesCommand(content) {
       verseStart: parseInt(verseMatch[3], 10),
       verseEnd: parseInt(verseMatch[4], 10),
       withIntro: hasWithIntroFlag(content),
+      fresh: hasFreshFlag(content),
     };
   }
 
@@ -160,6 +198,7 @@ function parseWriteNotesCommand(content) {
       startChapter: ch,
       endChapter: ch,
       withIntro: hasWithIntroFlag(content),
+      fresh: hasFreshFlag(content),
     };
   }
 
@@ -203,6 +242,7 @@ async function notesPipeline(route, message) {
       startChapter: route._startChapter,
       endChapter: route._endChapter,
       withIntro: hasWithIntroFlag(message.content),
+      fresh: hasFreshFlag(message.content),
     };
   } else {
     parsed = parseWriteNotesCommand(message.content);
@@ -214,14 +254,15 @@ async function notesPipeline(route, message) {
     return;
   }
 
-  const { book, startChapter, endChapter, verseStart, verseEnd, withIntro } = parsed;
+  const { book, startChapter, endChapter, verseStart, verseEnd, withIntro, fresh } = parsed;
   const sessionKey = stream ? `stream-${stream}-${topic}` : `dm-${message.sender_id}`;
+  const debugRunId = `notes-${message.id || Date.now()}`;
   const checkpointRef = {
     sessionKey,
     pipelineType: 'notes',
     scope: { book, startChapter, endChapter, verseStart: verseStart ?? null, verseEnd: verseEnd ?? null },
   };
-  const existingCheckpoint = getCheckpoint(checkpointRef);
+  let existingCheckpoint = getCheckpoint(checkpointRef);
   const chapterCount = endChapter - startChapter + 1;
   const hasGlobalVerseRange = verseStart != null && verseEnd != null && startChapter === endChapter;
   const rangeLabel = hasGlobalVerseRange
@@ -236,6 +277,15 @@ async function notesPipeline(route, message) {
     await addReaction(msgId, 'cross_mark');
     await status(`No Door43 username mapped for ${message.sender_email}. Add it to door43-users.json.`);
     return;
+  }
+
+  if (fresh) {
+    clearCheckpoint(checkpointRef);
+    for (let ch = startChapter; ch <= endChapter; ch++) {
+      cleanupNotesArtifacts({ book, chapter: ch, verseStart, verseEnd });
+    }
+    existingCheckpoint = null;
+    await status(`Fresh mode enabled for **${rangeLabel}** — cleared existing checkpoint and prior artifacts.`);
   }
 
   await addReaction(msgId, 'working_on_it');
@@ -262,7 +312,14 @@ async function notesPipeline(route, message) {
   let resumeChapter = Number(existingCheckpoint?.resume?.chapter || startChapter);
   let resumeSkill = existingCheckpoint?.resume?.skill || null;
 
-  if (existingCheckpoint?.state === 'paused_for_outage' && resumeChapter >= startChapter) {
+  const canResumeFromCheckpoint = (
+    existingCheckpoint?.resume?.chapter != null &&
+    (existingCheckpoint?.state === 'paused_for_outage' || existingCheckpoint?.state === 'failed')
+  );
+  // #region agent log
+  fetch('http://localhost:7282/ingest/190f0e90-444d-4921-920d-f208e86f8cb3',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'7de6a4'},body:JSON.stringify({sessionId:'7de6a4',runId:debugRunId,hypothesisId:'H4',location:'notes-pipeline.js:resume-gate',message:'checkpoint and resume decision',data:{scope:{book,startChapter,endChapter,verseStart:verseStart??null,verseEnd:verseEnd??null},fresh,checkpointState:existingCheckpoint?.state||null,resume:existingCheckpoint?.resume||null,canResumeFromCheckpoint},timestamp:Date.now()})}).catch(()=>{});
+  // #endregion
+  if (!fresh && canResumeFromCheckpoint && resumeChapter >= startChapter) {
     await status(`Resuming notes from checkpoint at **${book} ${resumeChapter}** (${resumeSkill || 'chapter start'}).`);
     await reply(`Resuming notes run for **${rangeLabel}** from **${book} ${resumeChapter}** (${resumeSkill || 'chapter start'}).`);
   } else {
@@ -326,7 +383,7 @@ async function notesPipeline(route, message) {
       await status(`**${ref}**: No AI artifacts (missing: ${missing.join(', ')}) \u2192 deep-issue-id path`);
 
       const verseFlag = hasVerseRange ? ` --verses ${verseStart}-${verseEnd}` : '';
-      const issuesVTag = hasVerseRange ? `${tag}-v${verseStart}-${verseEnd}` : tag;
+      const issuesVTag = hasVerseRange ? `${tag}-vv${verseStart}-${verseEnd}` : tag;
       skills.push({
         name: 'deep-issue-id',
         prompt: `${book} ${ch}${verseFlag}`,
@@ -354,7 +411,7 @@ async function notesPipeline(route, message) {
     skills.push({
       name: 'tn-writer',
       prompt: `${skillRef} --issues ${issuesPath}`,
-      expectedOutput: notesChapterRel,
+      expectedOutput: hasVerseRange ? notesShardRel : notesChapterRel,
       ops: 1,
     });
 
@@ -379,9 +436,19 @@ async function notesPipeline(route, message) {
     for (let si = startSkillIndex; si < skills.length; si++) {
       const skill = skills[si];
       const skillStart = Date.now();
+      // Delete expected output so Claude must recreate it (prevents stale-mtime false failures on resume)
+      if (skill.expectedOutput) {
+        const preClean = resolveOutputFile(skill.expectedOutput, book);
+        if (preClean) {
+          try { fs.unlinkSync(path.resolve(CSKILLBP_DIR, preClean)); } catch (_) { /* fine if missing */ }
+        }
+      }
       const timeoutMs = calcSkillTimeout(book, ch, skill.ops);
       await status(`Running **${skill.name}** for ${ref} (timeout: ${Math.round(timeoutMs / 60000)}min)...`);
       console.log(`[notes] Running ${skill.name}: ${skill.prompt} (timeout: ${Math.round(timeoutMs / 60000)}min)`);
+      // #region agent log
+      fetch('http://localhost:7282/ingest/190f0e90-444d-4921-920d-f208e86f8cb3',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'7de6a4'},body:JSON.stringify({sessionId:'7de6a4',runId:debugRunId,hypothesisId:'H1',location:'notes-pipeline.js:skill-start',message:'skill start',data:{ref,skill:skill.name,expectedOutput:skill.expectedOutput||null,prompt:skill.prompt,skillStart,timeoutMs},timestamp:Date.now()})}).catch(()=>{});
+      // #endregion
       setCheckpoint(checkpointRef, {
         state: 'running',
         totalSuccess,
@@ -409,6 +476,9 @@ async function notesPipeline(route, message) {
         skillError = err;
         console.error(`[notes] ${skill.name} error: ${err.message}`);
       }
+      // #region agent log
+      fetch('http://localhost:7282/ingest/190f0e90-444d-4921-920d-f208e86f8cb3',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'7de6a4'},body:JSON.stringify({sessionId:'7de6a4',runId:debugRunId,hypothesisId:'H4',location:'notes-pipeline.js:skill-result',message:'skill result/error',data:{ref,skill:skill.name,hadError:!!skillError,error:skillError?String(skillError.message||skillError):null,resultSubtype:result?.subtype||null,resultError:result?.error||null},timestamp:Date.now()})}).catch(()=>{});
+      // #endregion
 
       const duration = ((Date.now() - skillStart) / 1000).toFixed(1);
       const sdkSuccess = result?.subtype === 'success';
@@ -476,6 +546,9 @@ async function notesPipeline(route, message) {
       // Check expected output (resolveOutputFile handles padding + subdirs)
       if (skill.expectedOutput) {
         const resolved = resolveOutputFile(skill.expectedOutput, book);
+        // #region agent log
+        fetch('http://localhost:7282/ingest/190f0e90-444d-4921-920d-f208e86f8cb3',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'7de6a4'},body:JSON.stringify({sessionId:'7de6a4',runId:debugRunId,hypothesisId:'H1',location:'notes-pipeline.js:resolve-output',message:'resolved expected output',data:{ref,skill:skill.name,expectedOutput:skill.expectedOutput,resolved:resolved||null},timestamp:Date.now()})}).catch(()=>{});
+        // #endregion
         if (!resolved) {
           failedSkill = skill.name;
           await status(`**${skill.name}** failed for ${ref} \u2014 expected output not found: ${skill.expectedOutput} (${duration}s)`);
@@ -496,6 +569,9 @@ async function notesPipeline(route, message) {
         } catch (_) {
           mtimeMs = 0;
         }
+        // #region agent log
+        fetch('http://localhost:7282/ingest/190f0e90-444d-4921-920d-f208e86f8cb3',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'7de6a4'},body:JSON.stringify({sessionId:'7de6a4',runId:debugRunId,hypothesisId:'H2',location:'notes-pipeline.js:freshness-check',message:'mtime freshness evaluation',data:{ref,skill:skill.name,resolved,skillStart,mtimeMs,isStale:mtimeMs<(skillStart-2000)},timestamp:Date.now()})}).catch(()=>{});
+        // #endregion
         if (mtimeMs < skillStart - 2000) {
           if (skill.name === 'post-edit-review') {
             // post-edit-review can legitimately keep an unchanged issues TSV.
@@ -532,7 +608,9 @@ async function notesPipeline(route, message) {
             const absResolved = path.resolve(CSKILLBP_DIR, resolved);
             const absShard = path.resolve(CSKILLBP_DIR, notesShardRel);
             fs.mkdirSync(path.dirname(absShard), { recursive: true });
-            fs.copyFileSync(absResolved, absShard);
+            if (absResolved !== absShard) {
+              fs.copyFileSync(absResolved, absShard);
+            }
             skill.resolvedOutput = notesShardRel;
             console.log(`[notes] Wrote verse shard: ${notesShardRel}`);
             // Keep a chapter-level assembled view up-to-date for future checks/runs.
