@@ -325,7 +325,7 @@ async function generatePipeline(route, message) {
 
   const canResumeFromCheckpoint = (
     existingCheckpoint?.resume?.chapter != null &&
-    (existingCheckpoint?.state === 'paused_for_outage' || existingCheckpoint?.state === 'failed')
+    (existingCheckpoint?.state === 'paused_for_outage' || existingCheckpoint?.state === 'failed' || existingCheckpoint?.state === 'running')
   );
   if (!fresh && canResumeFromCheckpoint && resumeChapter >= start) {
     await status(`Resuming generation from checkpoint at **${book} ${resumeChapter}** (${resumeSkill || 'chapter start'}).`);

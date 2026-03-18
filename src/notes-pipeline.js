@@ -314,7 +314,7 @@ async function notesPipeline(route, message) {
 
   const canResumeFromCheckpoint = (
     existingCheckpoint?.resume?.chapter != null &&
-    (existingCheckpoint?.state === 'paused_for_outage' || existingCheckpoint?.state === 'failed')
+    (existingCheckpoint?.state === 'paused_for_outage' || existingCheckpoint?.state === 'failed' || existingCheckpoint?.state === 'running')
   );
   // #region agent log
   fetch('http://localhost:7282/ingest/190f0e90-444d-4921-920d-f208e86f8cb3',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'7de6a4'},body:JSON.stringify({sessionId:'7de6a4',runId:debugRunId,hypothesisId:'H4',location:'notes-pipeline.js:resume-gate',message:'checkpoint and resume decision',data:{scope:{book,startChapter,endChapter,verseStart:verseStart??null,verseEnd:verseEnd??null},fresh,checkpointState:existingCheckpoint?.state||null,resume:existingCheckpoint?.resume||null,canResumeFromCheckpoint},timestamp:Date.now()})}).catch(()=>{});

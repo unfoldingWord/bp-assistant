@@ -6,7 +6,7 @@ const { getTotalVerses } = require('./verse-counts');
 const { classifyIntent } = require('./intent-classifier');
 const { preflightCheck, estimateTokens } = require('./usage-tracker');
 const { getPendingMerge, clearPendingMerge } = require('./pending-merges');
-const { getCheckpoint, clearCheckpoint } = require('./pipeline-checkpoints');
+const { getCheckpoint, setCheckpoint, clearCheckpoint } = require('./pipeline-checkpoints');
 const { listCheckpoints } = require('./pipeline-checkpoints');
 const { resumeInsertion } = require('./insertion-resume');
 const { normalizeBookName, isValidBook } = require('./pipeline-utils');
@@ -261,7 +261,7 @@ function getResumeCheckpoint(route, sessionKey, captures) {
     },
   });
   if (!checkpoint) return null;
-  const resumable = checkpoint.state === 'paused_for_outage' || checkpoint.state === 'failed';
+  const resumable = checkpoint.state === 'paused_for_outage' || checkpoint.state === 'failed' || checkpoint.state === 'running';
   if (!resumable || checkpoint?.resume?.chapter == null) return null;
   return checkpoint;
 }
@@ -482,13 +482,15 @@ function firePipeline(route, message) {
       : `dm-${message.sender_id}`;
     activeCp = getActiveCheckpoint(route, sessionKey, captures);
     if (isStaleRunningCheckpoint(activeCp)) {
-      clearCheckpoint({
+      // Convert interrupted 'running' to 'failed' so it becomes resumable
+      // instead of clearing the checkpoint and losing the resume point.
+      setCheckpoint({
         sessionKey: activeCp.sessionKey,
         pipelineType: activeCp.pipelineType,
         scope: activeCp.scope,
-      });
+      }, { state: 'failed', current: { ...activeCp.current, status: 'failed', errorKind: 'interrupted' } });
       console.warn(
-        `[router] Cleared stale running checkpoint for ${activeCp.pipelineType} ${activeCp.scope?.book || ''} ` +
+        `[router] Converted interrupted checkpoint to resumable for ${activeCp.pipelineType} ${activeCp.scope?.book || ''} ` +
         `${activeCp.scope?.startChapter || ''}-${activeCp.scope?.endChapter || ''}`.trim()
       );
       activeCp = null;
