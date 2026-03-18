@@ -66,7 +66,12 @@ Claude API path also supports aliases through config:
 - `modelAliases.sonnet`
 - `modelAliases.haiku`
 
-This alias resolution is API-runner-only and does not alter the existing Claude SDK path.
+Cross-provider equivalents are handled with the same alias keys per provider:
+- OpenAI example: `sonnet -> gpt-5.3`
+- Gemini example: `sonnet -> gemini-2.5-pro`
+- xAI example: `sonnet -> grok-4-1-fast-reasoning`
+
+This alias resolution is API-runner-only and does not alter the existing Claude SDK path (`opus`/`sonnet`/`haiku`).
 
 Load order:
 - `MODEL_PROVIDER_CONFIG_FILE` (if set)

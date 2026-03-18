@@ -12,7 +12,8 @@ async function getAnthropicClass() {
   return _Anthropic;
 }
 
-const { defaultModel: DEFAULT_MODEL, models: MODELS } = getProviderConfig('claude');
+const DEFAULT_MODEL = getProviderConfig('claude').defaultModel;
+const MODELS = getProviderConfig('claude').models;
 
 const THINKING_MAP = {
   low: 'low',
@@ -62,7 +63,8 @@ function toClaudeMessages(messages) {
 async function sendRequest({ model, system, messages, tools, thinking, apiKey }) {
   const Anthropic = await getAnthropicClass();
   const client = new Anthropic({ apiKey });
-  const modelId = resolveProviderModel('claude', model || DEFAULT_MODEL);
+  const providerCfg = getProviderConfig('claude');
+  const modelId = resolveProviderModel('claude', model || providerCfg.defaultModel);
 
   const params = {
     model: modelId,
@@ -133,8 +135,9 @@ function formatAssistantMessage(content, toolCalls) {
 }
 
 function estimateCost(model, usage) {
-  const resolved = resolveProviderModel('claude', model || DEFAULT_MODEL);
-  const m = MODELS[resolved] || MODELS[DEFAULT_MODEL];
+  const providerCfg = getProviderConfig('claude');
+  const resolved = resolveProviderModel('claude', model || providerCfg.defaultModel);
+  const m = providerCfg.models[resolved] || providerCfg.models[providerCfg.defaultModel];
   const inputCost = (usage.inputTokens / 1_000_000) * m.inputPer1M;
   const outputCost = (usage.outputTokens / 1_000_000) * m.outputPer1M;
   return inputCost + outputCost;

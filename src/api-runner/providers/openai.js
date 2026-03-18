@@ -1,9 +1,10 @@
 // providers/openai.js — OpenAI SDK provider
 
 const OpenAI = require('openai');
-const { getProviderConfig } = require('../provider-config');
+const { getProviderConfig, resolveProviderModel } = require('../provider-config');
 
-const { defaultModel: DEFAULT_MODEL, models: MODELS } = getProviderConfig('openai');
+const DEFAULT_MODEL = getProviderConfig('openai').defaultModel;
+const MODELS = getProviderConfig('openai').models;
 
 const THINKING_MAP = {
   low: 'low',
@@ -53,9 +54,10 @@ function toOpenAIMessages(system, messages) {
 /**
  * Send a request to the OpenAI-compatible API.
  */
-async function sendRequest({ model, system, messages, tools, thinking, apiKey, baseUrl }) {
+async function sendRequest({ model, system, messages, tools, thinking, apiKey, baseUrl, providerName = 'openai' }) {
   const client = new OpenAI({ apiKey, baseURL: baseUrl });
-  const modelId = model || DEFAULT_MODEL;
+  const providerCfg = getProviderConfig(providerName);
+  const modelId = resolveProviderModel(providerName, model || providerCfg.defaultModel);
 
   const body = {
     model: modelId,
@@ -129,8 +131,10 @@ function formatAssistantMessage(content, toolCalls) {
   return { role: 'assistant', content, toolCalls };
 }
 
-function estimateCost(model, usage) {
-  const m = MODELS[model] || MODELS[DEFAULT_MODEL];
+function estimateCost(model, usage, providerName = 'openai') {
+  const providerCfg = getProviderConfig(providerName);
+  const resolved = resolveProviderModel(providerName, model || providerCfg.defaultModel);
+  const m = providerCfg.models[resolved] || providerCfg.models[providerCfg.defaultModel];
   const inputCost = (usage.inputTokens / 1_000_000) * m.inputPer1M;
   const outputCost = (usage.outputTokens / 1_000_000) * m.outputPer1M;
   return inputCost + outputCost;

@@ -22,6 +22,11 @@ const DEFAULT_PROVIDER_CONFIGS = {
     defaultModel: 'gpt-4.1',
     secretName: 'openai_api_key',
     envName: 'OPENAI_API_KEY',
+    modelAliases: {
+      opus: 'gpt-5.4',
+      sonnet: 'gpt-5.3',
+      haiku: 'o4-mini',
+    },
     models: {
       'gpt-4.1': { label: 'GPT 4.1', inputPer1M: 2.0, outputPer1M: 8.0 },
       'gpt-5.3': { label: 'GPT 5.3', inputPer1M: 4.0, outputPer1M: 16.0 },
@@ -34,6 +39,11 @@ const DEFAULT_PROVIDER_CONFIGS = {
     defaultModel: 'gemini-3.1-pro-preview',
     secretName: 'google_api_key',
     envName: 'GOOGLE_API_KEY',
+    modelAliases: {
+      opus: 'gemini-3.1-pro-preview',
+      sonnet: 'gemini-2.5-pro',
+      haiku: 'gemini-3-flash-preview',
+    },
     models: {
       'gemini-3.1-pro-preview': { label: 'Gemini 3.1 Pro (preview)', inputPer1M: 1.25, outputPer1M: 10.0 },
       'gemini-3-pro-preview': { label: 'Gemini 3 Pro (preview)', inputPer1M: 1.25, outputPer1M: 10.0 },
@@ -47,6 +57,11 @@ const DEFAULT_PROVIDER_CONFIGS = {
     secretName: 'xai_api_key',
     envName: 'XAI_API_KEY',
     baseUrl: 'https://api.x.ai',
+    modelAliases: {
+      opus: 'grok-4-0709',
+      sonnet: 'grok-4-1-fast-reasoning',
+      haiku: 'grok-4-1-fast-non-reasoning',
+    },
     models: {
       'grok-4-0709': { label: 'Grok 4', inputPer1M: 3.0, outputPer1M: 9.0 },
       'grok-4-1-fast-reasoning': { label: 'Grok 4.1 Fast (reasoning)', inputPer1M: 3.0, outputPer1M: 9.0 },
@@ -68,6 +83,11 @@ const DEFAULT_PROVIDER_CONFIGS = {
     secretName: 'openai_api_key',
     envName: 'OPENAI_API_KEY',
     baseUrl: 'https://api.groq.com/openai/v1',
+    modelAliases: {
+      opus: 'qwen/qwen3-32b',
+      sonnet: 'meta-llama/llama-4-scout-17b-16e-instruct',
+      haiku: 'meta-llama/llama-4-scout-17b-16e-instruct',
+    },
     models: {
       'meta-llama/llama-4-scout-17b-16e-instruct': { label: 'Llama 4 Scout', inputPer1M: 0.2, outputPer1M: 0.2 },
       'qwen/qwen3-32b': { label: 'Qwen3 32B', inputPer1M: 0.29, outputPer1M: 0.39 },
@@ -78,6 +98,11 @@ const DEFAULT_PROVIDER_CONFIGS = {
     secretName: 'openai_api_key',
     envName: 'OPENAI_API_KEY',
     baseUrl: 'https://api.deepseek.com',
+    modelAliases: {
+      opus: 'deepseek-reasoner',
+      sonnet: 'deepseek-chat',
+      haiku: 'deepseek-chat',
+    },
     models: {
       'deepseek-chat': { label: 'DeepSeek Chat', inputPer1M: 0.27, outputPer1M: 1.1 },
       'deepseek-reasoner': { label: 'DeepSeek Reasoner', inputPer1M: 0.55, outputPer1M: 2.19 },
@@ -88,6 +113,11 @@ const DEFAULT_PROVIDER_CONFIGS = {
     secretName: 'openai_api_key',
     envName: 'OPENAI_API_KEY',
     baseUrl: 'https://api.mistral.ai/v1',
+    modelAliases: {
+      opus: 'mistral-large-latest',
+      sonnet: 'mistral-medium-latest',
+      haiku: 'mistral-medium-latest',
+    },
     models: {
       'mistral-large-latest': { label: 'Mistral Large', inputPer1M: 2.0, outputPer1M: 6.0 },
       'mistral-medium-latest': { label: 'Mistral Medium', inputPer1M: 0.6, outputPer1M: 1.8 },
@@ -204,7 +234,7 @@ function getProviderNames() {
 
 function resolveXaiModel(model, thinking) {
   const cfg = getProviderConfig('xai');
-  if (model) return model;
+  if (model) return cfg.modelAliases?.[model] || model;
   return cfg.autoModelByThinking[thinking || 'medium'] || cfg.defaultModel;
 }
 

@@ -188,7 +188,11 @@ async function runAgentLoop({
     const m = xaiConfig.models[modelForCost] || fallback;
     cost = (totalInputTokens / 1_000_000) * m.inputPer1M + (totalOutputTokens / 1_000_000) * m.outputPer1M;
   } else {
-    cost = providerMod.estimateCost(modelForCost, { inputTokens: totalInputTokens, outputTokens: totalOutputTokens });
+    cost = providerMod.estimateCost(
+      modelForCost,
+      { inputTokens: totalInputTokens, outputTokens: totalOutputTokens },
+      providerName
+    );
   }
 
   console.log(`[agent-loop] Finished — turns: ${turns}, input: ${totalInputTokens}, output: ${totalOutputTokens}, cost: $${cost.toFixed(4)}, duration: ${(durationMs / 1000).toFixed(1)}s`);

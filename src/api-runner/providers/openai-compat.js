@@ -12,23 +12,27 @@ function wrap(config) {
     async sendRequest(args) {
       return openaiProvider.sendRequest({
         ...args,
+        providerName: config.providerName,
         baseUrl: args.baseUrl || config.baseUrl,
         model: args.model || config.defaultModel,
       });
+    },
+    estimateCost(model, usage) {
+      return openaiProvider.estimateCost(model, usage, config.providerName);
     },
   };
 }
 
 function forGroq() {
-  return wrap(getProviderConfig('groq'));
+  return wrap({ ...getProviderConfig('groq'), providerName: 'groq' });
 }
 
 function forDeepSeek() {
-  return wrap(getProviderConfig('deepseek'));
+  return wrap({ ...getProviderConfig('deepseek'), providerName: 'deepseek' });
 }
 
 function forMistral() {
-  return wrap(getProviderConfig('mistral'));
+  return wrap({ ...getProviderConfig('mistral'), providerName: 'mistral' });
 }
 
 module.exports = {

@@ -1,9 +1,10 @@
 // providers/gemini.js — Google Gemini SDK provider
 
 const { GoogleGenAI } = require('@google/genai');
-const { getProviderConfig } = require('../provider-config');
+const { getProviderConfig, resolveProviderModel } = require('../provider-config');
 
-const { defaultModel: DEFAULT_MODEL, models: MODELS } = getProviderConfig('gemini');
+const DEFAULT_MODEL = getProviderConfig('gemini').defaultModel;
+const MODELS = getProviderConfig('gemini').models;
 
 const THINKING_MAP_3X = {
   low: 'low',
@@ -69,9 +70,10 @@ function toGeminiContents(messages) {
 /**
  * Send a request to the Gemini API.
  */
-async function sendRequest({ model, system, messages, tools, thinking, apiKey }) {
+async function sendRequest({ model, system, messages, tools, thinking, apiKey, providerName = 'gemini' }) {
   const ai = new GoogleGenAI({ apiKey });
-  const modelId = model || DEFAULT_MODEL;
+  const providerCfg = getProviderConfig(providerName);
+  const modelId = resolveProviderModel(providerName, model || providerCfg.defaultModel);
 
   const config = { maxOutputTokens: 65536 };
   const thinkingCfg = getThinkingConfig(modelId, thinking);
@@ -147,8 +149,10 @@ function formatAssistantMessage(content, toolCalls, _rawParts) {
   return { role: 'assistant', content, toolCalls, _rawParts };
 }
 
-function estimateCost(model, usage) {
-  const m = MODELS[model] || MODELS[DEFAULT_MODEL];
+function estimateCost(model, usage, providerName = 'gemini') {
+  const providerCfg = getProviderConfig(providerName);
+  const resolved = resolveProviderModel(providerName, model || providerCfg.defaultModel);
+  const m = providerCfg.models[resolved] || providerCfg.models[providerCfg.defaultModel];
   const inputCost = (usage.inputTokens / 1_000_000) * m.inputPer1M;
   const outputCost = (usage.outputTokens / 1_000_000) * m.outputPer1M;
   return inputCost + outputCost;
