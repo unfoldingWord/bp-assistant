@@ -312,6 +312,7 @@ async function notesPipeline(route, message) {
   let usageLimitTag = null;
   let resumeChapter = Number(existingCheckpoint?.resume?.chapter || startChapter);
   let resumeSkill = existingCheckpoint?.resume?.skill || null;
+  const skillOutputs = existingCheckpoint?.skillOutputs || {};
 
   const canResumeFromCheckpoint = (
     existingCheckpoint?.resume?.chapter != null &&
@@ -331,6 +332,7 @@ async function notesPipeline(route, message) {
     state: 'running',
     totalSuccess,
     totalFail,
+    skillOutputs,
     resume: { chapter: resumeChapter, skill: resumeSkill },
   });
 
@@ -438,6 +440,16 @@ async function notesPipeline(route, message) {
         await status(`Checkpoint resume skill "${resumeSkill}" not found for ${ref}; restarting chapter skill chain.`);
       }
     }
+    // Restore resolvedOutput for skipped skills from the manifest
+    const chOutputs = skillOutputs[ch] || {};
+    for (let si2 = 0; si2 < startSkillIndex; si2++) {
+      if (chOutputs[skills[si2].name]) {
+        skills[si2].resolvedOutput = chOutputs[skills[si2].name];
+      }
+    }
+    if (chOutputs['deep-issue-id']) issuesPath = chOutputs['deep-issue-id'];
+    else if (chOutputs['post-edit-review']) issuesPath = chOutputs['post-edit-review'];
+
     for (let si = startSkillIndex; si < skills.length; si++) {
       const skill = skills[si];
       const skillStart = Date.now();
@@ -612,6 +624,8 @@ async function notesPipeline(route, message) {
           }
         }
         skill.resolvedOutput = resolved;
+        if (!skillOutputs[ch]) skillOutputs[ch] = {};
+        skillOutputs[ch][skill.name] = resolved;
         // Update issuesPath if deep-issue-id produced it in a subdirectory
         if (skill.name === 'deep-issue-id') {
           issuesPath = resolved;
@@ -633,6 +647,7 @@ async function notesPipeline(route, message) {
               fs.copyFileSync(absResolved, absShard);
             }
             skill.resolvedOutput = notesShardRel;
+            skillOutputs[ch]['tn-writer'] = notesShardRel;
             console.log(`[notes] Wrote verse shard: ${notesShardRel}`);
             // Keep a chapter-level assembled view up-to-date for future checks/runs.
             const assembledRel = refreshChapterNotesFromShards(book, tag, notesChapterRel);
@@ -668,6 +683,7 @@ async function notesPipeline(route, message) {
         state: 'running',
         totalSuccess,
         totalFail,
+        skillOutputs,
         current: { chapter: ch, skill: skill.name, status: 'succeeded' },
         resume: null,
       });
@@ -681,6 +697,7 @@ async function notesPipeline(route, message) {
         state: abortForOutage ? 'paused_for_outage' : 'failed',
         totalSuccess,
         totalFail,
+        skillOutputs,
         resume: { chapter: ch, skill: failedSkill },
       });
       await status(`Chapter ${ref} failed at **${failedSkill}** after ${chapterDuration}s`);
@@ -699,7 +716,9 @@ async function notesPipeline(route, message) {
     }
 
     const tnWriterSkill = skills.find(s => s.name === 'tn-writer');
-    const notesSource = tnWriterSkill?.resolvedOutput || (hasVerseRange ? notesShardRel : notesChapterRel);
+    const notesSource = tnWriterSkill?.resolvedOutput
+      || (skillOutputs[ch] || {})['tn-writer']
+      || (hasVerseRange ? notesShardRel : notesChapterRel);
     let chapterFailed = false;
 
     setCheckpoint(checkpointRef, {
