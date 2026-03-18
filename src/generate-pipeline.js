@@ -358,6 +358,7 @@ async function generatePipeline(route, message) {
 
     if (!runInitialSkill) {
       await status(`Resuming ${chapterRef} at **align-all-parallel**.`);
+      claudeResult = { subtype: 'success', resumed: true };
     } else if (isDryRun) {
       const dryRunRef = hasVerseRange ? `${book} ${ch}:${verseStart}-${verseEnd}` : `${book} ${ch}`;
       console.log(`[dry-run] Would run Claude SDK: /${skill} ${dryRunRef} (in ${CSKILLBP_DIR})`);
@@ -459,9 +460,11 @@ async function generatePipeline(route, message) {
 
     // UST is the last artifact the pipeline produces
     // Discover by recency — handles any naming variant the skill used
+    // When resuming at align-all-parallel, ULT/UST were written in a prior run — skip freshness filter
     const chPat = new RegExp(`^${book}-0*${ch}(-(?!.*aligned).*)?\.usfm$`);
-    const ultRel = discoverFreshOutput('output/AI-ULT', book, chPat, chapterStart);
-    const ustRel = discoverFreshOutput('output/AI-UST', book, chPat, chapterStart);
+    const freshnessMs = runInitialSkill ? chapterStart : null;
+    const ultRel = discoverFreshOutput('output/AI-ULT', book, chPat, freshnessMs);
+    const ustRel = discoverFreshOutput('output/AI-UST', book, chPat, freshnessMs);
     const hasUlt = !!ultRel;
     const hasUst = !!ustRel;
 
@@ -539,7 +542,7 @@ async function generatePipeline(route, message) {
       continue;
     }
 
-    if (!isFreshOutput(ustRel, chapterStart)) {
+    if (runInitialSkill && !isFreshOutput(ustRel, chapterStart)) {
       await status(`Failed to generate **${book} ${ch}**: output appears stale from an earlier run (${ustRel}).`);
       fail++;
       setCheckpoint(checkpointRef, {
