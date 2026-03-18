@@ -11,7 +11,7 @@ const path = require('path');
 const config = require('./config');
 const { sendMessage, sendDM, addReaction, removeReaction, uploadFile } = require('./zulip-client');
 const { runClaude, DEFAULT_RESTRICTED_TOOLS, isTransientOutageError } = require('./claude-runner');
-const { getDoor43Username, buildBranchName, resolveOutputFile, calcSkillTimeout, normalizeBookName, resolveConflictMention, CSKILLBP_DIR } = require('./pipeline-utils');
+const { getDoor43Username, buildBranchName, resolveOutputFile, discoverFreshOutput, calcSkillTimeout, normalizeBookName, resolveConflictMention, CSKILLBP_DIR } = require('./pipeline-utils');
 const { verifyRepoPush, verifyDcsToken } = require('./repo-verify');
 const { ensureFreshToken, isAuthError } = require('./auth-refresh');
 const { recordMetrics, getCumulativeTokens, recordRunSummary } = require('./usage-tracker');
@@ -358,6 +358,7 @@ async function generatePipeline(route, message) {
 
     if (!runInitialSkill) {
       await status(`Resuming ${chapterRef} at **align-all-parallel**.`);
+      claudeResult = { subtype: 'success', resumed: true };
     } else if (isDryRun) {
       const dryRunRef = hasVerseRange ? `${book} ${ch}:${verseStart}-${verseEnd}` : `${book} ${ch}`;
       console.log(`[dry-run] Would run Claude SDK: /${skill} ${dryRunRef} (in ${CSKILLBP_DIR})`);
@@ -458,10 +459,12 @@ async function generatePipeline(route, message) {
     const sdkSuccess = claudeResult?.subtype === 'success';
 
     // UST is the last artifact the pipeline produces
-    // Check both flat (output/AI-ULT/PSA-133.usfm) and subfolder (output/AI-ULT/PSA/PSA-133.usfm) paths
-    const vTag = hasVerseRange ? `${book}-${ch}-vv${verseStart}-${verseEnd}` : `${book}-${ch}`;
-    const ultRel = resolveOutputFile(`output/AI-ULT/${vTag}.usfm`, book);
-    const ustRel = resolveOutputFile(`output/AI-UST/${vTag}.usfm`, book);
+    // Discover by recency — handles any naming variant the skill used
+    // When resuming at align-all-parallel, ULT/UST were written in a prior run — skip freshness filter
+    const chPat = new RegExp(`^${book}-0*${ch}(-(?!.*aligned).*)?\.usfm$`);
+    const freshnessMs = runInitialSkill ? chapterStart : null;
+    const ultRel = discoverFreshOutput('output/AI-ULT', book, chPat, freshnessMs);
+    const ustRel = discoverFreshOutput('output/AI-UST', book, chPat, freshnessMs);
     const hasUlt = !!ultRel;
     const hasUst = !!ustRel;
 
@@ -539,7 +542,7 @@ async function generatePipeline(route, message) {
       continue;
     }
 
-    if (!isFreshOutput(ustRel, chapterStart)) {
+    if (runInitialSkill && !isFreshOutput(ustRel, chapterStart)) {
       await status(`Failed to generate **${book} ${ch}**: output appears stale from an earlier run (${ustRel}).`);
       fail++;
       setCheckpoint(checkpointRef, {
@@ -691,9 +694,10 @@ async function generatePipeline(route, message) {
         success: alignResult?.subtype === 'success', userId: message.sender_id,
       });
 
-      // Check aligned output files via resolveOutputFile (handles padding + subdirs)
-      const alignedUltRel = resolveOutputFile(`output/AI-ULT/${vAlign}-aligned.usfm`, book);
-      const alignedUstRel = resolveOutputFile(`output/AI-UST/${vAlign}-aligned.usfm`, book);
+      // Discover aligned output files by recency — handles any naming variant
+      const alignPat = new RegExp(`^${book}-0*${ch}(-.*)?-aligned\\.usfm$`);
+      const alignedUltRel = discoverFreshOutput('output/AI-ULT', book, alignPat, chapterStart);
+      const alignedUstRel = discoverFreshOutput('output/AI-UST', book, alignPat, chapterStart);
 
       if (!alignedUltRel || !alignedUstRel) {
         await status(`**align-all-parallel** failed for ${book} ${ch} \u2014 aligned files not found (${alignDuration}s)`);

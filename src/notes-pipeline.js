@@ -12,7 +12,7 @@ const path = require('path');
 const config = require('./config');
 const { sendMessage, sendDM, addReaction, removeReaction } = require('./zulip-client');
 const { runClaude, DEFAULT_RESTRICTED_TOOLS, isTransientOutageError } = require('./claude-runner');
-const { getDoor43Username, buildBranchName, resolveOutputFile, checkPrerequisites, calcSkillTimeout, normalizeBookName, resolveConflictMention, CSKILLBP_DIR } = require('./pipeline-utils');
+const { getDoor43Username, buildBranchName, resolveOutputFile, discoverFreshOutput, checkPrerequisites, calcSkillTimeout, normalizeBookName, resolveConflictMention, CSKILLBP_DIR } = require('./pipeline-utils');
 const { verifyRepoPush, verifyDcsToken } = require('./repo-verify');
 const { recordMetrics, getCumulativeTokens, recordRunSummary } = require('./usage-tracker');
 const { door43Push, checkConflictingBranches, REPO_MAP, getRepoFilename } = require('./door43-push');
@@ -576,9 +576,13 @@ async function notesPipeline(route, message) {
         break;
       }
 
-      // Check expected output (resolveOutputFile handles padding + subdirs)
+      // Check expected output — discover by recency first, fall back to resolveOutputFile
       if (skill.expectedOutput) {
-        const resolved = resolveOutputFile(skill.expectedOutput, book);
+        const outDir = path.dirname(skill.expectedOutput);
+        const outExt = path.extname(skill.expectedOutput).replace('.', '\\.');
+        const discoverPat = new RegExp(`^${book}-0*${ch}(-.*)?${outExt}$`);
+        const resolved = discoverFreshOutput(outDir, book, discoverPat, skillStart)
+          || resolveOutputFile(skill.expectedOutput, book);
         // #region agent log
         fetch('http://localhost:7282/ingest/190f0e90-444d-4921-920d-f208e86f8cb3',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'7de6a4'},body:JSON.stringify({sessionId:'7de6a4',runId:debugRunId,hypothesisId:'H1',location:'notes-pipeline.js:resolve-output',message:'resolved expected output',data:{ref,skill:skill.name,expectedOutput:skill.expectedOutput,resolved:resolved||null},timestamp:Date.now()})}).catch(()=>{});
         // #endregion
