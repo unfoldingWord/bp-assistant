@@ -390,7 +390,8 @@ async function generatePipeline(route, message) {
         resume: { chapter: ch, skill },
       });
       // Delete expected outputs so Claude must recreate them (prevents stale-mtime false failures on resume)
-      for (const rel of [`output/AI-ULT/${book}-${ch}.usfm`, `output/AI-UST/${book}-${ch}.usfm`]) {
+      const vDel = hasVerseRange ? `${book}-${ch}-vv${verseStart}-${verseEnd}` : `${book}-${ch}`;
+      for (const rel of [`output/AI-ULT/${vDel}.usfm`, `output/AI-UST/${vDel}.usfm`]) {
         const resolved = resolveOutputFile(rel, book);
         if (resolved) {
           try { fs.unlinkSync(path.resolve(CSKILLBP_DIR, resolved)); } catch (_) { /* fine if missing */ }
@@ -458,8 +459,9 @@ async function generatePipeline(route, message) {
 
     // UST is the last artifact the pipeline produces
     // Check both flat (output/AI-ULT/PSA-133.usfm) and subfolder (output/AI-ULT/PSA/PSA-133.usfm) paths
-    const ultRel = resolveOutputFile(`output/AI-ULT/${book}-${ch}.usfm`, book);
-    const ustRel = resolveOutputFile(`output/AI-UST/${book}-${ch}.usfm`, book);
+    const vTag = hasVerseRange ? `${book}-${ch}-vv${verseStart}-${verseEnd}` : `${book}-${ch}`;
+    const ultRel = resolveOutputFile(`output/AI-ULT/${vTag}.usfm`, book);
+    const ustRel = resolveOutputFile(`output/AI-UST/${vTag}.usfm`, book);
     const hasUlt = !!ultRel;
     const hasUst = !!ustRel;
 
@@ -629,7 +631,8 @@ async function generatePipeline(route, message) {
       resume: { chapter: ch, skill: 'align-all-parallel' },
     });
     // Delete expected aligned outputs so Claude must recreate them (prevents stale-mtime false failures on resume)
-    for (const rel of [`output/AI-ULT/${book}-${ch}-aligned.usfm`, `output/AI-UST/${book}-${ch}-aligned.usfm`]) {
+    const vAlign = hasVerseRange ? `${book}-${ch}-vv${verseStart}-${verseEnd}` : `${book}-${ch}`;
+    for (const rel of [`output/AI-ULT/${vAlign}-aligned.usfm`, `output/AI-UST/${vAlign}-aligned.usfm`]) {
       const resolved = resolveOutputFile(rel, book);
       if (resolved) {
         try { fs.unlinkSync(path.resolve(CSKILLBP_DIR, resolved)); } catch (_) { /* fine if missing */ }
@@ -689,8 +692,8 @@ async function generatePipeline(route, message) {
       });
 
       // Check aligned output files via resolveOutputFile (handles padding + subdirs)
-      const alignedUltRel = resolveOutputFile(`output/AI-ULT/${book}-${ch}-aligned.usfm`, book);
-      const alignedUstRel = resolveOutputFile(`output/AI-UST/${book}-${ch}-aligned.usfm`, book);
+      const alignedUltRel = resolveOutputFile(`output/AI-ULT/${vAlign}-aligned.usfm`, book);
+      const alignedUstRel = resolveOutputFile(`output/AI-UST/${vAlign}-aligned.usfm`, book);
 
       if (!alignedUltRel || !alignedUstRel) {
         await status(`**align-all-parallel** failed for ${book} ${ch} \u2014 aligned files not found (${alignDuration}s)`);
