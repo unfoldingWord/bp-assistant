@@ -320,6 +320,11 @@ function isResumeStatusCommand(content) {
   return t === 'status resume' || t === 'resume status' || t === 'operator status';
 }
 
+function isResumeCommand(content) {
+  const cleaned = String(content || '').replace(/^@\*\*[^*]+\*\*\s*/, '').trim();
+  return /^\s*resume\s*$/i.test(cleaned);
+}
+
 function hasFreshCommandFlag(content) {
   const t = String(content || '');
   return /--fresh\b/i.test(t) || /--new\b/i.test(t);
@@ -438,6 +443,49 @@ function buildSyntheticRoute(intent, senderName) {
       ? `I'll generate the initial content (ULT & UST, issues draft) for **${rangeLabel}**. Sound right? (yes/no)`
       : `I'll write translation notes for **${rangeLabel}**. Sound right? (yes/no)`,
   };
+}
+
+/**
+ * Build a synthetic route from a paused checkpoint so the pipeline can resume.
+ */
+function buildResumeRoute(checkpoint) {
+  const routeNameMap = { generate: 'generate-content', notes: 'write-notes' };
+  const targetName = routeNameMap[checkpoint.pipelineType];
+  const baseRoute = targetName ? config.routes.find(r => r.name === targetName) : null;
+  if (!baseRoute) return null;
+
+  const scope = checkpoint.scope;
+  const rangeLabel = scope.verseStart != null && scope.verseEnd != null && scope.startChapter === scope.endChapter
+    ? `${scope.book} ${scope.startChapter}:${scope.verseStart}-${scope.verseEnd}`
+    : scope.startChapter === scope.endChapter
+      ? `${scope.book} ${scope.startChapter}`
+      : `${scope.book} ${scope.startChapter}-${scope.endChapter}`;
+
+  return {
+    ...baseRoute,
+    _synthetic: true,
+    _book: scope.book,
+    _startChapter: scope.startChapter,
+    _endChapter: scope.endChapter,
+    _verseStart: scope.verseStart || null,
+    _verseEnd: scope.verseEnd || null,
+    _scopeText: rangeLabel.replace(/^\S+\s+/, ''), // chapter/verse part only
+    confirmMessage: `I'll resume ${checkpoint.pipelineType} for **${rangeLabel}**. Sound right? (yes/no)`,
+  };
+}
+
+/**
+ * Calculate timeout for a resume operation based on checkpoint scope.
+ */
+function calcResumeTimeout(checkpoint) {
+  const scope = checkpoint.scope;
+  const chapters = [];
+  for (let i = scope.startChapter; i <= scope.endChapter; i++) chapters.push(i);
+  const routeName = checkpoint.pipelineType === 'generate' ? 'generate-content' : 'write-notes';
+  const baseRoute = config.routes.find(r => r.name === routeName);
+  const ops = baseRoute?.operations || 1;
+  const totalVerses = getTotalVerses(scope.book, chapters);
+  return Math.max(totalVerses * ops * MS_PER_VERSE_OP, MIN_TIMEOUT_MS);
 }
 
 /**
@@ -659,6 +707,40 @@ async function routeMessage(message) {
       }
       // Other messages pass through to normal routing
     }
+  }
+
+  // Handle bare "resume" command — find paused checkpoints for this topic
+  if (isStream && isResumeCommand(message.content)) {
+    const paused = listCheckpoints()
+      .filter(cp => cp && cp.sessionKey === sessionKey &&
+        (cp.state === 'paused_for_outage' || cp.state === 'failed'))
+      .sort((a, b) => String(b.updatedAt || '').localeCompare(String(a.updatedAt || '')));
+
+    if (paused.length === 0) {
+      await sendMessage(message.display_recipient, message.subject,
+        `@**${message.sender_full_name}** No paused pipelines to resume in this topic.`);
+      return;
+    }
+
+    const cp = paused[0];
+    const scope = formatCheckpointScope(cp);
+    const skill = cp.resume?.skill || cp.current?.skill || '';
+    const skillLabel = skill ? ` at **${skill}**` : '';
+    const confirmText = `Resume **${cp.pipelineType}** for **${scope}**${skillLabel}? (yes/no)`;
+
+    const syntheticRoute = buildResumeRoute(cp);
+    if (!syntheticRoute) {
+      await sendMessage(message.display_recipient, message.subject,
+        `@**${message.sender_full_name}** Found a paused checkpoint but couldn't build a route for it. Try re-sending the original command.`);
+      return;
+    }
+
+    const timeoutMs = calcResumeTimeout(cp);
+    pendingConfirmations.set(sessionKey, { route: syntheticRoute, message, timeoutMs });
+    console.log(`[router] Resume command — awaiting confirmation for ${cp.pipelineType} ${scope} in ${sessionKey}`);
+    await sendMessage(message.display_recipient, message.subject,
+      `@**${message.sender_full_name}** ${confirmText}`);
+    return;
   }
 
   let { route, captures } = matchRoute(message.content);
