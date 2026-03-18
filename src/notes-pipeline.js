@@ -416,10 +416,11 @@ async function notesPipeline(route, message) {
     });
 
     // tn-quality-check runs as a separate Sonnet invocation for independent review
+    const qualityTag = hasVerseRange ? `${tag}-vv${verseStart}-${verseEnd}` : tag;
     skills.push({
       name: 'tn-quality-check',
       prompt: `${skillRef}`,
-      expectedOutput: `output/quality/${book}/${tag}-quality.md`,
+      expectedOutput: `output/quality/${book}/${qualityTag}-quality.md`,
       ops: 1,
       model: 'sonnet',
     });
