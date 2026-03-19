@@ -370,4 +370,40 @@ function verifyTq({ tsvFile, inputJson }) {
   return result.join('\n');
 }
 
-module.exports = { giteaPr, prepareCompare, prepareTq, verifyTq };
+/**
+ * Append a vocabulary decision to a quick-ref CSV file.
+ * Deduplicates by Strong number — returns existing entry if found.
+ */
+function appendQuickref({ file, strong, hebrew, rendering, book = 'ALL', context = '', notes = '', source = 'AI' }) {
+  const HEADER = 'Strong,Hebrew,Rendering,Book,Context,Notes,Date,Source';
+  const csvName = `${file}.csv`;
+  const csvPath = path.join(CSKILLBP_DIR, 'data', 'quick-ref', csvName);
+
+  // Ensure directory exists
+  const dir = path.dirname(csvPath);
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+
+  // Create file with header if missing
+  if (!fs.existsSync(csvPath)) {
+    fs.writeFileSync(csvPath, HEADER + '\n', 'utf8');
+  }
+
+  // Check for existing entry with same Strong number
+  const content = fs.readFileSync(csvPath, 'utf8');
+  const lines = content.split('\n').filter(l => l.trim());
+  for (const line of lines.slice(1)) { // skip header
+    const fields = line.split(',');
+    if (fields[0] === strong) {
+      return `Already exists: ${line}`;
+    }
+  }
+
+  // Build and append new row
+  const today = new Date().toISOString().slice(0, 10);
+  const escapeCsv = (s) => s.includes(',') || s.includes('"') ? `"${s.replace(/"/g, '""')}"` : s;
+  const row = [strong, hebrew, rendering, book, escapeCsv(context), escapeCsv(notes), today, source].join(',');
+  fs.appendFileSync(csvPath, row + '\n', 'utf8');
+  return `Appended to ${csvName}: ${row}`;
+}
+
+module.exports = { giteaPr, prepareCompare, prepareTq, verifyTq, appendQuickref };

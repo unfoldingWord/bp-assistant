@@ -13,7 +13,7 @@ const { buildStrongsIndex, buildTnIndex, buildUstIndex } = require('./index-tool
 const { checkTwHeadwords, compareUltUst, detectAbstractNouns } = require('./issue-tools');
 const { extractAlignmentData, fixHebrewQuotes, flagNarrowQuotes, generateIds, resolveGlQuotes, verifyAtFit, assembleNotes, prepareNotes } = require('./tn-tools');
 const { validateTnTsv, checkTnQuality } = require('./quality-tools');
-const { giteaPr, prepareCompare, prepareTq, verifyTq } = require('./misc-tools');
+const { giteaPr, prepareCompare, prepareTq, verifyTq, appendQuickref } = require('./misc-tools');
 
 /**
  * Create the SDK MCP server config. Must be called after the SDK is loaded
@@ -301,6 +301,18 @@ function createWorkspaceTools(createSdkMcpServer, tool, z) {
       tool('verify_tq', 'Verify translation questions TSV format and content', {
         tsvFile: z.string().describe('TQ TSV file path'), inputJson: z.string().optional(),
       }, async (args) => ({ content: [{ type: 'text', text: verifyTq(args) }] })),
+
+      // --- Quick-ref tools ---
+      tool('append_quickref', 'Append a vocabulary decision to a quick-ref CSV (deduplicates by Strong number)', {
+        file: z.enum(['ult_decisions', 'ust_decisions']).describe('Which quick-ref file'),
+        strong: z.string().describe('Strong number (e.g. H4869)'),
+        hebrew: z.string().describe('Hebrew word'),
+        rendering: z.string().describe('English rendering chosen'),
+        book: z.string().optional().describe('Book scope — default ALL'),
+        context: z.string().optional().describe('Verse context for the decision'),
+        notes: z.string().optional().describe('Rationale for the decision'),
+        source: z.enum(['AI', 'human']).optional().describe('Who made this decision — default AI'),
+      }, async (args) => ({ content: [{ type: 'text', text: appendQuickref(args) }] })),
     ],
   });
 }
