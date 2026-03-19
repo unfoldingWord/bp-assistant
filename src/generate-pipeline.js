@@ -477,7 +477,9 @@ async function generatePipeline(route, message) {
     // Discover by recency — handles any naming variant the skill used
     // When resuming at align-all-parallel, ULT/UST were written in a prior run — skip freshness filter
     const chPat = new RegExp(`^${book}-0*${ch}(-(?!.*aligned).*)?\.usfm$`);
-    const freshnessMs = runInitialSkill ? chapterStart : null;
+    // Single-verse --lite runs may leave the UST unchanged (Claude deems existing content sufficient).
+    // In that case freshness is not a useful signal — just check that the file exists.
+    const freshnessMs = (runInitialSkill && !hasVerseRange) ? chapterStart : null;
     const ultRel = discoverFreshOutput('output/AI-ULT', book, chPat, freshnessMs);
     const ustRel = discoverFreshOutput('output/AI-UST', book, chPat, freshnessMs);
     const hasUlt = !!ultRel;
@@ -557,7 +559,7 @@ async function generatePipeline(route, message) {
       continue;
     }
 
-    if (runInitialSkill && !isFreshOutput(ustRel, chapterStart)) {
+    if (runInitialSkill && !hasVerseRange && !isFreshOutput(ustRel, chapterStart)) {
       await status(`Failed to generate **${book} ${ch}**: output appears stale from an earlier run (${ustRel}).`);
       fail++;
       setCheckpoint(checkpointRef, {
