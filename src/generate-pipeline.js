@@ -414,7 +414,7 @@ async function generatePipeline(route, message) {
         }
       }
       try {
-        const timeoutMs = calcSkillTimeout(book, ch, 3); // 3 ops for initial-pipeline
+        const timeoutMs = calcSkillTimeout(book, ch, route.operations || 6);
         const skillRef = hasVerseRange ? `${book} ${ch}:${verseStart}-${verseEnd}` : `${book} ${ch}`;
         if (runInitialSkill) {
           claudeResult = await runClaude({
@@ -477,7 +477,7 @@ async function generatePipeline(route, message) {
     // Discover by recency — handles any naming variant the skill used
     // When resuming at align-all-parallel, ULT/UST were written in a prior run — skip freshness filter
     const chPat = new RegExp(`^${book}-0*${ch}(-(?!.*aligned).*)?\.usfm$`);
-    // Single-verse --lite runs may leave the UST unchanged (Claude deems existing content sufficient).
+    // Single-verse runs may leave the UST unchanged (Claude deems existing content sufficient).
     // In that case freshness is not a useful signal — just check that the file exists.
     const freshnessMs = (runInitialSkill && !hasVerseRange) ? chapterStart : null;
     const ultRel = discoverFreshOutput('output/AI-ULT', book, chPat, freshnessMs);

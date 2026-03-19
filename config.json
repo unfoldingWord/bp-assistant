@@ -25,11 +25,11 @@
       "name": "generate-content",
       "match": "/generate\\s+(\\w+)\\s+(\\d+(?::\\d+(?:[-–—]\\d+)?)?(?:\\s*[-–—to]+\\s*\\d+)?)/i",
       "type": "sdk",
-      "skill": "initial-pipeline --lite",
+      "skill": "initial-pipeline",
 
       "reply": false,
       "confirmMessage": "I'll generate the initial content (ULT & UST, issues draft) for **$1 $2**. Sound right? (yes/no)",
-      "operations": 3,
+      "operations": 6,
       "tokenEstimate": {
         "perChapter": 5000000,
         "sessionBudget": 45000000
