@@ -74,6 +74,7 @@ async function apiPipeline(route, message) {
       cwd: selectedCwd,
       verbose: !!route.verbose,
       dryRun: isDryRun,
+      toolChoice: route.toolChoice,
     });
 
     await removeReaction(msgId, 'working_on_it');

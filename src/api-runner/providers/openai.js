@@ -54,7 +54,7 @@ function toOpenAIMessages(system, messages) {
 /**
  * Send a request to the OpenAI-compatible API.
  */
-async function sendRequest({ model, system, messages, tools, thinking, apiKey, baseUrl, providerName = 'openai' }) {
+async function sendRequest({ model, system, messages, tools, thinking, apiKey, baseUrl, providerName = 'openai', toolChoice }) {
   const client = new OpenAI({ apiKey, baseURL: baseUrl });
   const providerCfg = getProviderConfig(providerName);
   const modelId = resolveProviderModel(providerName, model || providerCfg.defaultModel);
@@ -67,6 +67,11 @@ async function sendRequest({ model, system, messages, tools, thinking, apiKey, b
 
   if (tools && tools.length > 0) {
     body.tools = tools;
+
+    // tool_choice: auto → "auto", required → "required", none → "none"
+    if (toolChoice) {
+      body.tool_choice = toolChoice;
+    }
   }
 
   // GPT-5+ doesn't support reasoning_effort with tools via chat completions

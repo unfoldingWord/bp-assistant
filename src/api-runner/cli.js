@@ -33,6 +33,7 @@ function parseArgs(argv) {
     skill: null,
     pipeline: null,
     prompt: null,
+    toolChoice: null,
     maxTurns: 100,
     timeout: 30,
     cwd: '/srv/bot/workspace',
@@ -49,6 +50,7 @@ function parseArgs(argv) {
       case '--skill': args.skill = argv[++i]; break;
       case '--pipeline': args.pipeline = argv[++i]; break;
       case '--prompt': args.prompt = argv[++i]; break;
+      case '--tool-choice': args.toolChoice = argv[++i]; break;
       case '--max-turns': args.maxTurns = parseInt(argv[++i], 10); break;
       case '--timeout': args.timeout = parseInt(argv[++i], 10); break;
       case '--cwd': args.cwd = argv[++i]; break;
@@ -86,6 +88,7 @@ Options:
   --skill <name>        Single skill name from workspace
   --pipeline <name>     Orchestration name
   --prompt <text>       User message / book+chapter (required)
+  --tool-choice <mode>  Tool choice: auto, required, none (default: provider default)
   --max-turns <n>       Max agentic loop iterations per skill (default: 100)
   --timeout <min>       Minutes per skill run before abort (default: 30)
   --cwd <path>          Working directory for tools (default: /srv/bot/workspace)
@@ -147,6 +150,7 @@ async function main() {
     provider: args.provider,
     model: args.model,
     thinking: args.thinking,
+    toolChoice: args.toolChoice,
     maxTurns: args.maxTurns,
     timeout: args.timeout,
     cwd: args.cwd,

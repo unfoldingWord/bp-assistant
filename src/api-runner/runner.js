@@ -21,6 +21,7 @@ const { getProviderConfig } = require('./provider-config');
  * @param {boolean} opts.verbose - Verbose output
  * @param {boolean} opts.dryRun - Print system prompt, don't call API
  * @param {string} opts.systemAppend - Extra text to append to system prompt
+ * @param {string} opts.toolChoice - Tool choice: auto, required, none
  * @param {Object} opts.apiKeys - { gemini, openai, xai, anthropic }
  * @returns {Promise<{turns: number, inputTokens: number, outputTokens: number, cost: number, durationMs: number, finalText: string}>}
  */
@@ -32,8 +33,9 @@ async function runSkill(name, prompt, opts = {}) {
     return dryRun(system, prompt, opts);
   }
 
+  const provider = opts.provider || 'gemini';
   return runAgentLoop({
-    provider: opts.provider || 'gemini',
+    provider,
     model: opts.model,
     system,
     userMessage: prompt,
@@ -42,7 +44,9 @@ async function runSkill(name, prompt, opts = {}) {
     cwd,
     verbose: opts.verbose || false,
     thinking: opts.thinking || 'medium',
-    apiKey: resolveApiKey(opts.provider || 'gemini', opts.apiKeys || {}),
+    apiKey: resolveApiKey(provider, opts.apiKeys || {}),
+    toolChoice: opts.toolChoice,
+    apiKeyResolver: (p) => resolveApiKey(p, opts.apiKeys || {}),
   });
 }
 
@@ -62,8 +66,9 @@ async function runCustom(systemText, prompt, opts = {}) {
     return dryRun(system, prompt, opts);
   }
 
+  const provider = opts.provider || 'gemini';
   return runAgentLoop({
-    provider: opts.provider || 'gemini',
+    provider,
     model: opts.model,
     system,
     userMessage: prompt,
@@ -72,7 +77,9 @@ async function runCustom(systemText, prompt, opts = {}) {
     cwd,
     verbose: opts.verbose || false,
     thinking: opts.thinking || 'medium',
-    apiKey: resolveApiKey(opts.provider || 'gemini', opts.apiKeys || {}),
+    apiKey: resolveApiKey(provider, opts.apiKeys || {}),
+    toolChoice: opts.toolChoice,
+    apiKeyResolver: (p) => resolveApiKey(p, opts.apiKeys || {}),
   });
 }
 
@@ -98,7 +105,8 @@ function listProviders() {
   return getProviderNames();
 }
 
-module.exports = { runSkill, runCustom, listProviders };
+module.exports = { runSkill, runCustom, resolveApiKey, listProviders };
+
 function dryRun(system, prompt, opts) {
   console.log('=== DRY RUN ===\n');
   console.log('--- System Prompt ---');
@@ -109,6 +117,7 @@ function dryRun(system, prompt, opts) {
   console.log(`Provider: ${opts.provider || 'gemini'}`);
   console.log(`Model: ${opts.model || '(default)'}`);
   console.log(`Thinking: ${opts.thinking || 'medium'}`);
+  console.log(`Tool Choice: ${opts.toolChoice || '(default)'}`);
   console.log(`Max turns: ${opts.maxTurns || 100}`);
   console.log(`Timeout: ${opts.timeout || 30} min`);
   console.log(`CWD: ${opts.cwd || '/srv/bot/workspace'}`);

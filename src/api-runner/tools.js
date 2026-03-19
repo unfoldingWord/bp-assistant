@@ -6,6 +6,8 @@ const path = require('path');
 const fg = require('fast-glob');
 const z = require('zod');
 const { createWorkspaceTools } = require('../workspace-tools');
+const { VERSE_DATA_TOOL_SCHEMAS, executeVerseDataTool, isVerseDataTool } = require('./verse-data');
+const { AGENT_TOOL_SCHEMAS, executeAgentTool, isAgentTool } = require('./agent-tools');
 
 const MCP_PREFIX = 'mcp__workspace-tools__';
 
@@ -83,6 +85,8 @@ const CORE_TOOL_SCHEMAS = [
 const WORKSPACE_TOOL_REGISTRY = buildWorkspaceToolRegistry();
 const TOOL_SCHEMAS = [
   ...CORE_TOOL_SCHEMAS,
+  ...VERSE_DATA_TOOL_SCHEMAS,
+  ...AGENT_TOOL_SCHEMAS,
   ...WORKSPACE_TOOL_REGISTRY.schemas,
 ];
 
@@ -189,20 +193,45 @@ function resolvePath(filePath, cwd) {
   return path.resolve(cwd, filePath);
 }
 
-async function executeTool(name, params, cwd) {
+/**
+ * Execute a tool by name.
+ *
+ * @param {string} name - Tool name
+ * @param {Object} params - Tool parameters
+ * @param {string} cwd - Working directory
+ * @param {Object} [agentContext] - Context for agent tools: { parentOpts, runAgentLoopFn }
+ * @returns {Promise<string>} Tool result
+ */
+async function executeTool(name, params, cwd, agentContext) {
   try {
+    // Core file tools
     switch (name) {
       case 'Read': return executeRead(params, cwd);
       case 'Write': return executeWrite(params, cwd);
       case 'Edit': return executeEdit(params, cwd);
       case 'Glob': return executeGlob(params, cwd);
       case 'Grep': return executeGrep(params, cwd);
-      default:
-        if (WORKSPACE_TOOL_REGISTRY.handlers[name]) {
-          return executeWorkspaceTool(name, params);
-        }
-        return `Error: Unknown tool "${name}"`;
     }
+
+    // Verse data tools
+    if (isVerseDataTool(name)) {
+      return executeVerseDataTool(name, params);
+    }
+
+    // Agent/team tools
+    if (isAgentTool(name)) {
+      if (!agentContext) {
+        return `Error: Agent tools require agent context (not available in this execution mode)`;
+      }
+      return executeAgentTool(name, params, agentContext);
+    }
+
+    // Workspace tools (MCP-style)
+    if (WORKSPACE_TOOL_REGISTRY.handlers[name]) {
+      return executeWorkspaceTool(name, params);
+    }
+
+    return `Error: Unknown tool "${name}"`;
   } catch (err) {
     return `Error: ${err.message}`;
   }

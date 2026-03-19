@@ -60,7 +60,7 @@ function toClaudeMessages(messages) {
 /**
  * Send a request to the Claude Messages API.
  */
-async function sendRequest({ model, system, messages, tools, thinking, apiKey }) {
+async function sendRequest({ model, system, messages, tools, thinking, apiKey, toolChoice }) {
   const Anthropic = await getAnthropicClass();
   const client = new Anthropic({ apiKey });
   const providerCfg = getProviderConfig('claude');
@@ -78,6 +78,12 @@ async function sendRequest({ model, system, messages, tools, thinking, apiKey })
 
   if (tools && tools.length > 0) {
     params.tools = tools;
+
+    // tool_choice: auto → {type:"auto"}, required → {type:"any"}, none → {type:"none"}
+    if (toolChoice) {
+      const typeMap = { auto: 'auto', required: 'any', none: 'none' };
+      params.tool_choice = { type: typeMap[toolChoice] || 'auto' };
+    }
   }
 
   if (thinking && thinking !== 'none') {

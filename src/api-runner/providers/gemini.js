@@ -70,7 +70,7 @@ function toGeminiContents(messages) {
 /**
  * Send a request to the Gemini API.
  */
-async function sendRequest({ model, system, messages, tools, thinking, apiKey, providerName = 'gemini' }) {
+async function sendRequest({ model, system, messages, tools, thinking, apiKey, providerName = 'gemini', toolChoice }) {
   const ai = new GoogleGenAI({ apiKey });
   const providerCfg = getProviderConfig(providerName);
   const modelId = resolveProviderModel(providerName, model || providerCfg.defaultModel);
@@ -86,6 +86,14 @@ async function sendRequest({ model, system, messages, tools, thinking, apiKey, p
   }
   if (tools && tools.length > 0) {
     config.tools = tools;
+
+    // toolConfig: auto → AUTO, required → ANY, none → NONE
+    if (toolChoice) {
+      const modeMap = { auto: 'AUTO', required: 'ANY', none: 'NONE' };
+      config.toolConfig = {
+        functionCallingConfig: { mode: modeMap[toolChoice] || 'AUTO' },
+      };
+    }
   }
 
   let response;
