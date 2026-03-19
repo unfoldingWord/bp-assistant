@@ -8,7 +8,7 @@ const {
   fetchGlossary, fetchIssuesResolved, fetchTemplates,
 } = require('./fetch-tools');
 const { splitTsv, mergeTsvs, fixTrailingNewlines } = require('./tsv-tools');
-const { extractUltEnglish, filterPsalms, curlyQuotes, checkUstPassives } = require('./usfm-tools');
+const { extractUltEnglish, filterPsalms, curlyQuotes, checkUstPassives, createAlignedUsfm } = require('./usfm-tools');
 const { buildStrongsIndex, buildTnIndex, buildUstIndex } = require('./index-tools');
 const { checkTwHeadwords, compareUltUst, detectAbstractNouns } = require('./issue-tools');
 const { extractAlignmentData, fixHebrewQuotes, flagNarrowQuotes, generateIds, resolveGlQuotes, verifyAtFit, assembleNotes, prepareNotes } = require('./tn-tools');
@@ -199,6 +199,23 @@ function createWorkspaceTools(createSdkMcpServer, tool, z) {
         },
         async (args) => ({
           content: [{ type: 'text', text: checkUstPassives(args) }],
+        })
+      ),
+
+      tool(
+        'create_aligned_usfm',
+        'Convert alignment mapping JSON to aligned USFM3 (mechanically computes correct x-occurrence/x-occurrences)',
+        {
+          hebrew: z.string().describe('Hebrew source USFM path (relative to workspace)'),
+          mapping: z.string().describe('Alignment mapping JSON path (relative to workspace)'),
+          source: z.string().describe('Source ULT/UST USFM path (relative to workspace)'),
+          output: z.string().optional().describe('Output aligned USFM path (omit to return content)'),
+          chapter: z.number().int().optional().describe('Process only this chapter'),
+          verse: z.number().int().optional().describe('Process only this verse (requires chapter)'),
+          ust: z.boolean().optional().describe('UST mode: brackets outside milestones'),
+        },
+        async (args) => ({
+          content: [{ type: 'text', text: createAlignedUsfm(args) }],
         })
       ),
 

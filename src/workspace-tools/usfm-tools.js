@@ -4,6 +4,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const { execFileSync } = require('child_process');
 
 const CSKILLBP_DIR = process.env.CSKILLBP_DIR || '/srv/bot/workspace';
 
@@ -245,4 +246,42 @@ function checkUstPassives({ file }) {
   return `Found ${findings.length} passive construction(s):\n${findings.join('\n')}`;
 }
 
-module.exports = { extractUltEnglish, filterPsalms, curlyQuotes, checkUstPassives };
+/**
+ * Convert alignment mapping JSON to aligned USFM3.
+ * Wraps the existing create_aligned_usfm.js script via execFileSync (no shell needed).
+ */
+function createAlignedUsfm({ hebrew, mapping, source, output, chapter, verse, ust }) {
+  const scriptPath = path.join(CSKILLBP_DIR, '.claude/skills/utilities/scripts/usfm/create_aligned_usfm.js');
+
+  if (!fs.existsSync(scriptPath)) {
+    return `Error: script not found at ${scriptPath}`;
+  }
+
+  const args = [scriptPath];
+  args.push('--hebrew', path.resolve(CSKILLBP_DIR, hebrew));
+  args.push('--mapping', path.resolve(CSKILLBP_DIR, mapping));
+  args.push('--source', path.resolve(CSKILLBP_DIR, source));
+  if (output) args.push('--output', path.resolve(CSKILLBP_DIR, output));
+  if (chapter != null) args.push('--chapter', String(chapter));
+  if (verse != null) args.push('--verse', String(verse));
+  if (ust) args.push('--ust');
+
+  try {
+    const result = execFileSync(process.execPath, args, {
+      cwd: CSKILLBP_DIR,
+      encoding: 'utf8',
+      maxBuffer: 10 * 1024 * 1024,
+      timeout: 30000,
+    });
+    if (output) {
+      return `Aligned USFM written to ${output}`;
+    }
+    return result;
+  } catch (err) {
+    const stderr = err.stderr ? err.stderr.toString() : '';
+    const msg = stderr || err.message;
+    return `Error running create_aligned_usfm: ${msg}`;
+  }
+}
+
+module.exports = { extractUltEnglish, filterPsalms, curlyQuotes, checkUstPassives, createAlignedUsfm };
