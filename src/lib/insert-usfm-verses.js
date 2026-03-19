@@ -79,8 +79,8 @@ function findVerseBoundaries(lines, startIdx, endIdx, verseStart, verseEnd) {
   let replaceStart = null;
   let replaceEnd = null;
   const nextVerse = verseEnd + 1;
-  const verseStartPat = new RegExp(`\\\\v\\s+${verseStart}\\s`);
-  const nextVersePat = new RegExp(`\\\\v\\s+${nextVerse}\\s`);
+  const verseStartPat = new RegExp(`\\\\v\\s+${verseStart}(?:\\s|$)`);
+  const nextVersePat = new RegExp(`\\\\v\\s+${nextVerse}(?:\\s|$)`);
 
   for (let i = startIdx; i < endIdx; i++) {
     const line = lines[i];
@@ -112,7 +112,7 @@ function findVerseBoundaries(lines, startIdx, endIdx, verseStart, verseEnd) {
 
 function countVerseMarkers(lines, startIdx, endIdx) {
   let count = 0;
-  const pat = /\\v\s+\d+\s/g;
+  const pat = /\\v\s+\d+(?:\s|$)/g;
   for (let i = startIdx; i < endIdx; i++) {
     const matches = lines[i].match(pat);
     if (matches) count += matches.length;
