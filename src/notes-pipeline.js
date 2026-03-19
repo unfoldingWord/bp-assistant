@@ -378,6 +378,7 @@ async function notesPipeline(route, message) {
         prompt: `${skillRef} --issues ${issuesPath}`,
         appendSystemPrompt: POST_EDIT_REVIEW_HINT,
         expectedOutput: issuesPath,
+        skipPreClean: true,   // expectedOutput is also the input — don't delete it
         ops: 1,
       });
     } else {
@@ -411,10 +412,11 @@ async function notesPipeline(route, message) {
     const { chapterRel: notesChapterRel, shardRel: notesShardRel } = buildNotesPaths(
       book, tag, hasVerseRange, verseStart, verseEnd
     );
+    const tnExpectedOutput = hasVerseRange ? notesShardRel : notesChapterRel;
     skills.push({
       name: 'tn-writer',
-      prompt: `${skillRef} --issues ${issuesPath}`,
-      expectedOutput: hasVerseRange ? notesShardRel : notesChapterRel,
+      prompt: `${skillRef} --issues ${issuesPath} --output ${tnExpectedOutput}`,
+      expectedOutput: tnExpectedOutput,
       ops: 1,
     });
 
@@ -454,7 +456,8 @@ async function notesPipeline(route, message) {
       const skill = skills[si];
       const skillStart = Date.now();
       // Delete expected output so Claude must recreate it (prevents stale-mtime false failures on resume)
-      if (skill.expectedOutput) {
+      // Skip when expectedOutput is also the skill's input (e.g. post-edit-review)
+      if (skill.expectedOutput && !skill.skipPreClean) {
         const preClean = resolveOutputFile(skill.expectedOutput, book);
         if (preClean) {
           try { fs.unlinkSync(path.resolve(CSKILLBP_DIR, preClean)); } catch (_) { /* fine if missing */ }
