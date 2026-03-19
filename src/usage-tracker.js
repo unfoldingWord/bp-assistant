@@ -105,17 +105,16 @@ const BOOTSTRAP_DEFAULTS = {
 };
 
 // Bootstrap defaults: seconds/verse for each skill (for time estimates)
-// Updated 2026-03-03 from 101 actual skill runs (medians).
-// Will be replaced by median-based estimates once >=2 data points exist per skill.
+// Updated 2026-03-19 — post-MCP migration actuals (skills use MCP tools instead of Bash).
 const TIME_BOOTSTRAP_DEFAULTS = {
-  'generate|initial-pipeline': 73,   // 17 runs, median 72.9
-  'generate|align-all-parallel':      56,   // 7 runs, median 55.6
-  'notes|post-edit-review':           40,   // 15 runs, median 39.6
-  'notes|tn-writer':                  73,   // 15 runs, median 73.3
-  'notes|tn-quality-check':           23,   // 15 runs, median 23.2
-  'notes|chapter-intro':              25,   // 2 runs, median 24.6
-  'notes|deep-issue-id':       14,   // 1 run, 13.9
-  '*|repo-insert':                    12,   // 23 runs, blended gen+notes median
+  'generate|initial-pipeline': 73,   // not yet MCP-migrated
+  'generate|align-all-parallel':      56,   // not yet MCP-migrated
+  'notes|post-edit-review':           50,   // was 40 pre-MCP
+  'notes|tn-writer':                 100,   // was 73 pre-MCP
+  'notes|tn-quality-check':           30,   // was 23 pre-MCP
+  'notes|chapter-intro':              35,   // was 25 pre-MCP
+  'notes|deep-issue-id':              55,   // was 14 pre-MCP — biggest jump (Task polling overhead)
+  '*|repo-insert':                    15,   // was 12 pre-MCP
 };
 
 // Skill chains: which skills run for each pipeline type
@@ -233,9 +232,13 @@ function estimateTokens({ pipeline, book, startCh, endCh }) {
   const skillTimeMedians = {};
   let anyBootstrapped = false;
 
+  // Only use post-MCP migration data — pre-MCP timing data is from a different regime
+  const MCP_CUTOFF = '2026-03-17';
+
   for (const skill of chain) {
     const matching = allEntries.filter(e =>
       e.pipeline === pipeline && e.skill === skill && e.verses > 0 && e.total_tokens > 0
+      && e.ts >= MCP_CUTOFF
     );
     const perVerseValues = matching.map(e => e.total_tokens / e.verses);
 
