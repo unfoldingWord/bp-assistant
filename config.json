@@ -23,7 +23,7 @@
     },
     {
       "name": "generate-content",
-      "match": "/generate\\s+(\\w+)\\s+(\\d+(?::\\d+[-–—]\\d+)?(?:\\s*[-–—to]+\\s*\\d+)?)/i",
+      "match": "/generate\\s+(\\w+)\\s+(\\d+(?::\\d+(?:[-–—]\\d+)?)?(?:\\s*[-–—to]+\\s*\\d+)?)/i",
       "type": "sdk",
       "skill": "initial-pipeline --lite",
 
@@ -37,7 +37,7 @@
     },
     {
       "name": "write-notes",
-      "match": "/write notes(?:\\s+for)?\\s+(\\w+)\\s+(\\d+(?::\\d+[-–—]\\d+)?(?:\\s*[-–—]\\s*\\d+)?)/i",
+      "match": "/write notes(?:\\s+for)?\\s+(\\w+)\\s+(\\d+(?::\\d+(?:[-–—]\\d+)?)?(?:\\s*[-–—]\\s*\\d+)?)/i",
       "type": "notes",
       "reply": false,
       "confirmMessage": "I'll write translation notes for **$1 $2**. Sound right? (yes/no)",

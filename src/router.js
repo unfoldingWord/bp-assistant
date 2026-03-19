@@ -183,12 +183,18 @@ function parseBookChapters(captures) {
     if (/^[a-zA-Z]+$/.test(s)) {
       book = normalizeBookName(s);
     } else {
-      // Verse-range format "CH:VS-VS" — only the chapter matters here
+      // Verse-range format "CH:VS-VS"
       const verseRange = s.match(/^(\d+):(\d+)[-–—](\d+)$/);
       if (verseRange) {
         chapterNums.push(Number(verseRange[1]));
         verseStart = Number(verseRange[2]);
         verseEnd = Number(verseRange[3]);
+      // Single-verse format "CH:VS"
+      } else if (/^(\d+):(\d+)$/.test(s)) {
+        const sv = s.match(/^(\d+):(\d+)$/);
+        chapterNums.push(Number(sv[1]));
+        verseStart = Number(sv[2]);
+        verseEnd = Number(sv[2]);
       } else {
         // Extract all numbers
         const nums = s.match(/\d+/g);

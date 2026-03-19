@@ -87,6 +87,21 @@ function parseGenerateCommand(content) {
     };
   }
 
+  // Single verse: generate lam 2:1
+  const singleVerseMatch = input.match(/generate\s+([a-z0-9]+)\s+(\d+):(\d+)(?!\s*[-\u2013\u2014])/);
+  if (singleVerseMatch) {
+    const chapter = parseInt(singleVerseMatch[2], 10);
+    const verse = parseInt(singleVerseMatch[3], 10);
+    return {
+      book: normalizeBookName(singleVerseMatch[1]),
+      start: chapter,
+      end: chapter,
+      verseStart: verse,
+      verseEnd: verse,
+      fresh: hasFreshFlag(content),
+    };
+  }
+
   // Range: generate psa 79-89, generate psa 79\u201389, generate psa 79 to 89
   const rangeMatch = input.match(/generate\s+([a-z0-9]+)\s+(\d+)\s*[-\u2013\u2014to]+\s*(\d+)/);
   if (rangeMatch) {
