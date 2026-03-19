@@ -170,12 +170,18 @@ async function checkConflictingBranches(repo, targetFile, chapter) {
 
         // Chapter-level check: inspect the patch to see if it touches our chapter.
         // Gitea omits patch data for large files (e.g. 19-PSA.usfm at 43K+ lines).
-        // When that happens, fall back to fetching raw content from both branches.
+        // When that happens, fetch the full PR diff which includes all files regardless of size.
         let touchesChapter;
-        if (fileEntry.patch) {
-          touchesChapter = diffTouchesChapter(fileEntry.patch, targetFile, chapter);
+        let patch = fileEntry.patch;
+        if (!patch) {
+          console.log(`${LOG_PREFIX} PR #${pr.number}: no patch data for ${targetFile} — fetching full PR diff`);
+          patch = await fetchPRFilePatch(repo, pr.number, targetFile, token);
+        }
+        if (patch) {
+          touchesChapter = diffTouchesChapter(patch, targetFile, chapter);
         } else {
-          console.log(`${LOG_PREFIX} PR #${pr.number}: no patch data for ${targetFile} — fetching raw content to compare`);
+          // Both patch sources failed — fall back to raw content comparison (less accurate)
+          console.warn(`${LOG_PREFIX} PR #${pr.number}: full PR diff also unavailable for ${targetFile} — falling back to raw content compare`);
           touchesChapter = await rawContentTouchesChapter(repo, targetFile, pr.base.label, pr.head.label, chapter, token);
         }
         if (touchesChapter) {
@@ -249,6 +255,46 @@ function diffTouchesChapter(patch, filename, chapter) {
   }
 
   return false;
+}
+
+/**
+ * Fetch the full PR diff and extract the patch for a specific file.
+ * The /pulls/{number}.diff endpoint returns the complete unified diff even for
+ * large files where the PR-files endpoint omits patch data.
+ * Returns the file's patch string, or null on failure.
+ */
+async function fetchPRFilePatch(repo, prNumber, targetFile, token) {
+  try {
+    const res = await apiRequest('GET',
+      `/repos/${ORG}/${repo}/pulls/${prNumber}.diff`,
+      token, null, 60000);
+    if (res.status !== 200 || typeof res.data !== 'string') return null;
+
+    // Parse the unified diff to extract hunks for targetFile.
+    // File headers look like: "diff --git a/path/to/file b/path/to/file"
+    const lines = res.data.split('\n');
+    const patch = [];
+    let inTargetFile = false;
+    for (const line of lines) {
+      if (line.startsWith('diff --git ')) {
+        // Check if this file section is our target
+        // Format: "diff --git a/19-PSA.usfm b/19-PSA.usfm"
+        inTargetFile = line.includes(`a/${targetFile}`) && line.includes(`b/${targetFile}`);
+        continue;
+      }
+      if (inTargetFile) {
+        // Skip the diff metadata lines (---, +++, index)
+        if (line.startsWith('---') || line.startsWith('+++') || line.startsWith('index ')) continue;
+        patch.push(line);
+      }
+    }
+
+    if (patch.length === 0) return null;
+    return patch.join('\n');
+  } catch (err) {
+    console.warn(`${LOG_PREFIX} fetchPRFilePatch failed for PR #${prNumber}: ${err.message}`);
+    return null;
+  }
 }
 
 /**
