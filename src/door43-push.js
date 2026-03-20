@@ -456,11 +456,14 @@ async function syncRepo(repoDir, repoName, branch, baseBranch = 'master') {
   await git.setConfig({ fs, dir: repoDir, path: 'user.email', value: 'bot@unfoldingword.org' });
   await git.setConfig({ fs, dir: repoDir, path: 'user.name', value: 'BW Bot' });
 
-  // Fetch latest
+  // Fetch latest (retry up to 3x for transient network failures)
   console.log(`${LOG_PREFIX} Fetching origin for ${repoName}...`);
-  await withTimeout(
-    git.fetch({ fs, http: gitHttp, dir: repoDir, remote: 'origin', onAuth }),
-    60000, `fetch ${repoName}`
+  await withRetry(
+    () => withTimeout(
+      git.fetch({ fs, http: gitHttp, dir: repoDir, remote: 'origin', onAuth }),
+      60000, `fetch ${repoName}`
+    ),
+    { maxAttempts: 3, baseDelayMs: 3000, label: `fetch ${repoName}` }
   );
 
   // Delete local branch if it exists (ignore errors if it doesn't)
