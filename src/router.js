@@ -833,7 +833,7 @@ async function routeMessage(message) {
         if (pfBook && pfChapters.length) {
           const pfStart = Math.min(...pfChapters);
           const pfEnd = Math.max(...pfChapters);
-          const preflight = preflightCheck({ pipeline: pipelineType, book: pfBook, startCh: pfStart, endCh: pfEnd });
+          const preflight = await preflightCheck({ pipeline: pipelineType, book: pfBook, startCh: pfStart, endCh: pfEnd });
 
           if (preflight.decision === 'reject') {
             await sendMessage(message.display_recipient, message.subject,
@@ -909,7 +909,7 @@ async function routeMessage(message) {
           // Pre-flight usage check for generate/notes pipelines
           const pipelineType = getPipelineType(syntheticRoute);
           if (pipelineType) {
-            const preflight = preflightCheck({
+            const preflight = await preflightCheck({
               pipeline: pipelineType, book: intent.book,
               startCh: intent.startChapter, endCh: intent.endChapter,
             });

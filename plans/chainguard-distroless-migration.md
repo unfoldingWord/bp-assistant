@@ -4,6 +4,51 @@
 
 The bot runs on `node:22-slim` (Debian) and depends on Python 3, git CLI, bash, and curl at runtime. The goal is to reach `cgr.dev/chainguard/node:latest` — truly distroless (no shell, no package manager) — without losing any functionality. This requires eliminating every system-level dependency from both the bot app and the workspace skills.
 
+---
+
+## Current Status (2026-03-20 audit)
+
+**The bot is running on Chainguard distroless in production.** All user-facing command paths are bash-free. The migration is essentially complete.
+
+### Command Path Audit
+
+Every Zulip command was traced end-to-end through `router.js` -> `pipeline-runner.js` -> pipeline module:
+
+| Route Type | Command Examples | Pipeline | Execution Method | Shell-Free? |
+|---|---|---|---|---|
+| `sdk` | `generate MAT 1` | `generate-pipeline.js` | Claude SDK `query()`, `Bash` in disallowedTools | Yes |
+| `notes` | `write notes MAT 1` | `notes-pipeline.js` | Claude SDK `query()`, `Bash` in disallowedTools | Yes |
+| `editor-note` | `note MAT some text` | `note-pipeline.js` | Pure file I/O, no subprocess | Yes |
+| `interactive-dm` | `MAT 1 review` | `interactive-dm-pipeline.js` | Claude SDK `query()`, `Bash` in disallowedTools | Yes |
+
+All SDK-based pipelines explicitly block the Bash tool via `disallowedTools: ['Bash']`.
+
+### Remaining `child_process` Usage
+
+| File | Call | Chainguard-Safe? | Status |
+|---|---|---|---|
+| `usage-tracker.js` | Was using subprocess to call ccusage CLI | Was not safe — needed CLI binary | **Fixed** — replaced with `ccusage/data-loader` library import (no subprocess) |
+| `workspace-tools/usfm-tools.js:270` | `execFileSync(process.execPath, ...)` | **Yes** — spawns Node binary directly, no shell | No action needed |
+| `test-skill.js:103` | `spawn('claude', ...)` | N/A — dev-only test harness | No action needed |
+
+### Phase Completion Status
+
+| Phase | Status | Notes |
+|---|---|---|
+| 0: Dead code removal | **Done** | Shell pipeline path removed |
+| 1: isomorphic-git | **Done** | `door43-push.js` uses isomorphic-git |
+| 2: Bot Python to Node | **Done** | `insert_tn_rows.js`, `insert_usfm_verses.js` in `src/lib/` |
+| 3: Workspace Python to Node | **Done** | All scripts ported to workspace-tools MCP |
+| 4: Scripts to SDK MCP tools | **Done** | 70+ tools in `src/workspace-tools/index.js` |
+| 5: Distroless image | **Done** | `cgr.dev/chainguard/node:latest` in production Dockerfile |
+| ccusage cleanup | **Done** | Replaced subprocess with `ccusage/data-loader` library API |
+
+### What's Left
+
+Nothing blocking. The migration is complete. The plan below is preserved for historical reference.
+
+---
+
 ## Branching & Testing Strategy
 
 All migration work happens on a long-lived feature branch. Production stays on `main` throughout. Each phase merges to `main` only after testing confirms no regressions.

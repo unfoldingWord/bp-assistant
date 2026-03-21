@@ -1,10 +1,27 @@
 // usage-tracker.js -- Persist per-skill run metrics, estimate costs, gate expensive operations
-// Combines bot JSONL log with ccusage CLI data for full 5-hour window picture.
+// Combines ccusage library data with bot JSONL log for full 5-hour window picture.
 
 const fs = require('fs');
 const path = require('path');
-const { execSync } = require('child_process');
 const { getVerseCount, getTotalVerses } = require('./verse-counts');
+
+// ccusage is ESM-only — lazy-load via dynamic import() from CommonJS
+let _loadSessionBlockData = null;
+async function loadCcusageBlocks() {
+  if (!_loadSessionBlockData) {
+    try {
+      const mod = await import('ccusage/data-loader');
+      _loadSessionBlockData = mod.loadSessionBlockData;
+    } catch (err) {
+      console.warn(`[usage-tracker] ccusage library not available: ${err.message}`);
+      return [];
+    }
+  }
+  return _loadSessionBlockData({
+    offline: true,
+    claudePath: process.env.CLAUDE_CONFIG_DIR || undefined,
+  });
+}
 
 const METRICS_DIR = path.resolve(__dirname, '../data/metrics');
 const METRICS_FILE = path.join(METRICS_DIR, 'usage.jsonl');
@@ -88,7 +105,6 @@ function getEffectiveBudget() {
 function windowBudget() { return getConfig().windowBudgetTokens || 220000; }
 function windowHours() { return getConfig().windowHours || 5; }
 function warnThreshold() { return getConfig().warnThreshold || 0.7; }
-function ccusagePath() { return getConfig().ccusagePath || 'npx ccusage@latest'; }
 
 // Bootstrap defaults: tokens/verse for each skill
 // Updated 2026-03-03 from 101 actual skill runs (medians).
@@ -315,19 +331,16 @@ function estimateTokens({ pipeline, book, startCh, endCh }) {
 // ---------------------------------------------------------------------------
 // getHeadroom -- combine ccusage + bot log for full 5h window picture
 // ---------------------------------------------------------------------------
-function getHeadroom() {
+async function getHeadroom() {
   const budget = getEffectiveBudget();
   const configBudget = windowBudget();
   const hours = windowHours();
 
-  // Source 1: ccusage (CLI/desktop usage)
+  // Source 1: ccusage library (CLI/desktop usage)
   let ccusageTokens = 0;
   let ccusageOk = false;
   try {
-    const cmd = `${ccusagePath()} blocks --json --offline 2>/dev/null`;
-    const raw = execSync(cmd, { timeout: 10000, encoding: 'utf8' });
-    const parsed = JSON.parse(raw);
-    const blocks = parsed.blocks || parsed;
+    const blocks = await loadCcusageBlocks();
 
     // Find the active block (isActive: true) or the most recent non-gap block
     let activeBlock = null;
@@ -387,9 +400,9 @@ function getHeadroom() {
 // ---------------------------------------------------------------------------
 // preflightCheck -- gate decision before running a pipeline
 // ---------------------------------------------------------------------------
-function preflightCheck({ pipeline, book, startCh, endCh }) {
+async function preflightCheck({ pipeline, book, startCh, endCh }) {
   const estimate = estimateTokens({ pipeline, book, startCh, endCh });
-  const room = getHeadroom();
+  const room = await getHeadroom();
   const threshold = warnThreshold();
 
   const budget = room.budget;
@@ -407,8 +420,8 @@ function preflightCheck({ pipeline, book, startCh, endCh }) {
 // ---------------------------------------------------------------------------
 // getUsageSummary -- human-readable string for admin DMs
 // ---------------------------------------------------------------------------
-function getUsageSummary() {
-  const room = getHeadroom();
+async function getUsageSummary() {
+  const room = await getHeadroom();
   const pct = room.budget > 0 ? Math.round(room.used / room.budget * 100) : 0;
 
   let budgetLabel = formatTokens(room.budget);

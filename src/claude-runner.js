@@ -201,7 +201,7 @@ async function runClaudeOnce({
       if (isRateLimit) {
         console.warn(`[claude-runner] Rate limit detected -- calibrating window budget`);
         try {
-          const room = getHeadroom();
+          const room = await getHeadroom();
           recordRateLimit({ windowUsed: room.used, source: 'claude-runner-error' });
         } catch { /* non-fatal */ }
       }
@@ -223,7 +223,7 @@ async function runClaudeOnce({
     if (isRateLimit) {
       console.warn(`[claude-runner] Rate limit in result subtype -- calibrating window budget`);
       try {
-        const room = getHeadroom();
+        const room = await getHeadroom();
         recordRateLimit({ windowUsed: room.used, source: 'claude-runner-result' });
       } catch { /* non-fatal */ }
     }
