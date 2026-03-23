@@ -651,46 +651,56 @@ async function routeMessage(message) {
       return;
     }
   } else {
+    // Check for pending confirmation BEFORE auth check — otherwise non-authorized
+    // users talking in a topic with a pending confirmation get an unauthorized reply
+    // instead of being silently ignored.
+    if (pendingConfirmations.has(sessionKey)) {
+      const pending = pendingConfirmations.get(sessionKey);
+      const isOriginalSender = message.sender_id === pending.message.sender_id;
+
+      if (!isOriginalSender) {
+        // Someone else is talking in this topic — ignore silently
+        console.log(`[router] Ignoring message from ${message.sender_full_name} in topic with pending confirmation for ${pending.message.sender_full_name}`);
+        return;
+      }
+
+      if (isYes(message.content)) {
+        pendingConfirmations.delete(sessionKey);
+        clearSession(sessionKey);
+        try { await addReaction(message.id, 'working_on_it'); } catch (_) {}
+        const routeWithTimeout = { ...pending.route, timeoutMs: pending.timeoutMs };
+        console.log(`[router] Confirmed -- running "${pending.route.name}" for ${sessionKey} (timeout: ${pending.timeoutMs / 60000}min)`);
+        if (pending.route.name === 'editor-note') {
+          try {
+            await runPipeline(routeWithTimeout, pending.message);
+            try { await removeReaction(message.id, 'working_on_it'); } catch (_) {}
+            try { await addReaction(message.id, 'check'); } catch (_) {}
+          } catch (err) {
+            console.error(`[router] Pipeline "${pending.route.name}" failed: ${err.message}`);
+            try { await removeReaction(message.id, 'working_on_it'); } catch (_) {}
+            try { await addReaction(message.id, 'warning'); } catch (_) {}
+          }
+        } else {
+          firePipeline(routeWithTimeout, pending.message);
+        }
+        return;
+      } else if (isNo(message.content)) {
+        pendingConfirmations.delete(sessionKey);
+        console.log(`[router] Declined -- cleared pending for ${sessionKey}`);
+        await sendMessage(message.display_recipient, message.subject,
+          `No problem. ${HELP_TEXT}`);
+        return;
+      } else {
+        // Not yes/no from original sender -- clear pending and re-route the new message
+        pendingConfirmations.delete(sessionKey);
+        console.log(`[router] New message while pending -- re-routing for ${sessionKey}`);
+      }
+    }
+
     if (!isAuthorized) {
       console.log(`[router] Unauthorized stream mention from ${message.sender_id} (${message.sender_full_name})`);
       await sendMessage(message.display_recipient, message.subject, config.unauthorizedReply);
       return;
-    }
-  }
-
-  // Check for pending confirmation on stream messages
-  if (isStream && pendingConfirmations.has(sessionKey)) {
-    const pending = pendingConfirmations.get(sessionKey);
-    if (isYes(message.content)) {
-      pendingConfirmations.delete(sessionKey);
-      clearSession(sessionKey);
-      try { await addReaction(message.id, 'working_on_it'); } catch (_) {}
-      const routeWithTimeout = { ...pending.route, timeoutMs: pending.timeoutMs };
-      console.log(`[router] Confirmed -- running "${pending.route.name}" for ${sessionKey} (timeout: ${pending.timeoutMs / 60000}min)`);
-      if (pending.route.name === 'editor-note') {
-        try {
-          await runPipeline(routeWithTimeout, pending.message);
-          try { await removeReaction(message.id, 'working_on_it'); } catch (_) {}
-          try { await addReaction(message.id, 'check'); } catch (_) {}
-        } catch (err) {
-          console.error(`[router] Pipeline "${pending.route.name}" failed: ${err.message}`);
-          try { await removeReaction(message.id, 'working_on_it'); } catch (_) {}
-          try { await addReaction(message.id, 'warning'); } catch (_) {}
-        }
-      } else {
-        firePipeline(routeWithTimeout, pending.message);
-      }
-      return;
-    } else if (isNo(message.content)) {
-      pendingConfirmations.delete(sessionKey);
-      console.log(`[router] Declined -- cleared pending for ${sessionKey}`);
-      await sendMessage(message.display_recipient, message.subject,
-        `No problem. ${HELP_TEXT}`);
-      return;
-    } else {
-      // Not yes/no -- clear pending and re-route the new message
-      pendingConfirmations.delete(sessionKey);
-      console.log(`[router] New message while pending -- re-routing for ${sessionKey}`);
     }
   }
 
