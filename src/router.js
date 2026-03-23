@@ -5,7 +5,7 @@ const { getSession, clearSession, hasActiveStreamSession } = require('./session-
 const { getTotalVerses } = require('./verse-counts');
 const { classifyIntent } = require('./intent-classifier');
 const { preflightCheck, estimateTokens } = require('./usage-tracker');
-const { getPendingMerge, clearPendingMerge } = require('./pending-merges');
+const { getPendingMerge, clearPendingMerge, getAllPendingMerges } = require('./pending-merges');
 const { getCheckpoint, setCheckpoint, clearCheckpoint } = require('./pipeline-checkpoints');
 const { listCheckpoints } = require('./pipeline-checkpoints');
 const { resumeInsertion } = require('./insertion-resume');
@@ -120,6 +120,14 @@ function isMerged(content) {
 function isCancelMerge(content) {
   const t = content.trim().toLowerCase().replace(/^@\*\*[^*]+\*\*\s*/, '');
   return /^(cancel|discard|nevermind|never ?mind|forget it|start over)[\s.!]*$/.test(t);
+}
+
+function parseMergeCommand(content) {
+  const t = content.trim().replace(/^@\*\*[^*]+\*\*\s*/, '');
+  const m = t.match(/^(?:merged?)\s+(\w+)\s+(\d+)[\s.!]*$/i);
+  if (!m) return null;
+  const book = normalizeBookName(m[1]);
+  return book ? { book, chapter: parseInt(m[2]) } : null;
 }
 
 function buildConfirmMessage(template, captures) {
@@ -686,6 +694,26 @@ async function routeMessage(message) {
     }
   }
 
+  // Handle explicit "merge PSA 88" command — works from any topic
+  if (isStream) {
+    const mergeCmd = parseMergeCommand(message.content);
+    if (mergeCmd) {
+      const allPending = getAllPendingMerges();
+      const match = allPending.find(pm =>
+        pm.book === mergeCmd.book && pm.startChapter <= mergeCmd.chapter && pm.endChapter >= mergeCmd.chapter);
+      if (match) {
+        try { await addReaction(message.id, 'working_on_it'); } catch (_) {}
+        console.log(`[router] Explicit merge command for ${mergeCmd.book} ${mergeCmd.chapter} — resuming ${match.sessionKey}`);
+        resumeInsertion(match.sessionKey, message).catch(err =>
+          console.error(`[router] resumeInsertion failed: ${err.message}`));
+      } else {
+        await sendMessage(message.display_recipient, message.subject,
+          `No pending insertion found for ${mergeCmd.book} ${mergeCmd.chapter}.`);
+      }
+      return;
+    }
+  }
+
   // Check for pending merge (deferred repo-insert waiting for user to merge branches)
   if (isStream) {
     const pendingMerge = getPendingMerge(sessionKey);
@@ -704,14 +732,7 @@ async function routeMessage(message) {
           `Pending insertion discarded. Generated files are still in the output folder if you need them later.`);
         return;
       }
-      // Check if this is a new generate/notes command for the same book
-      const { route: newRoute } = matchRoute(message.content);
-      if (newRoute && (newRoute.name === 'generate-content' || newRoute.name === 'write-notes')) {
-        await sendMessage(message.display_recipient, message.subject,
-          `There's a pending insertion waiting for you to merge branches. Say **merged** when done, or **cancel** to discard it.`);
-        return;
-      }
-      // Other messages pass through to normal routing
+      // New commands pass through to normal routing — pending merge doesn't block new work
     }
   }
 
