@@ -383,20 +383,33 @@ function fixUnicodeQuotes({ tsvFile, hebrewUsfm, output }) {
   }
   if (curVerse && curLines.length) verseMap[curVerse] = extractVerseText(curLines);
 
-  // --- Build reduced source + offset map per verse ---
-  function buildReduced(raw) {
-    // Strip cantillation, word joiners, meteg, sof pasuq but keep everything else
-    const reduced = [];
-    const offsetMap = [];  // offsetMap[i] = index in raw for reduced[i]
+  // --- Build stripped version + offset map back to raw ---
+  // We strip marks from BOTH the quote and the raw verse for fuzzy matching,
+  // then map the match back to the FULL raw verse (preserving all marks).
+  function buildStripped(raw) {
+    const stripped = [];
+    const offsetMap = [];  // offsetMap[i] = index in raw for stripped[i]
     for (let i = 0; i < raw.length; i++) {
       const c = raw[i];
       if (!STRIP_RE.test(c)) {
-        reduced.push(c);
+        stripped.push(c);
         offsetMap.push(i);
       }
       STRIP_RE.lastIndex = 0;  // reset stateful regex
     }
-    return { text: reduced.join(''), offsetMap };
+    return { text: stripped.join(''), offsetMap };
+  }
+
+  // Given a match span [rStart, rEnd] in stripped text, return the
+  // corresponding full span from raw (including all marks).
+  function rawSpan(raw, offsetMap, rStart, rEnd, strippedLen) {
+    const rawStart = offsetMap[rStart];
+    // For the end: find the start of the NEXT stripped char, or end of raw
+    const rawEndExcl = (rEnd + 1 < strippedLen) ? offsetMap[rEnd + 1] : raw.length;
+    // Trim trailing spaces/sof-pasuq from the span
+    let end = rawEndExcl;
+    while (end > rawStart && (raw[end - 1] === ' ' || raw[end - 1] === '\u05C3')) end--;
+    return raw.slice(rawStart, end);
   }
 
   // --- Fix each TSV row ---
@@ -430,31 +443,33 @@ function fixUnicodeQuotes({ tsvFile, hebrewUsfm, output }) {
     let allMatched = true;
 
     for (const seg of segments) {
-      const { text: reducedText, offsetMap } = buildReduced(rawVerse);
-      // Normalize both for matching
-      const normQuote = seg.normalize('NFKD');
-      const normReduced = reducedText.normalize('NFKD');
+      const { text: strippedVerse, offsetMap } = buildStripped(rawVerse);
+      // Strip the quote too (it may or may not have marks)
+      const strippedQuote = seg.replace(STRIP_RE, () => { STRIP_RE.lastIndex = 0; return ''; });
+      STRIP_RE.lastIndex = 0;
 
-      // Build char map from normalized reduced back to reduced
-      // We need: position in normReduced -> position in reducedText
-      // NFKD can change string length (decomposition), so build explicit map
-      const nrMap = [];  // nrMap[i] = index in reducedText
-      let ri = 0;
-      for (let ni = 0; ni < normReduced.length; ni++) {
-        if (ri < reducedText.length) {
-          nrMap.push(ri);
-          const charNorm = reducedText[ri].normalize('NFKD');
+      // Normalize both for matching (handles combining mark reordering)
+      const normQuote = strippedQuote.normalize('NFKD');
+      const normStripped = strippedVerse.normalize('NFKD');
+
+      // Build map: normStripped index -> strippedVerse index
+      const nrMap = [];
+      let si = 0;
+      for (let ni = 0; ni < normStripped.length; ni++) {
+        if (si < strippedVerse.length) {
+          nrMap.push(si);
+          const charNorm = strippedVerse[si].normalize('NFKD');
           if (charNorm.length > 1) {
-            for (let k = 1; k < charNorm.length && ni + k < normReduced.length; k++) {
-              nrMap.push(ri);
+            for (let k = 1; k < charNorm.length && ni + k < normStripped.length; k++) {
+              nrMap.push(si);
             }
             ni += charNorm.length - 1;
           }
-          ri++;
+          si++;
         }
       }
 
-      const pos = normReduced.indexOf(normQuote);
+      const pos = normStripped.indexOf(normQuote);
       if (pos === -1) {
         allMatched = false;
         warnings.push(`${ref}: quote segment not found: "${seg.slice(0, 30)}..."`);
@@ -462,11 +477,13 @@ function fixUnicodeQuotes({ tsvFile, hebrewUsfm, output }) {
         continue;
       }
 
-      // Map back: pos in normReduced -> pos in reducedText
-      const rStart = (pos < nrMap.length) ? nrMap[pos] : 0;
+      // Map: normStripped pos -> strippedVerse pos -> raw pos
+      const sStart = (pos < nrMap.length) ? nrMap[pos] : 0;
       const endNorm = pos + normQuote.length - 1;
-      const rEnd = (endNorm < nrMap.length) ? nrMap[endNorm] : reducedText.length - 1;
-      const fixedSeg = reducedText.slice(rStart, rEnd + 1);
+      const sEnd = (endNorm < nrMap.length) ? nrMap[endNorm] : strippedVerse.length - 1;
+
+      // Extract the FULL raw span (with all marks) from the original verse
+      const fixedSeg = rawSpan(rawVerse, offsetMap, sStart, sEnd, strippedVerse.length);
       fixedSegments.push(fixedSeg);
     }
 
