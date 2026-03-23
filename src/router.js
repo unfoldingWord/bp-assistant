@@ -275,7 +275,7 @@ function getResumeCheckpoint(route, sessionKey, captures) {
     },
   });
   if (!checkpoint) return null;
-  const resumable = checkpoint.state === 'paused_for_outage' || checkpoint.state === 'failed' || checkpoint.state === 'running';
+  const resumable = checkpoint.state === 'paused_for_outage' || checkpoint.state === 'paused_for_usage_limit' || checkpoint.state === 'failed' || checkpoint.state === 'running';
   if (!resumable || checkpoint?.resume?.chapter == null) return null;
   return checkpoint;
 }
@@ -633,10 +633,10 @@ async function routeMessage(message) {
     }
     if (isResumeStatusCommand(message.content)) {
       const paused = listCheckpoints()
-        .filter((cp) => cp && cp.state === 'paused_for_outage')
+        .filter((cp) => cp && (cp.state === 'paused_for_outage' || cp.state === 'paused_for_usage_limit'))
         .sort((a, b) => String(b.updatedAt || '').localeCompare(String(a.updatedAt || '')));
       if (paused.length === 0) {
-        await sendDM(message.sender_id, 'No paused outage checkpoints found.');
+        await sendDM(message.sender_id, 'No paused checkpoints found.');
         return;
       }
       const lines = paused.slice(0, 25).map((cp, idx) => {
@@ -646,7 +646,7 @@ async function routeMessage(message) {
       });
       await sendDM(
         message.sender_id,
-        `Paused outage checkpoints (${paused.length}):\n${lines.join('\n')}`
+        `Paused checkpoints (${paused.length}):\n${lines.join('\n')}`
       );
       return;
     }
@@ -740,7 +740,7 @@ async function routeMessage(message) {
   if (isStream && isResumeCommand(message.content)) {
     const paused = listCheckpoints()
       .filter(cp => cp && cp.sessionKey === sessionKey &&
-        (cp.state === 'paused_for_outage' || cp.state === 'failed'))
+        (cp.state === 'paused_for_outage' || cp.state === 'paused_for_usage_limit' || cp.state === 'failed'))
       .sort((a, b) => String(b.updatedAt || '').localeCompare(String(a.updatedAt || '')));
 
     if (paused.length === 0) {

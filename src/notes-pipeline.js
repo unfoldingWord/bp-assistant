@@ -321,7 +321,7 @@ async function notesPipeline(route, message) {
 
   const canResumeFromCheckpoint = (
     existingCheckpoint?.resume?.chapter != null &&
-    (existingCheckpoint?.state === 'paused_for_outage' || existingCheckpoint?.state === 'failed' || existingCheckpoint?.state === 'running')
+    (existingCheckpoint?.state === 'paused_for_outage' || existingCheckpoint?.state === 'paused_for_usage_limit' || existingCheckpoint?.state === 'failed' || existingCheckpoint?.state === 'running')
   );
   // #region agent log
   fetch('http://localhost:7282/ingest/190f0e90-444d-4921-920d-f208e86f8cb3',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'7de6a4'},body:JSON.stringify({sessionId:'7de6a4',runId:debugRunId,hypothesisId:'H4',location:'notes-pipeline.js:resume-gate',message:'checkpoint and resume decision',data:{scope:{book,startChapter,endChapter,verseStart:verseStart??null,verseEnd:verseEnd??null},fresh,checkpointState:existingCheckpoint?.state||null,resume:existingCheckpoint?.resume||null,canResumeFromCheckpoint},timestamp:Date.now()})}).catch(()=>{});
@@ -555,7 +555,7 @@ async function notesPipeline(route, message) {
           await status(`**${skill.name}** failed for ${ref}: ${errText}`);
         }
         setCheckpoint(checkpointRef, {
-          state: 'failed',
+          state: abortForUsageLimit ? 'paused_for_usage_limit' : 'failed',
           totalSuccess,
           totalFail,
           current: { chapter: ch, skill: skill.name, status: 'failed', errorKind: 'sdk_error', error: errText },
@@ -577,7 +577,7 @@ async function notesPipeline(route, message) {
           await status(`**${skill.name}** failed for ${ref}: ${errText}`);
         }
         setCheckpoint(checkpointRef, {
-          state: 'failed',
+          state: abortForUsageLimit ? 'paused_for_usage_limit' : 'failed',
           totalSuccess,
           totalFail,
           current: { chapter: ch, skill: skill.name, status: 'failed', errorKind: 'non_success_result', error: errText },
@@ -708,7 +708,7 @@ async function notesPipeline(route, message) {
     if (failedSkill) {
       totalFail++;
       setCheckpoint(checkpointRef, {
-        state: abortForOutage ? 'paused_for_outage' : 'failed',
+        state: abortForOutage ? 'paused_for_outage' : abortForUsageLimit ? 'paused_for_usage_limit' : 'failed',
         totalSuccess,
         totalFail,
         skillOutputs,
@@ -930,7 +930,6 @@ async function notesPipeline(route, message) {
       tokensBefore, success: false, userId: message.sender_id,
     });
     await status(`Notes pipeline paused for **${rangeLabel}** due to usage limit.`);
-    clearCheckpoint(checkpointRef);
     return;
   }
 

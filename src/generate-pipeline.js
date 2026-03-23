@@ -340,7 +340,7 @@ async function generatePipeline(route, message) {
 
   const canResumeFromCheckpoint = (
     existingCheckpoint?.resume?.chapter != null &&
-    (existingCheckpoint?.state === 'paused_for_outage' || existingCheckpoint?.state === 'failed' || existingCheckpoint?.state === 'running')
+    (existingCheckpoint?.state === 'paused_for_outage' || existingCheckpoint?.state === 'paused_for_usage_limit' || existingCheckpoint?.state === 'failed' || existingCheckpoint?.state === 'running')
   );
   if (!fresh && canResumeFromCheckpoint && resumeChapter >= start) {
     await status(`Resuming generation from checkpoint at **${book} ${resumeChapter}** (${resumeSkill || 'chapter start'}).`);
@@ -495,7 +495,7 @@ async function generatePipeline(route, message) {
         abortForUsageLimit = true;
         usageLimitTag = buildUsageLimitResetTag(errText);
         setCheckpoint(checkpointRef, {
-          state: 'failed',
+          state: 'paused_for_usage_limit',
           success,
           fail,
           completedChapters,
@@ -523,7 +523,7 @@ async function generatePipeline(route, message) {
         abortForUsageLimit = true;
         usageLimitTag = buildUsageLimitResetTag(errText);
         setCheckpoint(checkpointRef, {
-          state: 'failed',
+          state: 'paused_for_usage_limit',
           success,
           fail,
           completedChapters,
@@ -774,7 +774,7 @@ async function generatePipeline(route, message) {
         abortForUsageLimit = true;
         usageLimitTag = buildUsageLimitResetTag(err.message || '');
         setCheckpoint(checkpointRef, {
-          state: 'failed',
+          state: 'paused_for_usage_limit',
           success,
           fail,
           completedChapters,
@@ -828,7 +828,6 @@ async function generatePipeline(route, message) {
       tokensBefore, success: false, userId: message.sender_id,
     });
     await status(`Generation paused for **${refLabel}** due to usage limit.`);
-    clearCheckpoint(checkpointRef);
     return;
   }
 
