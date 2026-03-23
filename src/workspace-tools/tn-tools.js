@@ -315,4 +315,181 @@ function prepareNotes({ inputTsv, ultUsfm, ustUsfm, output, alignedUsfm, alignme
   return `Prepared ${items.length} items\n${outPath}`;
 }
 
-module.exports = { extractAlignmentData, fixHebrewQuotes, flagNarrowQuotes, generateIds, resolveGlQuotes, verifyAtFit, assembleNotes, prepareNotes };
+/**
+ * Fix Hebrew quote Unicode to exactly match UHB source byte order.
+ *
+ * The TN pipeline can reorder combining marks (via NFKD normalization in
+ * tsv-quote-converters or LLM tokenization). This tool re-extracts each
+ * Hebrew quote from the UHB source so the bytes match exactly.
+ */
+function fixUnicodeQuotes({ tsvFile, hebrewUsfm, output }) {
+  // --- Resolve Hebrew USFM path ---
+  const tsvPath = path.resolve(CSKILLBP_DIR, tsvFile);
+  const tsvContent = fs.readFileSync(tsvPath, 'utf8');
+  const bookMatch = path.basename(tsvFile).match(/([A-Z0-9]{3})/i);
+  const bookCode = bookMatch ? bookMatch[1].toUpperCase() : '';
+
+  let hebrewPath;
+  if (hebrewUsfm) {
+    hebrewPath = path.resolve(CSKILLBP_DIR, hebrewUsfm);
+  } else {
+    const dir = path.join(CSKILLBP_DIR, 'data/hebrew_bible');
+    const files = fs.existsSync(dir) ? fs.readdirSync(dir).filter(f => f.toUpperCase().includes(bookCode) && f.endsWith('.usfm')) : [];
+    if (!files.length) return `ERROR: No Hebrew USFM found for ${bookCode}`;
+    hebrewPath = path.join(dir, files[0]);
+  }
+  const hebrewContent = fs.readFileSync(hebrewPath, 'utf8');
+
+  // Marks to strip from source to build "reduced source" (matching what TN quotes contain)
+  const STRIP_RE = /[\u0591-\u05AF\u2060\u05BD\u05C3]/g;
+
+  // --- Build verse map from Hebrew USFM ---
+  // Verse text may span multiple lines: \v on its own line, \w tokens on following lines.
+  // Preserves inter-word connectors like maqqeph.
+  const verseMap = {};  // { "ch:vs": rawText }
+  let ch = 0, curVerse = null, curLines = [];
+
+  function extractVerseText(lines) {
+    const text = lines.join(' ');
+    const parts = [];
+    let lastEnd = 0;
+    const WRE = /\\w\s+([^|]+)\|[^\\]*?\\w\*/g;
+    let m;
+    while ((m = WRE.exec(text)) !== null) {
+      const between = text.slice(lastEnd, m.index);
+      if (parts.length && between.includes('\u05BE')) parts.push('\u05BE');
+      else if (parts.length) parts.push(' ');
+      parts.push(m[1].trim());
+      lastEnd = m.index + m[0].length;
+    }
+    return parts.join('');
+  }
+
+  for (const line of hebrewContent.split('\n')) {
+    const trimmed = line.trim();
+    const cm = trimmed.match(/^\\c\s+(\d+)/);
+    if (cm) {
+      if (curVerse && curLines.length) verseMap[curVerse] = extractVerseText(curLines);
+      ch = parseInt(cm[1], 10); curVerse = null; curLines = [];
+      continue;
+    }
+    const vm = trimmed.match(/^\\v\s+(\d+[-\d]*)/);
+    if (vm) {
+      if (curVerse && curLines.length) verseMap[curVerse] = extractVerseText(curLines);
+      const vs = vm[1].split('-')[0];
+      curVerse = `${ch}:${vs}`; curLines = [];
+    }
+    if (curVerse && trimmed) curLines.push(trimmed);
+  }
+  if (curVerse && curLines.length) verseMap[curVerse] = extractVerseText(curLines);
+
+  // --- Build reduced source + offset map per verse ---
+  function buildReduced(raw) {
+    // Strip cantillation, word joiners, meteg, sof pasuq but keep everything else
+    const reduced = [];
+    const offsetMap = [];  // offsetMap[i] = index in raw for reduced[i]
+    for (let i = 0; i < raw.length; i++) {
+      const c = raw[i];
+      if (!STRIP_RE.test(c)) {
+        reduced.push(c);
+        offsetMap.push(i);
+      }
+      STRIP_RE.lastIndex = 0;  // reset stateful regex
+    }
+    return { text: reduced.join(''), offsetMap };
+  }
+
+  // --- Fix each TSV row ---
+  const lines = tsvContent.split('\n');
+  const header = lines[0];
+  const cols0 = header.split('\t');
+  const quoteIdx = cols0.indexOf('Quote');
+  const refIdx = cols0.indexOf('Reference');
+  if (quoteIdx === -1 || refIdx === -1) return 'ERROR: TSV missing Quote or Reference column';
+
+  let fixed = 0, skipped = 0, notFound = 0;
+  const warnings = [];
+
+  for (let i = 1; i < lines.length; i++) {
+    if (!lines[i].trim()) continue;
+    const cols = lines[i].split('\t');
+    if (cols.length <= quoteIdx) continue;
+    const quote = cols[quoteIdx];
+    if (!quote || !/[\u0590-\u05FF]/.test(quote)) continue;  // skip non-Hebrew
+
+    const ref = cols[refIdx];
+    const chVs = ref.includes(':') ? ref : null;
+    if (!chVs) continue;
+
+    const rawVerse = verseMap[chVs];
+    if (!rawVerse) { skipped++; continue; }
+
+    // Handle discontinuous quotes (separated by &)
+    const segments = quote.split(/\s*&\s*/);
+    const fixedSegments = [];
+    let allMatched = true;
+
+    for (const seg of segments) {
+      const { text: reducedText, offsetMap } = buildReduced(rawVerse);
+      // Normalize both for matching
+      const normQuote = seg.normalize('NFKD');
+      const normReduced = reducedText.normalize('NFKD');
+
+      // Build char map from normalized reduced back to reduced
+      // We need: position in normReduced -> position in reducedText
+      // NFKD can change string length (decomposition), so build explicit map
+      const nrMap = [];  // nrMap[i] = index in reducedText
+      let ri = 0;
+      for (let ni = 0; ni < normReduced.length; ni++) {
+        if (ri < reducedText.length) {
+          nrMap.push(ri);
+          const charNorm = reducedText[ri].normalize('NFKD');
+          if (charNorm.length > 1) {
+            for (let k = 1; k < charNorm.length && ni + k < normReduced.length; k++) {
+              nrMap.push(ri);
+            }
+            ni += charNorm.length - 1;
+          }
+          ri++;
+        }
+      }
+
+      const pos = normReduced.indexOf(normQuote);
+      if (pos === -1) {
+        allMatched = false;
+        warnings.push(`${ref}: quote segment not found: "${seg.slice(0, 30)}..."`);
+        fixedSegments.push(seg);  // keep original
+        continue;
+      }
+
+      // Map back: pos in normReduced -> pos in reducedText
+      const rStart = (pos < nrMap.length) ? nrMap[pos] : 0;
+      const endNorm = pos + normQuote.length - 1;
+      const rEnd = (endNorm < nrMap.length) ? nrMap[endNorm] : reducedText.length - 1;
+      const fixedSeg = reducedText.slice(rStart, rEnd + 1);
+      fixedSegments.push(fixedSeg);
+    }
+
+    const fixedQuote = fixedSegments.join(' & ');
+    if (fixedQuote !== quote) {
+      cols[quoteIdx] = fixedQuote;
+      lines[i] = cols.join('\t');
+      fixed++;
+    }
+    if (!allMatched) notFound++;
+  }
+
+  // --- Write output ---
+  const outPath = output ? path.resolve(CSKILLBP_DIR, output) : tsvPath;
+  fs.mkdirSync(path.dirname(outPath), { recursive: true });
+  fs.writeFileSync(outPath, lines.join('\n'));
+
+  const result = [`Fixed ${fixed} Hebrew quotes in ${path.basename(tsvFile)}`];
+  if (skipped) result.push(`Skipped ${skipped} (verse not in Hebrew source)`);
+  if (notFound) result.push(`${notFound} quotes had unmatched segments`);
+  if (warnings.length) result.push('Warnings:\n  ' + warnings.slice(0, 10).join('\n  '));
+  result.push(outPath);
+  return result.join('\n');
+}
+
+module.exports = { extractAlignmentData, fixHebrewQuotes, flagNarrowQuotes, generateIds, resolveGlQuotes, verifyAtFit, assembleNotes, prepareNotes, fixUnicodeQuotes };

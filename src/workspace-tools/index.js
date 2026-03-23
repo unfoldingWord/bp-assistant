@@ -11,7 +11,7 @@ const { splitTsv, mergeTsvs, fixTrailingNewlines } = require('./tsv-tools');
 const { extractUltEnglish, filterPsalms, curlyQuotes, checkUstPassives, createAlignedUsfm } = require('./usfm-tools');
 const { buildStrongsIndex, buildTnIndex, buildUstIndex } = require('./index-tools');
 const { checkTwHeadwords, compareUltUst, detectAbstractNouns } = require('./issue-tools');
-const { extractAlignmentData, fixHebrewQuotes, flagNarrowQuotes, generateIds, resolveGlQuotes, verifyAtFit, assembleNotes, prepareNotes } = require('./tn-tools');
+const { extractAlignmentData, fixHebrewQuotes, flagNarrowQuotes, generateIds, resolveGlQuotes, verifyAtFit, assembleNotes, prepareNotes, fixUnicodeQuotes } = require('./tn-tools');
 const { validateTnTsv, checkTnQuality } = require('./quality-tools');
 const { giteaPr, prepareCompare, prepareTq, verifyTq, appendQuickref } = require('./misc-tools');
 
@@ -271,6 +271,11 @@ function createWorkspaceTools(createSdkMcpServer, tool, z) {
         inputTsv: z.string().describe('Issue TSV path'), ultUsfm: z.string().optional(), ustUsfm: z.string().optional(),
         output: z.string().optional(), alignedUsfm: z.string().optional(), alignmentJson: z.string().optional(),
       }, async (args) => ({ content: [{ type: 'text', text: prepareNotes(args) }] })),
+      tool('fix_unicode_quotes', 'Fix Hebrew quote Unicode to exactly match UHB source byte order (post-assembly)', {
+        tsvFile: z.string().describe('TN TSV file path'),
+        hebrewUsfm: z.string().optional().describe('Hebrew USFM path (auto-detected from book code if omitted)'),
+        output: z.string().optional().describe('Output path (defaults to in-place overwrite)'),
+      }, async (args) => ({ content: [{ type: 'text', text: fixUnicodeQuotes(args) }] })),
 
       // --- Quality checks ---
       tool('validate_tn_tsv', 'Validate TN TSV against Door43 CI rules (checks 3-13)', {
