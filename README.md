@@ -1,12 +1,55 @@
-# Zulip Bot -- Pipeline Router & Claude SDK Runner
+# BP Assistant — Zulip Bot
 
-Monitors a Zulip channel and DMs, matches messages against routes via regex + NLU fallback, and dispatches to Claude SDK pipelines for book package generation. Runs inside Docker on an OCI ARM64 server.
+[![GitHub](https://img.shields.io/badge/github-unfoldingWord%2Fbp--assistant-blue)](https://github.com/unfoldingWord/bp-assistant)
+
+Zulip bot that orchestrates AI-assisted creation of unfoldingWord Book Packages. Monitors a Zulip channel and DMs, matches messages against routes via regex + NLU fallback, and dispatches to Claude SDK pipelines for Bible translation content generation.
+
+**Companion repo:** [bp-assistant-skills](https://github.com/unfoldingWord/bp-assistant-skills) — Claude Code skills and reference data that power the translation pipelines.
+
+## Prerequisites
+
+- Docker and Docker Compose
+- A Zulip organization with a bot account
+- A [Door43/Gitea](https://git.door43.org) account with API token
+- An Anthropic API key (for the Haiku NLU intent classifier)
+- Claude Code CLI authentication (for the Agent SDK pipelines)
 
 ## Quick start
 
+### Docker (recommended)
+
 ```bash
-# Copy .env.example to .env and fill in credentials
+# 1. Clone both repos side by side:
+#    /srv/bot/app/        (this repo)
+#    /srv/bot/workspace/  (bp-assistant-skills)
+#    /srv/bot/config/     (secrets + env, see below)
+
+# 2. Create config directory and secrets
+mkdir -p /srv/bot/config/secrets
+cp .env.example /srv/bot/config/.env
+# Edit .env and populate all values
+
+# Create secret files (one value per file, no trailing newline):
+echo -n "your-token" > /srv/bot/config/secrets/door43_token
+echo -n "your-username" > /srv/bot/config/secrets/door43_username
+echo -n "your-key" > /srv/bot/config/secrets/zulip_api_key
+echo -n "your-email" > /srv/bot/config/secrets/zulip_email
+
+# 3. Create external Docker resources
+docker volume create bot_claude-config
+docker network create work-net   # if not already present
+docker network create home-net   # if not already present
+
+# 4. Build and run
+docker compose up -d
+docker logs zulip-bot --tail 30 -f
+```
+
+### Local development
+
+```bash
 cp .env.example .env
+# Fill in credentials
 npm install
 npm start
 ```
@@ -102,6 +145,10 @@ Content is pushed to Door43/Gitea repos via deterministic JS code -- no Claude i
 - `door43-users.json` (gitignored) -- Maps email addresses to Door43 usernames
 - Requires `DCS_TOKEN` env var for Gitea API access
 
+## MCP server
+
+The bot runs an MCP (Model Context Protocol) server on port 3001 that exposes Bible translation reference data to Claude during pipeline execution. This includes Strong's concordance lookups, glossary data, and issue type descriptions. The server starts automatically with the bot.
+
 ## Usage tracking
 
 Every SDK call writes to `data/metrics/usage.jsonl`. Pre-flight checks combine `ccusage` (CLI/desktop usage) with the bot's JSONL log to estimate headroom in the 5-hour token window.
@@ -112,44 +159,60 @@ Every SDK call writes to `data/metrics/usage.jsonl`. Pre-flight checks combine `
 
 Bootstrap cost estimates (from 101+ observed runs) are in `src/usage-tracker.js` (`BOOTSTRAP_DEFAULTS`). The `estimateTokens()` function blends bootstrap with observed medians as data accumulates.
 
-## Environment variables
+## Environment variables & secrets
 
-See `.env.example`:
+In Docker, credentials are loaded from Docker secrets (files mounted at `/run/secrets/`). The `.env` file provides non-secret configuration.
+
+### `.env` (non-secret config)
 
 | Variable | Description |
 |---|---|
-| `ZULIP_API_KEY` | Your Zulip API key |
-| `ZULIP_EMAIL` | Your Zulip email |
 | `ZULIP_REALM` | Zulip server URL |
-| `PORT` | (optional) HTTP port |
-| `DCS_TOKEN` | Door43/Gitea API token for repo pushes |
-| `ANTHROPIC_API_KEY` | API key for Haiku NLU classifier |
+| `PORT` | (optional) HTTP port for MCP server (default: 3001) |
+| `ANTHROPIC_API_KEY` | API key for Haiku NLU intent classifier |
+
+### Docker secrets
+
+| Secret | Description |
+|---|---|
+| `zulip_api_key` | Zulip bot API key |
+| `zulip_email` | Zulip bot email |
+| `door43_token` | Door43/Gitea API token for repo pushes |
+| `door43_username` | Door43/Gitea username |
+| `claude_oauth_token` | Claude Code OAuth token (for Agent SDK) |
+| `bt_mcp_api_token` | Bible translation MCP API token |
+
+For local development without Docker, set these in `.env` directly (see `.env.example`).
 
 ## File structure
 
 ```
-.env                        <- Credentials (not committed)
-.env.example                <- Template
+.env.example                <- Template for local development
 config.json                 <- Channel, topics, routes, usage tracking config
 config.local.json           <- Admin/authorized user IDs (gitignored)
 door43-users.json           <- Email-to-Door43 username map (gitignored)
-Dockerfile                  <- node:22-slim + Python + Claude CLI, runs as botuser
-docker-compose.yml          <- Mounts workspace, config, data, claude-config
+Dockerfile                  <- Multi-stage: node:22-slim build → Chainguard distroless runtime
+docker-compose.yml          <- Mounts workspace, config, data; uses Docker secrets
 package.json                <- Dependencies: claude-agent-sdk, anthropic, zulip-js
 
 src/
   index.js                  <- Event loop: auth, poll Zulip events, filter, call router
   router.js                 <- Route matching, confirmation flow, pending merges, Haiku fallback
   config.js                 <- Merges config.json + config.local.json
+  secrets.js                <- Docker secrets loader (reads /run/secrets/* files)
   pipeline-runner.js        <- Dispatcher: sdk / notes / editor-note / interactive-dm
+  pipeline-context.js       <- Shared pipeline context (book, chapter, config)
+  pipeline-checkpoints.js   <- Checkpoint save/restore for pipeline resumption
   claude-runner.js          <- SDK query() wrapper with timeout, abort, metrics hooks
   generate-pipeline.js      <- ULT+UST generation + alignment + Door43 push
   notes-pipeline.js         <- TN skill chain (issue-id -> tn-writer -> quality-check) + Door43 push
   note-pipeline.js          <- Editor note filing (appends to data/editor-notes/BOOK.md)
   interactive-dm-pipeline.js <- Multi-turn Claude sessions (admin DMs + stream sessions)
+  insertion-resume.js       <- Resume interrupted repo-insert operations
   intent-classifier.js      <- Haiku NLU fallback for natural-language commands
+  mcp-server.js             <- MCP server (port 3001) exposing Bible translation data
   usage-tracker.js          <- JSONL metrics, token estimates, preflight checks, ccusage
-  door43-push.js            <- Deterministic Git+Gitea API push
+  door43-push.js            <- Deterministic Git+Gitea API push (isomorphic-git)
   door43-push-cli.js        <- CLI wrapper for door43-push
   repo-verify.js            <- Gitea API verification that PR merged to master
   session-store.js          <- File-backed Claude session persistence
@@ -159,14 +222,10 @@ src/
   pipeline-utils.js         <- Book name normalization, output file resolution, timeouts
   verse-counts.js           <- Verse count lookup for timeout/estimate calculations
 
-pipelines/
-  example.sh                <- Legacy shell pipeline template
-  generate.sh               <- Legacy shell generator (superseded by generate-pipeline.js)
-  zulip-helpers.sh          <- curl helpers for shell pipelines
-
 data/
   metrics/usage.jsonl       <- Token usage log (auto-created)
   sessions/                 <- Multi-turn session state (auto-created)
+  editor-notes/             <- Filed editor observations (auto-created)
 ```
 
 ## Config reference
