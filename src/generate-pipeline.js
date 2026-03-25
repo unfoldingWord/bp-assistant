@@ -369,9 +369,15 @@ async function generatePipeline(route, message) {
   });
 
   // =========================================================================
-  // Phase 1: Generate + Align (always runs)
+  // Phase 1: Generate + Align (skip entirely when resuming at door43-push)
   // =========================================================================
-  for (let ch = start; ch <= end; ch++) {
+  const skipToPhase2 = resumeSkill === 'door43-push' && completedChapters.length > 0;
+  if (skipToPhase2) {
+    await status(`Resuming at **door43-push** — skipping generation (${completedChapters.length} chapter(s) already generated).`);
+    // Restore success count from completed chapters
+    success = completedChapters.length;
+  }
+  for (let ch = start; !skipToPhase2 && ch <= end; ch++) {
     if (ch < resumeChapter) continue;
     console.log(`[generate] Processing ${book} chapter ${ch}...`);
     const chapterRef = hasVerseRange ? `${book} ${ch}:${verseStart}-${verseEnd}` : `${book} ${ch}`;
@@ -969,7 +975,24 @@ async function generatePipeline(route, message) {
     }
 
     for (const chData of completedChapters) {
+      // Skip chapters whose push already completed in a previous run
+      if (chData.ch < resumeChapter) continue;
+      if (chData.ch === resumeChapter && resumeSkill === 'door43-push-done') {
+        await status(`Skipping **door43-push** for ${book} ${chData.ch} (already completed in previous run).`);
+        continue;
+      }
+
       let chapterFailed = false;
+
+      // Save checkpoint before door43-push so we can resume here on failure
+      setCheckpoint(checkpointRef, {
+        state: 'running',
+        success,
+        fail,
+        completedChapters,
+        current: { chapter: chData.ch, skill: 'door43-push', status: 'running' },
+        resume: { chapter: chData.ch, skill: 'door43-push' },
+      });
 
       // Pre-flight: verify source files exist (only for requested content types)
       const pushUlt = contentTypes.includes('ult') && chData.ultAligned;
@@ -1056,6 +1079,23 @@ async function generatePipeline(route, message) {
         // Move from success to fail (was counted as success during Phase 1)
         success--;
         fail++;
+        setCheckpoint(checkpointRef, {
+          state: 'failed',
+          success,
+          fail,
+          completedChapters,
+          current: { chapter: chData.ch, skill: 'door43-push', status: 'failed', errorKind: 'push_failed' },
+          resume: { chapter: chData.ch, skill: 'door43-push' },
+        });
+      } else {
+        setCheckpoint(checkpointRef, {
+          state: 'running',
+          success,
+          fail,
+          completedChapters,
+          current: { chapter: chData.ch, skill: 'door43-push', status: 'succeeded' },
+          resume: { chapter: chData.ch, skill: 'door43-push-done' },
+        });
       }
     }
     } // end DCS token valid else block
