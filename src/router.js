@@ -1007,4 +1007,4 @@ function hasActiveSession(channel, topic, senderId) {
   return hasActiveStreamSession(channel, topic, senderId);
 }
 
-module.exports = { routeMessage, hasPendingAction, hasActiveSession };
+module.exports = { routeMessage, hasPendingAction, hasActiveSession, extractContentTypes };

@@ -11,6 +11,7 @@ const path = require('path');
 const config = require('./config');
 const { sendMessage, sendDM, addReaction, removeReaction, uploadFile } = require('./zulip-client');
 const { runClaude, DEFAULT_RESTRICTED_TOOLS, isTransientOutageError } = require('./claude-runner');
+const { extractContentTypes } = require('./router');
 const { getDoor43Username, buildBranchName, resolveOutputFile, discoverFreshOutput, calcSkillTimeout, normalizeBookName, resolveConflictMention, CSKILLBP_DIR } = require('./pipeline-utils');
 const { verifyRepoPush, verifyDcsToken } = require('./repo-verify');
 const { ensureFreshToken, isAuthError } = require('./auth-refresh');
@@ -72,6 +73,11 @@ function cleanupGenerateArtifacts({ book, chapter, verseStart, verseEnd }) {
 
 function parseGenerateCommand(content) {
   const input = content.toLowerCase();
+  const fresh = hasFreshFlag(content);
+  const contentTypes = extractContentTypes(content);
+  const noAlign = /--no-align\b/i.test(String(content || ''));
+  const alignOnly = /--align-only\b/i.test(String(content || ''));
+  const extra = { fresh, contentTypes, noAlign, alignOnly };
 
   // Verse range in a single chapter: generate lam 2:1-3
   const verseMatch = input.match(/generate\s+([a-z0-9]+)\s+(\d+):(\d+)\s*[-\u2013\u2014]\s*(\d+)/);
@@ -79,11 +85,10 @@ function parseGenerateCommand(content) {
     const chapter = parseInt(verseMatch[2], 10);
     return {
       book: normalizeBookName(verseMatch[1]),
-      start: chapter,
-      end: chapter,
+      start: chapter, end: chapter,
       verseStart: parseInt(verseMatch[3], 10),
       verseEnd: parseInt(verseMatch[4], 10),
-      fresh: hasFreshFlag(content),
+      ...extra,
     };
   }
 
@@ -94,11 +99,9 @@ function parseGenerateCommand(content) {
     const verse = parseInt(singleVerseMatch[3], 10);
     return {
       book: normalizeBookName(singleVerseMatch[1]),
-      start: chapter,
-      end: chapter,
-      verseStart: verse,
-      verseEnd: verse,
-      fresh: hasFreshFlag(content),
+      start: chapter, end: chapter,
+      verseStart: verse, verseEnd: verse,
+      ...extra,
     };
   }
 
@@ -109,9 +112,8 @@ function parseGenerateCommand(content) {
       book: normalizeBookName(rangeMatch[1]),
       start: parseInt(rangeMatch[2], 10),
       end: parseInt(rangeMatch[3], 10),
-      verseStart: null,
-      verseEnd: null,
-      fresh: hasFreshFlag(content),
+      verseStart: null, verseEnd: null,
+      ...extra,
     };
   }
 
@@ -121,11 +123,9 @@ function parseGenerateCommand(content) {
     const ch = parseInt(singleMatch[2], 10);
     return {
       book: normalizeBookName(singleMatch[1]),
-      start: ch,
-      end: ch,
-      verseStart: null,
-      verseEnd: null,
-      fresh: hasFreshFlag(content),
+      start: ch, end: ch,
+      verseStart: null, verseEnd: null,
+      ...extra,
     };
   }
 
@@ -241,6 +241,9 @@ async function generatePipeline(route, message) {
       verseStart: route._verseStart ?? null,
       verseEnd: route._verseEnd ?? null,
       fresh: hasFreshFlag(message.content),
+      contentTypes: extractContentTypes(message.content),
+      noAlign: /--no-align\b/i.test(String(message.content || '')),
+      alignOnly: /--align-only\b/i.test(String(message.content || '')),
     };
   } else {
     parsed = parseGenerateCommand(message.content);
@@ -252,7 +255,7 @@ async function generatePipeline(route, message) {
     return;
   }
 
-  const { book, start, end, verseStart, verseEnd, fresh } = parsed;
+  const { book, start, end, verseStart, verseEnd, fresh, contentTypes, noAlign, alignOnly } = parsed;
   const sessionKey = stream ? `stream-${stream}-${topic}` : `dm-${message.sender_id}`;
   const checkpointRef = {
     sessionKey,
@@ -301,7 +304,9 @@ async function generatePipeline(route, message) {
 
   // Signal working
   await addReaction(msgId, 'working_on_it');
-  const modeLabel = isFileResponse ? 'files-only' : 'full pipeline (align + repo-insert)';
+  const typeLabel = contentTypes.length === 1 ? `${contentTypes[0].toUpperCase()}-only` : 'full pipeline';
+  const alignLabel = noAlign ? 'files-only' : alignOnly ? 'align-only' : 'align + repo-insert';
+  const modeLabel = isFileResponse ? 'files-only' : `${typeLabel} (${alignLabel})`;
   const refLabel = hasVerseRange ? `${book} ${start}:${verseStart}-${verseEnd}` : `${book} ${start}\u2013${end}`;
   await status(`Starting generation for **${refLabel}** (${chapterCount} chapter(s), mode: ${modeLabel}, ~${estimatedTotal} tokens estimated)`);
 
@@ -313,8 +318,12 @@ async function generatePipeline(route, message) {
   const model = isTestFast ? 'haiku' : undefined;
   const betas = isTestFast ? undefined : ['context-1m-2025-08-07'];
 
-  // Determine skill from route config
-  const skill = route.skill || 'initial-pipeline';
+  // Determine skill from route config — single content type bypasses initial-pipeline
+  let skill = route.skill || 'initial-pipeline';
+  if (!alignOnly && contentTypes.length === 1) {
+    if (contentTypes[0] === 'ust') skill = 'UST-gen';
+    else if (contentTypes[0] === 'ult') skill = 'ULT-gen';
+  }
   const isInitialPipelineSkill = skill.split(/\s+/)[0] === 'initial-pipeline';
 
   if (isInitialPipelineSkill) {
@@ -417,7 +426,10 @@ async function generatePipeline(route, message) {
       try {
         const timeoutMs = calcSkillTimeout(book, ch, route.operations || 6);
         const skillRef = hasVerseRange ? `${book} ${ch}:${verseStart}-${verseEnd}` : `${book} ${ch}`;
-        if (runInitialSkill) {
+        if (alignOnly) {
+          await status(`Skipping generation (**align-only** mode) for ${book} ${ch}`);
+          claudeResult = { subtype: 'success', resumed: true };
+        } else if (runInitialSkill) {
           claudeResult = await runClaude({
             prompt: skillRef,
             cwd: CSKILLBP_DIR,
@@ -603,8 +615,8 @@ async function generatePipeline(route, message) {
       resume: null,
     });
 
-    // --- File-response path: upload files only ---
-    if (isFileResponse) {
+    // --- File-response path: upload files only (also used for --no-align) ---
+    if (isFileResponse || noAlign) {
       const links = [];
 
       if (hasUlt) {
@@ -716,11 +728,14 @@ async function generatePipeline(route, message) {
 
       // Discover aligned output files by recency — handles any naming variant
       const alignPat = new RegExp(`^${book}-0*${ch}(-.*)?-aligned\\.usfm$`);
-      const alignedUltRel = discoverFreshOutput('output/AI-ULT', book, alignPat, chapterStart);
-      const alignedUstRel = discoverFreshOutput('output/AI-UST', book, alignPat, chapterStart);
+      const needUlt = contentTypes.includes('ult');
+      const needUst = contentTypes.includes('ust');
+      const alignedUltRel = needUlt ? discoverFreshOutput('output/AI-ULT', book, alignPat, chapterStart) : null;
+      const alignedUstRel = needUst ? discoverFreshOutput('output/AI-UST', book, alignPat, chapterStart) : null;
 
-      if (!alignedUltRel || !alignedUstRel) {
-        await status(`**align-all-parallel** failed for ${book} ${ch} \u2014 aligned files not found (${alignDuration}s)`);
+      if ((needUlt && !alignedUltRel) || (needUst && !alignedUstRel)) {
+        const missing = [needUlt && !alignedUltRel && 'ULT', needUst && !alignedUstRel && 'UST'].filter(Boolean).join(', ');
+        await status(`**align-all-parallel** failed for ${book} ${ch} \u2014 aligned ${missing} file(s) not found (${alignDuration}s)`);
         fail++;
         setCheckpoint(checkpointRef, {
           state: 'failed',
@@ -732,7 +747,7 @@ async function generatePipeline(route, message) {
         });
         continue;
       }
-      if (!isFreshOutput(alignedUltRel, chapterStart) || !isFreshOutput(alignedUstRel, chapterStart)) {
+      if ((needUlt && !isFreshOutput(alignedUltRel, chapterStart)) || (needUst && !isFreshOutput(alignedUstRel, chapterStart))) {
         await status(`**align-all-parallel** failed for ${book} ${ch} \u2014 aligned output appears stale from an earlier run`);
         fail++;
         setCheckpoint(checkpointRef, {
@@ -837,7 +852,7 @@ async function generatePipeline(route, message) {
   // =========================================================================
   // Phase 2: Repo insert \u2014 push to master (non-file-response users only)
   // =========================================================================
-  if (!isFileResponse && completedChapters.length > 0) {
+  if (!isFileResponse && !noAlign && completedChapters.length > 0) {
     // Pre-flight: verify DCS token before spending time on repo-insert
     const dcsCheck = await verifyDcsToken();
     if (!dcsCheck.valid) {
@@ -854,12 +869,14 @@ async function generatePipeline(route, message) {
     const chapters = completedChapters.map(c => c.ch);
     const allConflicts = [];
     for (const ch of chapters) {
-      const ultConflicts = await checkConflictingBranches('en_ult', ultFile, ch);
-      const ustConflicts = await checkConflictingBranches('en_ust', ustFile, ch);
-      allConflicts.push(
-        ...ultConflicts.map(c => ({ ...c, repo: 'en_ult', file: ultFile })),
-        ...ustConflicts.map(c => ({ ...c, repo: 'en_ust', file: ustFile })),
-      );
+      if (contentTypes.includes('ult')) {
+        const ultConflicts = await checkConflictingBranches('en_ult', ultFile, ch);
+        allConflicts.push(...ultConflicts.map(c => ({ ...c, repo: 'en_ult', file: ultFile })));
+      }
+      if (contentTypes.includes('ust')) {
+        const ustConflicts = await checkConflictingBranches('en_ust', ustFile, ch);
+        allConflicts.push(...ustConflicts.map(c => ({ ...c, repo: 'en_ust', file: ustFile })));
+      }
     }
     // Deduplicate (same PR could appear for multiple chapters)
     const seen = new Set();
@@ -927,14 +944,14 @@ async function generatePipeline(route, message) {
     for (const chData of completedChapters) {
       let chapterFailed = false;
 
-      // Pre-flight: verify source files exist
-      const ultPath = path.resolve(CSKILLBP_DIR, chData.ultAligned);
-      const ustPath = path.resolve(CSKILLBP_DIR, chData.ustAligned);
-      if (!fs.existsSync(ultPath)) {
+      // Pre-flight: verify source files exist (only for requested content types)
+      const pushUlt = contentTypes.includes('ult') && chData.ultAligned;
+      const pushUst = contentTypes.includes('ust') && chData.ustAligned;
+      if (pushUlt && !fs.existsSync(path.resolve(CSKILLBP_DIR, chData.ultAligned))) {
         await status(`**door43-push** SKIPPED (ULT) for ${book} ${chData.ch}: source file missing: ${chData.ultAligned}`);
         chapterFailed = true;
       }
-      if (!chapterFailed && !fs.existsSync(ustPath)) {
+      if (!chapterFailed && pushUst && !fs.existsSync(path.resolve(CSKILLBP_DIR, chData.ustAligned))) {
         await status(`**door43-push** SKIPPED (UST) for ${book} ${chData.ch}: source file missing: ${chData.ustAligned}`);
         chapterFailed = true;
       }
@@ -942,7 +959,7 @@ async function generatePipeline(route, message) {
       const pushStartTime = new Date().toISOString();
 
       // door43-push ULT
-      if (!chapterFailed) {
+      if (!chapterFailed && pushUlt) {
         await status(`Running **door43-push** (ULT) for ${book} ${chData.ch}...`);
         try {
           const pushResultUlt = await door43Push({
@@ -966,7 +983,7 @@ async function generatePipeline(route, message) {
       }
 
       // door43-push UST
-      if (!chapterFailed) {
+      if (!chapterFailed && pushUst) {
         await status(`Running **door43-push** (UST) for ${book} ${chData.ch}...`);
         try {
           const pushResultUst = await door43Push({
@@ -993,18 +1010,19 @@ async function generatePipeline(route, message) {
       if (!chapterFailed) {
         const stagingBranch = buildBranchName(book, chData.ch);
         await status(`Verifying merges for ${book} ${chData.ch}...`);
-        const ultVerify = await verifyRepoPush({ repo: 'en_ult', stagingBranch, since: pushStartTime });
-        const ustVerify = await verifyRepoPush({ repo: 'en_ust', stagingBranch, since: pushStartTime });
+        const ultVerify = pushUlt ? await verifyRepoPush({ repo: 'en_ult', stagingBranch, since: pushStartTime }) : { success: true };
+        const ustVerify = pushUst ? await verifyRepoPush({ repo: 'en_ust', stagingBranch, since: pushStartTime }) : { success: true };
 
-        if (!ultVerify.success) {
+        if (pushUlt && !ultVerify.success) {
           await status(`Repo verify FAILED (ULT) for ${book} ${chData.ch}: ${ultVerify.details}`);
           chapterFailed = true;
         }
-        if (!ustVerify.success) {
+        if (pushUst && !ustVerify.success) {
           await status(`Repo verify FAILED (UST) for ${book} ${chData.ch}: ${ustVerify.details}`);
           chapterFailed = true;
         }
-        if (ultVerify.success && ustVerify.success) await status(`Repo verify OK for ${book} ${chData.ch}: ULT and UST merged to master`);
+        const pushedTypes = [pushUlt && 'ULT', pushUst && 'UST'].filter(Boolean).join(' and ');
+        if (!chapterFailed) await status(`Repo verify OK for ${book} ${chData.ch}: ${pushedTypes} merged to master`);
       }
 
       if (chapterFailed) {
@@ -1025,12 +1043,13 @@ async function generatePipeline(route, message) {
   }
 
   // Final message
-  if (!isFileResponse && success > 0) {
+  if (!isFileResponse && !noAlign && success > 0) {
     const rangeLabel = hasVerseRange
       ? `${book} ${start}:${verseStart}-${verseEnd}`
       : (start === end ? `${book} ${start}` : `${book} ${start}\u2013${end}`);
+    const repoList = [contentTypes.includes('ult') && 'en_ult', contentTypes.includes('ust') && 'en_ust'].filter(Boolean).join(' and ');
     await reply(
-      `Content for **${rangeLabel}** pushed to master in en_ult and en_ust.` +
+      `Content for **${rangeLabel}** pushed to master in ${repoList}.` +
       (fail > 0 ? `\n(${fail} chapter(s) had errors \u2014 check admin DMs for details.)` : '') +
       `\nYou may need to refresh the tcCreate or gatewayEdit page to see the new content.`
     );
