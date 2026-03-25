@@ -19,6 +19,7 @@ const { recordMetrics, getCumulativeTokens, recordRunSummary } = require('./usag
 const { door43Push, checkConflictingBranches, REPO_MAP, getRepoFilename } = require('./door43-push');
 const { setPendingMerge } = require('./pending-merges');
 const { getCheckpoint, setCheckpoint, clearCheckpoint } = require('./pipeline-checkpoints');
+const { buildGenerateContext, cleanupPipelineDir } = require('./pipeline-context');
 
 const LOG_DIR = path.resolve(__dirname, '../logs');
 const REQUIRED_INITIAL_PIPELINE_FILES = [
@@ -655,6 +656,25 @@ async function generatePipeline(route, message) {
     // --- Non-file-response path: Phase 1 \u2014 align and collect results ---
 
     // Step 2: align-all-parallel
+    // Build pipeline context so alignment uses the generated ULT/UST, not Door43 master
+    let genContextPath = null;
+    let genPipeDir = null;
+    try {
+      const genCtx = buildGenerateContext({
+        book,
+        chapter: ch,
+        ultPath: ultRel,
+        ustPath: ustRel || undefined,
+        verseStart: hasVerseRange ? verseStart : undefined,
+        verseEnd: hasVerseRange ? verseEnd : undefined,
+      });
+      genPipeDir = genCtx.dirPath;
+      genContextPath = genCtx.contextPath;
+      console.log(`[generate] Pipeline context for alignment: ${genContextPath}`);
+    } catch (err) {
+      console.warn(`[generate] Failed to build pipeline context (non-fatal): ${err.message}`);
+    }
+    const genCtxFlag = genContextPath ? ` --context ${genContextPath}` : '';
     await status(`Running **align-all-parallel** for ${book} ${ch}...`);
     setCheckpoint(checkpointRef, {
       state: 'running',
@@ -676,7 +696,7 @@ async function generatePipeline(route, message) {
       const alignTimeout = calcSkillTimeout(book, ch, 2);
       const alignRef = hasVerseRange ? `${book} ${ch}:${verseStart}-${verseEnd}` : `${book} ${ch}`;
       const alignResult = await runClaude({
-        prompt: alignRef,
+        prompt: `${alignRef}${genCtxFlag}`,
         cwd: CSKILLBP_DIR,
         model,
         betas,
@@ -823,6 +843,13 @@ async function generatePipeline(route, message) {
       current: { chapter: ch, status: 'chapter_succeeded' },
       resume: null,
     });
+
+    // Clean up pipeline working directory
+    if (genPipeDir) {
+      cleanupPipelineDir(genPipeDir);
+      genPipeDir = null;
+      genContextPath = null;
+    }
   }
 
   if (abortForOutage) {

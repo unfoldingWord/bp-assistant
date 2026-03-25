@@ -161,6 +161,12 @@ async function main() {
 
 startMcpServer();
 
+// Clean up stale pipeline working directories from crashed runs
+try {
+  const { cleanupStalePipelineDirs } = require('./pipeline-context');
+  cleanupStalePipelineDirs();
+} catch (_) { /* non-fatal */ }
+
 process.on('unhandledRejection', (reason) => {
   console.error('[bot] Unhandled promise rejection:', reason);
 });

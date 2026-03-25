@@ -1,0 +1,276 @@
+// pipeline-context.js — Per-chapter working directory and context manifest
+//
+// Eliminates stale file bugs by making the pipeline runner the single owner
+// of all source data. Each chapter gets a working directory with a context.json
+// manifest that skills read for their inputs.
+
+const fs = require('fs');
+const path = require('path');
+const { fetchDoor43 } = require('./workspace-tools/fetch-tools');
+const { readUsfmChapter } = require('./workspace-tools/usfm-tools');
+
+const CSKILLBP_DIR = process.env.CSKILLBP_DIR || path.resolve(__dirname, '../../workspace');
+
+// --- Book number map (for hebrew bible path) ---
+
+const BOOK_NUMBERS = {
+  GEN: '01', EXO: '02', LEV: '03', NUM: '04', DEU: '05',
+  JOS: '06', JDG: '07', RUT: '08', '1SA': '09', '2SA': '10',
+  '1KI': '11', '2KI': '12', '1CH': '13', '2CH': '14', EZR: '15',
+  NEH: '16', EST: '17', JOB: '18', PSA: '19', PRO: '20',
+  ECC: '21', SNG: '22', ISA: '23', JER: '24', LAM: '25',
+  EZK: '26', DAN: '27', HOS: '28', JOL: '29', AMO: '30',
+  OBA: '31', JON: '32', MIC: '33', NAM: '34', HAB: '35',
+  ZEP: '36', HAG: '37', ZEC: '38', MAL: '39',
+  MAT: '41', MRK: '42', LUK: '43', JHN: '44', ACT: '45',
+  ROM: '46', '1CO': '47', '2CO': '48', GAL: '49', EPH: '50',
+  PHP: '51', COL: '52', '1TH': '53', '2TH': '54', '1TI': '55',
+  '2TI': '56', TIT: '57', PHM: '58', HEB: '59', JAS: '60',
+  '1PE': '61', '2PE': '62', '1JN': '63', '2JN': '64', '3JN': '65',
+  JUD: '66', REV: '67',
+};
+
+/**
+ * Build the pipeline directory name for a chapter.
+ * PSA uses 3-digit padding, all others use 2-digit.
+ */
+function buildPipeDirName(book, chapter, verseStart, verseEnd) {
+  const width = book.toUpperCase() === 'PSA' ? 3 : 2;
+  const ch = String(chapter).padStart(width, '0');
+  const base = `${book.toUpperCase()}-${ch}`;
+  if (verseStart != null && verseEnd != null) {
+    return `${base}-v${verseStart}-${verseEnd}`;
+  }
+  return base;
+}
+
+/**
+ * Create a per-chapter pipeline working directory.
+ * Returns the path relative to CSKILLBP_DIR.
+ */
+function createPipelineDir({ book, chapter, verseStart, verseEnd }) {
+  const dirName = buildPipeDirName(book, chapter, verseStart, verseEnd);
+  const relPath = `tmp/pipeline/${dirName}`;
+  const absPath = path.resolve(CSKILLBP_DIR, relPath);
+  // Clean any stale directory from a previous run
+  if (fs.existsSync(absPath)) {
+    fs.rmSync(absPath, { recursive: true, force: true });
+  }
+  fs.mkdirSync(absPath, { recursive: true });
+  return relPath;
+}
+
+/**
+ * Write context.json to the pipeline directory.
+ */
+function writeContext(dirPath, contextObj) {
+  const absPath = path.resolve(CSKILLBP_DIR, dirPath, 'context.json');
+  fs.writeFileSync(absPath, JSON.stringify(contextObj, null, 2));
+}
+
+/**
+ * Read and parse context.json from a pipeline directory.
+ */
+function readContext(dirPath) {
+  const absPath = path.resolve(CSKILLBP_DIR, dirPath, 'context.json');
+  return JSON.parse(fs.readFileSync(absPath, 'utf8'));
+}
+
+/**
+ * Update the artifacts section in context.json after a skill completes.
+ */
+function updateContextArtifacts(dirPath, skillName, resolvedPath) {
+  const ctx = readContext(dirPath);
+  if (!ctx.artifacts) ctx.artifacts = {};
+  ctx.artifacts[skillName] = resolvedPath;
+  writeContext(dirPath, ctx);
+}
+
+/**
+ * Fetch a USFM file from Door43 into the pipeline directory.
+ * Returns the relative path to the fetched file.
+ */
+async function fetchSourceToDir(dirPath, { book, repo, targetFilename }) {
+  const relOutput = `${dirPath}/${targetFilename}`;
+  await fetchDoor43({ book, repo, output: relOutput });
+  return relOutput;
+}
+
+/**
+ * Extract a single chapter from a book-level USFM file and write to the pipeline dir.
+ * Returns the relative path to the extracted file.
+ */
+function extractChapterToDir(dirPath, { sourceFile, chapter, targetFilename }) {
+  const chapterContent = readUsfmChapter({ file: sourceFile, chapter });
+  if (typeof chapterContent === 'string' && chapterContent.startsWith('Error:')) {
+    throw new Error(chapterContent);
+  }
+  const relPath = `${dirPath}/${targetFilename}`;
+  const absPath = path.resolve(CSKILLBP_DIR, relPath);
+  fs.writeFileSync(absPath, chapterContent);
+  return relPath;
+}
+
+/**
+ * Clean up a pipeline working directory.
+ * Guarded to only remove directories under tmp/pipeline/.
+ */
+function cleanupPipelineDir(dirPath) {
+  if (!dirPath || !dirPath.startsWith('tmp/pipeline/')) {
+    console.warn(`[pipeline-context] Refusing to clean non-pipeline dir: ${dirPath}`);
+    return;
+  }
+  const absPath = path.resolve(CSKILLBP_DIR, dirPath);
+  if (fs.existsSync(absPath)) {
+    fs.rmSync(absPath, { recursive: true, force: true });
+  }
+}
+
+/**
+ * Clean up stale pipeline directories older than maxAgeMs.
+ * Call on bot startup to prevent disk buildup from crashed runs.
+ */
+function cleanupStalePipelineDirs(maxAgeMs = 24 * 60 * 60 * 1000) {
+  const pipelineRoot = path.resolve(CSKILLBP_DIR, 'tmp/pipeline');
+  if (!fs.existsSync(pipelineRoot)) return;
+  const now = Date.now();
+  let cleaned = 0;
+  for (const entry of fs.readdirSync(pipelineRoot)) {
+    const entryPath = path.join(pipelineRoot, entry);
+    try {
+      const stat = fs.statSync(entryPath);
+      if (stat.isDirectory() && (now - stat.mtimeMs) > maxAgeMs) {
+        fs.rmSync(entryPath, { recursive: true, force: true });
+        cleaned++;
+      }
+    } catch (_) { /* skip if stat fails */ }
+  }
+  if (cleaned > 0) {
+    console.log(`[pipeline-context] Cleaned ${cleaned} stale pipeline dir(s)`);
+  }
+}
+
+/**
+ * Build a full pipeline context for the notes pipeline.
+ * Fetches current ULT/UST from Door43 master, extracts the chapter,
+ * and writes context.json with all source paths.
+ *
+ * @param {object} opts
+ * @param {string} opts.book - 3-letter book code
+ * @param {number} opts.chapter - chapter number
+ * @param {number} [opts.verseStart] - start verse for range
+ * @param {number} [opts.verseEnd] - end verse for range
+ * @param {string} [opts.issuesPath] - resolved issues TSV path
+ * @param {string} [opts.alignedUltPath] - path to aligned ULT if it exists
+ * @returns {Promise<{dirPath: string, contextPath: string}>}
+ */
+async function buildNotesContext({ book, chapter, verseStart, verseEnd, issuesPath, alignedUltPath }) {
+  const dirPath = createPipelineDir({ book, chapter, verseStart, verseEnd });
+  const now = new Date().toISOString();
+
+  // Fetch current ULT and UST from Door43 master
+  const [ultPath, ustPath] = await Promise.all([
+    fetchSourceToDir(dirPath, { book, repo: 'en_ult', targetFilename: 'ult.usfm' }),
+    fetchSourceToDir(dirPath, { book, repo: 'en_ust', targetFilename: 'ust.usfm' }),
+  ]);
+
+  // Extract the chapter as plain text for skills that need it
+  const ultChapterPath = extractChapterToDir(dirPath, {
+    sourceFile: ultPath,
+    chapter,
+    targetFilename: 'ult_chapter.usfm',
+  });
+  const ustChapterPath = extractChapterToDir(dirPath, {
+    sourceFile: ustPath,
+    chapter,
+    targetFilename: 'ust_chapter.usfm',
+  });
+
+  // Build hebrew path
+  const bookUpper = book.toUpperCase();
+  const num = BOOK_NUMBERS[bookUpper];
+  const hebrewPath = num ? `data/hebrew_bible/${num}-${bookUpper}.usfm` : null;
+
+  const context = {
+    version: 1,
+    pipeline: 'notes',
+    book: bookUpper,
+    chapter,
+    verseStart: verseStart || null,
+    verseEnd: verseEnd || null,
+    startedAt: now,
+    sources: {
+      ult: ultChapterPath,
+      ust: ustChapterPath,
+      ultFull: ultPath,
+      ustFull: ustPath,
+      hebrew: hebrewPath,
+      ultAligned: alignedUltPath || null,
+      issues: issuesPath || null,
+    },
+    sourceOrigin: {
+      ult: { from: 'door43', repo: 'en_ult', branch: 'master', fetchedAt: now },
+      ust: { from: 'door43', repo: 'en_ust', branch: 'master', fetchedAt: now },
+    },
+    artifacts: {},
+  };
+
+  writeContext(dirPath, context);
+  return { dirPath, contextPath: `${dirPath}/context.json` };
+}
+
+/**
+ * Build a pipeline context for the generate pipeline (alignment step).
+ * Points ULT/UST to the just-generated files in output/.
+ *
+ * @param {object} opts
+ * @param {string} opts.book - 3-letter book code
+ * @param {number} opts.chapter - chapter number
+ * @param {string} opts.ultPath - path to generated ULT (relative to workspace)
+ * @param {string} [opts.ustPath] - path to generated UST
+ * @param {number} [opts.verseStart]
+ * @param {number} [opts.verseEnd]
+ * @returns {{dirPath: string, contextPath: string}}
+ */
+function buildGenerateContext({ book, chapter, ultPath, ustPath, verseStart, verseEnd }) {
+  const dirPath = createPipelineDir({ book, chapter, verseStart, verseEnd });
+  const bookUpper = book.toUpperCase();
+  const num = BOOK_NUMBERS[bookUpper];
+  const hebrewPath = num ? `data/hebrew_bible/${num}-${bookUpper}.usfm` : null;
+
+  const context = {
+    version: 1,
+    pipeline: 'generate',
+    book: bookUpper,
+    chapter,
+    verseStart: verseStart || null,
+    verseEnd: verseEnd || null,
+    startedAt: new Date().toISOString(),
+    sources: {
+      ult: ultPath,
+      ust: ustPath || null,
+      hebrew: hebrewPath,
+    },
+    sourceOrigin: {
+      ult: { from: 'pipeline', skill: 'initial-pipeline' },
+      ust: ustPath ? { from: 'pipeline', skill: 'initial-pipeline' } : null,
+    },
+    artifacts: {},
+  };
+
+  writeContext(dirPath, context);
+  return { dirPath, contextPath: `${dirPath}/context.json` };
+}
+
+module.exports = {
+  createPipelineDir,
+  writeContext,
+  readContext,
+  updateContextArtifacts,
+  fetchSourceToDir,
+  extractChapterToDir,
+  cleanupPipelineDir,
+  cleanupStalePipelineDirs,
+  buildNotesContext,
+  buildGenerateContext,
+};

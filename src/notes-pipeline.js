@@ -19,6 +19,7 @@ const { door43Push, checkConflictingBranches, REPO_MAP, getRepoFilename } = requ
 const { setPendingMerge } = require('./pending-merges');
 const { mergeTsvs } = require('./workspace-tools/tsv-tools');
 const { getCheckpoint, setCheckpoint, clearCheckpoint } = require('./pipeline-checkpoints');
+const { buildNotesContext, updateContextArtifacts, cleanupPipelineDir } = require('./pipeline-context');
 
 const LOG_DIR = path.resolve(__dirname, '../logs');
 
@@ -370,6 +371,31 @@ async function notesPipeline(route, message) {
     let failedSkill = null;
     const chapterStart = Date.now();
 
+    // --- Build pipeline context (fetch authoritative ULT/UST from Door43) ---
+    let contextPath = null;
+    let pipeDir = null;
+    try {
+      const alignedUltPath = resolved['AI-ULT']
+        ? resolved['AI-ULT'].replace(/\.usfm$/, '-aligned.usfm')
+        : null;
+      const alignedExists = alignedUltPath && fs.existsSync(path.resolve(CSKILLBP_DIR, alignedUltPath));
+      const ctxResult = await buildNotesContext({
+        book,
+        chapter: ch,
+        verseStart: hasVerseRange ? verseStart : undefined,
+        verseEnd: hasVerseRange ? verseEnd : undefined,
+        issuesPath: hasAIArtifacts ? resolved['issues TSV'] : undefined,
+        alignedUltPath: alignedExists ? alignedUltPath : undefined,
+      });
+      pipeDir = ctxResult.dirPath;
+      contextPath = ctxResult.contextPath;
+      console.log(`[notes] Pipeline context created: ${contextPath}`);
+    } catch (err) {
+      console.warn(`[notes] Failed to build pipeline context (non-fatal): ${err.message}`);
+      // Skills fall back to their existing file-discovery behavior
+    }
+    const ctxFlag = contextPath ? ` --context ${contextPath}` : '';
+
     // --- Build skill chain based on prerequisite availability ---
     const skills = [];
 
@@ -380,7 +406,7 @@ async function notesPipeline(route, message) {
 
       skills.push({
         name: 'post-edit-review',
-        prompt: `${skillRef} --issues ${issuesPath}`,
+        prompt: `${skillRef} --issues ${issuesPath}${ctxFlag}`,
         appendSystemPrompt: POST_EDIT_REVIEW_HINT,
         expectedOutput: issuesPath,
         skipPreClean: true,   // expectedOutput is also the input — don't delete it
@@ -395,7 +421,7 @@ async function notesPipeline(route, message) {
       const verseFlag = hasVerseRange ? ` --verses ${verseStart}-${verseEnd}` : '';
       skills.push({
         name: 'deep-issue-id',
-        prompt: `${book} ${ch}${verseFlag}`,
+        prompt: `${book} ${ch}${verseFlag}${ctxFlag}`,
         appendSystemPrompt: DEEP_ISSUE_ID_HINT,
         expectedOutput: issuesPath,
         ops: 3, // 2 analysts + challenger/merge
@@ -406,7 +432,7 @@ async function notesPipeline(route, message) {
     if (shouldRunIntro(book, ch, withIntro)) {
       skills.push({
         name: 'chapter-intro',
-        prompt: `${skillRef} --issues ${issuesPath}`,
+        prompt: `${skillRef} --issues ${issuesPath}${ctxFlag}`,
         expectedOutput: issuesPath,
         ops: 1,
       });
@@ -420,7 +446,7 @@ async function notesPipeline(route, message) {
     const tnExpectedOutput = hasVerseRange ? notesShardRel : notesChapterRel;
     skills.push({
       name: 'tn-writer',
-      prompt: `${skillRef} --issues ${issuesPath} --output ${tnExpectedOutput}`,
+      prompt: `${skillRef} --issues ${issuesPath} --output ${tnExpectedOutput}${ctxFlag}`,
       expectedOutput: tnExpectedOutput,
       ops: 1,
     });
@@ -430,7 +456,7 @@ async function notesPipeline(route, message) {
     const defaultNotesPath = hasVerseRange ? notesShardRel : notesChapterRel;
     skills.push({
       name: 'tn-quality-check',
-      prompt: `${skillRef} --notes ${defaultNotesPath}`,
+      prompt: `${skillRef} --notes ${defaultNotesPath}${ctxFlag}`,
       expectedOutput: `output/quality/${book}/${qualityTag}-quality.md`,
       appendSystemPrompt: TN_QUALITY_CHECK_HINT,
       maxTurns: 30,
@@ -844,6 +870,13 @@ async function notesPipeline(route, message) {
       current: { chapter: ch, status: 'chapter_succeeded' },
       resume: null,
     });
+
+    // Clean up pipeline working directory now that the chapter is done
+    if (pipeDir) {
+      cleanupPipelineDir(pipeDir);
+      pipeDir = null;
+      contextPath = null;
+    }
 
     // Notify user only after merge is confirmed
     if (chapterCount > 1) {
