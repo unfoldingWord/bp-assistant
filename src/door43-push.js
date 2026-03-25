@@ -6,6 +6,7 @@
 const fs = require('fs');
 const path = require('path');
 const https = require('https');
+const { execFileSync } = require('child_process');
 const git = require('isomorphic-git');
 const gitHttp = require('isomorphic-git/http/node');
 const { getVerseCount } = require('./verse-counts');
@@ -434,14 +435,37 @@ async function syncRepo(repoDir, repoName, branch, baseBranch = 'master') {
   const { token } = getConfig();
   const onAuth = token ? makeOnAuth(token) : undefined;
 
-  // Clone if missing — shallow (depth 1) since we only need the latest master tip
+  // Clone if missing — shallow (depth 1) since we only need the latest master tip.
+  // isomorphic-git aborts on repos with large ref lists (en_ust has 180KB+),
+  // so we try native git first, falling back to isomorphic-git.
   if (!fs.existsSync(path.join(repoDir, '.git'))) {
     console.log(`${LOG_PREFIX} Cloning ${repoName} (shallow, depth 1) into ${repoDir}...`);
     fs.mkdirSync(path.dirname(repoDir), { recursive: true });
-    await withTimeout(
-      git.clone({ fs, http: gitHttp, dir: repoDir, url: repoUrl, depth: 1, singleBranch: true }),
-      120000, `clone ${repoName}`
-    );
+    let cloned = false;
+    try {
+      execFileSync('git', ['clone', '--depth', '1', '--single-branch', repoUrl, repoDir],
+        { timeout: 120000, stdio: 'pipe' });
+      cloned = true;
+      console.log(`${LOG_PREFIX} Cloned ${repoName} via native git`);
+    } catch (nativeErr) {
+      console.warn(`${LOG_PREFIX} Native git clone failed (${nativeErr.message}), trying isomorphic-git...`);
+    }
+    if (!cloned) {
+      try {
+        await withTimeout(
+          git.clone({ fs, http: gitHttp, dir: repoDir, url: repoUrl, depth: 1, singleBranch: true }),
+          120000, `clone ${repoName}`
+        );
+      } catch (isoErr) {
+        // Clean up partial clone
+        try { fs.rmSync(repoDir, { recursive: true, force: true }); } catch {}
+        throw new Error(
+          `Clone failed for ${repoName}: ${isoErr.message}. ` +
+          `Repos with many branches may need pre-cloning on the host: ` +
+          `git clone --depth 1 --single-branch ${repoUrl} ${repoDir}`
+        );
+      }
+    }
   }
 
   // Verify remote URL points to unfoldingWord
