@@ -284,4 +284,32 @@ function createAlignedUsfm({ hebrew, mapping, source, output, chapter, verse, us
   }
 }
 
-module.exports = { extractUltEnglish, filterPsalms, curlyQuotes, checkUstPassives, createAlignedUsfm };
+/**
+ * Extract a single chapter from a book-level USFM file.
+ * Returns the file header (before first \c) plus the matching \c N block.
+ */
+function readUsfmChapter({ file, chapter }) {
+  const filePath = path.resolve(CSKILLBP_DIR, file);
+  if (!fs.existsSync(filePath)) return `Error: file not found: ${file}`;
+
+  const content = fs.readFileSync(filePath, 'utf8');
+  const ch = parseInt(chapter, 10);
+  if (isNaN(ch)) return `Error: invalid chapter number: ${chapter}`;
+
+  // Split by \c markers, preserving them (same pattern as filterPsalms)
+  const parts = content.split(/(\\c\s+\d+)/);
+  const header = parts[0]; // everything before first \c
+
+  for (let i = 1; i < parts.length; i += 2) {
+    const marker = parts[i];
+    const body = parts[i + 1] || '';
+    const m = marker.match(/\\c\s+(\d+)/);
+    if (m && parseInt(m[1], 10) === ch) {
+      return header + marker + body;
+    }
+  }
+
+  return `Error: chapter ${ch} not found in ${file}`;
+}
+
+module.exports = { extractUltEnglish, filterPsalms, curlyQuotes, checkUstPassives, createAlignedUsfm, readUsfmChapter };

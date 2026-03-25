@@ -311,6 +311,7 @@ async function generatePipeline(route, message) {
 
   // Determine model
   const model = isTestFast ? 'haiku' : undefined;
+  const betas = isTestFast ? undefined : ['context-1m-2025-08-07'];
 
   // Determine skill from route config
   const skill = route.skill || 'initial-pipeline';
@@ -421,6 +422,7 @@ async function generatePipeline(route, message) {
             prompt: skillRef,
             cwd: CSKILLBP_DIR,
             model,
+            betas,
             skill,
             tools: DEFAULT_RESTRICTED_TOOLS,
             disallowedTools: ['Bash'],
@@ -665,6 +667,7 @@ async function generatePipeline(route, message) {
         prompt: alignRef,
         cwd: CSKILLBP_DIR,
         model,
+        betas,
         skill: 'align-all-parallel',
         tools: DEFAULT_RESTRICTED_TOOLS,
         disallowedTools: ['Bash'],

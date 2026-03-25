@@ -64,6 +64,7 @@ function buildOptions({
   cwd,
   resume,
   model,
+  betas,
   allowedTools,
   tools,
   disallowedTools,
@@ -106,6 +107,9 @@ function buildOptions({
     options.resume = resume;
   }
   options.model = model || 'opus';
+  if (betas) {
+    options.betas = betas;
+  }
   if (appendSystemPrompt) {
     options.systemPrompt = appendSystemPrompt;
   }
@@ -116,6 +120,7 @@ async function runClaudeOnce({
   prompt,
   cwd,
   model,
+  betas,
   allowedTools,
   tools,
   disallowedTools,
@@ -142,6 +147,7 @@ async function runClaudeOnce({
   const options = buildOptions({
     cwd,
     model,
+    betas,
     allowedTools,
     tools,
     disallowedTools,
@@ -372,6 +378,7 @@ async function runClaudeStream({
   cwd,
   resume,
   model,
+  betas,
   allowedTools,
   tools,
   disallowedTools,
@@ -395,6 +402,7 @@ async function runClaudeStream({
     cwd,
     resume,
     model,
+    betas,
     allowedTools,
     tools,
     disallowedTools,

@@ -7,6 +7,7 @@
 const fs = require('fs');
 const path = require('path');
 const https = require('https');
+const { optimizeIssuesResolved } = require('./optimize-tools');
 
 const CSKILLBP_DIR = process.env.CSKILLBP_DIR || '/srv/bot/workspace';
 
@@ -239,7 +240,16 @@ async function fetchIssuesResolved({ force }) {
 
   fs.mkdirSync(path.dirname(filepath), { recursive: true });
   fs.writeFileSync(filepath, `# Fetched: ${today}\n${content}`);
-  return `Fetched issues_resolved.txt (${content.split('\n').length} lines)`;
+  const fetchMsg = `Fetched issues_resolved.txt (${content.split('\n').length} lines)`;
+
+  // Optimize for AI consumption after fresh fetch
+  try {
+    const optMsg = await optimizeIssuesResolved();
+    return `${fetchMsg}\n${optMsg}`;
+  } catch (err) {
+    console.warn(`[fetch-tools] Issues optimization failed (non-fatal): ${err.message}`);
+    return `${fetchMsg}\n(optimization skipped: ${err.message})`;
+  }
 }
 
 async function fetchTemplates({ sheetId, gid, output, format, force }) {

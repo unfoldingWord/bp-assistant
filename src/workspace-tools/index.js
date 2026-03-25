@@ -8,7 +8,7 @@ const {
   fetchGlossary, fetchIssuesResolved, fetchTemplates,
 } = require('./fetch-tools');
 const { splitTsv, mergeTsvs, fixTrailingNewlines } = require('./tsv-tools');
-const { extractUltEnglish, filterPsalms, curlyQuotes, checkUstPassives, createAlignedUsfm } = require('./usfm-tools');
+const { extractUltEnglish, filterPsalms, curlyQuotes, checkUstPassives, createAlignedUsfm, readUsfmChapter } = require('./usfm-tools');
 const { buildStrongsIndex, buildTnIndex, buildUstIndex } = require('./index-tools');
 const { checkTwHeadwords, compareUltUst, detectAbstractNouns } = require('./issue-tools');
 const { extractAlignmentData, fixHebrewQuotes, flagNarrowQuotes, generateIds, resolveGlQuotes, verifyAtFit, assembleNotes, prepareNotes, fixUnicodeQuotes } = require('./tn-tools');
@@ -216,6 +216,18 @@ function createWorkspaceTools(createSdkMcpServer, tool, z) {
         },
         async (args) => ({
           content: [{ type: 'text', text: createAlignedUsfm(args) }],
+        })
+      ),
+
+      tool(
+        'read_usfm_chapter',
+        'Read a single chapter from a book-level USFM file (returns header + chapter content, much smaller than the full file)',
+        {
+          file: z.string().describe('USFM file path relative to workspace (e.g. data/t4t/25-LAM.usfm)'),
+          chapter: z.number().int().describe('Chapter number to extract'),
+        },
+        async (args) => ({
+          content: [{ type: 'text', text: readUsfmChapter(args) }],
         })
       ),
 
