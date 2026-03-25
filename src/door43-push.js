@@ -434,12 +434,12 @@ async function syncRepo(repoDir, repoName, branch, baseBranch = 'master') {
   const { token } = getConfig();
   const onAuth = token ? makeOnAuth(token) : undefined;
 
-  // Clone if missing
+  // Clone if missing — shallow (depth 1) since we only need the latest master tip
   if (!fs.existsSync(path.join(repoDir, '.git'))) {
-    console.log(`${LOG_PREFIX} Cloning ${repoName} into ${repoDir}...`);
+    console.log(`${LOG_PREFIX} Cloning ${repoName} (shallow, depth 1) into ${repoDir}...`);
     fs.mkdirSync(path.dirname(repoDir), { recursive: true });
     await withTimeout(
-      git.clone({ fs, http: gitHttp, dir: repoDir, url: repoUrl, singleBranch: false }),
+      git.clone({ fs, http: gitHttp, dir: repoDir, url: repoUrl, depth: 1, singleBranch: false }),
       120000, `clone ${repoName}`
     );
   }
@@ -456,11 +456,11 @@ async function syncRepo(repoDir, repoName, branch, baseBranch = 'master') {
   await git.setConfig({ fs, dir: repoDir, path: 'user.email', value: 'bot@unfoldingword.org' });
   await git.setConfig({ fs, dir: repoDir, path: 'user.name', value: 'BW Bot' });
 
-  // Fetch latest (retry up to 3x for transient network failures)
-  console.log(`${LOG_PREFIX} Fetching origin for ${repoName}...`);
+  // Fetch latest (shallow, depth 1 — retry up to 3x for transient network failures)
+  console.log(`${LOG_PREFIX} Fetching origin for ${repoName} (depth 1)...`);
   await withRetry(
     () => withTimeout(
-      git.fetch({ fs, http: gitHttp, dir: repoDir, remote: 'origin', onAuth }),
+      git.fetch({ fs, http: gitHttp, dir: repoDir, remote: 'origin', depth: 1, onAuth }),
       60000, `fetch ${repoName}`
     ),
     { maxAttempts: 3, baseDelayMs: 3000, label: `fetch ${repoName}` }
