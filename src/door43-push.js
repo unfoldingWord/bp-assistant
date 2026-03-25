@@ -439,7 +439,7 @@ async function syncRepo(repoDir, repoName, branch, baseBranch = 'master') {
     console.log(`${LOG_PREFIX} Cloning ${repoName} (shallow, depth 1) into ${repoDir}...`);
     fs.mkdirSync(path.dirname(repoDir), { recursive: true });
     await withTimeout(
-      git.clone({ fs, http: gitHttp, dir: repoDir, url: repoUrl, depth: 1, singleBranch: false }),
+      git.clone({ fs, http: gitHttp, dir: repoDir, url: repoUrl, depth: 1, singleBranch: true }),
       120000, `clone ${repoName}`
     );
   }
@@ -460,7 +460,7 @@ async function syncRepo(repoDir, repoName, branch, baseBranch = 'master') {
   console.log(`${LOG_PREFIX} Fetching origin for ${repoName} (depth 1)...`);
   await withRetry(
     () => withTimeout(
-      git.fetch({ fs, http: gitHttp, dir: repoDir, remote: 'origin', depth: 1, onAuth }),
+      git.fetch({ fs, http: gitHttp, dir: repoDir, remote: 'origin', depth: 1, singleBranch: true, onAuth }),
       60000, `fetch ${repoName}`
     ),
     { maxAttempts: 3, baseDelayMs: 3000, label: `fetch ${repoName}` }
