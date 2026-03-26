@@ -681,6 +681,37 @@ async function generatePipeline(route, message) {
       console.warn(`[generate] Failed to build pipeline context (non-fatal): ${err.message}`);
     }
     const genCtxFlag = genContextPath ? ` --context ${genContextPath}` : '';
+    // When resuming from an align-all-parallel checkpoint, check if outputs are already complete.
+    // If so, skip re-running alignment (avoids double work after door43-push failures).
+    const vAlign = hasVerseRange ? `${book}-${ch}-vv${verseStart}-${verseEnd}` : `${book}-${ch}`;
+    if (resumeSkill === 'align-all-parallel' && ch === resumeChapter) {
+      const needUltCheck = contentTypes.includes('ult');
+      const needUstCheck = contentTypes.includes('ust');
+      const ultAlreadyDone = !needUltCheck || (() => {
+        const r = resolveOutputFile(`output/AI-ULT/${vAlign}-aligned.usfm`, book);
+        return r && fs.statSync(path.resolve(CSKILLBP_DIR, r)).size > 1000;
+      })();
+      const ustAlreadyDone = !needUstCheck || (() => {
+        const r = resolveOutputFile(`output/AI-UST/${vAlign}-aligned.usfm`, book);
+        return r && fs.statSync(path.resolve(CSKILLBP_DIR, r)).size > 1000;
+      })();
+      if (ultAlreadyDone && ustAlreadyDone) {
+        await status(`Aligned outputs already complete for ${book} ${ch} — skipping alignment re-run.`);
+        const alignedUltRel = needUltCheck ? resolveOutputFile(`output/AI-ULT/${vAlign}-aligned.usfm`, book) : null;
+        const alignedUstRel = needUstCheck ? resolveOutputFile(`output/AI-UST/${vAlign}-aligned.usfm`, book) : null;
+        if (!completedChapters.some((c) => c.ch === ch)) {
+          completedChapters.push({ ch, ultAligned: alignedUltRel, ustAligned: alignedUstRel });
+        }
+        success++;
+        setCheckpoint(checkpointRef, {
+          state: 'running', success, fail, completedChapters,
+          current: { chapter: ch, skill: 'align-all-parallel', status: 'skipped_complete' },
+          resume: null,
+        });
+        continue;
+      }
+    }
+
     await status(`Running **align-all-parallel** for ${book} ${ch}...`);
     setCheckpoint(checkpointRef, {
       state: 'running',
@@ -691,7 +722,6 @@ async function generatePipeline(route, message) {
       resume: { chapter: ch, skill: 'align-all-parallel' },
     });
     // Delete expected aligned outputs so Claude must recreate them (prevents stale-mtime false failures on resume)
-    const vAlign = hasVerseRange ? `${book}-${ch}-vv${verseStart}-${verseEnd}` : `${book}-${ch}`;
     for (const rel of [`output/AI-ULT/${vAlign}-aligned.usfm`, `output/AI-UST/${vAlign}-aligned.usfm`]) {
       const resolved = resolveOutputFile(rel, book);
       if (resolved) {
@@ -701,8 +731,9 @@ async function generatePipeline(route, message) {
     try {
       const alignTimeout = calcSkillTimeout(book, ch, 2);
       const alignRef = hasVerseRange ? `${book} ${ch}:${verseStart}-${verseEnd}` : `${book} ${ch}`;
+      const alignTypeFlags = [contentTypes.includes('ult') && '--ult', contentTypes.includes('ust') && '--ust'].filter(Boolean).join(' ');
       const alignResult = await runClaude({
-        prompt: `${alignRef}${genCtxFlag}`,
+        prompt: `${alignRef} ${alignTypeFlags}${genCtxFlag}`,
         cwd: CSKILLBP_DIR,
         model,
         betas,
