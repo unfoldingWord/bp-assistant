@@ -147,7 +147,14 @@ Content is pushed to Door43/Gitea repos via deterministic JS code -- no Claude i
 
 ## MCP server
 
-The bot runs an MCP (Model Context Protocol) server on port 3001 that exposes Bible translation reference data to Claude during pipeline execution. This includes Strong's concordance lookups, glossary data, and issue type descriptions. The server starts automatically with the bot.
+The bot runs an MCP (Model Context Protocol) server on port 3001 that exposes Bible translation reference data and USFM processing tools to Claude during pipeline execution. Key tools include:
+
+- **Reference data**: Strong's concordance, glossary, issue types, published translations
+- **USFM processing**: `create_aligned_usfm` (mapping JSON → aligned USFM), `merge_aligned_usfm` (assemble N partial files into one chapter), `read_usfm_chapter`, `curly_quotes`, `check_ust_passives`
+- **Quality**: `validate_tn_tsv`, `check_tn_quality`
+- **Index builders**: `build_strongs_index`, `build_tn_index`, `build_ust_index`
+
+The server starts automatically with the bot. Tool implementations live in `src/workspace-tools/`.
 
 ## Usage tracking
 
