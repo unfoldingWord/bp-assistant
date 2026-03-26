@@ -112,7 +112,9 @@ function findVerseBoundaries(lines, startIdx, endIdx, verseStart, verseEnd) {
 
 function countVerseMarkers(lines, startIdx, endIdx) {
   let count = 0;
-  const pat = /\\v\s+\d+(?:\s|$)/g;
+  // Match \v only at line start or after paragraph markers (\p, \q, \m, etc.)
+  // Avoids false positives from \v appearing inside \zaln alignment attributes
+  const pat = /(?:^|\\[pqmsd]\d?\s+)\\v\s+\d+(?:\s|$)/g;
   for (let i = startIdx; i < endIdx; i++) {
     const matches = lines[i].match(pat);
     if (matches) count += matches.length;
