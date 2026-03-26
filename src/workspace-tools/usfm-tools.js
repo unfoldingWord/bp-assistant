@@ -312,4 +312,52 @@ function readUsfmChapter({ file, chapter }) {
   return `Error: chapter ${ch} not found in ${file}`;
 }
 
-module.exports = { extractUltEnglish, filterPsalms, curlyQuotes, checkUstPassives, createAlignedUsfm, readUsfmChapter };
+/**
+ * Merge N partial aligned USFM files (from verse-range batches) into one full-chapter file.
+ * Takes the header + verses from part[0], then appends only the verse content from parts[1..N]
+ * (stripping each subsequent file's header up to and including the \c line).
+ */
+function mergeAlignedUsfm({ parts, output }) {
+  if (!parts || parts.length === 0) return 'Error: no parts provided';
+  if (!output) return 'Error: no output path provided';
+
+  const resolve = (p) => path.resolve(CSKILLBP_DIR, p);
+
+  // Read and validate all parts
+  const contents = [];
+  for (const p of parts) {
+    const full = resolve(p);
+    if (!fs.existsSync(full)) return `Error: part not found: ${p}`;
+    contents.push(fs.readFileSync(full, 'utf8'));
+  }
+
+  // Start with part[0] in full
+  let merged = contents[0].trimEnd();
+
+  // For subsequent parts, strip the header (everything up to and including the \c line)
+  for (let i = 1; i < contents.length; i++) {
+    const lines = contents[i].split('\n');
+    let bodyStart = 0;
+    for (let j = 0; j < lines.length; j++) {
+      if (lines[j].trim().startsWith('\\c ')) {
+        bodyStart = j + 1;
+        break;
+      }
+    }
+    const body = lines.slice(bodyStart).join('\n').trimStart();
+    if (body) merged += '\n' + body;
+  }
+
+  // Write output
+  const outFull = resolve(output);
+  fs.mkdirSync(path.dirname(outFull), { recursive: true });
+  fs.writeFileSync(outFull, merged + '\n');
+
+  // Count verses
+  const verseCount = (merged.match(/\\v \d+/g) || []).length;
+  const sizeKB = (Buffer.byteLength(merged, 'utf8') / 1024).toFixed(1);
+
+  return `Merged ${parts.length} parts → ${output} (${verseCount} verses, ${sizeKB}KB)`;
+}
+
+module.exports = { extractUltEnglish, filterPsalms, curlyQuotes, checkUstPassives, createAlignedUsfm, readUsfmChapter, mergeAlignedUsfm };

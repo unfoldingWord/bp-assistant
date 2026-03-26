@@ -8,7 +8,7 @@ const {
   fetchGlossary, fetchIssuesResolved, fetchTemplates,
 } = require('./fetch-tools');
 const { splitTsv, mergeTsvs, fixTrailingNewlines } = require('./tsv-tools');
-const { extractUltEnglish, filterPsalms, curlyQuotes, checkUstPassives, createAlignedUsfm, readUsfmChapter } = require('./usfm-tools');
+const { extractUltEnglish, filterPsalms, curlyQuotes, checkUstPassives, createAlignedUsfm, readUsfmChapter, mergeAlignedUsfm } = require('./usfm-tools');
 const { buildStrongsIndex, buildTnIndex, buildUstIndex } = require('./index-tools');
 const { checkTwHeadwords, compareUltUst, detectAbstractNouns } = require('./issue-tools');
 const { extractAlignmentData, fixHebrewQuotes, flagNarrowQuotes, generateIds, resolveGlQuotes, verifyAtFit, assembleNotes, prepareNotes, fixUnicodeQuotes } = require('./tn-tools');
@@ -228,6 +228,18 @@ function createWorkspaceTools(createSdkMcpServer, tool, z) {
         },
         async (args) => ({
           content: [{ type: 'text', text: readUsfmChapter(args) }],
+        })
+      ),
+
+      tool(
+        'merge_aligned_usfm',
+        'Merge N partial aligned USFM files (from verse-range batches) into a single full-chapter file. Use after split-batch alignment to assemble the final output.',
+        {
+          parts: z.array(z.string()).describe('Ordered array of partial USFM paths relative to workspace (e.g. ["output/AI-UST/LAM/LAM-04-v01-v11-aligned.usfm", "output/AI-UST/LAM/LAM-04-v12-v22-aligned.usfm"])'),
+          output: z.string().describe('Output path for merged file relative to workspace (e.g. output/AI-UST/LAM/LAM-04-aligned.usfm)'),
+        },
+        async (args) => ({
+          content: [{ type: 'text', text: mergeAlignedUsfm(args) }],
         })
       ),
 
