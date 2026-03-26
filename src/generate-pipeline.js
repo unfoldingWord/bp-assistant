@@ -317,7 +317,7 @@ async function generatePipeline(route, message) {
 
   // Determine model
   const model = isTestFast ? 'haiku' : undefined;
-  const betas = isTestFast ? undefined : ['context-1m-2025-08-07'];
+  const betas = undefined;
 
   // Determine skill from route config — single content type bypasses initial-pipeline
   let skill = route.skill || 'initial-pipeline';

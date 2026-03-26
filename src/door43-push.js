@@ -8,7 +8,63 @@ const path = require('path');
 const https = require('https');
 const { execFileSync } = require('child_process');
 const git = require('isomorphic-git');
-const gitHttp = require('isomorphic-git/http/node');
+const http_ = require('http');
+const https_ = require('https');
+
+// Custom HTTP handler for isomorphic-git — the default `simple-get` module
+// aborts on large repos (en_ult, en_ust) under Node v25 in Docker containers.
+// This uses native Node.js http/https which works reliably.
+async function collectBody(iter) {
+  const buffers = [];
+  if (iter && iter[Symbol.asyncIterator]) {
+    for await (const chunk of iter) buffers.push(Buffer.from(chunk));
+  } else if (Array.isArray(iter)) {
+    for (const chunk of iter) buffers.push(Buffer.from(chunk));
+  } else if (iter) {
+    buffers.push(Buffer.from(iter));
+  }
+  return buffers.length ? Buffer.concat(buffers) : null;
+}
+
+const gitHttp = {
+  async request({ url, method = 'GET', headers = {}, body }) {
+    const bodyBuf = body ? await collectBody(body) : null;
+    return new Promise((resolve, reject) => {
+      const parsed = new URL(url);
+      const mod = parsed.protocol === 'https:' ? https_ : http_;
+      const req = mod.request({
+        hostname: parsed.hostname,
+        port: parsed.port,
+        path: parsed.pathname + parsed.search,
+        method,
+        headers,
+      }, (res) => {
+        const iter = {
+          queue: [], ended: false, defer: null,
+          [Symbol.asyncIterator]() { return this; },
+          next() {
+            return new Promise((r) => {
+              if (this.queue.length > 0) return r({ value: this.queue.shift(), done: false });
+              if (this.ended) return r({ done: true });
+              this.defer = { resolve: r };
+            });
+          },
+          return() {},
+        };
+        res.on('data', (chunk) => {
+          const val = new Uint8Array(chunk);
+          if (iter.defer) { iter.defer.resolve({ value: val, done: false }); iter.defer = null; }
+          else iter.queue.push(val);
+        });
+        res.on('end', () => { iter.ended = true; if (iter.defer) { iter.defer.resolve({ done: true }); iter.defer = null; } });
+        res.on('error', reject);
+        resolve({ url: res.url || url, method, statusCode: res.statusCode, statusMessage: res.statusMessage, headers: res.headers, body: iter });
+      });
+      req.on('error', reject);
+      if (bodyBuf) req.end(bodyBuf); else req.end();
+    });
+  },
+};
 const { getVerseCount } = require('./verse-counts');
 const { insertTnRows } = require('./lib/insert-tn-rows');
 const { insertUsfmVerses } = require('./lib/insert-usfm-verses');
@@ -481,17 +537,23 @@ async function syncRepo(repoDir, repoName, branch, baseBranch = 'master') {
   await git.setConfig({ fs, dir: repoDir, path: 'user.name', value: 'BW Bot' });
 
   // Fetch latest (shallow, depth 1).
-  // Repos like en_ust have 180KB+ of refs — specify the exact ref to fetch
-  // and allow 120s (matching clone timeout) to avoid isomorphic-git choking
-  // on the ref advertisement.
+  // Uses custom HTTP handler (native https) because the default `simple-get`
+  // module aborts on large repos under Node v25 in Docker containers.
   console.log(`${LOG_PREFIX} Fetching origin/${baseBranch} for ${repoName} (depth 1)...`);
-  await withRetry(
-    () => withTimeout(
+  try {
+    await withTimeout(
       git.fetch({ fs, http: gitHttp, dir: repoDir, remote: 'origin', ref: baseBranch, depth: 1, singleBranch: true, onAuth }),
       120000, `fetch ${repoName}`
-    ),
-    { maxAttempts: 3, baseDelayMs: 3000, label: `fetch ${repoName}` }
-  );
+    );
+  } catch (fetchErr) {
+    console.warn(`${LOG_PREFIX} Fetch failed for ${repoName} (${fetchErr.message}) — deleting local clone and re-cloning fresh...`);
+    fs.rmSync(repoDir, { recursive: true, force: true });
+    await withTimeout(
+      git.clone({ fs, http: gitHttp, dir: repoDir, url: repoUrl, depth: 1, singleBranch: true, onAuth }),
+      120000, `re-clone ${repoName}`
+    );
+    console.log(`${LOG_PREFIX} Re-cloned ${repoName} fresh`);
+  }
 
   // Delete local branch if it exists (ignore errors if it doesn't)
   try {
