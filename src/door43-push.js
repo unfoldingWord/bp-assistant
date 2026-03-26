@@ -481,27 +481,17 @@ async function syncRepo(repoDir, repoName, branch, baseBranch = 'master') {
   await git.setConfig({ fs, dir: repoDir, path: 'user.name', value: 'BW Bot' });
 
   // Fetch latest (shallow, depth 1).
-  // Native git handles large ref lists (en_ust has 180KB+) much better than
-  // isomorphic-git, so try it first, falling back to isomorphic-git with retry.
-  console.log(`${LOG_PREFIX} Fetching origin for ${repoName} (depth 1)...`);
-  let fetched = false;
-  try {
-    execFileSync('git', ['fetch', 'origin', '--depth', '1'],
-      { cwd: repoDir, timeout: 60000, stdio: 'pipe' });
-    fetched = true;
-    console.log(`${LOG_PREFIX} Fetched ${repoName} via native git`);
-  } catch (nativeErr) {
-    console.warn(`${LOG_PREFIX} Native git fetch failed (${nativeErr.message}), trying isomorphic-git...`);
-  }
-  if (!fetched) {
-    await withRetry(
-      () => withTimeout(
-        git.fetch({ fs, http: gitHttp, dir: repoDir, remote: 'origin', depth: 1, singleBranch: true, onAuth }),
-        60000, `fetch ${repoName}`
-      ),
-      { maxAttempts: 3, baseDelayMs: 3000, label: `fetch ${repoName}` }
-    );
-  }
+  // Repos like en_ust have 180KB+ of refs — specify the exact ref to fetch
+  // and allow 120s (matching clone timeout) to avoid isomorphic-git choking
+  // on the ref advertisement.
+  console.log(`${LOG_PREFIX} Fetching origin/${baseBranch} for ${repoName} (depth 1)...`);
+  await withRetry(
+    () => withTimeout(
+      git.fetch({ fs, http: gitHttp, dir: repoDir, remote: 'origin', ref: baseBranch, depth: 1, singleBranch: true, onAuth }),
+      120000, `fetch ${repoName}`
+    ),
+    { maxAttempts: 3, baseDelayMs: 3000, label: `fetch ${repoName}` }
+  );
 
   // Delete local branch if it exists (ignore errors if it doesn't)
   try {
