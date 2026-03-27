@@ -101,7 +101,7 @@ function cleanupNotesArtifacts({ book, chapter, verseStart, verseEnd }) {
 
 function refreshChapterNotesFromShards(book, tag, chapterRel) {
   const shardGlob = `output/notes/${book}/${tag}-vv*.tsv`;
-  const merged = mergeTsvs({ globPattern: shardGlob, output: chapterRel });
+  const merged = mergeTsvs({ globPattern: shardGlob, output: chapterRel, noSort: true });
   if (!merged.startsWith('Merged')) return null;
   return chapterRel;
 }
