@@ -735,7 +735,7 @@ async function generatePipeline(route, message) {
       const alignResult = await runClaude({
         prompt: `${alignRef} ${alignTypeFlags}${genCtxFlag}`,
         cwd: CSKILLBP_DIR,
-        model,
+        model: model || 'sonnet',  // mechanical alignment — Sonnet suffices at lower cost
         betas,
         skill: 'align-all-parallel',
         tools: DEFAULT_RESTRICTED_TOOLS,

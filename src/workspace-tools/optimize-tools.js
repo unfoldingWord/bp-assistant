@@ -45,7 +45,7 @@ async function optimizeIssuesResolved() {
 
   const response = await client.messages.create({
     model: 'claude-sonnet-4-6',
-    max_tokens: 16000,
+    max_tokens: 32000,
     messages: [{
       role: 'user',
       content: `You are reorganizing a Bible translation team's "Issues Resolved" document for AI consumption. The source is organized chronologically by meeting date. Your job is to reorganize it by TOPIC so an AI translator can quickly find relevant decisions.

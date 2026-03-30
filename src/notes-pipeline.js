@@ -410,6 +410,7 @@ async function notesPipeline(route, message) {
         appendSystemPrompt: POST_EDIT_REVIEW_HINT,
         expectedOutput: issuesPath,
         skipPreClean: true,   // expectedOutput is also the input — don't delete it
+        model: 'sonnet',      // validation/reconciliation — Sonnet suffices at lower cost
         ops: 1,
       });
     } else {
