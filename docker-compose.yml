@@ -33,7 +33,6 @@ services:
       - zulip_api_key
     networks:
       - work-net
-      - home-net
     security_opt:
       - no-new-privileges:true
     cap_drop:
@@ -64,6 +63,4 @@ volumes:
 
 networks:
   work-net:
-    external: true
-  home-net:
     external: true
