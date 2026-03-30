@@ -107,7 +107,7 @@ function refreshChapterNotesFromShards(book, tag, chapterRel) {
 }
 
 function isUsageLimitError(text) {
-  return /hit your limit|usage limit|rate limit|too many requests|429/i.test(String(text || ''));
+  return /hit your limit|usage limit|rate limit|too many requests|out of .* usage|429/i.test(String(text || ''));
 }
 
 function chicagoIsoFromUtcDate(date) {
@@ -1000,7 +1000,10 @@ async function notesPipeline(route, message) {
   });
 
   await status(`Notes pipeline complete for **${rangeLabel}** in ${totalDuration}s \u2014 ${totalSuccess} ok, ${totalFail} failed.`);
-  clearCheckpoint(checkpointRef);
+  // Only clear checkpoint when all chapters succeeded; keep it for resume on failures
+  if (totalFail === 0) {
+    clearCheckpoint(checkpointRef);
+  }
 }
 
 module.exports = { notesPipeline };
