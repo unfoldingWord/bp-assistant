@@ -328,6 +328,9 @@ async function notesPipeline(route, message) {
   fetch('http://localhost:7282/ingest/190f0e90-444d-4921-920d-f208e86f8cb3',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'7de6a4'},body:JSON.stringify({sessionId:'7de6a4',runId:debugRunId,hypothesisId:'H4',location:'notes-pipeline.js:resume-gate',message:'checkpoint and resume decision',data:{scope:{book,startChapter,endChapter,verseStart:verseStart??null,verseEnd:verseEnd??null},fresh,checkpointState:existingCheckpoint?.state||null,resume:existingCheckpoint?.resume||null,canResumeFromCheckpoint},timestamp:Date.now()})}).catch(()=>{});
   // #endregion
   if (!fresh && canResumeFromCheckpoint && resumeChapter >= startChapter) {
+    // The resume chapter was counted as failed in the previous run; undo that
+    // so it isn't double-counted if it succeeds this time.
+    if (totalFail > 0) totalFail--;
     await status(`Resuming notes from checkpoint at **${book} ${resumeChapter}** (${resumeSkill || 'chapter start'}).`);
     await reply(`Resuming notes run for **${rangeLabel}** from **${book} ${resumeChapter}** (${resumeSkill || 'chapter start'}).`);
   } else {
