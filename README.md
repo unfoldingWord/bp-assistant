@@ -38,7 +38,6 @@ echo -n "your-email" > /srv/bot/config/secrets/zulip_email
 # 3. Create external Docker resources
 docker volume create bot_claude-config
 docker network create work-net   # if not already present
-docker network create home-net   # if not already present
 
 # 4. Build and run
 docker compose up -d
