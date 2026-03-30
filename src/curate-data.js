@@ -17,17 +17,10 @@ const DATA_DIR = path.join(WORKSPACE, 'data');
 const CACHE_DIR = path.join(DATA_DIR, 'cache');
 const MANIFEST_PATH = path.join(CACHE_DIR, 'published_manifest.json');
 
-// usfm-js lives in the workspace's scripts package
-const USFM_MODULES = path.join(WORKSPACE, '.claude', 'skills', 'utilities', 'scripts', 'usfm', 'node_modules');
+// usfm-js is an app dependency (installed via npm, baked into Docker image)
 let usfm;
 function getUsfm() {
-  if (!usfm) {
-    try {
-      usfm = require(path.join(USFM_MODULES, 'usfm-js'));
-    } catch (err) {
-      throw new Error('usfm-js not installed. Run npm install in ' + path.dirname(USFM_MODULES));
-    }
-  }
+  if (!usfm) usfm = require('usfm-js');
   return usfm;
 }
 

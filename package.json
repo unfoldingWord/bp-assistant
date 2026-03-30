@@ -17,6 +17,7 @@
     "ccusage": "^18.0.10",
     "dotenv": "^17.2.4",
     "isomorphic-git": "^1.37.4",
+    "usfm-js": "^3.4.3",
     "zod": "^4.0.0",
     "zulip-js": "^2.1.0"
   }
