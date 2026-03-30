@@ -334,6 +334,19 @@ function isResumeStatusCommand(content) {
   return t === 'status resume' || t === 'resume status' || t === 'operator status';
 }
 
+function isCurateCommand(content) {
+  const t = String(content || '').trim().toLowerCase();
+  return /^(update\s+data|curate\s+data|update\s+published|setup\s+data)/.test(t);
+}
+
+function parseCurateCommand(content) {
+  const t = String(content || '').trim().toLowerCase();
+  const force = t.includes('force') || t.includes('setup');
+  // "update data check" / "curate data fetch-door43" / "setup data"
+  const stepMatch = t.match(/\b(check|setup|fetch-door43|fetch-google|extract-english|resolve-quotes|build-indexes)\b/);
+  return { step: stepMatch ? stepMatch[1] : null, force };
+}
+
 function isResumeCommand(content) {
   const cleaned = String(content || '').replace(/^@\*\*[^*]+\*\*\s*/, '').trim();
   return /^\s*resume\s*$/i.test(cleaned);
@@ -648,6 +661,25 @@ async function routeMessage(message) {
         message.sender_id,
         `Paused checkpoints (${paused.length}):\n${lines.join('\n')}`
       );
+      return;
+    }
+    // ── Admin DM: update published data ─────────────────────────────────
+    if (isCurateCommand(message.content)) {
+      const { curatePublishedData } = require('./curate-data');
+      const parsed = parseCurateCommand(message.content);
+      await sendDM(message.sender_id, 'Starting data curation' + (parsed.step ? ' (step: ' + parsed.step + ')' : '') + (parsed.force ? ' [force]' : '') + '...');
+      try {
+        const result = await curatePublishedData({
+          step: parsed.step,
+          force: parsed.force,
+          onProgress: null, // progress goes to console logs
+        });
+        const summary = result.messages.slice(-5).join('\n');
+        await sendDM(message.sender_id, 'Curation complete.\n' + summary);
+      } catch (err) {
+        console.error('[router] Curation failed:', err);
+        await sendDM(message.sender_id, 'Curation failed: ' + err.message);
+      }
       return;
     }
   } else {
