@@ -509,4 +509,80 @@ function fixUnicodeQuotes({ tsvFile, hebrewUsfm, output }) {
   return result.join('\n');
 }
 
-module.exports = { extractAlignmentData, fixHebrewQuotes, flagNarrowQuotes, generateIds, resolveGlQuotes, verifyAtFit, assembleNotes, prepareNotes, fixUnicodeQuotes };
+/**
+ * Verify bold text in notes matches ULT verse exactly.
+ * Strips bold markers from any **word** that doesn't appear as-is in the ULT.
+ * Operates on assembled TSV (post-assembly, alongside curly_quotes / fix_unicode).
+ */
+function verifyBoldMatches({ tsvFile, ultUsfm, output }) {
+  const tsvPath = path.resolve(CSKILLBP_DIR, tsvFile);
+  const tsvContent = fs.readFileSync(tsvPath, 'utf8');
+
+  // Parse ULT verses
+  const ultVerses = {};
+  if (ultUsfm) {
+    const ultPath = path.resolve(CSKILLBP_DIR, ultUsfm);
+    if (fs.existsSync(ultPath)) {
+      const text = fs.readFileSync(ultPath, 'utf8');
+      let ch = 0;
+      for (const l of text.split('\n')) {
+        const cm = l.trim().match(/^\\c\s+(\d+)/);
+        if (cm) { ch = parseInt(cm[1], 10); continue; }
+        const vm = l.trim().match(/^\\v\s+(\d+[-\d]*)\s*(.*)/);
+        if (vm) {
+          let txt = vm[2] || '';
+          txt = txt.replace(/\\zaln-[se][^*]*\*/g, '').replace(/\\w\s+([^|]*?)\|[^\\]*?\\w\*/g, '$1')
+            .replace(/\\[a-z]+\d?\s+/g, ' ').replace(/\\[a-z]+\d?\*/g, '').replace(/\s+/g, ' ').trim();
+          ultVerses[`${ch}:${vm[1].split('-')[0]}`] = txt;
+        }
+      }
+    }
+  }
+
+  const lines = tsvContent.split('\n');
+  const header = lines[0];
+  const cols0 = header.split('\t');
+  const noteIdx = cols0.indexOf('Note');
+  const refIdx = cols0.indexOf('Reference');
+  if (noteIdx === -1 || refIdx === -1) return 'ERROR: TSV missing Note or Reference column';
+
+  let stripped = 0;
+  const log = [];
+
+  for (let i = 1; i < lines.length; i++) {
+    if (!lines[i].trim()) continue;
+    const cols = lines[i].split('\t');
+    if (cols.length <= noteIdx) continue;
+
+    const ref = cols[refIdx];
+    const ult = ultVerses[ref] || '';
+    if (!ult) continue;
+
+    let note = cols[noteIdx];
+    let changed = false;
+
+    note = note.replace(/\*\*([^*]+)\*\*/g, (match, boldText) => {
+      if (ult.includes(boldText)) return match; // exact match, keep bold
+      stripped++;
+      changed = true;
+      log.push(`${ref}: stripped bold from "${boldText}"`);
+      return boldText; // remove ** markers
+    });
+
+    if (changed) {
+      cols[noteIdx] = note;
+      lines[i] = cols.join('\t');
+    }
+  }
+
+  const outPath = output ? path.resolve(CSKILLBP_DIR, output) : tsvPath;
+  fs.mkdirSync(path.dirname(outPath), { recursive: true });
+  fs.writeFileSync(outPath, lines.join('\n'));
+
+  const result = [`Bold check: stripped ${stripped} non-matching bold(s) in ${path.basename(tsvFile)}`];
+  if (log.length) result.push(log.join('\n'));
+  result.push(outPath);
+  return result.join('\n');
+}
+
+module.exports = { extractAlignmentData, fixHebrewQuotes, flagNarrowQuotes, generateIds, resolveGlQuotes, verifyAtFit, assembleNotes, prepareNotes, fixUnicodeQuotes, verifyBoldMatches };

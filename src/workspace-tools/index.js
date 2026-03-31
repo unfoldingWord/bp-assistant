@@ -11,7 +11,7 @@ const { splitTsv, mergeTsvs, fixTrailingNewlines } = require('./tsv-tools');
 const { extractUltEnglish, filterPsalms, curlyQuotes, checkUstPassives, createAlignedUsfm, readUsfmChapter, mergeAlignedUsfm } = require('./usfm-tools');
 const { buildStrongsIndex, buildTnIndex, buildUstIndex } = require('./index-tools');
 const { checkTwHeadwords, compareUltUst, detectAbstractNouns } = require('./issue-tools');
-const { extractAlignmentData, fixHebrewQuotes, flagNarrowQuotes, generateIds, resolveGlQuotes, verifyAtFit, assembleNotes, prepareNotes, fixUnicodeQuotes } = require('./tn-tools');
+const { extractAlignmentData, fixHebrewQuotes, flagNarrowQuotes, generateIds, resolveGlQuotes, verifyAtFit, assembleNotes, prepareNotes, fixUnicodeQuotes, verifyBoldMatches } = require('./tn-tools');
 const { validateTnTsv, checkTnQuality } = require('./quality-tools');
 const { giteaPr, prepareCompare, prepareTq, verifyTq, appendQuickref } = require('./misc-tools');
 
@@ -300,6 +300,11 @@ function createWorkspaceTools(createSdkMcpServer, tool, z) {
         hebrewUsfm: z.string().optional().describe('Hebrew USFM path (auto-detected from book code if omitted)'),
         output: z.string().optional().describe('Output path (defaults to in-place overwrite)'),
       }, async (args) => ({ content: [{ type: 'text', text: fixUnicodeQuotes(args) }] })),
+      tool('verify_bold_matches', 'Strip bold markers from note text where the bolded word does not exactly match the ULT verse (post-assembly)', {
+        tsvFile: z.string().describe('TN TSV file path'),
+        ultUsfm: z.string().describe('Plain ULT USFM file path for verse text lookup'),
+        output: z.string().optional().describe('Output path (defaults to in-place overwrite)'),
+      }, async (args) => ({ content: [{ type: 'text', text: verifyBoldMatches(args) }] })),
 
       // --- Quality checks ---
       tool('validate_tn_tsv', 'Validate TN TSV against Door43 CI rules (checks 3-13)', {
