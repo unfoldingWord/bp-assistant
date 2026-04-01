@@ -243,7 +243,7 @@ function assembleNotes({ preparedJson, generatedJson, output }) {
     const noteText = item.id ? generated[item.id] : generated[String(item.index)];
     if (!noteText) { missing.push(item.id || `index:${item.index}`); continue; }
     const quote = item.orig_quote || '';
-    const note = noteText.replace(/\.\.\./g, '\u2026');
+    const note = noteText.replace(/\.\.\./g, '\u2026').replace(/<br\s*\/?>/gi, '').trim();
     const sref = item.sref ? `rc://*/ta/man/translate/${item.sref}` : '';
     rows.push({ ref: item.reference, id: item.id, tags: '', sref, quote, occurrence: quote ? '1' : '', note, _rk: refKey(item.reference), _ik: intraKey(item) });
   }

@@ -84,6 +84,12 @@ function validateTnTsv({ file, checks, maxErrors }) {
       }
     }
 
+    // Check 8b: HTML tags in Note column
+    if (enabledChecks.has(8)) {
+      const noteCol = cols[6] || '';
+      if (/<br\s*\/?>/i.test(noteCol)) addError(8, lineNum, ref, id, 'HTML <br> tag in Note column');
+    }
+
     // Check 9: Occurrence
     if (enabledChecks.has(9)) {
       const occ = cols[5] || '';
