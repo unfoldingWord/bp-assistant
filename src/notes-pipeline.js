@@ -34,9 +34,8 @@ const DEEP_ISSUE_ID_HINT =
   'Do NOT output text without a tool call or the session will end prematurely.';
 
 const TN_QUALITY_CHECK_HINT =
-  'Run the MCP mechanical checks (fix_trailing_newlines, check_tn_quality) and write the quality report. ' +
-  'Do NOT read the ULT, UST, or notes files for manual semantic review — the mechanical checks cover what matters. ' +
-  'Keep the conversation short: run checks, fix any auto-fixable issues, write the report, done.';
+  'Run the MCP mechanical checks (fix_trailing_newlines, check_tn_quality), then do the full semantic review (Steps 3-4), and write the quality report. ' +
+  'Keep the conversation short: run checks, fix issues, write the report, done.';
 
 // Ranges where the chapter intro is written by the human editor — skip automatically.
 // PSA 42-123: Books 2-4 handled by Benjamin; 119-123 is a subset but listed explicitly.
