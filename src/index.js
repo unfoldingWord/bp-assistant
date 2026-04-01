@@ -6,6 +6,7 @@ const { ensureFreshToken } = require('./auth-refresh');
 const { getAllPendingMerges } = require('./pending-merges');
 const { resumeInsertion } = require('./insertion-resume');
 const { verifyDcsToken } = require('./repo-verify');
+const { startResourceMonitor } = require('./resource-monitor');
 
 let myUserId = null;
 
@@ -160,6 +161,9 @@ async function main() {
 }
 
 startMcpServer();
+
+const METRICS_FILE = require('path').resolve(__dirname, '../data/metrics/usage.jsonl');
+startResourceMonitor(METRICS_FILE);
 
 // Clean up stale pipeline working directories from crashed runs
 try {
