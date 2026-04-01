@@ -400,7 +400,7 @@ function createMcpServer() {
 // ---------------------------------------------------------------------------
 
 function startMcpServer() {
-  const token = readSecret('bt_mcp_api_token');
+  const token = readSecret('bt_mcp_api_token', 'BT_MCP_API_TOKEN');
   if (!token) {
     console.warn('[mcp] bt_mcp_api_token is missing. MCP server disabled.');
     return;
