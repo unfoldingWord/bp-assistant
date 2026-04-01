@@ -38,6 +38,13 @@ function isAuthError(err) {
  */
 async function ensureFreshToken() {
   // If using a long-lived setup token, the SDK handles auth directly.
+  // Check secrets file first, then env var.
+  if (!process.env.CLAUDE_CODE_OAUTH_TOKEN) {
+    try {
+      const token = fs.readFileSync('/run/secrets/claude_oauth_token', 'utf8').trim();
+      if (token) process.env.CLAUDE_CODE_OAUTH_TOKEN = token;
+    } catch (_) {}
+  }
   if (process.env.CLAUDE_CODE_OAUTH_TOKEN) {
     return true;
   }
