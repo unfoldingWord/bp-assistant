@@ -8,7 +8,7 @@ const {
   fetchGlossary, fetchIssuesResolved, fetchTemplates,
 } = require('./fetch-tools');
 const { splitTsv, mergeTsvs, fixTrailingNewlines } = require('./tsv-tools');
-const { extractUltEnglish, filterPsalms, curlyQuotes, checkUstPassives, createAlignedUsfm, readUsfmChapter, mergeAlignedUsfm } = require('./usfm-tools');
+const { extractUltEnglish, filterPsalms, curlyQuotes, checkUstPassives, createAlignedUsfm, readUsfmChapter, mergeAlignedUsfm, validateAlignmentJson, validateUltBrackets, checkUltVoiceMismatch } = require('./usfm-tools');
 const { buildStrongsIndex, buildTnIndex, buildUstIndex } = require('./index-tools');
 const { checkTwHeadwords, compareUltUst, detectAbstractNouns } = require('./issue-tools');
 const { extractAlignmentData, fixHebrewQuotes, flagNarrowQuotes, generateIds, resolveGlQuotes, verifyAtFit, assembleNotes, prepareNotes, fixUnicodeQuotes, verifyBoldMatches, fillTsvIds } = require('./tn-tools');
@@ -243,6 +243,40 @@ function createWorkspaceTools(createSdkMcpServer, tool, z) {
         })
       ),
 
+      tool(
+        'validate_alignment_json',
+        'Validate alignment JSON files for ULT/UST-alignment workflow completeness. Checks required fields, sequential Hebrew indices, coverage of all Hebrew words, bracketing rules, and that every English word appears exactly once.',
+        {
+          files: z.array(z.string()).describe('Array of alignment JSON file paths relative to workspace'),
+          ust: z.boolean().optional().describe('UST mode: unaligned Hebrew indices are allowed; entries with empty hebrew_indices must have bracketed words'),
+        },
+        async (args) => ({
+          content: [{ type: 'text', text: validateAlignmentJson(args) }],
+        })
+      ),
+
+      tool(
+        'validate_ult_brackets',
+        'Cross-reference {bracketed} words in aligned ULT against Hebrew prefix Strong\'s numbers. Flags words that are bracketed (implied) but actually come from a Hebrew prefix (b:=in, d:=the, c:=and, etc.) — these should not be bracketed.',
+        {
+          alignedUsfm: z.string().describe('Aligned ULT USFM file path relative to workspace'),
+        },
+        async (args) => ({
+          content: [{ type: 'text', text: validateUltBrackets(args) }],
+        })
+      ),
+
+      tool(
+        'check_ult_voice_mismatch',
+        'Detect English passive voice constructions aligned to active Hebrew verb stems (Qal, Piel, Hiphil). Active Hebrew rendered with English passive (be + past participle) is likely a translation error.',
+        {
+          alignedUsfm: z.string().describe('Aligned ULT USFM file path relative to workspace'),
+        },
+        async (args) => ({
+          content: [{ type: 'text', text: checkUltVoiceMismatch(args) }],
+        })
+      ),
+
       // --- Index builders ---
       tool('build_strongs_index', "Build Strong's concordance index from aligned ULT USFM", {
         force: z.boolean().optional(), lookup: z.string().optional().describe("Strong's number to look up"), stats: z.boolean().optional(),
@@ -318,7 +352,7 @@ function createWorkspaceTools(createSdkMcpServer, tool, z) {
       tool('check_tn_quality', 'Run semantic quality checks on generated translation notes', {
         tsvPath: z.string().describe('Notes TSV path'), preparedJson: z.string().optional(), ultUsfm: z.string().optional(),
         ustUsfm: z.string().optional(), book: z.string().optional(), hebrewUsfm: z.string().optional(), output: z.string().optional(),
-      }, async (args) => ({ content: [{ type: 'text', text: checkTnQuality(args) }] })),
+      }, async (args) => ({ content: [{ type: 'text', text: await checkTnQuality(args) }] })),
 
       // --- Misc tools ---
       tool('gitea_pr', 'Create (and optionally merge) a PR on Door43 Gitea', {

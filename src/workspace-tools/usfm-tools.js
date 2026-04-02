@@ -360,4 +360,445 @@ function mergeAlignedUsfm({ parts, output }) {
   return `Merged ${parts.length} parts → ${output} (${verseCount} verses, ${sizeKB}KB)`;
 }
 
-module.exports = { extractUltEnglish, filterPsalms, curlyQuotes, checkUstPassives, createAlignedUsfm, readUsfmChapter, mergeAlignedUsfm };
+/**
+ * Validate alignment JSON files for the ULT/UST-alignment workflow.
+ * Port of: validate_alignment_json.py
+ */
+function validateAlignmentJson({ files, ust }) {
+  const ustMode = !!ust;
+  const results = {};
+
+  for (const relPath of files) {
+    const filePath = path.resolve(CSKILLBP_DIR, relPath);
+    const errors = [];
+
+    let data;
+    try {
+      data = JSON.parse(fs.readFileSync(filePath, 'utf8'));
+    } catch (e) {
+      results[relPath] = { pass: false, errors: [e.code === 'ENOENT' ? 'File not found' : `Invalid JSON: ${e.message}`] };
+      continue;
+    }
+
+    // Check required fields
+    for (const field of ['reference', 'hebrew_words', 'english_text', 'alignments']) {
+      if (!(field in data)) errors.push(`Missing required field: ${field}`);
+    }
+    if (errors.length) { results[relPath] = { pass: false, errors }; continue; }
+
+    // Check Hebrew word indices are sequential 0..n-1
+    const hebrewWords = data.hebrew_words;
+    for (let i = 0; i < hebrewWords.length; i++) {
+      if (hebrewWords[i].index !== i) {
+        errors.push(`Hebrew word at position ${i} has index ${hebrewWords[i].index}, expected ${i}`);
+      }
+    }
+
+    // Collect aligned indices
+    const alignedIndices = new Set();
+    for (const a of data.alignments) {
+      for (const idx of (a.hebrew_indices || [])) {
+        alignedIndices.add(idx);
+      }
+    }
+
+    // Check out-of-range indices
+    const expectedIndices = new Set([...Array(hebrewWords.length).keys()]);
+    const extra = [...alignedIndices].filter(i => !expectedIndices.has(i));
+    if (extra.length) errors.push(`Hebrew indices out of range: [${extra.sort((a, b) => a - b).join(', ')}]`);
+
+    // ULT mode: every Hebrew index must be aligned
+    if (!ustMode) {
+      const missing = [...expectedIndices].filter(i => !alignedIndices.has(i));
+      if (missing.length) errors.push(`Hebrew indices not aligned: [${missing.sort((a, b) => a - b).join(', ')}]`);
+    }
+
+    // UST mode: entries with hebrew_indices: [] must have all words bracketed
+    if (ustMode) {
+      for (let i = 0; i < data.alignments.length; i++) {
+        const a = data.alignments[i];
+        if (Array.isArray(a.hebrew_indices) && a.hebrew_indices.length === 0) {
+          for (const word of (a.english || [])) {
+            const stripped = word.replace(/[.,;:!?]+$/, '');
+            if (!(stripped.startsWith('{') && stripped.endsWith('}'))) {
+              errors.push(`Alignment ${i}: word "${word}" has hebrew_indices: [] but is not bracketed`);
+            }
+          }
+        }
+      }
+    }
+
+    // Check every English word appears exactly once across alignments
+    const hasDText = 'd_text' in data;
+
+    let engFromText, engFromAlignments;
+    if (hasDText) {
+      const dAlignments = data.alignments.filter(a => a.section === 'd');
+      const bodyAlignments = data.alignments.filter(a => a.section !== 'd');
+
+      // Validate d_text words
+      const dFromText = data.d_text.split(/\s+/);
+      const dFromAlignments = dAlignments.flatMap(a => a.english || []);
+      const dTextCounts = countWords(dFromText);
+      const dAlignCounts = countWords(dFromAlignments);
+      for (const word of new Set([...Object.keys(dTextCounts), ...Object.keys(dAlignCounts)])) {
+        const tc = dTextCounts[word] || 0;
+        const ac = dAlignCounts[word] || 0;
+        if (tc !== ac) {
+          if (ac === 0) errors.push(`d_text: Word "${word}" in d_text but not in section:d alignments`);
+          else if (tc === 0) errors.push(`d_text: Word "${word}" in section:d alignments but not in d_text`);
+          else errors.push(`d_text: Word "${word}": ${ac} in section:d alignments, ${tc} in d_text`);
+        }
+      }
+
+      engFromText = data.english_text.split(/\s+/);
+      engFromAlignments = bodyAlignments.flatMap(a => a.english || []);
+    } else {
+      engFromText = data.english_text.split(/\s+/);
+      engFromAlignments = data.alignments.flatMap(a => a.english || []);
+    }
+
+    const textCounts = countWords(engFromText);
+    const alignCounts = countWords(engFromAlignments);
+    for (const word of new Set([...Object.keys(textCounts), ...Object.keys(alignCounts)])) {
+      const tc = textCounts[word] || 0;
+      const ac = alignCounts[word] || 0;
+      if (tc !== ac) {
+        if (ac === 0) errors.push(`Word "${word}" in english_text but not in alignments`);
+        else if (tc === 0) errors.push(`Word "${word}" in alignments but not in english_text`);
+        else errors.push(`Word "${word}": ${ac} in alignments, ${tc} in english_text`);
+      }
+    }
+
+    results[relPath] = { pass: errors.length === 0, errors };
+  }
+
+  // Format output
+  const lines = [];
+  let allPass = true;
+  for (const [relPath, result] of Object.entries(results)) {
+    const name = path.basename(relPath);
+    if (result.pass) {
+      lines.push(`OK    ${name}`);
+    } else {
+      allPass = false;
+      lines.push(`FAIL  ${name}`);
+      for (const e of result.errors) lines.push(`      ${e}`);
+    }
+  }
+  const fileCount = Object.keys(results).length;
+  if (allPass) {
+    lines.push(`\nAll ${fileCount} file(s) passed.`);
+  } else {
+    lines.push(`\nValidation errors found.`);
+  }
+  return lines.join('\n');
+}
+
+function countWords(words) {
+  const counts = {};
+  for (const w of words) {
+    if (w) counts[w] = (counts[w] || 0) + 1;
+  }
+  return counts;
+}
+
+/**
+ * Validate bracketed words in aligned ULT against Hebrew prefix Strong's numbers.
+ * Port of: validate_ult_brackets.py
+ */
+function validateUltBrackets({ alignedUsfm }) {
+  const filePath = path.resolve(CSKILLBP_DIR, alignedUsfm);
+  if (!fs.existsSync(filePath)) return `Error: file not found: ${alignedUsfm}`;
+
+  const content = fs.readFileSync(filePath, 'utf8');
+
+  // Hebrew prefix -> expected English translations
+  const PREFIX_TRANSLATIONS = {
+    b: ['in', 'by', 'with', 'at', 'among', 'on', 'against', 'through', 'when', 'while'],
+    d: ['the'],
+    c: ['and', 'but', 'or', 'then', 'so', 'now', 'yet'],
+    k: ['like', 'as'],
+    l: ['to', 'for', 'of', 'belonging'],
+    m: ['from', 'out', 'than'],
+  };
+
+  let currentChapter = null;
+  let currentVerse = null;
+  const flagged = [];
+
+  const lines = content.split('\n');
+  for (let lineNum = 0; lineNum < lines.length; lineNum++) {
+    const line = lines[lineNum];
+
+    const chMatch = line.match(/^\\c\s+(\d+)/);
+    if (chMatch) { currentChapter = chMatch[1]; currentVerse = null; continue; }
+
+    const vMatch = line.match(/\\v\s+(\d+[-\d]*|front)/);
+    if (vMatch && currentChapter) currentVerse = vMatch[1];
+
+    if (currentVerse === null) continue;
+
+    // Walk the line parsing zaln-s milestones and \w markers
+    let pos = 0;
+    let activeStrong = null;
+
+    while (pos < line.length) {
+      // zaln-s milestone
+      const zalnMatch = line.slice(pos).match(/^\\zaln-s\s+\|([^\\]*?)\\?\*/);
+      if (zalnMatch) {
+        const attrs = zalnMatch[1];
+        const sm = attrs.match(/x-strong="([^"]*)"/);
+        if (sm) activeStrong = sm[1];
+        pos += zalnMatch[0].length;
+        continue;
+      }
+
+      // \w word marker
+      const wMatch = line.slice(pos).match(/^\\w\s+([^|\\]+)\|[^\\]*\\w\*/);
+      if (wMatch) {
+        const word = wMatch[1].trim();
+        if (word.startsWith('{') && word.endsWith('}') && activeStrong) {
+          // Check if Strong's has a prefix
+          const prefixMatch = activeStrong.match(/^([a-z]):(.+)/);
+          if (prefixMatch) {
+            const prefix = prefixMatch[1];
+            const expectedWords = PREFIX_TRANSLATIONS[prefix] || [];
+            const wordClean = word.replace(/^\{|\}$/g, '').toLowerCase();
+            if (expectedWords.includes(wordClean)) {
+              flagged.push({
+                verse_ref: `${currentChapter}:${currentVerse}`,
+                word,
+                strong: activeStrong,
+                prefix,
+                fix: `Remove brackets: ${word} -> ${wordClean}`,
+                line_num: lineNum + 1,
+              });
+            }
+          }
+        }
+        pos += wMatch[0].length;
+        continue;
+      }
+
+      // zaln-e milestone
+      const zalnEMatch = line.slice(pos).match(/^\\zaln-e\\?\*/);
+      if (zalnEMatch) {
+        activeStrong = null;
+        pos += zalnEMatch[0].length;
+        continue;
+      }
+
+      pos++;
+    }
+  }
+
+  if (!flagged.length) return `No bracket errors found in ${alignedUsfm}`;
+
+  const lines2 = [`Found ${flagged.length} bracket error(s) in ${alignedUsfm}:\n`];
+  for (const item of flagged) {
+    lines2.push(`  ${item.verse_ref}  ${item.word}  Strong's: ${item.strong}  prefix: ${item.prefix}  -> ${item.fix}`);
+  }
+  return lines2.join('\n');
+}
+
+/**
+ * Detect English passive voice aligned to active Hebrew verbs in aligned ULT USFM.
+ * Port of: check_ult_voice_mismatch.py
+ */
+function checkUltVoiceMismatch({ alignedUsfm }) {
+  const filePath = path.resolve(CSKILLBP_DIR, alignedUsfm);
+  if (!fs.existsSync(filePath)) return `Error: file not found: ${alignedUsfm}`;
+
+  const content = fs.readFileSync(filePath, 'utf8');
+
+  const PASSIVE_AUXILIARIES = new Set(['be', 'is', 'are', 'am', 'was', 'were', 'been', 'being']);
+
+  const PARTICIPLE_ENDINGS = ['ed', 'en', 'wn', 'ung', 'orn', 'oken', 'osen', 'otten', 'iven', 'aken', 'tten'];
+
+  const IRREGULAR_PARTICIPLES = new Set([
+    'been', 'done', 'gone', 'seen', 'known', 'shown', 'given', 'taken',
+    'made', 'said', 'told', 'found', 'thought', 'brought', 'bought',
+    'caught', 'taught', 'sought', 'felt', 'left', 'held', 'kept', 'slept',
+    'met', 'sent', 'spent', 'built', 'lent', 'lost', 'meant', 'heard',
+    'born', 'borne', 'worn', 'torn', 'sworn', 'chosen', 'frozen', 'spoken',
+    'broken', 'stolen', 'woken', 'written', 'hidden', 'ridden', 'driven',
+    'risen', 'forgiven', 'forgotten', 'begotten', 'bitten', 'eaten', 'beaten',
+    'shaken', 'forsaken', 'mistaken', 'undertaken', 'struck', 'stuck', 'stung',
+    'swung', 'hung', 'sung', 'rung', 'sprung', 'begun', 'run', 'won', 'spun',
+    'put', 'cut', 'shut', 'set', 'let', 'hit', 'hurt', 'cast', 'burst', 'cost',
+    'spread', 'shed', 'split', 'spit', 'quit', 'rid', 'bid', 'read', 'led',
+    'fed', 'bled', 'bred', 'sped', 'fled', 'paid', 'laid', 'called', 'filled',
+    'killed', 'named', 'blessed', 'cursed', 'gathered', 'scattered', 'covered',
+    'revealed', 'fulfilled', 'proclaimed', 'announced', 'established',
+    'justified', 'sanctified', 'glorified', 'baptized', 'circumcised',
+    'violated', 'humiliated', 'destroyed', 'consumed', 'exiled',
+  ]);
+
+  const NOT_PARTICIPLES = new Set([
+    'not', 'that', 'what', 'but', 'just', 'about', 'out', 'without',
+    'light', 'right', 'night', 'might', 'sight', 'fight', 'eight',
+    'great', 'heart', 'part', 'start', 'apart', 'art',
+    'in', 'then', 'when', 'often', 'even', 'open', 'seven', 'eleven',
+    'own', 'down', 'town', 'brown', 'grown',
+    'men', 'women', 'children', 'brethren',
+    'heaven', 'garden', 'burden', 'sudden', 'golden', 'wooden',
+    'listen', 'hasten', 'fasten', 'lessen', 'lesson',
+    'and', 'hand', 'land', 'stand', 'understand', 'command', 'demand',
+    'around', 'ground', 'sound', 'found', 'bound', 'round', 'wound',
+    'hundred', 'kindred',
+  ]);
+
+  const STATIVE_ADJECTIVES = new Set([
+    'ashamed', 'afraid', 'alone', 'afflicted', 'angry', 'anxious',
+    'aware', 'alive', 'asleep', 'awake', 'absent', 'able',
+    'blessed', 'blameless',
+    'clean', 'certain', 'content',
+    'dead', 'drunk',
+    'empty', 'evil',
+    'full', 'faithful', 'free',
+    'glad', 'good', 'great', 'guilty', 'gracious',
+    'holy', 'humble', 'hungry', 'happy',
+    'innocent', 'ill',
+    'jealous', 'just', 'joyful',
+    'kind',
+    'like', 'lost', 'low',
+    'merciful', 'mighty',
+    'naked', 'near',
+    'obedient', 'old',
+    'perfect', 'pleasant', 'poor', 'present', 'proud', 'pure',
+    'quick', 'quiet',
+    'ready', 'rich', 'righteous', 'right',
+    'sad', 'safe', 'sick', 'silent', 'sinful', 'sorry', 'strong', 'sure', 'still',
+    'true', 'troubled',
+    'unclean', 'unworthy', 'upright',
+    'weary', 'weak', 'well', 'whole', 'wicked', 'wise', 'worthy', 'wrong',
+    'young',
+  ]);
+
+  function isActiveStem(morph) {
+    const m = morph.match(/He,V([a-zA-Z])/);
+    if (!m) return false;
+    const stem = m[1];
+    if (stem === 't') return false; // Hitpael — reflexive, passive rendering ok
+    return stem === stem.toLowerCase();
+  }
+
+  function isPastParticiple(word) {
+    const w = word.toLowerCase();
+    if (STATIVE_ADJECTIVES.has(w) || NOT_PARTICIPLES.has(w)) return false;
+    if (IRREGULAR_PARTICIPLES.has(w)) return true;
+    return PARTICIPLE_ENDINGS.some(e => w.endsWith(e) && w.length > e.length + 2);
+  }
+
+  function findPassive(words) {
+    for (let i = 0; i < words.length; i++) {
+      const w = words[i].toLowerCase().replace(/[.,;:!?\u201c\u201d\u2018\u2019"'{}[\]]+/g, '');
+      if (PASSIVE_AUXILIARIES.has(w)) {
+        for (let j = i + 1; j < Math.min(i + 4, words.length); j++) {
+          const candidate = words[j].replace(/[.,;:!?\u201c\u201d\u2018\u2019"'{}[\]]+/g, '');
+          if (isPastParticiple(candidate)) {
+            return words.slice(i, j + 1).join(' ');
+          }
+        }
+      }
+    }
+    return null;
+  }
+
+  const mismatches = [];
+  let book = 'UNK';
+  const idMatch = content.match(/\\id\s+(\S+)/);
+  if (idMatch) book = idMatch[1];
+
+  let chapter = '0';
+  let verse = '0';
+  let currentRef = `${book} ${chapter}:${verse}`;
+
+  let inActiveZaln = false;
+  let activeLemma = '';
+  let activeContent = '';
+  let activeEnglish = [];
+  let zalnDepth = 0;
+
+  for (const line of content.split('\n')) {
+    const chMatch = line.match(/^\\c\s+(\d+)/);
+    if (chMatch) { chapter = chMatch[1]; currentRef = `${book} ${chapter}:${verse}`; }
+
+    const vMatch = line.match(/\\v\s+(\d+)/);
+    if (vMatch) { verse = vMatch[1]; currentRef = `${book} ${chapter}:${verse}`; }
+
+    if (inActiveZaln) {
+      const opens = (line.match(/\\zaln-s\b/g) || []).length;
+      const closes = (line.match(/\\zaln-e\\\*/g) || []).length;
+      zalnDepth += opens - closes;
+
+      const words = [...line.matchAll(/\\w\s+([^|{}\\\n]+?)\|/g)].map(m => m[1].trim());
+      activeEnglish.push(...words);
+
+      if (zalnDepth <= 0) {
+        const phrase = findPassive(activeEnglish);
+        if (phrase) {
+          mismatches.push({
+            ref: currentRef,
+            lemma: activeLemma,
+            hebrew: activeContent,
+            english_phrase: phrase,
+            english_context: activeEnglish.join(' '),
+          });
+        }
+        inActiveZaln = false;
+        activeEnglish = [];
+      }
+      continue;
+    }
+
+    // Look for a new zaln-s with an active Hebrew verb
+    const zalnMatch = line.match(/\\zaln-s\s*\|([^*]*)\\\*/);
+    if (zalnMatch) {
+      const attrs = zalnMatch[1];
+      const morphMatch = attrs.match(/x-morph="([^"]+)"/);
+      if (morphMatch && isActiveStem(morphMatch[1])) {
+        const lemmaMatch = attrs.match(/x-lemma="([^"]+)"/);
+        const contentMatch = attrs.match(/x-content="([^"]+)"/);
+        inActiveZaln = true;
+        activeLemma = lemmaMatch ? lemmaMatch[1] : '';
+        activeContent = contentMatch ? contentMatch[1] : '';
+        activeEnglish = [];
+
+        const opens = (line.match(/\\zaln-s\b/g) || []).length;
+        const closes = (line.match(/\\zaln-e\\\*/g) || []).length;
+        zalnDepth = opens - closes;
+
+        const words = [...line.matchAll(/\\w\s+([^|{}\\\n]+?)\|/g)].map(m => m[1].trim());
+        activeEnglish.push(...words);
+
+        if (zalnDepth <= 0) {
+          const phrase = findPassive(activeEnglish);
+          if (phrase) {
+            mismatches.push({
+              ref: currentRef,
+              lemma: activeLemma,
+              hebrew: activeContent,
+              english_phrase: phrase,
+              english_context: activeEnglish.join(' '),
+            });
+          }
+          inActiveZaln = false;
+          activeEnglish = [];
+        }
+      }
+    }
+  }
+
+  if (!mismatches.length) return `No voice mismatches found in ${alignedUsfm}`;
+
+  const lines3 = [`Voice mismatches in ${alignedUsfm}:`];
+  for (const m of mismatches) {
+    lines3.push(`  ${m.ref}: Hebrew ${m.hebrew} (${m.lemma}) — active stem but English "${m.english_phrase}" [context: ${m.english_context}]`);
+  }
+  lines3.push(`\nFound ${mismatches.length} mismatch(es).`);
+  return lines3.join('\n');
+}
+
+module.exports = { extractUltEnglish, filterPsalms, curlyQuotes, checkUstPassives, createAlignedUsfm, readUsfmChapter, mergeAlignedUsfm, validateAlignmentJson, validateUltBrackets, checkUltVoiceMismatch };

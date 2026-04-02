@@ -4,8 +4,16 @@
 
 const fs = require('fs');
 const path = require('path');
+const https = require('https');
 
 const CSKILLBP_DIR = process.env.CSKILLBP_DIR || '/srv/bot/workspace';
+
+// Sets used by orphaned-word checks (Check 10 / 10b)
+const CONJUNCTIONS = new Set(['and','but','so','then','or','for','yet','nor']);
+const PREPOSITIONS = new Set(['in','to','from','by','for','with','on','at','of','into','upon','about','through','against','between']);
+
+// Proper nouns that may legitimately start with uppercase mid-sentence
+const PROPER_NOUNS = new Set(['Yahweh','God','Lord','David','Israel','Jerusalem','Zion','Moses','Jacob','Abraham','Christ','Jesus','I']);
 
 // --- validate_tn_tsv ---
 
@@ -128,9 +136,115 @@ function validateTnTsv({ file, checks, maxErrors }) {
   }, null, 2);
 }
 
+// --- check_tn_quality helpers ---
+
+/**
+ * Strip {supply} braces from text (e.g. from gl_quote).
+ */
+function stripBraces(text) {
+  return text.replace(/\{[^}]*\}/g, '').trim();
+}
+
+/**
+ * Extract AT texts from after "Alternate translation:" lines.
+ * Returns array of strings (contents of [...] brackets).
+ */
+function extractAts(noteText) {
+  const ats = [];
+  const atLineRe = /Alternate translation:\s*(.*?)(?=\n|$)/g;
+  let m;
+  while ((m = atLineRe.exec(noteText)) !== null) {
+    const atLine = m[1];
+    const bracketRe = /\[([^\]]+)\]/g;
+    let bm;
+    while ((bm = bracketRe.exec(atLine)) !== null) {
+      ats.push(bm[1]);
+    }
+  }
+  return ats;
+}
+
+/**
+ * Parse Hebrew USFM into a map of { "ch:vs": [wordToken, ...] }.
+ * Extracts \w word|...\w* tokens by verse.
+ */
+function parseHebrewVerseWords(hebrewUsfmPath) {
+  if (!hebrewUsfmPath) return {};
+  const full = path.resolve(CSKILLBP_DIR, hebrewUsfmPath);
+  if (!fs.existsSync(full)) return {};
+  const text = fs.readFileSync(full, 'utf8');
+  const verseWords = {};
+  let ch = 0;
+  let curVerse = null;
+  let wordBuf = [];
+
+  function flushVerse() {
+    if (curVerse) verseWords[curVerse] = wordBuf.slice();
+  }
+
+  for (const line of text.split('\n')) {
+    const trimmed = line.trim();
+    const cm = trimmed.match(/^\\c\s+(\d+)/);
+    if (cm) {
+      flushVerse();
+      ch = parseInt(cm[1], 10);
+      curVerse = null;
+      wordBuf = [];
+      continue;
+    }
+    const vm = trimmed.match(/^\\v\s+(\d+[-\d]*)/);
+    if (vm) {
+      flushVerse();
+      curVerse = `${ch}:${vm[1].split('-')[0]}`;
+      wordBuf = [];
+    }
+    if (curVerse) {
+      const WRE = /\\w\s+([^|\\]+)\|[^\\]*?\\w\*/g;
+      let wm;
+      while ((wm = WRE.exec(trimmed)) !== null) {
+        wordBuf.push(wm[1].trim());
+      }
+    }
+  }
+  flushVerse();
+  return verseWords;
+}
+
+/**
+ * Fetch upstream TN IDs for a given book from Door43.
+ * Returns a Set of IDs on success, or null on failure.
+ */
+async function fetchUpstreamIds(book) {
+  return new Promise((resolve) => {
+    function parseIds(body) {
+      const ids = new Set();
+      for (const line of body.split('\n')) {
+        const cols = line.split('\t');
+        if (cols.length > 1 && /^[a-z][a-z0-9]{3}$/.test(cols[1])) ids.add(cols[1]);
+      }
+      return ids;
+    }
+    function fetchUrl(url, redirectsLeft) {
+      if (redirectsLeft <= 0) return resolve(null);
+      https.get(url, { timeout: 30000 }, (res) => {
+        if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+          res.resume();
+          return fetchUrl(res.headers.location, redirectsLeft - 1);
+        }
+        if (res.statusCode !== 200) { res.resume(); return resolve(null); }
+        const chunks = [];
+        res.on('data', c => chunks.push(c));
+        res.on('end', () => resolve(parseIds(Buffer.concat(chunks).toString('utf8'))));
+        res.on('error', () => resolve(null));
+      }).on('error', () => resolve(null));
+    }
+    fetchUrl(`https://git.door43.org/unfoldingWord/en_tn/raw/branch/master/tn_${book.toUpperCase()}.tsv`, 3);
+  });
+}
+
 // --- check_tn_quality ---
 
-function checkTnQuality({ tsvPath, preparedJson, ultUsfm, ustUsfm, book, hebrewUsfm, output }) {
+async function checkTnQuality({ tsvPath, preparedJson, ultUsfm, ustUsfm, book, hebrewUsfm, output }) {
   const tsv = path.resolve(CSKILLBP_DIR, tsvPath);
   const content = fs.readFileSync(tsv, 'utf8');
   const lines = content.split('\n');
@@ -180,6 +294,9 @@ function checkTnQuality({ tsvPath, preparedJson, ultUsfm, ustUsfm, book, hebrewU
   const ultVerses = parseVersesPlain(ultUsfm);
   const ustVerses = parseVersesPlain(ustUsfm);
 
+  // Parse Hebrew verse words for check 19
+  const hebrewVerseWords = parseHebrewVerseWords(hebrewUsfm);
+
   // Load translation issues for SRef validation
   const validIssues = new Set();
   const issuesFile = path.join(CSKILLBP_DIR, 'data', 'translation-issues.csv');
@@ -190,12 +307,21 @@ function checkTnQuality({ tsvPath, preparedJson, ultUsfm, ustUsfm, book, hebrewU
     }
   }
 
+  // Check 3: Fetch upstream IDs to detect collisions
+  let upstreamIds = null;
+  if (book) {
+    upstreamIds = await fetchUpstreamIds(book);
+  }
+
   const findings = [];
   const seenIds = new Set();
 
   function addFinding(row, ref, id, severity, category, message) {
     findings.push({ row, reference: ref, id, severity, category, message });
   }
+
+  // For check 20c: near-duplicate detection — collect notes by sref slug
+  const notesBySrefSlug = {};
 
   for (const n of notes) {
     // 1. ID format
@@ -205,10 +331,17 @@ function checkTnQuality({ tsvPath, preparedJson, ultUsfm, ustUsfm, book, hebrewU
     if (seenIds.has(n.id)) addFinding(n.row, n.ref, n.id, 'error', 'id_duplicate', `Duplicate ID: "${n.id}"`);
     seenIds.add(n.id);
 
-    // 4. Hebrew quote (RTL check)
-    if (n.quote) {
+    // 3. ID collision with upstream
+    if (upstreamIds && upstreamIds.has(n.id)) {
+      addFinding(n.row, n.ref, n.id, 'warning', 'id_collision', `ID "${n.id}" collides with upstream TN`);
+    }
+
+    // 4. Hebrew quote (RTL check) — empty quote is error, no RTL is error
+    if (!n.quote) {
+      addFinding(n.row, n.ref, n.id, 'error', 'empty_quote', 'Quote column is empty');
+    } else {
       const hasRtl = /[\u0590-\u05FF\u0600-\u06FF\uFB1D-\uFDFF\uFE70-\uFEFF]/.test(n.quote);
-      if (!hasRtl) addFinding(n.row, n.ref, n.id, 'warning', 'hebrew_quote', 'Quote column has no RTL characters');
+      if (!hasRtl) addFinding(n.row, n.ref, n.id, 'error', 'no_hebrew_in_quote', 'Quote column has no RTL characters');
     }
 
     // 5. AT bracket syntax
@@ -226,9 +359,35 @@ function checkTnQuality({ tsvPath, preparedJson, ultUsfm, ustUsfm, book, hebrewU
     const ustVerse = prepItem.ust_verse || ustVerses[n.ref] || '';
     const glQuote = prepItem.gl_quote || '';
 
+    // Extract ATs for this note
+    const ats = extractAts(n.note);
+
+    // 6. AT text must NOT appear verbatim in UST verse
+    if (ustVerse && ats.length) {
+      for (const at of ats) {
+        const atLower = at.toLowerCase();
+        const ustLower = ustVerse.toLowerCase();
+        if (atLower && ustLower.includes(atLower)) {
+          addFinding(n.row, n.ref, n.id, 'warning', 'at_not_ust', `AT text "${at.slice(0, 50)}" appears verbatim in UST verse`);
+          continue;
+        }
+        // Check >85% word overlap for longer ATs (>10 chars, >2 words)
+        if (at.length > 10) {
+          const atWords = atLower.split(/\s+/).filter(w => w.length > 2);
+          if (atWords.length > 2) {
+            const ustWords = new Set(ustLower.split(/\s+/));
+            const overlap = atWords.filter(w => ustWords.has(w)).length / atWords.length;
+            if (overlap > 0.85) {
+              addFinding(n.row, n.ref, n.id, 'warning', 'at_not_ust', `AT text "${at.slice(0, 50)}" has >85% word overlap with UST verse`);
+            }
+          }
+        }
+      }
+    }
+
     // 7. gl_quote in ULT
     if (glQuote && ultVerse) {
-      const cleanGlq = glQuote.replace(/\{[^}]*\}/g, '').trim();
+      const cleanGlq = stripBraces(glQuote);
       if (cleanGlq && !ultVerse.toLowerCase().includes(cleanGlq.toLowerCase())) {
         addFinding(n.row, n.ref, n.id, 'warning', 'gl_quote_not_in_ult', `gl_quote "${cleanGlq.slice(0, 50)}" not found in ULT`);
       }
@@ -248,6 +407,45 @@ function checkTnQuality({ tsvPath, preparedJson, ultUsfm, ustUsfm, book, hebrewU
       addFinding(n.row, n.ref, n.id, 'warning', 'rc_in_note', 'rc:// link found in Note (belongs in SupportReference)');
     }
 
+    // 10. Orphaned words after AT substitution into ULT
+    if (glQuote && ultVerse && ats.length) {
+      const cleanGlq = stripBraces(glQuote);
+      const ultStripped = ultVerse.replace(/\{[^}]*\}/g, '');
+      const glqIdx = ultStripped.toLowerCase().indexOf(cleanGlq.toLowerCase());
+      if (glqIdx >= 0) {
+        const simulated = ultStripped.slice(0, glqIdx) + '[AT]' + ultStripped.slice(glqIdx + cleanGlq.length);
+        const bracketPos = simulated.indexOf('[');
+        const beforeAt = simulated.slice(0, bracketPos);
+        const beforeWords = beforeAt.trim().split(/\s+/);
+        const wordBefore = beforeWords.length ? beforeWords[beforeWords.length - 1].toLowerCase().replace(/[^a-z]/g, '') : '';
+        if (wordBefore) {
+          if (CONJUNCTIONS.has(wordBefore)) {
+            addFinding(n.row, n.ref, n.id, 'warning', 'orphaned_conjunction', `Word "${wordBefore}" before AT may be orphaned conjunction`);
+          } else if (PREPOSITIONS.has(wordBefore)) {
+            const glqFirst = cleanGlq.toLowerCase().split(/\s+/)[0] || '';
+            if (glqFirst !== wordBefore) {
+              addFinding(n.row, n.ref, n.id, 'warning', 'orphaned_preposition', `Preposition "${wordBefore}" before AT may be orphaned`);
+            }
+          }
+        }
+      }
+    }
+
+    // 10b. Dropped leading conjunction
+    if (glQuote && ats.length) {
+      const cleanGlq = stripBraces(glQuote);
+      const glqFirstWord = cleanGlq.toLowerCase().split(/\s+/)[0] || '';
+      if (CONJUNCTIONS.has(glqFirstWord)) {
+        for (const at of ats) {
+          const atFirstWord = at.toLowerCase().split(/\s+/)[0] || '';
+          if (!CONJUNCTIONS.has(atFirstWord)) {
+            addFinding(n.row, n.ref, n.id, 'warning', 'dropped_conjunction', `gl_quote starts with conjunction "${glqFirstWord}" but AT does not`);
+            break;
+          }
+        }
+      }
+    }
+
     // 11. Psalms writer/author
     if (book && book.toUpperCase() === 'PSA') {
       if (/\bthe writer\b/i.test(n.note) || /\bthe author\b/i.test(n.note)) {
@@ -260,6 +458,69 @@ function checkTnQuality({ tsvPath, preparedJson, ultUsfm, ustUsfm, book, hebrewU
       addFinding(n.row, n.ref, n.id, 'warning', 'straight_quotes', 'Straight double quotes found (use curly quotes)');
     }
 
+    // 13. AT capitalization
+    if (glQuote && ultVerse && ats.length) {
+      const cleanGlq = stripBraces(glQuote);
+      const ultStripped = ultVerse.replace(/\{[^}]*\}/g, '');
+      const idx = ultStripped.toLowerCase().indexOf(cleanGlq.toLowerCase());
+      let position = 'mid_sentence';
+      if (idx === 0) {
+        position = 'verse_start';
+      } else if (idx > 0) {
+        const before = ultStripped.slice(0, idx).trimEnd();
+        if (before.length === 0) position = 'verse_start';
+        else if (before.endsWith('.')) position = 'after_period';
+      }
+      for (const at of ats) {
+        if (!at) continue;
+        const firstChar = at[0];
+        if ((position === 'verse_start' || position === 'after_period') && /[a-z]/.test(firstChar)) {
+          addFinding(n.row, n.ref, n.id, 'warning', 'at_capitalization', `AT "${at.slice(0, 40)}" should start with uppercase (${position})`);
+        } else if (position === 'mid_sentence' && /[A-Z]/.test(firstChar)) {
+          const firstWord = at.split(/\s+/)[0];
+          if (!PROPER_NOUNS.has(firstWord)) {
+            addFinding(n.row, n.ref, n.id, 'warning', 'at_capitalization', `AT "${at.slice(0, 40)}" starts uppercase mid-sentence`);
+          }
+        }
+      }
+    }
+
+    // 14. Abstract noun AT (covenant faithfulness / love)
+    if (n.sref && n.sref.includes('figs-abstractnouns') && glQuote && glQuote.includes('covenant faithfulness')) {
+      for (const at of ats) {
+        if (/\blove\b/i.test(at)) {
+          addFinding(n.row, n.ref, n.id, 'error', 'abstract_noun_in_at', 'AT uses "love" for "covenant faithfulness" — use the abstract noun form instead');
+          break;
+        }
+      }
+    }
+
+    // 15. AT ending punctuation
+    if (glQuote && ats.length) {
+      const cleanGlq = stripBraces(glQuote);
+      const glqLast = cleanGlq.slice(-1);
+      const isRquestion = n.sref && n.sref.includes('figs-rquestion');
+      for (const at of ats) {
+        if (!at) continue;
+        const atLast = at.slice(-1);
+        if (/[.?,!]/.test(atLast) && atLast !== glqLast) {
+          // Intentional exception: rquestion where glq ends ? and at ends . or !
+          if (isRquestion && glqLast === '?' && (atLast === '.' || atLast === '!')) continue;
+          addFinding(n.row, n.ref, n.id, 'warning', 'at_ending_punctuation', `AT ends with "${atLast}" but gl_quote ends with "${glqLast}"`);
+        }
+      }
+    }
+
+    // 16. Parallelism quote scope
+    if (n.sref && n.sref.includes('figs-parallelism')) {
+      const cleanGlq = stripBraces(glQuote);
+      const glqWords = cleanGlq.trim().split(/\s+/).filter(Boolean);
+      const verseWords = ultVerse.trim().split(/\s+/).filter(Boolean);
+      if (glqWords.length < 4 && verseWords.length > 8) {
+        addFinding(n.row, n.ref, n.id, 'warning', 'narrow_parallelism_quote', `Parallelism gl_quote has only ${glqWords.length} words but verse has ${verseWords.length}`);
+      }
+    }
+
     // 17. SupportReference validation
     if (n.sref) {
       const slugMatch = n.sref.match(/rc:\/\/\*\/ta\/man\/translate\/([^\s;,]+)/);
@@ -268,23 +529,137 @@ function checkTnQuality({ tsvPath, preparedJson, ultUsfm, ustUsfm, book, hebrewU
       }
     }
 
-    // 21. rquestion AT punctuation
-    if (n.sref && n.sref.includes('figs-rquestion') && atMatch) {
-      const ats = n.note.match(/\[([^\]]+)\]/g) || [];
-      for (const atRaw of ats) {
-        const at = atRaw.slice(1, -1).trim();
+    // 18. AT starting punctuation
+    if (glQuote && ats.length) {
+      const cleanGlq = stripBraces(glQuote);
+      const glqFirst = cleanGlq[0] || '';
+      for (const at of ats) {
+        if (!at) continue;
+        const atFirst = at[0];
+        if (/[.,;:!?]/.test(atFirst) && atFirst !== glqFirst) {
+          addFinding(n.row, n.ref, n.id, 'warning', 'at_starting_punctuation', `AT starts with "${atFirst}" but gl_quote starts with "${glqFirst}"`);
+        }
+      }
+    }
+
+    // 19. Hebrew quote joiners — check for discontinuous quotes missing " & "
+    if (n.quote && /[\u0590-\u05FF]/.test(n.quote) && !n.quote.includes(' & ')) {
+      const verseWords = hebrewVerseWords[n.ref] || [];
+      if (verseWords.length > 0) {
+        const CANT_RE = /[\u0591-\u05AF\u2060\u05BE]/g;
+        const quoteTokens = n.quote.split(/\s+/).filter(Boolean);
+        const positions = [];
+        for (const qt of quoteTokens) {
+          const qtStripped = qt.replace(CANT_RE, '');
+          const pos = verseWords.findIndex(w => w === qt || w.replace(CANT_RE, '') === qtStripped);
+          if (pos >= 0) positions.push(pos);
+        }
+        if (positions.length >= 2) {
+          const sorted = positions.slice().sort((a, b) => a - b);
+          for (let p = 1; p < sorted.length; p++) {
+            if (sorted[p] - sorted[p - 1] > 1) {
+              addFinding(n.row, n.ref, n.id, 'warning', 'hebrew_quote_missing_joiner', 'Discontinuous Hebrew quote may need " & " joiner');
+              break;
+            }
+          }
+        }
+      }
+    }
+
+    // 20. Multiverse notes
+    if (n.note) {
+      // 20a: multi-verse range language
+      if (/\bverses\s+\d+(?:\s*[-,]\s*\d+)*(?:\s*(?:,\s*)?and\s+\d+)/i.test(n.note) ||
+          /\bverses\s+\d+\s*[-\u2013]\s*\d+/i.test(n.note)) {
+        addFinding(n.row, n.ref, n.id, 'warning', 'multiverse_language', 'Note references multiple verses — may belong in a multi-verse entry');
+      }
+      // 20b: back-reference to another verse
+      if (/\b(?:as in|see|from|refers? to[^.]{0,30})\s+verse\s+\d+/i.test(n.note)) {
+        addFinding(n.row, n.ref, n.id, 'warning', 'multiverse_backref', 'Note references another verse number');
+      }
+    }
+
+    // Accumulate by sref slug for check 20c (near-duplicate detection)
+    if (n.sref) {
+      const slugM = n.sref.match(/rc:\/\/\*\/ta\/man\/translate\/([^\s;,]+)/);
+      if (slugM) {
+        const slug = slugM[1];
+        if (!notesBySrefSlug[slug]) notesBySrefSlug[slug] = [];
+        notesBySrefSlug[slug].push(n);
+      }
+    }
+
+    // 21. rquestion AT punctuation — only when gl_quote ends with '?'
+    const glqForRq = stripBraces(glQuote);
+    if (n.sref && n.sref.includes('figs-rquestion') && atMatch && glqForRq.endsWith('?')) {
+      for (const at of ats) {
         if (at.endsWith('?')) {
           addFinding(n.row, n.ref, n.id, 'warning', 'rquestion_punctuation', 'Rhetorical question AT should not end with "?"');
         }
       }
     }
+
+    // 22. Missing AT when required
+    if (prepItem.needs_at || prepItem.tcm_mode) {
+      if (!n.note.includes('Alternate translation:')) {
+        addFinding(n.row, n.ref, n.id, 'error', 'missing_at', 'Note requires Alternate translation but none found');
+      }
+    }
+
+    // 23. Single quotes used as quotation marks
+    {
+      const stripped23 = n.note.replace(/\*\*[^*]*\*\*/g, '').replace(/\[[^\]]*\]/g, '');
+      if (/\u2018[^\u2019]+\u2019/.test(stripped23) ||
+          /(?<!\w)'[^']{2,}'(?!\w)/.test(stripped23)) {
+        addFinding(n.row, n.ref, n.id, 'error', 'single_quotes', 'Single quotes used as quotation marks (use double curly quotes)');
+      }
+    }
+  }
+
+  // Check 20c: Near-duplicate detection across adjacent verse notes with same issue slug
+  {
+    const STOPWORDS = new Set(['the','a','an','and','or','but','in','on','at','to','for','of','is','was','it','this','that','are','be','by','as','with','from','not','have','has','had','he','she','they','we','you','his','her','their','its','our','your','i','me','him','them','us','my','who','what','which']);
+    function contentWords(text) {
+      return text.toLowerCase()
+        .replace(/\*\*[^*]*\*\*/g, ' ')
+        .replace(/\[[^\]]*\]/g, ' ')
+        .split(/\W+/)
+        .filter(w => w.length > 2 && !STOPWORDS.has(w));
+    }
+    function verseNum(ref) {
+      const m = ref.match(/:(\d+)/);
+      return m ? parseInt(m[1], 10) : 0;
+    }
+    for (const [slug, slugNotes] of Object.entries(notesBySrefSlug)) {
+      for (let i = 0; i < slugNotes.length; i++) {
+        for (let j = i + 1; j < slugNotes.length; j++) {
+          const ni = slugNotes[i], nj = slugNotes[j];
+          if (Math.abs(verseNum(ni.ref) - verseNum(nj.ref)) > 2) continue;
+          const wi = contentWords(ni.note);
+          const wj = contentWords(nj.note);
+          if (!wi.length || !wj.length) continue;
+          const setJ = new Set(wj);
+          const overlap = wi.filter(w => setJ.has(w)).length / Math.max(wi.length, wj.length);
+          if (overlap >= 0.75) {
+            addFinding(nj.row, nj.ref, nj.id, 'warning', 'multiverse_duplicate',
+              `Near-duplicate of note ${ni.id} at ${ni.ref} (${Math.round(overlap * 100)}% overlap, same "${slug}" issue)`);
+          }
+        }
+      }
+    }
+  }
+
+  // Prepend warning if upstream ID fetch failed (check 3)
+  if (book && upstreamIds === null) {
+    findings.unshift({ row: 0, reference: '', id: '', severity: 'warning', category: 'id_collision',
+      message: `Could not fetch upstream TN IDs for ${book} — collision check skipped` });
   }
 
   const summary = {
     total_notes: notes.length,
     errors: findings.filter(f => f.severity === 'error').length,
     warnings: findings.filter(f => f.severity === 'warning').length,
-    clean: notes.length - new Set(findings.map(f => f.row)).size,
+    clean: notes.length - new Set(findings.filter(f => f.row > 0).map(f => f.row)).size,
   };
 
   const result = JSON.stringify({ summary, findings }, null, 2);
