@@ -53,12 +53,17 @@ function splitTsv({ inputTsv, chunkSize = 40, ranges, outputDir }) {
   const fnMatch = basename.match(/([A-Za-z0-9]+)-(\d+)/);
   const chapter = fnMatch ? parseInt(fnMatch[2], 10) : null;
 
+  // Detect issues TSV format: Book\tReference\t... (col 0 = book code, col 1 = verse ref)
+  // vs notes TSV format: Reference\t... (col 0 = verse ref)
+  const firstDataLine = dataLines.find(l => l.trim());
+  const refCol = firstDataLine && /^[A-Z0-9]{2,3}\t/.test(firstDataLine) ? 1 : 0;
+
   // Separate intro rows
   const introRows = [];
   const verseRows = [];
   for (const line of dataLines) {
     if (!line.trim()) continue;
-    const ref = line.split('\t', 1)[0];
+    const ref = line.split('\t')[refCol] || '';
     if (isIntro(ref)) introRows.push(line);
     else verseRows.push(line);
   }
@@ -66,7 +71,7 @@ function splitTsv({ inputTsv, chunkSize = 40, ranges, outputDir }) {
   // Get all verse numbers
   const verseNums = new Set();
   for (const line of verseRows) {
-    const ref = line.split('\t', 1)[0];
+    const ref = line.split('\t')[refCol] || '';
     const v = parseVerseNum(ref);
     if (v !== null) verseNums.add(v);
   }
@@ -121,7 +126,7 @@ function splitTsv({ inputTsv, chunkSize = 40, ranges, outputDir }) {
     const { start, end } = chunkRanges[ci];
     const chunkFile = path.join(dir, `${base}-v${start}-${end}${ext}`);
     const chunkRows = verseRows.filter(line => {
-      const v = parseVerseNum(line.split('\t', 1)[0]);
+      const v = parseVerseNum(line.split('\t')[refCol] || '');
       return v !== null && v >= start && v <= end;
     });
 
