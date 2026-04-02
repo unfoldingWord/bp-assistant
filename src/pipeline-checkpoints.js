@@ -38,6 +38,16 @@ function getCheckpointByKey(key) {
     }
   } catch (err) {
     console.warn(`[pipeline-checkpoints] Failed to read ${key}: ${err.message}`);
+    // Main file corrupt — try .tmp fallback (write-then-rename left a good copy)
+    const tmpFile = file + '.tmp';
+    try {
+      if (fs.existsSync(tmpFile)) {
+        console.warn(`[pipeline-checkpoints] Falling back to .tmp file for ${key}`);
+        return JSON.parse(fs.readFileSync(tmpFile, 'utf8'));
+      }
+    } catch (err2) {
+      console.warn(`[pipeline-checkpoints] .tmp fallback also failed for ${key}: ${err2.message}`);
+    }
   }
   return null;
 }
@@ -62,7 +72,10 @@ function setCheckpoint({ sessionKey, pipelineType, scope }, patch) {
       updatedAt: new Date().toISOString(),
       createdAt: existing.createdAt || new Date().toISOString(),
     };
-    fs.writeFileSync(getFileByKey(key), JSON.stringify(next, null, 2), 'utf8');
+    const finalFile = getFileByKey(key);
+    const tmpFile = finalFile + '.tmp';
+    fs.writeFileSync(tmpFile, JSON.stringify(next, null, 2), 'utf8');
+    fs.renameSync(tmpFile, finalFile);  // atomic on Linux
     return next;
   } catch (err) {
     console.warn(`[pipeline-checkpoints] Failed to write checkpoint: ${err.message}`);
@@ -75,6 +88,8 @@ function clearCheckpoint({ sessionKey, pipelineType, scope }) {
     const key = buildCheckpointKey({ sessionKey, pipelineType, scope });
     const file = getFileByKey(key);
     if (fs.existsSync(file)) fs.unlinkSync(file);
+    const tmpFile = file + '.tmp';
+    if (fs.existsSync(tmpFile)) fs.unlinkSync(tmpFile);
   } catch (err) {
     console.warn(`[pipeline-checkpoints] Failed to clear checkpoint: ${err.message}`);
   }

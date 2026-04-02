@@ -12,7 +12,7 @@ const path = require('path');
 const config = require('./config');
 const { sendMessage, sendDM, addReaction, removeReaction } = require('./zulip-client');
 const { runClaude, DEFAULT_RESTRICTED_TOOLS, isTransientOutageError } = require('./claude-runner');
-const { getDoor43Username, buildBranchName, resolveOutputFile, discoverFreshOutput, checkPrerequisites, calcSkillTimeout, normalizeBookName, resolveConflictMention, CSKILLBP_DIR } = require('./pipeline-utils');
+const { getDoor43Username, buildBranchName, resolveOutputFile, discoverFreshOutput, checkPrerequisites, calcSkillTimeout, normalizeBookName, resolveConflictMention, parsePartialTsv, truncatePartialTsv, CSKILLBP_DIR } = require('./pipeline-utils');
 const { verifyRepoPush, verifyDcsToken } = require('./repo-verify');
 const { recordMetrics, getCumulativeTokens, recordRunSummary } = require('./usage-tracker');
 const { door43Push, checkConflictingBranches, REPO_MAP, getRepoFilename } = require('./door43-push');
@@ -478,10 +478,19 @@ async function notesPipeline(route, message) {
         await status(`Checkpoint resume skill "${resumeSkill}" not found for ${ref}; restarting chapter skill chain.`);
       }
     }
-    // Restore resolvedOutput for skipped skills from the manifest
+    // Restore resolvedOutput for skipped skills from the manifest, validating files still exist
     const chOutputs = skillOutputs[ch] || {};
     for (let si2 = 0; si2 < startSkillIndex; si2++) {
       if (chOutputs[skills[si2].name]) {
+        const absPath = path.resolve(CSKILLBP_DIR, chOutputs[skills[si2].name]);
+        if (!fs.existsSync(absPath)) {
+          // Cached output missing — restart chapter from this skill
+          console.warn(`[notes] Cached output missing for ${skills[si2].name}: ${chOutputs[skills[si2].name]} — restarting from this skill`);
+          startSkillIndex = si2;
+          resumeSkill = skills[si2].name;
+          await status(`Cached output for **${skills[si2].name}** (${ref}) missing on disk — restarting from this skill.`);
+          break;
+        }
         skills[si2].resolvedOutput = chOutputs[skills[si2].name];
       }
     }
@@ -491,9 +500,37 @@ async function notesPipeline(route, message) {
     for (let si = startSkillIndex; si < skills.length; si++) {
       const skill = skills[si];
       const skillStart = Date.now();
+      // --- Partial output recovery for tn-writer on resume ---
+      let partialRecovery = null;
+      if (skill.name === 'tn-writer' && ch === resumeChapter && resumeSkill === 'tn-writer' && !fresh) {
+        const partialPath = resolveOutputFile(skill.expectedOutput, book);
+        if (partialPath) {
+          const absPartial = path.resolve(CSKILLBP_DIR, partialPath);
+          partialRecovery = parsePartialTsv(absPartial, book, ch);
+          if (partialRecovery) {
+            console.log(`[notes] Partial tn-writer output detected for ${ref}: ${partialRecovery.safeRowCount} safe rows, verses ${partialRecovery.safeVerses.join(',')}, resume from verse ${partialRecovery.resumeFromVerse}`);
+            // Truncate to safe rows only
+            if (truncatePartialTsv(absPartial, partialRecovery.safeVerses)) {
+              await status(`Recovering partial tn-writer output for ${ref} (${partialRecovery.safeVerses.length} verses safe, resuming from verse ${partialRecovery.resumeFromVerse}).`);
+              // Prepend continuation instruction to the skill prompt
+              const recoveryPreamble =
+                `IMPORTANT: A previous run completed notes for verses ${partialRecovery.safeVerses.join(', ')}. ` +
+                `The partial file is at ${partialPath} with the header and ${partialRecovery.safeRowCount} completed rows. ` +
+                `Continue writing notes starting from verse ${partialRecovery.resumeFromVerse}, APPENDING to the existing file. ` +
+                `Do NOT rewrite the header or existing verses.\n\n`;
+              skill.prompt = recoveryPreamble + skill.prompt;
+            } else {
+              // Truncation failed — fall through to normal pre-clean
+              console.warn(`[notes] Partial TSV truncation failed for ${ref}, falling back to full re-run`);
+              partialRecovery = null;
+            }
+          }
+        }
+      }
       // Delete expected output so Claude must recreate it (prevents stale-mtime false failures on resume)
       // Skip when expectedOutput is also the skill's input (e.g. post-edit-review)
-      if (skill.expectedOutput && !skill.skipPreClean) {
+      // Skip pre-clean when we're recovering partial output (file was already truncated to safe rows)
+      if (skill.expectedOutput && !skill.skipPreClean && !partialRecovery) {
         const preClean = resolveOutputFile(skill.expectedOutput, book);
         if (preClean) {
           try { fs.unlinkSync(path.resolve(CSKILLBP_DIR, preClean)); } catch (_) { /* fine if missing */ }

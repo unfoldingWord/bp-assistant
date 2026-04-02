@@ -356,6 +356,118 @@ async function resolveConflictMention(branchName, fallbackSenderName) {
   return `@**${fallbackSenderName}**`;
 }
 
+/**
+ * Parse a partial TSV file from a crashed tn-writer run.
+ * Identifies safely-completed verses (discards the last verse as potentially incomplete).
+ * Returns null if no usable partial work exists.
+ *
+ * @param {string} filePath - Absolute path to the partial TSV file
+ * @param {string} book - Book code (e.g. 'PSA')
+ * @param {number} chapter - Chapter number
+ * @returns {{ safeVerses: number[], resumeFromVerse: number, safeRowCount: number, filePath: string, header: string } | null}
+ */
+function parsePartialTsv(filePath, book, chapter) {
+  try {
+    if (!fs.existsSync(filePath)) return null;
+    const raw = fs.readFileSync(filePath, 'utf8');
+    if (!raw.trim()) return null;
+
+    const lines = raw.split('\n');
+    if (lines.length < 2) return null; // header only
+
+    const header = lines[0];
+    const headerCols = header.split('\t').length;
+
+    // Parse data rows, discarding any truncated final line
+    const rows = [];
+    for (let i = 1; i < lines.length; i++) {
+      const line = lines[i].trim();
+      if (!line) continue;
+      const cols = line.split('\t');
+      if (cols.length < headerCols) {
+        // Truncated row — crash artifact, stop here
+        console.warn(`[pipeline-utils] Partial TSV line ${i + 1} truncated (${cols.length}/${headerCols} cols) — discarding`);
+        break;
+      }
+      rows.push({ line: lines[i], cols });
+    }
+
+    if (rows.length === 0) return null;
+
+    // Extract verse numbers from Reference column (col 0), format: "BOOK CH:V" or "front:intro"
+    const versesByRow = rows.map(r => {
+      const ref = r.cols[0];
+      const match = ref.match(/(\d+):(\d+)/);
+      return match ? parseInt(match[2], 10) : null;
+    });
+
+    // Find all unique verses present
+    const allVerses = [...new Set(versesByRow.filter(v => v != null))].sort((a, b) => a - b);
+    if (allVerses.length === 0) return null;
+
+    // Discard the last verse — may be incomplete
+    const lastVerse = allVerses[allVerses.length - 1];
+    const safeVerses = allVerses.slice(0, -1);
+
+    if (safeVerses.length === 0) return null; // only one verse present, can't trust it
+
+    // Count safe rows (everything except rows for the last verse)
+    const safeRows = rows.filter((_, i) => versesByRow[i] !== lastVerse);
+
+    return {
+      safeVerses,
+      resumeFromVerse: lastVerse,
+      safeRowCount: safeRows.length,
+      filePath,
+      header,
+    };
+  } catch (err) {
+    console.warn(`[pipeline-utils] parsePartialTsv failed for ${filePath}: ${err.message}`);
+    return null;
+  }
+}
+
+/**
+ * Truncate a partial TSV file to keep only the header and rows for safe verses.
+ * Removes rows for the last (potentially incomplete) verse.
+ *
+ * @param {string} filePath - Absolute path to the TSV file
+ * @param {number[]} safeVerses - Verse numbers to keep
+ * @returns {boolean} true if truncation was successful
+ */
+function truncatePartialTsv(filePath, safeVerses) {
+  try {
+    const raw = fs.readFileSync(filePath, 'utf8');
+    const lines = raw.split('\n');
+    const header = lines[0];
+    const headerCols = header.split('\t').length;
+    const safeSet = new Set(safeVerses);
+
+    const kept = [header];
+    for (let i = 1; i < lines.length; i++) {
+      const line = lines[i];
+      if (!line.trim()) continue;
+      const cols = line.split('\t');
+      if (cols.length < headerCols) break; // truncated row
+      const match = cols[0].match(/(\d+):(\d+)/);
+      const verse = match ? parseInt(match[2], 10) : null;
+      // Keep intro rows (no verse number) and rows for safe verses
+      if (verse === null || safeSet.has(verse)) {
+        kept.push(line);
+      }
+    }
+
+    // Write atomically
+    const tmpFile = filePath + '.trunc.tmp';
+    fs.writeFileSync(tmpFile, kept.join('\n') + '\n', 'utf8');
+    fs.renameSync(tmpFile, filePath);
+    return true;
+  } catch (err) {
+    console.warn(`[pipeline-utils] truncatePartialTsv failed for ${filePath}: ${err.message}`);
+    return false;
+  }
+}
+
 module.exports = {
   getDoor43Username,
   checkExistingBranch,
@@ -367,5 +479,7 @@ module.exports = {
   normalizeBookName,
   isValidBook,
   resolveConflictMention,
+  parsePartialTsv,
+  truncatePartialTsv,
   CSKILLBP_DIR,
 };
