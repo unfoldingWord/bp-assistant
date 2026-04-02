@@ -333,7 +333,7 @@ async function runParallelTnWriter({
         prompt,
         cwd: CSKILLBP_DIR,
         model: model || undefined,
-        skill: `tn-writer-shard-${i}`,
+        skill: 'tn-writer',
         tools: DEFAULT_RESTRICTED_TOOLS,
         disallowedTools: ['Bash'],
         disableLocalSettings: true,
