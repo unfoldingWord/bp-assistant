@@ -11,7 +11,7 @@ const { splitTsv, mergeTsvs, fixTrailingNewlines } = require('./tsv-tools');
 const { extractUltEnglish, filterPsalms, curlyQuotes, checkUstPassives, createAlignedUsfm, readUsfmChapter, mergeAlignedUsfm } = require('./usfm-tools');
 const { buildStrongsIndex, buildTnIndex, buildUstIndex } = require('./index-tools');
 const { checkTwHeadwords, compareUltUst, detectAbstractNouns } = require('./issue-tools');
-const { extractAlignmentData, fixHebrewQuotes, flagNarrowQuotes, generateIds, resolveGlQuotes, verifyAtFit, assembleNotes, prepareNotes, fixUnicodeQuotes, verifyBoldMatches } = require('./tn-tools');
+const { extractAlignmentData, fixHebrewQuotes, flagNarrowQuotes, generateIds, resolveGlQuotes, verifyAtFit, assembleNotes, prepareNotes, fixUnicodeQuotes, verifyBoldMatches, fillTsvIds } = require('./tn-tools');
 const { validateTnTsv, checkTnQuality } = require('./quality-tools');
 const { giteaPr, prepareCompare, prepareTq, verifyTq, appendQuickref } = require('./misc-tools');
 
@@ -291,6 +291,10 @@ function createWorkspaceTools(createSdkMcpServer, tool, z) {
         preparedJson: z.string().describe('Prepared notes JSON'), generatedJson: z.string().describe('Generated notes JSON'),
         output: z.string().describe('Output TSV path'),
       }, async (args) => ({ content: [{ type: 'text', text: assembleNotes(args) }] })),
+      tool('fill_tsv_ids', 'Fill empty ID columns in an assembled TN TSV with unique generated IDs (for post-merge ID assignment)', {
+        tsvFile: z.string().describe('TN TSV file path'),
+        book: z.string().optional().describe('Book code (auto-detected from filename if omitted)'),
+      }, async (args) => ({ content: [{ type: 'text', text: await fillTsvIds(args) }] })),
       tool('prepare_notes', 'Prepare issue TSV into structured JSON for note generation', {
         inputTsv: z.string().describe('Issue TSV path'), ultUsfm: z.string().optional(), ustUsfm: z.string().optional(),
         output: z.string().optional(), alignedUsfm: z.string().optional(), alignmentJson: z.string().optional(),

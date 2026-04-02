@@ -239,8 +239,9 @@ function assembleNotes({ preparedJson, generatedJson, output }) {
   const rows = [];
   const missing = [];
   for (const item of (prepared.items || [])) {
-    const noteText = generated[item.id];
-    if (!noteText) { missing.push(item.id); continue; }
+    // Match by ID if available, fall back to array index for late-ID workflows
+    const noteText = item.id ? generated[item.id] : generated[String(item.index)];
+    if (!noteText) { missing.push(item.id || `index:${item.index}`); continue; }
     const quote = item.orig_quote || '';
     const note = noteText.replace(/\.\.\./g, '\u2026');
     const sref = item.sref ? `rc://*/ta/man/translate/${item.sref}` : '';
@@ -585,4 +586,47 @@ function verifyBoldMatches({ tsvFile, ultUsfm, output }) {
   return result.join('\n');
 }
 
-module.exports = { extractAlignmentData, fixHebrewQuotes, flagNarrowQuotes, generateIds, resolveGlQuotes, verifyAtFit, assembleNotes, prepareNotes, fixUnicodeQuotes, verifyBoldMatches };
+/**
+ * Fill empty ID columns in an assembled TN TSV with unique generated IDs.
+ * Used after merging parallel shard TSVs that were assembled without IDs.
+ */
+async function fillTsvIds({ tsvFile, book }) {
+  const tsvPath = path.resolve(CSKILLBP_DIR, tsvFile);
+  const content = fs.readFileSync(tsvPath, 'utf8');
+  const lines = content.split('\n');
+  if (lines.length < 2) return 'No data rows to fill';
+
+  // Count rows needing IDs (non-header, non-empty, empty ID column)
+  const header = lines[0];
+  const dataLines = [];
+  const needsId = [];
+  for (let i = 1; i < lines.length; i++) {
+    if (!lines[i].trim()) continue;
+    dataLines.push(i);
+    const cols = lines[i].split('\t');
+    if (cols.length >= 2 && !cols[1].trim()) needsId.push(i);
+  }
+
+  if (needsId.length === 0) return `All ${dataLines.length} rows already have IDs`;
+
+  // Generate unique IDs
+  const bookCode = (book || '').toUpperCase() || path.basename(tsvFile).match(/([A-Z]{3})/i)?.[1] || 'UNK';
+  const idStr = await generateIds({ book: bookCode, count: needsId.length });
+  const ids = idStr.split('\n').filter(Boolean);
+
+  // Fill IDs into the lines
+  for (let j = 0; j < needsId.length; j++) {
+    const lineIdx = needsId[j];
+    const cols = lines[lineIdx].split('\t');
+    cols[1] = ids[j] || cols[1];
+    lines[lineIdx] = cols.join('\t');
+  }
+
+  // Write atomically
+  const tmpFile = tsvPath + '.tmp';
+  fs.writeFileSync(tmpFile, lines.join('\n'));
+  fs.renameSync(tmpFile, tsvPath);
+  return `Filled ${needsId.length} IDs in ${tsvFile}`;
+}
+
+module.exports = { extractAlignmentData, fixHebrewQuotes, flagNarrowQuotes, generateIds, resolveGlQuotes, verifyAtFit, assembleNotes, prepareNotes, fixUnicodeQuotes, verifyBoldMatches, fillTsvIds };

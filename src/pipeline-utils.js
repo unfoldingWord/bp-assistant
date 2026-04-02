@@ -468,6 +468,17 @@ function truncatePartialTsv(filePath, safeVerses) {
   }
 }
 
+/**
+ * Parse verse range from a shard filename like "ZEC-01-v1-7.tsv" → { vStart: 1, vEnd: 7 }
+ * Returns null if the filename doesn't contain a verse range.
+ */
+function parseChunkRange(filePath) {
+  const basename = path.basename(filePath);
+  const match = basename.match(/-v(\d+)-(\d+)\./);
+  if (!match) return null;
+  return { vStart: parseInt(match[1], 10), vEnd: parseInt(match[2], 10) };
+}
+
 module.exports = {
   getDoor43Username,
   checkExistingBranch,
@@ -481,5 +492,6 @@ module.exports = {
   resolveConflictMention,
   parsePartialTsv,
   truncatePartialTsv,
+  parseChunkRange,
   CSKILLBP_DIR,
 };

@@ -12,7 +12,9 @@ const path = require('path');
 const config = require('./config');
 const { sendMessage, sendDM, addReaction, removeReaction } = require('./zulip-client');
 const { runClaude, DEFAULT_RESTRICTED_TOOLS, isTransientOutageError } = require('./claude-runner');
-const { getDoor43Username, buildBranchName, resolveOutputFile, discoverFreshOutput, checkPrerequisites, calcSkillTimeout, normalizeBookName, resolveConflictMention, parsePartialTsv, truncatePartialTsv, CSKILLBP_DIR } = require('./pipeline-utils');
+const { getDoor43Username, buildBranchName, resolveOutputFile, discoverFreshOutput, checkPrerequisites, calcSkillTimeout, normalizeBookName, resolveConflictMention, parsePartialTsv, truncatePartialTsv, parseChunkRange, CSKILLBP_DIR } = require('./pipeline-utils');
+const { splitTsv } = require('./workspace-tools/tsv-tools');
+const { fillTsvIds } = require('./workspace-tools/tn-tools');
 const { verifyRepoPush, verifyDcsToken } = require('./repo-verify');
 const { recordMetrics, getCumulativeTokens, recordRunSummary } = require('./usage-tracker');
 const { door43Push, checkConflictingBranches, REPO_MAP, getRepoFilename } = require('./door43-push');
@@ -96,6 +98,28 @@ function cleanupNotesArtifacts({ book, chapter, verseStart, verseEnd }) {
   for (const rel of candidates) {
     removeIfExists(path.resolve(CSKILLBP_DIR, rel));
   }
+
+  // Clean up parallel tn-writer shard files (e.g. ZEC-01-v1-7.tsv)
+  const shardDir = path.resolve(CSKILLBP_DIR, `output/notes/${book}`);
+  try {
+    if (fs.existsSync(shardDir)) {
+      const shardPattern = new RegExp(`^${tag}-v\\d+-\\d+\\.tsv$`);
+      for (const f of fs.readdirSync(shardDir)) {
+        if (shardPattern.test(f)) removeIfExists(path.join(shardDir, f));
+      }
+    }
+  } catch (_) { /* non-fatal */ }
+
+  // Clean up split issue chunks (e.g. ZEC-01-v1-7.tsv in output/issues/)
+  const issueDir = path.resolve(CSKILLBP_DIR, `output/issues/${book}`);
+  try {
+    if (fs.existsSync(issueDir)) {
+      const chunkPattern = new RegExp(`^${tag}-v\\d+-\\d+\\.tsv$`);
+      for (const f of fs.readdirSync(issueDir)) {
+        if (chunkPattern.test(f)) removeIfExists(path.join(issueDir, f));
+      }
+    }
+  } catch (_) { /* non-fatal */ }
 }
 
 function refreshChapterNotesFromShards(book, tag, chapterRel) {
@@ -208,6 +232,186 @@ function parseWriteNotesCommand(content) {
   }
 
   return null;
+}
+
+// Default verse chunk size for parallel tn-writer batching
+const TN_WRITER_CHUNK_SIZE = 7;
+
+/**
+ * Run tn-writer in parallel shards. Splits issues TSV into verse-range chunks,
+ * launches independent runClaude calls per chunk, merges results, fills IDs.
+ *
+ * @returns {{ result: object|null, error: Error|null, shardDetails: object[] }}
+ */
+async function runParallelTnWriter({
+  book, ch, tag, issuesPath, outputPath, ctxFlag, model,
+  timeoutMs, appendSystemPrompt, checkpointRef, existingShards,
+  status, isDryRun, skillRef,
+}) {
+  // Split issues into chunks
+  const chunkResult = splitTsv({ inputTsv: issuesPath, chunkSize: TN_WRITER_CHUNK_SIZE });
+  const chunkPaths = chunkResult.split('\n').filter(Boolean);
+
+  // If only one chunk (short chapter), return null to fall through to normal single invocation
+  if (chunkPaths.length <= 1) return null;
+
+  const shardOutputDir = `output/notes/${book}`;
+  const shardDetails = chunkPaths.map(cp => {
+    const range = parseChunkRange(cp);
+    const relPath = path.relative(path.resolve(CSKILLBP_DIR), cp);
+    const shardOut = range
+      ? `${shardOutputDir}/${tag}-v${range.vStart}-${range.vEnd}.tsv`
+      : `${shardOutputDir}/${tag}.tsv`;
+    return { chunkPath: relPath, output: shardOut, range, status: 'pending' };
+  });
+
+  // Restore completed shards from checkpoint
+  const prevShards = existingShards || [];
+  for (const shard of shardDetails) {
+    const prev = prevShards.find(p => p.output === shard.output && p.status === 'completed');
+    if (prev) {
+      const absOut = path.resolve(CSKILLBP_DIR, shard.output);
+      if (fs.existsSync(absOut)) {
+        shard.status = 'completed';
+        console.log(`[notes] Shard already completed: ${shard.output}`);
+      }
+    }
+  }
+
+  const pendingShards = shardDetails.filter(s => s.status !== 'completed');
+  if (pendingShards.length === 0) {
+    await status(`All ${shardDetails.length} tn-writer shards already completed — merging.`);
+  } else {
+    await status(`Running **tn-writer** in ${shardDetails.length} parallel shards (${pendingShards.length} pending)...`);
+  }
+
+  // Launch parallel runClaude calls for pending shards
+  if (pendingShards.length > 0) {
+    // Pre-clean pending shard outputs
+    for (const shard of pendingShards) {
+      // Check for partial recovery on this shard (Level 2)
+      const absOut = path.resolve(CSKILLBP_DIR, shard.output);
+      const partial = parsePartialTsv(absOut, book, ch);
+      if (partial && partial.safeVerses.length > 0) {
+        if (truncatePartialTsv(absOut, partial.safeVerses)) {
+          shard.partialRecovery = partial;
+          console.log(`[notes] Shard ${shard.output}: partial recovery (${partial.safeVerses.length} safe verses, resume from ${partial.resumeFromVerse})`);
+        }
+      }
+      if (!shard.partialRecovery) {
+        removeIfExists(absOut);
+      }
+    }
+
+    const runPromises = pendingShards.map((shard, i) => {
+      const vRange = shard.range ? `${shard.range.vStart}-${shard.range.vEnd}` : '';
+      const verseArg = vRange ? `:${vRange}` : '';
+      let prompt = `${skillRef}${verseArg} --issues ${shard.chunkPath} --output ${shard.output}${ctxFlag}`;
+
+      // Prepend partial recovery instruction if applicable
+      if (shard.partialRecovery) {
+        const pr = shard.partialRecovery;
+        const preamble =
+          `IMPORTANT: A previous run completed notes for verses ${pr.safeVerses.join(', ')}. ` +
+          `The partial file is at ${shard.output} with the header and ${pr.safeRowCount} completed rows. ` +
+          `Continue writing notes starting from verse ${pr.resumeFromVerse}, APPENDING to the existing file. ` +
+          `Do NOT rewrite the header or existing verses.\n\n`;
+        prompt = preamble + prompt;
+      }
+
+      if (isDryRun) {
+        const absPath = path.resolve(CSKILLBP_DIR, shard.output);
+        fs.mkdirSync(path.dirname(absPath), { recursive: true });
+        const v1 = shard.range?.vStart || 1;
+        fs.writeFileSync(absPath, 'Reference\tID\tTags\tSupportReference\tQuote\tOccurrence\tNote\n' +
+          `${book} ${ch}:${v1}\t\t\t\t\t1\t[Stub note for dry run]\n`);
+        return Promise.resolve({ subtype: 'success', num_turns: 0, duration_ms: 100, total_cost_usd: 0, _shardIdx: i });
+      }
+
+      console.log(`[notes] tn-writer shard ${i}: ${prompt}`);
+      return runClaude({
+        prompt,
+        cwd: CSKILLBP_DIR,
+        model: model || undefined,
+        skill: `tn-writer-shard-${i}`,
+        tools: DEFAULT_RESTRICTED_TOOLS,
+        disallowedTools: ['Bash'],
+        disableLocalSettings: true,
+        forceNoAutoBashSandbox: true,
+        timeoutMs,
+        appendSystemPrompt,
+      }).then(r => ({ ...r, _shardIdx: i }))
+        .catch(err => ({ _shardIdx: i, _error: err, subtype: 'error' }));
+    });
+
+    const results = await Promise.allSettled(runPromises);
+
+    // Process results
+    let anyUsageLimit = false;
+    let anyTransientOutage = false;
+    for (let ri = 0; ri < results.length; ri++) {
+      const r = results[ri].status === 'fulfilled' ? results[ri].value : { _shardIdx: ri, _error: results[ri].reason, subtype: 'error' };
+      const shard = pendingShards[r._shardIdx ?? ri];
+      if (r._error) {
+        shard.status = 'failed';
+        shard.error = r._error.message || String(r._error);
+        if (isTransientOutageError(r._error)) anyTransientOutage = true;
+        if (isUsageLimitError(shard.error)) anyUsageLimit = true;
+        console.error(`[notes] tn-writer shard ${r._shardIdx} failed: ${shard.error}`);
+      } else if (r.subtype !== 'success') {
+        shard.status = 'failed';
+        shard.error = r.error || r.result || `subtype: ${r.subtype}`;
+        if (isUsageLimitError(shard.error)) anyUsageLimit = true;
+        console.error(`[notes] tn-writer shard ${r._shardIdx} non-success: ${shard.error}`);
+      } else {
+        // Check output file exists
+        const absOut = path.resolve(CSKILLBP_DIR, shard.output);
+        if (fs.existsSync(absOut)) {
+          shard.status = 'completed';
+          console.log(`[notes] tn-writer shard ${r._shardIdx} completed: ${shard.output}`);
+        } else {
+          shard.status = 'failed';
+          shard.error = 'Output file not found after successful SDK run';
+          console.error(`[notes] tn-writer shard ${r._shardIdx}: success but output missing`);
+        }
+      }
+    }
+
+    // Report shard results
+    const completedCount = shardDetails.filter(s => s.status === 'completed').length;
+    const failedCount = shardDetails.filter(s => s.status === 'failed').length;
+    await status(`tn-writer shards: ${completedCount}/${shardDetails.length} completed, ${failedCount} failed.`);
+
+    // If any shards failed, report as failure
+    if (failedCount > 0) {
+      const failedShardErrors = shardDetails.filter(s => s.status === 'failed').map(s => s.error).join('; ');
+      const errorResult = {
+        subtype: 'error',
+        error: `${failedCount}/${shardDetails.length} shards failed: ${failedShardErrors}`,
+      };
+      // Synthesize appropriate error type for the pipeline's error handling
+      if (anyUsageLimit) errorResult._usageLimit = true;
+      if (anyTransientOutage) errorResult._transientOutage = true;
+      return { result: errorResult, error: null, shardDetails };
+    }
+  }
+
+  // All shards completed — merge
+  await status(`Merging ${shardDetails.length} tn-writer shards...`);
+  const mergeGlob = `output/notes/${book}/${tag}-v*.tsv`;
+  const mergeResult = mergeTsvs({ globPattern: mergeGlob, output: outputPath });
+  console.log(`[notes] Merge result: ${mergeResult}`);
+
+  // Fill IDs on merged file
+  await status(`Generating IDs for merged notes...`);
+  const idResult = await fillTsvIds({ tsvFile: outputPath, book });
+  console.log(`[notes] Fill IDs result: ${idResult}`);
+
+  return {
+    result: { subtype: 'success', num_turns: 0, duration_ms: 0, total_cost_usd: 0 },
+    error: null,
+    shardDetails,
+  };
 }
 
 // --- Main pipeline ---
@@ -552,6 +756,42 @@ async function notesPipeline(route, message) {
 
       let result = null;
       let skillError = null;
+
+      // --- Parallel tn-writer: split into verse-range shards ---
+      let usedParallel = false;
+      if (skill.name === 'tn-writer' && !hasVerseRange) {
+        const existingShards = (skillOutputs[ch] || {})._tnWriterShards || [];
+        try {
+          const parallelResult = await runParallelTnWriter({
+            book, ch, tag, issuesPath, outputPath: skill.expectedOutput, ctxFlag,
+            model: model || skill.model, timeoutMs, appendSystemPrompt: skill.appendSystemPrompt,
+            checkpointRef, existingShards, status, isDryRun, skillRef,
+          });
+          if (parallelResult) {
+            // Parallel mode was used (chapter had enough verses to split)
+            usedParallel = true;
+            result = parallelResult.result;
+            // Save shard details in skillOutputs for checkpoint recovery
+            if (!skillOutputs[ch]) skillOutputs[ch] = {};
+            skillOutputs[ch]._tnWriterShards = parallelResult.shardDetails;
+            // Handle usage limit / transient outage propagation
+            if (result?._usageLimit) {
+              skillError = new Error(result.error);
+              result = null;
+            } else if (result?._transientOutage) {
+              skillError = new Error(result.error);
+              skillError._transientOutage = true;
+              result = null;
+            }
+          }
+        } catch (err) {
+          console.error(`[notes] Parallel tn-writer failed, falling back to single: ${err.message}`);
+          // Fall through to single invocation
+        }
+      }
+
+      // --- Standard single invocation (for non-tn-writer skills, or single-chunk fallback) ---
+      if (!usedParallel) {
       if (isDryRun) {
         console.log(`[dry-run] Would run ${skill.name}: ${skill.prompt}`);
         if (skill.expectedOutput) {
@@ -585,6 +825,7 @@ async function notesPipeline(route, message) {
           console.error(`[notes] ${skill.name} error: ${err.message}`);
         }
       }
+      } // end !usedParallel
       // #region agent log
       fetch('http://localhost:7282/ingest/190f0e90-444d-4921-920d-f208e86f8cb3',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'7de6a4'},body:JSON.stringify({sessionId:'7de6a4',runId:debugRunId,hypothesisId:'H4',location:'notes-pipeline.js:skill-result',message:'skill result/error',data:{ref,skill:skill.name,hadError:!!skillError,error:skillError?String(skillError.message||skillError):null,resultSubtype:result?.subtype||null,resultError:result?.error||null},timestamp:Date.now()})}).catch(()=>{});
       // #endregion
