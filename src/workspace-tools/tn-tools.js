@@ -313,7 +313,38 @@ function prepareNotes({ inputTsv, ultUsfm, ustUsfm, output, alignedUsfm, alignme
   const outPath = path.resolve(CSKILLBP_DIR, output || '/tmp/claude/prepared_notes.json');
   fs.mkdirSync(path.dirname(outPath), { recursive: true });
   fs.writeFileSync(outPath, JSON.stringify(result, null, 2));
-  return `Prepared ${items.length} items\n${outPath}`;
+
+  // Phase 3a: filter alignment data to target verses + 1-verse margin
+  let filterNote = '';
+  if (alignmentJson) {
+    const alignPath = path.resolve(CSKILLBP_DIR, alignmentJson);
+    if (fs.existsSync(alignPath)) {
+      const alignData = JSON.parse(fs.readFileSync(alignPath, 'utf8'));
+      const targetVerses = new Set(items.map(i => i.reference));
+      const expanded = new Set();
+      for (const ref of targetVerses) {
+        const parts = ref.split(':');
+        if (parts.length === 2) {
+          const ch = parts[0], vsNum = parseInt(parts[1], 10);
+          expanded.add(ref);
+          if (vsNum > 1) expanded.add(`${ch}:${vsNum - 1}`);
+          expanded.add(`${ch}:${vsNum + 1}`);
+        } else {
+          expanded.add(ref);
+        }
+      }
+      const before = Object.keys(alignData).length;
+      const filtered = {};
+      for (const [key, val] of Object.entries(alignData)) {
+        if (expanded.has(key)) filtered[key] = val;
+      }
+      const after = Object.keys(filtered).length;
+      fs.writeFileSync(alignPath, JSON.stringify(filtered, null, 2));
+      filterNote = `, alignment filtered ${before}→${after} verses`;
+    }
+  }
+
+  return `Prepared ${items.length} items${filterNote}\n${outPath}`;
 }
 
 /**
@@ -587,6 +618,179 @@ function verifyBoldMatches({ tsvFile, ultUsfm, output }) {
 }
 
 /**
+ * Fill empty orig_quote fields in prepared_notes.json using alignment data.
+ * Deterministically matches English gl_quote words to Hebrew via alignment,
+ * then extracts the exact Hebrew span from UHB source (character-for-character).
+ * Falls back gracefully for items that can't be resolved.
+ */
+function fillOrigQuotes({ preparedJson, alignmentJson, hebrewUsfm }) {
+  const prepPath = path.resolve(CSKILLBP_DIR, preparedJson);
+  const data = JSON.parse(fs.readFileSync(prepPath, 'utf8'));
+  const alignData = JSON.parse(fs.readFileSync(path.resolve(CSKILLBP_DIR, alignmentJson), 'utf8'));
+
+  const bookCode = (data.book || '').toUpperCase();
+  let hebrewPath;
+  if (hebrewUsfm) {
+    hebrewPath = path.resolve(CSKILLBP_DIR, hebrewUsfm);
+  } else {
+    const dir = path.join(CSKILLBP_DIR, 'data/hebrew_bible');
+    const files = fs.existsSync(dir) ? fs.readdirSync(dir).filter(f => f.toUpperCase().includes(bookCode) && f.endsWith('.usfm')) : [];
+    if (!files.length) return `ERROR: No Hebrew USFM found for ${bookCode}`;
+    hebrewPath = path.join(dir, files[0]);
+  }
+  const hebrewContent = fs.readFileSync(hebrewPath, 'utf8');
+
+  const STRIP_RE = /[\u0591-\u05AF\u2060\u05BD\u05C3]/g;
+  const CANT = /[\u0591-\u05AF\u2060\u05BE]/g;
+  const PUNC = /[{},;:.!?'""\u2018\u2019\u201C\u201D\u2014\u2013]/g;
+
+  // Build verse map (same logic as fixUnicodeQuotes)
+  const verseMap = {};
+  let hebCh = 0, curVerse = null, curLines = [];
+
+  function extractVerseText(lines) {
+    const text = lines.join(' ');
+    const parts = [];
+    let lastEnd = 0;
+    const WRE = /\\w\s+([^|]+)\|[^\\]*?\\w\*/g;
+    let m;
+    while ((m = WRE.exec(text)) !== null) {
+      const between = text.slice(lastEnd, m.index);
+      if (parts.length && between.includes('\u05BE')) parts.push('\u05BE');
+      else if (parts.length) parts.push(' ');
+      parts.push(m[1].trim());
+      lastEnd = m.index + m[0].length;
+    }
+    return parts.join('');
+  }
+
+  for (const line of hebrewContent.split('\n')) {
+    const trimmed = line.trim();
+    const cm = trimmed.match(/^\\c\s+(\d+)/);
+    if (cm) {
+      if (curVerse && curLines.length) verseMap[curVerse] = extractVerseText(curLines);
+      hebCh = parseInt(cm[1], 10); curVerse = null; curLines = [];
+      continue;
+    }
+    const vm = trimmed.match(/^\\v\s+(\d+[-\d]*)/);
+    if (vm) {
+      if (curVerse && curLines.length) verseMap[curVerse] = extractVerseText(curLines);
+      curVerse = `${hebCh}:${vm[1].split('-')[0]}`; curLines = [];
+    }
+    if (curVerse && trimmed) curLines.push(trimmed);
+  }
+  if (curVerse && curLines.length) verseMap[curVerse] = extractVerseText(curLines);
+
+  function buildStripped(raw) {
+    const stripped = [];
+    const offsetMap = [];
+    for (let i = 0; i < raw.length; i++) {
+      const c = raw[i];
+      if (!STRIP_RE.test(c)) { stripped.push(c); offsetMap.push(i); }
+      STRIP_RE.lastIndex = 0;
+    }
+    return { text: stripped.join(''), offsetMap };
+  }
+
+  function rawSpan(raw, offsetMap, rStart, rEnd, strippedLen) {
+    const rawStart = offsetMap[rStart];
+    const rawEndExcl = (rEnd + 1 < strippedLen) ? offsetMap[rEnd + 1] : raw.length;
+    let end = rawEndExcl;
+    while (end > rawStart && (raw[end - 1] === ' ' || raw[end - 1] === '\u05C3')) end--;
+    return raw.slice(rawStart, end);
+  }
+
+  function extractHebrewSpan(ref, hebWords) {
+    const rawVerse = verseMap[ref];
+    if (!rawVerse) return null;
+    const { text: strippedVerse, offsetMap } = buildStripped(rawVerse);
+    const normVerse = strippedVerse.normalize('NFKD');
+
+    const positions = [];
+    for (const hw of hebWords) {
+      const strippedHw = hw.replace(CANT, '');
+      const normHw = strippedHw.normalize('NFKD');
+      const normPos = normVerse.indexOf(normHw);
+      if (normPos < 0) return null;
+      // Map norm position back to strippedVerse position
+      let si = 0, ni = 0;
+      while (ni < normPos && si < strippedVerse.length) {
+        ni += strippedVerse[si].normalize('NFKD').length;
+        si++;
+      }
+      positions.push({ start: si, end: si + strippedHw.length - 1 });
+    }
+
+    if (!positions.length) return null;
+    const minStart = Math.min(...positions.map(p => p.start));
+    const maxEnd = Math.max(...positions.map(p => p.end));
+    return rawSpan(rawVerse, offsetMap, minStart, maxEnd, strippedVerse.length);
+  }
+
+  let resolved = 0;
+  const unresolved = [];
+
+  for (const item of (data.items || [])) {
+    if (item.orig_quote) continue;
+    if (!item.gl_quote) continue;
+    if (item.reference && item.reference.endsWith(':front')) continue;
+
+    const entries = alignData[item.reference] || [];
+    if (!entries.length) {
+      unresolved.push(`${item.id} ${item.reference}: no alignment entries`);
+      continue;
+    }
+
+    const cleanGlq = item.gl_quote.replace(/\{[^}]*\}/g, '').trim();
+    const glqNorm = cleanGlq.split(/\s+/).filter(Boolean).map(t => t.replace(PUNC, '').toLowerCase()).filter(Boolean);
+
+    if (!glqNorm.length) {
+      unresolved.push(`${item.id} ${item.reference}: empty gl_quote after cleaning`);
+      continue;
+    }
+
+    const usedIndices = new Set();
+    const matchedHeb = [];
+    let allMatched = true;
+
+    for (const glqWord of glqNorm) {
+      let found = false;
+      for (let i = 0; i < entries.length; i++) {
+        if (usedIndices.has(i)) continue;
+        const engNorm = (entries[i].eng || '').replace(PUNC, '').toLowerCase();
+        if (engNorm === glqWord) {
+          usedIndices.add(i);
+          if (entries[i].heb) matchedHeb.push(entries[i].heb);
+          found = true;
+          break;
+        }
+      }
+      if (!found) { allMatched = false; break; }
+    }
+
+    if (!allMatched || !matchedHeb.length) {
+      unresolved.push(`${item.id} ${item.reference}: "${cleanGlq.slice(0, 40)}" — not all words matched in alignment`);
+      continue;
+    }
+
+    const span = extractHebrewSpan(item.reference, matchedHeb);
+    if (!span) {
+      unresolved.push(`${item.id} ${item.reference}: Hebrew words found but not locatable in source verse`);
+      continue;
+    }
+
+    item.orig_quote = span;
+    resolved++;
+  }
+
+  fs.writeFileSync(prepPath, JSON.stringify(data, null, 2));
+
+  const lines = [`Resolved: ${resolved} of ${resolved + unresolved.length} items. Unresolved: ${unresolved.length} items:`];
+  for (const u of unresolved) lines.push(`  ${u}`);
+  return lines.join('\n');
+}
+
+/**
  * Fill empty ID columns in an assembled TN TSV with unique generated IDs.
  * Used after merging parallel shard TSVs that were assembled without IDs.
  */
@@ -629,4 +833,4 @@ async function fillTsvIds({ tsvFile, book }) {
   return `Filled ${needsId.length} IDs in ${tsvFile}`;
 }
 
-module.exports = { extractAlignmentData, fixHebrewQuotes, flagNarrowQuotes, generateIds, resolveGlQuotes, verifyAtFit, assembleNotes, prepareNotes, fixUnicodeQuotes, verifyBoldMatches, fillTsvIds };
+module.exports = { extractAlignmentData, fixHebrewQuotes, flagNarrowQuotes, generateIds, resolveGlQuotes, verifyAtFit, assembleNotes, prepareNotes, fixUnicodeQuotes, verifyBoldMatches, fillTsvIds, fillOrigQuotes };

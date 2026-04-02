@@ -11,7 +11,7 @@ const { splitTsv, mergeTsvs, fixTrailingNewlines } = require('./tsv-tools');
 const { extractUltEnglish, filterPsalms, curlyQuotes, checkUstPassives, createAlignedUsfm, readUsfmChapter, mergeAlignedUsfm, validateAlignmentJson, validateUltBrackets, checkUltVoiceMismatch } = require('./usfm-tools');
 const { buildStrongsIndex, buildTnIndex, buildUstIndex } = require('./index-tools');
 const { checkTwHeadwords, compareUltUst, detectAbstractNouns } = require('./issue-tools');
-const { extractAlignmentData, fixHebrewQuotes, flagNarrowQuotes, generateIds, resolveGlQuotes, verifyAtFit, assembleNotes, prepareNotes, fixUnicodeQuotes, verifyBoldMatches, fillTsvIds } = require('./tn-tools');
+const { extractAlignmentData, fixHebrewQuotes, flagNarrowQuotes, generateIds, resolveGlQuotes, verifyAtFit, assembleNotes, prepareNotes, fixUnicodeQuotes, verifyBoldMatches, fillTsvIds, fillOrigQuotes } = require('./tn-tools');
 const { validateTnTsv, checkTnQuality } = require('./quality-tools');
 const { giteaPr, prepareCompare, prepareTq, verifyTq, appendQuickref } = require('./misc-tools');
 
@@ -329,6 +329,11 @@ function createWorkspaceTools(createSdkMcpServer, tool, z) {
         tsvFile: z.string().describe('TN TSV file path'),
         book: z.string().optional().describe('Book code (auto-detected from filename if omitted)'),
       }, async (args) => ({ content: [{ type: 'text', text: await fillTsvIds(args) }] })),
+      tool('fill_orig_quotes', 'Fill empty orig_quote fields in prepared_notes.json using alignment data. Deterministically matches English gl_quote words to Hebrew alignment entries, then extracts the exact Hebrew character span from UHB source USFM. Updates prepared_notes.json in place. Returns a summary of how many items were resolved and lists any that could not be matched (for manual fallback).', {
+        preparedJson: z.string().describe('Prepared notes JSON path (relative to workspace)'),
+        alignmentJson: z.string().describe('Alignment data JSON path (relative to workspace)'),
+        hebrewUsfm: z.string().optional().describe('Hebrew USFM path (auto-detected from book code if omitted)'),
+      }, async (args) => ({ content: [{ type: 'text', text: fillOrigQuotes(args) }] })),
       tool('prepare_notes', 'Prepare issue TSV into structured JSON for note generation', {
         inputTsv: z.string().describe('Issue TSV path'), ultUsfm: z.string().optional(), ustUsfm: z.string().optional(),
         output: z.string().optional(), alignedUsfm: z.string().optional(), alignmentJson: z.string().optional(),

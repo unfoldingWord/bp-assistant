@@ -614,6 +614,29 @@ async function checkTnQuality({ tsvPath, preparedJson, ultUsfm, ustUsfm, book, h
         addFinding(n.row, n.ref, n.id, 'error', 'single_quotes', 'Single quotes used as quotation marks (use double curly quotes)');
       }
     }
+
+    // 24. "Here" rule compliance
+    if (/^Here[, ]/.test(n.note)) {
+      if (!/^Here,?\s+\*\*[a-z]/.test(n.note)) {
+        addFinding(n.row, n.ref, n.id, 'warning', 'here_rule',
+          'Note starts with "Here" but next content is not a bolded lowercase quote');
+      }
+    }
+
+    // 25. Template fixed-phrase adherence
+    {
+      const srefSlug = n.sref ? (n.sref.match(/translate\/([^\s;,]+)/) || [])[1] : '';
+      const TEMPLATE_PHRASES = {
+        'figs-abstractnouns': [/you could express the same idea/i],
+        'figs-rquestion': [/rhetorical question/i],
+        'figs-metaphor': [/speak/i],
+      };
+      const phrases = TEMPLATE_PHRASES[srefSlug];
+      if (phrases && !phrases.some(re => re.test(n.note))) {
+        addFinding(n.row, n.ref, n.id, 'warning', 'template_phrase_missing',
+          `Note for "${srefSlug}" missing expected template phrase`);
+      }
+    }
   }
 
   // Check 20c: Near-duplicate detection across adjacent verse notes with same issue slug
