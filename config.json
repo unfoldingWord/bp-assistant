@@ -59,7 +59,8 @@
     "name": "interactive-dm",
     "type": "interactive-dm",
     "reply": true,
-    "cwd": "/workspace"
+    "cwd": "/workspace",
+    "model": "sonnet"
   },
   "unauthorizedReply": "You're not on the authorized list, ask the admin in the response.",
   "usageTracking": {

@@ -7,6 +7,7 @@ const { getAllPendingMerges } = require('./pending-merges');
 const { resumeInsertion } = require('./insertion-resume');
 const { verifyDcsToken } = require('./repo-verify');
 const { startResourceMonitor } = require('./resource-monitor');
+const { ensureClaudeConfig } = require('./claude-config-init');
 
 let myUserId = null;
 
@@ -79,6 +80,7 @@ async function pollLoop(client, queueId, lastEventId) {
 }
 
 async function main() {
+  ensureClaudeConfig();
   const client = await getClient();
 
   // Get our own user ID to filter self-messages

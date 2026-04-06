@@ -81,8 +81,7 @@ function buildOptions({
     abortController: abortController || new AbortController(),
     maxTurns: maxTurns || DEFAULT_MAX_TURNS,
     allowedTools: allowedTools || DEFAULT_ALLOWED_TOOLS,
-    permissionMode: 'bypassPermissions',
-    allowDangerouslySkipPermissions: true,
+    permissionMode: 'auto',
     settingSources: disableLocalSettings ? ['user', 'project'] : ['user', 'project', 'local'],
     persistSession: true,
   };
