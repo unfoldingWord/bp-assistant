@@ -928,9 +928,33 @@ async function routeMessage(message) {
     console.log(`[router] Running route "${activeRoute.name}" for message ${message.id}`);
     firePipeline(activeRoute, message);
   } else if (!isStream && isAdmin && config.dmDefaultPipeline) {
-    // Admin DMs get interactive session if no route matches
-    console.log(`[router] No match -- running interactive DM pipeline for admin ${message.id}`);
-    firePipeline(config.dmDefaultPipeline, message);
+    // Admin DMs: try Haiku classification for structured commands before interactive DM fallback
+    let dmHaikuMatched = false;
+    try {
+      const intent = await classifyIntent(message.content);
+      console.log(`[router] DM Haiku classified as: ${JSON.stringify(intent)}`);
+
+      if (intent.intent === 'editor-note' && intent.book) {
+        const syntheticRoute = buildSyntheticRoute(intent, message.sender_full_name);
+        if (syntheticRoute) {
+          console.log(`[router] DM Haiku → routing to editor-note for ${intent.book}`);
+          firePipeline(syntheticRoute, message);
+          dmHaikuMatched = true;
+        }
+      }
+    } catch (err) {
+      console.error(`[router] DM Haiku classification failed: ${err.message}`);
+      if (isTransientOutageError(err)) {
+        await sendDM(message.sender_id, 'Claude is temporarily down, please retry shortly.');
+        return;
+      }
+    }
+
+    if (!dmHaikuMatched) {
+      // Fall back to interactive DM session for open-ended requests
+      console.log(`[router] No match -- running interactive DM pipeline for admin ${message.id}`);
+      firePipeline(config.dmDefaultPipeline, message);
+    }
   } else if (isStream) {
     // Check for active session first -- follow-up messages go directly to session resume
     const session = getSession(sessionKey);
