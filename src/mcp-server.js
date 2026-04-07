@@ -196,6 +196,11 @@ function loadCache() {
   const issuesPath = '/workspace/data/translation-issues.csv';
   const templatesPath = '/workspace/data/templates.csv';
 
+  if (!fs.existsSync(issuesPath) || !fs.existsSync(templatesPath)) {
+    console.warn(`[mcp] Cache preload skipped: ${!fs.existsSync(issuesPath) ? issuesPath : templatesPath} not found.`);
+    return;
+  }
+
   const issuesText = fs.readFileSync(issuesPath, 'utf8');
   const issueRows = parseCSV(issuesText);
   // Skip header row (first: "issue,last_updated")

@@ -154,14 +154,16 @@ function parseEditorNoteRemainder(remainder) {
 
   // Ordered from most specific to most general
   const scopePatterns = [
-    /^(\d+:\d+\s*[-–—]\s*\d+:\d+)\s+(.+)$/i,                      // 2:10-3:5
-    /^(\d+:\d+(?:\s*,\s*\d+:\d+(?:\s*[-–—]\s*\d+)?)*)\s+(.+)$/i, // 2:4, 2:6, 3:1-3
-    /^(\d+:\d+(?:\s*[-–—]\s*\d+)?(?:\s*,\s*\d+(?:\s*[-–—]\s*\d+)?)*)\s+(.+)$/i, // 2:4,6-8
-    /^(\d+(?:\s*[-–—]\s*\d+)?(?:\s*,\s*\d+(?:\s*[-–—]\s*\d+)?)*)\s+(.+)$/i,      // 2 / 2-4 / 2,4,6
+    /^(\d+:\d+\s*-\s*\d+:\d+)\s+(.+)$/i,                      // 2:10-3:5
+    /^(\d+:\d+(?:\s*,\s*\d+:\d+(?:\s*-\s*\d+)?)*)\s+(.+)$/i, // 2:4, 2:6, 3:1-3
+    /^(\d+:\d+(?:\s*-\s*\d+)?(?:\s*,\s*\d+(?:\s*-\s*\d+)?)*)\s+(.+)$/i, // 2:4,6-8
+    /^(\d+(?:\s*-\s*\d+)?(?:\s*,\s*\d+(?:\s*-\s*\d+)?)*)\s+(.+)$/i,      // 2 / 2-4 / 2,4,6
   ];
 
+  const normalizedWithoutCh = withoutCh.replace(/\s*[-–—]\s*/g, '-');
+
   for (const re of scopePatterns) {
-    const m = withoutCh.match(re);
+    const m = normalizedWithoutCh.match(re);
     if (m) {
       return {
         scope: normalizeScopeText(m[1]),
@@ -186,13 +188,14 @@ function parseBookChapters(captures) {
 
   for (const c of captures) {
     if (c == null) continue;
-    const s = String(c).trim();
+    // Pre-normalize dashes to standard hyphens
+    const s = String(c).trim().replace(/[-–—]/g, '-');
     // Book name: all letters
     if (/^[a-zA-Z]+$/.test(s)) {
       book = normalizeBookName(s);
     } else {
       // Verse-range format "CH:VS-VS"
-      const verseRange = s.match(/^(\d+):(\d+)[-–—](\d+)$/);
+      const verseRange = s.match(/^(\d+):(\d+)-(\d+)$/);
       if (verseRange) {
         chapterNums.push(Number(verseRange[1]));
         verseStart = Number(verseRange[2]);

@@ -68,6 +68,10 @@ async function verifyRepoPush({ repo, stagingBranch, since }) {
     };
   }
 
+  // If no 'since' is provided, default to looking for PRs merged within the last 1 hour
+  // to avoid picking up stale merged PRs from older runs reusing the same branch name.
+  const effectiveSince = since || new Date(Date.now() - 60 * 60 * 1000).toISOString();
+
   // First: validate the token works at all
   try {
     const tokenCheck = await apiGet(`/repos/${ORG}/${repo}`, token);
@@ -102,11 +106,11 @@ async function verifyRepoPush({ repo, stagingBranch, since }) {
     const merged = pulls.find(pr => {
       const isMerged = pr.merged === true || pr.merged_by != null;
       if (!isMerged) return false;
-      // If 'since' provided, only accept PRs merged after that time
-      if (since && pr.merged_at) {
-        return new Date(pr.merged_at) >= new Date(since);
+      
+      if (pr.merged_at) {
+        return new Date(pr.merged_at) >= new Date(effectiveSince);
       }
-      return true;
+      return false;
     });
 
     if (merged) {
