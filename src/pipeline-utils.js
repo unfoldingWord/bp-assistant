@@ -11,9 +11,16 @@ const MIN_TIMEOUT_MS = 10 * 60 * 1000;   // 10 min floor
 const MAX_TIMEOUT_MS = 90 * 60 * 1000;   // 90 min cap (post-MCP migration)
 const MS_PER_VERSE_OP = 7 * 60 * 1000;   // 7 min per verse per operation (post-MCP)
 
+// --- Resolve door43-users.json path (data dir takes precedence over app dir) ---
+function getDoor43UsersPath() {
+  const dataPath = '/app/data/door43-users.json';
+  if (fs.existsSync(dataPath)) return dataPath;
+  return path.resolve(__dirname, '../door43-users.json');
+}
+
 // --- Look up Door43 username from sender email ---
 function getDoor43Username(senderEmail) {
-  const usersFile = path.resolve(__dirname, '../door43-users.json');
+  const usersFile = getDoor43UsersPath();
   if (!fs.existsSync(usersFile)) return null;
   const users = JSON.parse(fs.readFileSync(usersFile, 'utf8'));
   return users[senderEmail] || null;
@@ -333,7 +340,7 @@ async function resolveConflictMention(branchName, fallbackSenderName) {
     const d43Username = tcMatch ? tcMatch[1] : branchName.split('-')[0];
 
     // Reverse-lookup door43-users.json (email → d43username) to find email
-    const usersFile = path.resolve(__dirname, '../door43-users.json');
+    const usersFile = getDoor43UsersPath();
     if (!fs.existsSync(usersFile)) return `@**${fallbackSenderName}**`;
 
     const users = JSON.parse(fs.readFileSync(usersFile, 'utf8'));
