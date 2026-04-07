@@ -78,7 +78,7 @@ function httpFetch(url, maxRedirects) {
   return new Promise(function (resolve, reject) {
     var client = url.startsWith('https') ? https : http;
     var req = client.get(url, { headers: { 'User-Agent': 'curate-data/1.0' } }, function (res) {
-      if ((res.statusCode === 301 || res.statusCode === 302 || res.statusCode === 303) && res.headers.location) {
+      if ((res.statusCode === 301 || res.statusCode === 302 || res.statusCode === 303 || res.statusCode === 307 || res.statusCode === 308) && res.headers.location) {
         if (maxRedirects <= 0) return reject(new Error('Too many redirects'));
         return resolve(httpFetch(res.headers.location, maxRedirects - 1));
       }
