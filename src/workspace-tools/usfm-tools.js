@@ -285,10 +285,35 @@ function createAlignedUsfm({ hebrew, mapping, source, output, chapter, verse, us
 }
 
 /**
+ * Strip alignment markers from USFM text, producing plain readable USFM.
+ * Removes \zaln-s/e milestones and extracts bare words from \w markers.
+ */
+function stripAlignmentMarkersUsfm(text) {
+  let result = text;
+  result = result.replace(/\\zaln-s\s*\|[^*]*\*/g, '');
+  result = result.replace(/\\zaln-e\\\*/g, '');
+  result = result.replace(/\\w\s+([^|]+)\|[^*]*\\w\*/g, '$1');
+  result = result.replace(/\\w\s+([^\\]+)\\w\*/g, '$1');
+  result = result.replace(/ {2,}/g, ' ');
+  result = result.replace(/ +([.,;:!?'")}])/g, '$1');
+  result = result.replace(/([{('"]) +/g, '$1');
+  result = result.replace(/ +\n/g, '\n');
+  result = result.replace(/\n{3,}/g, '\n\n');
+  return result;
+}
+
+/**
  * Extract a single chapter from a book-level USFM file.
  * Returns the file header (before first \c) plus the matching \c N block.
+ *
+ * @param {object} opts
+ * @param {string} opts.file - USFM file path relative to workspace
+ * @param {number} opts.chapter - Chapter number to extract
+ * @param {number} [opts.verseStart] - Optional start verse for range filtering
+ * @param {number} [opts.verseEnd] - Optional end verse for range filtering
+ * @param {boolean} [opts.plain] - Strip alignment markers before returning
  */
-function readUsfmChapter({ file, chapter }) {
+function readUsfmChapter({ file, chapter, verseStart, verseEnd, plain }) {
   const filePath = path.resolve(CSKILLBP_DIR, file);
   if (!fs.existsSync(filePath)) return `Error: file not found: ${file}`;
 
@@ -300,16 +325,48 @@ function readUsfmChapter({ file, chapter }) {
   const parts = content.split(/(\\c\s+\d+)/);
   const header = parts[0]; // everything before first \c
 
+  let chapterContent = null;
   for (let i = 1; i < parts.length; i += 2) {
     const marker = parts[i];
     const body = parts[i + 1] || '';
     const m = marker.match(/\\c\s+(\d+)/);
     if (m && parseInt(m[1], 10) === ch) {
-      return header + marker + body;
+      chapterContent = header + marker + body;
+      break;
     }
   }
 
-  return `Error: chapter ${ch} not found in ${file}`;
+  if (!chapterContent) return `Error: chapter ${ch} not found in ${file}`;
+
+  // Verse-range filtering: keep header + \c line + only verses in range
+  if (verseStart != null && verseEnd != null) {
+    const vs = parseInt(verseStart, 10);
+    const ve = parseInt(verseEnd, 10);
+    if (!isNaN(vs) && !isNaN(ve)) {
+      const lines = chapterContent.split('\n');
+      const filtered = [];
+      let inRange = true; // true until we see a \v marker outside range
+      let pastFirstVerse = false;
+      for (const line of lines) {
+        const vm = line.match(/^\\v\s+(\d+)\b/);
+        if (vm) {
+          const v = parseInt(vm[1], 10);
+          pastFirstVerse = true;
+          inRange = v >= vs && v <= ve;
+        }
+        if (!pastFirstVerse || inRange) {
+          filtered.push(line);
+        }
+      }
+      chapterContent = filtered.join('\n');
+    }
+  }
+
+  if (plain) {
+    chapterContent = stripAlignmentMarkersUsfm(chapterContent);
+  }
+
+  return chapterContent;
 }
 
 /**

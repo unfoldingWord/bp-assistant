@@ -221,10 +221,13 @@ function createWorkspaceTools(createSdkMcpServer, tool, z) {
 
       tool(
         'read_usfm_chapter',
-        'Read a single chapter from a book-level USFM file (returns header + chapter content, much smaller than the full file)',
+        'Read a single chapter from a book-level USFM file (returns header + chapter content, much smaller than the full file). Supports verse-range filtering and alignment stripping.',
         {
           file: z.string().describe('USFM file path relative to workspace (e.g. data/t4t/25-LAM.usfm)'),
           chapter: z.number().int().describe('Chapter number to extract'),
+          verseStart: z.number().int().optional().describe('Start verse for range filtering (inclusive)'),
+          verseEnd: z.number().int().optional().describe('End verse for range filtering (inclusive)'),
+          plain: z.boolean().optional().describe('Strip alignment markers (\\zaln, \\w) to return plain readable USFM'),
         },
         async (args) => ({
           content: [{ type: 'text', text: readUsfmChapter(args) }],

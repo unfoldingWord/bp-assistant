@@ -1082,6 +1082,21 @@ async function notesPipeline(route, message) {
       const duration = ((Date.now() - skillStart) / 1000).toFixed(1);
       const sdkSuccess = result?.subtype === 'success';
 
+      // Diagnostic log: budget and token info per skill
+      {
+        const turns = result?.num_turns ?? '?';
+        const cost = result?.total_cost_usd != null ? `$${result.total_cost_usd.toFixed(4)}` : '$?';
+        const inTok = result?.usage?.input_tokens ?? result?.usage?.inputTokens ?? 0;
+        const outTok = result?.usage?.output_tokens ?? result?.usage?.outputTokens ?? 0;
+        const tokens = inTok + outTok;
+        const budget = guardrails?.tokenBudget ?? '?';
+        const multiplier = guardrails?.multiplier != null ? guardrails.multiplier.toFixed(2) : '?';
+        const samples = guardrails?.historySamples ?? '?';
+        console.log(
+          `[notes] Skill complete: ${skill.name} ${book} ${ch} — turns=${turns}, cost=${cost}, tokens=${tokens}, budget=${budget}, multiplier=${multiplier}, historySamples=${samples}`
+        );
+      }
+
       // Log
       const logLine = `${new Date().toISOString()} | ${tag} | ${skill.name} | sdk=${sdkSuccess} | duration=${duration}s\n`;
       fs.appendFileSync(logFile, logLine);

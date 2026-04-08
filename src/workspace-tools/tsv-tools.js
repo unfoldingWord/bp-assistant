@@ -113,7 +113,7 @@ function splitTsv({ inputTsv, chunkSize = 40, ranges, outputDir }) {
     }
   }
 
-  if (chunkRanges.length <= 1) return path.resolve(inputPath);
+  if (chunkRanges.length <= 1 && !ranges) return path.resolve(inputPath);
 
   // Strip existing -vN-M suffix
   const dir = outputDir ? path.resolve(CSKILLBP_DIR, outputDir) : path.dirname(inputPath);

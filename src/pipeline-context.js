@@ -11,6 +11,28 @@ const { readUsfmChapter } = require('./workspace-tools/usfm-tools');
 
 const CSKILLBP_DIR = process.env.CSKILLBP_DIR || path.resolve(__dirname, '../../workspace');
 
+/**
+ * Strip alignment markers from USFM text, producing plain readable USFM.
+ * Removes \zaln-s/e milestones and extracts bare words from \w markers.
+ */
+function stripAlignmentMarkers(text) {
+  let result = text;
+  // Remove \zaln-s milestone with attributes
+  result = result.replace(/\\zaln-s\s*\|[^*]*\*/g, '');
+  // Remove \zaln-e milestones
+  result = result.replace(/\\zaln-e\\\*/g, '');
+  // Extract words from \w word|attrs\w*
+  result = result.replace(/\\w\s+([^|]+)\|[^*]*\\w\*/g, '$1');
+  result = result.replace(/\\w\s+([^\\]+)\\w\*/g, '$1');
+  // Normalize whitespace
+  result = result.replace(/ {2,}/g, ' ');
+  result = result.replace(/ +([.,;:!?'")}])/g, '$1');
+  result = result.replace(/([{('"]) +/g, '$1');
+  result = result.replace(/ +\n/g, '\n');
+  result = result.replace(/\n{3,}/g, '\n\n');
+  return result;
+}
+
 // --- Book number map (for hebrew bible path) ---
 
 const BOOK_NUMBERS = {
@@ -195,6 +217,20 @@ async function buildNotesContext({ book, chapter, verseStart, verseEnd, issuesPa
     targetFilename: 'ust_chapter.usfm',
   });
 
+  // Write plain (alignment-stripped) versions for model readability
+  const ultChapterPlainPath = `${dirPath}/ult_chapter_plain.usfm`;
+  const ustChapterPlainPath = `${dirPath}/ust_chapter_plain.usfm`;
+  const ultChapterAbs = path.resolve(CSKILLBP_DIR, ultChapterPath);
+  const ustChapterAbs = path.resolve(CSKILLBP_DIR, ustChapterPath);
+  fs.writeFileSync(
+    path.resolve(CSKILLBP_DIR, ultChapterPlainPath),
+    stripAlignmentMarkers(fs.readFileSync(ultChapterAbs, 'utf8'))
+  );
+  fs.writeFileSync(
+    path.resolve(CSKILLBP_DIR, ustChapterPlainPath),
+    stripAlignmentMarkers(fs.readFileSync(ustChapterAbs, 'utf8'))
+  );
+
   // Build hebrew path
   const bookUpper = book.toUpperCase();
   const num = BOOK_NUMBERS[bookUpper];
@@ -211,6 +247,8 @@ async function buildNotesContext({ book, chapter, verseStart, verseEnd, issuesPa
     sources: {
       ult: ultChapterPath,
       ust: ustChapterPath,
+      ultPlain: ultChapterPlainPath,
+      ustPlain: ustChapterPlainPath,
       ultFull: ultPath,
       ustFull: ustPath,
       hebrew: hebrewPath,
@@ -369,4 +407,5 @@ module.exports = {
   buildNotesContext,
   buildGenerateContext,
   buildUstContext,
+  stripAlignmentMarkers,
 };
