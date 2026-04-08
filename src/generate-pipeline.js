@@ -12,7 +12,7 @@ const config = require('./config');
 const { sendMessage, sendDM, addReaction, removeReaction, uploadFile } = require('./zulip-client');
 const { runClaude, DEFAULT_RESTRICTED_TOOLS, isTransientOutageError } = require('./claude-runner');
 const { extractContentTypes } = require('./router');
-const { getDoor43Username, buildBranchName, resolveOutputFile, discoverFreshOutput, calcSkillTimeout, normalizeBookName, resolveConflictMention, CSKILLBP_DIR } = require('./pipeline-utils');
+const { getDoor43Username, emailToFallbackUsername, buildBranchName, resolveOutputFile, discoverFreshOutput, calcSkillTimeout, normalizeBookName, resolveConflictMention, CSKILLBP_DIR } = require('./pipeline-utils');
 const { verifyRepoPush, verifyDcsToken } = require('./repo-verify');
 const { ensureFreshToken, isAuthError } = require('./auth-refresh');
 const { recordMetrics, getCumulativeTokens, recordRunSummary } = require('./usage-tracker');
@@ -287,9 +287,9 @@ async function generatePipeline(route, message) {
   if (!isFileResponse) {
     username = getDoor43Username(message.sender_email);
     if (!username) {
-      await addReaction(msgId, 'cross_mark');
-      await status(`No Door43 username mapped for ${message.sender_email}. Add it to door43-users.json.`);
-      return;
+      username = emailToFallbackUsername(message.sender_email);
+      console.warn(`[generate] No Door43 username for ${username} — add to door43-users.json`);
+      await status(`No Door43 username mapped for \`${username}\` — using as fallback. Add to door43-users.json to use a real username.`);
     }
   }
 

@@ -26,6 +26,17 @@ function getDoor43Username(senderEmail) {
   return users[senderEmail] || null;
 }
 
+// --- Derive a display-safe fallback from an email when no Door43 mapping exists ---
+// e.g. john.doe@example.org → jo..e@example.org
+function emailToFallbackUsername(email) {
+  const at = email.indexOf('@');
+  if (at < 0) return email.slice(0, 10);
+  const local = email.slice(0, at);
+  const domain = email.slice(at + 1);
+  const obfuscated = local.length <= 4 ? local : `${local.slice(0, 2)}..${local.slice(-1)}`;
+  return `${obfuscated}@${domain}`;
+}
+
 /**
  * Check if user has an existing branch on a Door43 repo.
  * @param {string} username - Door43 username
@@ -488,6 +499,7 @@ function parseChunkRange(filePath) {
 
 module.exports = {
   getDoor43Username,
+  emailToFallbackUsername,
   checkExistingBranch,
   buildBranchName,
   resolveOutputFile,

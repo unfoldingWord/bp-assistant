@@ -12,7 +12,7 @@ const path = require('path');
 const config = require('./config');
 const { sendMessage, sendDM, addReaction, removeReaction } = require('./zulip-client');
 const { runClaude, DEFAULT_RESTRICTED_TOOLS, isTransientOutageError } = require('./claude-runner');
-const { getDoor43Username, buildBranchName, resolveOutputFile, discoverFreshOutput, checkPrerequisites, calcSkillTimeout, normalizeBookName, resolveConflictMention, parsePartialTsv, truncatePartialTsv, parseChunkRange, CSKILLBP_DIR } = require('./pipeline-utils');
+const { getDoor43Username, emailToFallbackUsername, buildBranchName, resolveOutputFile, discoverFreshOutput, checkPrerequisites, calcSkillTimeout, normalizeBookName, resolveConflictMention, parsePartialTsv, truncatePartialTsv, parseChunkRange, CSKILLBP_DIR } = require('./pipeline-utils');
 const { splitTsv } = require('./workspace-tools/tsv-tools');
 const { fillTsvIds } = require('./workspace-tools/tn-tools');
 const { verifyRepoPush, verifyDcsToken } = require('./repo-verify');
@@ -482,11 +482,11 @@ async function notesPipeline(route, message) {
       : `${book} ${startChapter}\u2013${endChapter}`);
 
   // --- Look up Door43 username ---
-  const username = getDoor43Username(message.sender_email);
+  let username = getDoor43Username(message.sender_email);
   if (!username) {
-    await addReaction(msgId, 'cross_mark');
-    await status(`No Door43 username mapped for ${message.sender_email}. Add it to door43-users.json.`);
-    return;
+    username = emailToFallbackUsername(message.sender_email);
+    console.warn(`[notes] No Door43 username for ${username} — add to door43-users.json`);
+    await status(`No Door43 username mapped for ${username} — using as fallback. Add to door43-users.json to use a real username.`);
   }
 
   if (fresh) {
