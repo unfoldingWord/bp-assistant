@@ -820,6 +820,11 @@ async function notesPipeline(route, message) {
             forceNoAutoBashSandbox: true,
             timeoutMs,
             appendSystemPrompt: skill.appendSystemPrompt,
+            onProgress: ({ turnCount, lastTool, elapsedMs, timedOut }) => {
+              const elapsed = Math.round(elapsedMs / 60000);
+              const suffix = timedOut ? ' — **timed out**, aborting' : '';
+              return status(`Still running **${skill.name}** for ${ref} — ${elapsed}min, ${turnCount} tool calls${lastTool ? `, last: \`${lastTool}\`` : ''}${suffix}`);
+            },
           });
         } catch (err) {
           skillError = err;

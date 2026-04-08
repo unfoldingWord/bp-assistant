@@ -129,6 +129,7 @@ async function runClaudeOnce({
   maxTurns,
   timeoutMs,
   appendSystemPrompt,
+  onProgress,
 }) {
   await ensureFreshToken();
   const query = await getQuery();
@@ -138,10 +139,29 @@ async function runClaudeOnce({
 
   const abortController = new AbortController();
   const timeout = timeoutMs || DEFAULT_TIMEOUT_MS;
+  let turnCount = 0;
+  let lastTool = null;
+  const queryStart = Date.now();
+
   const timer = setTimeout(() => {
-    console.warn(`[claude-runner] Timeout reached (${timeout / 1000}s) — aborting query`);
+    const elapsed = Math.round((Date.now() - queryStart) / 1000);
+    console.warn(`[claude-runner] Timeout reached after ${elapsed}s — ${turnCount} tool calls, last tool: ${lastTool || 'none'} — aborting query`);
+    if (onProgress) {
+      try {
+        const p = onProgress({ turnCount, lastTool, elapsedMs: Date.now() - queryStart, timedOut: true });
+        if (p && typeof p.catch === 'function') p.catch(() => {});
+      } catch (_) {}
+    }
     abortController.abort();
   }, timeout);
+
+  const HEARTBEAT_MS = 10 * 60 * 1000;
+  const heartbeatTimer = onProgress ? setInterval(() => {
+    try {
+      const p = onProgress({ turnCount, lastTool, elapsedMs: Date.now() - queryStart, timedOut: false });
+      if (p && typeof p.catch === 'function') p.catch(() => {});
+    } catch (_) {}
+  }, HEARTBEAT_MS) : null;
 
   const options = buildOptions({
     cwd,
@@ -173,6 +193,8 @@ async function runClaudeOnce({
           if ('text' in block) {
             console.log(`[claude] ${block.text.slice(0, 200)}`);
           } else if ('name' in block) {
+            turnCount++;
+            lastTool = block.name;
             console.log(`[claude] Tool: ${block.name}(${JSON.stringify(block.input || {}).slice(0, 150)})`);
           }
         }
@@ -198,7 +220,8 @@ async function runClaudeOnce({
     }
   } catch (err) {
     if (err.name === 'AbortError' || abortController.signal.aborted) {
-      console.warn(`[claude-runner] Query aborted (timeout or manual abort)`);
+      const elapsed = Math.round((Date.now() - queryStart) / 1000);
+      console.warn(`[claude-runner] Query aborted after ${elapsed}s — ${turnCount} tool calls, last tool: ${lastTool || 'none'}`);
     } else {
       // Detect rate limit errors and calibrate the window budget
       const msg = (err.message || '').toLowerCase();
@@ -214,6 +237,7 @@ async function runClaudeOnce({
     }
   } finally {
     clearTimeout(timer);
+    if (heartbeatTimer) clearInterval(heartbeatTimer);
     try { conversation.close(); } catch (_) {}
   }
 
@@ -301,7 +325,7 @@ async function runClaude(args) {
   while (true) {
     attempt++;
     try {
-      const result = await runClaudeOnce(args);
+      const result = await runClaudeOnce({ ...args });
       if (result?.subtype === 'success') return result;
 
       const resultMsg = `${result?.subtype || ''} ${result?.error || ''} ${result?.result || ''}`.trim();

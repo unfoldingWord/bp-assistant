@@ -449,6 +449,11 @@ async function generatePipeline(route, message) {
             disableLocalSettings: true,
             forceNoAutoBashSandbox: true,
             timeoutMs,
+            onProgress: ({ turnCount, lastTool, elapsedMs, timedOut }) => {
+              const elapsed = Math.round(elapsedMs / 60000);
+              const suffix = timedOut ? ' — **timed out**, aborting' : '';
+              return status(`Still working on **${book} ${ch}** (${skill}) — ${elapsed}min, ${turnCount} tool calls${lastTool ? `, last: \`${lastTool}\`` : ''}${suffix}`);
+            },
           });
         } else {
           claudeResult = { subtype: 'success', resumed: true };
@@ -746,6 +751,11 @@ async function generatePipeline(route, message) {
         disableLocalSettings: true,
         forceNoAutoBashSandbox: true,
         timeoutMs: alignTimeout,
+        onProgress: ({ turnCount, lastTool, elapsedMs, timedOut }) => {
+          const elapsed = Math.round(elapsedMs / 60000);
+          const suffix = timedOut ? ' — **timed out**, aborting' : '';
+          return status(`Still aligning **${book} ${ch}** — ${elapsed}min, ${turnCount} tool calls${lastTool ? `, last: \`${lastTool}\`` : ''}${suffix}`);
+        },
       });
       const alignDuration = ((Date.now() - chapterStart) / 1000).toFixed(1);
 
