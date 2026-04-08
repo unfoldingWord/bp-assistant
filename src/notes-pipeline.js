@@ -15,6 +15,7 @@ const { runClaude, DEFAULT_RESTRICTED_TOOLS, isTransientOutageError } = require(
 const { getDoor43Username, emailToFallbackUsername, buildBranchName, resolveOutputFile, discoverFreshOutput, checkPrerequisites, calcSkillTimeout, normalizeBookName, resolveConflictMention, parsePartialTsv, truncatePartialTsv, parseChunkRange, CSKILLBP_DIR } = require('./pipeline-utils');
 const { splitTsv } = require('./workspace-tools/tsv-tools');
 const { fillTsvIds } = require('./workspace-tools/tn-tools');
+const { normalizeIssuesFile, buildParallelismIntroHintArgs } = require('./issue-normalizer');
 const { verifyRepoPush, verifyDcsToken } = require('./repo-verify');
 const { recordMetrics, getCumulativeTokens, recordRunSummary } = require('./usage-tracker');
 const { door43Push, checkConflictingBranches, REPO_MAP, getRepoFilename } = require('./door43-push');
@@ -38,6 +39,10 @@ const DEEP_ISSUE_ID_HINT =
 const TN_QUALITY_CHECK_HINT =
   'Run the MCP mechanical checks (fix_trailing_newlines, check_tn_quality), then do the full semantic review (Steps 3-4), and write the quality report. ' +
   'Keep the conversation short: run checks, fix issues, write the report, done.';
+
+const PARALLELISM_HIGH_THRESHOLD = 5;
+const PARALLELISM_EXCEPTION_CAP = 1;
+const PARALLELISM_DUPLICATE_THRESHOLD = 0.75;
 
 // Ranges where chapter intros are provided by the human editor and must be skipped.
 const SKIP_INTRO_RANGES = [
@@ -77,6 +82,10 @@ function buildNotesPaths(book, tag, hasVerseRange, verseStart, verseEnd) {
 function buildIssuesPath(book, tag, hasVerseRange, verseStart, verseEnd) {
   if (!hasVerseRange) return `output/issues/${book}/${tag}.tsv`;
   return `output/issues/${book}/${tag}-v${verseStart}-${verseEnd}.tsv`;
+}
+
+function buildChapterIntroPrompt(skillRef, issuesPath, ctxFlag, introHintArgs = '') {
+  return `${skillRef} --issues ${issuesPath}${ctxFlag}${introHintArgs || ''}`;
 }
 
 function removeIfExists(absPath) {
@@ -593,6 +602,8 @@ async function notesPipeline(route, message) {
     let issuesPath;
     let failedSkill = null;
     const chapterStart = Date.now();
+    let chapterIntroHintArgs = '';
+    let issueNormalizationDone = false;
 
     // --- Build pipeline context (fetch authoritative ULT/UST from Door43) ---
     let contextPath = null;
@@ -622,6 +633,7 @@ async function notesPipeline(route, message) {
 
     // --- Build skill chain based on prerequisite availability ---
     const skills = [];
+    const issueProducerSkillNames = new Set(['deep-issue-id', 'post-edit-review']);
 
     if (hasAIArtifacts) {
       // AI artifacts found -> post-edit-review path
@@ -656,7 +668,7 @@ async function notesPipeline(route, message) {
     if (shouldRunIntro(book, ch, withIntro)) {
       skills.push({
         name: 'chapter-intro',
-        prompt: `${skillRef} --issues ${issuesPath}${ctxFlag}`,
+        prompt: buildChapterIntroPrompt(skillRef, issuesPath, ctxFlag, chapterIntroHintArgs),
         expectedOutput: issuesPath,
         skipPreClean: true, // expectedOutput is also input; do not delete verse issues before intro insertion
         ops: 1,
@@ -718,6 +730,56 @@ async function notesPipeline(route, message) {
     }
     if (chOutputs['deep-issue-id']) issuesPath = chOutputs['deep-issue-id'];
     else if (chOutputs['post-edit-review']) issuesPath = chOutputs['post-edit-review'];
+
+    async function runIssueNormalizationStage() {
+      if (!issuesPath || issueNormalizationDone) return;
+      const result = normalizeIssuesFile({
+        issuesPath,
+        options: {
+          highParallelismThreshold: PARALLELISM_HIGH_THRESHOLD,
+          exceptionCap: PARALLELISM_EXCEPTION_CAP,
+          duplicateSimilarityThreshold: PARALLELISM_DUPLICATE_THRESHOLD,
+        },
+      });
+      issueNormalizationDone = true;
+
+      if (withIntro) {
+        chapterIntroHintArgs = buildParallelismIntroHintArgs(result.introSignal);
+      }
+
+      if (pipeDir && result.introSignal) {
+        updateContextArtifacts(pipeDir, 'parallelism_signal', result.introSignal);
+      }
+
+      const s = result.summary;
+      const signal = result.introSignal?.parallelism_signal || 'none';
+      await status(
+        `**${ref}**: issue-normalizer kept ${s.kept_parallelism_rows}/${s.total_parallelism_rows} parallelism rows ` +
+        `(exceptions: ${s.kept_parallelism_exceptions}, dropped: ${s.dropped_parallelism_rows}), intro signal: ${signal}.`
+      );
+      console.log(
+        `[notes] issue-normalizer ${ref}: ` +
+        `parallelism total=${s.total_parallelism_rows}, kept=${s.kept_parallelism_rows}, ` +
+        `exceptions=${s.kept_parallelism_exceptions}, dropped=${s.dropped_parallelism_rows}, signal=${signal}`
+      );
+
+      // Keep downstream prompts pinned to normalized issues path and intro hint.
+      for (const sk of skills) {
+        if (sk.prompt && sk.prompt.includes('--issues ')) {
+          sk.prompt = sk.prompt.replace(/--issues\s+\S+/, `--issues ${issuesPath}`);
+        }
+      }
+      for (const sk of skills) {
+        if (sk.name === 'chapter-intro') {
+          sk.prompt = buildChapterIntroPrompt(skillRef, issuesPath, ctxFlag, chapterIntroHintArgs);
+        }
+      }
+    }
+
+    // If resuming after issue-producer stages, normalize before chapter-intro/tn-writer.
+    if (issuesPath && skills[startSkillIndex] && !issueProducerSkillNames.has(skills[startSkillIndex].name)) {
+      await runIssueNormalizationStage();
+    }
 
     for (let si = startSkillIndex; si < skills.length; si++) {
       const skill = skills[si];
@@ -982,6 +1044,9 @@ async function notesPipeline(route, message) {
               s.prompt = s.prompt.replace(/--issues\s+\S+/, `--issues ${issuesPath}`);
             }
           }
+        }
+        if (issueProducerSkillNames.has(skill.name)) {
+          await runIssueNormalizationStage();
         }
         // Pass resolved notes path to quality-check so it can find the file
         if (skill.name === 'tn-writer') {
@@ -1323,4 +1388,5 @@ module.exports = {
   parseWriteNotesCommand,
   buildParsedNotesRequest,
   shouldRunIntro,
+  buildChapterIntroPrompt,
 };

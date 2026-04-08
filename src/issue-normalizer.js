@@ -1,0 +1,255 @@
+// issue-normalizer.js — Deterministic chapter-level normalization for issue TSVs
+
+const fs = require('fs');
+const path = require('path');
+const { CSKILLBP_DIR } = require('./pipeline-utils');
+
+const DEFAULTS = {
+  highParallelismThreshold: 5,
+  exceptionCap: 1,
+  duplicateSimilarityThreshold: 0.75,
+  uniqueReasonCodes: new Set(['tricola', 'pivot', 'ellipsis-critical', 'structure-shift']),
+};
+
+function parseTsvLine(line) {
+  const cols = line.split('\t');
+  while (cols.length < 7) cols.push('');
+  return cols;
+}
+
+function toTsvLine(cols) {
+  return cols.join('\t');
+}
+
+function normalizeIssueType(raw) {
+  const text = String(raw || '').trim();
+  if (!text) return '';
+  const rc = text.match(/translate\/([^\s;,]+)/i);
+  if (rc) return rc[1].trim().toLowerCase();
+  return text.toLowerCase();
+}
+
+function tokenize(text) {
+  return String(text || '')
+    .toLowerCase()
+    .replace(/[^a-z0-9\s-]/g, ' ')
+    .split(/\s+/)
+    .filter(Boolean);
+}
+
+function jaccardSimilarity(aText, bText) {
+  const a = new Set(tokenize(aText));
+  const b = new Set(tokenize(bText));
+  if (!a.size && !b.size) return 1;
+  if (!a.size || !b.size) return 0;
+  let inter = 0;
+  for (const w of a) if (b.has(w)) inter++;
+  return inter / (a.size + b.size - inter);
+}
+
+function hasFirstInstanceTag(explanation) {
+  const txt = String(explanation || '');
+  return /\bt:\s*first\s+instance\b/i.test(txt) || /\bfirst\s+instance\b/i.test(txt);
+}
+
+function stripFirstInstanceTag(explanation) {
+  let txt = String(explanation || '');
+  txt = txt
+    .replace(/\b(?:;\s*)?t:\s*first\s+instance\b(?:\s*[-–—:]\s*)?/ig, ' ')
+    .replace(/\b(?:;\s*)?first\s+instance\b(?:\s*[-–—:]\s*)?/ig, ' ')
+    .replace(/\s{2,}/g, ' ')
+    .replace(/\s+([,.;:!?])/g, '$1')
+    .trim();
+  return txt;
+}
+
+function extractUniqueReason(explanation, reasonCodes) {
+  const m = String(explanation || '').match(/\breason:\s*([a-z-]+)/i);
+  if (!m) return null;
+  const code = m[1].toLowerCase();
+  return reasonCodes.has(code) ? code : null;
+}
+
+function classifyParallelism(explanation) {
+  const text = String(explanation || '').toLowerCase();
+  if (/\bsynthetic\s+parallelism\b/.test(text)) return 'synthetic';
+  if (/\bantithetical\s+parallelism\b/.test(text)) return 'antithetical';
+  return 'synonymous_or_unspecified';
+}
+
+function buildIntroSignal(rawSynonymousCount, threshold) {
+  return rawSynonymousCount >= threshold
+    ? { parallelism_signal: 'high', parallelism_synonymous_count: rawSynonymousCount }
+    : { parallelism_signal: null, parallelism_synonymous_count: rawSynonymousCount };
+}
+
+function normalizeIssueRows(lines, options = {}) {
+  const cfg = {
+    highParallelismThreshold: options.highParallelismThreshold ?? DEFAULTS.highParallelismThreshold,
+    exceptionCap: options.exceptionCap ?? DEFAULTS.exceptionCap,
+    duplicateSimilarityThreshold: options.duplicateSimilarityThreshold ?? DEFAULTS.duplicateSimilarityThreshold,
+    uniqueReasonCodes: options.uniqueReasonCodes || DEFAULTS.uniqueReasonCodes,
+  };
+
+  const output = [];
+  const summary = {
+    total_rows: 0,
+    total_parallelism_rows: 0,
+    raw_synonymous_parallelism_rows: 0,
+    kept_parallelism_rows: 0,
+    kept_parallelism_exceptions: 0,
+    dropped_parallelism_rows: 0,
+    dropped_nonsynonymous_parallelism_rows: 0,
+    dropped_unqualified_parallelism_rows: 0,
+    dropped_duplicate_parallelism_rows: 0,
+    dropped_exception_cap_parallelism_rows: 0,
+    dropped_invalid_reason_parallelism_rows: 0,
+    first_instance_tags_removed: 0,
+  };
+
+  let firstKeptParallelism = null;
+  const keptParallelismRows = [];
+  let keptExceptionCount = 0;
+  let firstInstanceAssigned = false;
+
+  for (const line of lines) {
+    if (!line.trim()) continue;
+    const cols = parseTsvLine(line);
+    const isHeader = cols[0].toLowerCase() === 'book' && String(cols[1] || '').toLowerCase() === 'reference';
+    if (isHeader) {
+      output.push(toTsvLine(cols));
+      continue;
+    }
+    summary.total_rows++;
+
+    const issueType = normalizeIssueType(cols[2]);
+    if (issueType !== 'figs-parallelism') {
+      output.push(toTsvLine(cols));
+      continue;
+    }
+
+    summary.total_parallelism_rows++;
+    const explanation = cols[6] || '';
+    const quote = cols[3] || '';
+    const classification = classifyParallelism(explanation);
+    if (classification === 'synonymous_or_unspecified') {
+      summary.raw_synonymous_parallelism_rows++;
+    }
+
+    if (classification === 'synthetic' || classification === 'antithetical') {
+      summary.dropped_parallelism_rows++;
+      summary.dropped_nonsynonymous_parallelism_rows++;
+      continue;
+    }
+
+    if (!firstKeptParallelism) {
+      firstKeptParallelism = { quote, explanation, ref: cols[1] };
+      keptParallelismRows.push(firstKeptParallelism);
+      if (hasFirstInstanceTag(explanation)) {
+        firstInstanceAssigned = true;
+      }
+      summary.kept_parallelism_rows++;
+      output.push(toTsvLine(cols));
+      continue;
+    }
+
+    const hasUniqueQualifier = /\bq:\s*unique-parallelism\b/i.test(explanation);
+    const reasonCode = extractUniqueReason(explanation, cfg.uniqueReasonCodes);
+    if (!hasUniqueQualifier) {
+      summary.dropped_parallelism_rows++;
+      summary.dropped_unqualified_parallelism_rows++;
+      continue;
+    }
+
+    if (!reasonCode) {
+      summary.dropped_parallelism_rows++;
+      summary.dropped_invalid_reason_parallelism_rows++;
+      continue;
+    }
+
+    if (keptExceptionCount >= cfg.exceptionCap) {
+      summary.dropped_parallelism_rows++;
+      summary.dropped_exception_cap_parallelism_rows++;
+      continue;
+    }
+
+    const candidateText = `${quote} ${explanation}`;
+    const isNearDuplicate = keptParallelismRows.some((k) => {
+      const baseText = `${k.quote} ${k.explanation}`;
+      return jaccardSimilarity(baseText, candidateText) >= cfg.duplicateSimilarityThreshold;
+    });
+    if (isNearDuplicate) {
+      summary.dropped_parallelism_rows++;
+      summary.dropped_duplicate_parallelism_rows++;
+      continue;
+    }
+
+    if (hasFirstInstanceTag(explanation)) {
+      if (firstInstanceAssigned) {
+        cols[6] = stripFirstInstanceTag(explanation);
+        summary.first_instance_tags_removed++;
+      } else {
+        firstInstanceAssigned = true;
+      }
+    }
+
+    const kept = { quote, explanation: cols[6] || '', ref: cols[1] };
+    keptParallelismRows.push(kept);
+    keptExceptionCount++;
+    summary.kept_parallelism_rows++;
+    summary.kept_parallelism_exceptions++;
+    output.push(toTsvLine(cols));
+  }
+
+  // Second pass: ensure only one first-instance marker among kept rows.
+  if (summary.kept_parallelism_rows > 0) {
+    let seen = false;
+    for (let i = 0; i < output.length; i++) {
+      const cols = parseTsvLine(output[i]);
+      if (normalizeIssueType(cols[2]) !== 'figs-parallelism') continue;
+      const exp = cols[6] || '';
+      if (!hasFirstInstanceTag(exp)) continue;
+      if (!seen) {
+        seen = true;
+      } else {
+        cols[6] = stripFirstInstanceTag(exp);
+        output[i] = toTsvLine(cols);
+        summary.first_instance_tags_removed++;
+      }
+    }
+  }
+
+  const introSignal = buildIntroSignal(
+    summary.raw_synonymous_parallelism_rows,
+    cfg.highParallelismThreshold
+  );
+
+  return { lines: output, summary, introSignal };
+}
+
+function normalizeIssuesFile({ issuesPath, options = {} }) {
+  const absPath = path.resolve(CSKILLBP_DIR, issuesPath);
+  const content = fs.readFileSync(absPath, 'utf8');
+  const hadTrailingNewline = content.endsWith('\n');
+  const lines = content.split('\n').filter((line) => line.trim().length > 0);
+  const result = normalizeIssueRows(lines, options);
+  const outputText = result.lines.join('\n') + (hadTrailingNewline ? '\n' : '');
+  fs.writeFileSync(absPath, outputText);
+  return {
+    normalizedPath: issuesPath,
+    summary: result.summary,
+    introSignal: result.introSignal,
+  };
+}
+
+function buildParallelismIntroHintArgs(introSignal) {
+  if (!introSignal || introSignal.parallelism_signal !== 'high') return '';
+  const count = Number(introSignal.parallelism_synonymous_count || 0);
+  return ` --parallelism-signal high --parallelism-count ${count}`;
+}
+
+module.exports = {
+  normalizeIssueRows,
+  normalizeIssuesFile,
+  buildParallelismIntroHintArgs,
+};
