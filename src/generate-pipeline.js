@@ -19,7 +19,7 @@ const { recordMetrics, getCumulativeTokens, recordRunSummary } = require('./usag
 const { door43Push, checkConflictingBranches, REPO_MAP, getRepoFilename } = require('./door43-push');
 const { setPendingMerge } = require('./pending-merges');
 const { getCheckpoint, setCheckpoint, clearCheckpoint } = require('./pipeline-checkpoints');
-const { buildGenerateContext, cleanupPipelineDir } = require('./pipeline-context');
+const { buildGenerateContext, buildUstContext, cleanupPipelineDir } = require('./pipeline-context');
 
 const LOG_DIR = path.resolve(__dirname, '../logs');
 const REQUIRED_INITIAL_PIPELINE_FILES = [
@@ -73,7 +73,12 @@ function cleanupGenerateArtifacts({ book, chapter, verseStart, verseEnd }) {
 }
 
 function parseGenerateCommand(content) {
-  const input = content.toLowerCase();
+  const input = content
+    .replace(/\bULT\b/ig, ' ')
+    .replace(/\bUST\b/ig, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .toLowerCase();
   const fresh = hasFreshFlag(content);
   const contentTypes = extractContentTypes(content);
   const noAlign = /--no-align\b/i.test(String(content || ''));
@@ -131,6 +136,28 @@ function parseGenerateCommand(content) {
   }
 
   return null;
+}
+
+function buildParsedGenerateRequest(route, content) {
+  if (route && route._synthetic) {
+    return {
+      book: route._book,
+      start: route._startChapter,
+      end: route._endChapter,
+      verseStart: route._verseStart ?? null,
+      verseEnd: route._verseEnd ?? null,
+      fresh: hasFreshFlag(content),
+      contentTypes: extractContentTypes(content),
+      noAlign: /--no-align\b/i.test(String(content || '')),
+      alignOnly: /--align-only\b/i.test(String(content || '')),
+    };
+  }
+  return parseGenerateCommand(content);
+}
+
+function hasRequiredGeneratedOutputs(contentTypes, outputs) {
+  const neededTypes = Array.isArray(contentTypes) && contentTypes.length ? contentTypes : ['ult', 'ust'];
+  return neededTypes.every((type) => (type === 'ult' ? outputs.hasUlt : outputs.hasUst));
 }
 
 function isUsageLimitError(text) {
@@ -233,22 +260,7 @@ async function generatePipeline(route, message) {
   }
 
   // Parse command \u2014 support both regex-parsed and synthetic routes from intent classifier
-  let parsed;
-  if (route._synthetic) {
-    parsed = {
-      book: route._book,
-      start: route._startChapter,
-      end: route._endChapter,
-      verseStart: route._verseStart ?? null,
-      verseEnd: route._verseEnd ?? null,
-      fresh: hasFreshFlag(message.content),
-      contentTypes: extractContentTypes(message.content),
-      noAlign: /--no-align\b/i.test(String(message.content || '')),
-      alignOnly: /--align-only\b/i.test(String(message.content || '')),
-    };
-  } else {
-    parsed = parseGenerateCommand(message.content);
-  }
+  const parsed = buildParsedGenerateRequest(route, message.content);
 
   if (!parsed) {
     await addReaction(msgId, 'cross_mark');
@@ -387,6 +399,8 @@ async function generatePipeline(route, message) {
     let claudeResult = null;
     let sdkError = null;
     const runInitialSkill = !(ch === resumeChapter && resumeSkill === 'align-all-parallel');
+    let directUstContext = null;
+    let directUstUltPath = null;
 
     if (!runInitialSkill) {
       await status(`Resuming ${chapterRef} at **align-all-parallel**.`);
@@ -433,13 +447,28 @@ async function generatePipeline(route, message) {
       try {
         const timeoutMs = calcSkillTimeout(book, ch, route.operations || 6);
         const skillRef = hasVerseRange ? `${book} ${ch}:${verseStart}-${verseEnd}` : `${book} ${ch}`;
+        let initialPrompt = skillRef;
+        if (skill === 'UST-gen') {
+          const existingUlt = resolveOutputFile(`output/AI-ULT/${hasVerseRange ? `${book}-${ch}-vv${verseStart}-${verseEnd}` : `${book}-${ch}`}.usfm`, book)
+            || discoverFreshOutput('output/AI-ULT', book, new RegExp(`^${book}-0*${ch}(-(?!.*aligned).*)?\\.usfm$`), null);
+          directUstContext = await buildUstContext({
+            book,
+            chapter: ch,
+            verseStart: hasVerseRange ? verseStart : undefined,
+            verseEnd: hasVerseRange ? verseEnd : undefined,
+            localUltPath: existingUlt || null,
+          });
+          directUstUltPath = directUstContext.selectedUltPath;
+          initialPrompt = `${skillRef} --context ${directUstContext.contextPath}`;
+          console.log(`[generate] UST-gen context created: ${directUstContext.contextPath} (ULT source: ${directUstUltPath})`);
+        }
         console.log(`[generate] Starting ${book} ${ch}${hasVerseRange ? `:${verseStart}-${verseEnd}` : ''} — skill: ${skill}`);
         if (alignOnly) {
           await status(`Skipping generation (**align-only** mode) for ${book} ${ch}`);
           claudeResult = { subtype: 'success', resumed: true };
         } else if (runInitialSkill) {
           claudeResult = await runClaude({
-            prompt: skillRef,
+            prompt: initialPrompt,
             cwd: CSKILLBP_DIR,
             model,
             betas,
@@ -574,29 +603,38 @@ async function generatePipeline(route, message) {
       continue;
     }
 
-    if (!hasUst) {
-      await status(`Failed to generate **${book} ${ch}**. UST not produced${hasUlt ? ' (ULT exists but may be incomplete)' : ''}. Check logs for details.`);
+    if (!hasRequiredGeneratedOutputs(contentTypes, { hasUlt, hasUst })) {
+      const missingTypes = contentTypes.filter((type) => (type === 'ult' ? !hasUlt : !hasUst)).map((type) => type.toUpperCase());
+      await status(`Failed to generate **${book} ${ch}**. Missing expected output: ${missingTypes.join(', ')}.${hasUlt || hasUst ? ' Some artifacts exist but may be incomplete.' : ''} Check logs for details.`);
       fail++;
       setCheckpoint(checkpointRef, {
         state: 'failed',
         success,
         fail,
         completedChapters,
-        current: { chapter: ch, skill, status: 'failed', errorKind: 'missing_output', outputStatus: 'missing' },
+        current: {
+          chapter: ch,
+          skill,
+          status: 'failed',
+          errorKind: 'missing_output',
+          outputStatus: 'missing',
+          missingTypes,
+        },
         resume: { chapter: ch, skill },
       });
       continue;
     }
 
-    if (runInitialSkill && !hasVerseRange && !isFreshOutput(ustRel, chapterStart)) {
-      await status(`Failed to generate **${book} ${ch}**: output appears stale from an earlier run (${ustRel}).`);
+    const freshnessTarget = contentTypes.includes('ust') ? ustRel : ultRel;
+    if (runInitialSkill && !hasVerseRange && freshnessTarget && !isFreshOutput(freshnessTarget, chapterStart)) {
+      await status(`Failed to generate **${book} ${ch}**: output appears stale from an earlier run (${freshnessTarget}).`);
       fail++;
       setCheckpoint(checkpointRef, {
         state: 'failed',
         success,
         fail,
         completedChapters,
-        current: { chapter: ch, skill, status: 'failed', errorKind: 'stale_output', outputStatus: 'stale', outputPath: ustRel },
+        current: { chapter: ch, skill, status: 'failed', errorKind: 'stale_output', outputStatus: 'stale', outputPath: freshnessTarget },
         resume: { chapter: ch, skill },
       });
       continue;
@@ -674,13 +712,15 @@ async function generatePipeline(route, message) {
     let genContextPath = null;
     let genPipeDir = null;
     try {
+      const alignmentUltPath = contentTypes.includes('ult') ? ultRel : (directUstUltPath || ultRel);
       const genCtx = buildGenerateContext({
         book,
         chapter: ch,
-        ultPath: ultRel,
+        ultPath: alignmentUltPath,
         ustPath: ustRel || undefined,
         verseStart: hasVerseRange ? verseStart : undefined,
         verseEnd: hasVerseRange ? verseEnd : undefined,
+        dirPath: directUstContext?.dirPath || null,
       });
       genPipeDir = genCtx.dirPath;
       genContextPath = genCtx.contextPath;
@@ -1182,4 +1222,9 @@ async function generatePipeline(route, message) {
   clearCheckpoint(checkpointRef);
 }
 
-module.exports = { generatePipeline };
+module.exports = {
+  generatePipeline,
+  parseGenerateCommand,
+  buildParsedGenerateRequest,
+  hasRequiredGeneratedOutputs,
+};

@@ -1,7 +1,7 @@
 // notes-pipeline.js — Multi-skill sequential pipeline for translation note writing
 // Triggered by: "write notes <book> <chapter>" or "write notes <book> <start>-<end>"
 // Skills: [post-edit-review OR deep-issue-id] -> [chapter-intro] -> tn-writer (Opus) -> tn-quality-check (Sonnet) -> repo-insert (Haiku)
-// chapter-intro is skipped by default; enabled when "with intro" is passed (unless auto-exclusion applies)
+// chapter-intro runs by default; disabled only when the user opts out.
 //
 // Each chapter is fully processed (skills + repo-insert + repo-verify) before
 // moving to the next, so the editor gets access as soon as a chapter merges.
@@ -39,21 +39,16 @@ const TN_QUALITY_CHECK_HINT =
   'Run the MCP mechanical checks (fix_trailing_newlines, check_tn_quality), then do the full semantic review (Steps 3-4), and write the quality report. ' +
   'Keep the conversation short: run checks, fix issues, write the report, done.';
 
-// Ranges where the chapter intro is written by the human editor — skip automatically.
-// PSA 42-123: Books 2-4 handled by Benjamin; 119-123 is a subset but listed explicitly.
-const SKIP_INTRO_RANGES = [
-  { book: 'PSA', start: 42, end: 123 },
-];
-
-function shouldRunIntro(book, chapter, withIntroFlag) {
-  if (!withIntroFlag) return false;
-  // Auto-exclusion ranges still override even if "with intro" is requested
-  if (SKIP_INTRO_RANGES.some(r => r.book === book && chapter >= r.start && chapter <= r.end)) return false;
-  return true;
+function shouldRunIntro(withIntroFlag) {
+  return !!withIntroFlag;
 }
 
 function hasWithIntroFlag(content) {
   return /--with-?intro\b/i.test(content) || /\bwith[\s-]intro\b/i.test(content);
+}
+
+function hasNoIntroFlag(content) {
+  return /--no-?intro\b/i.test(String(content || '')) || /\bno[\s-]intro\b/i.test(String(content || ''));
 }
 
 function hasFreshFlag(content) {
@@ -66,6 +61,11 @@ function buildNotesPaths(book, tag, hasVerseRange, verseStart, verseEnd) {
     ? `output/notes/${book}/${tag}-vv${verseStart}-${verseEnd}.tsv`
     : chapterRel;
   return { chapterRel, shardRel };
+}
+
+function buildIssuesPath(book, tag, hasVerseRange, verseStart, verseEnd) {
+  if (!hasVerseRange) return `output/issues/${book}/${tag}.tsv`;
+  return `output/issues/${book}/${tag}-v${verseStart}-${verseEnd}.tsv`;
 }
 
 function removeIfExists(absPath) {
@@ -192,13 +192,15 @@ function buildUsageLimitResetTag(errorText) {
 // --- Parse "write notes BOOK CH" or "write notes BOOK CH:VS-VS" or "write notes BOOK CH1-CH2" ---
 function parseWriteNotesCommand(content) {
   // Range: write notes PSA 66-72 or write notes for PSA 66-72
+  const withIntro = !hasNoIntroFlag(content) || hasWithIntroFlag(content);
+
   const rangeMatch = content.match(/write notes(?:\s+for)?\s+(\w+)\s+(\d+)\s*[-\u2013\u2014to]+\s*(\d+)/i);
   if (rangeMatch) {
     return {
       book: normalizeBookName(rangeMatch[1]),
       startChapter: parseInt(rangeMatch[2], 10),
       endChapter: parseInt(rangeMatch[3], 10),
-      withIntro: hasWithIntroFlag(content),
+      withIntro,
       fresh: hasFreshFlag(content),
     };
   }
@@ -213,7 +215,7 @@ function parseWriteNotesCommand(content) {
       endChapter: ch,
       verseStart: parseInt(verseMatch[3], 10),
       verseEnd: parseInt(verseMatch[4], 10),
-      withIntro: hasWithIntroFlag(content),
+      withIntro,
       fresh: hasFreshFlag(content),
     };
   }
@@ -226,12 +228,27 @@ function parseWriteNotesCommand(content) {
       book: normalizeBookName(singleMatch[1]),
       startChapter: ch,
       endChapter: ch,
-      withIntro: hasWithIntroFlag(content),
+      withIntro,
       fresh: hasFreshFlag(content),
     };
   }
 
   return null;
+}
+
+function buildParsedNotesRequest(route, content) {
+  if (route && route._synthetic) {
+    return {
+      book: route._book,
+      startChapter: route._startChapter,
+      endChapter: route._endChapter,
+      verseStart: route._verseStart ?? null,
+      verseEnd: route._verseEnd ?? null,
+      withIntro: !hasNoIntroFlag(content) || hasWithIntroFlag(content),
+      fresh: hasFreshFlag(content),
+    };
+  }
+  return parseWriteNotesCommand(content);
 }
 
 // Default verse chunk size for parallel tn-writer batching
@@ -445,18 +462,7 @@ async function notesPipeline(route, message) {
 
   // --- Parse command ---
   // Support both regex-parsed commands and synthetic routes from intent classifier
-  let parsed;
-  if (route._synthetic) {
-    parsed = {
-      book: route._book,
-      startChapter: route._startChapter,
-      endChapter: route._endChapter,
-      withIntro: hasWithIntroFlag(message.content),
-      fresh: hasFreshFlag(message.content),
-    };
-  } else {
-    parsed = parseWriteNotesCommand(message.content);
-  }
+  const parsed = buildParsedNotesRequest(route, message.content);
 
   if (!parsed) {
     await addReaction(msgId, 'cross_mark');
@@ -592,6 +598,7 @@ async function notesPipeline(route, message) {
         verseEnd: hasVerseRange ? verseEnd : undefined,
         issuesPath: hasAIArtifacts ? resolved['issues TSV'] : undefined,
         alignedUltPath: alignedExists ? alignedUltPath : undefined,
+        reuseExisting: !fresh && !!existingCheckpoint && ch === resumeChapter,
       });
       pipeDir = ctxResult.dirPath;
       contextPath = ctxResult.contextPath;
@@ -621,8 +628,7 @@ async function notesPipeline(route, message) {
       });
     } else {
       // No AI artifacts -> deep-issue-id path (fetches from Door43 master)
-      const issuesVTag = hasVerseRange ? `${tag}-vv${verseStart}-${verseEnd}` : tag;
-      issuesPath = `output/issues/${issuesVTag}.tsv`;
+      issuesPath = buildIssuesPath(book, tag, hasVerseRange, verseStart, verseEnd);
       await status(`**${ref}**: No AI artifacts (missing: ${missing.join(', ')}) \u2192 deep-issue-id path`);
 
       const verseFlag = hasVerseRange ? ` --verses ${verseStart}-${verseEnd}` : '';
@@ -636,15 +642,13 @@ async function notesPipeline(route, message) {
     }
 
     // chapter-intro: only runs when "with intro" is requested (and not in auto-exclusion range)
-    if (shouldRunIntro(book, ch, withIntro)) {
+    if (shouldRunIntro(withIntro)) {
       skills.push({
         name: 'chapter-intro',
         prompt: `${skillRef} --issues ${issuesPath}${ctxFlag}`,
         expectedOutput: issuesPath,
         ops: 1,
       });
-    } else if (withIntro) {
-      await status(`**${ref}**: skipping chapter-intro (auto-excluded range)`);
     }
 
     const { chapterRel: notesChapterRel, shardRel: notesShardRel } = buildNotesPaths(
@@ -960,8 +964,8 @@ async function notesPipeline(route, message) {
           issuesPath = resolved;
           // Update subsequent skill prompts that reference issuesPath
           for (const s of skills) {
-            if (s.prompt && s.prompt.includes(`output/issues/${tag}.tsv`)) {
-              s.prompt = s.prompt.replace(`output/issues/${tag}.tsv`, issuesPath);
+            if (s.prompt && s.prompt.includes('--issues ')) {
+              s.prompt = s.prompt.replace(/--issues\s+\S+/, `--issues ${issuesPath}`);
             }
           }
         }
@@ -1294,4 +1298,8 @@ async function notesPipeline(route, message) {
   }
 }
 
-module.exports = { notesPipeline };
+module.exports = {
+  notesPipeline,
+  parseWriteNotesCommand,
+  buildParsedNotesRequest,
+};

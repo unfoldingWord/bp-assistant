@@ -147,6 +147,83 @@ function normalizeScopeText(scopeText) {
     .trim();
 }
 
+function parseIntentScope(scopeText, startChapter, endChapter) {
+  const normalized = normalizeScopeText(scopeText);
+  const fallbackStart = Number.isFinite(startChapter) ? startChapter : null;
+  const fallbackEnd = Number.isFinite(endChapter) ? endChapter : fallbackStart;
+
+  if (!normalized) {
+    return { scopeText: null, startChapter: fallbackStart, endChapter: fallbackEnd, verseStart: null, verseEnd: null };
+  }
+
+  const crossChapterVerseRange = normalized.match(/^(\d+):(\d+)-(\d+):(\d+)$/);
+  if (crossChapterVerseRange) {
+    return {
+      scopeText: normalized,
+      startChapter: Number(crossChapterVerseRange[1]),
+      endChapter: Number(crossChapterVerseRange[3]),
+      verseStart: null,
+      verseEnd: null,
+    };
+  }
+
+  const verseRange = normalized.match(/^(\d+):(\d+)-(\d+)$/);
+  if (verseRange) {
+    const chapter = Number(verseRange[1]);
+    return {
+      scopeText: normalized,
+      startChapter: chapter,
+      endChapter: chapter,
+      verseStart: Number(verseRange[2]),
+      verseEnd: Number(verseRange[3]),
+    };
+  }
+
+  const singleVerse = normalized.match(/^(\d+):(\d+)$/);
+  if (singleVerse) {
+    const chapter = Number(singleVerse[1]);
+    const verse = Number(singleVerse[2]);
+    return {
+      scopeText: normalized,
+      startChapter: chapter,
+      endChapter: chapter,
+      verseStart: verse,
+      verseEnd: verse,
+    };
+  }
+
+  const chapterRange = normalized.match(/^(\d+)-(\d+)$/);
+  if (chapterRange) {
+    return {
+      scopeText: normalized,
+      startChapter: Number(chapterRange[1]),
+      endChapter: Number(chapterRange[2]),
+      verseStart: null,
+      verseEnd: null,
+    };
+  }
+
+  const singleChapter = normalized.match(/^(\d+)$/);
+  if (singleChapter) {
+    const chapter = Number(singleChapter[1]);
+    return {
+      scopeText: normalized,
+      startChapter: chapter,
+      endChapter: chapter,
+      verseStart: null,
+      verseEnd: null,
+    };
+  }
+
+  return {
+    scopeText: normalized,
+    startChapter: fallbackStart,
+    endChapter: fallbackEnd,
+    verseStart: null,
+    verseEnd: null,
+  };
+}
+
 function parseEditorNoteRemainder(remainder) {
   const raw = (remainder || '').trim();
   if (!raw) return { scope: null, noteText: '' };
@@ -259,8 +336,8 @@ function getResumeCheckpoint(route, sessionKey, captures) {
     ? {
         book: route._book,
         chapters: [route._startChapter, route._endChapter].filter((n) => Number.isFinite(n)),
-        verseStart: null,
-        verseEnd: null,
+        verseStart: route._verseStart ?? null,
+        verseEnd: route._verseEnd ?? null,
       }
     : parseBookChapters(captures || []);
   if (!parsed.book || !parsed.chapters || parsed.chapters.length === 0) return null;
@@ -290,8 +367,8 @@ function getActiveCheckpoint(route, sessionKey, captures) {
     ? {
         book: route._book,
         chapters: [route._startChapter, route._endChapter].filter((n) => Number.isFinite(n)),
-        verseStart: null,
-        verseEnd: null,
+        verseStart: route._verseStart ?? null,
+        verseEnd: route._verseEnd ?? null,
       }
     : parseBookChapters(captures || []);
   if (!parsed.book || !parsed.chapters || parsed.chapters.length === 0) return null;
@@ -445,6 +522,7 @@ function buildSyntheticRoute(intent, senderName) {
     : (intent.startChapter === intent.endChapter
       ? `${intent.book} ${intent.startChapter}`
       : `${intent.book} ${intent.startChapter}–${intent.endChapter}`);
+  const parsedScope = parseIntentScope(intent.scopeText, intent.startChapter, intent.endChapter);
 
   if (intent.intent === 'editor-review') {
     const types = intent.contentTypes || ['ult', 'ust'];
@@ -453,9 +531,11 @@ function buildSyntheticRoute(intent, senderName) {
       ...baseRoute,
       _synthetic: true,
       _book: intent.book,
-      _startChapter: intent.startChapter,
-      _endChapter: intent.endChapter,
-      _scopeText: intent.scopeText || null,
+      _startChapter: parsedScope.startChapter,
+      _endChapter: parsedScope.endChapter,
+      _scopeText: parsedScope.scopeText,
+      _verseStart: parsedScope.verseStart,
+      _verseEnd: parsedScope.verseEnd,
       _contentTypes: types,
       confirmMessage: `I'll compare the human-edited **${rangeLabel}** ${typeLabel} against what the AI generated and identify improvements. Sound right? (yes/no)`,
         systemPrompt: buildEditorReviewSystemPrompt(types, senderName, intent.scopeText),
@@ -466,9 +546,11 @@ function buildSyntheticRoute(intent, senderName) {
     ...baseRoute,
     _synthetic: true,
     _book: intent.book,
-    _startChapter: intent.startChapter,
-    _endChapter: intent.endChapter,
-    _scopeText: intent.scopeText || null,
+    _startChapter: parsedScope.startChapter,
+    _endChapter: parsedScope.endChapter,
+    _scopeText: parsedScope.scopeText,
+    _verseStart: parsedScope.verseStart,
+    _verseEnd: parsedScope.verseEnd,
     confirmMessage: intent.intent === 'generate'
       ? `I'll generate the initial content (ULT & UST, issues draft) for **${rangeLabel}**. Sound right? (yes/no)`
       : `I'll write translation notes for **${rangeLabel}**. Sound right? (yes/no)`,
@@ -1066,4 +1148,11 @@ function hasActiveSession(channel, topic, senderId) {
   return hasActiveStreamSession(channel, topic, senderId);
 }
 
-module.exports = { routeMessage, hasPendingAction, hasActiveSession, extractContentTypes };
+module.exports = {
+  routeMessage,
+  hasPendingAction,
+  hasActiveSession,
+  extractContentTypes,
+  buildSyntheticRoute,
+  parseIntentScope,
+};

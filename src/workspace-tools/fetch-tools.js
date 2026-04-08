@@ -75,6 +75,25 @@ function httpsGet(url) {
   });
 }
 
+function httpsHead(url) {
+  return new Promise((resolve, reject) => {
+    const req = https.request(url, { method: 'HEAD', timeout: 30000 }, (res) => {
+      if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+        res.resume();
+        return httpsHead(res.headers.location).then(resolve, reject);
+      }
+      if (res.statusCode !== 200) {
+        res.resume();
+        return reject(new Error(`HTTP ${res.statusCode} for ${url}`));
+      }
+      res.resume();
+      resolve(res.headers);
+    });
+    req.on('error', reject);
+    req.end();
+  });
+}
+
 // --- Cache helpers ---
 
 function getCachedDate(filepath) {
@@ -177,6 +196,26 @@ async function fetchDoor43({ book, repo, branch, user, output }) {
     return `Saved ${filename} to ${outPath} (${content.split('\n').length} lines)`;
   }
   return content;
+}
+
+async function getDoor43FileInfo({ book, repo, branch, user }) {
+  const normalized = normalizeBook(book);
+  const num = BOOK_NUMBERS[normalized];
+  if (!num) throw new Error(`Unknown book: ${book}`);
+  const filename = `${num}-${normalized}.usfm`;
+  const org = user || 'unfoldingWord';
+  const repoName = repo || 'en_ult';
+  const branchName = branch || 'master';
+  const url = `https://git.door43.org/${org}/${repoName}/raw/branch/${branchName}/${filename}`;
+  const headers = await httpsHead(url);
+  const lastModified = headers['last-modified'] || null;
+  const lastModifiedMs = lastModified ? Date.parse(lastModified) : null;
+  return {
+    url,
+    lastModified,
+    lastModifiedMs: Number.isFinite(lastModifiedMs) ? lastModifiedMs : null,
+    etag: headers.etag || null,
+  };
 }
 
 // --- Google Sheets/Docs fetch ---
@@ -284,6 +323,7 @@ module.exports = {
   fetchUst,
   fetchT4t,
   fetchDoor43,
+  getDoor43FileInfo,
   fetchGlossary,
   fetchIssuesResolved,
   fetchTemplates,

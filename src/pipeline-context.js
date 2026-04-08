@@ -6,7 +6,7 @@
 
 const fs = require('fs');
 const path = require('path');
-const { fetchDoor43 } = require('./workspace-tools/fetch-tools');
+const { fetchDoor43, getDoor43FileInfo } = require('./workspace-tools/fetch-tools');
 const { readUsfmChapter } = require('./workspace-tools/usfm-tools');
 
 const CSKILLBP_DIR = process.env.CSKILLBP_DIR || path.resolve(__dirname, '../../workspace');
@@ -48,16 +48,25 @@ function buildPipeDirName(book, chapter, verseStart, verseEnd) {
  * Create a per-chapter pipeline working directory.
  * Returns the path relative to CSKILLBP_DIR.
  */
-function createPipelineDir({ book, chapter, verseStart, verseEnd }) {
+function createPipelineDir({ book, chapter, verseStart, verseEnd, reset = true }) {
   const dirName = buildPipeDirName(book, chapter, verseStart, verseEnd);
   const relPath = `tmp/pipeline/${dirName}`;
   const absPath = path.resolve(CSKILLBP_DIR, relPath);
-  // Clean any stale directory from a previous run
-  if (fs.existsSync(absPath)) {
+  // Clean any stale directory from a previous run when requested.
+  if (reset && fs.existsSync(absPath)) {
     fs.rmSync(absPath, { recursive: true, force: true });
   }
   fs.mkdirSync(absPath, { recursive: true });
   return relPath;
+}
+
+function buildRuntimePaths(dirPath) {
+  return {
+    preparedNotes: `${dirPath}/prepared_notes.json`,
+    generatedNotes: `${dirPath}/generated_notes.json`,
+    alignmentData: `${dirPath}/alignment_data.json`,
+    tnQualityFindings: `${dirPath}/tn_quality_findings.json`,
+  };
 }
 
 /**
@@ -164,8 +173,8 @@ function cleanupStalePipelineDirs(maxAgeMs = 24 * 60 * 60 * 1000) {
  * @param {string} [opts.alignedUltPath] - path to aligned ULT if it exists
  * @returns {Promise<{dirPath: string, contextPath: string}>}
  */
-async function buildNotesContext({ book, chapter, verseStart, verseEnd, issuesPath, alignedUltPath }) {
-  const dirPath = createPipelineDir({ book, chapter, verseStart, verseEnd });
+async function buildNotesContext({ book, chapter, verseStart, verseEnd, issuesPath, alignedUltPath, reuseExisting = false }) {
+  const dirPath = createPipelineDir({ book, chapter, verseStart, verseEnd, reset: !reuseExisting });
   const now = new Date().toISOString();
 
   // Fetch current ULT and UST from Door43 master
@@ -212,6 +221,7 @@ async function buildNotesContext({ book, chapter, verseStart, verseEnd, issuesPa
       ult: { from: 'door43', repo: 'en_ult', branch: 'master', fetchedAt: now },
       ust: { from: 'door43', repo: 'en_ust', branch: 'master', fetchedAt: now },
     },
+    runtime: buildRuntimePaths(dirPath),
     artifacts: {},
   };
 
@@ -232,8 +242,8 @@ async function buildNotesContext({ book, chapter, verseStart, verseEnd, issuesPa
  * @param {number} [opts.verseEnd]
  * @returns {{dirPath: string, contextPath: string}}
  */
-function buildGenerateContext({ book, chapter, ultPath, ustPath, verseStart, verseEnd }) {
-  const dirPath = createPipelineDir({ book, chapter, verseStart, verseEnd });
+function buildGenerateContext({ book, chapter, ultPath, ustPath, verseStart, verseEnd, dirPath: existingDirPath = null }) {
+  const dirPath = existingDirPath || createPipelineDir({ book, chapter, verseStart, verseEnd, reset: true });
   const bookUpper = book.toUpperCase();
   const num = BOOK_NUMBERS[bookUpper];
   const hebrewPath = num ? `data/hebrew_bible/${num}-${bookUpper}.usfm` : null;
@@ -255,11 +265,96 @@ function buildGenerateContext({ book, chapter, ultPath, ustPath, verseStart, ver
       ult: { from: 'pipeline', skill: 'initial-pipeline' },
       ust: ustPath ? { from: 'pipeline', skill: 'initial-pipeline' } : null,
     },
+    runtime: buildRuntimePaths(dirPath),
     artifacts: {},
   };
 
   writeContext(dirPath, context);
   return { dirPath, contextPath: `${dirPath}/context.json` };
+}
+
+async function buildUstContext({ book, chapter, verseStart, verseEnd, localUltPath }) {
+  const dirPath = createPipelineDir({ book, chapter, verseStart, verseEnd, reset: true });
+  const now = new Date().toISOString();
+  const bookUpper = book.toUpperCase();
+  const num = BOOK_NUMBERS[bookUpper];
+  const hebrewPath = num ? `data/hebrew_bible/${num}-${bookUpper}.usfm` : null;
+
+  const [door43UltInfo, masterUltFull] = await Promise.all([
+    getDoor43FileInfo({ book, repo: 'en_ult', branch: 'master' }),
+    fetchSourceToDir(dirPath, { book, repo: 'en_ult', targetFilename: 'ult_master.usfm' }),
+  ]);
+  const masterUltPath = extractChapterToDir(dirPath, {
+    sourceFile: masterUltFull,
+    chapter,
+    targetFilename: 'ult_master_chapter.usfm',
+  });
+
+  let selectedUltPath = masterUltPath;
+  let selectedOrigin = {
+    from: 'door43',
+    repo: 'en_ult',
+    branch: 'master',
+    fetchedAt: now,
+    lastModified: door43UltInfo.lastModified,
+  };
+
+  if (localUltPath) {
+    const localAbsPath = path.resolve(CSKILLBP_DIR, localUltPath);
+    if (fs.existsSync(localAbsPath)) {
+      const localStat = fs.statSync(localAbsPath);
+      const localModifiedAt = new Date(localStat.mtimeMs).toISOString();
+      const remoteModifiedMs = door43UltInfo.lastModifiedMs;
+      if (!remoteModifiedMs || localStat.mtimeMs >= remoteModifiedMs) {
+        selectedUltPath = localUltPath;
+        selectedOrigin = {
+          from: 'pipeline',
+          skill: 'ULT-gen',
+          selectedBecause: remoteModifiedMs ? 'local_generated_newer_or_equal' : 'remote_timestamp_unavailable',
+          modifiedAt: localModifiedAt,
+          comparedToDoor43LastModified: door43UltInfo.lastModified,
+        };
+      }
+    }
+  }
+
+  const context = {
+    version: 1,
+    pipeline: 'generate',
+    mode: 'ust-only',
+    book: bookUpper,
+    chapter,
+    verseStart: verseStart || null,
+    verseEnd: verseEnd || null,
+    startedAt: now,
+    sources: {
+      ult: selectedUltPath,
+      ultFull: selectedUltPath === localUltPath ? null : masterUltFull,
+      ust: null,
+      hebrew: hebrewPath,
+      issues: null,
+    },
+    sourceOrigin: {
+      ult: selectedOrigin,
+      door43UltMaster: {
+        from: 'door43',
+        repo: 'en_ult',
+        branch: 'master',
+        fetchedAt: now,
+        lastModified: door43UltInfo.lastModified,
+        chapterPath: masterUltPath,
+      },
+    },
+    runtime: buildRuntimePaths(dirPath),
+    artifacts: {},
+  };
+
+  writeContext(dirPath, context);
+  return {
+    dirPath,
+    contextPath: `${dirPath}/context.json`,
+    selectedUltPath,
+  };
 }
 
 module.exports = {
@@ -273,4 +368,5 @@ module.exports = {
   cleanupStalePipelineDirs,
   buildNotesContext,
   buildGenerateContext,
+  buildUstContext,
 };
