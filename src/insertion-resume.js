@@ -149,6 +149,8 @@ async function runGenerateInsertPhase(completedChapters, username, book) {
 
   for (const ch of completedChapters) {
     let chapterFailed = false;
+    let ultNoChanges = false;
+    let ustNoChanges = false;
     const pushStartTime = new Date().toISOString();
 
     // door43-push ULT
@@ -164,6 +166,7 @@ async function runGenerateInsertPhase(completedChapters, username, book) {
         await status(`**door43-push** (ULT) failed for ${book} ${ch.ch}: ${pushResultUlt.details}`);
         chapterFailed = true;
       } else {
+        ultNoChanges = pushResultUlt.noChanges === true;
         await status(`**door43-push** (ULT) done for ${book} ${ch.ch}: ${pushResultUlt.details}`);
       }
     } catch (err) {
@@ -186,6 +189,7 @@ async function runGenerateInsertPhase(completedChapters, username, book) {
           await status(`**door43-push** (UST) failed for ${book} ${ch.ch}: ${pushResultUst.details}`);
           chapterFailed = true;
         } else {
+          ustNoChanges = pushResultUst.noChanges === true;
           await status(`**door43-push** (UST) done for ${book} ${ch.ch}: ${pushResultUst.details}`);
         }
       } catch (err) {
@@ -198,19 +202,27 @@ async function runGenerateInsertPhase(completedChapters, username, book) {
     // repo-verify: belt-and-suspenders check
     if (!chapterFailed) {
       const stagingBranch = buildBranchName(book, ch.ch);
-      await status(`Verifying merges for ${book} ${ch.ch}...`);
-      const ultVerify = await verifyRepoPush({ repo: 'en_ult', stagingBranch, since: pushStartTime });
-      const ustVerify = await verifyRepoPush({ repo: 'en_ust', stagingBranch, since: pushStartTime });
+      const verifyUlt = !ultNoChanges;
+      const verifyUst = !ustNoChanges;
+      const skippedTypes = [ultNoChanges && 'ULT', ustNoChanges && 'UST'].filter(Boolean);
+      if (skippedTypes.length > 0) {
+        await status(`Repo verify SKIPPED (${skippedTypes.join(' and ')}) for ${book} ${ch.ch}: no content changes to push`);
+      }
+      if (verifyUlt || verifyUst) {
+        await status(`Verifying merges for ${book} ${ch.ch}...`);
+      }
+      const ultVerify = verifyUlt ? await verifyRepoPush({ repo: 'en_ult', stagingBranch, since: pushStartTime }) : { success: true };
+      const ustVerify = verifyUst ? await verifyRepoPush({ repo: 'en_ust', stagingBranch, since: pushStartTime }) : { success: true };
 
-      if (!ultVerify.success) {
+      if (verifyUlt && !ultVerify.success) {
         await status(`Repo verify FAILED (ULT) for ${book} ${ch.ch}: ${ultVerify.details}`);
         chapterFailed = true;
       }
-      if (!ustVerify.success) {
+      if (verifyUst && !ustVerify.success) {
         await status(`Repo verify FAILED (UST) for ${book} ${ch.ch}: ${ustVerify.details}`);
         chapterFailed = true;
       }
-      if (ultVerify.success && ustVerify.success) await status(`Repo verify OK for ${book} ${ch.ch}`);
+      if (ultVerify.success && ustVerify.success && (verifyUlt || verifyUst)) await status(`Repo verify OK for ${book} ${ch.ch}`);
     }
 
     if (chapterFailed) fail++;
@@ -230,6 +242,7 @@ async function runNotesInsertPhase(completedChapters, username, book) {
 
   for (const ch of completedChapters) {
     let chapterFailed = false;
+    let pushNoChanges = false;
     const pushStartTime = new Date().toISOString();
 
     await status(`Running deferred **door43-push** (TN) for ${book} ${ch.ch}...`);
@@ -244,6 +257,7 @@ async function runNotesInsertPhase(completedChapters, username, book) {
         await status(`**door43-push** (TN) failed for ${book} ${ch.ch}: ${pushResult.details}`);
         chapterFailed = true;
       } else {
+        pushNoChanges = pushResult.noChanges === true;
         await status(`**door43-push** (TN) done for ${book} ${ch.ch}: ${pushResult.details}`);
       }
     } catch (err) {
@@ -254,14 +268,18 @@ async function runNotesInsertPhase(completedChapters, username, book) {
 
     // repo-verify: belt-and-suspenders check
     if (!chapterFailed) {
-      const stagingBranch = buildBranchName(book, ch.ch);
-      await status(`Verifying merge for ${book} ${ch.ch}...`);
-      const verify = await verifyRepoPush({ repo: 'en_tn', stagingBranch, since: pushStartTime });
-      if (!verify.success) {
-        await status(`Repo verify FAILED for ${book} ${ch.ch}: ${verify.details}`);
-        chapterFailed = true;
+      if (pushNoChanges) {
+        await status(`Repo verify SKIPPED for ${book} ${ch.ch}: no content changes to push`);
       } else {
-        await status(`Repo verify OK for ${book} ${ch.ch}`);
+        const stagingBranch = buildBranchName(book, ch.ch);
+        await status(`Verifying merge for ${book} ${ch.ch}...`);
+        const verify = await verifyRepoPush({ repo: 'en_tn', stagingBranch, since: pushStartTime });
+        if (!verify.success) {
+          await status(`Repo verify FAILED for ${book} ${ch.ch}: ${verify.details}`);
+          chapterFailed = true;
+        } else {
+          await status(`Repo verify OK for ${book} ${ch.ch}`);
+        }
       }
     }
 

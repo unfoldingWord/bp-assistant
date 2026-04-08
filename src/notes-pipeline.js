@@ -1,7 +1,7 @@
 // notes-pipeline.js — Multi-skill sequential pipeline for translation note writing
 // Triggered by: "write notes <book> <chapter>" or "write notes <book> <start>-<end>"
 // Skills: [post-edit-review OR deep-issue-id] -> [chapter-intro] -> tn-writer (Opus) -> tn-quality-check (Sonnet) -> repo-insert (Haiku)
-// chapter-intro runs by default; disabled only when the user opts out.
+// chapter-intro runs by default; disabled when the user opts out or auto-excluded.
 //
 // Each chapter is fully processed (skills + repo-insert + repo-verify) before
 // moving to the next, so the editor gets access as soon as a chapter merges.
@@ -39,8 +39,19 @@ const TN_QUALITY_CHECK_HINT =
   'Run the MCP mechanical checks (fix_trailing_newlines, check_tn_quality), then do the full semantic review (Steps 3-4), and write the quality report. ' +
   'Keep the conversation short: run checks, fix issues, write the report, done.';
 
-function shouldRunIntro(withIntroFlag) {
-  return !!withIntroFlag;
+// Ranges where chapter intros are provided by the human editor and must be skipped.
+const SKIP_INTRO_RANGES = [
+  { book: 'PSA', start: 1, end: 150 },
+];
+
+function isIntroAutoExcluded(book, chapter) {
+  return SKIP_INTRO_RANGES.some(r => r.book === book && chapter >= r.start && chapter <= r.end);
+}
+
+function shouldRunIntro(book, chapter, withIntroFlag) {
+  if (!withIntroFlag) return false;
+  if (isIntroAutoExcluded(book, chapter)) return false;
+  return true;
 }
 
 function hasWithIntroFlag(content) {
@@ -642,13 +653,16 @@ async function notesPipeline(route, message) {
     }
 
     // chapter-intro: only runs when "with intro" is requested (and not in auto-exclusion range)
-    if (shouldRunIntro(withIntro)) {
+    if (shouldRunIntro(book, ch, withIntro)) {
       skills.push({
         name: 'chapter-intro',
         prompt: `${skillRef} --issues ${issuesPath}${ctxFlag}`,
         expectedOutput: issuesPath,
+        skipPreClean: true, // expectedOutput is also input; do not delete verse issues before intro insertion
         ops: 1,
       });
+    } else if (withIntro && isIntroAutoExcluded(book, ch)) {
+      await status(`**${ref}**: skipping chapter-intro (auto-excluded range)`);
     }
 
     const { chapterRel: notesChapterRel, shardRel: notesShardRel } = buildNotesPaths(
@@ -1108,6 +1122,7 @@ async function notesPipeline(route, message) {
       }
     }
 
+    let pushNoChanges = false;
     if (!chapterFailed) await status(`Running **door43-push** (TN) for ${ref}...`);
     const pushStartTime = new Date().toISOString();
     if (!chapterFailed) try {
@@ -1121,6 +1136,7 @@ async function notesPipeline(route, message) {
         await status(`**door43-push** (TN) failed for ${ref}: ${pushResult.details}`);
         chapterFailed = true;
       } else {
+        pushNoChanges = pushResult.noChanges === true;
         await status(`**door43-push** (TN) done for ${ref}: ${pushResult.details}`);
       }
     } catch (err) {
@@ -1129,7 +1145,11 @@ async function notesPipeline(route, message) {
       chapterFailed = true;
     }
 
-    if (!chapterFailed) {
+    if (!chapterFailed && pushNoChanges) {
+      await status(`Repo verify SKIPPED for ${ref}: no content changes to push`);
+    }
+
+    if (!chapterFailed && !pushNoChanges) {
       await status(`Verifying push for ${ref}...`);
       const stagingBranch = buildBranchName(book, ch);
       const verify = await verifyRepoPush({ repo: 'en_tn', stagingBranch, since: pushStartTime });
@@ -1302,4 +1322,5 @@ module.exports = {
   notesPipeline,
   parseWriteNotesCommand,
   buildParsedNotesRequest,
+  shouldRunIntro,
 };

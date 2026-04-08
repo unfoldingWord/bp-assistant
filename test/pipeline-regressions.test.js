@@ -10,6 +10,7 @@ const {
 const {
   parseWriteNotesCommand,
   buildParsedNotesRequest,
+  shouldRunIntro,
 } = require('../src/notes-pipeline');
 
 test('synthetic notes route preserves verse ranges from intent scopeText', () => {
@@ -82,4 +83,10 @@ test('write notes defaults to running chapter intro unless explicitly disabled',
 
   const disabledParsed = parseWriteNotesCommand('write notes for isa 51 --no-intro');
   assert.equal(disabledParsed.withIntro, false);
+});
+
+test('chapter intro is auto-skipped for Psalms', () => {
+  assert.equal(shouldRunIntro('PSA', 35, true), false);
+  assert.equal(shouldRunIntro('PSA', 119, true), false);
+  assert.equal(shouldRunIntro('ISA', 51, true), true);
 });
