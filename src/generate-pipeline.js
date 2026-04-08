@@ -433,6 +433,7 @@ async function generatePipeline(route, message) {
       try {
         const timeoutMs = calcSkillTimeout(book, ch, route.operations || 6);
         const skillRef = hasVerseRange ? `${book} ${ch}:${verseStart}-${verseEnd}` : `${book} ${ch}`;
+        console.log(`[generate] Starting ${book} ${ch}${hasVerseRange ? `:${verseStart}-${verseEnd}` : ''} — skill: ${skill}`);
         if (alignOnly) {
           await status(`Skipping generation (**align-only** mode) for ${book} ${ch}`);
           claudeResult = { subtype: 'success', resumed: true };
@@ -539,7 +540,9 @@ async function generatePipeline(route, message) {
     }
 
     if (!claudeResult || claudeResult.subtype !== 'success') {
-      const errText = claudeResult?.error || claudeResult?.result || `Claude returned subtype "${claudeResult?.subtype || 'unknown'}"`;
+      const errText = !claudeResult
+        ? 'timed out or was aborted (no result returned)'
+        : (claudeResult.error || claudeResult.result || `non-success subtype: "${claudeResult.subtype}"`);
       if (isUsageLimitError(errText)) {
         abortForUsageLimit = true;
         usageLimitTag = buildUsageLimitResetTag(errText);
@@ -747,7 +750,9 @@ async function generatePipeline(route, message) {
       const alignDuration = ((Date.now() - chapterStart) / 1000).toFixed(1);
 
       if (!alignResult || alignResult.subtype !== 'success') {
-        const errText = alignResult?.error || alignResult?.result || `Claude returned subtype "${alignResult?.subtype || 'unknown'}"`;
+        const errText = !alignResult
+          ? 'timed out or was aborted (no result returned)'
+          : (alignResult.error || alignResult.result || `non-success subtype: "${alignResult.subtype}"`);
         if (isUsageLimitError(errText)) {
           abortForUsageLimit = true;
           usageLimitTag = buildUsageLimitResetTag(errText);

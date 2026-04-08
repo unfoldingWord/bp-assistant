@@ -9,6 +9,12 @@ const { verifyDcsToken } = require('./repo-verify');
 const { startResourceMonitor } = require('./resource-monitor');
 const { ensureClaudeConfig } = require('./claude-config-init');
 
+// Prepend ISO timestamp to every console line
+['log', 'warn', 'error'].forEach(method => {
+  const orig = console[method].bind(console);
+  console[method] = (...args) => orig(`[${new Date().toISOString()}]`, ...args);
+});
+
 let myUserId = null;
 
 async function registerQueue(client) {

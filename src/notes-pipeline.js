@@ -808,6 +808,7 @@ async function notesPipeline(route, message) {
         result = { subtype: 'success', num_turns: 0, duration_ms: 200, total_cost_usd: 0 };
       } else {
         try {
+          console.log(`[notes] Starting skill ${skill.name} for ${ref}`);
           result = await runClaude({
             prompt: skill.prompt,
             cwd: CSKILLBP_DIR,
@@ -874,7 +875,9 @@ async function notesPipeline(route, message) {
       // Hard fail on non-success result payloads, even if old output files exist.
       if (!result || result.subtype !== 'success') {
         failedSkill = skill.name;
-        const errText = result?.error || result?.result || `Claude returned subtype "${result?.subtype || 'unknown'}"`;
+        const errText = !result
+          ? 'timed out or was aborted (no result returned)'
+          : (result.error || result.result || `non-success subtype: "${result.subtype}"`);
         if (isUsageLimitError(errText)) {
           abortForUsageLimit = true;
           usageLimitTag = buildUsageLimitResetTag(errText);
