@@ -130,6 +130,7 @@ async function runClaudeOnce({
   timeoutMs,
   appendSystemPrompt,
   onProgress,
+  guardrails,
 }) {
   await ensureFreshToken();
   const query = await getQuery();
@@ -142,6 +143,8 @@ async function runClaudeOnce({
   let turnCount = 0;
   let lastTool = null;
   const queryStart = Date.now();
+  const toolErrorSigs = new Map();
+  let consecutiveToolErrors = 0;
 
   const timer = setTimeout(() => {
     const elapsed = Math.round((Date.now() - queryStart) / 1000);
@@ -204,6 +207,35 @@ async function runClaudeOnce({
         const text = typeof message.message?.content === 'string'
           ? message.message.content
           : JSON.stringify(message.message?.content || '');
+        const lower = text.toLowerCase();
+        const isToolError = lower.includes('tool_use_error');
+        if (isToolError) {
+          const sig = lower.includes('string to replace not found')
+            ? 'string_not_found'
+            : lower.includes('no changes to make')
+              ? 'no_op_edit'
+              : lower.includes('file has been modified since read')
+                ? 'stale_edit'
+                : 'other_tool_error';
+          consecutiveToolErrors += 1;
+          toolErrorSigs.set(sig, (toolErrorSigs.get(sig) || 0) + 1);
+          if (guardrails) {
+            const maxConsecutive = Number(guardrails.maxConsecutiveToolErrors || 0);
+            const maxSigRepeats = Number(guardrails.maxRepeatedToolErrorSignature || 0);
+            const sigRepeats = Number(toolErrorSigs.get(sig) || 0);
+            const stopForConsecutive = maxConsecutive > 0 && consecutiveToolErrors >= maxConsecutive;
+            const stopForRepeats = maxSigRepeats > 0 && sigRepeats >= maxSigRepeats && sig !== 'other_tool_error';
+            if (stopForConsecutive || stopForRepeats) {
+              throw new Error(
+                `Guardrail stop: repeated tool errors (${sig}, consecutive=${consecutiveToolErrors}, repeats=${sigRepeats})`
+              );
+            }
+          }
+        } else if (lower.includes('tool_result')) {
+          // Only reset on non-error tool results to avoid false positives during
+          // legitimate read/validation sequences.
+          consecutiveToolErrors = 0;
+        }
         if (text.includes('command-stderr') || text.includes('Error')) {
           console.error(`[claude-runner] SDK user message (error): ${text.slice(0, 500)}`);
         } else {
@@ -216,6 +248,9 @@ async function runClaudeOnce({
         }
       } else {
         console.log(`[claude-runner] SDK event: ${message.type}${message.subtype ? '/' + message.subtype : ''}`);
+      }
+      if (guardrails && Number(guardrails.maxToolCalls || 0) > 0 && turnCount >= Number(guardrails.maxToolCalls)) {
+        throw new Error(`Guardrail stop: max tool calls exceeded (${turnCount}/${guardrails.maxToolCalls})`);
       }
     }
   } catch (err) {
@@ -326,6 +361,20 @@ async function runClaude(args) {
     attempt++;
     try {
       const result = await runClaudeOnce({ ...args });
+      if (args?.guardrails?.tokenBudget && result?.usage) {
+        const u = result.usage || {};
+        const total = (u.input_tokens ?? u.inputTokens ?? 0)
+          + (u.output_tokens ?? u.outputTokens ?? 0)
+          + (u.cache_read_input_tokens ?? u.cacheReadInputTokens ?? 0)
+          + (u.cache_creation_input_tokens ?? u.cacheCreationInputTokens ?? 0);
+        if (total > Number(args.guardrails.tokenBudget)) {
+          return {
+            ...result,
+            subtype: 'error',
+            error: `Guardrail stop: token budget exceeded (${total}/${args.guardrails.tokenBudget})`,
+          };
+        }
+      }
       if (result?.subtype === 'success') return result;
 
       const resultMsg = `${result?.subtype || ''} ${result?.error || ''} ${result?.result || ''}`.trim();

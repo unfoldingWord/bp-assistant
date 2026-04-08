@@ -491,6 +491,92 @@ function formatTokens(n) {
   return String(n);
 }
 
+function median(values) {
+  if (!values.length) return null;
+  const sorted = values.slice().sort((a, b) => a - b);
+  return sorted[Math.floor(sorted.length / 2)];
+}
+
+function verseBucket(verses) {
+  const v = Number(verses || 0);
+  if (v <= 20) return 'small';
+  if (v <= 45) return 'medium';
+  return 'large';
+}
+
+/**
+ * Compute adaptive per-skill guardrails with warm-up defaults.
+ * Warm-up behavior: when historical samples are sparse, keep multiplier at a
+ * safe balanced default (never near-zero).
+ */
+function getAdaptiveSkillGuardrails({
+  pipeline,
+  skill,
+  book,
+  verses = 0,
+  issueCount = 0,
+  sourceWordCount = 0,
+} = {}) {
+  const cfg = getConfig().adaptiveGuards || {};
+  const minBudget = Number(cfg.minBudgetTokens || 120000);
+  const maxBudget = Number(cfg.maxBudgetTokens || 1400000);
+  const wordFactor = Number(cfg.wordFactor || 35);
+  const issueFactor = Number(cfg.issueFactor || 12000);
+  const warmupSamples = Number(cfg.warmupSamples || 3);
+  const warmupMultiplier = Number(cfg.warmupMultiplier || 1.0);
+  const minMultiplier = Number(cfg.minMultiplier || 0.7);
+  const maxMultiplier = Number(cfg.maxMultiplier || 1.6);
+  const hardMaxTurns = Number(cfg.hardMaxTurns || 70);
+  const hardMaxToolCalls = Number(cfg.hardMaxToolCalls || 220);
+  const maxConsecutiveToolErrors = Number(cfg.maxConsecutiveToolErrors || 4);
+  const maxRepeatedToolErrorSignature = Number(cfg.maxRepeatedToolErrorSignature || 3);
+
+  const fallbackBase = getBootstrapDefault(pipeline || 'notes', skill || 'tn-writer');
+  const baseBudget = Number((cfg.baseBudgetBySkill && cfg.baseBudgetBySkill[`${pipeline}|${skill}`]) || fallbackBase);
+
+  let history = [];
+  try {
+    if (fs.existsSync(METRICS_FILE)) {
+      const bucket = verseBucket(verses);
+      const lines = fs.readFileSync(METRICS_FILE, 'utf8').split('\n').filter(Boolean);
+      history = lines
+        .map((line) => { try { return JSON.parse(line); } catch { return null; } })
+        .filter(Boolean)
+        .filter((e) =>
+          e.pipeline === pipeline &&
+          e.skill === skill &&
+          e.book === book &&
+          (e.total_tokens || 0) > 0 &&
+          e.success === true &&
+          verseBucket(e.verses || 0) === bucket
+        )
+        .slice(-40);
+    }
+  } catch {
+    history = [];
+  }
+
+  const histMedian = median(history.map((e) => Number(e.total_tokens || 0)).filter((n) => n > 0));
+  const rawMultiplier = histMedian && baseBudget > 0 ? (histMedian / baseBudget) : warmupMultiplier;
+  const effectiveMultiplier = history.length >= warmupSamples
+    ? Math.max(minMultiplier, Math.min(maxMultiplier, rawMultiplier))
+    : warmupMultiplier;
+
+  const variableBudget = baseBudget + (Number(sourceWordCount || 0) * wordFactor) + (Number(issueCount || 0) * issueFactor);
+  const tokenBudget = Math.round(Math.max(minBudget, Math.min(maxBudget, variableBudget * effectiveMultiplier)));
+
+  return {
+    tokenBudget,
+    maxTurns: Math.min(hardMaxTurns, Math.max(12, Math.round(tokenBudget / 25000))),
+    maxToolCalls: Math.min(hardMaxToolCalls, Math.max(40, Math.round(tokenBudget / 7000))),
+    maxConsecutiveToolErrors,
+    maxRepeatedToolErrorSignature,
+    warmupApplied: history.length < warmupSamples,
+    historySamples: history.length,
+    multiplier: +effectiveMultiplier.toFixed(3),
+  };
+}
+
 module.exports = {
   recordMetrics,
   recordRateLimit,
@@ -500,4 +586,5 @@ module.exports = {
   getUsageSummary,
   getCumulativeTokens,
   recordRunSummary,
+  getAdaptiveSkillGuardrails,
 };

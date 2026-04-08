@@ -17,12 +17,13 @@ const { splitTsv } = require('./workspace-tools/tsv-tools');
 const { fillTsvIds } = require('./workspace-tools/tn-tools');
 const { normalizeIssuesFile, buildParallelismIntroHintArgs } = require('./issue-normalizer');
 const { verifyRepoPush, verifyDcsToken } = require('./repo-verify');
-const { recordMetrics, getCumulativeTokens, recordRunSummary } = require('./usage-tracker');
+const { recordMetrics, getCumulativeTokens, recordRunSummary, getAdaptiveSkillGuardrails } = require('./usage-tracker');
 const { door43Push, checkConflictingBranches, REPO_MAP, getRepoFilename } = require('./door43-push');
 const { setPendingMerge } = require('./pending-merges');
 const { mergeTsvs } = require('./workspace-tools/tsv-tools');
 const { getCheckpoint, setCheckpoint, clearCheckpoint } = require('./pipeline-checkpoints');
 const { buildNotesContext, updateContextArtifacts, cleanupPipelineDir } = require('./pipeline-context');
+const { getVerseCount } = require('./verse-counts');
 
 const LOG_DIR = path.resolve(__dirname, '../logs');
 
@@ -273,6 +274,110 @@ function buildParsedNotesRequest(route, content) {
 
 // Default verse chunk size for parallel tn-writer batching
 const TN_WRITER_CHUNK_SIZE = 7;
+const TN_WRITER_PARALLEL_MIN_VERSES = Number((config.notesGuardrails || {}).tnWriterParallelMinVerses || 35);
+const RESCUE_MAX_PASSES = Number((config.notesGuardrails || {}).rescueMaxPasses || 1);
+
+function countIssueRows(tsvRelPath) {
+  try {
+    const abs = path.resolve(CSKILLBP_DIR, tsvRelPath);
+    if (!fs.existsSync(abs)) return 0;
+    const lines = fs.readFileSync(abs, 'utf8').split('\n').filter((l) => l.trim());
+    return Math.max(0, lines.length - 1);
+  } catch {
+    return 0;
+  }
+}
+
+function countUsfmWords(usfmRelPath) {
+  try {
+    const abs = path.resolve(CSKILLBP_DIR, usfmRelPath);
+    if (!fs.existsSync(abs)) return 0;
+    const raw = fs.readFileSync(abs, 'utf8');
+    const plain = raw
+      .replace(/\\zaln-[se][^*]*\*/g, ' ')
+      .replace(/\\w\s+([^|]*?)\|[^\\]*?\\w\*/g, '$1')
+      .replace(/\\[a-z]+\d?\s*/gi, ' ')
+      .replace(/\{[^}]*\}/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+    return plain ? plain.split(' ').length : 0;
+  } catch {
+    return 0;
+  }
+}
+
+function parseContextPathFlag(ctxFlag) {
+  const m = String(ctxFlag || '').match(/--context\s+(\S+)/);
+  return m ? m[1] : null;
+}
+
+function buildSkillGuardrails({ pipeline, skill, book, chapter, issuesPath, contextPath }) {
+  const issues = countIssueRows(issuesPath);
+  let sourceWords = 0;
+  if (contextPath) {
+    try {
+      const ctxAbs = path.resolve(CSKILLBP_DIR, contextPath);
+      const ctx = JSON.parse(fs.readFileSync(ctxAbs, 'utf8'));
+      sourceWords = countUsfmWords(ctx?.sources?.ult || '');
+    } catch { /* ignore */ }
+  }
+  const verses = (() => { try { return getVerseCount(book, chapter); } catch { return 20; } })();
+  return getAdaptiveSkillGuardrails({
+    pipeline,
+    skill,
+    book,
+    verses,
+    issueCount: issues,
+    sourceWordCount: sourceWords,
+  });
+}
+
+function readQualityFindings(qualityRelPath) {
+  try {
+    const abs = path.resolve(CSKILLBP_DIR, qualityRelPath);
+    if (!fs.existsSync(abs)) return null;
+    return JSON.parse(fs.readFileSync(abs, 'utf8'));
+  } catch {
+    return null;
+  }
+}
+
+function collectUnresolvedQuoteFindings(qualityJson) {
+  const findings = Array.isArray(qualityJson?.findings) ? qualityJson.findings : [];
+  return findings.filter((f) => ['empty_quote', 'no_hebrew_in_quote', 'gl_quote_not_in_ult'].includes(String(f.category || '')));
+}
+
+function appendIssueTagsToTsv(tsvRelPath, unresolvedFindings) {
+  const abs = path.resolve(CSKILLBP_DIR, tsvRelPath);
+  if (!fs.existsSync(abs) || !Array.isArray(unresolvedFindings) || unresolvedFindings.length === 0) return 0;
+  const byId = new Map();
+  for (const f of unresolvedFindings) {
+    const id = String(f.id || '').trim();
+    if (!id) continue;
+    const code = f.category === 'empty_quote' ? 'ISSUE:QUOTE_EMPTY'
+      : f.category === 'no_hebrew_in_quote' ? 'ISSUE:MATCH_FAIL'
+        : 'ISSUE:GLQ_MISS';
+    if (!byId.has(id)) byId.set(id, new Set());
+    byId.get(id).add(code);
+  }
+  const lines = fs.readFileSync(abs, 'utf8').split('\n');
+  let updated = 0;
+  for (let i = 1; i < lines.length; i++) {
+    if (!lines[i].trim()) continue;
+    const cols = lines[i].split('\t');
+    while (cols.length < 7) cols.push('');
+    const id = String(cols[1] || '').trim();
+    if (!byId.has(id)) continue;
+    const existing = String(cols[2] || '').split(',').map((s) => s.trim()).filter(Boolean);
+    const merged = new Set(existing);
+    for (const code of byId.get(id)) merged.add(code);
+    cols[2] = Array.from(merged).join(', ');
+    lines[i] = cols.slice(0, 7).join('\t');
+    updated++;
+  }
+  fs.writeFileSync(abs, lines.join('\n'));
+  return updated;
+}
 
 /**
  * Run tn-writer in parallel shards. Splits issues TSV into verse-range chunks,
@@ -324,6 +429,16 @@ async function runParallelTnWriter({
 
   // Launch parallel runClaude calls for pending shards
   if (pendingShards.length > 0) {
+    const baseContextRel = parseContextPathFlag(ctxFlag);
+    let baseContext = null;
+    if (baseContextRel) {
+      try {
+        baseContext = JSON.parse(fs.readFileSync(path.resolve(CSKILLBP_DIR, baseContextRel), 'utf8'));
+      } catch (_) {
+        baseContext = null;
+      }
+    }
+
     // Pre-clean pending shard outputs
     for (const shard of pendingShards) {
       // Check for partial recovery on this shard (Level 2)
@@ -343,7 +458,28 @@ async function runParallelTnWriter({
     const runPromises = pendingShards.map((shard, i) => {
       const vRange = shard.range ? `${shard.range.vStart}-${shard.range.vEnd}` : '';
       const verseArg = vRange ? `:${vRange}` : '';
-      let prompt = `${skillRef}${verseArg} --issues ${shard.chunkPath} --output ${shard.output}${ctxFlag}`;
+      let shardCtxFlag = '';
+      if (baseContext && shard.range) {
+        const shardDir = path.resolve(CSKILLBP_DIR, 'tmp', 'pipeline', `${book}-${String(ch).padStart(book === 'PSA' ? 3 : 2, '0')}`, 'shards');
+        fs.mkdirSync(shardDir, { recursive: true });
+        const shardCtxRel = path.relative(
+          path.resolve(CSKILLBP_DIR),
+          path.join(shardDir, `${tag}-v${shard.range.vStart}-${shard.range.vEnd}.context.json`)
+        );
+        const shardCtxAbs = path.resolve(CSKILLBP_DIR, shardCtxRel);
+        const shardCtx = JSON.parse(JSON.stringify(baseContext));
+        shardCtx.runtime = shardCtx.runtime || {};
+        const stem = `${tag}-v${shard.range.vStart}-${shard.range.vEnd}`;
+        shardCtx.runtime.preparedNotes = `tmp/pipeline/${tag}/shards/${stem}.prepared_notes.json`;
+        shardCtx.runtime.generatedNotes = `tmp/pipeline/${tag}/shards/${stem}.generated_notes.json`;
+        shardCtx.runtime.alignmentData = `tmp/pipeline/${tag}/shards/${stem}.alignment_data.json`;
+        shardCtx.runtime.tnQualityFindings = `tmp/pipeline/${tag}/shards/${stem}.quality_findings.json`;
+        fs.writeFileSync(shardCtxAbs, JSON.stringify(shardCtx, null, 2));
+        shardCtxFlag = ` --context ${shardCtxRel}`;
+      } else if (ctxFlag) {
+        shardCtxFlag = ctxFlag;
+      }
+      let prompt = `${skillRef}${verseArg} --issues ${shard.chunkPath} --output ${shard.output}${shardCtxFlag}`;
 
       // Prepend partial recovery instruction if applicable
       if (shard.partialRecovery) {
@@ -366,6 +502,14 @@ async function runParallelTnWriter({
       }
 
       console.log(`[notes] tn-writer shard ${i}: ${prompt}`);
+      const guardrails = buildSkillGuardrails({
+        pipeline: 'notes',
+        skill: 'tn-writer',
+        book,
+        chapter: ch,
+        issuesPath: shard.chunkPath,
+        contextPath: parseContextPathFlag(shardCtxFlag),
+      });
       return runClaude({
         prompt,
         cwd: CSKILLBP_DIR,
@@ -376,7 +520,9 @@ async function runParallelTnWriter({
         disableLocalSettings: true,
         forceNoAutoBashSandbox: true,
         timeoutMs,
+        maxTurns: guardrails.maxTurns,
         appendSystemPrompt,
+        guardrails,
       }).then(r => ({ ...r, _shardIdx: i }))
         .catch(err => ({ _shardIdx: i, _error: err, subtype: 'error' }));
     });
@@ -821,6 +967,17 @@ async function notesPipeline(route, message) {
         }
       }
       const timeoutMs = calcSkillTimeout(book, ch, skill.ops);
+      const guardrails = buildSkillGuardrails({
+        pipeline: 'notes',
+        skill: skill.name,
+        book,
+        chapter: ch,
+        issuesPath,
+        contextPath: parseContextPathFlag(ctxFlag),
+      });
+      const maxTurns = skill.maxTurns
+        ? Math.min(skill.maxTurns, guardrails.maxTurns)
+        : guardrails.maxTurns;
       await status(`Running **${skill.name}** for ${ref} (timeout: ${Math.round(timeoutMs / 60000)}min)...`);
       console.log(`[notes] Running ${skill.name}: ${skill.prompt} (timeout: ${Math.round(timeoutMs / 60000)}min)`);
       // #region agent log
@@ -839,7 +996,9 @@ async function notesPipeline(route, message) {
 
       // --- Parallel tn-writer: split into verse-range shards ---
       let usedParallel = false;
-      if (skill.name === 'tn-writer' && !hasVerseRange) {
+      let chapterVerseCount = 0;
+      try { chapterVerseCount = getVerseCount(book, ch); } catch { chapterVerseCount = 0; }
+      if (skill.name === 'tn-writer' && !hasVerseRange && chapterVerseCount >= TN_WRITER_PARALLEL_MIN_VERSES) {
         const existingShards = (skillOutputs[ch] || {})._tnWriterShards || [];
         try {
           const parallelResult = await runParallelTnWriter({
@@ -868,6 +1027,8 @@ async function notesPipeline(route, message) {
           console.error(`[notes] Parallel tn-writer failed, falling back to single: ${err.message}`);
           // Fall through to single invocation
         }
+      } else if (skill.name === 'tn-writer' && !hasVerseRange) {
+        console.log(`[notes] Parallel tn-writer skipped for ${ref}: ${chapterVerseCount} verses (< ${TN_WRITER_PARALLEL_MIN_VERSES})`);
       }
 
       // --- Standard single invocation (for non-tn-writer skills, or single-chunk fallback) ---
@@ -899,7 +1060,9 @@ async function notesPipeline(route, message) {
             disableLocalSettings: true,
             forceNoAutoBashSandbox: true,
             timeoutMs,
+            maxTurns,
             appendSystemPrompt: skill.appendSystemPrompt,
+            guardrails,
             onProgress: ({ turnCount, lastTool, elapsedMs, timedOut }) => {
               const elapsed = Math.round(elapsedMs / 60000);
               const suffix = timedOut ? ' — **timed out**, aborting' : '';
@@ -1132,6 +1295,56 @@ async function notesPipeline(route, message) {
       || (skillOutputs[ch] || {})['tn-writer']
       || (hasVerseRange ? notesShardRel : notesChapterRel);
     let chapterFailed = false;
+
+    // Optional bounded rescue + graceful degradation for unresolved quote issues
+    const qualityOutput = (skillOutputs[ch] || {})['tn-quality-check'];
+    if (qualityOutput) {
+      let quality = readQualityFindings(qualityOutput);
+      let unresolved = collectUnresolvedQuoteFindings(quality);
+      if (unresolved.length > 0 && RESCUE_MAX_PASSES > 0) {
+        await status(`Detected ${unresolved.length} unresolved quote issue(s) in ${ref}; running bounded rescue pass.`);
+        try {
+          const rescueGuardrails = buildSkillGuardrails({
+            pipeline: 'notes',
+            skill: 'tn-quality-check',
+            book,
+            chapter: ch,
+            issuesPath,
+            contextPath: parseContextPathFlag(ctxFlag),
+          });
+          const rescuePrompt =
+            `${skillRef} --notes ${notesSource}\n\n` +
+            `BOUNDED_RESCUE_MODE: One pass only. Focus only on unresolved quote-matching/findings. ` +
+            `Do not create scratch scripts and do not perform open-ended manual JSON surgery loops.`;
+          await runClaude({
+            prompt: rescuePrompt,
+            cwd: CSKILLBP_DIR,
+            model: model || 'sonnet',
+            skill: 'tn-quality-check',
+            tools: DEFAULT_RESTRICTED_TOOLS,
+            disallowedTools: ['Bash'],
+            disableLocalSettings: true,
+            forceNoAutoBashSandbox: true,
+            timeoutMs: Math.min(8 * 60 * 1000, calcSkillTimeout(book, ch, 1)),
+            maxTurns: Math.min(12, rescueGuardrails.maxTurns),
+            appendSystemPrompt: TN_QUALITY_CHECK_HINT,
+            guardrails: {
+              ...rescueGuardrails,
+              maxConsecutiveToolErrors: Math.min(3, rescueGuardrails.maxConsecutiveToolErrors || 3),
+              maxRepeatedToolErrorSignature: Math.min(2, rescueGuardrails.maxRepeatedToolErrorSignature || 2),
+            },
+          });
+        } catch (err) {
+          console.warn(`[notes] bounded rescue pass failed for ${ref}: ${err.message}`);
+        }
+        quality = readQualityFindings(qualityOutput);
+        unresolved = collectUnresolvedQuoteFindings(quality);
+      }
+      if (unresolved.length > 0) {
+        const tagged = appendIssueTagsToTsv(notesSource, unresolved);
+        await status(`Graceful degradation for ${ref}: ${unresolved.length} unresolved quote finding(s), tagged ${tagged} row(s) in Tags column.`);
+      }
+    }
 
     setCheckpoint(checkpointRef, {
       state: 'running',
@@ -1389,4 +1602,6 @@ module.exports = {
   buildParsedNotesRequest,
   shouldRunIntro,
   buildChapterIntroPrompt,
+  _appendIssueTagsToTsv: appendIssueTagsToTsv,
+  _collectUnresolvedQuoteFindings: collectUnresolvedQuoteFindings,
 };

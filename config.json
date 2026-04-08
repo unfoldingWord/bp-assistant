@@ -67,6 +67,24 @@
     "windowBudgetTokens": 220000,
     "windowHours": 5,
     "warnThreshold": 0.7,
-    "ccusagePath": "npx ccusage@latest"
+    "ccusagePath": "npx ccusage@latest",
+    "adaptiveGuards": {
+      "minBudgetTokens": 120000,
+      "maxBudgetTokens": 1400000,
+      "wordFactor": 35,
+      "issueFactor": 12000,
+      "warmupSamples": 3,
+      "warmupMultiplier": 1.0,
+      "minMultiplier": 0.7,
+      "maxMultiplier": 1.6,
+      "hardMaxTurns": 70,
+      "hardMaxToolCalls": 220,
+      "maxConsecutiveToolErrors": 4,
+      "maxRepeatedToolErrorSignature": 3
+    }
+  },
+  "notesGuardrails": {
+    "tnWriterParallelMinVerses": 35,
+    "rescueMaxPasses": 1
   }
 }
