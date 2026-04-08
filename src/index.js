@@ -171,6 +171,7 @@ async function main() {
 startMcpServer();
 
 const METRICS_FILE = require('path').resolve(__dirname, '../data/metrics/usage.jsonl');
+require('fs').mkdirSync(require('path').dirname(METRICS_FILE), { recursive: true });
 startResourceMonitor(METRICS_FILE);
 
 // Clean up stale pipeline working directories from crashed runs
