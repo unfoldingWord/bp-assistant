@@ -713,7 +713,11 @@ async function door43Push(opts) {
     const pushResult = await commitAndPush(repoDir, branch, repoFilename, commitMsg);
 
     if (pushResult.noChanges) {
-      return { success: true, details: `No changes detected for ${type.toUpperCase()} ${book} ${chapter} — content already matches master` };
+      return {
+        success: true,
+        noChanges: true,
+        details: `No changes detected for ${type.toUpperCase()} ${book} ${chapter} — content already matches master`,
+      };
     }
 
     // Step 5: Create PR targeting master, merge, delete staging branch

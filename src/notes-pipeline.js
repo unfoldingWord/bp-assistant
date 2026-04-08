@@ -33,9 +33,8 @@ const DEEP_ISSUE_ID_HINT =
   'Do NOT output text without a tool call or the session will end prematurely.';
 
 // Ranges where the chapter intro is written by the human editor — skip automatically.
-// PSA 42-123: Books 2-4 handled by Benjamin; 119-123 is a subset but listed explicitly.
 const SKIP_INTRO_RANGES = [
-  { book: 'PSA', start: 42, end: 123 },
+  { book: 'PSA', start: 1, end: 150 },
 ];
 
 function shouldRunIntro(book, chapter, withIntroFlag) {
@@ -402,6 +401,7 @@ async function notesPipeline(route, message) {
         name: 'chapter-intro',
         prompt: `${skillRef} --issues ${issuesPath}`,
         expectedOutput: issuesPath,
+        skipPreClean: true, // expectedOutput is also input; do not delete verse issues before intro insertion
         ops: 1,
       });
     } else if (withIntro) {
@@ -454,7 +454,8 @@ async function notesPipeline(route, message) {
       const skill = skills[si];
       const skillStart = Date.now();
       // Delete expected output so Claude must recreate it (prevents stale-mtime false failures on resume)
-      if (skill.expectedOutput) {
+      // Skip when expectedOutput is also the skill input (e.g. post-edit-review, chapter-intro).
+      if (skill.expectedOutput && !skill.skipPreClean) {
         const preClean = resolveOutputFile(skill.expectedOutput, book);
         if (preClean) {
           try { fs.unlinkSync(path.resolve(CSKILLBP_DIR, preClean)); } catch (_) { /* fine if missing */ }
@@ -779,6 +780,7 @@ async function notesPipeline(route, message) {
       }
     }
 
+    let pushNoChanges = false;
     if (!chapterFailed) await status(`Running **door43-push** (TN) for ${ref}...`);
     const pushStartTime = new Date().toISOString();
     if (!chapterFailed) try {
@@ -792,6 +794,7 @@ async function notesPipeline(route, message) {
         await status(`**door43-push** (TN) failed for ${ref}: ${pushResult.details}`);
         chapterFailed = true;
       } else {
+        pushNoChanges = pushResult.noChanges === true;
         await status(`**door43-push** (TN) done for ${ref}: ${pushResult.details}`);
       }
     } catch (err) {
@@ -800,7 +803,11 @@ async function notesPipeline(route, message) {
       chapterFailed = true;
     }
 
-    if (!chapterFailed) {
+    if (!chapterFailed && pushNoChanges) {
+      await status(`Repo verify SKIPPED for ${ref}: no content changes to push`);
+    }
+
+    if (!chapterFailed && !pushNoChanges) {
       await status(`Verifying push for ${ref}...`);
       const stagingBranch = buildBranchName(book, ch);
       const verify = await verifyRepoPush({ repo: 'en_tn', stagingBranch, since: pushStartTime });
