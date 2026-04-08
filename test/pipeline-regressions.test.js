@@ -11,7 +11,9 @@ const {
   parseWriteNotesCommand,
   buildParsedNotesRequest,
   shouldRunIntro,
+  buildChapterIntroPrompt,
 } = require('../src/notes-pipeline');
+const { buildParallelismIntroHintArgs } = require('../src/issue-normalizer');
 
 test('synthetic notes route preserves verse ranges from intent scopeText', () => {
   const route = buildSyntheticRoute({
@@ -89,4 +91,23 @@ test('chapter intro is auto-skipped for Psalms', () => {
   assert.equal(shouldRunIntro('PSA', 35, true), false);
   assert.equal(shouldRunIntro('PSA', 119, true), false);
   assert.equal(shouldRunIntro('ISA', 51, true), true);
+});
+
+test('chapter intro prompt includes high parallelism hint when signal is high', () => {
+  const hint = buildParallelismIntroHintArgs({
+    parallelism_signal: 'high',
+    parallelism_synonymous_count: 7,
+  });
+  const prompt = buildChapterIntroPrompt('ISA 51', 'output/issues/ISA/ISA-051.tsv', ' --context tmp/pipeline/x/context.json', hint);
+  assert.match(prompt, /--parallelism-signal high/);
+  assert.match(prompt, /--parallelism-count 7/);
+});
+
+test('chapter intro prompt has no hint when signal is absent', () => {
+  const hint = buildParallelismIntroHintArgs({
+    parallelism_signal: null,
+    parallelism_synonymous_count: 2,
+  });
+  const prompt = buildChapterIntroPrompt('ISA 51', 'output/issues/ISA/ISA-051.tsv', '', hint);
+  assert.equal(prompt.includes('--parallelism-signal'), false);
 });
