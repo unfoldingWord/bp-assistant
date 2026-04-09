@@ -252,7 +252,7 @@ async function buildNotesContext({ book, chapter, verseStart, verseEnd, issuesPa
       ultFull: ultPath,
       ustFull: ustPath,
       hebrew: hebrewPath,
-      ultAligned: alignedUltPath || null,
+      ultAligned: ultChapterPath,
       issues: issuesPath || null,
     },
     sourceOrigin: {
