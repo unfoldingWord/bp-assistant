@@ -36,11 +36,14 @@ function extractAlignmentData({ alignedUsfm, output }) {
     const trimmed = line.trim();
     const cm = trimmed.match(/^\\c\s+(\d+)/);
     if (cm) { chapter = parseInt(cm[1], 10); verse = '0'; milestones.length = 0; continue; }
-    const vm = trimmed.match(/^\\v\s+(\d+[-\d]*|front)\s*/);
-    if (vm) { verse = vm[1].split('-')[0]; milestones.length = 0; continue; }
 
-    // Skip content before the first verse marker (superscriptions, headers, etc.)
-    if (verse === '0') continue;
+    // Skip file headers (\id, \usfm, \h, etc.) before any chapter marker
+    if (chapter === 0) continue;
+
+    // Verse marker can appear mid-line after a poetry marker (e.g. \q1 \v 1 \zaln-s...)
+    // Update verse but do NOT continue — alignment data on the same line must still be processed
+    const vm = trimmed.match(/\\v\s+(\d+[-\d]*|front)/);
+    if (vm) { verse = vm[1].split('-')[0]; milestones.length = 0; }
 
     const ZALN_S = /\\zaln-s\s+\|([^\\]*?)\\?\*/g;
     const ZALN_E = /\\zaln-e\\?\*/g;
