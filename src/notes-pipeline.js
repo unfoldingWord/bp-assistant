@@ -13,8 +13,9 @@ const config = require('./config');
 const { sendMessage, sendDM, addReaction, removeReaction } = require('./zulip-client');
 const { runClaude, DEFAULT_RESTRICTED_TOOLS, isTransientOutageError } = require('./claude-runner');
 const { getDoor43Username, emailToFallbackUsername, buildBranchName, resolveOutputFile, discoverFreshOutput, checkPrerequisites, calcSkillTimeout, normalizeBookName, resolveConflictMention, parsePartialTsv, truncatePartialTsv, parseChunkRange, CSKILLBP_DIR } = require('./pipeline-utils');
-const { splitTsv } = require('./workspace-tools/tsv-tools');
+const { splitTsv, fixTrailingNewlines } = require('./workspace-tools/tsv-tools');
 const { fillTsvIds, prepareNotes, fillOrigQuotes, resolveGlQuotes, flagNarrowQuotes } = require('./workspace-tools/tn-tools');
+const { checkTnQuality } = require('./workspace-tools/quality-tools');
 const { normalizeIssuesFile, buildParallelismIntroHintArgs } = require('./issue-normalizer');
 const { verifyRepoPush, verifyDcsToken } = require('./repo-verify');
 const { recordMetrics, getCumulativeTokens, recordRunSummary, getAdaptiveSkillGuardrails } = require('./usage-tracker');
@@ -39,8 +40,11 @@ const DEEP_ISSUE_ID_HINT =
   'Do NOT output text without a tool call or the session will end prematurely.';
 
 const TN_QUALITY_CHECK_HINT =
-  'Run the MCP mechanical checks (fix_trailing_newlines, check_tn_quality), then do the full semantic review (Steps 3-4), and write the quality report. ' +
-  'Keep the conversation short: run checks, fix issues, write the report, done.';
+  'Mechanical checks have already run. Read runtime.tnQualityFindings from context.json — ' +
+  'this is the starting findings list. Do not re-run fix_trailing_newlines or check_tn_quality before reviewing. ' +
+  'Do the full semantic review (Steps 3a-3j), fix issues found, then re-run check_tn_quality ' +
+  'at most once to verify fixes. If issues still persist after that one re-check, report them ' +
+  'as unresolved and stop. Do not loop further.';
 
 const TN_WRITER_HINT =
   'The pipeline has already run all mechanical preparation (prepare_notes, fill_orig_quotes, resolve_gl_quotes, flag_narrow_quotes). ' +
@@ -141,7 +145,34 @@ function runMechanicalPrep({ issuesPath, pipeDir, status }) {
   const flagResult = flagNarrowQuotes({ preparedJson: ctx.runtime.preparedNotes });
   const flagSummary = flagResult.split('\n')[0];
 
+  // Clear stale generated_notes so tn-writer starts fresh
+  const genPath = path.resolve(CSKILLBP_DIR, ctx.runtime.generatedNotes);
+  fs.writeFileSync(genPath, '');
+
   return { prepSummary, fillSummary, glSummary, flagSummary };
+}
+
+/**
+ * Run mechanical quality checks in Node.js before invoking tn-quality-check.
+ * Runs fix_trailing_newlines + check_tn_quality directly so Claude reads
+ * pre-run findings and cannot loop on re-checking.
+ *
+ * Returns a summary string for status reporting.
+ */
+async function runMechanicalQualityPrep({ notesPath, pipeDir }) {
+  const ctx = readContext(pipeDir);
+  const fixResult = fixTrailingNewlines({ file: notesPath });
+  const qualityResult = await checkTnQuality({
+    tsvPath: notesPath,
+    preparedJson: ctx.runtime.preparedNotes,
+    ultUsfm: ctx.sources.ultPlain || ctx.sources.ult,
+    ustUsfm: ctx.sources.ustPlain || ctx.sources.ust,
+    book: ctx.book,
+    output: ctx.runtime.tnQualityFindings,
+  });
+  const summary = qualityResult.split('\n')[0];
+  console.log(`[notes] Quality mechanical prep: ${fixResult}; ${summary}`);
+  return summary;
 }
 
 function buildNotesPaths(book, tag, hasVerseRange, verseStart, verseEnd) {
@@ -981,7 +1012,7 @@ async function notesPipeline(route, message) {
       prompt: `${skillRef} --notes ${defaultNotesPath}${ctxFlag}`,
       expectedOutput: `output/quality/${book}/${qualityTag}-quality.md`,
       appendSystemPrompt: TN_QUALITY_CHECK_HINT,
-      maxTurns: 60,
+      maxTurns: 30,
       ops: 1,
       model: 'sonnet',
     });
@@ -1068,6 +1099,8 @@ async function notesPipeline(route, message) {
 
     // Mechanical prep flag — set true once runMechanicalPrep() completes in the skill loop.
     let mechanicalPrepDone = false;
+    // Quality mechanical prep flag — set true once runMechanicalQualityPrep() completes.
+    let qualityPrepDone = false;
 
     for (let si = startSkillIndex; si < skills.length; si++) {
       const skill = skills[si];
@@ -1088,6 +1121,23 @@ async function notesPipeline(route, message) {
           // Non-fatal: tn-writer skill can still do prep via MCP tools (old path)
         }
       }
+
+      // --- Quality mechanical prep: run fix_trailing_newlines + check_tn_quality before tn-quality-check ---
+      if (skill.name === 'tn-quality-check' && !qualityPrepDone && pipeDir) {
+        try {
+          const notesPath = skills.find(s => s.name === 'tn-writer')?.resolvedOutput
+            || skills.find(s => s.name === 'tn-writer')?.expectedOutput;
+          if (notesPath) {
+            await status(`**${ref}**: Running quality mechanical checks...`);
+            const summary = await runMechanicalQualityPrep({ notesPath, pipeDir });
+            qualityPrepDone = true;
+            await status(`**${ref}**: Quality mechanical checks done — ${summary}`);
+          }
+        } catch (err) {
+          console.error(`[notes] Quality mechanical prep failed (non-fatal): ${err.message}`);
+        }
+      }
+
 
       const skillStart = Date.now();
       // --- Partial output recovery for tn-writer on resume ---
