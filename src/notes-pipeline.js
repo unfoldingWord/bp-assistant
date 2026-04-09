@@ -14,7 +14,7 @@ const { sendMessage, sendDM, addReaction, removeReaction } = require('./zulip-cl
 const { runClaude, DEFAULT_RESTRICTED_TOOLS, isTransientOutageError } = require('./claude-runner');
 const { getDoor43Username, emailToFallbackUsername, buildBranchName, resolveOutputFile, discoverFreshOutput, checkPrerequisites, calcSkillTimeout, normalizeBookName, resolveConflictMention, parsePartialTsv, truncatePartialTsv, parseChunkRange, CSKILLBP_DIR } = require('./pipeline-utils');
 const { splitTsv } = require('./workspace-tools/tsv-tools');
-const { fillTsvIds } = require('./workspace-tools/tn-tools');
+const { fillTsvIds, prepareNotes, fillOrigQuotes, resolveGlQuotes, flagNarrowQuotes } = require('./workspace-tools/tn-tools');
 const { normalizeIssuesFile, buildParallelismIntroHintArgs } = require('./issue-normalizer');
 const { verifyRepoPush, verifyDcsToken } = require('./repo-verify');
 const { recordMetrics, getCumulativeTokens, recordRunSummary, getAdaptiveSkillGuardrails } = require('./usage-tracker');
@@ -43,11 +43,13 @@ const TN_QUALITY_CHECK_HINT =
   'Keep the conversation short: run checks, fix issues, write the report, done.';
 
 const TN_WRITER_HINT =
+  'The pipeline has already run all mechanical preparation (prepare_notes, fill_orig_quotes, resolve_gl_quotes, flag_narrow_quotes). ' +
+  'Read runtime.preparedNotes from context.json — all fields are populated. Do not re-run preparation MCP tools. ' +
   'Stay in the tn-writer lane. Do not use Task/Agent/Team tools, web tools, SendMessage, or notebook editing. ' +
   'Do not hunt for alternate templates or run exploratory repair loops. ' +
   'Use only the prepared inputs, especially writer_packet, named canonical references, and workspace MCP tools needed for the documented tn-writer sequence. ' +
   'Do not re-decide templates, parse raw explanation directives again, or invent a new AT policy when the prepared item already provides them. ' +
-  'Run the sequence once in order: prepare inputs, fill orig_quote, resolve gl_quote, verify quotes, flag narrow quotes, read style/canonical refs as needed, generate notes, run one AT-fit verification pass with at most one bounded fix pass, assemble TSV, post-process, final review. ' +
+  'Run the sequence once in order: read prepared data, read style/canonical refs, generate notes, run one AT-fit verification pass with at most one bounded fix pass, assemble TSV, post-process, final review. ' +
   'If a subset still fails after that bounded pass, stop and report the unresolved IDs instead of exploring side paths.';
 
 const TN_WRITER_TOOL_BLOCKLIST = [
@@ -95,6 +97,51 @@ function hasNoIntroFlag(content) {
 
 function hasFreshFlag(content) {
   return /--fresh\b/i.test(String(content || '')) || /--new\b/i.test(String(content || ''));
+}
+
+/**
+ * Run all mechanical prep steps in Node.js before invoking tn-writer.
+ * This replaces ~100 Claude MCP tool calls with direct function calls:
+ *   1. prepareNotes — parse issues TSV, build writer packets
+ *   2. fillOrigQuotes — match English→alignment→Hebrew
+ *   3. resolveGlQuotes — reverse lookup English spans
+ *   4. flagNarrowQuotes — flag quotes needing expansion
+ *
+ * Returns a summary string for status reporting.
+ */
+function runMechanicalPrep({ issuesPath, pipeDir, status }) {
+  const ctx = readContext(pipeDir);
+
+  // 1. Prepare notes (parse issues, build writer packets, extract alignment)
+  const prepResult = prepareNotes({
+    inputTsv: issuesPath,
+    ultUsfm: ctx.sources.ultPlain || ctx.sources.ult,
+    ustUsfm: ctx.sources.ustPlain || ctx.sources.ust,
+    alignedUsfm: ctx.sources.ultAligned,
+    output: ctx.runtime.preparedNotes,
+    alignmentJson: ctx.runtime.alignmentData,
+  });
+  const prepSummary = prepResult.split('\n')[0];
+
+  // 2. Fill Hebrew orig_quotes from alignment data
+  const fillResult = fillOrigQuotes({
+    preparedJson: ctx.runtime.preparedNotes,
+    alignmentJson: ctx.runtime.alignmentData,
+  });
+  const fillSummary = fillResult.split('\n')[0];
+
+  // 3. Resolve gl_quotes (reverse lookup from Hebrew to English spans)
+  const glResult = resolveGlQuotes({
+    preparedJson: ctx.runtime.preparedNotes,
+    alignmentJson: ctx.runtime.alignmentData,
+  });
+  const glSummary = glResult.split('\n')[0];
+
+  // 4. Flag narrow quotes
+  const flagResult = flagNarrowQuotes({ preparedJson: ctx.runtime.preparedNotes });
+  const flagSummary = flagResult.split('\n')[0];
+
+  return { prepSummary, fillSummary, glSummary, flagSummary };
 }
 
 function buildNotesPaths(book, tag, hasVerseRange, verseStart, verseEnd) {
@@ -882,6 +929,11 @@ async function notesPipeline(route, message) {
       issuesPath = buildIssuesPath(book, tag, hasVerseRange, verseStart, verseEnd);
       await status(`**${ref}**: No AI artifacts (missing: ${missing.join(', ')}) \u2192 deep-issue-id path`);
 
+      // Pre-create stub so Claude doesn't burn turns on Read-before-Write
+      const issuesAbs = path.resolve(CSKILLBP_DIR, issuesPath);
+      fs.mkdirSync(path.dirname(issuesAbs), { recursive: true });
+      if (!fs.existsSync(issuesAbs)) fs.writeFileSync(issuesAbs, '');
+
       const verseFlag = hasVerseRange ? ` --verses ${verseStart}-${verseEnd}` : '';
       skills.push({
         name: 'deep-issue-id',
@@ -909,6 +961,10 @@ async function notesPipeline(route, message) {
       book, tag, hasVerseRange, verseStart, verseEnd
     );
     const tnExpectedOutput = hasVerseRange ? notesShardRel : notesChapterRel;
+    // Pre-create notes output stub
+    const notesAbs = path.resolve(CSKILLBP_DIR, tnExpectedOutput);
+    fs.mkdirSync(path.dirname(notesAbs), { recursive: true });
+    if (!fs.existsSync(notesAbs)) fs.writeFileSync(notesAbs, '');
     skills.push({
       name: 'tn-writer',
       prompt: `${skillRef} --issues ${issuesPath} --output ${tnExpectedOutput}${ctxFlag}`,
@@ -1010,8 +1066,29 @@ async function notesPipeline(route, message) {
       await runIssueNormalizationStage();
     }
 
+    // Mechanical prep flag — set true once runMechanicalPrep() completes in the skill loop.
+    let mechanicalPrepDone = false;
+
     for (let si = startSkillIndex; si < skills.length; si++) {
       const skill = skills[si];
+
+      // --- Mechanical prep: run all deterministic steps before tn-writer ---
+      if (skill.name === 'tn-writer' && !mechanicalPrepDone && pipeDir && issuesPath) {
+        try {
+          await status(`**${ref}**: Running mechanical prep (prepare, fill quotes, resolve GL, flag narrow)...`);
+          const prep = runMechanicalPrep({ issuesPath, pipeDir, status });
+          mechanicalPrepDone = true;
+          await status(
+            `**${ref}**: Mechanical prep complete — ${prep.prepSummary}; ${prep.fillSummary}; ${prep.glSummary}; ${prep.flagSummary}`
+          );
+          console.log(`[notes] Mechanical prep ${ref}: prep=${prep.prepSummary}, fill=${prep.fillSummary}, gl=${prep.glSummary}, flag=${prep.flagSummary}`);
+        } catch (err) {
+          console.error(`[notes] Mechanical prep failed for ${ref}: ${err.message}`);
+          await status(`**${ref}**: Mechanical prep failed — ${err.message}. Claude will run prep via MCP tools.`);
+          // Non-fatal: tn-writer skill can still do prep via MCP tools (old path)
+        }
+      }
+
       const skillStart = Date.now();
       // --- Partial output recovery for tn-writer on resume ---
       let partialRecovery = null;

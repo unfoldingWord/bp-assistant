@@ -92,6 +92,21 @@ function buildRuntimePaths(dirPath) {
 }
 
 /**
+ * Pre-create empty stub files for all runtime paths.
+ * The Claude SDK requires Read before Write — creating stubs up front
+ * saves ~15 tool calls per skill invocation.
+ */
+function preCreateStubs(dirPath) {
+  const runtime = buildRuntimePaths(dirPath);
+  for (const relPath of Object.values(runtime)) {
+    const absPath = path.resolve(CSKILLBP_DIR, relPath);
+    if (!fs.existsSync(absPath)) {
+      fs.writeFileSync(absPath, '');
+    }
+  }
+}
+
+/**
  * Write context.json to the pipeline directory.
  */
 function writeContext(dirPath, contextObj) {
@@ -264,6 +279,7 @@ async function buildNotesContext({ book, chapter, verseStart, verseEnd, issuesPa
   };
 
   writeContext(dirPath, context);
+  preCreateStubs(dirPath);
   return { dirPath, contextPath: `${dirPath}/context.json` };
 }
 

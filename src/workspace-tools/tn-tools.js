@@ -657,15 +657,20 @@ function prepareNotes({ inputTsv, ultUsfm, ustUsfm, output, alignedUsfm, alignme
     if (!fp) return {};
     const full = path.resolve(CSKILLBP_DIR, fp);
     if (!fs.existsSync(full)) return {};
-    const text = fs.readFileSync(full, 'utf8');
+    const raw = fs.readFileSync(full, 'utf8');
+    // Join all lines into one string first so \v matching works on multi-line USFM
+    const text = raw.replace(/\n/g, ' ');
     const verses = {};
     let ch = 0;
-    for (const l of text.split('\n')) {
-      const cm = l.trim().match(/^\\c\s+(\d+)/);
+    // Split on USFM markers, process sequentially
+    const tokens = text.split(/(\\c\s+\d+|\\v\s+\d+[-\d]*)/);
+    for (let i = 0; i < tokens.length; i++) {
+      const t = tokens[i];
+      const cm = t.match(/^\\c\s+(\d+)$/);
       if (cm) { ch = parseInt(cm[1], 10); continue; }
-      const vm = l.trim().match(/^\\v\s+(\d+[-\d]*)\s*(.*)/);
-      if (vm) {
-        let txt = vm[2] || '';
+      const vm = t.match(/^\\v\s+(\d+[-\d]*)$/);
+      if (vm && i + 1 < tokens.length) {
+        let txt = tokens[i + 1] || '';
         txt = txt.replace(/\\zaln-[se][^*]*\*/g, '').replace(/\\w\s+([^|]*?)\|[^\\]*?\\w\*/g, '$1')
           .replace(/\\[a-z]+\d?\s+/g, ' ').replace(/\\[a-z]+\d?\*/g, '').replace(/\s+/g, ' ').trim();
         verses[`${ch}:${vm[1].split('-')[0]}`] = txt;
@@ -682,7 +687,9 @@ function prepareNotes({ inputTsv, ultUsfm, ustUsfm, output, alignedUsfm, alignme
     item.ust_verse = ustV[item.reference] || '';
     item.book = bookCode;
 
-    const directives = parseExplanationDirectives(item.explanation);
+    // Strip [heb:...] hint from explanation before parsing directives (it's for fillOrigQuotes, not note text)
+    const explanationForDirectives = item.explanation.replace(/\s*\[heb:[^\]]*\]/g, '').trim();
+    const directives = parseExplanationDirectives(explanationForDirectives);
     const templateSelection = resolveTemplateSelection({
       sref: item.sref,
       templateHints: directives.template_hints,
@@ -1135,7 +1142,37 @@ function fillOrigQuotes({ preparedJson, alignmentJson, hebrewUsfm }) {
     return rawSpan(rawVerse, offsetMap, minStart, maxEnd, strippedVerse.length);
   }
 
+  // Extract [heb:...] hint from explanation and try direct UHB match
+  function extractHebrewHint(explanation) {
+    const m = String(explanation || '').match(/\[heb:([^\]]+)\]/);
+    return m ? m[1].trim() : null;
+  }
+
+  function tryHebrewHintMatch(ref, hint) {
+    const rawVerse = verseMap[ref];
+    if (!rawVerse || !hint) return null;
+    const { text: strippedVerse, offsetMap } = buildStripped(rawVerse);
+    // Strip cantillation from the hint too
+    const strippedHint = hint.replace(STRIP_RE, () => { STRIP_RE.lastIndex = 0; return ''; });
+    STRIP_RE.lastIndex = 0;
+    const normHint = strippedHint.normalize('NFKD');
+    const normVerse = strippedVerse.normalize('NFKD');
+    const pos = normVerse.indexOf(normHint);
+    if (pos < 0) return null;
+    // Map norm position back to strippedVerse position
+    let si = 0, ni = 0;
+    while (ni < pos && si < strippedVerse.length) {
+      ni += strippedVerse[si].normalize('NFKD').length;
+      si++;
+    }
+    const startPos = si;
+    const endPos = startPos + strippedHint.length - 1;
+    if (endPos >= strippedVerse.length) return null;
+    return rawSpan(rawVerse, offsetMap, startPos, endPos, strippedVerse.length);
+  }
+
   let resolved = 0;
+  let resolvedViaHint = 0;
   const unresolved = [];
 
   for (const item of (data.items || [])) {
@@ -1145,6 +1182,20 @@ function fillOrigQuotes({ preparedJson, alignmentJson, hebrewUsfm }) {
 
     // Strip any non-verse suffix from reference (e.g., "36:1:writing-oracleformula" → "36:1")
     const alignRef = item.reference.replace(/:(?!\d).*$/, '');
+
+    // Try Hebrew hint path first (more reliable when available)
+    const hebrewHint = extractHebrewHint(item.explanation);
+    if (hebrewHint) {
+      const hintSpan = tryHebrewHintMatch(alignRef, hebrewHint);
+      if (hintSpan) {
+        item.orig_quote = hintSpan;
+        resolved++;
+        resolvedViaHint++;
+        continue;
+      }
+      // Hint didn't match — fall through to alignment path
+    }
+
     const entries = alignData[alignRef] || alignData[item.reference] || [];
     if (!entries.length) {
       unresolved.push(`${item.id} ${alignRef}: no alignment entries`);
@@ -1195,7 +1246,8 @@ function fillOrigQuotes({ preparedJson, alignmentJson, hebrewUsfm }) {
 
   fs.writeFileSync(prepPath, JSON.stringify(data, null, 2));
 
-  const lines = [`Resolved: ${resolved} of ${resolved + unresolved.length} items. Unresolved: ${unresolved.length} items:`];
+  const hintNote = resolvedViaHint ? ` (${resolvedViaHint} via Hebrew hint)` : '';
+  const lines = [`Resolved: ${resolved} of ${resolved + unresolved.length} items${hintNote}. Unresolved: ${unresolved.length} items:`];
   for (const u of unresolved) lines.push(`  ${u}`);
   return lines.join('\n');
 }

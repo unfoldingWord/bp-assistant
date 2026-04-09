@@ -227,17 +227,122 @@ function normalizeIssueRows(lines, options = {}) {
   return { lines: output, summary, introSignal };
 }
 
+/**
+ * Detect the column format and normalize to canonical 7-col:
+ *   Book  Reference  SRef  GLQuote  NeedsAT  AT  Explanation
+ *
+ * When a Hebrew column is present, appends its value as [heb:...] in the explanation.
+ * Returns the normalized lines array (no header row in output).
+ */
+function normalizeColumnFormat(lines, fileBook) {
+  if (!lines.length) return { lines: [], reformatted: false };
+
+  const firstCols = lines[0].split('\t');
+  const firstLower = firstCols.map(c => (c || '').trim().toLowerCase());
+
+  // Check for header row
+  const headerKeywords = ['reference', 'issue', 'hebrew', 'ult_quote', 'hint', 'quote', 'note', 'occurrence', 'supportreference', 'id', 'tags'];
+  const hasHeader = firstLower.some(h => headerKeywords.includes(h));
+
+  // If it already looks like canonical format (first col is a book code or 'Book'), pass through
+  if (!hasHeader) {
+    const first = firstCols[0]?.trim();
+    // Canonical: starts with book code (3 letters) or is a chapter:verse reference
+    if (/^[A-Z0-9]{2,3}$/i.test(first) || (first?.toLowerCase() === 'book')) {
+      return { lines, reformatted: false };
+    }
+    // If first col is a reference like "2:1", it's a headerless new format
+    if (/^\d+:\d+/.test(first)) {
+      // No header, Reference in col 0. Map columns heuristically.
+      const output = [];
+      for (const line of lines) {
+        const cols = line.split('\t');
+        while (cols.length < 4) cols.push('');
+        const ref = cols[0]?.trim();
+        const sref = cols[1]?.trim() || '';
+        // Detect Hebrew in any column — append as hint
+        let hebrew = '';
+        let glQuote = '';
+        let explanation = '';
+        for (let i = 2; i < cols.length; i++) {
+          const val = (cols[i] || '').trim();
+          if (/[\u0590-\u05FF]/.test(val) && !hebrew) { hebrew = val; }
+          else if (!glQuote && !hebrew && val && !/^\d+$/.test(val)) { glQuote = val; }
+          else if (!glQuote && val && !/^\d+$/.test(val) && !/[\u0590-\u05FF]/.test(val)) { glQuote = val; }
+          else if (val && val.length > glQuote.length && !/[\u0590-\u05FF]/.test(val) && !/^\d+$/.test(val)) { explanation = val; }
+        }
+        // If no clear explanation, use last non-empty non-Hebrew non-numeric column
+        if (!explanation) {
+          for (let i = cols.length - 1; i >= 2; i--) {
+            const val = (cols[i] || '').trim();
+            if (val && !/[\u0590-\u05FF]/.test(val) && val !== glQuote && !/^\d+$/.test(val)) {
+              explanation = val;
+              break;
+            }
+          }
+        }
+        if (hebrew) explanation = (explanation ? explanation + ' ' : '') + `[heb:${hebrew}]`;
+        output.push(`${fileBook}\t${ref}\t${sref}\t${glQuote}\t\t\t${explanation}`);
+      }
+      return { lines: output, reformatted: true };
+    }
+    return { lines, reformatted: false };
+  }
+
+  // Has header — build column map
+  const hMap = {};
+  firstLower.forEach((h, i) => { hMap[h] = i; });
+
+  const refIdx = hMap['reference'] ?? hMap['ref'] ?? -1;
+  const srefIdx = hMap['issue'] ?? hMap['supportreference'] ?? hMap['sref'] ?? hMap['issue_type'] ?? -1;
+  const glIdx = hMap['ult_quote'] ?? hMap['glquote'] ?? hMap['gl_quote'] ?? hMap['quote'] ?? -1;
+  const hebIdx = hMap['hebrew'] ?? hMap['heb'] ?? -1;
+  const noteIdx = hMap['explanation'] ?? hMap['hint'] ?? hMap['note'] ?? -1;
+  const needsAtIdx = hMap['needs_at'] ?? hMap['go?'] ?? -1;
+  const atIdx = hMap['at'] ?? hMap['at_provided'] ?? -1;
+
+  const output = [];
+  for (let i = 1; i < lines.length; i++) {
+    const cols = lines[i].split('\t');
+    const get = (idx) => (idx >= 0 && idx < cols.length) ? (cols[idx] || '').trim() : '';
+
+    let ref = get(refIdx);
+    // Strip book prefix from reference (e.g., "ZEC 2:1" → "2:1")
+    ref = ref.replace(/^[A-Z0-9]{2,3}\s+/i, '');
+    if (!ref || !/\d/.test(ref)) continue; // skip non-data rows
+
+    const sref = get(srefIdx);
+    const glQuote = get(glIdx);
+    const needsAt = get(needsAtIdx);
+    const at = get(atIdx);
+    let explanation = get(noteIdx);
+    const hebrew = get(hebIdx);
+
+    if (hebrew) explanation = (explanation ? explanation + ' ' : '') + `[heb:${hebrew}]`;
+
+    output.push(`${fileBook}\t${ref}\t${sref}\t${glQuote}\t${needsAt}\t${at}\t${explanation}`);
+  }
+  return { lines: output, reformatted: true };
+}
+
 function normalizeIssuesFile({ issuesPath, options = {} }) {
   const absPath = path.resolve(CSKILLBP_DIR, issuesPath);
   const content = fs.readFileSync(absPath, 'utf8');
   const hadTrailingNewline = content.endsWith('\n');
   const lines = content.split('\n').filter((line) => line.trim().length > 0);
-  const result = normalizeIssueRows(lines, options);
+
+  // Step 0: Normalize column format to canonical 7-col
+  const fnMatch = path.basename(absPath).match(/([A-Z0-9]+)-(\d+)/i);
+  const fileBook = fnMatch ? fnMatch[1].toUpperCase() : '';
+  const colResult = normalizeColumnFormat(lines, fileBook);
+  const normalizedLines = colResult.lines;
+
+  const result = normalizeIssueRows(normalizedLines, options);
   const outputText = result.lines.join('\n') + (hadTrailingNewline ? '\n' : '');
   fs.writeFileSync(absPath, outputText);
   return {
     normalizedPath: issuesPath,
-    summary: result.summary,
+    summary: { ...result.summary, columnFormatReformatted: colResult.reformatted },
     introSignal: result.introSignal,
   };
 }

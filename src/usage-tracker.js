@@ -568,7 +568,7 @@ function getAdaptiveSkillGuardrails({
 
   return {
     tokenBudget: tokenBudgetEnabled ? derivedBudget : null,
-    maxTurns: Math.min(hardMaxTurns, Math.max(200, Math.round(derivedBudget / 25000))),
+    maxTurns: Math.min(hardMaxTurns, Math.max(500, Math.round(derivedBudget / 25000))),
     maxToolCalls: Math.min(hardMaxToolCalls, Math.max(500, Math.round(derivedBudget / 7000))),
     maxConsecutiveToolErrors,
     maxRepeatedToolErrorSignature,

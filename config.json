@@ -78,14 +78,16 @@
       "warmupMultiplier": 1.0,
       "minMultiplier": 0.7,
       "maxMultiplier": 1.6,
-      "hardMaxTurns": 70,
-      "hardMaxToolCalls": 220,
-      "maxConsecutiveToolErrors": 4,
-      "maxRepeatedToolErrorSignature": 3
+      "hardMaxTurns": 1000,
+      "hardMaxToolCalls": 1000,
+      "maxConsecutiveToolErrors": 25,
+      "maxRepeatedToolErrorSignature": 25
     }
   },
   "notesGuardrails": {
     "tnWriterParallelMinVerses": 35,
+    "tnWriterMaxTurns": 150,
+    "tnWriterMaxToolCalls": 400,
     "rescueMaxPasses": 1
   }
 }
