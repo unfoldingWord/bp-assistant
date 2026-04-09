@@ -300,7 +300,7 @@ function buildParsedNotesRequest(route, content) {
 // Default verse chunk size for parallel tn-writer batching
 const TN_WRITER_CHUNK_SIZE = 7;
 const TN_WRITER_PARALLEL_MIN_VERSES = Number((config.notesGuardrails || {}).tnWriterParallelMinVerses || 35);
-const TN_WRITER_MAX_TURNS = Number((config.notesGuardrails || {}).tnWriterMaxTurns || 36);
+const TN_WRITER_MAX_TURNS = Number((config.notesGuardrails || {}).tnWriterMaxTurns || 80);
 const TN_WRITER_MAX_TOOL_CALLS = Number((config.notesGuardrails || {}).tnWriterMaxToolCalls || 90);
 const RESCUE_MAX_PASSES = Number((config.notesGuardrails || {}).rescueMaxPasses || 1);
 const TN_WRITER_RESTRICTED_TOOLS = DEFAULT_RESTRICTED_TOOLS.filter((tool) => !TN_WRITER_TOOL_BLOCKLIST.includes(tool));
