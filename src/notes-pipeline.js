@@ -22,7 +22,8 @@ const { door43Push, checkConflictingBranches, REPO_MAP, getRepoFilename } = requ
 const { setPendingMerge } = require('./pending-merges');
 const { mergeTsvs } = require('./workspace-tools/tsv-tools');
 const { getCheckpoint, setCheckpoint, clearCheckpoint } = require('./pipeline-checkpoints');
-const { buildNotesContext, updateContextArtifacts, cleanupPipelineDir } = require('./pipeline-context');
+const { buildNotesContext, updateContextArtifacts, cleanupPipelineDir, readContext, writeContext } = require('./pipeline-context');
+const { checkUltEdits } = require('./check-ult-edits');
 const { getVerseCount } = require('./verse-counts');
 
 const LOG_DIR = path.resolve(__dirname, '../logs');
@@ -782,19 +783,49 @@ async function notesPipeline(route, message) {
     const issueProducerSkillNames = new Set(['deep-issue-id', 'post-edit-review']);
 
     if (hasAIArtifacts) {
-      // AI artifacts found -> post-edit-review path
+      // AI artifacts found -> run mechanical diff gate before committing to post-edit-review
       issuesPath = resolved['issues TSV'];
-      await status(`**${ref}**: AI artifacts found \u2192 post-edit-review path`);
 
-      skills.push({
-        name: 'post-edit-review',
-        prompt: `${skillRef} --issues ${issuesPath}${ctxFlag}`,
-        appendSystemPrompt: POST_EDIT_REVIEW_HINT,
-        expectedOutput: issuesPath,
-        skipPreClean: true,   // expectedOutput is also the input — don't delete it
-        model: 'sonnet',      // validation/reconciliation — Sonnet suffices at lower cost
-        ops: 1,
-      });
+      let diffResult = { hasEdits: false, masterPath: null };
+      try {
+        diffResult = await checkUltEdits({
+          book,
+          chapter: ch,
+          workspaceDir: CSKILLBP_DIR,
+          pipeDir: pipeDir || undefined,
+        });
+      } catch (err) {
+        // Non-fatal: if diff check fails, proceed with post-edit-review as a safe fallback
+        console.warn(`[notes] checkUltEdits failed (non-fatal), proceeding with post-edit-review: ${err.message}`);
+        diffResult = { hasEdits: true, masterPath: null };
+      }
+
+      if (!diffResult.hasEdits) {
+        await status(`**${ref}**: No human edits detected — skipping post-edit-review.`);
+      } else {
+        await status(`**${ref}**: AI artifacts found \u2192 post-edit-review path`);
+
+        // Store the plain master chapter path in context so the skill can read it
+        if (diffResult.masterPath && contextPath && pipeDir) {
+          try {
+            const ctx = readContext(pipeDir);
+            ctx.sources.ultMasterPlain = diffResult.masterPath;
+            writeContext(pipeDir, ctx);
+          } catch (err) {
+            console.warn(`[notes] Failed to update context with ultMasterPlain: ${err.message}`);
+          }
+        }
+
+        skills.push({
+          name: 'post-edit-review',
+          prompt: `${skillRef} --issues ${issuesPath}${ctxFlag}`,
+          appendSystemPrompt: POST_EDIT_REVIEW_HINT,
+          expectedOutput: issuesPath,
+          skipPreClean: true,   // expectedOutput is also the input — don't delete it
+          model: 'sonnet',      // validation/reconciliation — Sonnet suffices at lower cost
+          ops: 1,
+        });
+      }
     } else {
       // No AI artifacts -> deep-issue-id path (fetches from Door43 master)
       issuesPath = buildIssuesPath(book, tag, hasVerseRange, verseStart, verseEnd);
