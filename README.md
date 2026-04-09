@@ -125,9 +125,12 @@ Uses the Claude Agent SDK `query()` to run skills in `/workspace`. The `generate
 ### `notes` (write-notes)
 The `notes-pipeline.js` module runs a skill chain per chapter:
 1. `post-edit-review` or `deep-issue-id` (reconcile/find issues)
-2. `tn-writer` (generate notes from issues)
-3. `tn-quality-check` (validate notes)
-4. Door43 push + verify
+2. Issue normalization (parallelism capping, deduplication) via `issue-normalizer.js`
+3. Mechanical prep in Node.js (prepare notes, fill Hebrew orig_quotes, resolve GL quotes, flag narrow quotes) — runs before `tn-writer` so Claude skips those MCP tool calls
+4. `tn-writer` (generate notes from issues)
+5. Quality mechanical prep in Node.js (fix trailing newlines, run all mechanical quality checks) — runs before `tn-quality-check` so Claude reads pre-run findings
+6. `tn-quality-check` (semantic review + one fix pass)
+7. Door43 push + verify
 
 ### `editor-note`
 Appends an observation to `data/editor-notes/BOOK.md`. Simple file-append operation via `note-pipeline.js`.
@@ -150,6 +153,7 @@ The bot runs an MCP (Model Context Protocol) server on port 3001 that exposes Bi
 
 - **Reference data**: Strong's concordance, glossary, issue types, published translations
 - **USFM processing**: `create_aligned_usfm` (mapping JSON → aligned USFM), `merge_aligned_usfm` (assemble N partial files into one chapter), `read_usfm_chapter`, `curly_quotes`, `check_ust_passives`
+- **TN processing**: `prepare_notes`, `fill_orig_quotes`, `resolve_gl_quotes`, `flag_narrow_quotes`, `fill_tsv_ids`, `assemble_notes`, `fix_trailing_newlines`
 - **Quality**: `validate_tn_tsv`, `check_tn_quality`
 - **Index builders**: `build_strongs_index`, `build_tn_index`, `build_ust_index`
 
@@ -209,6 +213,8 @@ src/
   pipeline-runner.js        <- Dispatcher: sdk / notes / editor-note / interactive-dm
   pipeline-context.js       <- Shared pipeline context (book, chapter, config)
   pipeline-checkpoints.js   <- Checkpoint save/restore for pipeline resumption
+  issue-normalizer.js       <- Parallelism capping and deduplication for issue TSVs
+  check-ult-edits.js        <- Detect human ULT edits (for post-edit-review gating)
   claude-runner.js          <- SDK query() wrapper with timeout, abort, metrics hooks
   generate-pipeline.js      <- ULT+UST generation + alignment + Door43 push
   notes-pipeline.js         <- TN skill chain (issue-id -> tn-writer -> quality-check) + Door43 push
