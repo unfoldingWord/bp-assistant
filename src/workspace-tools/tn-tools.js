@@ -25,6 +25,284 @@ function httpsGet(url) {
   });
 }
 
+function parseCSV(text) {
+  const lines = text.split('\n').filter((l) => l.trim() && !l.startsWith('#'));
+  return lines.map((line) => {
+    const row = [];
+    let field = '';
+    let inQuote = false;
+    for (let i = 0; i < line.length; i++) {
+      const ch = line[i];
+      if (ch === '"') {
+        if (inQuote && line[i + 1] === '"') {
+          field += '"';
+          i++;
+        } else {
+          inQuote = !inQuote;
+        }
+      } else if (ch === ',' && !inQuote) {
+        row.push(field);
+        field = '';
+      } else {
+        field += ch;
+      }
+    }
+    row.push(field);
+    return row;
+  });
+}
+
+function normalizeWhitespace(value) {
+  return String(value || '').replace(/\s+/g, ' ').trim();
+}
+
+function normalizeTemplateType(value) {
+  return normalizeWhitespace(value).toLowerCase();
+}
+
+function stripAlternateTranslation(templateText) {
+  return normalizeWhitespace(String(templateText || '').replace(/\s*Alternate translation:\s*\[[\s\S]*$/i, ''));
+}
+
+function templateHasAlternateTranslation(templateText) {
+  return /Alternate translation:/i.test(String(templateText || ''));
+}
+
+function parseExplanationDirectives(explanation) {
+  const raw = String(explanation || '').trim();
+  if (!raw) return { clean_explanation: '', must_include: [], template_hints: [] };
+
+  const parts = raw.split(/\s+(?=[it]:)/);
+  const mustInclude = [];
+  const templateHints = [];
+  const remaining = [];
+
+  for (const part of parts) {
+    const trimmed = part.trim();
+    if (!trimmed) continue;
+    if (trimmed.startsWith('i:')) {
+      const value = normalizeWhitespace(trimmed.slice(2));
+      if (value) mustInclude.push(value);
+      continue;
+    }
+    if (trimmed.startsWith('t:')) {
+      const value = normalizeWhitespace(trimmed.slice(2));
+      if (value) templateHints.push(value);
+      continue;
+    }
+    remaining.push(trimmed);
+  }
+
+  return {
+    clean_explanation: normalizeWhitespace(remaining.join(' ')),
+    must_include: mustInclude,
+    template_hints: templateHints,
+  };
+}
+
+let _templateCache = null;
+function loadTemplateMap() {
+  if (_templateCache) return _templateCache;
+  const templatesPath = path.join(CSKILLBP_DIR, 'data/templates.csv');
+  if (!fs.existsSync(templatesPath)) {
+    _templateCache = new Map();
+    return _templateCache;
+  }
+  const rows = parseCSV(fs.readFileSync(templatesPath, 'utf8'));
+  const map = new Map();
+  for (const row of rows.slice(1)) {
+    if (!row[0] || !row[2]) continue;
+    const issueType = normalizeWhitespace(row[0]);
+    const type = normalizeWhitespace(row[1] || '');
+    const template = normalizeWhitespace(row[2]);
+    if (!issueType || !template) continue;
+    if (!map.has(issueType)) map.set(issueType, []);
+    map.get(issueType).push({ issue_type: issueType, type, template });
+  }
+  _templateCache = map;
+  return _templateCache;
+}
+
+function templatePriority(template) {
+  const type = normalizeTemplateType(template?.type || '');
+  if (!type || type === 'generic') return 0;
+  return 1;
+}
+
+function resolveTemplateSelection({ sref, templateHints = [], templateMap = loadTemplateMap() }) {
+  const templates = Array.isArray(templateMap?.get?.(sref)) ? templateMap.get(sref) : [];
+  const normalizedHints = templateHints.map(normalizeTemplateType).filter(Boolean);
+
+  let selected = null;
+  let templateLocked = false;
+  let selectionReason = 'missing';
+
+  if (normalizedHints.length) {
+    const exact = templates.filter((template) => normalizedHints.includes(normalizeTemplateType(template.type)));
+    if (exact.length === 1) {
+      selected = exact[0];
+      templateLocked = true;
+      selectionReason = 'hint_exact';
+    } else if (exact.length > 1) {
+      exact.sort((a, b) => templatePriority(a) - templatePriority(b) || normalizeTemplateType(a.type).localeCompare(normalizeTemplateType(b.type)));
+      selected = exact[0];
+      selectionReason = 'hint_multi';
+    }
+  }
+
+  if (!selected && templates.length === 1) {
+    selected = templates[0];
+    templateLocked = true;
+    selectionReason = 'single_template';
+  }
+
+  if (!selected && templates.length > 1) {
+    const sorted = templates.slice().sort((a, b) => templatePriority(a) - templatePriority(b) || normalizeTemplateType(a.type).localeCompare(normalizeTemplateType(b.type)));
+    selected = sorted[0];
+    selectionReason = 'deterministic_default';
+  }
+
+  return {
+    selected_template: selected || null,
+    template_locked: templateLocked,
+    selection_reason: selectionReason,
+    candidate_templates: templates.map((template) => ({
+      type: normalizeWhitespace(template.type || '') || 'generic',
+      template_text: stripAlternateTranslation(template.template),
+      has_alternate_translation: templateHasAlternateTranslation(template.template),
+    })),
+  };
+}
+
+const ISSUE_STYLE_RULES = {
+  'writing-background': ['no_at', 'no_narrative_elaboration'],
+  'writing-newevent': ['no_at', 'no_narrative_elaboration'],
+  'figs-imperative': ['no_extra_imperative_explanation'],
+  'grammar-connect-logic-result': ['keep_to_template', 'do_not_identify_specific_phrases'],
+  'figs-quotesinquotes': ['keep_to_template', 'do_not_quote_embedded_text'],
+};
+
+function hasAtOverride(mustInclude) {
+  const joined = (mustInclude || []).join(' ');
+  return /\balternate translation\b|\bAT\b/i.test(joined);
+}
+
+function deriveStyleProfile({ sref, mustInclude = [], atProvided = '', needsAt = false, selectedTemplate = null }) {
+  const styleRules = [...(ISSUE_STYLE_RULES[sref] || [])];
+  const overrides = [];
+
+  let atPolicy = normalizeWhitespace(atProvided) ? 'provided' : (needsAt || templateHasAlternateTranslation(selectedTemplate?.template || '')) ? 'required' : 'not_needed';
+
+  if (styleRules.includes('no_at')) {
+    if (hasAtOverride(mustInclude)) {
+      overrides.push('at_policy_from_i');
+    } else {
+      atPolicy = 'forbidden';
+    }
+  }
+
+  return { at_policy: atPolicy, style_rules: styleRules, rule_overrides: overrides };
+}
+
+function formatAlternateTranslation(at) {
+  const value = normalizeWhitespace(at);
+  if (!value) return '';
+  if (value.includes('/')) {
+    const options = value.split('/').map(normalizeWhitespace).filter(Boolean).map((option) => `[${option}]`);
+    return options.length ? ` Alternate translation: ${options.join(' or ')}` : '';
+  }
+  return ` Alternate translation: [${value}]`;
+}
+
+function buildSeeHowReference(refHint, item) {
+  const hint = normalizeWhitespace(refHint).replace(/^see how\s+/i, '');
+  if (!hint) return '';
+  const currentBook = String(item.book || '').toLowerCase();
+  const [currentChapter] = String(item.reference || '').split(':');
+  const sameVerse = hint.match(/^(\d+)$/);
+  if (sameVerse && currentBook && currentChapter) {
+    const verse = sameVerse[1];
+    return `See how you translated the similar expression in [verse ${verse}](../../${currentBook}/${currentChapter}/${verse}.md).`;
+  }
+  const sameBook = hint.match(/^(\d+):(\d+)$/);
+  if (sameBook && currentBook) {
+    const chapter = sameBook[1];
+    const verse = sameBook[2];
+    return `See how you translated the similar expression in [chapter ${chapter}:${verse}](../../${currentBook}/${chapter}/${verse}.md).`;
+  }
+  const otherBook = hint.match(/^([1-3]?[A-Za-z]{3})\s+(\d+):(\d+)$/);
+  if (otherBook) {
+    const book = otherBook[1].toLowerCase();
+    const chapter = otherBook[2];
+    const verse = otherBook[3];
+    return `See how you translated the similar expression in [${otherBook[1].toUpperCase()} ${chapter}:${verse}](../../${book}/${chapter}/${verse}.md).`;
+  }
+  return '';
+}
+
+function maybeBuildProgrammaticNote(item) {
+  const explanation = normalizeWhitespace(item.explanation || '');
+  if (!/^see how\b/i.test(explanation)) return '';
+  const referenceNote = buildSeeHowReference(explanation, item);
+  if (!referenceNote) return '';
+  return normalizeWhitespace(`${referenceNote}${formatAlternateTranslation(item.at_provided || '')}`);
+}
+
+function buildWriterPacket(item) {
+  return {
+    reference: item.reference,
+    id: item.id,
+    sref: item.sref,
+    note_type: item.note_type,
+    at_policy: item.at_policy,
+    template_type: item.template_type || 'generic',
+    template_locked: !!item.template_locked,
+    template_text: item.template_text || '',
+    must_include: item.must_include || [],
+    clean_explanation: item.clean_explanation || '',
+    style_rules: item.style_rules || [],
+    rule_overrides: item.rule_overrides || [],
+    gl_quote: item.gl_quote || '',
+    orig_quote: item.orig_quote || '',
+    ult_verse: item.ult_verse || '',
+    ust_verse: item.ust_verse || '',
+    at_provided: item.at_provided || '',
+    prose_mode: 'template_plus_necessity',
+    programmatic_note: item.programmatic_note || '',
+  };
+}
+
+function buildWriterPrompt(item) {
+  if (item.programmatic_note) {
+    return `Return only this note exactly as written:\n${item.programmatic_note}`;
+  }
+
+  const packet = buildWriterPacket(item);
+  const lines = [
+    'Return only the note text.',
+    'Write the shortest faithful translation note that fully satisfies the selected template for this single item.',
+    'Keep the fixed template wording intact. Only add explanation if needed to explain what the figure or construction is doing in this verse.',
+    'Do not choose a different template or introduce broader contextual elaboration.',
+    `Reference: ${packet.reference}`,
+    `Issue type: ${packet.sref}`,
+    `Quote: ${packet.gl_quote || '(none)'}`,
+    `AT policy: ${packet.at_policy}`,
+    `Selected template type: ${packet.template_type}`,
+    `Selected template: ${packet.template_text || '(no template found)'}`,
+  ];
+
+  if (packet.clean_explanation) lines.push(`Explanation context: ${packet.clean_explanation}`);
+  if (packet.must_include.length) lines.push(`Must include: ${packet.must_include.join(' | ')}`);
+  if (packet.style_rules.length) lines.push(`Style rules: ${packet.style_rules.join(', ')}`);
+  if (packet.rule_overrides.length) lines.push(`Overrides: ${packet.rule_overrides.join(', ')}`);
+  if (packet.at_policy === 'required') lines.push('Include an Alternate translation: [text] at the end of the note.');
+  else lines.push('Do not add an alternate translation unless the provided note text already includes one programmatically.');
+  if (packet.at_policy === 'provided' && packet.at_provided) lines.push(`Provided AT context: ${packet.at_provided}`);
+  if (packet.ult_verse) lines.push(`ULT verse: ${packet.ult_verse}`);
+  if (packet.ust_verse) lines.push(`UST verse: ${packet.ust_verse}`);
+  return lines.join('\n');
+}
+
 function extractAlignmentData({ alignedUsfm, output }) {
   const filePath = path.resolve(CSKILLBP_DIR, alignedUsfm);
   const content = fs.readFileSync(filePath, 'utf8');
@@ -271,6 +549,7 @@ function prepareNotes({ inputTsv, ultUsfm, ustUsfm, output, alignedUsfm, alignme
   const lines = content.split('\n').filter(l => l.trim());
   const items = [];
   const introRows = [];
+  const templateMap = loadTemplateMap();
   for (const line of lines) {
     const cols = line.split('\t');
     if (cols[0].toLowerCase() === 'book') continue;
@@ -284,7 +563,11 @@ function prepareNotes({ inputTsv, ultUsfm, ustUsfm, output, alignedUsfm, alignme
       gl_quote: cols[3] || '', needs_at: (cols[4] || '').toLowerCase() === 'yes' || cols[4] === '1',
       at_provided: cols[5] || '', explanation: cols[6] || '',
       id: '', orig_quote: '', ult_verse: '', ust_verse: '',
-      note_type: '', hebrew_front_words: [],
+      note_type: '', hebrew_front_words: [], tcm_mode: false,
+      template_text: '', template_type: '', template_locked: false, must_include: [],
+      clean_explanation: '', at_policy: 'not_needed', style_rules: [], rule_overrides: [],
+      writer_packet: null, prompt: '', system_prompt_key: 'given_at_agent', programmatic_note: '',
+      candidate_templates: [],
     });
   }
   function parseVerses(fp) {
@@ -309,12 +592,48 @@ function prepareNotes({ inputTsv, ultUsfm, ustUsfm, output, alignedUsfm, alignme
   }
   const ultV = parseVerses(ultUsfm);
   const ustV = parseVerses(ustUsfm);
+  const fnM = path.basename(inputPath).match(/([A-Z0-9]+)-(\d+)/i);
+  const bookCode = fnM ? fnM[1].toUpperCase() : '';
   for (const item of items) {
     item.ult_verse = ultV[item.reference] || '';
     item.ust_verse = ustV[item.reference] || '';
-    item.note_type = item.at_provided ? 'given_at' : item.needs_at ? 'writes_at' : 'see_how';
+    item.book = bookCode;
+
+    const directives = parseExplanationDirectives(item.explanation);
+    const templateSelection = resolveTemplateSelection({
+      sref: item.sref,
+      templateHints: directives.template_hints,
+      templateMap,
+    });
+    const styleProfile = deriveStyleProfile({
+      sref: item.sref,
+      mustInclude: directives.must_include,
+      atProvided: item.at_provided,
+      needsAt: item.needs_at,
+      selectedTemplate: templateSelection.selected_template,
+    });
+
+    item.clean_explanation = directives.clean_explanation;
+    item.must_include = directives.must_include;
+    item.template_locked = templateSelection.template_locked;
+    item.template_type = normalizeWhitespace(templateSelection.selected_template?.type || '') || 'generic';
+    item.template_text = stripAlternateTranslation(templateSelection.selected_template?.template || '');
+    item.candidate_templates = templateSelection.candidate_templates;
+    item.at_policy = styleProfile.at_policy;
+    item.style_rules = styleProfile.style_rules;
+    item.rule_overrides = styleProfile.rule_overrides;
+
+    const explanation = normalizeWhitespace(item.explanation);
+    if (/^see how\b/i.test(explanation)) {
+      item.note_type = item.at_provided ? 'see_how' : 'see_how_at';
+    } else {
+      item.note_type = item.at_policy === 'required' ? 'writes_at' : 'given_at';
+    }
+    item.system_prompt_key = item.at_policy === 'required' ? 'ai_writes_at_agent' : 'given_at_agent';
+    item.programmatic_note = maybeBuildProgrammaticNote(item);
+    item.writer_packet = buildWriterPacket(item);
+    item.prompt = buildWriterPrompt(item);
   }
-  const fnM = path.basename(inputPath).match(/([A-Z0-9]+)-(\d+)/i);
   const result = { book: fnM ? fnM[1].toUpperCase() : '', chapter: fnM ? fnM[2] : '', source_file: inputTsv, item_count: items.length, items, intro_rows: introRows, alignment_data_path: alignmentJson || '' };
   const outPath = path.resolve(CSKILLBP_DIR, output || '/tmp/claude/prepared_notes.json');
   fs.mkdirSync(path.dirname(outPath), { recursive: true });
@@ -839,4 +1158,24 @@ async function fillTsvIds({ tsvFile, book }) {
   return `Filled ${needsId.length} IDs in ${tsvFile}`;
 }
 
-module.exports = { extractAlignmentData, fixHebrewQuotes, flagNarrowQuotes, generateIds, resolveGlQuotes, verifyAtFit, assembleNotes, prepareNotes, fixUnicodeQuotes, verifyBoldMatches, fillTsvIds, fillOrigQuotes };
+module.exports = {
+  extractAlignmentData,
+  fixHebrewQuotes,
+  flagNarrowQuotes,
+  generateIds,
+  resolveGlQuotes,
+  verifyAtFit,
+  assembleNotes,
+  prepareNotes,
+  fixUnicodeQuotes,
+  verifyBoldMatches,
+  fillTsvIds,
+  fillOrigQuotes,
+  _parseExplanationDirectives: parseExplanationDirectives,
+  _resolveTemplateSelection: resolveTemplateSelection,
+  _deriveStyleProfile: deriveStyleProfile,
+  _buildWriterPacket: buildWriterPacket,
+  _buildWriterPrompt: buildWriterPrompt,
+  _maybeBuildProgrammaticNote: maybeBuildProgrammaticNote,
+  _stripAlternateTranslation: stripAlternateTranslation,
+};
