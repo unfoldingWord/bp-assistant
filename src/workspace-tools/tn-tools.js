@@ -1038,7 +1038,7 @@ function verifyBoldMatches({ tsvFile, ultUsfm, output }) {
  * then extracts the exact Hebrew span from UHB source (character-for-character).
  * Falls back gracefully for items that can't be resolved.
  */
-function fillOrigQuotes({ preparedJson, alignmentJson, hebrewUsfm }) {
+function fillOrigQuotes({ preparedJson, alignmentJson, hebrewUsfm, masterUltUsfm }) {
   const prepPath = path.resolve(CSKILLBP_DIR, preparedJson);
   const data = JSON.parse(fs.readFileSync(prepPath, 'utf8'));
   const alignData = JSON.parse(fs.readFileSync(path.resolve(CSKILLBP_DIR, alignmentJson), 'utf8'));
@@ -1056,8 +1056,12 @@ function fillOrigQuotes({ preparedJson, alignmentJson, hebrewUsfm }) {
   const hebrewContent = fs.readFileSync(hebrewPath, 'utf8');
 
   const STRIP_RE = /[\u0591-\u05AF\u2060\u05BD\u05C3]/g;
-  const CANT = /[\u0591-\u05AF\u2060\u05BE]/g;
-  const PUNC = /[{},;:.!?'""\u2018\u2019\u201C\u201D\u2014\u2013]/g;
+  const PUNC = /[{},;:.!?'""\u2018\u2019\u201C\u201D\u2014\u2013()]/g;
+  const STOP_WORDS = new Set(['a','an','the','of','in','on','at','to','for','by','as','and','or','but','not','with','from']);
+
+  function stripForSearch(s) {
+    return s.replace(/[\u0591-\u05AF\u2060\u05BD\u05C3]/g, '');
+  }
 
   // Build verse map (same logic as fixUnicodeQuotes)
   const verseMap = {};
@@ -1123,10 +1127,11 @@ function fillOrigQuotes({ preparedJson, alignmentJson, hebrewUsfm }) {
 
     const positions = [];
     for (const hw of hebWords) {
-      const strippedHw = hw.replace(CANT, '');
+      const strippedHw = stripForSearch(hw);
       const normHw = strippedHw.normalize('NFKD');
+      if (!normHw) continue;
       const normPos = normVerse.indexOf(normHw);
-      if (normPos < 0) return null;
+      if (normPos < 0) continue; // skip unlocatable words rather than failing entirely
       // Map norm position back to strippedVerse position
       let si = 0, ni = 0;
       while (ni < normPos && si < strippedVerse.length) {
@@ -1171,8 +1176,126 @@ function fillOrigQuotes({ preparedJson, alignmentJson, hebrewUsfm }) {
     return rawSpan(rawVerse, offsetMap, startPos, endPos, strippedVerse.length);
   }
 
+  // --- Shared resolution: &-split + two-pass (exact then content-word) ---
+  function resolveWithAlignment(glQuote, entries) {
+    const cleanGlq = glQuote.replace(/\{[^}]*\}/g, '').trim();
+    if (!cleanGlq) return null;
+    const segments = cleanGlq.split(/\s*&\s*/);
+
+    const usedIndices = new Set();
+    const allHeb = [];
+
+    for (const seg of segments) {
+      const words = seg.trim().split(/\s+/).filter(Boolean)
+        .map(t => t.replace(PUNC, '').toLowerCase()).filter(Boolean);
+      if (!words.length) continue;
+
+      // Pass 1: exact match (all words)
+      const pass1Used = new Set();
+      const pass1Heb = [];
+      let pass1All = true;
+      for (const w of words) {
+        let found = false;
+        for (let i = 0; i < entries.length; i++) {
+          if (usedIndices.has(i) || pass1Used.has(i)) continue;
+          const engNorm = (entries[i].eng || '').replace(PUNC, '').toLowerCase();
+          if (engNorm === w) {
+            pass1Used.add(i);
+            if (entries[i].heb) pass1Heb.push(entries[i].heb);
+            found = true;
+            break;
+          }
+        }
+        if (!found) { pass1All = false; }
+      }
+
+      if (pass1All && pass1Heb.length) {
+        for (const idx of pass1Used) usedIndices.add(idx);
+        allHeb.push(...pass1Heb);
+        continue;
+      }
+
+      // Pass 2: content-words-only (skip stop words), require >= 50% match
+      const contentWords = words.filter(w => !STOP_WORDS.has(w));
+      const wordsToTry = contentWords.length ? contentWords : words;
+      const pass2Used = new Set();
+      const pass2Heb = [];
+      let matched = 0;
+      for (const w of wordsToTry) {
+        for (let i = 0; i < entries.length; i++) {
+          if (usedIndices.has(i) || pass2Used.has(i)) continue;
+          const engNorm = (entries[i].eng || '').replace(PUNC, '').toLowerCase();
+          if (engNorm === w) {
+            pass2Used.add(i);
+            if (entries[i].heb) pass2Heb.push(entries[i].heb);
+            matched++;
+            break;
+          }
+        }
+      }
+      if (matched < Math.ceil(wordsToTry.length / 2) || !pass2Heb.length) return null;
+      for (const idx of pass2Used) usedIndices.add(idx);
+      allHeb.push(...pass2Heb);
+    }
+
+    return allHeb.length ? allHeb : null;
+  }
+
+  // --- Parse master ULT \zaln-s alignment markers into per-verse entries ---
+  function parseMasterUltAlignments(usfmContent) {
+    const alignByVerse = {};
+    let chapter = 0, verse = 0;
+    const stack = [];
+    const COMBINED_RE = /\\zaln-s\s+\|([^\\]*?)\\?\*|\\zaln-e\\?\*|\\w\s+([^|]*?)\|[^\\]*?\\w\*/g;
+
+    for (const line of usfmContent.split('\n')) {
+      const trimmed = line.trim();
+      const cm = trimmed.match(/\\c\s+(\d+)/);
+      if (cm) { chapter = parseInt(cm[1], 10); verse = 0; }
+      const vm = trimmed.match(/\\v\s+(\d+)/);
+      if (vm) { verse = parseInt(vm[1], 10); }
+      if (!verse) continue;
+      let m;
+      COMBINED_RE.lastIndex = 0;
+      while ((m = COMBINED_RE.exec(trimmed)) !== null) {
+        if (m[1] !== undefined) {
+          const attrs = m[1];
+          const contentM = attrs.match(/x-content="([^"]*)"/);
+          stack.push({ heb: contentM ? contentM[1] : '' });
+        } else if (m[0].startsWith('\\zaln-e')) {
+          stack.pop();
+        } else if (m[2] !== undefined) {
+          const word = m[2].trim();
+          if (stack.length > 0 && stack[stack.length - 1].heb) {
+            const key = `${chapter}:${verse}`;
+            if (!alignByVerse[key]) alignByVerse[key] = [];
+            alignByVerse[key].push({ eng: word, heb: stack[stack.length - 1].heb });
+          }
+        }
+      }
+    }
+    return alignByVerse;
+  }
+
+  // Lazy-load master ULT alignments (from Door43 human-edited ULT with \zaln-s markers)
+  let masterAlignData = null; // loaded on first need
+  function loadMasterUltAlignments(book, explicitPath) {
+    if (explicitPath) {
+      const p = path.resolve(CSKILLBP_DIR, explicitPath);
+      if (fs.existsSync(p)) return parseMasterUltAlignments(fs.readFileSync(p, 'utf8'));
+    }
+    // Auto-detect from door43-repos/en_ult/
+    const d43Dir = path.join(CSKILLBP_DIR, 'door43-repos/en_ult');
+    if (fs.existsSync(d43Dir)) {
+      const files = fs.readdirSync(d43Dir).filter(f => f.toUpperCase().includes(book) && f.endsWith('.usfm'));
+      if (files.length) return parseMasterUltAlignments(fs.readFileSync(path.join(d43Dir, files[0]), 'utf8'));
+    }
+    return null;
+  }
+
   let resolved = 0;
   let resolvedViaHint = 0;
+  let resolvedViaMaster = 0;
   const unresolved = [];
 
   for (const item of (data.items || [])) {
@@ -1197,57 +1320,45 @@ function fillOrigQuotes({ preparedJson, alignmentJson, hebrewUsfm }) {
     }
 
     const entries = alignData[alignRef] || alignData[item.reference] || [];
-    if (!entries.length) {
-      unresolved.push(`${item.id} ${alignRef}: no alignment entries`);
+
+    // Step 2: AI alignment + &-split + content-word fallback
+    let hebWords = entries.length ? resolveWithAlignment(item.gl_quote, entries) : null;
+    let span = hebWords ? extractHebrewSpan(alignRef, hebWords) : null;
+
+    if (span) {
+      item.orig_quote = span;
+      resolved++;
       continue;
     }
 
-    const cleanGlq = item.gl_quote.replace(/\{[^}]*\}/g, '').trim();
-    const glqNorm = cleanGlq.split(/\s+/).filter(Boolean).map(t => t.replace(PUNC, '').toLowerCase()).filter(Boolean);
-
-    if (!glqNorm.length) {
-      unresolved.push(`${item.id} ${alignRef}: empty gl_quote after cleaning`);
-      continue;
+    // Step 3: Master ULT alignment fallback
+    if (!masterAlignData) {
+      masterAlignData = loadMasterUltAlignments(bookCode, masterUltUsfm);
     }
-
-    const usedIndices = new Set();
-    const matchedHeb = [];
-    let allMatched = true;
-
-    for (const glqWord of glqNorm) {
-      let found = false;
-      for (let i = 0; i < entries.length; i++) {
-        if (usedIndices.has(i)) continue;
-        const engNorm = (entries[i].eng || '').replace(PUNC, '').toLowerCase();
-        if (engNorm === glqWord) {
-          usedIndices.add(i);
-          if (entries[i].heb) matchedHeb.push(entries[i].heb);
-          found = true;
-          break;
+    if (masterAlignData) {
+      const masterEntries = masterAlignData[alignRef] || [];
+      if (masterEntries.length) {
+        hebWords = resolveWithAlignment(item.gl_quote, masterEntries);
+        span = hebWords ? extractHebrewSpan(alignRef, hebWords) : null;
+        if (span) {
+          item.orig_quote = span;
+          resolved++;
+          resolvedViaMaster++;
+          continue;
         }
       }
-      if (!found) { allMatched = false; break; }
     }
 
-    if (!allMatched || !matchedHeb.length) {
-      unresolved.push(`${item.id} ${alignRef}: "${cleanGlq.slice(0, 40)}" — not all words matched in alignment`);
-      continue;
-    }
-
-    const span = extractHebrewSpan(alignRef, matchedHeb);
-    if (!span) {
-      unresolved.push(`${item.id} ${alignRef}: Hebrew words found but not locatable in source verse`);
-      continue;
-    }
-
-    item.orig_quote = span;
-    resolved++;
+    // Step 4: Unresolved
+    const cleanGlq = item.gl_quote.replace(/\{[^}]*\}/g, '').trim();
+    unresolved.push(`${item.id} ${alignRef}: "${cleanGlq.slice(0, 40)}" — no alignment match`);
   }
 
   fs.writeFileSync(prepPath, JSON.stringify(data, null, 2));
 
-  const hintNote = resolvedViaHint ? ` (${resolvedViaHint} via Hebrew hint)` : '';
-  const lines = [`Resolved: ${resolved} of ${resolved + unresolved.length} items${hintNote}. Unresolved: ${unresolved.length} items:`];
+  const hintNote = resolvedViaHint ? `, ${resolvedViaHint} via Hebrew hint` : '';
+  const masterNote = resolvedViaMaster ? `, ${resolvedViaMaster} via master ULT` : '';
+  const lines = [`Resolved: ${resolved} of ${resolved + unresolved.length} items (${resolved - resolvedViaHint - resolvedViaMaster} via AI alignment${hintNote}${masterNote}). Unresolved: ${unresolved.length} items:`];
   for (const u of unresolved) lines.push(`  ${u}`);
   return lines.join('\n');
 }
