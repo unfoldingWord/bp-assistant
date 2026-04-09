@@ -451,7 +451,8 @@ function resolveGlQuotes({ preparedJson, alignmentJson, dryRun }) {
   const log = [];
   for (const item of (data.items || [])) {
     if (!item.orig_quote) continue;
-    const entries = alignData[item.reference] || [];
+    const alignRef = item.reference.replace(/:(?!\d).*$/, '');
+    const entries = alignData[alignRef] || alignData[item.reference] || [];
     if (!entries.length) continue;
     const hebWords = item.orig_quote.split(/\s+/);
     const matchedEng = [];
@@ -550,18 +551,100 @@ function prepareNotes({ inputTsv, ultUsfm, ustUsfm, output, alignedUsfm, alignme
   const items = [];
   const introRows = [];
   const templateMap = loadTemplateMap();
-  for (const line of lines) {
+
+  // --- Detect TSV column format ---
+  // Canonical (old): Book  Reference  SRef  GLQuote  NeedsAT  AT  Explanation
+  // Various new formats have headers and different column orders.
+  // Detect format from first line, then map columns to canonical positions.
+  const fnM0 = path.basename(inputPath).match(/([A-Z0-9]+)-(\d+)/i);
+  const fileBook = fnM0 ? fnM0[1].toUpperCase() : '';
+
+  let colMap = null; // null = canonical positional mapping
+  let skipFirstLine = false;
+
+  if (lines.length > 0) {
+    const firstCols = lines[0].split('\t');
+    const firstLower = firstCols.map(c => (c || '').trim().toLowerCase());
+
+    // Check for header row: contains known header words (case-insensitive)
+    const headerKeywords = ['reference', 'issue', 'hebrew', 'ult_quote', 'hint', 'quote', 'note', 'occurrence', 'supportreference'];
+    const hasHeader = firstLower.some(h => headerKeywords.includes(h));
+
+    if (hasHeader) {
+      // Build column mapping from header names
+      skipFirstLine = true;
+      const hMap = {};
+      firstLower.forEach((h, i) => { hMap[h] = i; });
+      colMap = {
+        reference: hMap['reference'] ?? hMap['ref'] ?? -1,
+        sref: hMap['issue'] ?? hMap['supportreference'] ?? hMap['sref'] ?? -1,
+        gl_quote: hMap['ult_quote'] ?? hMap['glquote'] ?? hMap['gl_quote'] ?? -1,
+        needs_at: hMap['needs_at'] ?? hMap['go?'] ?? -1,
+        at_provided: hMap['at'] ?? hMap['at_provided'] ?? -1,
+        explanation: hMap['explanation'] ?? hMap['hint'] ?? hMap['note'] ?? -1,
+        book_col: hMap['book'] ?? -1,
+      };
+    } else if (firstCols[0] && /^\d+:\d+/.test(firstCols[0].trim())) {
+      // No header, col[0] is a verse reference (new format without book code)
+      // Heuristic: Reference, Issue/SRef, ...rest varies
+      colMap = { reference: 0, sref: 1, gl_quote: 3, needs_at: -1, at_provided: -1, explanation: 4, book_col: -1 };
+      // If col[2] looks like Hebrew (contains Hebrew Unicode range), gl_quote is col[3]
+      // If col[2] looks like English, gl_quote is col[2] and explanation is col[3]
+      if (firstCols.length > 2 && !/[\u0590-\u05FF]/.test(firstCols[2] || '')) {
+        colMap.gl_quote = 2;
+        colMap.explanation = firstCols.length > 3 ? 3 : -1;
+      }
+    }
+    // else: canonical old format (Book, Ref, SRef, GLQuote, NeedsAT, AT, Explanation) — colMap stays null
+  }
+
+  function extractRow(cols) {
+    if (!colMap) {
+      // Canonical old format: Book  Ref  SRef  GLQuote  NeedsAT  AT  Explanation
+      const rawRef = cols[1] || cols[0];
+      return {
+        book: (cols[0] || '').trim(),
+        reference: rawRef.includes(':') ? rawRef : `${cols[0]}:${cols[1]}`,
+        sref: cols[2] || '',
+        gl_quote: cols[3] || '',
+        needs_at: cols[4] || '',
+        at_provided: cols[5] || '',
+        explanation: cols[6] || '',
+      };
+    }
+    const get = (key) => (colMap[key] >= 0 && colMap[key] < cols.length) ? (cols[colMap[key]] || '').trim() : '';
+    let ref = get('reference');
+    // Strip book prefix from reference if present (e.g., "ZEC 2:1" → "2:1")
+    ref = ref.replace(/^[A-Z0-9]{2,3}\s+/i, '');
+    return {
+      book: get('book_col') || fileBook,
+      reference: ref,
+      sref: get('sref'),
+      gl_quote: get('gl_quote'),
+      needs_at: get('needs_at'),
+      at_provided: get('at_provided'),
+      explanation: get('explanation'),
+    };
+  }
+
+  for (let li = skipFirstLine ? 1 : 0; li < lines.length; li++) {
+    const line = lines[li];
     const cols = line.split('\t');
-    if (cols[0].toLowerCase() === 'book') continue;
+    // Skip old-format header if present
+    if (!colMap && cols[0].toLowerCase() === 'book') continue;
     while (cols.length < 7) cols.push('');
-    const rawRef = cols[1] || cols[0];
-    if (rawRef.includes(':intro') || rawRef === 'intro') { introRows.push(line); continue; }
+
+    const row = extractRow(cols);
+    if (row.reference.includes(':intro') || row.reference === 'intro') { introRows.push(line); continue; }
+    // Validate reference looks like chapter:verse
+    if (!/^\d+:\d+/.test(row.reference)) continue;
+
     items.push({
       index: items.length,
-      reference: rawRef.includes(':') ? rawRef : `${cols[0]}:${cols[1]}`,
-      sref: (cols[2] || '').replace(/^rc:\/\/\*\/ta\/man\/translate\//, ''),
-      gl_quote: cols[3] || '', needs_at: (cols[4] || '').toLowerCase() === 'yes' || cols[4] === '1',
-      at_provided: cols[5] || '', explanation: cols[6] || '',
+      reference: row.reference,
+      sref: row.sref.replace(/^rc:\/\/\*\/ta\/man\/translate\//, ''),
+      gl_quote: row.gl_quote, needs_at: row.needs_at.toLowerCase() === 'yes' || row.needs_at === '1',
+      at_provided: row.at_provided, explanation: row.explanation,
       id: '', orig_quote: '', ult_verse: '', ust_verse: '',
       note_type: '', hebrew_front_words: [], tcm_mode: false,
       template_text: '', template_type: '', template_locked: false, must_include: [],
@@ -1060,9 +1143,11 @@ function fillOrigQuotes({ preparedJson, alignmentJson, hebrewUsfm }) {
     if (!item.gl_quote) continue;
     if (item.reference && item.reference.endsWith(':front')) continue;
 
-    const entries = alignData[item.reference] || [];
+    // Strip any non-verse suffix from reference (e.g., "36:1:writing-oracleformula" → "36:1")
+    const alignRef = item.reference.replace(/:(?!\d).*$/, '');
+    const entries = alignData[alignRef] || alignData[item.reference] || [];
     if (!entries.length) {
-      unresolved.push(`${item.id} ${item.reference}: no alignment entries`);
+      unresolved.push(`${item.id} ${alignRef}: no alignment entries`);
       continue;
     }
 
@@ -1070,7 +1155,7 @@ function fillOrigQuotes({ preparedJson, alignmentJson, hebrewUsfm }) {
     const glqNorm = cleanGlq.split(/\s+/).filter(Boolean).map(t => t.replace(PUNC, '').toLowerCase()).filter(Boolean);
 
     if (!glqNorm.length) {
-      unresolved.push(`${item.id} ${item.reference}: empty gl_quote after cleaning`);
+      unresolved.push(`${item.id} ${alignRef}: empty gl_quote after cleaning`);
       continue;
     }
 
@@ -1094,13 +1179,13 @@ function fillOrigQuotes({ preparedJson, alignmentJson, hebrewUsfm }) {
     }
 
     if (!allMatched || !matchedHeb.length) {
-      unresolved.push(`${item.id} ${item.reference}: "${cleanGlq.slice(0, 40)}" — not all words matched in alignment`);
+      unresolved.push(`${item.id} ${alignRef}: "${cleanGlq.slice(0, 40)}" — not all words matched in alignment`);
       continue;
     }
 
-    const span = extractHebrewSpan(item.reference, matchedHeb);
+    const span = extractHebrewSpan(alignRef, matchedHeb);
     if (!span) {
-      unresolved.push(`${item.id} ${item.reference}: Hebrew words found but not locatable in source verse`);
+      unresolved.push(`${item.id} ${alignRef}: Hebrew words found but not locatable in source verse`);
       continue;
     }
 
