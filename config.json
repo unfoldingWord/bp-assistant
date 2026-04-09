@@ -69,6 +69,7 @@
     "warnThreshold": 0.7,
     "ccusagePath": "npx ccusage@latest",
     "adaptiveGuards": {
+      "enableTokenBudget": false,
       "minBudgetTokens": 120000,
       "maxBudgetTokens": 1400000,
       "wordFactor": 35,

@@ -518,6 +518,7 @@ function getAdaptiveSkillGuardrails({
   sourceWordCount = 0,
 } = {}) {
   const cfg = getConfig().adaptiveGuards || {};
+  const tokenBudgetEnabled = cfg.enableTokenBudget !== false;
   const minBudget = Number(cfg.minBudgetTokens || 120000);
   const maxBudget = Number(cfg.maxBudgetTokens || 1400000);
   const wordFactor = Number(cfg.wordFactor || 35);
@@ -563,12 +564,12 @@ function getAdaptiveSkillGuardrails({
     : warmupMultiplier;
 
   const variableBudget = baseBudget + (Number(sourceWordCount || 0) * wordFactor) + (Number(issueCount || 0) * issueFactor);
-  const tokenBudget = Math.round(Math.max(minBudget, Math.min(maxBudget, variableBudget * effectiveMultiplier)));
+  const derivedBudget = Math.round(Math.max(minBudget, Math.min(maxBudget, variableBudget * effectiveMultiplier)));
 
   return {
-    tokenBudget,
-    maxTurns: Math.min(hardMaxTurns, Math.max(12, Math.round(tokenBudget / 25000))),
-    maxToolCalls: Math.min(hardMaxToolCalls, Math.max(40, Math.round(tokenBudget / 7000))),
+    tokenBudget: tokenBudgetEnabled ? derivedBudget : null,
+    maxTurns: Math.min(hardMaxTurns, Math.max(12, Math.round(derivedBudget / 25000))),
+    maxToolCalls: Math.min(hardMaxToolCalls, Math.max(40, Math.round(derivedBudget / 7000))),
     maxConsecutiveToolErrors,
     maxRepeatedToolErrorSignature,
     warmupApplied: history.length < warmupSamples,

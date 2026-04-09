@@ -13,6 +13,7 @@ test('adaptive guardrails use warm-up default when no history exists', () => {
     sourceWordCount: 520,
   });
   assert.equal(g.warmupApplied, true);
-  assert.ok(g.tokenBudget > 0);
+  assert.equal(g.tokenBudget, null);
   assert.ok(g.maxTurns >= 12);
+  assert.ok(g.maxToolCalls >= 40);
 });
