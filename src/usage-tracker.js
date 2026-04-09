@@ -527,10 +527,10 @@ function getAdaptiveSkillGuardrails({
   const warmupMultiplier = Number(cfg.warmupMultiplier || 1.0);
   const minMultiplier = Number(cfg.minMultiplier || 0.7);
   const maxMultiplier = Number(cfg.maxMultiplier || 1.6);
-  const hardMaxTurns = Number(cfg.hardMaxTurns || 70);
-  const hardMaxToolCalls = Number(cfg.hardMaxToolCalls || 220);
-  const maxConsecutiveToolErrors = Number(cfg.maxConsecutiveToolErrors || 4);
-  const maxRepeatedToolErrorSignature = Number(cfg.maxRepeatedToolErrorSignature || 3);
+  const hardMaxTurns = Number(cfg.hardMaxTurns || 1000);
+  const hardMaxToolCalls = Number(cfg.hardMaxToolCalls || 1000);
+  const maxConsecutiveToolErrors = Number(cfg.maxConsecutiveToolErrors || 25);
+  const maxRepeatedToolErrorSignature = Number(cfg.maxRepeatedToolErrorSignature || 25);
 
   const fallbackBase = getBootstrapDefault(pipeline || 'notes', skill || 'tn-writer');
   const baseBudget = Number((cfg.baseBudgetBySkill && cfg.baseBudgetBySkill[`${pipeline}|${skill}`]) || fallbackBase);
@@ -568,8 +568,8 @@ function getAdaptiveSkillGuardrails({
 
   return {
     tokenBudget: tokenBudgetEnabled ? derivedBudget : null,
-    maxTurns: Math.min(hardMaxTurns, Math.max(12, Math.round(derivedBudget / 25000))),
-    maxToolCalls: Math.min(hardMaxToolCalls, Math.max(40, Math.round(derivedBudget / 7000))),
+    maxTurns: Math.min(hardMaxTurns, Math.max(200, Math.round(derivedBudget / 25000))),
+    maxToolCalls: Math.min(hardMaxToolCalls, Math.max(500, Math.round(derivedBudget / 7000))),
     maxConsecutiveToolErrors,
     maxRepeatedToolErrorSignature,
     warmupApplied: history.length < warmupSamples,
