@@ -42,6 +42,29 @@ const TN_QUALITY_CHECK_HINT =
   'Run the MCP mechanical checks (fix_trailing_newlines, check_tn_quality), then do the full semantic review (Steps 3-4), and write the quality report. ' +
   'Keep the conversation short: run checks, fix issues, write the report, done.';
 
+const TN_WRITER_HINT =
+  'Stay in the tn-writer lane. Do not use Task/Agent/Team tools, web tools, SendMessage, or notebook editing. ' +
+  'Do not hunt for alternate templates or run exploratory repair loops. ' +
+  'Use only the prepared inputs, named canonical references, and workspace MCP tools needed for the documented tn-writer sequence. ' +
+  'Run the sequence once in order: prepare inputs, fill orig_quote, resolve gl_quote, verify quotes, flag narrow quotes, read style/canonical refs as needed, generate notes, run one AT-fit verification pass with at most one bounded fix pass, assemble TSV, post-process, final review. ' +
+  'If a subset still fails after that bounded pass, stop and report the unresolved IDs instead of exploring side paths.';
+
+const TN_WRITER_TOOL_BLOCKLIST = [
+  'Task',
+  'TaskOutput',
+  'SendMessage',
+  'Agent',
+  'TeamCreate',
+  'TeamDelete',
+  'TaskCreate',
+  'TaskUpdate',
+  'TaskList',
+  'TaskGet',
+  'NotebookEdit',
+  'WebFetch',
+  'WebSearch',
+];
+
 const PARALLELISM_HIGH_THRESHOLD = 5;
 const PARALLELISM_EXCEPTION_CAP = 1;
 const PARALLELISM_DUPLICATE_THRESHOLD = 0.75;
@@ -276,7 +299,10 @@ function buildParsedNotesRequest(route, content) {
 // Default verse chunk size for parallel tn-writer batching
 const TN_WRITER_CHUNK_SIZE = 7;
 const TN_WRITER_PARALLEL_MIN_VERSES = Number((config.notesGuardrails || {}).tnWriterParallelMinVerses || 35);
+const TN_WRITER_MAX_TURNS = Number((config.notesGuardrails || {}).tnWriterMaxTurns || 36);
+const TN_WRITER_MAX_TOOL_CALLS = Number((config.notesGuardrails || {}).tnWriterMaxToolCalls || 90);
 const RESCUE_MAX_PASSES = Number((config.notesGuardrails || {}).rescueMaxPasses || 1);
+const TN_WRITER_RESTRICTED_TOOLS = DEFAULT_RESTRICTED_TOOLS.filter((tool) => !TN_WRITER_TOOL_BLOCKLIST.includes(tool));
 
 function countIssueRows(tsvRelPath) {
   try {
@@ -312,6 +338,28 @@ function parseContextPathFlag(ctxFlag) {
   return m ? m[1] : null;
 }
 
+function applySkillSpecificGuardrails(skill, guardrails) {
+  if (skill !== 'tn-writer') return guardrails;
+  return {
+    ...guardrails,
+    maxTurns: Math.min(Number(guardrails?.maxTurns || TN_WRITER_MAX_TURNS), TN_WRITER_MAX_TURNS),
+    maxToolCalls: Math.min(Number(guardrails?.maxToolCalls || TN_WRITER_MAX_TOOL_CALLS), TN_WRITER_MAX_TOOL_CALLS),
+  };
+}
+
+function getSkillToolConfig(skill) {
+  if (skill === 'tn-writer') {
+    return {
+      tools: TN_WRITER_RESTRICTED_TOOLS,
+      disallowedTools: ['Bash', ...TN_WRITER_TOOL_BLOCKLIST],
+    };
+  }
+  return {
+    tools: DEFAULT_RESTRICTED_TOOLS,
+    disallowedTools: ['Bash'],
+  };
+}
+
 function buildSkillGuardrails({ pipeline, skill, book, chapter, issuesPath, contextPath }) {
   const issues = countIssueRows(issuesPath);
   let sourceWords = 0;
@@ -323,7 +371,7 @@ function buildSkillGuardrails({ pipeline, skill, book, chapter, issuesPath, cont
     } catch { /* ignore */ }
   }
   const verses = (() => { try { return getVerseCount(book, chapter); } catch { return 20; } })();
-  return getAdaptiveSkillGuardrails({
+  const adaptive = getAdaptiveSkillGuardrails({
     pipeline,
     skill,
     book,
@@ -331,6 +379,7 @@ function buildSkillGuardrails({ pipeline, skill, book, chapter, issuesPath, cont
     issueCount: issues,
     sourceWordCount: sourceWords,
   });
+  return applySkillSpecificGuardrails(skill, adaptive);
 }
 
 function readQualityFindings(qualityRelPath) {
@@ -511,13 +560,14 @@ async function runParallelTnWriter({
         issuesPath: shard.chunkPath,
         contextPath: parseContextPathFlag(shardCtxFlag),
       });
+      const toolConfig = getSkillToolConfig('tn-writer');
       return runClaude({
         prompt,
         cwd: CSKILLBP_DIR,
         model: model || undefined,
         skill: 'tn-writer',
-        tools: DEFAULT_RESTRICTED_TOOLS,
-        disallowedTools: ['Bash'],
+        tools: toolConfig.tools,
+        disallowedTools: toolConfig.disallowedTools,
         disableLocalSettings: true,
         forceNoAutoBashSandbox: true,
         timeoutMs,
@@ -861,6 +911,7 @@ async function notesPipeline(route, message) {
     skills.push({
       name: 'tn-writer',
       prompt: `${skillRef} --issues ${issuesPath} --output ${tnExpectedOutput}${ctxFlag}`,
+      appendSystemPrompt: TN_WRITER_HINT,
       expectedOutput: tnExpectedOutput,
       ops: 1,
     });
@@ -1009,6 +1060,7 @@ async function notesPipeline(route, message) {
       const maxTurns = skill.maxTurns
         ? Math.min(skill.maxTurns, guardrails.maxTurns)
         : guardrails.maxTurns;
+      const toolConfig = getSkillToolConfig(skill.name);
       await status(`Running **${skill.name}** for ${ref} (timeout: ${Math.round(timeoutMs / 60000)}min)...`);
       console.log(`[notes] Running ${skill.name}: ${skill.prompt} (timeout: ${Math.round(timeoutMs / 60000)}min)`);
       // #region agent log
@@ -1086,8 +1138,8 @@ async function notesPipeline(route, message) {
             cwd: CSKILLBP_DIR,
             model: model || skill.model, // TEST_FAST haiku overrides per-skill model
             skill: skill.name,
-            tools: DEFAULT_RESTRICTED_TOOLS,
-            disallowedTools: ['Bash'],
+            tools: toolConfig.tools,
+            disallowedTools: toolConfig.disallowedTools,
             disableLocalSettings: true,
             forceNoAutoBashSandbox: true,
             timeoutMs,
@@ -1648,6 +1700,8 @@ module.exports = {
   buildParsedNotesRequest,
   shouldRunIntro,
   buildChapterIntroPrompt,
+  _applySkillSpecificGuardrails: applySkillSpecificGuardrails,
+  _getSkillToolConfig: getSkillToolConfig,
   _appendIssueTagsToTsv: appendIssueTagsToTsv,
   _collectUnresolvedQuoteFindings: collectUnresolvedQuoteFindings,
 };
