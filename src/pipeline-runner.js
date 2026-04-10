@@ -15,6 +15,10 @@ async function runPipeline(route, message) {
     console.log(`[pipeline] Running interactive DM pipeline (route: ${route.name})`);
     const { interactiveDmPipeline } = require('./interactive-dm-pipeline');
     await interactiveDmPipeline(route, message);
+  } else if (route.type === 'issue-report') {
+    console.log(`[pipeline] Running issue-report pipeline (route: ${route.name})`);
+    const { issueReportPipeline } = require('./issue-report-pipeline');
+    await issueReportPipeline(route, message);
   }
 }
 

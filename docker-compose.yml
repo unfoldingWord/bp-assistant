@@ -31,6 +31,7 @@ services:
       - door43_username
       - zulip_email
       - zulip_api_key
+      - github_token
     networks:
       - work-net
     security_opt:
@@ -55,6 +56,8 @@ secrets:
     file: ../config/secrets/zulip_email
   zulip_api_key:
     file: ../config/secrets/zulip_api_key
+  github_token:
+    file: ../config/secrets/github_token
 
 volumes:
   claude-config:
