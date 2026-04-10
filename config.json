@@ -15,6 +15,13 @@
   "watchDMs": true,
   "routes": [
     {
+      "name": "report-issue",
+      "match": "/^(?:report|feedback|issue|bug)[:\\s]\\s*[\\s\\S]+/i",
+      "type": "issue-report",
+      "reply": false,
+      "operations": 1
+    },
+    {
       "name": "editor-note",
       "match": "/^note\\s+(\\w+)\\s+(.+)/i",
       "type": "editor-note",
