@@ -6,6 +6,8 @@ const fs = require('fs');
 const path = require('path');
 const https = require('https');
 
+const { loadTemplateMap } = require('./tn-tools');
+
 const CSKILLBP_DIR = process.env.CSKILLBP_DIR || '/srv/bot/workspace';
 
 // Sets used by orphaned-word checks (Check 10 / 10b)
@@ -321,6 +323,7 @@ async function checkTnQuality({ tsvPath, preparedJson, ultUsfm, ustUsfm, book, h
 
   const findings = [];
   const seenIds = new Set();
+  const _templateMap = loadTemplateMap();
 
   function addFinding(row, ref, id, severity, category, message) {
     findings.push({ row, reference: ref, id, severity, category, message });
@@ -629,18 +632,55 @@ async function checkTnQuality({ tsvPath, preparedJson, ultUsfm, ustUsfm, book, h
       }
     }
 
-    // 25. Template fixed-phrase adherence
+    // 25. Template conformance — note opening must match the first fixed phrase from its canonical template
     {
       const srefSlug = n.sref ? (n.sref.match(/translate\/([^\s;,]+)/) || [])[1] : '';
-      const TEMPLATE_PHRASES = {
-        'figs-abstractnouns': [/you could express the same idea/i],
-        'figs-rquestion': [/rhetorical question/i],
-        'figs-metaphor': [/speak/i],
-      };
-      const phrases = TEMPLATE_PHRASES[srefSlug];
-      if (phrases && !phrases.some(re => re.test(n.note))) {
-        addFinding(n.row, n.ref, n.id, 'warning', 'template_phrase_missing',
-          `Note for "${srefSlug}" missing expected template phrase`);
+      let templateText = prepItem?.template_text || '';
+      if (!templateText && srefSlug) {
+        const tpl = _templateMap.get(srefSlug);
+        if (tpl && tpl.length) templateText = tpl[0].template;
+      }
+      if (templateText) {
+        // Extract the first fixed phrase from the template (between start/placeholder boundaries)
+        // Strip AT, bold placeholders, and split on ALL-CAPS words
+        const cleaned = templateText
+          .replace(/Alternate translation:.*$/i, '')
+          .replace(/\*\*[^*]+\*\*/g, '\x00')  // mark **bold** placeholder positions
+          .replace(/\b[A-Z]{2,}\b/g, '\x00');  // mark ALL-CAPS placeholder positions
+        // Split on placeholder markers and take the first substantial segment
+        const firstPhrase = cleaned
+          .split('\x00')
+          .map(s => s.trim().replace(/\s+/g, ' '))
+          .find(s => s.length > 15);
+        if (firstPhrase) {
+          // Strip bold and brackets from note for comparison
+          const noteStripped = n.note
+            .replace(/\*\*[^*]+\*\*/g, ' ')
+            .replace(/\[[^\]]*\]/g, ' ')
+            .replace(/\s+/g, ' ')
+            .toLowerCase();
+          if (!noteStripped.includes(firstPhrase.toLowerCase())) {
+            addFinding(n.row, n.ref, n.id, 'warning', 'template_deviation',
+              `Note may deviate from canonical template. Expected opening phrase: "${firstPhrase.slice(0, 80)}"`);
+          }
+        }
+      }
+    }
+
+    // 25b. Contamination phrase detection
+    {
+      const CONTAMINATION_PHRASES = [
+        'not looking for information',
+        'not seeking information',
+        'not asking for information',
+        'does not expect an answer',
+      ];
+      for (const phrase of CONTAMINATION_PHRASES) {
+        if (n.note.toLowerCase().includes(phrase)) {
+          addFinding(n.row, n.ref, n.id, 'error', 'contamination_phrase',
+            `Note contains known contamination phrase: "${phrase}"`);
+          break;
+        }
       }
     }
   }
