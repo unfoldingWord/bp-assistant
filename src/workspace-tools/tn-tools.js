@@ -447,32 +447,38 @@ function resolveGlQuotes({ preparedJson, alignmentJson, dryRun }) {
   const data = JSON.parse(fs.readFileSync(path.resolve(CSKILLBP_DIR, preparedJson), 'utf8'));
   const alignData = JSON.parse(fs.readFileSync(path.resolve(CSKILLBP_DIR, alignmentJson), 'utf8'));
   const CANT = /[\u0591-\u05AF\u2060\u05BE]/g;
-  const PUNC = /[{},;:.!?'""\u2018\u2019\u201C\u201D\u2014\u2013]/g;
   let updated = 0;
   const log = [];
+
   for (const item of (data.items || [])) {
     if (!item.orig_quote) continue;
     const alignRef = item.reference.replace(/:(?!\d).*$/, '');
     const entries = alignData[alignRef] || alignData[item.reference] || [];
     if (!entries.length) continue;
+
+    // Build set of target Hebrew words (stripped of cantillation)
     const hebWords = item.orig_quote.split(/\s+/);
-    const matchedEng = [];
-    for (const hw of hebWords) {
-      const stripped = hw.replace(CANT, '');
-      const found = entries.find(e => e.heb === hw) || entries.find(e => e.heb.replace(CANT, '') === stripped);
-      if (found) matchedEng.push(found.eng);
+    const targetSet = new Set(hebWords.map(w => w.replace(CANT, '')));
+
+    // Single pass through entries in ULT word order — collect all matches
+    const matched = entries.filter(e => {
+      const stripped = e.heb.replace(CANT, '');
+      return targetSet.has(stripped) || targetSet.has(e.heb);
+    });
+
+    if (!matched.length) continue;
+
+    const span = matched.map(e => e.eng).join(' ');
+    if (span && span !== item.gl_quote) {
+      log.push(`${item.reference}: "${item.gl_quote}" -> "${span}"`);
+      if (!dryRun) {
+        item.gl_quote = span;
+        if (item.writer_packet) item.writer_packet.gl_quote = span;
+      }
+      updated++;
     }
-    if (!matchedEng.length) continue;
-    const ultTokens = (item.ult_verse || '').split(/\s+/);
-    const ultClean = ultTokens.map(t => t.replace(PUNC, '').toLowerCase());
-    const positions = [];
-    for (const eng of matchedEng) { const idx = ultClean.indexOf(eng.replace(PUNC, '').toLowerCase()); if (idx >= 0) positions.push(idx); }
-    if (!positions.length) continue;
-    let start = Math.min(...positions), end = Math.max(...positions);
-    while (start > 0 && ultTokens[start - 1].startsWith('{')) start--;
-    const span = ultTokens.slice(start, end + 1).join(' ');
-    if (span !== item.gl_quote) { log.push(`${item.reference}: "${item.gl_quote}" -> "${span}"`); if (!dryRun) item.gl_quote = span; updated++; }
   }
+
   if (!dryRun) fs.writeFileSync(path.resolve(CSKILLBP_DIR, preparedJson), JSON.stringify(data, null, 2));
   log.unshift(`${dryRun ? '[DRY RUN] ' : ''}Updated ${updated} gl_quotes`);
   return log.join('\n');
