@@ -446,6 +446,16 @@ function createTnWriterTools(createSdkMcpServer, tool, z) {
       tool('curly_quotes', 'Convert straight quotes to curly quotes', {
         input: z.string(), output: z.string().optional(), inPlace: z.boolean().optional(),
       }, async (args) => ({ content: [{ type: 'text', text: curlyQuotes(args) }] })),
+      tool('fix_unicode_quotes', 'Fix Hebrew quote Unicode to exactly match UHB source byte order (post-assembly)', {
+        tsvFile: z.string().describe('TN TSV file path'),
+        hebrewUsfm: z.string().optional().describe('Hebrew USFM path (auto-detected from book code if omitted)'),
+        output: z.string().optional().describe('Output path (defaults to in-place overwrite)'),
+      }, async (args) => ({ content: [{ type: 'text', text: fixUnicodeQuotes(args) }] })),
+      tool('verify_bold_matches', 'Strip bold markers from note text where the bolded word does not exactly match the ULT verse (post-assembly)', {
+        tsvFile: z.string().describe('TN TSV file path'),
+        ultUsfm: z.string().describe('Plain ULT USFM file path for verse text lookup'),
+        output: z.string().optional().describe('Output path (defaults to in-place overwrite)'),
+      }, async (args) => ({ content: [{ type: 'text', text: verifyBoldMatches(args) }] })),
     ],
   });
 }
@@ -465,6 +475,9 @@ function createQualityTools(createSdkMcpServer, tool, z) {
       tool('fix_trailing_newlines', 'Fix trailing \\n in TSV Note column', {
         file: z.string(),
       }, async (args) => ({ content: [{ type: 'text', text: fixTrailingNewlines(args) }] })),
+      tool('assemble_notes', 'Assemble notes into final TN TSV', {
+        preparedJson: z.string(), generatedJson: z.string(), output: z.string(),
+      }, async (args) => ({ content: [{ type: 'text', text: assembleNotes(args) }] })),
       tool('curly_quotes', 'Convert straight quotes to curly quotes', {
         input: z.string(), output: z.string().optional(), inPlace: z.boolean().optional(),
       }, async (args) => ({ content: [{ type: 'text', text: curlyQuotes(args) }] })),
@@ -496,6 +509,9 @@ function createIssueIdTools(createSdkMcpServer, tool, z) {
       tool('fetch_issues_resolved', 'Fetch Issues Resolved document', {
         force: z.boolean().optional(),
       }, async (args) => ({ content: [{ type: 'text', text: await fetchIssuesResolved(args) }] })),
+      tool('build_tn_index', 'Build translation notes index from published TN TSV files', {
+        force: z.boolean().optional(), lookup: z.string().optional().describe('Keyword to search'), issue: z.string().optional().describe('Issue type to query'), stats: z.boolean().optional(),
+      }, async (args) => ({ content: [{ type: 'text', text: await buildTnIndex(args) }] })),
     ],
   });
 }
