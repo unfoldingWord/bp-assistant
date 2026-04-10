@@ -67,16 +67,34 @@ function buildPipeDirName(book, chapter, verseStart, verseEnd) {
 }
 
 /**
+ * Archive a pipeline directory by renaming it with a timestamp suffix.
+ * e.g. tmp/pipeline/HAB-01 → tmp/pipeline/HAB-01-20260410-153045
+ */
+function archivePipelineDir(absPath, dirName) {
+  const ts = new Date().toISOString().replace(/\.\d+Z$/, '').replace(/[-:T]/g, '');
+  const formattedTs = `${ts.slice(0, 8)}-${ts.slice(8, 14)}`;
+  const archivePath = path.join(path.dirname(absPath), `${dirName}-${formattedTs}`);
+  try {
+    fs.renameSync(absPath, archivePath);
+  } catch (_) {
+    // If rename fails (e.g. cross-device), fall back to deletion
+    fs.rmSync(absPath, { recursive: true, force: true });
+  }
+}
+
+/**
  * Create a per-chapter pipeline working directory.
  * Returns the path relative to CSKILLBP_DIR.
+ * When reset=true and the directory already exists, it is archived with a
+ * timestamp suffix so previous run data is preserved for debugging.
  */
 function createPipelineDir({ book, chapter, verseStart, verseEnd, reset = true }) {
   const dirName = buildPipeDirName(book, chapter, verseStart, verseEnd);
   const relPath = `tmp/pipeline/${dirName}`;
   const absPath = path.resolve(CSKILLBP_DIR, relPath);
-  // Clean any stale directory from a previous run when requested.
+  // Archive any stale directory from a previous run instead of deleting it.
   if (reset && fs.existsSync(absPath)) {
-    fs.rmSync(absPath, { recursive: true, force: true });
+    archivePipelineDir(absPath, dirName);
   }
   fs.mkdirSync(absPath, { recursive: true });
   return relPath;
@@ -158,8 +176,9 @@ function extractChapterToDir(dirPath, { sourceFile, chapter, targetFilename }) {
 }
 
 /**
- * Clean up a pipeline working directory.
- * Guarded to only remove directories under tmp/pipeline/.
+ * Archive a pipeline working directory by renaming it with a timestamp suffix.
+ * Guarded to only touch directories under tmp/pipeline/.
+ * Pipeline files are preserved for 30 days to aid debugging.
  */
 function cleanupPipelineDir(dirPath) {
   if (!dirPath || !dirPath.startsWith('tmp/pipeline/')) {
@@ -168,15 +187,19 @@ function cleanupPipelineDir(dirPath) {
   }
   const absPath = path.resolve(CSKILLBP_DIR, dirPath);
   if (fs.existsSync(absPath)) {
-    fs.rmSync(absPath, { recursive: true, force: true });
+    const dirName = path.basename(absPath);
+    archivePipelineDir(absPath, dirName);
   }
 }
 
+const THIRTY_DAYS_MS = 30 * 24 * 60 * 60 * 1000;
+
 /**
- * Clean up stale pipeline directories older than maxAgeMs.
- * Call on bot startup to prevent disk buildup from crashed runs.
+ * Clean up stale pipeline directories older than maxAgeMs (default: 30 days).
+ * Call on bot startup and weekly to prevent disk buildup.
+ * Scans all dirs in tmp/pipeline/ — both active run dirs and timestamped archives.
  */
-function cleanupStalePipelineDirs(maxAgeMs = 24 * 60 * 60 * 1000) {
+function cleanupStalePipelineDirs(maxAgeMs = THIRTY_DAYS_MS) {
   const pipelineRoot = path.resolve(CSKILLBP_DIR, 'tmp/pipeline');
   if (!fs.existsSync(pipelineRoot)) return;
   const now = Date.now();
@@ -192,7 +215,7 @@ function cleanupStalePipelineDirs(maxAgeMs = 24 * 60 * 60 * 1000) {
     } catch (_) { /* skip if stat fails */ }
   }
   if (cleaned > 0) {
-    console.log(`[pipeline-context] Cleaned ${cleaned} stale pipeline dir(s)`);
+    console.log(`[pipeline-context] Cleaned ${cleaned} stale pipeline dir(s) (>${Math.round(maxAgeMs / 86400000)}d old)`);
   }
 }
 
