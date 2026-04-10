@@ -14,7 +14,7 @@ const { sendMessage, sendDM, addReaction, removeReaction } = require('./zulip-cl
 const { runClaude, DEFAULT_RESTRICTED_TOOLS, isTransientOutageError } = require('./claude-runner');
 const { getDoor43Username, emailToFallbackUsername, buildBranchName, resolveOutputFile, discoverFreshOutput, checkPrerequisites, calcSkillTimeout, normalizeBookName, resolveConflictMention, parsePartialTsv, truncatePartialTsv, parseChunkRange, CSKILLBP_DIR } = require('./pipeline-utils');
 const { splitTsv, fixTrailingNewlines } = require('./workspace-tools/tsv-tools');
-const { fillTsvIds, prepareNotes, fillOrigQuotes, resolveGlQuotes, flagNarrowQuotes } = require('./workspace-tools/tn-tools');
+const { fillTsvIds, prepareNotes, fillOrigQuotes, resolveGlQuotes, flagNarrowQuotes, extractAlignmentData } = require('./workspace-tools/tn-tools');
 const { checkTnQuality } = require('./workspace-tools/quality-tools');
 const { normalizeIssuesFile, buildParallelismIntroHintArgs } = require('./issue-normalizer');
 const { verifyRepoPush, verifyDcsToken } = require('./repo-verify');
@@ -106,6 +106,7 @@ function hasFreshFlag(content) {
 /**
  * Run all mechanical prep steps in Node.js before invoking tn-writer.
  * This replaces ~100 Claude MCP tool calls with direct function calls:
+ *   0. extractAlignmentData — parse aligned USFM → alignment_data.json
  *   1. prepareNotes — parse issues TSV, build writer packets
  *   2. fillOrigQuotes — match English→alignment→Hebrew
  *   3. resolveGlQuotes — reverse lookup English spans
@@ -116,7 +117,26 @@ function hasFreshFlag(content) {
 function runMechanicalPrep({ issuesPath, pipeDir, status }) {
   const ctx = readContext(pipeDir);
 
-  // 1. Prepare notes (parse issues, build writer packets, extract alignment)
+  // 0. Extract alignment data from aligned USFM before any steps that depend on it.
+  //    Steps 1-3 all read alignment_data.json; it must be populated first.
+  const hasAligned = ctx.sources && ctx.sources.ultAligned;
+  let extractSummary;
+  if (hasAligned) {
+    const extractResult = extractAlignmentData({
+      alignedUsfm: ctx.sources.ultAligned,
+      output: ctx.runtime.alignmentData,
+    });
+    extractSummary = extractResult.split('\n')[0];
+  } else {
+    // Guard: write an empty object so JSON.parse never crashes on a 0-byte stub
+    const alignPath = path.resolve(CSKILLBP_DIR, ctx.runtime.alignmentData);
+    fs.mkdirSync(path.dirname(alignPath), { recursive: true });
+    const existing = fs.existsSync(alignPath) ? fs.readFileSync(alignPath, 'utf8').trim() : '';
+    if (!existing) fs.writeFileSync(alignPath, '{}');
+    extractSummary = 'skipped (no aligned USFM)';
+  }
+
+  // 1. Prepare notes (parse issues, build writer packets, filter alignment)
   const prepResult = prepareNotes({
     inputTsv: issuesPath,
     ultUsfm: ctx.sources.ultPlain || ctx.sources.ult,
@@ -127,19 +147,29 @@ function runMechanicalPrep({ issuesPath, pipeDir, status }) {
   });
   const prepSummary = prepResult.split('\n')[0];
 
-  // 2. Fill Hebrew orig_quotes from alignment data
-  const fillResult = fillOrigQuotes({
-    preparedJson: ctx.runtime.preparedNotes,
-    alignmentJson: ctx.runtime.alignmentData,
-  });
-  const fillSummary = fillResult.split('\n')[0];
+  // 2. Fill Hebrew orig_quotes from alignment data (skip if no alignment)
+  let fillSummary;
+  if (hasAligned) {
+    const fillResult = fillOrigQuotes({
+      preparedJson: ctx.runtime.preparedNotes,
+      alignmentJson: ctx.runtime.alignmentData,
+    });
+    fillSummary = fillResult.split('\n')[0];
+  } else {
+    fillSummary = 'skipped (no alignment data)';
+  }
 
-  // 3. Resolve gl_quotes (reverse lookup from Hebrew to English spans)
-  const glResult = resolveGlQuotes({
-    preparedJson: ctx.runtime.preparedNotes,
-    alignmentJson: ctx.runtime.alignmentData,
-  });
-  const glSummary = glResult.split('\n')[0];
+  // 3. Resolve gl_quotes (reverse lookup from Hebrew to English spans; skip if no alignment)
+  let glSummary;
+  if (hasAligned) {
+    const glResult = resolveGlQuotes({
+      preparedJson: ctx.runtime.preparedNotes,
+      alignmentJson: ctx.runtime.alignmentData,
+    });
+    glSummary = glResult.split('\n')[0];
+  } else {
+    glSummary = 'skipped (no alignment data)';
+  }
 
   // 4. Flag narrow quotes
   const flagResult = flagNarrowQuotes({ preparedJson: ctx.runtime.preparedNotes });
@@ -149,7 +179,7 @@ function runMechanicalPrep({ issuesPath, pipeDir, status }) {
   const genPath = path.resolve(CSKILLBP_DIR, ctx.runtime.generatedNotes);
   fs.writeFileSync(genPath, '');
 
-  return { prepSummary, fillSummary, glSummary, flagSummary };
+  return { extractSummary, prepSummary, fillSummary, glSummary, flagSummary };
 }
 
 /**
@@ -1112,9 +1142,9 @@ async function notesPipeline(route, message) {
           const prep = runMechanicalPrep({ issuesPath, pipeDir, status });
           mechanicalPrepDone = true;
           await status(
-            `**${ref}**: Mechanical prep complete — ${prep.prepSummary}; ${prep.fillSummary}; ${prep.glSummary}; ${prep.flagSummary}`
+            `**${ref}**: Mechanical prep complete — extract=${prep.extractSummary}; ${prep.prepSummary}; ${prep.fillSummary}; ${prep.glSummary}; ${prep.flagSummary}`
           );
-          console.log(`[notes] Mechanical prep ${ref}: prep=${prep.prepSummary}, fill=${prep.fillSummary}, gl=${prep.glSummary}, flag=${prep.flagSummary}`);
+          console.log(`[notes] Mechanical prep ${ref}: extract=${prep.extractSummary}, prep=${prep.prepSummary}, fill=${prep.fillSummary}, gl=${prep.glSummary}, flag=${prep.flagSummary}`);
         } catch (err) {
           console.error(`[notes] Mechanical prep failed for ${ref}: ${err.message}`);
           await status(`**${ref}**: Mechanical prep failed — ${err.message}. Claude will run prep via MCP tools.`);
@@ -1436,6 +1466,22 @@ async function notesPipeline(route, message) {
         }
         if (issueProducerSkillNames.has(skill.name)) {
           await runIssueNormalizationStage();
+          // Sanity check: verify the issues TSV starts with an uppercase book code (not a row number)
+          if (skill.name === 'post-edit-review' && issuesPath) {
+            try {
+              const absIssues = path.resolve(CSKILLBP_DIR, issuesPath);
+              const content = fs.readFileSync(absIssues, 'utf8');
+              const firstLine = content.split('\n').find(l => l.trim().length > 0);
+              if (firstLine) {
+                const col0 = firstLine.split('\t')[0];
+                if (!/^[A-Z]{2,3}$/.test(col0)) {
+                  console.warn(`[notes] post-edit-review TSV format warning: column 0 is "${col0}", expected uppercase book code (e.g. PSA). Row numbers may have been prepended.`);
+                }
+              }
+            } catch (e) {
+              // Non-fatal — file may not exist yet if skill was skipped
+            }
+          }
         }
         // Pass resolved notes path to quality-check so it can find the file
         if (skill.name === 'tn-writer') {

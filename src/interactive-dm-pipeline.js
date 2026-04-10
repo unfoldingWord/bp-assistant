@@ -5,7 +5,7 @@ const path = require('path');
 const os = require('os');
 const config = require('./config');
 const { getSession, setSession, setModel, clearSession, incrementExchanges } = require('./session-store');
-const { buildOptions, DEFAULT_RESTRICTED_TOOLS, getWorkspaceToolsServer } = require('./claude-runner');
+const { buildOptions, DEFAULT_RESTRICTED_TOOLS, createFreshWorkspaceToolsServer } = require('./claude-runner');
 const { ensureFreshToken } = require('./auth-refresh');
 const { sendDM, sendMessage, addReaction, removeReaction } = require('./zulip-client');
 const { recordMetrics } = require('./usage-tracker');
@@ -169,7 +169,7 @@ async function runInteractiveQuery({ prompt, cwd, resume, model, maxTurns, timeo
     attempt++;
     await ensureFreshToken();
     const queryFn = await getQuery();
-    const wsTools = await getWorkspaceToolsServer();
+    const wsTools = await createFreshWorkspaceToolsServer();
     const abortController = new AbortController();
     const timeout = timeoutMs || DEFAULT_TIMEOUT_MS;
     const timer = setTimeout(() => {

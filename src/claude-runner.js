@@ -8,7 +8,9 @@ const config = require('./config');
 const { sendDM } = require('./zulip-client');
 
 let _query = null;
-let _workspaceToolsServer = null;
+let _sdkCreateSdkMcpServer = null;
+let _sdkTool = null;
+let _z = null;
 
 async function getQuery() {
   if (!_query) {
@@ -18,13 +20,17 @@ async function getQuery() {
   return _query;
 }
 
-async function getWorkspaceToolsServer() {
-  if (!_workspaceToolsServer) {
+// Returns a NEW server instance every call — never cached.
+// The SDK connects a transport to each instance; reusing one across parallel
+// runClaude() calls causes "Already connected to a transport" crashes.
+async function createFreshWorkspaceToolsServer() {
+  if (!_sdkCreateSdkMcpServer) {
     const sdk = await import('@anthropic-ai/claude-agent-sdk');
-    const { z } = require('zod');
-    _workspaceToolsServer = createWorkspaceTools(sdk.createSdkMcpServer, sdk.tool, z);
+    _sdkCreateSdkMcpServer = sdk.createSdkMcpServer;
+    _sdkTool = sdk.tool;
+    _z = require('zod').z;
   }
-  return _workspaceToolsServer;
+  return createWorkspaceTools(_sdkCreateSdkMcpServer, _sdkTool, _z);
 }
 
 // Default: 10 minutes per invocation, 200 turns max
@@ -134,7 +140,7 @@ async function runClaudeOnce({
 }) {
   await ensureFreshToken();
   const query = await getQuery();
-  const wsTools = await getWorkspaceToolsServer();
+  const wsTools = await createFreshWorkspaceToolsServer();
 
   const fullPrompt = skill ? `/${skill} ${prompt}` : prompt;
 
@@ -462,7 +468,7 @@ async function runClaudeStream({
 }) {
   await ensureFreshToken();
   const query = await getQuery();
-  const wsTools = await getWorkspaceToolsServer();
+  const wsTools = await createFreshWorkspaceToolsServer();
   const abortController = new AbortController();
   const timeout = timeoutMs || DEFAULT_TIMEOUT_MS;
   const timer = setTimeout(() => {
@@ -501,7 +507,7 @@ module.exports = {
   runClaude,
   runClaudeStream,
   buildOptions,
-  getWorkspaceToolsServer,
+  createFreshWorkspaceToolsServer,
   DEFAULT_RESTRICTED_TOOLS,
   ClaudeTransientOutageError,
   isTransientOutageError,
