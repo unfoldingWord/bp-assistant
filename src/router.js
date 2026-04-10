@@ -452,8 +452,12 @@ function formatCheckpointScope(cp) {
 function matchRoute(content) {
   // Strip @mentions like @**Bot Name** or @**Bot Name|1234**
   const cleanContent = content.replace(/^@\*\*[^*]+\*\*\s*/, '').trim();
+  const looksLikeApiGenerate = /^api generate\b/i.test(cleanContent);
 
   for (const route of config.routes) {
+    if (looksLikeApiGenerate && route.type !== 'api') {
+      continue;
+    }
     const pattern = route.match;
 
     // Support /regex/ patterns

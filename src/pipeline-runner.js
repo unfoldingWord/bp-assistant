@@ -19,6 +19,10 @@ async function runPipeline(route, message) {
     console.log(`[pipeline] Running issue-report pipeline (route: ${route.name})`);
     const { issueReportPipeline } = require('./issue-report-pipeline');
     await issueReportPipeline(route, message);
+  } else if (route.type === 'api') {
+    console.log(`[pipeline] Running API pipeline (route: ${route.name})`);
+    const { apiPipeline } = require('./api-runner/api-pipeline');
+    await apiPipeline(route, message);
   }
 }
 
