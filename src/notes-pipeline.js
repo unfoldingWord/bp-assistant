@@ -54,7 +54,10 @@ const TN_WRITER_HINT =
   'Use only the prepared inputs, especially writer_packet, named canonical references, and workspace MCP tools needed for the documented tn-writer sequence. ' +
   'Do not re-decide templates, parse raw explanation directives again, or invent a new AT policy when the prepared item already provides them. ' +
   'Run the sequence once in order: read prepared data, read style/canonical refs, generate notes, run one AT-fit verification pass with at most one bounded fix pass, assemble TSV, post-process, final review. ' +
-  'If a subset still fails after that bounded pass, stop and report the unresolved IDs instead of exploring side paths.';
+  'If a subset still fails after that bounded pass, stop and report the unresolved IDs instead of exploring side paths. ' +
+  'TEMPLATE FIDELITY: Each note MUST begin by filling in writer_packet.template_text — that is the only authorized sentence structure. ' +
+  'Do not prepend extra sentences before the template or substitute phrasings from Translation Academy definitions, issue-identification skill files, or published notes in data/published-tns/. ' +
+  'In particular, never use phrases like "not looking for information" or "not seeking information" — these come from TA descriptions and are not part of any canonical template.';
 
 const TN_WRITER_TOOL_BLOCKLIST = [
   'Task',
