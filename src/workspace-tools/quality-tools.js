@@ -374,7 +374,7 @@ async function checkTnQuality({ tsvPath, preparedJson, ultUsfm, ustUsfm, book, h
         const atLower = at.toLowerCase();
         const ustLower = ustVerse.toLowerCase();
         if (atLower && ustLower.includes(atLower)) {
-          addFinding(n.row, n.ref, n.id, 'warning', 'at_not_ust', `AT text "${at.slice(0, 50)}" appears verbatim in UST verse`);
+          addFinding(n.row, n.ref, n.id, 'error', 'at_matches_ust', `AT text "${at.slice(0, 50)}" appears verbatim in UST verse`);
           continue;
         }
         // Check >85% word overlap for longer ATs (>10 chars, >2 words)
