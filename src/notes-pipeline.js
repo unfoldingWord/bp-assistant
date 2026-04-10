@@ -23,7 +23,7 @@ const { door43Push, checkConflictingBranches, REPO_MAP, getRepoFilename } = requ
 const { setPendingMerge } = require('./pending-merges');
 const { mergeTsvs } = require('./workspace-tools/tsv-tools');
 const { getCheckpoint, setCheckpoint, clearCheckpoint } = require('./pipeline-checkpoints');
-const { buildNotesContext, updateContextArtifacts, cleanupPipelineDir, readContext, writeContext } = require('./pipeline-context');
+const { buildNotesContext, updateContextArtifacts, readContext, writeContext } = require('./pipeline-context');
 const { checkUltEdits } = require('./check-ult-edits');
 const { getVerseCount } = require('./verse-counts');
 
@@ -1734,12 +1734,9 @@ async function notesPipeline(route, message) {
       resume: null,
     });
 
-    // Clean up pipeline working directory now that the chapter is done
-    if (pipeDir) {
-      cleanupPipelineDir(pipeDir);
-      pipeDir = null;
-      contextPath = null;
-    }
+    // Pipeline working directory is preserved for debugging (cleaned up after 30 days)
+    pipeDir = null;
+    contextPath = null;
 
     // Notify user only after merge is confirmed
     if (chapterCount > 1) {

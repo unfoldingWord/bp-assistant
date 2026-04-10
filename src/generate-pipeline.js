@@ -19,7 +19,7 @@ const { recordMetrics, getCumulativeTokens, recordRunSummary } = require('./usag
 const { door43Push, checkConflictingBranches, REPO_MAP, getRepoFilename } = require('./door43-push');
 const { setPendingMerge } = require('./pending-merges');
 const { getCheckpoint, setCheckpoint, clearCheckpoint } = require('./pipeline-checkpoints');
-const { buildGenerateContext, buildUstContext, cleanupPipelineDir } = require('./pipeline-context');
+const { buildGenerateContext, buildUstContext } = require('./pipeline-context');
 
 const LOG_DIR = path.resolve(__dirname, '../logs');
 const REQUIRED_INITIAL_PIPELINE_FILES = [
@@ -936,12 +936,9 @@ async function generatePipeline(route, message) {
       resume: null,
     });
 
-    // Clean up pipeline working directory
-    if (genPipeDir) {
-      cleanupPipelineDir(genPipeDir);
-      genPipeDir = null;
-      genContextPath = null;
-    }
+    // Pipeline working directory is preserved for debugging (cleaned up after 30 days)
+    genPipeDir = null;
+    genContextPath = null;
   }
 
   if (abortForOutage) {

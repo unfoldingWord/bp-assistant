@@ -174,11 +174,21 @@ const METRICS_FILE = require('path').resolve(__dirname, '../data/metrics/usage.j
 require('fs').mkdirSync(require('path').dirname(METRICS_FILE), { recursive: true });
 startResourceMonitor(METRICS_FILE);
 
-// Clean up stale pipeline working directories from crashed runs
+// Clean up pipeline working directories older than 30 days on startup
 try {
   const { cleanupStalePipelineDirs } = require('./pipeline-context');
   cleanupStalePipelineDirs();
 } catch (_) { /* non-fatal */ }
+
+// Weekly cleanup: remove pipeline dirs older than 30 days
+const WEEK_MS = 7 * 24 * 60 * 60 * 1000;
+setInterval(() => {
+  try {
+    const { cleanupStalePipelineDirs } = require('./pipeline-context');
+    cleanupStalePipelineDirs();
+    console.log('[bot] Weekly pipeline cleanup complete');
+  } catch (_) { /* non-fatal */ }
+}, WEEK_MS).unref();
 
 process.on('unhandledRejection', (reason) => {
   console.error('[bot] Unhandled promise rejection:', reason);
