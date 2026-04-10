@@ -363,7 +363,7 @@ function extractAlignmentData({ alignedUsfm, output }) {
   return json;
 }
 
-function fixHebrewQuotes({ book, chapter, hebrewUsfm }) {
+function fixHebrewQuotes({ book, chapter, hebrewUsfm, output }) {
   let filePath;
   if (hebrewUsfm) filePath = path.resolve(CSKILLBP_DIR, hebrewUsfm);
   else {
@@ -394,7 +394,14 @@ function fixHebrewQuotes({ book, chapter, hebrewUsfm }) {
       }
     }
   }
-  return JSON.stringify(words);
+  const json = JSON.stringify(words);
+  if (output) {
+    const outPath = path.resolve(CSKILLBP_DIR, output);
+    fs.mkdirSync(path.dirname(outPath), { recursive: true });
+    fs.writeFileSync(outPath, json);
+    return `Extracted ${words.length} Hebrew superscription words to ${outPath}`;
+  }
+  return json;
 }
 
 function flagNarrowQuotes({ preparedJson }) {
@@ -1420,6 +1427,52 @@ async function fillTsvIds({ tsvFile, book }) {
   return `Filled ${needsId.length} IDs in ${tsvFile}`;
 }
 
+/**
+ * Combo tool: runs prepare → extract alignment → resolve gl_quotes → flag narrow → verify AT fit
+ * in a single call. Returns a summary string instead of 5 separate tool results.
+ */
+function prepareAndValidate({ inputTsv, ultUsfm, ustUsfm, alignedUsfm, output }) {
+  const prepOutput = output || '/tmp/claude/prepared_notes.json';
+  const alignOutput = '/tmp/claude/alignment_data.json';
+  const lines = [];
+
+  // 1. Prepare notes
+  const prepResult = prepareNotes({ inputTsv, ultUsfm, ustUsfm, output: prepOutput, alignedUsfm, alignmentJson: alignOutput });
+  lines.push(prepResult);
+
+  // 2. Extract alignment data (only if aligned USFM exists)
+  if (alignedUsfm) {
+    const alignPath = path.resolve(CSKILLBP_DIR, alignedUsfm);
+    if (fs.existsSync(alignPath)) {
+      const alignResult = extractAlignmentData({ alignedUsfm, output: alignOutput });
+      lines.push(alignResult);
+
+      // 3. Resolve gl_quotes
+      const resolveResult = resolveGlQuotes({ preparedJson: prepOutput, alignmentJson: alignOutput });
+      lines.push(resolveResult);
+    } else {
+      lines.push(`Aligned USFM not found: ${alignedUsfm} — skipping alignment/gl_quote resolution`);
+    }
+  } else {
+    lines.push('No aligned USFM provided — skipping alignment/gl_quote resolution');
+  }
+
+  // 4. Flag narrow quotes
+  const flagResult = flagNarrowQuotes({ preparedJson: prepOutput });
+  lines.push(flagResult);
+
+  // 5. Verify AT fit (needs generated JSON — skip if not yet available)
+  const genJsonPath = '/tmp/claude/generated_notes.json';
+  if (fs.existsSync(path.resolve(CSKILLBP_DIR, genJsonPath))) {
+    const verifyResult = verifyAtFit({ preparedJson: prepOutput, generatedJson: genJsonPath });
+    lines.push(verifyResult);
+  } else {
+    lines.push('Generated notes not yet available — skipping AT fit verification (run after note generation)');
+  }
+
+  return lines.join('\n\n');
+}
+
 module.exports = {
   extractAlignmentData,
   fixHebrewQuotes,
@@ -1429,6 +1482,7 @@ module.exports = {
   verifyAtFit,
   assembleNotes,
   prepareNotes,
+  prepareAndValidate,
   fixUnicodeQuotes,
   verifyBoldMatches,
   fillTsvIds,

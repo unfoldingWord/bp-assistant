@@ -11,7 +11,7 @@ const { splitTsv, mergeTsvs, fixTrailingNewlines } = require('./tsv-tools');
 const { extractUltEnglish, filterPsalms, curlyQuotes, checkUstPassives, createAlignedUsfm, readUsfmChapter, mergeAlignedUsfm, validateAlignmentJson, validateUltBrackets, checkUltVoiceMismatch } = require('./usfm-tools');
 const { buildStrongsIndex, buildTnIndex, buildUstIndex } = require('./index-tools');
 const { checkTwHeadwords, compareUltUst, detectAbstractNouns } = require('./issue-tools');
-const { extractAlignmentData, fixHebrewQuotes, flagNarrowQuotes, generateIds, resolveGlQuotes, verifyAtFit, assembleNotes, prepareNotes, fixUnicodeQuotes, verifyBoldMatches, fillTsvIds, fillOrigQuotes } = require('./tn-tools');
+const { extractAlignmentData, fixHebrewQuotes, flagNarrowQuotes, generateIds, resolveGlQuotes, verifyAtFit, assembleNotes, prepareNotes, prepareAndValidate, fixUnicodeQuotes, verifyBoldMatches, fillTsvIds, fillOrigQuotes } = require('./tn-tools');
 const { validateTnTsv, checkTnQuality } = require('./quality-tools');
 const { giteaPr, prepareCompare, prepareTq, verifyTq, appendQuickref } = require('./misc-tools');
 
@@ -310,6 +310,7 @@ function createWorkspaceTools(createSdkMcpServer, tool, z) {
       }, async (args) => ({ content: [{ type: 'text', text: extractAlignmentData(args) }] })),
       tool('fix_hebrew_quotes', 'Extract Hebrew superscription words for a chapter', {
         book: z.string().describe('Book code'), chapter: z.string().describe('Chapter number'), hebrewUsfm: z.string().optional(),
+        output: z.string().optional().describe('Output JSON path. Omit to return content.'),
       }, async (args) => ({ content: [{ type: 'text', text: fixHebrewQuotes(args) }] })),
       tool('flag_narrow_quotes', 'Flag gl_quotes that are too narrow for AT substitution', {
         preparedJson: z.string().describe('Prepared notes JSON path'),
@@ -342,6 +343,11 @@ function createWorkspaceTools(createSdkMcpServer, tool, z) {
         inputTsv: z.string().describe('Issue TSV path'), ultUsfm: z.string().optional(), ustUsfm: z.string().optional(),
         output: z.string().optional(), alignedUsfm: z.string().optional(), alignmentJson: z.string().optional(),
       }, async (args) => ({ content: [{ type: 'text', text: prepareNotes(args) }] })),
+
+      tool('prepare_and_validate', 'Combo: prepare notes + extract alignment + resolve gl_quotes + flag narrow quotes + verify AT fit in one call', {
+        inputTsv: z.string().describe('Issue TSV path'), ultUsfm: z.string().optional(), ustUsfm: z.string().optional(),
+        alignedUsfm: z.string().optional(), output: z.string().optional().describe('Output path for prepared JSON'),
+      }, async (args) => ({ content: [{ type: 'text', text: prepareAndValidate(args) }] })),
       tool('fix_unicode_quotes', 'Fix Hebrew quote Unicode to exactly match UHB source byte order (post-assembly)', {
         tsvFile: z.string().describe('TN TSV file path'),
         hebrewUsfm: z.string().optional().describe('Hebrew USFM path (auto-detected from book code if omitted)'),
@@ -398,4 +404,100 @@ function createWorkspaceTools(createSdkMcpServer, tool, z) {
   });
 }
 
-module.exports = { createWorkspaceTools };
+/**
+ * Per-skill tool sets — register only the tools needed for each skill.
+ * Reduces schema overhead from 36+ tools to 5-12 per skill run.
+ */
+function createTnWriterTools(createSdkMcpServer, tool, z) {
+  return createSdkMcpServer({
+    name: 'workspace-tools',
+    version: '1.0.0',
+    tools: [
+      tool('prepare_notes', 'Prepare issue TSV into structured JSON for note generation', {
+        inputTsv: z.string().describe('Issue TSV path'), ultUsfm: z.string().optional(), ustUsfm: z.string().optional(),
+        output: z.string().optional(), alignedUsfm: z.string().optional(), alignmentJson: z.string().optional(),
+      }, async (args) => ({ content: [{ type: 'text', text: prepareNotes(args) }] })),
+      tool('prepare_and_validate', 'Combo: prepare notes + extract alignment + resolve gl_quotes + flag narrow + verify AT fit', {
+        inputTsv: z.string().describe('Issue TSV path'), ultUsfm: z.string().optional(), ustUsfm: z.string().optional(),
+        alignedUsfm: z.string().optional(), output: z.string().optional(),
+      }, async (args) => ({ content: [{ type: 'text', text: prepareAndValidate(args) }] })),
+      tool('extract_alignment_data', 'Extract word-level alignment data from aligned USFM', {
+        alignedUsfm: z.string().describe('Aligned USFM file path'), output: z.string().optional(),
+      }, async (args) => ({ content: [{ type: 'text', text: extractAlignmentData(args) }] })),
+      tool('fix_hebrew_quotes', 'Extract Hebrew superscription words for a chapter', {
+        book: z.string(), chapter: z.string(), hebrewUsfm: z.string().optional(),
+        output: z.string().optional(),
+      }, async (args) => ({ content: [{ type: 'text', text: fixHebrewQuotes(args) }] })),
+      tool('resolve_gl_quotes', 'Resolve gl_quotes using alignment data', {
+        preparedJson: z.string(), alignmentJson: z.string(), dryRun: z.boolean().optional(),
+      }, async (args) => ({ content: [{ type: 'text', text: resolveGlQuotes(args) }] })),
+      tool('flag_narrow_quotes', 'Flag gl_quotes too narrow for AT substitution', {
+        preparedJson: z.string(),
+      }, async (args) => ({ content: [{ type: 'text', text: flagNarrowQuotes(args) }] })),
+      tool('verify_at_fit', 'Verify AT substitutions fit in ULT verses', {
+        preparedJson: z.string(), generatedJson: z.string(),
+      }, async (args) => ({ content: [{ type: 'text', text: verifyAtFit(args) }] })),
+      tool('generate_ids', 'Generate unique 4-char TN IDs', {
+        book: z.string(), count: z.number().int(),
+      }, async (args) => ({ content: [{ type: 'text', text: await generateIds(args) }] })),
+      tool('assemble_notes', 'Assemble notes into final TN TSV', {
+        preparedJson: z.string(), generatedJson: z.string(), output: z.string(),
+      }, async (args) => ({ content: [{ type: 'text', text: assembleNotes(args) }] })),
+      tool('curly_quotes', 'Convert straight quotes to curly quotes', {
+        input: z.string(), output: z.string().optional(), inPlace: z.boolean().optional(),
+      }, async (args) => ({ content: [{ type: 'text', text: curlyQuotes(args) }] })),
+    ],
+  });
+}
+
+function createQualityTools(createSdkMcpServer, tool, z) {
+  return createSdkMcpServer({
+    name: 'workspace-tools',
+    version: '1.0.0',
+    tools: [
+      tool('check_tn_quality', 'Run semantic quality checks on generated translation notes', {
+        tsvPath: z.string(), preparedJson: z.string().optional(), ultUsfm: z.string().optional(),
+        ustUsfm: z.string().optional(), book: z.string().optional(), hebrewUsfm: z.string().optional(), output: z.string().optional(),
+      }, async (args) => ({ content: [{ type: 'text', text: checkTnQuality(args) }] })),
+      tool('validate_tn_tsv', 'Validate TN TSV against Door43 CI rules', {
+        file: z.string(), checks: z.array(z.number()).optional(), maxErrors: z.number().optional(),
+      }, async (args) => ({ content: [{ type: 'text', text: validateTnTsv(args) }] })),
+      tool('fix_trailing_newlines', 'Fix trailing \\n in TSV Note column', {
+        file: z.string(),
+      }, async (args) => ({ content: [{ type: 'text', text: fixTrailingNewlines(args) }] })),
+      tool('curly_quotes', 'Convert straight quotes to curly quotes', {
+        input: z.string(), output: z.string().optional(), inPlace: z.boolean().optional(),
+      }, async (args) => ({ content: [{ type: 'text', text: curlyQuotes(args) }] })),
+    ],
+  });
+}
+
+function createIssueIdTools(createSdkMcpServer, tool, z) {
+  return createSdkMcpServer({
+    name: 'workspace-tools',
+    version: '1.0.0',
+    tools: [
+      tool('check_tw_headwords', 'Check terms against Translation Words headwords index', {
+        terms: z.array(z.string()),
+      }, async (args) => ({ content: [{ type: 'text', text: checkTwHeadwords(args) }] })),
+      tool('compare_ult_ust', 'Compare ULT and UST verse-by-verse', {
+        ultFile: z.string(), ustFile: z.string(), chapter: z.number().int().optional(), format: z.enum(['tsv', 'json']).optional(),
+      }, async (args) => ({ content: [{ type: 'text', text: compareUltUst(args) }] })),
+      tool('detect_abstract_nouns', 'Detect abstract nouns in text', {
+        alignmentJson: z.string().optional(), text: z.string().optional(), format: z.enum(['json', 'tsv']).optional(),
+      }, async (args) => ({ content: [{ type: 'text', text: detectAbstractNouns(args) }] })),
+      tool('fetch_door43', 'Fetch a single USFM file from Door43', {
+        book: z.string(), repo: z.string().optional(), branch: z.string().optional(),
+        user: z.string().optional(), output: z.string().optional(),
+      }, async (args) => ({ content: [{ type: 'text', text: await fetchDoor43(args) }] })),
+      tool('fetch_glossary', 'Fetch glossary CSV sheets', {
+        sheets: z.array(z.string()).optional(), force: z.boolean().optional(),
+      }, async (args) => ({ content: [{ type: 'text', text: await fetchGlossary(args) }] })),
+      tool('fetch_issues_resolved', 'Fetch Issues Resolved document', {
+        force: z.boolean().optional(),
+      }, async (args) => ({ content: [{ type: 'text', text: await fetchIssuesResolved(args) }] })),
+    ],
+  });
+}
+
+module.exports = { createWorkspaceTools, createTnWriterTools, createQualityTools, createIssueIdTools };

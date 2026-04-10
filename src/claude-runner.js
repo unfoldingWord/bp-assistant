@@ -3,7 +3,7 @@
 
 const { ensureFreshToken } = require('./auth-refresh');
 const { recordRateLimit, getHeadroom } = require('./usage-tracker');
-const { createWorkspaceTools } = require('./workspace-tools');
+const { createWorkspaceTools, createTnWriterTools, createQualityTools, createIssueIdTools } = require('./workspace-tools');
 const config = require('./config');
 const { sendDM } = require('./zulip-client');
 
@@ -23,14 +23,20 @@ async function getQuery() {
 // Returns a NEW server instance every call — never cached.
 // The SDK connects a transport to each instance; reusing one across parallel
 // runClaude() calls causes "Already connected to a transport" crashes.
-async function createFreshWorkspaceToolsServer() {
+async function createFreshWorkspaceToolsServer(toolSet) {
   if (!_sdkCreateSdkMcpServer) {
     const sdk = await import('@anthropic-ai/claude-agent-sdk');
     _sdkCreateSdkMcpServer = sdk.createSdkMcpServer;
     _sdkTool = sdk.tool;
     _z = require('zod').z;
   }
-  return createWorkspaceTools(_sdkCreateSdkMcpServer, _sdkTool, _z);
+  const factories = {
+    'tn-writer': createTnWriterTools,
+    quality: createQualityTools,
+    'issue-id': createIssueIdTools,
+  };
+  const factory = factories[toolSet] || createWorkspaceTools;
+  return factory(_sdkCreateSdkMcpServer, _sdkTool, _z);
 }
 
 // Default: 10 minutes per invocation, 200 turns max
@@ -135,12 +141,13 @@ async function runClaudeOnce({
   maxTurns,
   timeoutMs,
   appendSystemPrompt,
+  mcpToolSet,
   onProgress,
   guardrails,
 }) {
   await ensureFreshToken();
   const query = await getQuery();
-  const wsTools = await createFreshWorkspaceToolsServer();
+  const wsTools = await createFreshWorkspaceToolsServer(mcpToolSet);
 
   const fullPrompt = skill ? `/${skill} ${prompt}` : prompt;
 

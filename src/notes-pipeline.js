@@ -1018,6 +1018,7 @@ async function notesPipeline(route, message) {
         prompt: `${book} ${ch}${verseFlag}${ctxFlag}`,
         appendSystemPrompt: DEEP_ISSUE_ID_HINT,
         expectedOutput: issuesPath,
+        mcpTools: 'issue-id',
         ops: 3, // 2 analysts + challenger/merge
       });
     }
@@ -1048,6 +1049,7 @@ async function notesPipeline(route, message) {
       prompt: `${skillRef} --issues ${issuesPath} --output ${tnExpectedOutput}${ctxFlag}`,
       appendSystemPrompt: TN_WRITER_HINT,
       expectedOutput: tnExpectedOutput,
+      mcpTools: 'tn-writer',
       ops: 1,
     });
 
@@ -1059,6 +1061,7 @@ async function notesPipeline(route, message) {
       prompt: `${skillRef} --notes ${defaultNotesPath}${ctxFlag}`,
       expectedOutput: `output/quality/${book}/${qualityTag}-quality.md`,
       appendSystemPrompt: TN_QUALITY_CHECK_HINT,
+      mcpTools: 'quality',
       maxTurns: 30,
       ops: 1,
       model: 'sonnet',
@@ -1320,6 +1323,7 @@ async function notesPipeline(route, message) {
             timeoutMs,
             maxTurns,
             appendSystemPrompt: skill.appendSystemPrompt,
+            mcpToolSet: skill.mcpTools,
             guardrails,
             onProgress: ({ turnCount, lastTool, elapsedMs, timedOut }) => {
               const elapsed = Math.round(elapsedMs / 60000);
