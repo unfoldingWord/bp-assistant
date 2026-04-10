@@ -101,7 +101,9 @@ function preCreateStubs(dirPath) {
   for (const relPath of Object.values(runtime)) {
     const absPath = path.resolve(CSKILLBP_DIR, relPath);
     if (!fs.existsSync(absPath)) {
-      fs.writeFileSync(absPath, '');
+      // Use '{}' for JSON stubs so Read/JSON.parse don't choke on empty files
+      const isJson = relPath.endsWith('.json');
+      fs.writeFileSync(absPath, isJson ? '{}' : '');
     }
   }
 }

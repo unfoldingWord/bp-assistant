@@ -491,7 +491,7 @@ function verifyAtFit({ preparedJson, generatedJson }) {
     for (const atRaw of atMatches) {
       const at = atRaw.slice(1, -1);
       const ult = item.ult_verse || '';
-      const glq = (item.gl_quote || '').replace(/\{[^}]*\}/g, '').trim();
+      const glq = (item.gl_quote || '').replace(/\{[^}]*\}/g, '').replace(/\s+/g, ' ').trim();
       let idx = ult.indexOf(glq);
       if (idx < 0) idx = ult.toLowerCase().indexOf(glq.toLowerCase());
       if (idx >= 0) { results.push(`${item.reference} (${id}) [${item.sref}]\n  [${at}]\n  -> ${(ult.slice(0, idx) + at + ult.slice(idx + glq.length)).slice(0, 150)}`); }
@@ -516,7 +516,7 @@ function assembleNotes({ preparedJson, generatedJson, output }) {
   }
   function intraKey(item) {
     const ult = (item.ult_verse || '').toLowerCase();
-    const glq = (item.gl_quote || '').replace(/\{[^}]*\}/g, '').trim().toLowerCase();
+    const glq = (item.gl_quote || '').replace(/\{[^}]*\}/g, '').replace(/\s+/g, ' ').trim().toLowerCase();
     if (!ult || !glq) return [9998, 0];
     let pos = ult.indexOf(glq);
     if (pos < 0) pos = 9999;
@@ -525,11 +525,18 @@ function assembleNotes({ preparedJson, generatedJson, output }) {
   const rows = [];
   const missing = [];
   for (const item of (prepared.items || [])) {
-    // Match by ID if available, fall back to array index for late-ID workflows
-    const noteText = item.id ? generated[item.id] : generated[String(item.index)];
+    // Match by ID if available, fall back to array index, then reference-based keys
+    let noteText = item.id ? generated[item.id] : generated[String(item.index)];
+    if (!noteText && item.reference) noteText = generated[item.reference];
+    if (!noteText && item.reference && item.sref) noteText = generated[`${item.reference}:${item.sref}`] || generated[`${item.reference}_${item.sref}`];
     if (!noteText) { missing.push(item.id || `index:${item.index}`); continue; }
     const quote = item.orig_quote || '';
-    const note = noteText.replace(/\.\.\./g, '\u2026').replace(/<br\s*\/?>/gi, '').trim();
+    const note = noteText
+      .replace(/\.\.\./g, '\u2026')
+      .replace(/<br\s*\/?>/gi, '')
+      .replace(/\\u([0-9a-fA-F]{4})/g, (_, hex) => String.fromCharCode(parseInt(hex, 16)))
+      .replace(/Alternate translation:\s*["\u201C]([^"\u201D]*)["\u201D]/g, 'Alternate translation: [$1]')
+      .trim();
     const sref = item.sref ? `rc://*/ta/man/translate/${item.sref}` : '';
     rows.push({ ref: item.reference, id: item.id, tags: '', sref, quote, occurrence: quote ? '1' : '', note, _rk: refKey(item.reference), _ik: intraKey(item) });
   }
