@@ -178,9 +178,10 @@ function runMechanicalPrep({ issuesPath, pipeDir, status }) {
   const flagResult = flagNarrowQuotes({ preparedJson: ctx.runtime.preparedNotes });
   const flagSummary = flagResult.split('\n')[0];
 
-  // Clear stale generated_notes so tn-writer starts fresh
+  // Clear stale generated_notes so tn-writer starts fresh (must be valid JSON
+  // so that downstream Read with offset and JSON.parse don't choke on empty file)
   const genPath = path.resolve(CSKILLBP_DIR, ctx.runtime.generatedNotes);
-  fs.writeFileSync(genPath, '');
+  fs.writeFileSync(genPath, '{}');
 
   return { extractSummary, prepSummary, fillSummary, glSummary, flagSummary };
 }
@@ -692,9 +693,11 @@ async function runParallelTnWriter({
 
     const results = await Promise.allSettled(runPromises);
 
-    // Process results
+    // Process results and aggregate shard metrics
     let anyUsageLimit = false;
     let anyTransientOutage = false;
+    let totalTurns = 0, totalDurationMs = 0, totalCostUsd = 0;
+    let totalInputTokens = 0, totalOutputTokens = 0;
     for (let ri = 0; ri < results.length; ri++) {
       const r = results[ri].status === 'fulfilled' ? results[ri].value : { _shardIdx: ri, _error: results[ri].reason, subtype: 'error' };
       const shard = pendingShards[r._shardIdx ?? ri];
@@ -714,6 +717,11 @@ async function runParallelTnWriter({
         const absOut = path.resolve(CSKILLBP_DIR, shard.output);
         if (fs.existsSync(absOut)) {
           shard.status = 'completed';
+          totalTurns += r.num_turns || 0;
+          totalDurationMs += r.duration_ms || 0;
+          totalCostUsd += r.total_cost_usd || 0;
+          totalInputTokens += r.usage?.input_tokens ?? r.usage?.inputTokens ?? 0;
+          totalOutputTokens += r.usage?.output_tokens ?? r.usage?.outputTokens ?? 0;
           console.log(`[notes] tn-writer shard ${r._shardIdx} completed: ${shard.output}`);
         } else {
           shard.status = 'failed';
@@ -754,7 +762,13 @@ async function runParallelTnWriter({
   console.log(`[notes] Fill IDs result: ${idResult}`);
 
   return {
-    result: { subtype: 'success', num_turns: 0, duration_ms: 0, total_cost_usd: 0 },
+    result: {
+      subtype: 'success',
+      num_turns: totalTurns,
+      duration_ms: totalDurationMs,
+      total_cost_usd: totalCostUsd,
+      usage: { input_tokens: totalInputTokens, output_tokens: totalOutputTokens },
+    },
     error: null,
     shardDetails,
   };
