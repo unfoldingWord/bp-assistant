@@ -756,11 +756,6 @@ async function runParallelTnWriter({
   const mergeResult = mergeTsvs({ globPattern: mergeGlob, output: outputPath });
   console.log(`[notes] Merge result: ${mergeResult}`);
 
-  // Fill IDs on merged file
-  await status(`Generating IDs for merged notes...`);
-  const idResult = await fillTsvIds({ tsvFile: outputPath, book });
-  console.log(`[notes] Fill IDs result: ${idResult}`);
-
   return {
     result: {
       subtype: 'success',
@@ -1522,6 +1517,16 @@ async function notesPipeline(route, message) {
             if (assembledRel) {
               console.log(`[notes] Refreshed chapter aggregate from shards: ${assembledRel}`);
             }
+          }
+          // Fill IDs on the assembled notes file (covers both single-run and parallel-shard
+          // paths). Without this, chapters produce TSVs with empty ID columns, causing
+          // ~100+ mechanical errors in quality-check.
+          try {
+            const notesPathToFill = skill.resolvedOutput || resolved;
+            const fillResult = await fillTsvIds({ tsvFile: notesPathToFill, book });
+            console.log(`[notes] fillTsvIds: ${fillResult}`);
+          } catch (err) {
+            console.warn(`[notes] fillTsvIds failed (non-fatal): ${err.message}`);
           }
           for (const s of skills) {
             if (s.name === 'tn-quality-check') {
