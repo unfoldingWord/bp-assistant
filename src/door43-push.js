@@ -620,7 +620,7 @@ function insertContent({ type, book, chapter, source, verses, repoDir, repoFilen
 // commitAndPush — git add, commit, push with retry
 // ---------------------------------------------------------------------------
 
-async function commitAndPush(repoDir, branch, filename, commitMsg) {
+async function commitAndPush(repoDir, branch, filename, commitMsg, { force = false } = {}) {
   const { token } = getConfig();
   const onAuth = token ? makeOnAuth(token) : undefined;
 
@@ -648,7 +648,7 @@ async function commitAndPush(repoDir, branch, filename, commitMsg) {
   // Push with retry
   await withRetry(
     () => withTimeout(
-      git.push({ fs, http: gitHttp, dir: repoDir, remote: 'origin', ref: branch, onAuth }),
+      git.push({ fs, http: gitHttp, dir: repoDir, remote: 'origin', ref: branch, onAuth, force }),
       60000, `push ${branch}`
     ),
     { maxAttempts: 3, baseDelayMs: 2000, label: `push ${branch}` }
@@ -848,7 +848,7 @@ async function door43Push(opts) {
 
     // Step 4: Commit and push
     const commitMsg = `${type.toUpperCase()}: ${book} ${chapter} [${username}]`;
-    const pushResult = await commitAndPush(repoDir, branch, repoFilename, commitMsg);
+    const pushResult = await commitAndPush(repoDir, branch, repoFilename, commitMsg, { force: !!branchOnly });
 
     if (pushResult.noChanges) {
       return {
