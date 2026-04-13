@@ -121,10 +121,15 @@ async function apiPipeline(route, message) {
       }
 
       // 3. Issue producer
+      const skipPer = /--skip-per\b/i.test(message.content);
       let issueResult = null;
       let issuesPath = hasAIArtifacts ? prereqs.resolved['issues TSV'] : null;
 
-      if (hasAIArtifacts) {
+      if (skipPer) {
+        // Skip all issue identification — use existing issues TSV directly
+        if (!issuesPath) throw new Error(`--skip-per requires an existing issues TSV for ${book} ${chapter}, but none was found.`);
+        await reply(`--skip-per set — skipping issue identification, using existing issues TSV directly.`);
+      } else if (hasAIArtifacts) {
         const diffResult = await checkUltEdits({
           book, chapter,
           workspaceDir: path.resolve(CSKILLBP_DIR),
