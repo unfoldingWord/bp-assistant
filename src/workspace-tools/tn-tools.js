@@ -597,9 +597,9 @@ function prepareNotes({ inputTsv, ultUsfm, ustUsfm, output, alignedUsfm, alignme
       const hMap = {};
       firstLower.forEach((h, i) => { hMap[h] = i; });
       colMap = {
-        reference: hMap['reference'] ?? hMap['ref'] ?? -1,
+        reference: hMap['reference'] ?? hMap['ref'] ?? hMap['chapter:verse'] ?? hMap['chapter'] ?? -1,
         sref: hMap['issue'] ?? hMap['supportreference'] ?? hMap['sref'] ?? -1,
-        gl_quote: hMap['ult_quote'] ?? hMap['glquote'] ?? hMap['gl_quote'] ?? -1,
+        gl_quote: hMap['ult_quote'] ?? hMap['glquote'] ?? hMap['gl_quote'] ?? hMap['ult text'] ?? hMap['ult_text'] ?? -1,
         needs_at: hMap['needs_at'] ?? hMap['go?'] ?? -1,
         at_provided: hMap['at'] ?? hMap['at_provided'] ?? -1,
         explanation: hMap['explanation'] ?? hMap['hint'] ?? hMap['note'] ?? -1,
