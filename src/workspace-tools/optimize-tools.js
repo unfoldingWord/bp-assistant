@@ -5,6 +5,7 @@
 const fs = require('fs');
 const path = require('path');
 const Anthropic = require('@anthropic-ai/sdk');
+const { resolveProviderModel } = require('../api-runner/provider-config');
 
 const CSKILLBP_DIR = process.env.CSKILLBP_DIR || '/srv/bot/workspace';
 
@@ -44,7 +45,7 @@ async function optimizeIssuesResolved() {
   const today = new Date().toISOString().slice(0, 10);
 
   const response = await client.messages.create({
-    model: 'claude-sonnet-4-6',
+    model: resolveProviderModel('claude', 'sonnet'),
     max_tokens: 32000,
     messages: [{
       role: 'user',

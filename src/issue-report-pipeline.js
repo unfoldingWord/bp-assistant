@@ -3,6 +3,7 @@
 const Anthropic = require('@anthropic-ai/sdk');
 const { sendMessage, sendDM, addReaction, removeReaction } = require('./zulip-client');
 const { readSecret } = require('./secrets');
+const { resolveProviderModel } = require('./api-runner/provider-config');
 
 const GITHUB_ORG = 'unfoldingWord';
 const VALID_REPOS = new Set(['bp-assistant', 'bp-assistant-skills']);
@@ -51,7 +52,7 @@ async function issueReportPipeline(route, message) {
 
     const client = new Anthropic({ apiKey });
     const response = await client.messages.create({
-      model: 'claude-sonnet-4-6',
+      model: resolveProviderModel('claude', 'sonnet'),
       max_tokens: 1024,
       system: SYSTEM_PROMPT,
       messages: [{

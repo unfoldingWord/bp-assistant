@@ -775,7 +775,7 @@ async function createAndMergePR(token, repo, branch, title, baseBranch = 'master
  * @returns {{ success: boolean, details: string, prNumber?: number }}
  */
 async function door43Push(opts) {
-  const { type, book, chapter, username, branch, source, verses } = opts;
+  const { type, book, chapter, username, branch, source, verses, branchOnly } = opts;
   const repo = REPO_MAP[type];
   if (!repo) {
     return { success: false, details: `Unknown type: ${type}. Expected tn, ult, or ust.` };
@@ -859,6 +859,14 @@ async function door43Push(opts) {
     }
 
     // Step 5: Create PR targeting master, merge, delete staging branch
+    //         Skip when branchOnly=true — leave the branch open for review
+    if (branchOnly) {
+      const duration = ((Date.now() - startTime) / 1000).toFixed(1);
+      const branchUrl = `https://git.door43.org/${ORG}/${repo}/src/branch/${branch}`;
+      console.log(`${LOG_PREFIX} branchOnly: skipping PR for ${type.toUpperCase()} ${book} ${chapter} — branch at ${branchUrl}`);
+      return { success: true, branchOnly: true, branchUrl, duration };
+    }
+
     const prResult = await createAndMergePR(config.token, repo, branch, prTitle);
     const duration = ((Date.now() - startTime) / 1000).toFixed(1);
 
