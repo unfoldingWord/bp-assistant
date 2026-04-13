@@ -216,9 +216,11 @@ async function apiPipeline(route, message) {
       // 7. door43-push (TN)
       if (username) {
         await reply(`Pushing TN to Door43 for user **${username}**...`);
+        const chPad = String(chapter).padStart(book.toUpperCase() === 'PSA' ? 3 : 2, '0');
         const pushRes = await door43Push({
           type: 'tn', book, chapter, username,
           branch: buildBranchName(book, chapter),
+          source: `output/notes/${book}/${book}-${chPad}.tsv`,
         });
         await reply(`door43-push TN: ${pushRes.branchUrl || pushRes.details || (pushRes.success ? 'ok' : 'failed')}`);
       }
