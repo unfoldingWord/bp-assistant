@@ -3,7 +3,10 @@ const { sendMessage, sendDM, addReaction, removeReaction } = require('../zulip-c
 const fs = require('fs');
 const path = require('path');
 const { door43Push } = require('../door43-push');
-const { getDoor43Username, normalizeBookName, buildBranchName, discoverFreshOutput } = require('../pipeline-utils');
+const { getDoor43Username, normalizeBookName, buildBranchName, discoverFreshOutput, checkPrerequisites, CSKILLBP_DIR } = require('../pipeline-utils');
+const { buildNotesContext, readContext, writeContext } = require('../pipeline-context');
+const { extractAlignmentData, prepareNotes, fillOrigQuotes, resolveGlQuotes, flagNarrowQuotes } = require('../workspace-tools/tn-tools');
+const { checkUltEdits } = require('../check-ult-edits');
 
 function parseRegexLiteral(literal) {
   if (typeof literal !== 'string') return null;
@@ -87,6 +90,145 @@ async function apiPipeline(route, message) {
 
   try {
     await addReaction(msgId, 'working_on_it');
+
+    // --- Notes orchestration for tn-writer skill ---
+    if (skillName === 'tn-writer' && !isDryRun) {
+      const { book, chapter, username } = parseBookChapterUser(prompt, message.sender_email);
+      if (!book || !chapter) throw new Error(`Could not parse book/chapter from prompt: "${prompt}"`);
+
+      // 1. Check prerequisites (decides issue producer path)
+      const prereqs = checkPrerequisites(book, chapter);
+      const hasAIArtifacts = prereqs.missing.length === 0;
+
+      // 2. Build pipeline context (fetches ULT/UST from Door43 master)
+      const alignedUltPath = prereqs.resolved['AI-ULT']
+        ? prereqs.resolved['AI-ULT'].replace(/\.usfm$/, '-aligned.usfm')
+        : null;
+      const alignedExists = alignedUltPath && fs.existsSync(path.resolve(CSKILLBP_DIR, alignedUltPath));
+
+      await reply(`Building notes context for ${book} ${chapter}...`);
+      const ctxResult = await buildNotesContext({
+        book, chapter,
+        issuesPath: hasAIArtifacts ? prereqs.resolved['issues TSV'] : undefined,
+      });
+      const { dirPath, contextPath } = ctxResult;
+
+      // If aligned ULT exists, point context.sources.ultAligned at it
+      if (alignedExists) {
+        const ctx = readContext(dirPath);
+        ctx.sources.ultAligned = alignedUltPath;
+        writeContext(dirPath, ctx);
+      }
+
+      // 3. Issue producer
+      let issueResult = null;
+      let issuesPath = hasAIArtifacts ? prereqs.resolved['issues TSV'] : null;
+
+      if (hasAIArtifacts) {
+        const diffResult = await checkUltEdits({
+          book, chapter,
+          workspaceDir: path.resolve(CSKILLBP_DIR),
+          pipeDir: dirPath,
+        });
+        if (diffResult.hasEdits) {
+          const ctx = readContext(dirPath);
+          ctx.sources.ultMasterPlain = diffResult.masterPath;
+          writeContext(dirPath, ctx);
+          await reply(`AI artifacts found with human edits — running post-edit-review...`);
+          issueResult = await runSkill('post-edit-review',
+            `--issues ${issuesPath} --context ${contextPath}`,
+            { provider, model: 'sonnet', thinking: 'medium', maxTurns: 60, timeout: 20, cwd: selectedCwd });
+          await reply(`post-edit-review done (turns: ${issueResult.turns}, cost: $${(issueResult.cost || 0).toFixed(4)}).`);
+        } else {
+          await reply(`AI artifacts found, no human edits — using existing issues TSV.`);
+        }
+      } else {
+        await reply(`No AI artifacts (missing: ${prereqs.missing.join(', ')}) — running deep-issue-id...`);
+        issueResult = await runSkill('deep-issue-id',
+          `${book} ${chapter} --context ${contextPath}`,
+          { provider, model: route.model || null, thinking: 'medium', maxTurns: 100, timeout: 30, cwd: selectedCwd });
+        await reply(`deep-issue-id done (turns: ${issueResult.turns}, cost: $${(issueResult.cost || 0).toFixed(4)}).`);
+
+        // Re-resolve issues path now that deep-issue-id has written it
+        const freshPrereqs = checkPrerequisites(book, chapter);
+        issuesPath = freshPrereqs.resolved['issues TSV'] || null;
+        if (!issuesPath) throw new Error(`deep-issue-id completed but no issues TSV found for ${book} ${chapter}.`);
+        const ctx = readContext(dirPath);
+        ctx.sources.issues = issuesPath;
+        writeContext(dirPath, ctx);
+      }
+
+      // 4. Mechanical JS preprocessing
+      await reply(`Running mechanical preprocessing...`);
+      const ctx = readContext(dirPath);
+      const hasAligned = !!(ctx.sources && ctx.sources.ultAligned);
+
+      if (hasAligned) {
+        extractAlignmentData({
+          alignedUsfm: ctx.sources.ultAligned,
+          output: ctx.runtime.alignmentData,
+        });
+      }
+
+      const prepResult = prepareNotes({
+        inputTsv: issuesPath,
+        ultUsfm: ctx.sources.ultPlain || ctx.sources.ult,
+        ustUsfm: ctx.sources.ustPlain || ctx.sources.ust,
+        alignedUsfm: ctx.sources.ultAligned,
+        output: ctx.runtime.preparedNotes,
+        alignmentJson: ctx.runtime.alignmentData,
+      });
+      const prepMatch = prepResult.match(/^Prepared (\d+) items/);
+      const prepCount = prepMatch ? parseInt(prepMatch[1]) : 0;
+      if (prepCount === 0) throw new Error(`Preprocessing produced 0 items for ${book} ${chapter}. Check issues TSV.`);
+
+      if (hasAligned) {
+        fillOrigQuotes({
+          preparedJson: ctx.runtime.preparedNotes,
+          alignmentJson: ctx.runtime.alignmentData,
+        });
+        resolveGlQuotes({
+          preparedJson: ctx.runtime.preparedNotes,
+          alignmentJson: ctx.runtime.alignmentData,
+        });
+      }
+
+      flagNarrowQuotes({ preparedJson: ctx.runtime.preparedNotes });
+
+      // 5. tn-writer (Opus by default)
+      await reply(`Preprocessing done (${prepCount} items). Running tn-writer...`);
+      const writerResult = await runSkill('tn-writer',
+        `${book} ${chapter} --context ${contextPath}`,
+        { provider, model: route.model || null, thinking: 'medium', maxTurns: route.maxTurns || 150, timeout: route.timeout || 45, cwd: selectedCwd, toolChoice: route.toolChoice });
+      await reply(`tn-writer done (turns: ${writerResult.turns}, cost: $${(writerResult.cost || 0).toFixed(4)}). Running tn-quality-check...`);
+
+      // 6. tn-quality-check (Sonnet)
+      const qcResult = await runSkill('tn-quality-check',
+        `${book} ${chapter} --context ${contextPath}`,
+        { provider, model: 'sonnet', thinking: 'medium', maxTurns: 60, timeout: 20, cwd: selectedCwd });
+      await reply(`tn-quality-check done (turns: ${qcResult.turns}, cost: $${(qcResult.cost || 0).toFixed(4)}).`);
+
+      // 7. door43-push (TN)
+      if (username) {
+        await reply(`Pushing TN to Door43 for user **${username}**...`);
+        const pushRes = await door43Push({
+          type: 'tn', book, chapter, username,
+          branch: buildBranchName(book, chapter),
+        });
+        await reply(`door43-push TN: ${pushRes.branchUrl || pushRes.details || (pushRes.success ? 'ok' : 'failed')}`);
+      }
+
+      await removeReaction(msgId, 'working_on_it');
+      await addReaction(msgId, 'check');
+
+      const totalCost = [issueResult, writerResult, qcResult]
+        .filter(Boolean)
+        .reduce((sum, r) => sum + (r.cost || 0), 0);
+      await reply(`Notes pipeline complete. Total est. cost: $${totalCost.toFixed(4)}.`);
+      return;
+    }
+
+    // --- Normal single-skill flow ---
     await reply(`Running **${skillName}** via **${provider}** for \`${prompt}\`...`);
 
     const startTime = Date.now();

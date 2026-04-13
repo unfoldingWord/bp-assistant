@@ -46,13 +46,25 @@
       "name": "api-generate",
       "match": "/api generate\\s+(.+)/i",
       "type": "api",
-      "provider": "openai",
-      "skill": "initial-pipeline --lite",
+      "provider": "claude",
+      "skill": "initial-pipeline",
       "cwd": "/workspace",
       "toolChoice": "auto",
       "reply": false,
       "confirmMessage": "I'll run API generate for **$1** using the parallel api-runner. Sound right? (yes/no)",
       "operations": 3
+    },
+    {
+      "name": "api-write-notes",
+      "match": "/api write[\\s-]?notes\\s+(.+)/i",
+      "type": "api",
+      "provider": "claude",
+      "skill": "tn-writer",
+      "cwd": "/workspace",
+      "toolChoice": "auto",
+      "reply": false,
+      "confirmMessage": "I'll write translation notes for **$1** via API runner. Sound right? (yes/no)",
+      "operations": 1
     },
     {
       "name": "write-notes",
