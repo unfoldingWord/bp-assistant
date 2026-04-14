@@ -104,6 +104,9 @@ function filterPsalms() {
  */
 function curlyQuotes({ input, output, inPlace }) {
   const inputPath = path.resolve(CSKILLBP_DIR, input);
+  if (inputPath.endsWith('.json')) {
+    throw new Error(`curly_quotes must not be called on JSON files — it will corrupt property name delimiters. Received: ${inputPath}`);
+  }
   let text = fs.readFileSync(inputPath, 'utf8');
 
   // Process line by line to handle context
