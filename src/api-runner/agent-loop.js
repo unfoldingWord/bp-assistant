@@ -175,6 +175,8 @@ async function runAgentLoop({
       }
     }
 
+    console.log(`[agent-loop] ${depthPrefix}Stop reason: ${response.stopReason}, Tool calls: ${response.toolCalls?.length || 0}`);
+
     // No tool calls — model is done
     if (!response.toolCalls || response.toolCalls.length === 0) {
       console.log(`[agent-loop] ${depthPrefix}No tool calls — done after ${turns} turns`);

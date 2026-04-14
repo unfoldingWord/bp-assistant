@@ -117,7 +117,7 @@
   },
   "notesGuardrails": {
     "tnWriterParallelMinVerses": 35,
-    "tnWriterMaxTurns": 200,
+    "tnWriterMaxTurns": 400,
     "tnWriterMaxToolCalls": 400,
     "rescueMaxPasses": 1
   }

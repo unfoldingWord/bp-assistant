@@ -23,13 +23,21 @@ const THINKING_MAP = {
 };
 
 /**
- * Convert internal messages to Claude Messages API format.
+ * Convert internal messages to Claude Messages API format with Cache Control.
  */
 function toClaudeMessages(messages) {
   const result = [];
-  for (const msg of messages) {
+  const totalMsgs = messages.length;
+  
+  for (let i = 0; i < totalMsgs; i++) {
+    const msg = messages[i];
+    const isLast = (i === totalMsgs - 1);
+    const isCachePoint = (i === totalMsgs - 2 || i === totalMsgs - 4); // Cache a few points back
+
     if (msg.role === 'user') {
-      result.push({ role: 'user', content: msg.content });
+      const content = [{ type: 'text', text: msg.content }];
+      if (isCachePoint) content[0].cache_control = { type: 'ephemeral' };
+      result.push({ role: 'user', content });
     } else if (msg.role === 'assistant') {
       const blocks = [];
       if (msg.content) blocks.push({ type: 'text', text: msg.content });
@@ -43,14 +51,24 @@ function toClaudeMessages(messages) {
           });
         }
       }
+      if (isCachePoint && blocks.length > 0) {
+        blocks[blocks.length - 1].cache_control = { type: 'ephemeral' };
+      }
       result.push({ role: 'assistant', content: blocks });
     } else if (msg.role === 'tool') {
-      const blocks = msg.results.map(r => ({
-        type: 'tool_result',
-        tool_use_id: r.toolCallId,
-        content: typeof r.content === 'string' ? r.content : JSON.stringify(r.content),
-        is_error: r.isError || false,
-      }));
+      const blocks = msg.results.map((r, idx) => {
+        const block = {
+          type: 'tool_result',
+          tool_use_id: r.toolCallId,
+          content: typeof r.content === 'string' ? r.content : JSON.stringify(r.content),
+          is_error: r.isError || false,
+        };
+        // If this is the last block of a cache point turn, add cache control
+        if (isCachePoint && idx === msg.results.length - 1) {
+          block.cache_control = { type: 'ephemeral' };
+        }
+        return block;
+      });
       result.push({ role: 'user', content: blocks });
     }
   }
@@ -73,7 +91,14 @@ async function sendRequest({ model, system, messages, tools, thinking, apiKey, t
   };
 
   if (system) {
-    params.system = system;
+    // Always cache the system prompt (contains the Skill instructions)
+    params.system = [
+      {
+        type: 'text',
+        text: system,
+        cache_control: { type: 'ephemeral' }
+      }
+    ];
   }
 
   if (tools && tools.length > 0) {
@@ -93,7 +118,15 @@ async function sendRequest({ model, system, messages, tools, thinking, apiKey, t
     params.max_tokens = 128000;
   }
 
-  const resp = await client.messages.create(params);
+  // Override the default 10-minute timeout for large API runner workloads
+  // For high max_tokens, Anthropic requires streaming. We use .stream() and wait for finalMessage()
+  const stream = await client.messages.stream(params, { 
+    timeout: 60 * 60 * 1000,
+    headers: {
+      'anthropic-beta': 'prompt-caching-2024-07-31'
+    }
+  });
+  const resp = await stream.finalMessage();
   return parseResponse(resp);
 }
 
@@ -117,6 +150,8 @@ function parseResponse(resp) {
   const usage = {
     inputTokens: resp.usage?.input_tokens || 0,
     outputTokens: resp.usage?.output_tokens || 0,
+    cacheReadTokens: resp.usage?.cache_read_input_tokens || 0,
+    cacheCreateTokens: resp.usage?.cache_creation_input_tokens || 0,
   };
 
   const stopReason = resp.stop_reason || 'unknown';
@@ -144,9 +179,15 @@ function estimateCost(model, usage) {
   const providerCfg = getProviderConfig('claude');
   const resolved = resolveProviderModel('claude', model || providerCfg.defaultModel);
   const m = providerCfg.models[resolved] || providerCfg.models[providerCfg.defaultModel];
-  const inputCost = (usage.inputTokens / 1_000_000) * m.inputPer1M;
+  
+  const cacheReadCost = (usage.cacheReadTokens / 1_000_000) * (m.inputPer1M * 0.1); // 90% discount
+  const cacheCreateCost = (usage.cacheCreateTokens / 1_000_000) * (m.inputPer1M * 1.25); // 25% premium
+  const standardInputTokens = usage.inputTokens - usage.cacheReadTokens - usage.cacheCreateTokens;
+  const standardInputCost = (Math.max(0, standardInputTokens) / 1_000_000) * m.inputPer1M;
+  
   const outputCost = (usage.outputTokens / 1_000_000) * m.outputPer1M;
-  return inputCost + outputCost;
+  
+  return cacheReadCost + cacheCreateCost + standardInputCost + outputCost;
 }
 
 module.exports = {
