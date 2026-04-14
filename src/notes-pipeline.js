@@ -14,7 +14,7 @@ const { sendMessage, sendDM, addReaction, removeReaction } = require('./zulip-cl
 const { runClaude, DEFAULT_RESTRICTED_TOOLS, isTransientOutageError } = require('./claude-runner');
 const { getDoor43Username, emailToFallbackUsername, buildBranchName, resolveOutputFile, discoverFreshOutput, checkPrerequisites, calcSkillTimeout, normalizeBookName, resolveConflictMention, parsePartialTsv, truncatePartialTsv, parseChunkRange, CSKILLBP_DIR } = require('./pipeline-utils');
 const { splitTsv, fixTrailingNewlines } = require('./workspace-tools/tsv-tools');
-const { fillTsvIds, prepareNotes, fillOrigQuotes, resolveGlQuotes, flagNarrowQuotes, extractAlignmentData, prepareATContext, substituteAT } = require('./workspace-tools/tn-tools');
+const { fillTsvIds, generateIds, prepareNotes, fillOrigQuotes, resolveGlQuotes, flagNarrowQuotes, extractAlignmentData, prepareATContext, substituteAT } = require('./workspace-tools/tn-tools');
 const { checkTnQuality } = require('./workspace-tools/quality-tools');
 const { normalizeIssuesFile, buildParallelismIntroHintArgs } = require('./issue-normalizer');
 const { verifyRepoPush, verifyDcsToken } = require('./repo-verify');
@@ -119,7 +119,7 @@ function hasFreshFlag(content) {
  *
  * Returns a summary string for status reporting.
  */
-function runMechanicalPrep({ issuesPath, pipeDir, status }) {
+async function runMechanicalPrep({ issuesPath, pipeDir, status }) {
   const ctx = readContext(pipeDir);
 
   // 0. Extract alignment data from aligned USFM before any steps that depend on it.
@@ -180,12 +180,30 @@ function runMechanicalPrep({ issuesPath, pipeDir, status }) {
   const flagResult = flagNarrowQuotes({ preparedJson: ctx.runtime.preparedNotes });
   const flagSummary = flagResult.split('\n')[0];
 
+  // 5. Generate TN IDs for all items so tn-writer receives a fully-populated
+  //    prepared JSON. This prevents tn-writer from improvising ID generation
+  //    via Edit calls, and ensures fillTsvIds (post-tn-writer) is a no-op safety net.
+  const prepPath = path.resolve(CSKILLBP_DIR, ctx.runtime.preparedNotes);
+  const prepData = JSON.parse(fs.readFileSync(prepPath, 'utf8'));
+  const needsId = (prepData.items || []).filter(it => !it.id);
+  let idSummary = 'skipped (all IDs present)';
+  if (needsId.length > 0) {
+    const idStr = await generateIds({ book: prepData.book || ctx.book, count: needsId.length });
+    const newIds = idStr.split('\n').filter(Boolean);
+    let idx = 0;
+    for (const it of prepData.items) {
+      if (!it.id) it.id = newIds[idx++] || '';
+    }
+    fs.writeFileSync(prepPath, JSON.stringify(prepData, null, 2));
+    idSummary = `generated ${needsId.length} IDs`;
+  }
+
   // Clear stale generated_notes so tn-writer starts fresh (must be valid JSON
   // so that downstream Read with offset and JSON.parse don't choke on empty file)
   const genPath = path.resolve(CSKILLBP_DIR, ctx.runtime.generatedNotes);
   fs.writeFileSync(genPath, '{}');
 
-  return { extractSummary, prepSummary, fillSummary, glSummary, flagSummary };
+  return { extractSummary, prepSummary, fillSummary, glSummary, flagSummary, idSummary };
 }
 
 /**
@@ -1676,13 +1694,13 @@ async function notesPipeline(route, message) {
       // --- Mechanical prep: run all deterministic steps before tn-writer ---
       if (skill.name === 'tn-writer' && !mechanicalPrepDone && pipeDir && issuesPath) {
         try {
-          await status(`**${ref}**: Running mechanical prep (prepare, fill quotes, resolve GL, flag narrow)...`);
-          const prep = runMechanicalPrep({ issuesPath, pipeDir, status });
+          await status(`**${ref}**: Running mechanical prep (prepare, fill quotes, resolve GL, flag narrow, generate IDs)...`);
+          const prep = await runMechanicalPrep({ issuesPath, pipeDir, status });
           mechanicalPrepDone = true;
           await status(
-            `**${ref}**: Mechanical prep complete — extract=${prep.extractSummary}; ${prep.prepSummary}; ${prep.fillSummary}; ${prep.glSummary}; ${prep.flagSummary}`
+            `**${ref}**: Mechanical prep complete — extract=${prep.extractSummary}; ${prep.prepSummary}; ${prep.fillSummary}; ${prep.glSummary}; ${prep.flagSummary}; ids=${prep.idSummary}`
           );
-          console.log(`[notes] Mechanical prep ${ref}: extract=${prep.extractSummary}, prep=${prep.prepSummary}, fill=${prep.fillSummary}, gl=${prep.glSummary}, flag=${prep.flagSummary}`);
+          console.log(`[notes] Mechanical prep ${ref}: extract=${prep.extractSummary}, prep=${prep.prepSummary}, fill=${prep.fillSummary}, gl=${prep.glSummary}, flag=${prep.flagSummary}, ids=${prep.idSummary}`);
 
           // Run see-how detection after mechanical prep
           try {
