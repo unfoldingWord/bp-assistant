@@ -11,7 +11,7 @@ const { splitTsv, mergeTsvs, fixTrailingNewlines } = require('./tsv-tools');
 const { extractUltEnglish, filterPsalms, curlyQuotes, checkUstPassives, createAlignedUsfm, readUsfmChapter, mergeAlignedUsfm, validateAlignmentJson, validateUltBrackets, checkUltVoiceMismatch } = require('./usfm-tools');
 const { buildStrongsIndex, buildTnIndex, buildUstIndex } = require('./index-tools');
 const { checkTwHeadwords, compareUltUst, detectAbstractNouns } = require('./issue-tools');
-const { extractAlignmentData, fixHebrewQuotes, flagNarrowQuotes, generateIds, resolveGlQuotes, verifyAtFit, assembleNotes, prepareNotes, prepareAndValidate, fixUnicodeQuotes, verifyBoldMatches, fillTsvIds, fillOrigQuotes } = require('./tn-tools');
+const { extractAlignmentData, fixHebrewQuotes, flagNarrowQuotes, generateIds, resolveGlQuotes, verifyAtFit, assembleNotes, prepareNotes, prepareAndValidate, fixUnicodeQuotes, verifyBoldMatches, fillTsvIds, fillOrigQuotes, prepareATContext } = require('./tn-tools');
 const { validateTnTsv, checkTnQuality } = require('./quality-tools');
 const { giteaPr, prepareCompare, prepareTq, verifyTq, appendQuickref } = require('./misc-tools');
 
@@ -358,6 +358,13 @@ function createWorkspaceTools(createSdkMcpServer, tool, z) {
         ultUsfm: z.string().describe('Plain ULT USFM file path for verse text lookup'),
         output: z.string().optional().describe('Output path (defaults to in-place overwrite)'),
       }, async (args) => ({ content: [{ type: 'text', text: verifyBoldMatches(args) }] })),
+
+      // --- AT generation support ---
+      tool('prepare_at_context', 'Build AT writer context packets for items needing alternate translation generation', {
+        preparedJson: z.string().describe('Prepared notes JSON path (relative to workspace)'),
+        generatedJson: z.string().optional().describe('Generated notes JSON path (relative to workspace)'),
+        output: z.string().optional().describe('Output path for AT context JSON (relative to workspace)'),
+      }, async (args) => ({ content: [{ type: 'text', text: prepareATContext(args) }] })),
 
       // --- Quality checks ---
       tool('validate_tn_tsv', 'Validate TN TSV against Door43 CI rules (checks 3-13)', {

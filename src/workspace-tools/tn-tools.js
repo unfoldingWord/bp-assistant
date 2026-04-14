@@ -296,7 +296,7 @@ function buildWriterPrompt(item) {
   if (packet.must_include.length) lines.push(`Must include: ${packet.must_include.join(' | ')}`);
   if (packet.style_rules.length) lines.push(`Style rules: ${packet.style_rules.join(', ')}`);
   if (packet.rule_overrides.length) lines.push(`Overrides: ${packet.rule_overrides.join(', ')}`);
-  if (packet.at_policy === 'required') lines.push('Include an Alternate translation: [text] at the end of the note.');
+  if (packet.at_policy === 'required') lines.push('Do NOT include an alternate translation. The AT will be generated separately by the pipeline. Write only the explanatory note text.');
   else lines.push('Do not add an alternate translation unless the provided note text already includes one programmatically.');
   if (packet.at_policy === 'provided' && packet.at_provided) lines.push(`Provided AT context: ${packet.at_provided}`);
   if (packet.ult_verse) lines.push(`ULT verse: ${packet.ult_verse}`);
@@ -549,6 +549,8 @@ function assembleNotes({ preparedJson, generatedJson, output }) {
       .replace(/<br\s*\/?>/gi, '')
       .replace(/\\u([0-9a-fA-F]{4})/g, (_, hex) => String.fromCharCode(parseInt(hex, 16)))
       .replace(/Alternate translation:\s*["\u201C]([^"\u201D]*)["\u201D]/g, 'Alternate translation: [$1]')
+      // Catch bare AT text (no quotes or brackets) — e.g. "Alternate translation: some text"
+      .replace(/Alternate translation:\s+(?![\["\u201C])(.+?)$/gm, 'Alternate translation: [$1]')
       .trim();
     const sref = item.sref ? `rc://*/ta/man/translate/${item.sref}` : '';
     rows.push({ ref: item.reference, id: item.id, tags: '', sref, quote, occurrence: quote ? '1' : '', note, _rk: refKey(item.reference), _ik: intraKey(item) });
@@ -1473,6 +1475,126 @@ function prepareAndValidate({ inputTsv, ultUsfm, ustUsfm, alignedUsfm, output })
   return lines.join('\n\n');
 }
 
+// --- AT Generation Support ---
+
+/**
+ * Substitute an AT into a verse by replacing the gl_quote span.
+ * Returns the modified verse string, or null if gl_quote not found.
+ *
+ * Handles discontinuous quotes (contains \u2026 or "...").
+ */
+function substituteAT(verse, glQuote, atText) {
+  if (!verse || !glQuote || !atText) return null;
+
+  // Handle discontinuous quotes: "first part … second part"
+  const ellipsis = '\u2026';
+  if (glQuote.includes(ellipsis) || glQuote.includes('...')) {
+    const separator = glQuote.includes(ellipsis) ? ellipsis : '...';
+    const parts = glQuote.split(separator).map(p => p.trim());
+    const atParts = atText.includes(ellipsis)
+      ? atText.split(ellipsis).map(p => p.trim())
+      : atText.includes('...')
+        ? atText.split('...').map(p => p.trim())
+        : [atText]; // AT has no separator — replace first part only
+
+    let result = verse;
+    for (let i = 0; i < parts.length; i++) {
+      const replacement = atParts[i] || atParts[atParts.length - 1] || '';
+      const idx = result.indexOf(parts[i]);
+      if (idx === -1) return null; // part not found
+      result = result.slice(0, idx) + replacement + result.slice(idx + parts[i].length);
+    }
+    return result;
+  }
+
+  // Simple contiguous quote
+  const idx = verse.indexOf(glQuote);
+  if (idx === -1) {
+    // Try case-insensitive match
+    const lowerIdx = verse.toLowerCase().indexOf(glQuote.toLowerCase());
+    if (lowerIdx === -1) return null;
+    return verse.slice(0, lowerIdx) + atText + verse.slice(lowerIdx + glQuote.length);
+  }
+  return verse.slice(0, idx) + atText + verse.slice(idx + glQuote.length);
+}
+
+/**
+ * Build AT writer context packets for items that need AT generation.
+ * Reads prepared_notes.json, returns an array of context packets per item.
+ *
+ * @param {object} args
+ * @param {string} args.preparedJson - Path to prepared_notes.json (relative to workspace)
+ * @param {string} [args.generatedJson] - Path to generated_notes.json (relative to workspace)
+ * @param {string} [args.output] - Output path for AT context JSON (relative to workspace)
+ * @returns {string} Summary or JSON content
+ */
+function prepareATContext({ preparedJson, generatedJson, output }) {
+  const prepPath = path.resolve(CSKILLBP_DIR, preparedJson);
+  const prepared = JSON.parse(fs.readFileSync(prepPath, 'utf8'));
+
+  let generatedNotes = {};
+  if (generatedJson) {
+    const genPath = path.resolve(CSKILLBP_DIR, generatedJson);
+    if (fs.existsSync(genPath)) {
+      generatedNotes = JSON.parse(fs.readFileSync(genPath, 'utf8'));
+    }
+  }
+
+  // Build verse lookup for context window (prev + current + next)
+  const ultVerses = {};
+  const ustVerses = {};
+  for (const item of (prepared.items || [])) {
+    if (item.ult_verse) ultVerses[item.reference] = item.ult_verse;
+    if (item.ust_verse) ustVerses[item.reference] = item.ust_verse;
+  }
+
+  // Helper to get adjacent verse text
+  function getVerseContext(ref) {
+    const [ch, vs] = ref.split(':').map(Number);
+    if (isNaN(ch) || isNaN(vs)) return { prev: '', current: ultVerses[ref] || '', next: '' };
+    return {
+      prev: ultVerses[`${ch}:${vs - 1}`] || '',
+      current: ultVerses[ref] || '',
+      next: ultVerses[`${ch}:${vs + 1}`] || '',
+    };
+  }
+
+  const packets = [];
+  for (const item of (prepared.items || [])) {
+    if (item.at_policy !== 'required') continue;
+    if (item.programmatic_note) continue; // "see how" notes already have ATs
+
+    const noteText = generatedNotes[item.id] || '';
+    const verseCtx = getVerseContext(item.reference);
+
+    packets.push({
+      id: item.id,
+      reference: item.reference,
+      issue_type: item.sref,
+      exact_ult_span: item.gl_quote || '',
+      full_verse: verseCtx.current,
+      verse_context: {
+        prev: verseCtx.prev,
+        current: verseCtx.current,
+        next: verseCtx.next,
+      },
+      note_text: noteText,
+      ust_verse: item.ust_verse || '',
+      is_discontinuous: (item.gl_quote || '').includes('\u2026') || (item.gl_quote || '').includes('...'),
+      template_type: item.template_type || '',
+    });
+  }
+
+  const result = { book: prepared.book, chapter: prepared.chapter, item_count: packets.length, packets };
+  if (output) {
+    const outPath = path.resolve(CSKILLBP_DIR, output);
+    fs.mkdirSync(path.dirname(outPath), { recursive: true });
+    fs.writeFileSync(outPath, JSON.stringify(result, null, 2));
+    return `Prepared ${packets.length} AT context packets to ${outPath}`;
+  }
+  return JSON.stringify(result, null, 2);
+}
+
 module.exports = {
   extractAlignmentData,
   fixHebrewQuotes,
@@ -1488,6 +1610,8 @@ module.exports = {
   fillTsvIds,
   fillOrigQuotes,
   loadTemplateMap,
+  prepareATContext,
+  substituteAT,
   _parseExplanationDirectives: parseExplanationDirectives,
   _resolveTemplateSelection: resolveTemplateSelection,
   _deriveStyleProfile: deriveStyleProfile,

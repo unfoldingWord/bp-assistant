@@ -14,7 +14,7 @@ const { sendMessage, sendDM, addReaction, removeReaction } = require('./zulip-cl
 const { runClaude, DEFAULT_RESTRICTED_TOOLS, isTransientOutageError } = require('./claude-runner');
 const { getDoor43Username, emailToFallbackUsername, buildBranchName, resolveOutputFile, discoverFreshOutput, checkPrerequisites, calcSkillTimeout, normalizeBookName, resolveConflictMention, parsePartialTsv, truncatePartialTsv, parseChunkRange, CSKILLBP_DIR } = require('./pipeline-utils');
 const { splitTsv, fixTrailingNewlines } = require('./workspace-tools/tsv-tools');
-const { fillTsvIds, prepareNotes, fillOrigQuotes, resolveGlQuotes, flagNarrowQuotes, extractAlignmentData } = require('./workspace-tools/tn-tools');
+const { fillTsvIds, prepareNotes, fillOrigQuotes, resolveGlQuotes, flagNarrowQuotes, extractAlignmentData, prepareATContext, substituteAT } = require('./workspace-tools/tn-tools');
 const { checkTnQuality } = require('./workspace-tools/quality-tools');
 const { normalizeIssuesFile, buildParallelismIntroHintArgs } = require('./issue-normalizer');
 const { verifyRepoPush, verifyDcsToken } = require('./repo-verify');
@@ -53,7 +53,9 @@ const TN_WRITER_HINT =
   'Do not hunt for alternate templates or run exploratory repair loops. ' +
   'Use only the prepared inputs, especially writer_packet, named canonical references, and workspace MCP tools needed for the documented tn-writer sequence. ' +
   'Do not re-decide templates, parse raw explanation directives again, or invent a new AT policy when the prepared item already provides them. ' +
-  'Run the sequence once in order: read prepared data, read style/canonical refs, generate notes, run one AT-fit verification pass with at most one bounded fix pass, assemble TSV, post-process, final review. ' +
+  'Do not generate alternate translations — the pipeline handles AT generation separately after note writing. Write only the explanatory note text. ' +
+  'Run the sequence once in order: read prepared data, read style/canonical refs, generate notes, assemble TSV, post-process, final review. ' +
+  'Skip AT-fit verification — that is handled by the separate AT generation step. ' +
   'If a subset still fails after that bounded pass, stop and report the unresolved IDs instead of exploring side paths. ' +
   'TEMPLATE FIDELITY: Each note MUST begin by filling in writer_packet.template_text — that is the only authorized sentence structure. ' +
   'Do not prepend extra sentences before the template or substitute phrasings from Translation Academy definitions, issue-identification skill files, or published notes in data/published-tns/. ' +
@@ -184,6 +186,525 @@ function runMechanicalPrep({ issuesPath, pipeDir, status }) {
   fs.writeFileSync(genPath, '{}');
 
   return { extractSummary, prepSummary, fillSummary, glSummary, flagSummary };
+}
+
+/**
+ * "See how" detection pass — groups recurring issue patterns within a chapter
+ * and marks subsequent occurrences as back-references to the first.
+ *
+ * Runs after mechanical prep, modifies prepared_notes.json in place.
+ * Items marked with see_how get a programmatic "See how you translated..."
+ * note instead of a full template-based note.
+ *
+ * @param {object} args
+ * @param {string} args.pipeDir - Pipeline working directory
+ * @returns {string} Summary of see-how detections
+ */
+function runSeeHowDetection({ pipeDir }) {
+  const ctx = readContext(pipeDir);
+  const prepPath = path.resolve(CSKILLBP_DIR, ctx.runtime.preparedNotes);
+  const prepared = JSON.parse(fs.readFileSync(prepPath, 'utf8'));
+  const items = prepared.items || [];
+
+  if (items.length === 0) return '0 items';
+
+  // Group items by issue type (sref)
+  const bySref = {};
+  for (const item of items) {
+    if (!item.sref) continue;
+    if (!bySref[item.sref]) bySref[item.sref] = [];
+    bySref[item.sref].push(item);
+  }
+
+  let seeHowCount = 0;
+  let combinedCount = 0;
+
+  for (const [sref, group] of Object.entries(bySref)) {
+    if (group.length < 2) continue;
+
+    // Further group by gl_quote similarity (Hebrew pattern)
+    // Use a simple approach: group items with the same gl_quote text
+    const byQuote = {};
+    for (const item of group) {
+      const key = (item.gl_quote || '').toLowerCase().trim();
+      if (!key) continue;
+      if (!byQuote[key]) byQuote[key] = [];
+      byQuote[key].push(item);
+    }
+
+    for (const [, quoteGroup] of Object.entries(byQuote)) {
+      if (quoteGroup.length < 2) continue;
+
+      // Sort by verse reference to find the first occurrence
+      quoteGroup.sort((a, b) => {
+        const [aCh, aVs] = (a.reference || '').split(':').map(Number);
+        const [bCh, bVs] = (b.reference || '').split(':').map(Number);
+        return (aCh - bCh) || (aVs - bVs);
+      });
+
+      // Check for same-verse duplicates
+      const verseGroups = {};
+      for (const item of quoteGroup) {
+        const vs = item.reference;
+        if (!verseGroups[vs]) verseGroups[vs] = [];
+        verseGroups[vs].push(item);
+      }
+
+      for (const [vs, vsItems] of Object.entries(verseGroups)) {
+        if (vsItems.length > 1) {
+          // Same verse, same quote, same issue type — flag for combination
+          for (let i = 1; i < vsItems.length; i++) {
+            vsItems[i]._combine_with = vsItems[0].id;
+            combinedCount++;
+          }
+        }
+      }
+
+      // Mark subsequent cross-verse occurrences as "see how"
+      const canonicalItem = quoteGroup[0]; // First occurrence is canonical
+      const canonicalRef = canonicalItem.reference;
+
+      for (let i = 1; i < quoteGroup.length; i++) {
+        const item = quoteGroup[i];
+        // Skip same-verse items (handled as combinations above)
+        if (item.reference === canonicalRef) continue;
+        // Skip items already flagged
+        if (item._combine_with) continue;
+
+        // Build "see how" reference
+        const [ch, vs] = canonicalRef.split(':');
+        const bookLower = (prepared.book || '').toLowerCase();
+        const chPad = String(ch).padStart(prepared.book === 'PSA' ? 3 : 2, '0');
+        const vsPad = String(vs).padStart(2, '0');
+
+        item.programmatic_note = `See how you translated the similar expression in [${canonicalRef}](../${chPad}/${vsPad}.md).`;
+        if (item.at_provided) {
+          item.programmatic_note += ` Alternate translation: [${item.at_provided}]`;
+        }
+        item.note_type = 'see_how';
+        seeHowCount++;
+      }
+    }
+  }
+
+  // Write back modified prepared notes
+  if (seeHowCount > 0 || combinedCount > 0) {
+    fs.writeFileSync(prepPath, JSON.stringify(prepared, null, 2));
+  }
+
+  const summary = `${seeHowCount} see-how back-refs, ${combinedCount} same-verse combinations`;
+  console.log(`[notes] See-how detection: ${summary}`);
+  return summary;
+}
+
+/**
+ * Run per-note generation using the Claude Agent SDK.
+ * Replaces the sharded Claude Code agent approach with parallel focused SDK calls.
+ * Each note gets its own runClaude call with a constrained prompt and small maxTurns.
+ *
+ * @param {object} args
+ * @param {string} args.pipeDir - Pipeline working directory
+ * @param {string} args.outputPath - Output TSV path (relative to workspace)
+ * @param {function} args.status - Status reporting function
+ * @param {string} args.book - Book code
+ * @returns {Promise<{success: boolean, notesPath: string, summary: string}>}
+ */
+async function runPerNoteGeneration({ pipeDir, outputPath, status, book }) {
+  const ctx = readContext(pipeDir);
+
+  // Read prepared notes
+  const prepPath = path.resolve(CSKILLBP_DIR, ctx.runtime.preparedNotes);
+  const prepared = JSON.parse(fs.readFileSync(prepPath, 'utf8'));
+  const items = prepared.items || [];
+
+  if (items.length === 0) {
+    return { success: true, notesPath: outputPath, summary: '0 items' };
+  }
+
+  // Load the note style guide for the system prompt
+  const styleGuidePath = path.resolve(CSKILLBP_DIR, '.claude/skills/tn-writer/reference/note-style-guide.md');
+  let styleGuide = '';
+  try {
+    styleGuide = fs.readFileSync(styleGuidePath, 'utf8');
+  } catch (_) {
+    styleGuide = 'Follow template exactly. Fill in only the variable parts.';
+  }
+
+  // Load canonical references if available
+  let canonicalRefs = '';
+  const glGuidelinesPath = path.resolve(CSKILLBP_DIR, '.claude/skills/tn-writer/reference/gl_guidelines.md');
+  try {
+    canonicalRefs = fs.readFileSync(glGuidelinesPath, 'utf8');
+  } catch (_) { /* optional */ }
+
+  // System prompt appended to each SDK call
+  const systemPromptAppend = [
+    'You are writing a single translation note for Bible translators.',
+    'Follow the template exactly. Fill in only the variable parts.',
+    'Output ONLY the note text, nothing else. Do not use any tools.',
+    'Do NOT include an alternate translation — that is handled separately.',
+    '',
+    '--- NOTE STYLE GUIDE ---',
+    styleGuide,
+    canonicalRefs ? '\n--- GL GUIDELINES ---\n' + canonicalRefs : '',
+  ].join('\n');
+
+  await status(`Generating **${items.length} notes** via per-note SDK calls...`);
+  console.log(`[notes] Per-note generation: ${items.length} items`);
+
+  const CONCURRENCY = 10;
+  const results = { success: 0, failed: 0, programmatic: 0 };
+  const generatedNotes = {};
+
+  async function generateOneNote(item) {
+    // Programmatic notes don't need SDK calls
+    if (item.programmatic_note) {
+      return { id: item.id, success: true, note: item.programmatic_note, programmatic: true };
+    }
+
+    const packet = item.writer_packet || {};
+    const prompt = [
+      `TEMPLATE: "${packet.template_text || '(no template)'}"`,
+      `VERSE (ULT): ${packet.ult_verse || item.ult_verse || ''}`,
+      `VERSE (UST): ${packet.ust_verse || item.ust_verse || ''}`,
+      `GL_QUOTE: ${packet.gl_quote || item.gl_quote || ''}`,
+      `ISSUE TYPE: ${packet.sref || item.sref || ''}`,
+      `REFERENCE: ${item.reference || ''}`,
+      packet.clean_explanation ? `EXPLANATION: ${packet.clean_explanation}` : '',
+      (packet.must_include || []).length ? `MUST INCLUDE: ${packet.must_include.join(' | ')}` : '',
+      (packet.style_rules || []).length ? `STYLE RULES: ${packet.style_rules.join(', ')}` : '',
+      (packet.rule_overrides || []).length ? `OVERRIDES: ${packet.rule_overrides.join(', ')}` : '',
+      '',
+      'Write the note text. Output ONLY the note text, nothing else.',
+      'Do NOT include an alternate translation.',
+    ].filter(Boolean).join('\n');
+
+    try {
+      const result = await runClaude({
+        prompt,
+        cwd: CSKILLBP_DIR,
+        model: 'sonnet',
+        maxTurns: 2,
+        timeoutMs: 60 * 1000,
+        appendSystemPrompt: systemPromptAppend,
+        tools: [],
+        disallowedTools: ['Bash', 'Read', 'Write', 'Edit', 'Glob', 'Grep', 'Agent', 'Task', 'Skill'],
+      });
+      // Extract text from the result
+      let noteText = '';
+      if (result?.result?.text) {
+        noteText = result.result.text.trim();
+      } else if (typeof result?.result === 'string') {
+        noteText = result.result.trim();
+      }
+      // Strip any accidentally included AT
+      noteText = noteText.replace(/\s*Alternate translation:.*$/i, '').trim();
+
+      if (!noteText) {
+        return { id: item.id, success: false, reason: 'empty response' };
+      }
+      return { id: item.id, success: true, note: noteText };
+    } catch (err) {
+      console.error(`[notes] Per-note generation failed for ${item.id}: ${err.message}`);
+      return { id: item.id, success: false, reason: err.message };
+    }
+  }
+
+  // Run with concurrency limiter
+  const queue = [...items];
+  const noteResults = [];
+  const running = new Set();
+
+  while (queue.length > 0 || running.size > 0) {
+    while (running.size < CONCURRENCY && queue.length > 0) {
+      const item = queue.shift();
+      const promise = generateOneNote(item).then(r => {
+        running.delete(promise);
+        noteResults.push(r);
+        return r;
+      });
+      running.add(promise);
+    }
+    if (running.size > 0) {
+      await Promise.race(running);
+    }
+  }
+
+  // Collect results
+  for (const r of noteResults) {
+    if (r.success) {
+      results.success++;
+      if (r.programmatic) results.programmatic++;
+      generatedNotes[r.id] = r.note;
+    } else {
+      results.failed++;
+      console.warn(`[notes] Note failed for ${r.id}: ${r.reason || 'unknown'}`);
+    }
+  }
+
+  // Write generated notes JSON
+  const genPath = path.resolve(CSKILLBP_DIR, ctx.runtime.generatedNotes);
+  fs.mkdirSync(path.dirname(genPath), { recursive: true });
+  fs.writeFileSync(genPath, JSON.stringify(generatedNotes, null, 2));
+
+  // Assemble TSV
+  const { assembleNotes } = require('./workspace-tools/tn-tools');
+  assembleNotes({
+    preparedJson: ctx.runtime.preparedNotes,
+    generatedJson: ctx.runtime.generatedNotes,
+    output: outputPath,
+  });
+
+  const summary = `${results.success}/${items.length} notes generated (${results.programmatic} programmatic, ${results.failed} failed)`;
+  console.log(`[notes] Per-note generation complete: ${summary}`);
+  return { success: results.failed < items.length * 0.1, notesPath: outputPath, summary };
+}
+
+/**
+ * Run AT generation as a separate pipeline step after tn-writer.
+ * For each note item with at_policy: required, makes a focused SDK call
+ * to generate the AT, then a Haiku SDK call to validate it, then
+ * programmatically appends "Alternate translation: [text]" to the generated notes JSON.
+ *
+ * @param {object} args
+ * @param {string} args.notesPath - Path to assembled notes TSV (relative to workspace)
+ * @param {string} args.pipeDir - Pipeline working directory
+ * @param {function} args.status - Status reporting function
+ * @returns {Promise<string>} Summary of AT generation results
+ */
+async function runATGeneration({ notesPath, pipeDir, status }) {
+  const ctx = readContext(pipeDir);
+
+  // Build AT context packets
+  const atCtxResult = prepareATContext({
+    preparedJson: ctx.runtime.preparedNotes,
+    generatedJson: ctx.runtime.generatedNotes,
+  });
+  const atCtx = JSON.parse(atCtxResult);
+
+  if (!atCtx.packets || atCtx.packets.length === 0) {
+    console.log('[notes] AT generation: no items need ATs');
+    return '0 ATs needed';
+  }
+
+  await status(`Generating **${atCtx.packets.length} alternate translations** via SDK...`);
+  console.log(`[notes] AT generation: ${atCtx.packets.length} items`);
+
+  const CONCURRENCY = 10;
+  const results = { success: 0, failed: 0, validated: 0, retried: 0 };
+
+  // AT Writer system prompt
+  const atSystemPrompt = [
+    'You write alternate translations for Bible translation notes.',
+    'An alternate translation replaces a specific phrase in the verse with simpler phrasing that resolves a translation issue described in a note.',
+    '',
+    'RULES:',
+    '- Output ONLY the replacement text, nothing else. Do not use any tools.',
+    '- Must read naturally when substituted into the verse',
+    '- Must resolve the figure/issue (not preserve it)',
+    '- Minimal changes from original text',
+    '- Match capitalization of sentence position',
+    '- Keep leading conjunctions/prepositions if present in original',
+    '- No ending punctuation unless the note specifically suggests modifying punctuation (e.g. figs-rquestion changing ? to .)',
+    '- For discontinuous quotes (with \u2026), use \u2026 between AT parts',
+  ].join('\n');
+
+  // Haiku validator system prompt
+  const validatorSystemPrompt =
+    'Answer YES or NO only, then one sentence explaining why. Do not use any tools.\n\n' +
+    'Does the modified verse read as natural English AND address the issue described in the note?';
+
+  // Helper to extract text from SDK result
+  function extractResultText(result) {
+    if (!result) return '';
+    if (result.result?.text) return result.result.text.trim();
+    if (typeof result.result === 'string') return result.result.trim();
+    // Fallback: look for text in the result message
+    if (result.result?.message?.content) {
+      for (const block of result.result.message.content) {
+        if (block.type === 'text' || typeof block === 'string') {
+          return (block.text || block).trim();
+        }
+      }
+    }
+    return '';
+  }
+
+  // Process items with concurrency limiter
+  async function generateOneAT(packet) {
+    const userPrompt = [
+      `VERSE: ${packet.full_verse}`,
+      packet.verse_context.prev ? `PREVIOUS VERSE: ${packet.verse_context.prev}` : '',
+      packet.verse_context.next ? `NEXT VERSE: ${packet.verse_context.next}` : '',
+      `UST (your AT must NOT match this): ${packet.ust_verse}`,
+      '',
+      `ISSUE TYPE: ${packet.issue_type}`,
+      `NOTE: ${packet.note_text}`,
+      `TEXT TO REPLACE: ${packet.exact_ult_span}`,
+    ].filter(Boolean).join('\n');
+
+    try {
+      // Step 1: Generate AT with Sonnet via SDK
+      const atResult = await runClaude({
+        prompt: userPrompt,
+        cwd: CSKILLBP_DIR,
+        model: 'sonnet',
+        maxTurns: 2,
+        timeoutMs: 60 * 1000,
+        appendSystemPrompt: atSystemPrompt,
+        tools: [],
+        disallowedTools: ['Bash', 'Read', 'Write', 'Edit', 'Glob', 'Grep', 'Agent', 'Task', 'Skill'],
+      });
+      let atText = extractResultText(atResult);
+      // Strip any accidental brackets or "Alternate translation:" prefix
+      atText = atText.replace(/^\[|\]$/g, '').replace(/^Alternate translation:\s*/i, '').trim();
+
+      if (!atText) {
+        return { id: packet.id, success: false, reason: 'empty response' };
+      }
+
+      // Step 2: Programmatic substitution
+      const modifiedVerse = substituteAT(packet.full_verse, packet.exact_ult_span, atText);
+      if (!modifiedVerse) {
+        return { id: packet.id, success: false, reason: 'gl_quote not found in verse', at: atText };
+      }
+
+      // Step 3: Haiku validation via SDK
+      const validatorPrompt = [
+        `ORIGINAL: ${packet.full_verse}`,
+        `MODIFIED: ${modifiedVerse}`,
+        `NOTE: ${packet.note_text}`,
+      ].join('\n');
+
+      const valResult = await runClaude({
+        prompt: validatorPrompt,
+        cwd: CSKILLBP_DIR,
+        model: 'haiku',
+        maxTurns: 2,
+        timeoutMs: 30 * 1000,
+        appendSystemPrompt: validatorSystemPrompt,
+        tools: [],
+        disallowedTools: ['Bash', 'Read', 'Write', 'Edit', 'Glob', 'Grep', 'Agent', 'Task', 'Skill'],
+      });
+      const valText = extractResultText(valResult);
+      const isValid = /^YES\b/i.test(valText);
+
+      if (isValid) {
+        return { id: packet.id, success: true, at: atText, validated: true };
+      }
+
+      // Step 4: One retry with rejection feedback
+      results.retried++;
+      const retryPrompt = [
+        userPrompt,
+        '',
+        `PREVIOUS ATTEMPT REJECTED: ${atText}`,
+        `REASON: ${valText}`,
+        'Try again with a different approach.',
+      ].join('\n');
+
+      const retryResult = await runClaude({
+        prompt: retryPrompt,
+        cwd: CSKILLBP_DIR,
+        model: 'sonnet',
+        maxTurns: 2,
+        timeoutMs: 60 * 1000,
+        appendSystemPrompt: atSystemPrompt,
+        tools: [],
+        disallowedTools: ['Bash', 'Read', 'Write', 'Edit', 'Glob', 'Grep', 'Agent', 'Task', 'Skill'],
+      });
+      let retryAt = extractResultText(retryResult);
+      retryAt = retryAt.replace(/^\[|\]$/g, '').replace(/^Alternate translation:\s*/i, '').trim();
+
+      if (!retryAt) {
+        return { id: packet.id, success: true, at: atText, validated: false, tag: 'at-fit' };
+      }
+
+      // Accept retry without re-validating (tag for human review if first was rejected)
+      return { id: packet.id, success: true, at: retryAt, validated: false, tag: 'at-fit' };
+    } catch (err) {
+      console.error(`[notes] AT generation failed for ${packet.id}: ${err.message}`);
+      return { id: packet.id, success: false, reason: err.message };
+    }
+  }
+
+  // Run with concurrency limiter
+  const queue = [...atCtx.packets];
+  const atResults = [];
+  const running = new Set();
+
+  while (queue.length > 0 || running.size > 0) {
+    while (running.size < CONCURRENCY && queue.length > 0) {
+      const packet = queue.shift();
+      const promise = generateOneAT(packet).then(r => {
+        running.delete(promise);
+        atResults.push(r);
+        return r;
+      });
+      running.add(promise);
+    }
+    if (running.size > 0) {
+      await Promise.race(running);
+    }
+  }
+
+  // Apply results to generated notes and assembled TSV
+  const genPath = path.resolve(CSKILLBP_DIR, ctx.runtime.generatedNotes);
+  const generatedNotes = JSON.parse(fs.readFileSync(genPath, 'utf8'));
+
+  const tagsToApply = new Map(); // id -> tag
+
+  for (const r of atResults) {
+    if (r.success && r.at) {
+      results.success++;
+      if (r.validated) results.validated++;
+      // Append AT to the note text
+      const existingNote = generatedNotes[r.id] || '';
+      generatedNotes[r.id] = `${existingNote} Alternate translation: [${r.at}]`;
+      if (r.tag) tagsToApply.set(r.id, r.tag);
+    } else {
+      results.failed++;
+      console.warn(`[notes] AT failed for ${r.id}: ${r.reason || 'unknown'}`);
+      // Leave note without AT — quality check will flag it
+    }
+  }
+
+  // Write updated generated notes
+  fs.writeFileSync(genPath, JSON.stringify(generatedNotes, null, 2));
+
+  // Re-assemble the TSV with the updated notes (includes ATs now)
+  if (notesPath) {
+    const { assembleNotes } = require('./workspace-tools/tn-tools');
+    assembleNotes({
+      preparedJson: ctx.runtime.preparedNotes,
+      generatedJson: ctx.runtime.generatedNotes,
+      output: notesPath,
+    });
+    console.log(`[notes] Re-assembled notes with ATs to ${notesPath}`);
+
+    // Apply tags to flagged rows
+    if (tagsToApply.size > 0) {
+      const absNotes = path.resolve(CSKILLBP_DIR, notesPath);
+      if (fs.existsSync(absNotes)) {
+        const lines = fs.readFileSync(absNotes, 'utf8').split('\n');
+        for (let i = 1; i < lines.length; i++) {
+          if (!lines[i].trim()) continue;
+          const cols = lines[i].split('\t');
+          const id = cols[1] || '';
+          const tag = tagsToApply.get(id);
+          if (tag) {
+            cols[2] = cols[2] ? `${cols[2]}, ${tag}` : tag;
+            lines[i] = cols.join('\t');
+          }
+        }
+        fs.writeFileSync(absNotes, lines.join('\n'));
+      }
+    }
+  }
+
+  const summary = `${results.success}/${atCtx.packets.length} ATs generated (${results.validated} validated, ${results.retried} retried, ${results.failed} failed)`;
+  console.log(`[notes] AT generation complete: ${summary}`);
+  return summary;
 }
 
 /**
@@ -415,6 +936,7 @@ const TN_WRITER_PARALLEL_MIN_VERSES = Number((config.notesGuardrails || {}).tnWr
 const TN_WRITER_MAX_TURNS = Number((config.notesGuardrails || {}).tnWriterMaxTurns || 1000);
 const TN_WRITER_MAX_TOOL_CALLS = Number((config.notesGuardrails || {}).tnWriterMaxToolCalls || 1000);
 const RESCUE_MAX_PASSES = Number((config.notesGuardrails || {}).rescueMaxPasses || 1);
+const USE_PER_NOTE_GENERATION = Boolean((config.notesGuardrails || {}).usePerNoteGeneration);
 const TN_WRITER_RESTRICTED_TOOLS = DEFAULT_RESTRICTED_TOOLS.filter((tool) => !TN_WRITER_TOOL_BLOCKLIST.includes(tool));
 
 function countIssueRows(tsvRelPath) {
@@ -1146,6 +1668,7 @@ async function notesPipeline(route, message) {
     let mechanicalPrepDone = false;
     // Quality mechanical prep flag — set true once runMechanicalQualityPrep() completes.
     let qualityPrepDone = false;
+    let atGenerationDone = false;
 
     for (let si = startSkillIndex; si < skills.length; si++) {
       const skill = skills[si];
@@ -1160,10 +1683,37 @@ async function notesPipeline(route, message) {
             `**${ref}**: Mechanical prep complete — extract=${prep.extractSummary}; ${prep.prepSummary}; ${prep.fillSummary}; ${prep.glSummary}; ${prep.flagSummary}`
           );
           console.log(`[notes] Mechanical prep ${ref}: extract=${prep.extractSummary}, prep=${prep.prepSummary}, fill=${prep.fillSummary}, gl=${prep.glSummary}, flag=${prep.flagSummary}`);
+
+          // Run see-how detection after mechanical prep
+          try {
+            const seeHowSummary = runSeeHowDetection({ pipeDir });
+            if (seeHowSummary !== '0 see-how back-refs, 0 same-verse combinations') {
+              await status(`**${ref}**: See-how detection — ${seeHowSummary}`);
+            }
+          } catch (seeHowErr) {
+            console.warn(`[notes] See-how detection failed (non-fatal): ${seeHowErr.message}`);
+          }
         } catch (err) {
           console.error(`[notes] Mechanical prep failed for ${ref}: ${err.message}`);
           await status(`**${ref}**: Mechanical prep failed — ${err.message}. Claude will run prep via MCP tools.`);
           // Non-fatal: tn-writer skill can still do prep via MCP tools (old path)
+        }
+      }
+
+      // --- AT generation: run between tn-writer and tn-quality-check ---
+      if (skill.name === 'tn-quality-check' && !atGenerationDone && pipeDir) {
+        try {
+          const writerNotesPath = skills.find(s => s.name === 'tn-writer')?.resolvedOutput
+            || skills.find(s => s.name === 'tn-writer')?.expectedOutput;
+          if (writerNotesPath) {
+            await status(`**${ref}**: Running separate AT generation...`);
+            const atSummary = await runATGeneration({ notesPath: writerNotesPath, pipeDir, status });
+            atGenerationDone = true;
+            await status(`**${ref}**: AT generation complete — ${atSummary}`);
+          }
+        } catch (err) {
+          console.error(`[notes] AT generation failed (non-fatal): ${err.message}`);
+          await status(`**${ref}**: AT generation failed — ${err.message}. Quality check will flag missing ATs.`);
         }
       }
 
@@ -1250,11 +1800,38 @@ async function notesPipeline(route, message) {
       let result = null;
       let skillError = null;
 
+      // --- Per-note generation: direct API calls per note (replaces Claude Code sessions) ---
+      let usedPerNote = false;
+      if (skill.name === 'tn-writer' && USE_PER_NOTE_GENERATION && !hasVerseRange && !isDryRun) {
+        try {
+          await status(`**${ref}**: Using per-note generation (direct API calls)...`);
+          const perNoteResult = await runPerNoteGeneration({
+            pipeDir,
+            outputPath: skill.expectedOutput,
+            status,
+            book,
+          });
+          usedPerNote = true;
+          if (perNoteResult.success) {
+            result = { subtype: 'success', num_turns: 0, duration_ms: 0, total_cost_usd: 0 };
+            skill.resolvedOutput = perNoteResult.notesPath;
+            await status(`**${ref}**: Per-note generation — ${perNoteResult.summary}`);
+          } else {
+            console.warn(`[notes] Per-note generation had issues: ${perNoteResult.summary}`);
+            result = { subtype: 'success', num_turns: 0, duration_ms: 0, total_cost_usd: 0 };
+            skill.resolvedOutput = perNoteResult.notesPath;
+          }
+        } catch (err) {
+          console.error(`[notes] Per-note generation failed, falling back to Claude sessions: ${err.message}`);
+          usedPerNote = false; // Fall through to existing paths
+        }
+      }
+
       // --- Parallel tn-writer: split into verse-range shards ---
       let usedParallel = false;
       let chapterVerseCount = 0;
       try { chapterVerseCount = getVerseCount(book, ch); } catch { chapterVerseCount = 0; }
-      if (skill.name === 'tn-writer' && !hasVerseRange && chapterVerseCount >= TN_WRITER_PARALLEL_MIN_VERSES) {
+      if (!usedPerNote && skill.name === 'tn-writer' && !hasVerseRange && chapterVerseCount >= TN_WRITER_PARALLEL_MIN_VERSES) {
         const existingShards = (skillOutputs[ch] || {})._tnWriterShards || [];
         try {
           const parallelResult = await runParallelTnWriter({
@@ -1288,7 +1865,7 @@ async function notesPipeline(route, message) {
       }
 
       // --- Standard single invocation (for non-tn-writer skills, or single-chunk fallback) ---
-      if (!usedParallel) {
+      if (!usedPerNote && !usedParallel) {
       if (isDryRun) {
         console.log(`[dry-run] Would run ${skill.name}: ${skill.prompt}`);
         if (skill.expectedOutput) {

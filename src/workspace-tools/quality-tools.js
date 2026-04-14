@@ -625,8 +625,33 @@ async function checkTnQuality({ tsvPath, preparedJson, ultUsfm, ustUsfm, book, h
     }
 
     // 24. "Here" rule compliance
+    //     Whitelist canonical template openings that start with "Here" — these are
+    //     structurally correct and should not trigger the "bolded lowercase quote" rule.
     if (/^Here[, ]/.test(n.note)) {
-      if (!/^Here,?\s+\*\*[a-z]/.test(n.note)) {
+      // Check if this "Here" opening matches a canonical template for this issue type
+      let hereWhitelisted = false;
+      const srefSlug24 = n.sref ? (n.sref.match(/translate\/([^\s;,]+)/) || [])[1] : '';
+      if (srefSlug24) {
+        const tpls = _templateMap.get(srefSlug24);
+        if (tpls && tpls.length) {
+          for (const tpl of tpls) {
+            if (/^Here[, ]/.test(tpl.template)) {
+              // Build a prefix from the template: replace placeholders with flexible matchers
+              const tplPrefix = tpl.template
+                .slice(0, 60)
+                .replace(/\*\*[^*]+\*\*/g, '\\*\\*[^*]+\\*\\*')
+                .replace(/\b[A-Z]{2,}\b/g, '\\S+');
+              try {
+                if (new RegExp('^' + tplPrefix).test(n.note)) {
+                  hereWhitelisted = true;
+                  break;
+                }
+              } catch (_) { /* invalid regex from template — skip */ }
+            }
+          }
+        }
+      }
+      if (!hereWhitelisted && !/^Here,?\s+\*\*[a-z]/.test(n.note)) {
         addFinding(n.row, n.ref, n.id, 'warning', 'here_rule',
           'Note starts with "Here" but next content is not a bolded lowercase quote');
       }
@@ -695,6 +720,10 @@ async function checkTnQuality({ tsvPath, preparedJson, ultUsfm, ustUsfm, book, h
         .split(/\W+/)
         .filter(w => w.length > 2 && !STOPWORDS.has(w));
     }
+    function boldedWords(text) {
+      const matches = text.match(/\*\*([^*]+)\*\*/g) || [];
+      return matches.map(m => m.replace(/\*\*/g, '').toLowerCase().trim()).filter(Boolean);
+    }
     function verseNum(ref) {
       const m = ref.match(/:(\d+)/);
       return m ? parseInt(m[1], 10) : 0;
@@ -710,6 +739,17 @@ async function checkTnQuality({ tsvPath, preparedJson, ultUsfm, ustUsfm, book, h
           const setJ = new Set(wj);
           const overlap = wi.filter(w => setJ.has(w)).length / Math.max(wi.length, wj.length);
           if (overlap >= 0.75) {
+            // Suppress cross-verse duplicates when bolded words (variable fill-ins) differ —
+            // this means template-faithful notes on different source text, not true duplicates.
+            if (verseNum(ni.ref) !== verseNum(nj.ref)) {
+              const bi = boldedWords(ni.note);
+              const bj = boldedWords(nj.note);
+              if (bi.length && bj.length) {
+                const setBj = new Set(bj);
+                const boldOverlap = bi.filter(w => setBj.has(w)).length / Math.max(bi.length, bj.length);
+                if (boldOverlap < 0.75) continue; // Different variable parts — template-driven, not duplicate
+              }
+            }
             addFinding(nj.row, nj.ref, nj.id, 'warning', 'multiverse_duplicate',
               `Near-duplicate of note ${ni.id} at ${ni.ref} (${Math.round(overlap * 100)}% overlap, same "${slug}" issue)`);
           }
