@@ -1533,6 +1533,18 @@ async function notesPipeline(route, message) {
               s.prompt = `${skillRef} --notes ${skill.resolvedOutput || resolved}`;
             }
           }
+          // Backup the assembled notes file so a later resume can restore it if the
+          // output gets wiped by a concurrent fresh run before push completes.
+          try {
+            const backupSrc = path.resolve(CSKILLBP_DIR, skill.resolvedOutput || resolved);
+            const backupDest = backupSrc + '.bak';
+            if (fs.existsSync(backupSrc)) {
+              fs.copyFileSync(backupSrc, backupDest);
+              console.log(`[notes] Backed up assembled notes to ${backupDest}`);
+            }
+          } catch (err) {
+            console.warn(`[notes] notes backup failed (non-fatal): ${err.message}`);
+          }
         }
       }
 
@@ -1674,12 +1686,19 @@ async function notesPipeline(route, message) {
       chapterFailed = true;
     }
 
-    // Pre-flight: verify source file exists
+    // Pre-flight: verify source file exists (restore from backup if wiped)
     if (!chapterFailed) {
       const notesPath = path.resolve(CSKILLBP_DIR, notesSource);
       if (!fs.existsSync(notesPath)) {
-        await status(`**door43-push SKIPPED** for ${ref}: source file missing: ${notesSource}`);
-        chapterFailed = true;
+        const bakPath = notesPath + '.bak';
+        if (fs.existsSync(bakPath)) {
+          fs.copyFileSync(bakPath, notesPath);
+          console.log(`[notes] Restored notes from backup: ${bakPath}`);
+          await status(`Restored notes from backup for ${ref}.`);
+        } else {
+          await status(`**door43-push SKIPPED** for ${ref}: source file missing: ${notesSource}`);
+          chapterFailed = true;
+        }
       }
     }
 
