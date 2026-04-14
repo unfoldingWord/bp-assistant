@@ -33,7 +33,7 @@ NT_BOOKS.forEach((b, i) => { BOOK_NUMBERS[b] = String(i + 41).padStart(2, '0'); 
 const V88_PUBLISHED = [
   'GEN', 'EXO', 'LEV', 'DEU', 'JOS', 'JDG', 'RUT', '1SA', '2SA',
   '1KI', '2KI', 'EZR', 'NEH', 'EST', 'JOB', 'PRO', 'SNG',
-  'JOL', 'OBA', 'JON', 'NAM', 'ZEP', 'HAG', 'MAL', 'PSA',
+  'JOL', 'OBA', 'JON', 'NAM', 'ZEP', 'HAG', 'MAL',
 ];
 
 const BOOK_ALIASES = {
@@ -164,12 +164,35 @@ async function fetchHebrewBible({ books, force }) {
 
 async function fetchUlt({ books, force }) {
   const bookList = books && books.length ? books.map(normalizeBook) : V88_PUBLISHED;
+  const notPublished = bookList.filter(b => !V88_PUBLISHED.includes(b));
+  if (notPublished.length) {
+    return `Error: ${notPublished.join(', ')} not in the v88 published list. Use fetch_master_ult for master-branch content on non-published books.`;
+  }
   return fetchDoor43Batch('en_ult', bookList, 'data/published_ult', force || false);
 }
 
 async function fetchUst({ books, force }) {
   const bookList = books && books.length ? books.map(normalizeBook) : V88_PUBLISHED;
+  const notPublished = bookList.filter(b => !V88_PUBLISHED.includes(b));
+  if (notPublished.length) {
+    return `Error: ${notPublished.join(', ')} not in the v88 published list. Use fetch_master_ust for master-branch content on non-published books.`;
+  }
   return fetchDoor43Batch('en_ust', bookList, 'data/published_ust', force || false);
+}
+
+// fetchMasterUlt / fetchMasterUst — fetch non-published books from master branch.
+// Always fetches fresh (no cache check) since master always needs to be latest.
+// Stores to data/master_ult/ and data/master_ust/ — separate from published_* folders.
+async function fetchMasterUlt({ books }) {
+  const bookList = books && books.length ? books.map(normalizeBook) : [];
+  if (!bookList.length) return 'Error: specify at least one book code.';
+  return fetchDoor43Batch('en_ult', bookList, 'data/master_ult', true /* always force */);
+}
+
+async function fetchMasterUst({ books }) {
+  const bookList = books && books.length ? books.map(normalizeBook) : [];
+  if (!bookList.length) return 'Error: specify at least one book code.';
+  return fetchDoor43Batch('en_ust', bookList, 'data/master_ust', true /* always force */);
 }
 
 async function fetchT4t({ books, force }) {
@@ -321,6 +344,8 @@ module.exports = {
   fetchHebrewBible,
   fetchUlt,
   fetchUst,
+  fetchMasterUlt,
+  fetchMasterUst,
   fetchT4t,
   fetchDoor43,
   getDoor43FileInfo,

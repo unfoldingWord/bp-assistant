@@ -4,7 +4,7 @@
 // Claude calls these as mcp__workspace-tools__<tool_name> — no shell needed.
 
 const {
-  fetchHebrewBible, fetchUlt, fetchUst, fetchT4t, fetchDoor43,
+  fetchHebrewBible, fetchUlt, fetchUst, fetchMasterUlt, fetchMasterUst, fetchT4t, fetchDoor43,
   fetchGlossary, fetchIssuesResolved, fetchTemplates,
 } = require('./fetch-tools');
 const { splitTsv, mergeTsvs, fixTrailingNewlines } = require('./tsv-tools');
@@ -38,9 +38,9 @@ function createWorkspaceTools(createSdkMcpServer, tool, z) {
       ),
       tool(
         'fetch_ult',
-        'Fetch published ULT (Literal Translation) USFM files from Door43 into data/published_ult/',
+        'Fetch published ULT USFM files from Door43 into data/published_ult/. Only accepts the 25 v88 published books — for non-published books use fetch_master_ult.',
         {
-          books: z.array(z.string()).optional().describe('Specific book codes. Omit for all 25 v88 published books.'),
+          books: z.array(z.string()).optional().describe('Specific book codes (must be v88 published). Omit for all 25 v88 published books.'),
           force: z.boolean().optional().describe('Force re-fetch even if cached today'),
         },
         async (args) => ({
@@ -49,13 +49,33 @@ function createWorkspaceTools(createSdkMcpServer, tool, z) {
       ),
       tool(
         'fetch_ust',
-        'Fetch published UST (Simplified Translation) USFM files from Door43 into data/published_ust/',
+        'Fetch published UST USFM files from Door43 into data/published_ust/. Only accepts the 25 v88 published books — for non-published books use fetch_master_ust.',
         {
-          books: z.array(z.string()).optional().describe('Specific book codes. Omit for all 25 v88 published books.'),
+          books: z.array(z.string()).optional().describe('Specific book codes (must be v88 published). Omit for all 25 v88 published books.'),
           force: z.boolean().optional().describe('Force re-fetch even if cached today'),
         },
         async (args) => ({
           content: [{ type: 'text', text: await fetchUst(args) }],
+        })
+      ),
+      tool(
+        'fetch_master_ult',
+        'Fetch ULT from Door43 master branch for working reference on non-published books. Always fetches fresh. Stores to data/master_ult/ — not authoritative, not indexed.',
+        {
+          books: z.array(z.string()).describe('Book codes to fetch (e.g. ["ISA", "JER"]). Required.'),
+        },
+        async (args) => ({
+          content: [{ type: 'text', text: await fetchMasterUlt(args) }],
+        })
+      ),
+      tool(
+        'fetch_master_ust',
+        'Fetch UST from Door43 master branch for working reference on non-published books. Always fetches fresh. Stores to data/master_ust/ — not authoritative, not indexed.',
+        {
+          books: z.array(z.string()).describe('Book codes to fetch (e.g. ["ISA", "JER"]). Required.'),
+        },
+        async (args) => ({
+          content: [{ type: 'text', text: await fetchMasterUst(args) }],
         })
       ),
       tool(
