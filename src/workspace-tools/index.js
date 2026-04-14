@@ -11,7 +11,7 @@ const { splitTsv, mergeTsvs, fixTrailingNewlines } = require('./tsv-tools');
 const { extractUltEnglish, filterPsalms, curlyQuotes, checkUstPassives, createAlignedUsfm, readUsfmChapter, mergeAlignedUsfm, validateAlignmentJson, validateUltBrackets, checkUltVoiceMismatch } = require('./usfm-tools');
 const { buildStrongsIndex, buildTnIndex, buildUstIndex } = require('./index-tools');
 const { checkTwHeadwords, compareUltUst, detectAbstractNouns } = require('./issue-tools');
-const { extractAlignmentData, fixHebrewQuotes, flagNarrowQuotes, generateIds, resolveGlQuotes, verifyAtFit, assembleNotes, prepareNotes, prepareAndValidate, fixUnicodeQuotes, verifyBoldMatches, fillTsvIds, fillOrigQuotes, prepareATContext } = require('./tn-tools');
+const { extractAlignmentData, fixHebrewQuotes, flagNarrowQuotes, generateIds, resolveGlQuotes, verifyAtFit, assembleNotes, prepareNotes, prepareAndValidate, fixUnicodeQuotes, verifyBoldMatches, fillTsvIds, fillOrigQuotes, prepareATContext, readPreparedNotes } = require('./tn-tools');
 const { validateTnTsv, checkTnQuality } = require('./quality-tools');
 const { giteaPr, prepareCompare, prepareTq, verifyTq, appendQuickref } = require('./misc-tools');
 
@@ -365,6 +365,12 @@ function createWorkspaceTools(createSdkMcpServer, tool, z) {
         generatedJson: z.string().optional().describe('Generated notes JSON path (relative to workspace)'),
         output: z.string().optional().describe('Output path for AT context JSON (relative to workspace)'),
       }, async (args) => ({ content: [{ type: 'text', text: prepareATContext(args) }] })),
+      tool('read_prepared_notes', 'Read a bounded slice of prepared_notes.json items. Use this instead of the raw Read tool to avoid the 10K-token file-read limit. Call with summaryOnly:true first to get total count and IDs, then fetch items in batches of ≤20.', {
+        preparedJson: z.string().describe('Prepared notes JSON path (relative to workspace)'),
+        start: z.number().int().optional().describe('First item index (0-based, inclusive). Default: 0'),
+        end: z.number().int().optional().describe('Last item index (inclusive). Default: start+19'),
+        summaryOnly: z.boolean().optional().describe('Return only total count and item IDs — no bodies'),
+      }, async (args) => ({ content: [{ type: 'text', text: readPreparedNotes(args) }] })),
 
       // --- Quality checks ---
       tool('validate_tn_tsv', 'Validate TN TSV against Door43 CI rules (checks 3-13)', {
@@ -463,6 +469,12 @@ function createTnWriterTools(createSdkMcpServer, tool, z) {
         ultUsfm: z.string().describe('Plain ULT USFM file path for verse text lookup'),
         output: z.string().optional().describe('Output path (defaults to in-place overwrite)'),
       }, async (args) => ({ content: [{ type: 'text', text: verifyBoldMatches(args) }] })),
+      tool('read_prepared_notes', 'Read a bounded slice of prepared_notes.json items. Use this instead of the raw Read tool to avoid the 10K-token file-read limit. Call with summaryOnly:true first to get total count and IDs, then fetch items in batches of ≤20.', {
+        preparedJson: z.string().describe('Prepared notes JSON path (relative to workspace)'),
+        start: z.number().int().optional().describe('First item index (0-based, inclusive). Default: 0'),
+        end: z.number().int().optional().describe('Last item index (inclusive). Default: start+19'),
+        summaryOnly: z.boolean().optional().describe('Return only total count and item IDs — no bodies'),
+      }, async (args) => ({ content: [{ type: 'text', text: readPreparedNotes(args) }] })),
     ],
   });
 }

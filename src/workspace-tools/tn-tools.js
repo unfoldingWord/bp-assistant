@@ -1595,6 +1595,37 @@ function prepareATContext({ preparedJson, generatedJson, output }) {
   return JSON.stringify(result, null, 2);
 }
 
+/**
+ * Read a slice of prepared_notes.json items without hitting the SDK's 10K-token
+ * Read-tool limit. Always use this instead of reading the raw file directly.
+ *
+ * @param {object} args
+ * @param {string} args.preparedJson  - path relative to workspace
+ * @param {number} [args.start=0]     - first item index (0-based, inclusive)
+ * @param {number} [args.end]         - last item index (inclusive). Default: start+19
+ * @param {boolean} [args.summaryOnly] - return only counts + IDs, no item bodies
+ */
+function readPreparedNotes({ preparedJson, start = 0, end, summaryOnly = false }) {
+  const fullPath = path.resolve(CSKILLBP_DIR, preparedJson);
+  const items = JSON.parse(fs.readFileSync(fullPath, 'utf8'));
+  const total = items.length;
+
+  if (summaryOnly) {
+    const ids = items.map((it) => it.id || it.reference || '(no-id)');
+    return JSON.stringify({ total, ids });
+  }
+
+  const resolvedEnd = end !== undefined ? Math.min(end, total - 1) : Math.min(start + 19, total - 1);
+  const slice = items.slice(start, resolvedEnd + 1);
+  return JSON.stringify({
+    total,
+    start,
+    end: resolvedEnd,
+    hasMore: resolvedEnd < total - 1,
+    items: slice,
+  });
+}
+
 module.exports = {
   extractAlignmentData,
   fixHebrewQuotes,
@@ -1611,6 +1642,7 @@ module.exports = {
   fillOrigQuotes,
   loadTemplateMap,
   prepareATContext,
+  readPreparedNotes,
   substituteAT,
   _parseExplanationDirectives: parseExplanationDirectives,
   _resolveTemplateSelection: resolveTemplateSelection,
