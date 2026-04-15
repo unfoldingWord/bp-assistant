@@ -56,6 +56,16 @@ function normalizeWhitespace(value) {
   return String(value || '').replace(/\s+/g, ' ').trim();
 }
 
+function decodeVisibleUnicodeEscapes(text) {
+  let value = String(text || '');
+  let previous;
+  do {
+    previous = value;
+    value = value.replace(/\\+u([0-9a-fA-F]{4})/g, (_, hex) => String.fromCharCode(parseInt(hex, 16)));
+  } while (value !== previous && /\\u[0-9a-fA-F]{4}/.test(value));
+  return value;
+}
+
 function normalizeTemplateType(value) {
   return normalizeWhitespace(value).toLowerCase();
 }
@@ -689,6 +699,16 @@ function verifyAtFit({ preparedJson, generatedJson }) {
   return lines.join('\n');
 }
 
+function normalizeAssembledNoteText(noteText) {
+  return decodeVisibleUnicodeEscapes(String(noteText || ''))
+    .replace(/\.\.\./g, '\u2026')
+    .replace(/<br\s*\/?>/gi, '')
+    .replace(/Alternate translation:\s*["\u201C]([^"\u201D]*)["\u201D]/g, 'Alternate translation: [$1]')
+    // Catch bare AT text (no quotes or brackets) — e.g. "Alternate translation: some text"
+    .replace(/Alternate translation:\s+(?![\["\u201C])(.+?)$/gm, 'Alternate translation: [$1]')
+    .trim();
+}
+
 function assembleNotes({ preparedJson, generatedJson, output }) {
   const prepared = JSON.parse(fs.readFileSync(path.resolve(CSKILLBP_DIR, preparedJson), 'utf8'));
   const generated = JSON.parse(fs.readFileSync(path.resolve(CSKILLBP_DIR, generatedJson), 'utf8'));
@@ -717,14 +737,7 @@ function assembleNotes({ preparedJson, generatedJson, output }) {
     if (!noteText && item.reference && item.sref) noteText = generated[`${item.reference}:${item.sref}`] || generated[`${item.reference}_${item.sref}`];
     if (!noteText) { missing.push(item.id || `index:${item.index}`); continue; }
     const quote = item.orig_quote || '';
-    const note = noteText
-      .replace(/\.\.\./g, '\u2026')
-      .replace(/<br\s*\/?>/gi, '')
-      .replace(/\\u([0-9a-fA-F]{4})/g, (_, hex) => String.fromCharCode(parseInt(hex, 16)))
-      .replace(/Alternate translation:\s*["\u201C]([^"\u201D]*)["\u201D]/g, 'Alternate translation: [$1]')
-      // Catch bare AT text (no quotes or brackets) — e.g. "Alternate translation: some text"
-      .replace(/Alternate translation:\s+(?![\["\u201C])(.+?)$/gm, 'Alternate translation: [$1]')
-      .trim();
+    const note = normalizeAssembledNoteText(noteText);
     const sref = item.sref ? `rc://*/ta/man/translate/${item.sref}` : '';
     rows.push({ ref: item.reference, id: item.id, tags: '', sref, quote, occurrence: quote ? '1' : '', note, _rk: refKey(item.reference), _ik: intraKey(item) });
   }
@@ -1861,5 +1874,6 @@ module.exports = {
   _buildWriterPacket: buildWriterPacket,
   _buildWriterPrompt: buildWriterPrompt,
   _maybeBuildProgrammaticNote: maybeBuildProgrammaticNote,
+  _normalizeAssembledNoteText: normalizeAssembledNoteText,
   _stripAlternateTranslation: stripAlternateTranslation,
 };

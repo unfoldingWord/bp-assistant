@@ -153,6 +153,19 @@ function stripBraces(text) {
   return text.replace(/\{[^}]*\}/g, '').trim();
 }
 
+function flattenBraces(text) {
+  return String(text || '').replace(/\{([^}]*)\}/g, '$1').replace(/\s+/g, ' ').trim();
+}
+
+function normalizeComparableAtText(text) {
+  return String(text || '')
+    .toLowerCase()
+    .replace(/\s*(?:\.{3}|\u2026)\s*/g, ' ')
+    .replace(/[^a-z0-9\s]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
 /**
  * Extract AT texts from after "Alternate translation:" lines.
  * Returns array of strings (contents of [...] brackets).
@@ -362,6 +375,10 @@ async function checkTnQuality({ tsvPath, preparedJson, ultUsfm, ustUsfm, book, h
       }
     }
 
+    if (/\\u[0-9a-fA-F]{4}/.test(n.note)) {
+      addFinding(n.row, n.ref, n.id, 'error', 'unicode_escape_literal', 'Literal unicode escape sequence leaked into note text');
+    }
+
     // Get ULT/UST verse context
     const prepItem = prepItems[n.id] || {};
     const ultVerse = prepItem.ult_verse || ultVerses[n.ref] || '';
@@ -399,6 +416,23 @@ async function checkTnQuality({ tsvPath, preparedJson, ultUsfm, ustUsfm, book, h
       const cleanGlq = stripBraces(glQuote);
       if (cleanGlq && !ultVerse.toLowerCase().includes(cleanGlq.toLowerCase())) {
         addFinding(n.row, n.ref, n.id, 'warning', 'gl_quote_not_in_ult', `gl_quote "${cleanGlq.slice(0, 50)}" not found in ULT`);
+      }
+    }
+
+    if (glQuote && ats.length) {
+      const cleanGlq = stripBraces(glQuote);
+      const flattenedGlq = flattenBraces(glQuote);
+      const normalizedGlq = normalizeComparableAtText(flattenedGlq || cleanGlq);
+      const sourceHasEllipsis = /(?:\.{3}|\u2026| & )/.test(flattenedGlq || cleanGlq);
+      for (const at of ats) {
+        const normalizedAt = normalizeComparableAtText(at);
+        if (normalizedGlq && normalizedAt && normalizedGlq === normalizedAt) {
+          addFinding(n.row, n.ref, n.id, 'error', 'at_equals_ult_after_brace_strip', 'AT is identical to the brace-stripped ULT quote');
+        }
+        const atHasEllipsis = /(?:\.{3}|\u2026| & )/.test(at);
+        if (atHasEllipsis && !sourceHasEllipsis) {
+          addFinding(n.row, n.ref, n.id, 'warning', 'at_ellipsis_mismatch', 'AT is discontinuous but the source quote is contiguous');
+        }
       }
     }
 

@@ -83,6 +83,52 @@ function buildIntroSignal(rawSynonymousCount, threshold) {
     : { parallelism_signal: null, parallelism_synonymous_count: rawSynonymousCount };
 }
 
+function normalizeDiscontinuousQuoteSyntax(quote) {
+  return String(quote || '')
+    .replace(/\s*(?:\.{3}|\u2026)\s*/g, ' & ')
+    .replace(/\s*&\s*/g, ' & ')
+    .replace(/\s{2,}/g, ' ')
+    .trim();
+}
+
+function normalizeComparableText(text) {
+  return String(text || '')
+    .replace(/\{[^}]*\}/g, ' ')
+    .replace(/\s*(?:\.{3}|\u2026)\s*/g, ' & ')
+    .toLowerCase()
+    .replace(/[^a-z0-9&\s-]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function quoteWordTokens(text) {
+  return normalizeComparableText(text)
+    .replace(/\s*&\s*/g, ' ')
+    .split(/\s+/)
+    .filter(Boolean);
+}
+
+function quoteIsCoveredByLargerQuote(smaller, larger) {
+  const smallNorm = normalizeComparableText(smaller);
+  const largeNorm = normalizeComparableText(larger);
+  if (!smallNorm || !largeNorm || smallNorm === largeNorm) return false;
+  if (largeNorm.includes(smallNorm)) return true;
+
+  const smallTokens = quoteWordTokens(smaller);
+  const largeTokenSet = new Set(quoteWordTokens(larger));
+  if (!smallTokens.length) return false;
+  return smallTokens.every((token) => largeTokenSet.has(token));
+}
+
+function normalizeExplanationStem(explanation) {
+  return normalizeComparableText(
+    String(explanation || '')
+      .replace(/\bq:\s*[a-z-]+/ig, ' ')
+      .replace(/\breason:\s*[a-z-]+/ig, ' ')
+      .replace(/\bt:\s*first\s+instance\b/ig, ' ')
+  );
+}
+
 function normalizeIssueRows(lines, options = {}) {
   const cfg = {
     highParallelismThreshold: options.highParallelismThreshold ?? DEFAULTS.highParallelismThreshold,
@@ -105,6 +151,10 @@ function normalizeIssueRows(lines, options = {}) {
     dropped_exception_cap_parallelism_rows: 0,
     dropped_invalid_reason_parallelism_rows: 0,
     first_instance_tags_removed: 0,
+    dropped_braced_ellipsis_rows: 0,
+    dropped_parallelism_overlap_doublets: 0,
+    dropped_split_snippet_rows: 0,
+    normalized_discontinuous_quotes: 0,
   };
 
   let firstKeptParallelism = null;
@@ -219,12 +269,84 @@ function normalizeIssueRows(lines, options = {}) {
     }
   }
 
+  const postProcessed = [];
+  const dataRows = [];
+  for (const line of output) {
+    const cols = parseTsvLine(line);
+    const isHeader = cols[0].toLowerCase() === 'book' && String(cols[1] || '').toLowerCase() === 'reference';
+    if (isHeader) {
+      postProcessed.push(toTsvLine(cols));
+      continue;
+    }
+    const normalizedQuote = normalizeDiscontinuousQuoteSyntax(cols[3] || '');
+    if (normalizedQuote !== (cols[3] || '')) {
+      cols[3] = normalizedQuote;
+      summary.normalized_discontinuous_quotes++;
+    }
+    dataRows.push({
+      cols,
+      issueType: normalizeIssueType(cols[2]),
+      ref: cols[1] || '',
+      quote: cols[3] || '',
+      explanation: cols[6] || '',
+      drop: false,
+    });
+  }
+
+  const keptParallelismByRef = new Map();
+  for (const row of dataRows) {
+    if (row.issueType !== 'figs-parallelism' || row.drop) continue;
+    if (!keptParallelismByRef.has(row.ref)) keptParallelismByRef.set(row.ref, []);
+    keptParallelismByRef.get(row.ref).push(row);
+  }
+
+  for (const row of dataRows) {
+    if (row.issueType === 'figs-ellipsis' && /\{[^}]+\}/.test(row.quote)) {
+      row.drop = true;
+      summary.dropped_braced_ellipsis_rows++;
+      continue;
+    }
+
+    if (row.issueType === 'figs-doublet') {
+      const parallelismRows = keptParallelismByRef.get(row.ref) || [];
+      if (parallelismRows.some((parallelismRow) => quoteIsCoveredByLargerQuote(row.quote, parallelismRow.quote))) {
+        row.drop = true;
+        summary.dropped_parallelism_overlap_doublets++;
+      }
+    }
+  }
+
+  for (let i = 0; i < dataRows.length; i++) {
+    const row = dataRows[i];
+    if (row.drop) continue;
+    for (let j = 0; j < dataRows.length; j++) {
+      if (i === j) continue;
+      const candidate = dataRows[j];
+      if (candidate.drop) continue;
+      if (row.ref !== candidate.ref || row.issueType !== candidate.issueType) continue;
+      if (!quoteIsCoveredByLargerQuote(row.quote, candidate.quote)) continue;
+
+      const rowStem = normalizeExplanationStem(row.explanation);
+      const candidateStem = normalizeExplanationStem(candidate.explanation);
+      if (!rowStem || !candidateStem) continue;
+      if (rowStem !== candidateStem) continue;
+
+      row.drop = true;
+      summary.dropped_split_snippet_rows++;
+      break;
+    }
+  }
+
+  for (const row of dataRows) {
+    if (!row.drop) postProcessed.push(toTsvLine(row.cols));
+  }
+
   const introSignal = buildIntroSignal(
     summary.raw_synonymous_parallelism_rows,
     cfg.highParallelismThreshold
   );
 
-  return { lines: output, summary, introSignal };
+  return { lines: postProcessed, summary, introSignal };
 }
 
 /**

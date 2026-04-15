@@ -14,9 +14,10 @@ const { sendMessage, sendDM, addReaction, removeReaction } = require('./zulip-cl
 const { runClaude, DEFAULT_RESTRICTED_TOOLS, isTransientOutageError } = require('./claude-runner');
 const { getDoor43Username, emailToFallbackUsername, buildBranchName, resolveOutputFile, discoverFreshOutput, checkPrerequisites, calcSkillTimeout, normalizeBookName, resolveConflictMention, parsePartialTsv, truncatePartialTsv, parseChunkRange, CSKILLBP_DIR } = require('./pipeline-utils');
 const { splitTsv, fixTrailingNewlines } = require('./workspace-tools/tsv-tools');
-const { fillTsvIds, generateIds, prepareNotes, fillOrigQuotes, resolveGlQuotes, flagNarrowQuotes, extractAlignmentData, prepareATContext, substituteAT } = require('./workspace-tools/tn-tools');
+const { fillTsvIds, generateIds, prepareNotes, fillOrigQuotes, resolveGlQuotes, flagNarrowQuotes, extractAlignmentData, prepareATContext, substituteAT, fixUnicodeQuotes, verifyBoldMatches } = require('./workspace-tools/tn-tools');
 const { checkTnQuality } = require('./workspace-tools/quality-tools');
 const { normalizeIssuesFile, buildParallelismIntroHintArgs } = require('./issue-normalizer');
+const { curlyQuotes } = require('./workspace-tools/usfm-tools');
 const { verifyRepoPush, verifyDcsToken } = require('./repo-verify');
 const { recordMetrics, getCumulativeTokens, recordRunSummary, getAdaptiveSkillGuardrails } = require('./usage-tracker');
 const { door43Push, checkConflictingBranches, REPO_MAP, getRepoFilename } = require('./door43-push');
@@ -719,11 +720,37 @@ async function runATGeneration({ notesPath, pipeDir, status }) {
         fs.writeFileSync(absNotes, lines.join('\n'));
       }
     }
+
+    const postSummary = postProcessNotesTsv({
+      notesPath,
+      ultUsfm: ctx.sources.ultPlain || ctx.sources.ult,
+      hebrewUsfm: ctx.sources.hebrew,
+    });
+    console.log(`[notes] Final post-processing after AT generation: ${postSummary}`);
   }
 
   const summary = `${results.success}/${atCtx.packets.length} ATs generated (${results.validated} validated, ${results.retried} retried, ${results.failed} failed)`;
   console.log(`[notes] AT generation complete: ${summary}`);
   return summary;
+}
+
+function postProcessNotesTsv({ notesPath, ultUsfm, hebrewUsfm }) {
+  const steps = [];
+  steps.push(`curlyQuotes: ${curlyQuotes({ input: notesPath, inPlace: true })}`);
+
+  if (hebrewUsfm && fs.existsSync(path.resolve(CSKILLBP_DIR, hebrewUsfm))) {
+    steps.push(`fixUnicodeQuotes: ${fixUnicodeQuotes({ tsvFile: notesPath, hebrewUsfm })}`);
+  } else {
+    steps.push('fixUnicodeQuotes: skipped (no Hebrew USFM available)');
+  }
+
+  if (ultUsfm && fs.existsSync(path.resolve(CSKILLBP_DIR, ultUsfm))) {
+    steps.push(`verifyBoldMatches: ${verifyBoldMatches({ tsvFile: notesPath, ultUsfm })}`);
+  } else {
+    steps.push('verifyBoldMatches: skipped (no ULT USFM available)');
+  }
+
+  return steps.join('; ');
 }
 
 /**
@@ -2516,4 +2543,5 @@ module.exports = {
   _getSkillToolConfig: getSkillToolConfig,
   _appendIssueTagsToTsv: appendIssueTagsToTsv,
   _collectUnresolvedQuoteFindings: collectUnresolvedQuoteFindings,
+  _postProcessNotesTsv: postProcessNotesTsv,
 };

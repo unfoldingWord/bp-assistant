@@ -64,3 +64,52 @@ test('checkTnQuality uses at_required as the missing_at contract', async () => {
   const missingAtIds = findings.filter((f) => f.category === 'missing_at').map((f) => f.id);
   assert.deepEqual(missingAtIds, ['a1b2']);
 });
+
+test('checkTnQuality flags literal unicode escapes and ATs identical to brace-stripped ULT quote', async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'quality-tools-at-'));
+  const relRoot = path.join('tmp', path.basename(tempDir));
+  const absRoot = path.join('/srv/bot/workspace', relRoot);
+  fs.mkdirSync(absRoot, { recursive: true });
+
+  const tsvRel = path.join(relRoot, 'tn.tsv');
+  const prepRel = path.join(relRoot, 'prepared_notes.json');
+  const ultRel = path.join(relRoot, 'ult.usfm');
+  const ustRel = path.join(relRoot, 'ust.usfm');
+  const findingsRel = path.join(relRoot, 'findings.json');
+
+  fs.writeFileSync(path.join('/srv/bot/workspace', tsvRel), [
+    'Reference\tID\tTags\tSupportReference\tQuote\tOccurrence\tNote',
+    '1:1\ta1b2\t\trc://*/ta/man/translate/figs-ellipsis\tמְעַט\t1\tThis note leaked an escape: the wicked person\\u2019s place. Alternate translation: [Better is the little of the righteous]',
+  ].join('\n'));
+
+  fs.writeFileSync(path.join('/srv/bot/workspace', prepRel), JSON.stringify({
+    items: [
+      {
+        id: 'a1b2',
+        reference: '1:1',
+        at_required: true,
+        gl_quote: 'Better {is} the little of the righteous',
+        issue_span_gl_quote: 'Better {is} the little of the righteous',
+        ult_verse: 'Better is the little of the righteous than great abundance.',
+        ust_verse: 'It is better for the righteous person to have a little.',
+      },
+    ],
+  }, null, 2));
+
+  fs.writeFileSync(path.join('/srv/bot/workspace', ultRel), '\\c 1\n\\v 1 Better is the little of the righteous than great abundance.\n');
+  fs.writeFileSync(path.join('/srv/bot/workspace', ustRel), '\\c 1\n\\v 1 It is better for the righteous person to have a little.\n');
+
+  await checkTnQuality({
+    tsvPath: tsvRel,
+    preparedJson: prepRel,
+    ultUsfm: ultRel,
+    ustUsfm: ustRel,
+    output: findingsRel,
+  });
+
+  const findings = JSON.parse(fs.readFileSync(path.join('/srv/bot/workspace', findingsRel), 'utf8')).findings || [];
+  const categories = findings.map((f) => f.category);
+
+  assert.ok(categories.includes('unicode_escape_literal'));
+  assert.ok(categories.includes('at_equals_ult_after_brace_strip'));
+});

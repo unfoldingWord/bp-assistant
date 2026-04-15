@@ -113,3 +113,41 @@ test('normalizeIssueRows emits high intro signal when raw synonymous count reach
   assert.equal(result.introSignal.parallelism_signal, 'high');
   assert.equal(result.introSignal.parallelism_synonymous_count, 5);
 });
+
+test('normalizeIssueRows drops ellipsis rows that only restate ULT brace supplies', () => {
+  const input = [
+    row({ ref: '37:16', sref: 'figs-ellipsis', quote: 'Better {is} the little of the righteous', explanation: 'implied verb supplied in braces' }),
+    row({ ref: '37:16', sref: 'figs-possession', quote: 'the little of the righteous', explanation: 'what belongs to the righteous' }),
+  ];
+
+  const result = normalizeIssueRows(input);
+  const srefs = result.lines.map((line) => line.split('\t')[2]);
+
+  assert.equal(srefs.includes('figs-ellipsis'), false);
+  assert.equal(result.summary.dropped_braced_ellipsis_rows, 1);
+});
+
+test('normalizeIssueRows drops doublet rows subsumed by kept parallelism in same verse', () => {
+  const input = [
+    row({ ref: '37:1', sref: 'figs-doublet', quote: 'evildoers & doers of unrighteousness', explanation: 'doublet - two terms for wicked people' }),
+    row({ ref: '37:1', sref: 'figs-parallelism', quote: 'Do not be upset about evildoers; do not be envious of the doers of unrighteousness', explanation: 'synonymous parallelism t: first instance' }),
+  ];
+
+  const result = normalizeIssueRows(input);
+  const keptSrefs = result.lines.map((line) => line.split('\t')[2]);
+
+  assert.deepEqual(keptSrefs, ['figs-parallelism']);
+  assert.equal(result.summary.dropped_parallelism_overlap_doublets, 1);
+});
+
+test('normalizeIssueRows normalizes discontinuous quote ellipsis to ampersand syntax', () => {
+  const input = [
+    row({ ref: '37:33', sref: 'writing-pronouns', quote: 'him ... his hand', explanation: 'first him = righteous; his = wicked' }),
+  ];
+
+  const result = normalizeIssueRows(input);
+  const cols = result.lines[0].split('\t');
+
+  assert.equal(cols[3], 'him & his hand');
+  assert.equal(result.summary.normalized_discontinuous_quotes, 1);
+});

@@ -14,6 +14,7 @@ const {
   _resolveQuoteScopeSelection,
   _buildWriterPrompt,
   _maybeBuildProgrammaticNote,
+  _normalizeAssembledNoteText,
 } = require('../src/workspace-tools/tn-tools');
 
 test('parseExplanationDirectives separates t: and i: instructions deterministically', () => {
@@ -222,4 +223,13 @@ test('quote scope selector marks parallelism rows as full_parallelism', () => {
   });
   assert.equal(selection.scope_mode, 'full_parallelism');
   assert.equal(selection.selected_span, 'one side and the matching side');
+});
+
+test('normalizeAssembledNoteText decodes visible unicode escapes and brackets bare AT text', () => {
+  const normalized = _normalizeAssembledNoteText(
+    'The pronoun refers to the wicked. Alternate translation: the wicked person\\\\u2019s place'
+  );
+
+  assert.match(normalized, /Alternate translation: \[the wicked person’s place\]/);
+  assert.doesNotMatch(normalized, /\\u2019/);
 });
