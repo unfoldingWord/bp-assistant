@@ -14,7 +14,8 @@ const THINKING_MAP_3X = {
 };
 
 const THINKING_MAP_25 = {
-  low: 0,
+  // Gemini 2.5 rejects a zero budget for models that require thinking mode.
+  low: 1024,
   medium: 4096,
   high: 8192,
   max: 32768,
@@ -188,6 +189,7 @@ module.exports = {
   formatToolResult,
   formatAssistantMessage,
   estimateCost,
+  getThinkingConfig,
   toGeminiContents,
   DEFAULT_MODEL,
   MODELS,

@@ -9,6 +9,10 @@ const {
   resolveProviderModel,
 } = require('../src/api-runner/provider-config');
 const geminiProvider = require('../src/api-runner/providers/gemini');
+const {
+  getHarnessModels,
+  validateRequiredArtifacts,
+} = require('../scripts/test-providers-zec3');
 const { resolveAgentProvider } = require('../src/api-runner/team-manager');
 const { getProviderSystemAppend } = require('../src/api-runner/provider-nudges');
 const { readPreparedNotes } = require('../src/workspace-tools/tn-tools');
@@ -32,6 +36,14 @@ test('gemini provider config exposes fallback models for transient overloads', (
   ]);
 });
 
+test('gemini ZEC harness defaults follow provider-config aliases', () => {
+  const models = getHarnessModels('gemini');
+  assert.equal(models.opus, resolveProviderModel('gemini', 'opus'));
+  assert.equal(models.sonnet, resolveProviderModel('gemini', 'sonnet'));
+  assert.equal(models.opus, 'gemini-3.1-pro-preview');
+  assert.equal(models.sonnet, 'gemini-2.5-pro');
+});
+
 test('gemini tool results preserve upstream tool call ids', () => {
   const result = geminiProvider.formatToolResult('call-123', 'ping', { ok: true }, false);
   assert.deepEqual(result, {
@@ -42,6 +54,16 @@ test('gemini tool results preserve upstream tool call ids', () => {
       content: JSON.stringify({ ok: true }),
       isError: false,
     }],
+  });
+});
+
+test('gemini 2.5 low thinking keeps a positive budget', () => {
+  assert.equal(typeof geminiProvider.getThinkingConfig, 'function');
+  assert.deepEqual(geminiProvider.getThinkingConfig('gemini-2.5-pro', 'low'), {
+    thinkingConfig: { thinkingBudget: 1024 },
+  });
+  assert.deepEqual(geminiProvider.getThinkingConfig('gemini-3.1-pro-preview', 'low'), {
+    thinkingConfig: { thinkingLevel: 'low' },
   });
 });
 
@@ -101,6 +123,29 @@ test('provider-specific runner nudges stay attached to openai and xai', () => {
   assert.equal(getProviderSystemAppend('gemini', 'initial-pipeline'), '');
   assert.equal(getProviderSystemAppend('openai', 'align-all-parallel', { book: 'ZEC', chapter: 3 }), '');
   assert.equal(getProviderSystemAppend('xai', 'tn-writer'), '');
+});
+
+test('zec harness artifact gate rejects missing or empty required outputs', () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'zec3-artifacts-'));
+  const paths = {
+    ult: path.join(tempDir, 'ZEC-03.usfm'),
+    ultAligned: path.join(tempDir, 'ZEC-03-aligned.usfm'),
+    ust: path.join(tempDir, 'ZEC-03-UST.usfm'),
+    ustAligned: path.join(tempDir, 'ZEC-03-UST-aligned.usfm'),
+    issues: path.join(tempDir, 'ZEC-03-issues.tsv'),
+    notes: path.join(tempDir, 'ZEC-03-notes.tsv'),
+  };
+
+  fs.writeFileSync(paths.ult, '\\id ZEC');
+  fs.writeFileSync(paths.ultAligned, '\\id ZEC');
+  fs.writeFileSync(paths.ust, '');
+  fs.writeFileSync(paths.ustAligned, '\\id ZEC');
+  fs.writeFileSync(paths.issues, 'Reference\tID\n3:1\ta1b2\n');
+
+  const result = validateRequiredArtifacts(paths);
+  assert.equal(result.ok, false);
+  assert.deepEqual(result.missing.map((entry) => entry.key), ['notes']);
+  assert.deepEqual(result.empty.map((entry) => entry.key), ['ust']);
 });
 
 test('readPreparedNotes accepts object-backed prepared_notes packets', () => {
