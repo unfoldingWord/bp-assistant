@@ -480,7 +480,7 @@ async function runPerNoteGeneration({ pipeDir, outputPath, status, book }) {
 
 /**
  * Run AT generation as a separate pipeline step after tn-writer.
- * For each note item with at_policy: required, makes a focused SDK call
+ * For each note item with at_required: true, makes a focused SDK call
  * to generate the AT, then a Haiku SDK call to validate it, then
  * programmatically appends "Alternate translation: [text]" to the generated notes JSON.
  *
@@ -559,6 +559,7 @@ async function runATGeneration({ notesPath, pipeDir, status }) {
       `ISSUE TYPE: ${packet.issue_type}`,
       `NOTE: ${packet.note_text}`,
       `TEXT TO REPLACE: ${packet.exact_ult_span}`,
+      `QUOTE SCOPE MODE: ${packet.quote_scope_mode || 'focused_span'}`,
     ].filter(Boolean).join('\n');
 
     try {

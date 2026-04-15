@@ -6,7 +6,7 @@ const fs = require('fs');
 const path = require('path');
 const https = require('https');
 
-const { loadTemplateMap } = require('./tn-tools');
+const { loadTemplateMap, resolveAtRequirement } = require('./tn-tools');
 
 const CSKILLBP_DIR = process.env.CSKILLBP_DIR || '/srv/bot/workspace';
 
@@ -366,7 +366,7 @@ async function checkTnQuality({ tsvPath, preparedJson, ultUsfm, ustUsfm, book, h
     const prepItem = prepItems[n.id] || {};
     const ultVerse = prepItem.ult_verse || ultVerses[n.ref] || '';
     const ustVerse = prepItem.ust_verse || ustVerses[n.ref] || '';
-    const glQuote = prepItem.gl_quote || '';
+    const glQuote = prepItem.issue_span_gl_quote || prepItem.gl_quote || '';
 
     // Extract ATs for this note
     const ats = extractAts(n.note);
@@ -609,7 +609,7 @@ async function checkTnQuality({ tsvPath, preparedJson, ultUsfm, ustUsfm, book, h
     }
 
     // 22. Missing AT when required
-    if (prepItem.needs_at || prepItem.tcm_mode) {
+    if (resolveAtRequirement(prepItem).at_required) {
       if (!n.note.includes('Alternate translation:')) {
         addFinding(n.row, n.ref, n.id, 'error', 'missing_at', 'Note requires Alternate translation but none found');
       }

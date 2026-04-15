@@ -6,9 +6,12 @@ const path = require('path');
 
 const {
   prepareNotes,
+  prepareATContext,
   _parseExplanationDirectives,
   _resolveTemplateSelection,
   _deriveStyleProfile,
+  _deriveAtRequirement,
+  _resolveQuoteScopeSelection,
   _buildWriterPrompt,
   _maybeBuildProgrammaticNote,
 } = require('../src/workspace-tools/tn-tools');
@@ -37,7 +40,7 @@ test('resolveTemplateSelection locks a single exact template hint match', () => 
 
   assert.equal(selected.template_locked, true);
   assert.equal(selected.selected_template.type, 'request');
-  assert.equal(selected.candidate_templates.length, 2);
+  assert.equal(selected.candidate_templates.length, 1);
 });
 
 test('deriveStyleProfile enforces no-at rules unless i: explicitly overrides them', () => {
@@ -49,6 +52,7 @@ test('deriveStyleProfile enforces no-at rules unless i: explicitly overrides the
     selectedTemplate: { template: 'Background template.' },
   });
   assert.equal(forbidden.at_policy, 'forbidden');
+  assert.equal(forbidden.at_required, false);
   assert.ok(forbidden.style_rules.includes('no_at'));
 
   const overridden = _deriveStyleProfile({
@@ -58,8 +62,21 @@ test('deriveStyleProfile enforces no-at rules unless i: explicitly overrides the
     needsAt: true,
     selectedTemplate: { template: 'Background template.' },
   });
-  assert.equal(overridden.at_policy, 'required');
+  assert.equal(overridden.at_policy, 'not_needed');
+  assert.equal(overridden.at_required, false);
   assert.ok(overridden.rule_overrides.includes('at_policy_from_i'));
+});
+
+test('deriveAtRequirement requires AT when the selected template has an AT slot', () => {
+  const decision = _deriveAtRequirement({
+    atProvided: '',
+    needsAt: false,
+    selectedTemplate: { template: 'Use this. Alternate translation: [ALT]' },
+    styleRules: [],
+    hasAtPolicyOverride: false,
+  });
+  assert.equal(decision.at_policy, 'required');
+  assert.equal(decision.at_required, true);
 });
 
 test('buildWriterPrompt uses the selected template and forbids exploratory template choice', () => {
@@ -135,12 +152,74 @@ test('prepareNotes writes a packetized item with deterministic template and poli
   assert.equal(item.template_type, 'generic');
   assert.equal(item.template_locked, true);
   assert.equal(item.at_policy, 'forbidden');
+  assert.equal(item.at_required, false);
+  assert.equal(item.scope_mode, 'focused_span');
+  assert.equal(item.issue_span_gl_quote, item.gl_quote);
   assert.deepEqual(item.must_include, ['Keep the transition natural']);
   assert.equal(item.clean_explanation, '');
   assert.ok(item.template_text.startsWith('Here the author is providing background information'));
   assert.equal(item.writer_packet.prose_mode, 'template_plus_necessity');
   assert.equal(item.writer_packet.at_policy, 'forbidden');
+  assert.equal(item.writer_packet.at_required, false);
+  assert.equal(item.writer_packet.issue_span_gl_quote, item.issue_span_gl_quote);
   assert.match(item.prompt, /Selected template:/);
+  assert.match(item.prompt, /Quote scope mode:/);
   assert.match(item.prompt, /Do not add an alternate translation/);
   assert.doesNotMatch(item.prompt, /discern which particular template/i);
+});
+
+test('prepareNotes keeps at_required false when selected template has no AT slot', () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tn-tools-at-'));
+  const issuesRel = path.join('tmp', path.basename(tempDir), 'PSA-036.tsv');
+  const ultRel = path.join('tmp', path.basename(tempDir), 'PSA-036.ult.usfm');
+  const ustRel = path.join('tmp', path.basename(tempDir), 'PSA-036.ust.usfm');
+  const outRel = path.join('tmp', path.basename(tempDir), 'prepared_notes.json');
+
+  fs.mkdirSync(path.join('/srv/bot/workspace', 'tmp', path.basename(tempDir)), { recursive: true });
+  fs.writeFileSync(path.join('/srv/bot/workspace', issuesRel), [
+    'Book\tReference\tSRef\tGLQuote\tNeedsAT\tAT\tExplanation',
+    'PSA\t36:1\twriting-background\tThen\tYes\t\t',
+  ].join('\n'));
+  fs.writeFileSync(path.join('/srv/bot/workspace', ultRel), '\\c 36\n\\v 1 Then the king spoke.\n');
+  fs.writeFileSync(path.join('/srv/bot/workspace', ustRel), '\\c 36\n\\v 1 Then the king spoke.\n');
+
+  prepareNotes({ inputTsv: issuesRel, ultUsfm: ultRel, ustUsfm: ustRel, output: outRel });
+  const prepared = JSON.parse(fs.readFileSync(path.join('/srv/bot/workspace', outRel), 'utf8'));
+  const item = prepared.items[0];
+  assert.equal(item.chosen_template_has_at_slot, false);
+  assert.equal(item.at_required, false);
+});
+
+test('prepareATContext keys off canonical at_required', () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tn-tools-atctx-'));
+  const root = path.join('/srv/bot/workspace', 'tmp', path.basename(tempDir));
+  fs.mkdirSync(root, { recursive: true });
+
+  const preparedRel = path.join('tmp', path.basename(tempDir), 'prepared_notes.json');
+  const generatedRel = path.join('tmp', path.basename(tempDir), 'generated_notes.json');
+  fs.writeFileSync(path.join('/srv/bot/workspace', preparedRel), JSON.stringify({
+    book: 'PSA',
+    chapter: '1',
+    items: [
+      { id: 'a111', reference: '1:1', sref: 'figs-metaphor', at_required: false, needs_at: true, gl_quote: 'old text', issue_span_gl_quote: 'old text', ult_verse: 'old text appears here', ust_verse: 'ust one' },
+      { id: 'b222', reference: '1:2', sref: 'figs-metaphor', at_required: true, needs_at: false, gl_quote: 'new text', issue_span_gl_quote: 'new text', ult_verse: 'new text appears here', ust_verse: 'ust two', scope_mode: 'focused_span' },
+    ],
+  }, null, 2));
+  fs.writeFileSync(path.join('/srv/bot/workspace', generatedRel), JSON.stringify({ b222: 'note text' }, null, 2));
+
+  const atCtx = JSON.parse(prepareATContext({ preparedJson: preparedRel, generatedJson: generatedRel }));
+  assert.equal(atCtx.item_count, 1);
+  assert.equal(atCtx.packets[0].id, 'b222');
+  assert.equal(atCtx.packets[0].quote_scope_mode, 'focused_span');
+  assert.equal(atCtx.packets[0].exact_ult_span, 'new text');
+});
+
+test('quote scope selector marks parallelism rows as full_parallelism', () => {
+  const selection = _resolveQuoteScopeSelection({
+    sref: 'figs-parallelism',
+    glQuote: 'one side',
+    ultVerse: 'one side and the matching side',
+  });
+  assert.equal(selection.scope_mode, 'full_parallelism');
+  assert.equal(selection.selected_span, 'one side and the matching side');
 });

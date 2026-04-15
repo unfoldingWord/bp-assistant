@@ -129,16 +129,109 @@ function templatePriority(template) {
   return 1;
 }
 
-function resolveTemplateSelection({ sref, templateHints = [], templateMap = loadTemplateMap() }) {
+const ISSUE_SCOPE_MODE_BY_SLUG = {
+  'figs-parallelism': 'full_parallelism',
+};
+
+const ISSUE_SCOPE_MODE_BY_PREFIX = [
+  ['grammar-connect-logic-', 'full_restructure_region'],
+  ['grammar-connect-time-', 'full_restructure_region'],
+];
+
+function detectIssueScopeMode(sref, glQuote = '') {
+  const normalizedSref = normalizeWhitespace(sref);
+  const normalizedQuote = normalizeWhitespace(glQuote);
+  if (/\s&\s/.test(normalizedQuote) || normalizedQuote.includes('\u2026') || normalizedQuote.includes('...')) {
+    return 'discontinuous_span';
+  }
+  if (ISSUE_SCOPE_MODE_BY_SLUG[normalizedSref]) return ISSUE_SCOPE_MODE_BY_SLUG[normalizedSref];
+  for (const [prefix, mode] of ISSUE_SCOPE_MODE_BY_PREFIX) {
+    if (normalizedSref.startsWith(prefix)) return mode;
+  }
+  return 'focused_span';
+}
+
+function applyScopeModeToSpan({ scopeMode, glQuote = '', ultVerse = '' }) {
+  const normalizedQuote = normalizeWhitespace(glQuote);
+  if ((scopeMode === 'full_parallelism' || scopeMode === 'full_restructure_region') && normalizeWhitespace(ultVerse)) {
+    return normalizeWhitespace(ultVerse);
+  }
+  return normalizedQuote;
+}
+
+function resolveQuoteScopeSelection({ sref, glQuote = '', ultVerse = '' }) {
+  const scopeMode = detectIssueScopeMode(sref, glQuote);
+  const selectedSpan = applyScopeModeToSpan({ scopeMode, glQuote, ultVerse });
+  return {
+    scope_mode: scopeMode,
+    selected_span: selectedSpan || normalizeWhitespace(glQuote),
+    selector_status: 'fallback_deterministic',
+    selector_fallback_reason: 'quote_scope_selector_not_configured',
+  };
+}
+
+function buildTemplateId(sref, templateType, index) {
+  const slug = normalizeWhitespace(sref) || 'unknown';
+  const type = normalizeTemplateType(templateType || '') || 'generic';
+  return `${slug}::${type}::${index}`;
+}
+
+function toTemplateCandidate(template, sref, index) {
+  return {
+    template_id: buildTemplateId(sref, template?.type, index),
+    type: normalizeWhitespace(template?.type || '') || 'generic',
+    template_text: stripAlternateTranslation(template?.template || ''),
+    has_alternate_translation: templateHasAlternateTranslation(template?.template || ''),
+    _template: template,
+  };
+}
+
+function resolveTemplateSelection({
+  sref,
+  templateHints = [],
+  noAtOnly = false,
+  templateMap = loadTemplateMap(),
+  selectorChoice = null,
+}) {
   const templates = Array.isArray(templateMap?.get?.(sref)) ? templateMap.get(sref) : [];
+  const candidates = templates.map((template, index) => toTemplateCandidate(template, sref, index));
   const normalizedHints = templateHints.map(normalizeTemplateType).filter(Boolean);
+  let filtered = candidates.slice();
+  const fallbackReasons = [];
+
+  if (normalizedHints.length) {
+    const hinted = filtered.filter((candidate) => normalizedHints.includes(normalizeTemplateType(candidate.type)));
+    if (hinted.length) filtered = hinted;
+    else fallbackReasons.push('hint_filter_empty');
+  }
+
+  if (noAtOnly) {
+    const noAt = filtered.filter((candidate) => !candidate.has_alternate_translation);
+    if (noAt.length) filtered = noAt;
+    else fallbackReasons.push('no_at_filter_empty');
+  }
 
   let selected = null;
   let templateLocked = false;
   let selectionReason = 'missing';
+  let selectorStatus = 'fallback_deterministic';
+  let selectorFallbackReason = fallbackReasons.length ? fallbackReasons.join(',') : 'none';
 
-  if (normalizedHints.length) {
-    const exact = templates.filter((template) => normalizedHints.includes(normalizeTemplateType(template.type)));
+  if (selectorChoice && selectorChoice.template_id) {
+    const aiPick = filtered.find((candidate) => candidate.template_id === selectorChoice.template_id);
+    if (aiPick) {
+      selected = aiPick;
+      selectionReason = 'selector_choice';
+      selectorStatus = 'selected';
+      selectorFallbackReason = 'none';
+    } else {
+      fallbackReasons.push('invalid_selector_template');
+      selectorFallbackReason = fallbackReasons.join(',');
+    }
+  }
+
+  if (!selected && normalizedHints.length) {
+    const exact = filtered.filter((candidate) => normalizedHints.includes(normalizeTemplateType(candidate.type)));
     if (exact.length === 1) {
       selected = exact[0];
       templateLocked = true;
@@ -150,26 +243,32 @@ function resolveTemplateSelection({ sref, templateHints = [], templateMap = load
     }
   }
 
-  if (!selected && templates.length === 1) {
-    selected = templates[0];
+  if (!selected && filtered.length === 1) {
+    selected = filtered[0];
     templateLocked = true;
     selectionReason = 'single_template';
   }
 
-  if (!selected && templates.length > 1) {
-    const sorted = templates.slice().sort((a, b) => templatePriority(a) - templatePriority(b) || normalizeTemplateType(a.type).localeCompare(normalizeTemplateType(b.type)));
+  if (!selected && filtered.length > 1) {
+    const sorted = filtered.slice().sort((a, b) => templatePriority(a) - templatePriority(b) || normalizeTemplateType(a.type).localeCompare(normalizeTemplateType(b.type)));
     selected = sorted[0];
     selectionReason = 'deterministic_default';
   }
 
+  const selectedTemplate = selected?._template || null;
   return {
-    selected_template: selected || null,
+    selected_template: selectedTemplate,
+    selected_template_id: selected?.template_id || '',
+    selected_template_has_at_slot: !!selected?.has_alternate_translation,
     template_locked: templateLocked,
     selection_reason: selectionReason,
-    candidate_templates: templates.map((template) => ({
-      type: normalizeWhitespace(template.type || '') || 'generic',
-      template_text: stripAlternateTranslation(template.template),
-      has_alternate_translation: templateHasAlternateTranslation(template.template),
+    selector_status: selectorStatus,
+    selector_fallback_reason: selectorFallbackReason,
+    candidate_templates: filtered.map((candidate) => ({
+      template_id: candidate.template_id,
+      type: candidate.type,
+      template_text: candidate.template_text,
+      has_alternate_translation: candidate.has_alternate_translation,
     })),
   };
 }
@@ -187,21 +286,82 @@ function hasAtOverride(mustInclude) {
   return /\balternate translation\b|\bAT\b/i.test(joined);
 }
 
+function deriveAtRequirement({
+  atProvided = '',
+  needsAt = false,
+  selectedTemplate = null,
+  selectedTemplateHasAtSlot = null,
+  styleRules = [],
+  hasAtPolicyOverride = false,
+}) {
+  const provided = normalizeWhitespace(atProvided);
+  const templateHasAtSlot = typeof selectedTemplateHasAtSlot === 'boolean'
+    ? selectedTemplateHasAtSlot
+    : templateHasAlternateTranslation(selectedTemplate?.template || '');
+  const noAtRestricted = styleRules.includes('no_at') && !hasAtPolicyOverride;
+
+  if (provided) {
+    return { at_policy: 'provided', at_required: false, selected_template_has_at_slot: templateHasAtSlot, reason: 'provided_at' };
+  }
+  if (noAtRestricted) {
+    return { at_policy: 'forbidden', at_required: false, selected_template_has_at_slot: templateHasAtSlot, reason: 'no_at_rule' };
+  }
+  if (templateHasAtSlot) {
+    return { at_policy: 'required', at_required: true, selected_template_has_at_slot: true, reason: 'template_requires_at' };
+  }
+  if (!selectedTemplate && needsAt) {
+    return { at_policy: 'required', at_required: true, selected_template_has_at_slot: false, reason: 'needs_at_without_template' };
+  }
+  if (needsAt) {
+    return { at_policy: 'not_needed', at_required: false, selected_template_has_at_slot: false, reason: 'template_without_at_slot' };
+  }
+  return { at_policy: 'not_needed', at_required: false, selected_template_has_at_slot: templateHasAtSlot, reason: 'not_required' };
+}
+
 function deriveStyleProfile({ sref, mustInclude = [], atProvided = '', needsAt = false, selectedTemplate = null }) {
   const styleRules = [...(ISSUE_STYLE_RULES[sref] || [])];
   const overrides = [];
-
-  let atPolicy = normalizeWhitespace(atProvided) ? 'provided' : (needsAt || templateHasAlternateTranslation(selectedTemplate?.template || '')) ? 'required' : 'not_needed';
+  const hasPolicyOverride = hasAtOverride(mustInclude);
 
   if (styleRules.includes('no_at')) {
-    if (hasAtOverride(mustInclude)) {
+    if (hasPolicyOverride) {
       overrides.push('at_policy_from_i');
-    } else {
-      atPolicy = 'forbidden';
     }
   }
 
-  return { at_policy: atPolicy, style_rules: styleRules, rule_overrides: overrides };
+  const atDecision = deriveAtRequirement({
+    atProvided,
+    needsAt,
+    selectedTemplate,
+    styleRules,
+    hasAtPolicyOverride: hasPolicyOverride,
+  });
+
+  return {
+    at_policy: atDecision.at_policy,
+    at_required: atDecision.at_required,
+    selected_template_has_at_slot: atDecision.selected_template_has_at_slot,
+    at_decision_reason: atDecision.reason,
+    style_rules: styleRules,
+    rule_overrides: overrides,
+  };
+}
+
+function resolveAtRequirement(item = {}) {
+  if (typeof item.at_required === 'boolean') {
+    return { at_required: item.at_required, source: 'at_required' };
+  }
+
+  const policy = normalizeWhitespace(item.at_policy).toLowerCase();
+  if (policy === 'required') return { at_required: true, source: 'at_policy_required' };
+  if (policy === 'provided' || policy === 'forbidden' || policy === 'not_needed') {
+    return { at_required: false, source: `at_policy_${policy}` };
+  }
+
+  if (item.tcm_mode) return { at_required: true, source: 'tcm_mode' };
+  if (item.selected_template_has_at_slot === true) return { at_required: true, source: 'selected_template_has_at_slot' };
+  if (item.needs_at) return { at_required: true, source: 'needs_at' };
+  return { at_required: false, source: 'default' };
 }
 
 function formatAlternateTranslation(at) {
@@ -249,20 +409,26 @@ function maybeBuildProgrammaticNote(item) {
 }
 
 function buildWriterPacket(item) {
+  const scopedQuote = item.issue_span_gl_quote || item.gl_quote || '';
   return {
     reference: item.reference,
     id: item.id,
     sref: item.sref,
     note_type: item.note_type,
     at_policy: item.at_policy,
+    at_required: !!item.at_required,
     template_type: item.template_type || 'generic',
     template_locked: !!item.template_locked,
     template_text: item.template_text || '',
+    chosen_template_id: item.chosen_template_id || '',
+    chosen_template_has_at_slot: !!item.chosen_template_has_at_slot,
+    scope_mode: item.scope_mode || 'focused_span',
     must_include: item.must_include || [],
     clean_explanation: item.clean_explanation || '',
     style_rules: item.style_rules || [],
     rule_overrides: item.rule_overrides || [],
-    gl_quote: item.gl_quote || '',
+    issue_span_gl_quote: scopedQuote,
+    gl_quote: scopedQuote,
     orig_quote: item.orig_quote || '',
     ult_verse: item.ult_verse || '',
     ust_verse: item.ust_verse || '',
@@ -286,9 +452,11 @@ function buildWriterPrompt(item) {
     'Your note MUST begin by filling in the selected template below. Do not prepend extra sentences or substitute phrasings from Translation Academy definitions or other notes.',
     `Reference: ${packet.reference}`,
     `Issue type: ${packet.sref}`,
-    `Quote: ${packet.gl_quote || '(none)'}`,
+    `Quote (scoped): ${packet.issue_span_gl_quote || '(none)'}`,
+    `Quote scope mode: ${packet.scope_mode}`,
     `AT policy: ${packet.at_policy}`,
     `Selected template type: ${packet.template_type}`,
+    `Selected template ID: ${packet.chosen_template_id || '(none)'}`,
     `Selected template: ${packet.template_text || '(no template found)'}`,
   ];
 
@@ -296,7 +464,7 @@ function buildWriterPrompt(item) {
   if (packet.must_include.length) lines.push(`Must include: ${packet.must_include.join(' | ')}`);
   if (packet.style_rules.length) lines.push(`Style rules: ${packet.style_rules.join(', ')}`);
   if (packet.rule_overrides.length) lines.push(`Overrides: ${packet.rule_overrides.join(', ')}`);
-  if (packet.at_policy === 'required') lines.push('Do NOT include an alternate translation. The AT will be generated separately by the pipeline. Write only the explanatory note text.');
+  if (packet.at_required) lines.push('Do NOT include an alternate translation. The AT will be generated separately by the pipeline. Write only the explanatory note text.');
   else lines.push('Do not add an alternate translation unless the provided note text already includes one programmatically.');
   if (packet.at_policy === 'provided' && packet.at_provided) lines.push(`Provided AT context: ${packet.at_provided}`);
   if (packet.ult_verse) lines.push(`ULT verse: ${packet.ult_verse}`);
@@ -476,11 +644,16 @@ function resolveGlQuotes({ preparedJson, alignmentJson, dryRun }) {
     if (!matched.length) continue;
 
     const span = matched.map(e => e.eng).join(' ');
-    if (span && span !== item.gl_quote) {
-      log.push(`${item.reference}: "${item.gl_quote}" -> "${span}"`);
+    const currentScoped = item.issue_span_gl_quote || item.gl_quote || '';
+    if (span && span !== currentScoped) {
+      log.push(`${item.reference}: "${currentScoped}" -> "${span}"`);
       if (!dryRun) {
+        item.issue_span_gl_quote = span;
         item.gl_quote = span;
-        if (item.writer_packet) item.writer_packet.gl_quote = span;
+        if (item.writer_packet) {
+          item.writer_packet.issue_span_gl_quote = span;
+          item.writer_packet.gl_quote = span;
+        }
       }
       updated++;
     }
@@ -666,12 +839,18 @@ function prepareNotes({ inputTsv, ultUsfm, ustUsfm, output, alignedUsfm, alignme
       index: items.length,
       reference: row.reference,
       sref: row.sref.replace(/^rc:\/\/\*\/ta\/man\/translate\//, ''),
-      gl_quote: row.gl_quote, needs_at: row.needs_at.toLowerCase() === 'yes' || row.needs_at === '1',
+      gl_quote: row.gl_quote, issue_span_gl_quote: normalizeWhitespace(row.gl_quote), scope_mode: 'focused_span',
+      needs_at: row.needs_at.toLowerCase() === 'yes' || row.needs_at === '1',
       at_provided: row.at_provided, explanation: row.explanation,
       id: '', orig_quote: '', ult_verse: '', ust_verse: '',
       note_type: '', hebrew_front_words: [], tcm_mode: false,
+      chosen_template_id: '', chosen_template_has_at_slot: false,
       template_text: '', template_type: '', template_locked: false, must_include: [],
-      clean_explanation: '', at_policy: 'not_needed', style_rules: [], rule_overrides: [],
+      clean_explanation: '', at_policy: 'not_needed', at_required: false, at_decision_reason: '',
+      template_selector_status: 'fallback_deterministic', template_selector_fallback_reason: 'not_run',
+      quote_scope_selector_status: 'fallback_deterministic', quote_scope_selector_fallback_reason: 'not_run',
+      selector_status: 'fallback_deterministic', selector_fallback_reason: 'not_run',
+      style_rules: [], rule_overrides: [],
       writer_packet: null, prompt: '', system_prompt_key: 'given_at_agent', programmatic_note: '',
       candidate_templates: [],
     });
@@ -713,9 +892,11 @@ function prepareNotes({ inputTsv, ultUsfm, ustUsfm, output, alignedUsfm, alignme
     // Strip [heb:...] hint from explanation before parsing directives (it's for fillOrigQuotes, not note text)
     const explanationForDirectives = item.explanation.replace(/\s*\[heb:[^\]]*\]/g, '').trim();
     const directives = parseExplanationDirectives(explanationForDirectives);
+    const noAtOnly = (ISSUE_STYLE_RULES[item.sref] || []).includes('no_at') && !hasAtOverride(directives.must_include);
     const templateSelection = resolveTemplateSelection({
       sref: item.sref,
       templateHints: directives.template_hints,
+      noAtOnly,
       templateMap,
     });
     const styleProfile = deriveStyleProfile({
@@ -725,24 +906,47 @@ function prepareNotes({ inputTsv, ultUsfm, ustUsfm, output, alignedUsfm, alignme
       needsAt: item.needs_at,
       selectedTemplate: templateSelection.selected_template,
     });
+    const quoteScopeSelection = resolveQuoteScopeSelection({
+      sref: item.sref,
+      glQuote: item.gl_quote,
+      ultVerse: item.ult_verse,
+    });
 
     item.clean_explanation = directives.clean_explanation;
     item.must_include = directives.must_include;
     item.template_locked = templateSelection.template_locked;
+    item.chosen_template_id = templateSelection.selected_template_id || '';
+    item.chosen_template_has_at_slot = !!templateSelection.selected_template_has_at_slot;
     item.template_type = normalizeWhitespace(templateSelection.selected_template?.type || '') || 'generic';
     item.template_text = stripAlternateTranslation(templateSelection.selected_template?.template || '');
     item.candidate_templates = templateSelection.candidate_templates;
     item.at_policy = styleProfile.at_policy;
+    item.at_required = !!styleProfile.at_required;
+    item.at_decision_reason = styleProfile.at_decision_reason || '';
     item.style_rules = styleProfile.style_rules;
     item.rule_overrides = styleProfile.rule_overrides;
+    item.template_selector_status = templateSelection.selector_status || 'fallback_deterministic';
+    item.template_selector_fallback_reason = templateSelection.selector_fallback_reason || '';
+    item.scope_mode = quoteScopeSelection.scope_mode || 'focused_span';
+    item.issue_span_gl_quote = quoteScopeSelection.selected_span || normalizeWhitespace(item.gl_quote);
+    item.gl_quote = item.issue_span_gl_quote;
+    item.quote_scope_selector_status = quoteScopeSelection.selector_status || 'fallback_deterministic';
+    item.quote_scope_selector_fallback_reason = quoteScopeSelection.selector_fallback_reason || '';
+    item.selector_status = item.template_selector_status === 'selected' && item.quote_scope_selector_status === 'selected'
+      ? 'selected'
+      : 'fallback_deterministic';
+    item.selector_fallback_reason = [
+      item.template_selector_status !== 'selected' ? `template:${item.template_selector_fallback_reason}` : '',
+      item.quote_scope_selector_status !== 'selected' ? `quote_scope:${item.quote_scope_selector_fallback_reason}` : '',
+    ].filter(Boolean).join(';');
 
     const explanation = normalizeWhitespace(item.explanation);
     if (/^see how\b/i.test(explanation)) {
       item.note_type = item.at_provided ? 'see_how' : 'see_how_at';
     } else {
-      item.note_type = item.at_policy === 'required' ? 'writes_at' : 'given_at';
+      item.note_type = item.at_required ? 'writes_at' : 'given_at';
     }
-    item.system_prompt_key = item.at_policy === 'required' ? 'ai_writes_at_agent' : 'given_at_agent';
+    item.system_prompt_key = item.at_required ? 'ai_writes_at_agent' : 'given_at_agent';
     item.programmatic_note = maybeBuildProgrammaticNote(item);
     item.writer_packet = buildWriterPacket(item);
     item.prompt = buildWriterPrompt(item);
@@ -1323,7 +1527,8 @@ function fillOrigQuotes({ preparedJson, alignmentJson, hebrewUsfm, masterUltUsfm
 
   for (const item of (data.items || [])) {
     if (item.orig_quote) continue;
-    if (!item.gl_quote) continue;
+    const scopedGlQuote = item.issue_span_gl_quote || item.gl_quote || '';
+    if (!scopedGlQuote) continue;
     if (item.reference && item.reference.endsWith(':front')) continue;
 
     // Strip any non-verse suffix from reference (e.g., "36:1:writing-oracleformula" → "36:1")
@@ -1345,7 +1550,7 @@ function fillOrigQuotes({ preparedJson, alignmentJson, hebrewUsfm, masterUltUsfm
     const entries = alignData[alignRef] || alignData[item.reference] || [];
 
     // Step 2: AI alignment + &-split + content-word fallback
-    let hebWords = entries.length ? resolveWithAlignment(item.gl_quote, entries) : null;
+    let hebWords = entries.length ? resolveWithAlignment(scopedGlQuote, entries) : null;
     let span = hebWords ? extractHebrewSpan(alignRef, hebWords) : null;
 
     if (span) {
@@ -1361,7 +1566,7 @@ function fillOrigQuotes({ preparedJson, alignmentJson, hebrewUsfm, masterUltUsfm
     if (masterAlignData) {
       const masterEntries = masterAlignData[alignRef] || [];
       if (masterEntries.length) {
-        hebWords = resolveWithAlignment(item.gl_quote, masterEntries);
+        hebWords = resolveWithAlignment(scopedGlQuote, masterEntries);
         span = hebWords ? extractHebrewSpan(alignRef, hebWords) : null;
         if (span) {
           item.orig_quote = span;
@@ -1373,7 +1578,7 @@ function fillOrigQuotes({ preparedJson, alignmentJson, hebrewUsfm, masterUltUsfm
     }
 
     // Step 4: Unresolved
-    const cleanGlq = item.gl_quote.replace(/\{[^}]*\}/g, '').trim();
+    const cleanGlq = scopedGlQuote.replace(/\{[^}]*\}/g, '').trim();
     unresolved.push(`${item.id} ${alignRef}: "${cleanGlq.slice(0, 40)}" — no alignment match`);
   }
 
@@ -1561,17 +1766,19 @@ function prepareATContext({ preparedJson, generatedJson, output }) {
 
   const packets = [];
   for (const item of (prepared.items || [])) {
-    if (item.at_policy !== 'required') continue;
+    if (!resolveAtRequirement(item).at_required) continue;
     if (item.programmatic_note) continue; // "see how" notes already have ATs
 
     const noteText = generatedNotes[item.id] || '';
     const verseCtx = getVerseContext(item.reference);
+    const scopedQuote = item.issue_span_gl_quote || item.gl_quote || '';
 
     packets.push({
       id: item.id,
       reference: item.reference,
       issue_type: item.sref,
-      exact_ult_span: item.gl_quote || '',
+      quote_scope_mode: item.scope_mode || 'focused_span',
+      exact_ult_span: scopedQuote,
       full_verse: verseCtx.current,
       verse_context: {
         prev: verseCtx.prev,
@@ -1580,7 +1787,7 @@ function prepareATContext({ preparedJson, generatedJson, output }) {
       },
       note_text: noteText,
       ust_verse: item.ust_verse || '',
-      is_discontinuous: (item.gl_quote || '').includes('\u2026') || (item.gl_quote || '').includes('...'),
+      is_discontinuous: scopedQuote.includes('\u2026') || scopedQuote.includes('...') || scopedQuote.includes(' & '),
       template_type: item.template_type || '',
     });
   }
@@ -1644,9 +1851,13 @@ module.exports = {
   prepareATContext,
   readPreparedNotes,
   substituteAT,
+  resolveAtRequirement,
   _parseExplanationDirectives: parseExplanationDirectives,
   _resolveTemplateSelection: resolveTemplateSelection,
   _deriveStyleProfile: deriveStyleProfile,
+  _deriveAtRequirement: deriveAtRequirement,
+  _resolveQuoteScopeSelection: resolveQuoteScopeSelection,
+  _detectIssueScopeMode: detectIssueScopeMode,
   _buildWriterPacket: buildWriterPacket,
   _buildWriterPrompt: buildWriterPrompt,
   _maybeBuildProgrammaticNote: maybeBuildProgrammaticNote,
