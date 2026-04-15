@@ -61,12 +61,12 @@ const DEFAULT_PROVIDER_CONFIGS = {
     },
   },
   xai: {
-    defaultModel: 'grok-4-0709',
+    defaultModel: 'grok-4-1-fast-reasoning',
     secretName: 'xai_api_key',
     envName: 'XAI_API_KEY',
     baseUrl: 'https://api.x.ai/v1',
     modelAliases: {
-      opus: 'grok-4-0709',
+      opus: 'grok-4-1-fast-reasoning',
       sonnet: 'grok-4-1-fast-reasoning',
       haiku: 'grok-4-1-fast-non-reasoning',
     },
@@ -86,8 +86,8 @@ const DEFAULT_PROVIDER_CONFIGS = {
     },
     reasoningEffortModels: ['grok-3-mini'],
     fallbackModels: {
-      'grok-4-0709': ['grok-4-1-fast-reasoning'],
-      'grok-4-1-fast-reasoning': ['grok-4-1-fast-non-reasoning', 'grok-3-mini'],
+      'grok-4-1-fast-reasoning': ['grok-4-0709', 'grok-4-1-fast-non-reasoning', 'grok-3-mini'],
+      'grok-4-0709': ['grok-4-1-fast-non-reasoning', 'grok-3-mini'],
     },
   },
   groq: {

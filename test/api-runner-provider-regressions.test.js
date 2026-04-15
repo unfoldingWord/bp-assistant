@@ -10,12 +10,14 @@ const {
 } = require('../src/api-runner/provider-config');
 const geminiProvider = require('../src/api-runner/providers/gemini');
 const { resolveAgentProvider } = require('../src/api-runner/team-manager');
+const { getProviderSystemAppend } = require('../src/api-runner/provider-nudges');
 const { readPreparedNotes } = require('../src/workspace-tools/tn-tools');
 
 test('openai aliases resolve to current runner defaults', () => {
   assert.equal(resolveProviderModel('openai', 'opus'), 'gpt-5.4');
   assert.equal(resolveProviderModel('openai', 'sonnet'), 'gpt-5.4-mini');
   assert.equal(resolveProviderModel('openai', 'haiku'), 'gpt-5.4-nano');
+  assert.equal(resolveProviderModel('xai', 'opus'), 'grok-4-1-fast-reasoning');
 });
 
 test('gemini provider config exposes fallback models for transient overloads', () => {
@@ -77,6 +79,21 @@ test('locked provider runs keep sub-agents on the parent provider', () => {
     resolveAgentProvider({}, { provider: 'gemini', lockProvider: true }),
     'gemini'
   );
+});
+
+test('provider-specific initial-pipeline nudges stay attached to openai and xai', () => {
+  const openaiNudge = getProviderSystemAppend('openai', 'initial-pipeline', { book: 'ZEC', chapter: 3 });
+  assert.match(openaiNudge, /output\/AI-ULT\/ZEC\/ZEC-03\.usfm/);
+  assert.match(openaiNudge, /Verify they exist with a Glob or Read/);
+  assert.match(openaiNudge, /zero-padded chapter tag "ZEC-03"/);
+
+  const xaiNudge = getProviderSystemAppend('xai', 'initial-pipeline', { book: 'ZEC', chapter: 3 });
+  assert.match(xaiNudge, /header-only file/);
+  assert.match(xaiNudge, /at least one data row/);
+  assert.match(xaiNudge, /Do NOT invent unpadded variants such as "ZEC-3\.usfm"/);
+
+  assert.equal(getProviderSystemAppend('gemini', 'initial-pipeline'), '');
+  assert.equal(getProviderSystemAppend('xai', 'tn-writer'), '');
 });
 
 test('readPreparedNotes accepts object-backed prepared_notes packets', () => {

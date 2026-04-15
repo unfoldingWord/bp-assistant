@@ -7,6 +7,7 @@ const { getDoor43Username, normalizeBookName, buildBranchName, discoverFreshOutp
 const { buildNotesContext, readContext, writeContext } = require('../pipeline-context');
 const { extractAlignmentData, prepareNotes, fillOrigQuotes, resolveGlQuotes, flagNarrowQuotes, generateIds } = require('../workspace-tools/tn-tools');
 const { checkUltEdits } = require('../check-ult-edits');
+const { getProviderSystemAppend } = require('./provider-nudges');
 
 function parseRegexLiteral(literal) {
   if (typeof literal !== 'string') return null;
@@ -252,6 +253,7 @@ async function apiPipeline(route, message) {
     await reply(`Running **${skillName}** via **${provider}** for \`${prompt}\`...`);
 
     const startTime = Date.now();
+    const skillContext = parseBookChapterUser(prompt, message.sender_email);
     const result = await runSkill(skillName, prompt, {
       provider,
       model,
@@ -262,6 +264,7 @@ async function apiPipeline(route, message) {
       verbose: !!route.verbose,
       dryRun: isDryRun,
       toolChoice: route.toolChoice,
+      systemAppend: getProviderSystemAppend(provider, skillName, skillContext),
     });
 
     await removeReaction(msgId, 'working_on_it');

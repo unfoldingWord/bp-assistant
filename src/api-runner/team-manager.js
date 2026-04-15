@@ -124,6 +124,7 @@ async function spawnAgent(opts, parentOpts, runAgentLoopFn) {
       thinking,
       apiKey,
       depth: depth + 1,
+      lockProvider: !!parentOpts.lockProvider,
     });
 
     const finalText = result.finalText || '(no output)';
@@ -191,6 +192,7 @@ async function sendMessageToAgent(opts, parentOpts, runAgentLoopFn) {
       thinking: agent.thinking,
       apiKey,
       depth: (parentOpts.depth || 0) + 1,
+      lockProvider: !!parentOpts.lockProvider,
     });
 
     agent.status = 'completed';
