@@ -17,7 +17,8 @@ test('openai aliases resolve to current runner defaults', () => {
   assert.equal(resolveProviderModel('openai', 'opus'), 'gpt-5.4');
   assert.equal(resolveProviderModel('openai', 'sonnet'), 'gpt-5.4-mini');
   assert.equal(resolveProviderModel('openai', 'haiku'), 'gpt-5.4-nano');
-  assert.equal(resolveProviderModel('xai', 'opus'), 'grok-4-1-fast-reasoning');
+  assert.equal(resolveProviderModel('xai', 'opus'), 'grok-4.20-reasoning');
+  assert.equal(resolveProviderModel('xai', 'sonnet'), 'grok-4.20-reasoning');
 });
 
 test('gemini provider config exposes fallback models for transient overloads', () => {
@@ -81,7 +82,7 @@ test('locked provider runs keep sub-agents on the parent provider', () => {
   );
 });
 
-test('provider-specific initial-pipeline nudges stay attached to openai and xai', () => {
+test('provider-specific runner nudges stay attached to openai and xai', () => {
   const openaiNudge = getProviderSystemAppend('openai', 'initial-pipeline', { book: 'ZEC', chapter: 3 });
   assert.match(openaiNudge, /output\/AI-ULT\/ZEC\/ZEC-03\.usfm/);
   assert.match(openaiNudge, /Verify they exist with a Glob or Read/);
@@ -92,7 +93,13 @@ test('provider-specific initial-pipeline nudges stay attached to openai and xai'
   assert.match(xaiNudge, /at least one data row/);
   assert.match(xaiNudge, /Do NOT invent unpadded variants such as "ZEC-3\.usfm"/);
 
+  const xaiAlignNudge = getProviderSystemAppend('xai', 'align-all-parallel', { book: 'ZEC', chapter: 3 });
+  assert.match(xaiAlignNudge, /output\/AI-ULT\/ZEC\/ZEC-03-aligned\.usfm/);
+  assert.match(xaiAlignNudge, /create_aligned_usfm/);
+  assert.match(xaiAlignNudge, /Do not accept a representative sample/);
+
   assert.equal(getProviderSystemAppend('gemini', 'initial-pipeline'), '');
+  assert.equal(getProviderSystemAppend('openai', 'align-all-parallel', { book: 'ZEC', chapter: 3 }), '');
   assert.equal(getProviderSystemAppend('xai', 'tn-writer'), '');
 });
 

@@ -61,16 +61,17 @@ const DEFAULT_PROVIDER_CONFIGS = {
     },
   },
   xai: {
-    defaultModel: 'grok-4-1-fast-reasoning',
+    defaultModel: 'grok-4.20-reasoning',
     secretName: 'xai_api_key',
     envName: 'XAI_API_KEY',
     baseUrl: 'https://api.x.ai/v1',
     modelAliases: {
-      opus: 'grok-4-1-fast-reasoning',
-      sonnet: 'grok-4-1-fast-reasoning',
+      opus: 'grok-4.20-reasoning',
+      sonnet: 'grok-4.20-reasoning',
       haiku: 'grok-4-1-fast-non-reasoning',
     },
     models: {
+      'grok-4.20-reasoning': { label: 'Grok 4.20 (reasoning)', inputPer1M: 3.0, outputPer1M: 15.0 },
       'grok-4-0709': { label: 'Grok 4', inputPer1M: 3.0, outputPer1M: 9.0 },
       'grok-4-1-fast-reasoning': { label: 'Grok 4.1 Fast (reasoning)', inputPer1M: 3.0, outputPer1M: 9.0 },
       'grok-4-1-fast-non-reasoning': { label: 'Grok 4.1 Fast (no CoT)', inputPer1M: 3.0, outputPer1M: 9.0 },
@@ -79,13 +80,14 @@ const DEFAULT_PROVIDER_CONFIGS = {
     },
     autoModelByThinking: {
       low: 'grok-4-1-fast-non-reasoning',
-      medium: 'grok-4-1-fast-reasoning',
-      high: 'grok-4-1-fast-reasoning',
-      max: 'grok-4-1-fast-reasoning',
+      medium: 'grok-4.20-reasoning',
+      high: 'grok-4.20-reasoning',
+      max: 'grok-4.20-reasoning',
       none: 'grok-4-1-fast-non-reasoning',
     },
     reasoningEffortModels: ['grok-3-mini'],
     fallbackModels: {
+      'grok-4.20-reasoning': ['grok-4-1-fast-reasoning', 'grok-4-0709', 'grok-4-1-fast-non-reasoning', 'grok-3-mini'],
       'grok-4-1-fast-reasoning': ['grok-4-0709', 'grok-4-1-fast-non-reasoning', 'grok-3-mini'],
       'grok-4-0709': ['grok-4-1-fast-non-reasoning', 'grok-3-mini'],
     },

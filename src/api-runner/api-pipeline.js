@@ -288,11 +288,13 @@ async function apiPipeline(route, message) {
           thinking: 'medium',
           maxTurns: 50,
           cwd: selectedCwd,
+          systemAppend: getProviderSystemAppend(provider, 'align-all-parallel', { book, chapter }),
         });
 
         const tag = `${book}-${String(chapter).padStart(book === 'PSA' ? 3 : 2, '0')}`;
-        const ultAligned = discoverFreshOutput('output/AI-ULT', book, new RegExp(`^${tag}-.*-aligned\\.usfm$`), startTime);
-        const ustAligned = discoverFreshOutput('output/AI-UST', book, new RegExp(`^${tag}-.*-aligned\\.usfm$`), startTime);
+        const alignedPattern = new RegExp(`^${tag}(?:-.*)?-aligned\\.usfm$`);
+        const ultAligned = discoverFreshOutput('output/AI-ULT', book, alignedPattern, startTime);
+        const ustAligned = discoverFreshOutput('output/AI-UST', book, alignedPattern, startTime);
 
         if (!ultAligned && !ustAligned) {
           throw new Error('Alignment phase failed: no aligned USFM files were produced.');
