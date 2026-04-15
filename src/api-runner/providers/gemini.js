@@ -1,7 +1,7 @@
 // providers/gemini.js — Google Gemini SDK provider
 
 const { GoogleGenAI } = require('@google/genai');
-const { getProviderConfig, resolveProviderModel } = require('../provider-config');
+const { assertProviderModel, getProviderConfig, resolveProviderModel } = require('../provider-config');
 
 const DEFAULT_MODEL = getProviderConfig('gemini').defaultModel;
 const MODELS = getProviderConfig('gemini').models;
@@ -57,6 +57,7 @@ function toGeminiContents(messages) {
         role: 'user',
         parts: msg.results.map(r => ({
           functionResponse: {
+            ...(r.toolCallId ? { id: r.toolCallId } : {}),
             name: r.name,
             response: { content: r.content },
           },
@@ -73,7 +74,7 @@ function toGeminiContents(messages) {
 async function sendRequest({ model, system, messages, tools, thinking, apiKey, providerName = 'gemini', toolChoice }) {
   const ai = new GoogleGenAI({ apiKey });
   const providerCfg = getProviderConfig(providerName);
-  const modelId = resolveProviderModel(providerName, model || providerCfg.defaultModel);
+  const modelId = assertProviderModel(providerName, model || providerCfg.defaultModel);
 
   const config = { maxOutputTokens: 65536 };
   const thinkingCfg = getThinkingConfig(modelId, thinking);
@@ -105,7 +106,7 @@ async function sendRequest({ model, system, messages, tools, thinking, apiKey, p
     });
   } catch (error) {
     const status = error?.status || error?.response?.status;
-    const message = error?.message || 'Unknown Gemini SDK error';
+    const message = extractGeminiErrorMessage(error);
     throw new Error(`Gemini API error${status ? ` ${status}` : ''}: ${message}`);
   }
 
@@ -127,7 +128,7 @@ function parseResponse(data) {
       content += part.text;
     } else if (part.functionCall) {
       toolCalls.push({
-        id: `gemini-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+        id: part.functionCall.id || `gemini-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
         name: part.functionCall.name,
         arguments: part.functionCall.args || {},
       });
@@ -149,7 +150,12 @@ function parseResponse(data) {
 function formatToolResult(toolCallId, name, result, isError) {
   return {
     role: 'tool',
-    results: [{ name, content: typeof result === 'string' ? result : JSON.stringify(result) }],
+    results: [{
+      toolCallId,
+      name,
+      content: typeof result === 'string' ? result : JSON.stringify(result),
+      isError: !!isError,
+    }],
   };
 }
 
@@ -166,11 +172,23 @@ function estimateCost(model, usage, providerName = 'gemini') {
   return inputCost + outputCost;
 }
 
+function extractGeminiErrorMessage(error) {
+  if (!error) return 'Unknown Gemini SDK error';
+  const raw = error?.message || 'Unknown Gemini SDK error';
+  try {
+    const parsed = JSON.parse(raw);
+    return parsed?.error?.message || raw;
+  } catch {
+    return raw;
+  }
+}
+
 module.exports = {
   sendRequest,
   formatToolResult,
   formatAssistantMessage,
   estimateCost,
+  toGeminiContents,
   DEFAULT_MODEL,
   MODELS,
 };

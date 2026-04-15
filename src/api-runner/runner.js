@@ -47,6 +47,7 @@ async function runSkill(name, prompt, opts = {}) {
     apiKey: resolveApiKey(provider, opts.apiKeys || {}),
     toolChoice: opts.toolChoice,
     apiKeyResolver: (p) => resolveApiKey(p, opts.apiKeys || {}),
+    lockProvider: !!opts.lockProvider,
   });
 }
 
@@ -80,6 +81,7 @@ async function runCustom(systemText, prompt, opts = {}) {
     apiKey: resolveApiKey(provider, opts.apiKeys || {}),
     toolChoice: opts.toolChoice,
     apiKeyResolver: (p) => resolveApiKey(p, opts.apiKeys || {}),
+    lockProvider: !!opts.lockProvider,
   });
 }
 

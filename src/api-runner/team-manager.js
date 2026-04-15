@@ -2,6 +2,7 @@
 // Manages named teams of agents, each with their own provider/model/conversation state.
 
 const MAX_DEPTH = 3;
+const { isConfiguredModel, resolveProviderModel } = require('./provider-config');
 
 // Global state
 const teams = new Map();   // teamName → Team
@@ -76,8 +77,9 @@ async function spawnAgent(opts, parentOpts, runAgentLoopFn) {
     return `Error: Maximum agent nesting depth (${MAX_DEPTH}) reached. Cannot spawn "${opts.name}".`;
   }
 
-  const provider = opts.provider || parentOpts.provider || 'gemini';
-  const model = opts.model || (provider === parentOpts.provider ? parentOpts.model : undefined);
+  const provider = resolveAgentProvider(opts, parentOpts);
+  const requestedModel = opts.model || (provider === parentOpts.provider ? parentOpts.model : undefined);
+  const model = normalizeAgentModel(provider, requestedModel);
   const thinking = opts.thinking || parentOpts.thinking || 'medium';
   const cwd = parentOpts.cwd || '/srv/bot/workspace';
   const apiKey = parentOpts.apiKeyResolver ? parentOpts.apiKeyResolver(provider) : parentOpts.apiKey;
@@ -178,7 +180,7 @@ async function sendMessageToAgent(opts, parentOpts, runAgentLoopFn) {
   try {
     const result = await runAgentLoopFn({
       provider: agent.provider,
-      model: agent.model,
+      model: normalizeAgentModel(agent.provider, agent.model),
       system: agent.systemPrompt,
       userMessage: opts.message,
       existingMessages: agent.messages,
@@ -244,6 +246,22 @@ function getTask(id) {
   return { id, status: entry.status, result: entry.result };
 }
 
+function normalizeAgentModel(provider, requestedModel) {
+  if (!requestedModel) return undefined;
+  const resolved = resolveProviderModel(provider, requestedModel);
+  if (isConfiguredModel(provider, resolved)) {
+    return resolved;
+  }
+  return undefined;
+}
+
+function resolveAgentProvider(opts, parentOpts) {
+  if (parentOpts?.lockProvider && parentOpts?.provider) {
+    return parentOpts.provider;
+  }
+  return opts.provider || parentOpts.provider || 'gemini';
+}
+
 module.exports = {
   createTeam,
   deleteTeam,
@@ -253,4 +271,6 @@ module.exports = {
   createTask,
   getTask,
   MAX_DEPTH,
+  normalizeAgentModel,
+  resolveAgentProvider,
 };

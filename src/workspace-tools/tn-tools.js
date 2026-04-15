@@ -1827,7 +1827,8 @@ function prepareATContext({ preparedJson, generatedJson, output }) {
  */
 function readPreparedNotes({ preparedJson, start = 0, end, summaryOnly = false }) {
   const fullPath = path.resolve(CSKILLBP_DIR, preparedJson);
-  const items = JSON.parse(fs.readFileSync(fullPath, 'utf8'));
+  const parsed = JSON.parse(fs.readFileSync(fullPath, 'utf8'));
+  const items = Array.isArray(parsed) ? parsed : (Array.isArray(parsed?.items) ? parsed.items : []);
   const total = items.length;
 
   if (summaryOnly) {

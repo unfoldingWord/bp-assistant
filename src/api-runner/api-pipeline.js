@@ -5,7 +5,7 @@ const path = require('path');
 const { door43Push } = require('../door43-push');
 const { getDoor43Username, normalizeBookName, buildBranchName, discoverFreshOutput, checkPrerequisites, CSKILLBP_DIR } = require('../pipeline-utils');
 const { buildNotesContext, readContext, writeContext } = require('../pipeline-context');
-const { extractAlignmentData, prepareNotes, fillOrigQuotes, resolveGlQuotes, flagNarrowQuotes } = require('../workspace-tools/tn-tools');
+const { extractAlignmentData, prepareNotes, fillOrigQuotes, resolveGlQuotes, flagNarrowQuotes, generateIds } = require('../workspace-tools/tn-tools');
 const { checkUltEdits } = require('../check-ult-edits');
 
 function parseRegexLiteral(literal) {
@@ -199,6 +199,19 @@ async function apiPipeline(route, message) {
       }
 
       flagNarrowQuotes({ preparedJson: ctx.runtime.preparedNotes });
+
+      const prepPath = path.resolve(CSKILLBP_DIR, ctx.runtime.preparedNotes);
+      const prepData = JSON.parse(fs.readFileSync(prepPath, 'utf8'));
+      const needsId = (prepData.items || []).filter((item) => !item.id);
+      if (needsId.length > 0) {
+        const idStr = await generateIds({ book: prepData.book || book, count: needsId.length });
+        const newIds = idStr.split('\n').filter(Boolean);
+        let idx = 0;
+        for (const item of prepData.items || []) {
+          if (!item.id) item.id = newIds[idx++] || '';
+        }
+        fs.writeFileSync(prepPath, JSON.stringify(prepData, null, 2));
+      }
 
       // 5. tn-writer (Opus by default)
       await reply(`Preprocessing done (${prepCount} items). Running tn-writer...`);

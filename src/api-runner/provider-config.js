@@ -19,18 +19,21 @@ const DEFAULT_PROVIDER_CONFIGS = {
     },
   },
   openai: {
-    defaultModel: 'gpt-4.1',
+    defaultModel: 'gpt-5.4',
     secretName: 'openai_api_key',
     envName: 'OPENAI_API_KEY',
     modelAliases: {
       opus: 'gpt-5.4',
-      sonnet: 'gpt-5.3',
-      haiku: 'o4-mini',
+      sonnet: 'gpt-5.4-mini',
+      haiku: 'gpt-5.4-nano',
+      'gpt-5.1-mini': 'gpt-5.4-mini',
     },
     models: {
       'gpt-4.1': { label: 'GPT 4.1', inputPer1M: 2.0, outputPer1M: 8.0 },
       'gpt-5.3': { label: 'GPT 5.3', inputPer1M: 4.0, outputPer1M: 16.0 },
       'gpt-5.4': { label: 'GPT 5.4', inputPer1M: 5.0, outputPer1M: 20.0 },
+      'gpt-5.4-mini': { label: 'GPT 5.4 mini', inputPer1M: 0.8, outputPer1M: 3.2 },
+      'gpt-5.4-nano': { label: 'GPT 5.4 nano', inputPer1M: 0.2, outputPer1M: 0.8 },
       'o3': { label: 'o3', inputPer1M: 2.5, outputPer1M: 10.0 },
       'o4-mini': { label: 'o4 mini', inputPer1M: 0.5, outputPer1M: 2.0 },
     },
@@ -51,12 +54,17 @@ const DEFAULT_PROVIDER_CONFIGS = {
       'gemini-2.5-pro': { label: 'Gemini 2.5 Pro', inputPer1M: 1.25, outputPer1M: 10.0 },
       'gemini-2.5-flash': { label: 'Gemini 2.5 Flash', inputPer1M: 0.15, outputPer1M: 0.6 },
     },
+    fallbackModels: {
+      'gemini-3.1-pro-preview': ['gemini-3-pro-preview', 'gemini-2.5-pro'],
+      'gemini-3-pro-preview': ['gemini-2.5-pro'],
+      'gemini-3-flash-preview': ['gemini-2.5-flash'],
+    },
   },
   xai: {
     defaultModel: 'grok-4-0709',
     secretName: 'xai_api_key',
     envName: 'XAI_API_KEY',
-    baseUrl: 'https://api.x.ai',
+    baseUrl: 'https://api.x.ai/v1',
     modelAliases: {
       opus: 'grok-4-0709',
       sonnet: 'grok-4-1-fast-reasoning',
@@ -77,6 +85,10 @@ const DEFAULT_PROVIDER_CONFIGS = {
       none: 'grok-4-1-fast-non-reasoning',
     },
     reasoningEffortModels: ['grok-3-mini'],
+    fallbackModels: {
+      'grok-4-0709': ['grok-4-1-fast-reasoning'],
+      'grok-4-1-fast-reasoning': ['grok-4-1-fast-non-reasoning', 'grok-3-mini'],
+    },
   },
   groq: {
     defaultModel: 'meta-llama/llama-4-scout-17b-16e-instruct',
@@ -177,6 +189,12 @@ function mergeProvider(baseCfg, overrideCfg) {
       ...(overrideCfg?.modelAliases || {}),
     };
   }
+  if (baseCfg?.fallbackModels || overrideCfg?.fallbackModels) {
+    merged.fallbackModels = {
+      ...(baseCfg?.fallbackModels || {}),
+      ...(overrideCfg?.fallbackModels || {}),
+    };
+  }
   if (Array.isArray(overrideCfg?.reasoningEffortModels)) {
     merged.reasoningEffortModels = [...overrideCfg.reasoningEffortModels];
   } else if (Array.isArray(baseCfg?.reasoningEffortModels)) {
@@ -245,6 +263,39 @@ function resolveProviderModel(provider, model) {
   return cfg.modelAliases?.[candidate] || candidate;
 }
 
+function isConfiguredModel(provider, model) {
+  if (!model || typeof model !== 'string') return false;
+  const cfg = getProviderConfig(provider);
+  return !!cfg.models?.[model];
+}
+
+function assertProviderModel(provider, model) {
+  const cfg = getProviderConfig(provider);
+  const resolved = resolveProviderModel(provider, model);
+  if (typeof resolved !== 'string' || isConfiguredModel(provider, resolved)) {
+    return resolved;
+  }
+
+  const validAliases = Object.keys(cfg.modelAliases || {});
+  const validModels = Object.keys(cfg.models || {});
+  throw new Error(
+    `Unknown ${provider} model "${model}". Valid aliases: ${validAliases.join(', ') || '(none)'}; valid models: ${validModels.join(', ')}`
+  );
+}
+
+function getFallbackModel(provider, currentModel, attemptedModels = new Set()) {
+  const cfg = getProviderConfig(provider);
+  const resolvedCurrent = resolveProviderModel(provider, currentModel || cfg.defaultModel);
+  const candidates = cfg.fallbackModels?.[resolvedCurrent] || [];
+  for (const candidate of candidates) {
+    const resolved = resolveProviderModel(provider, candidate);
+    if (!attemptedModels.has(resolved) && isConfiguredModel(provider, resolved)) {
+      return resolved;
+    }
+  }
+  return null;
+}
+
 module.exports = {
   DEFAULT_PROVIDER_CONFIGS,
   getResolvedProviderConfigs,
@@ -252,4 +303,7 @@ module.exports = {
   getProviderNames,
   resolveProviderModel,
   resolveXaiModel,
+  isConfiguredModel,
+  assertProviderModel,
+  getFallbackModel,
 };

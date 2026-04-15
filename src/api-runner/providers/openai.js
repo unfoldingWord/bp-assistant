@@ -1,7 +1,7 @@
 // providers/openai.js — OpenAI SDK provider
 
 const OpenAI = require('openai');
-const { getProviderConfig, resolveProviderModel } = require('../provider-config');
+const { assertProviderModel, getProviderConfig, resolveProviderModel } = require('../provider-config');
 
 const DEFAULT_MODEL = getProviderConfig('openai').defaultModel;
 const MODELS = getProviderConfig('openai').models;
@@ -57,7 +57,7 @@ function toOpenAIMessages(system, messages) {
 async function sendRequest({ model, system, messages, tools, thinking, apiKey, baseUrl, providerName = 'openai', toolChoice }) {
   const client = new OpenAI({ apiKey, baseURL: baseUrl });
   const providerCfg = getProviderConfig(providerName);
-  const modelId = resolveProviderModel(providerName, model || providerCfg.defaultModel);
+  const modelId = assertProviderModel(providerName, model || providerCfg.defaultModel);
 
   const body = {
     model: modelId,
@@ -84,7 +84,7 @@ async function sendRequest({ model, system, messages, tools, thinking, apiKey, b
     data = await client.chat.completions.create(body);
   } catch (error) {
     const status = error?.status || error?.response?.status;
-    const message = error?.message || 'Unknown OpenAI SDK error';
+    const message = normalizeOpenAiErrorMessage(error);
     throw new Error(`OpenAI API error${status ? ` ${status}` : ''}: ${message}`);
   }
   return parseResponse(data);
@@ -144,6 +144,12 @@ function estimateCost(model, usage, providerName = 'openai') {
   const inputCost = (usage.inputTokens / 1_000_000) * m.inputPer1M;
   const outputCost = (usage.outputTokens / 1_000_000) * m.outputPer1M;
   return inputCost + outputCost;
+}
+
+function normalizeOpenAiErrorMessage(error) {
+  const raw = error?.message || 'Unknown OpenAI SDK error';
+  const providerMessage = error?.error?.message || error?.response?.data?.error?.message;
+  return providerMessage || raw;
 }
 
 module.exports = {
