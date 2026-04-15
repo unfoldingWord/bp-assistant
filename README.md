@@ -132,6 +132,13 @@ The `notes-pipeline.js` module runs a skill chain per chapter:
 6. `tn-quality-check` (semantic review + one fix pass)
 7. Door43 push + verify
 
+#### Notes pipeline contract updates
+
+- Preparation now emits canonical metadata for each issue: `chosen_template_id`, `at_required`, `scope_mode`, and `issue_span_gl_quote`. These fields drive the downstream writer/AT calls instead of raw TSV hints.
+- Template candidates are filtered deterministically, and AI selectors (template choice + quote scope) return the winning template ID plus rationale so Claude never re-scans for templates.
+- Alternate translations are generated only when `at_required` is true (derived from the chosen template slot and explicit overrides) so quality checks and AT packets share the same enforcement contract.
+- Quote scope policy is enforced in code using the new `scope_mode`; the `tn-writer` and AT prompts now include the scoped English span plus scope mode context that maps back to Hebrew via `issue_span_gl_quote`.
+
 ### `editor-note`
 Appends an observation to `data/editor-notes/BOOK.md`. Simple file-append operation via `note-pipeline.js`.
 
