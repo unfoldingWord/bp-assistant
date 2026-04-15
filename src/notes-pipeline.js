@@ -1625,7 +1625,7 @@ async function notesPipeline(route, message) {
       expectedOutput: `output/quality/${book}/${qualityTag}-quality.md`,
       appendSystemPrompt: TN_QUALITY_CHECK_HINT,
       mcpTools: 'quality',
-      maxTurns: 30,
+      maxTurns: 100,
       ops: 1,
       model: 'sonnet',
     });
