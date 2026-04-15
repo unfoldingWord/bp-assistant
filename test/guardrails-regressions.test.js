@@ -23,14 +23,14 @@ test('adaptive guardrails use warm-up default when no history exists', () => {
 });
 
 test('tn-writer guardrails are clamped to bounded execution limits', () => {
-  // With mechanical prep moved to Node.js, tn-writer limits are higher (150 turns, 400 tool calls)
+  // Guardrail clamp is config-driven (config.json notesGuardrails.* currently 400/400).
   const bounded = _applySkillSpecificGuardrails('tn-writer', {
     maxTurns: 200,
     maxToolCalls: 500,
     tokenBudget: null,
   });
 
-  assert.equal(bounded.maxTurns, 150);
+  assert.equal(bounded.maxTurns, 200);
   assert.equal(bounded.maxToolCalls, 400);
   assert.equal(bounded.tokenBudget, null);
 });
