@@ -3,7 +3,7 @@ const { sendMessage, sendDM, addReaction, removeReaction } = require('../zulip-c
 const fs = require('fs');
 const path = require('path');
 const { door43Push } = require('../door43-push');
-const { getDoor43Username, normalizeBookName, buildBranchName, discoverFreshOutput, checkPrerequisites, CSKILLBP_DIR } = require('../pipeline-utils');
+const { getDoor43Username, normalizeBookName, buildBranchName, discoverFreshOutput, checkPrerequisites, resolveOutputFile, CSKILLBP_DIR } = require('../pipeline-utils');
 const { buildNotesContext, readContext, writeContext } = require('../pipeline-context');
 const { extractAlignmentData, prepareNotes, fillOrigQuotes, resolveGlQuotes, flagNarrowQuotes, generateIds } = require('../workspace-tools/tn-tools');
 const { checkUltEdits } = require('../check-ult-edits');
@@ -237,10 +237,12 @@ async function apiPipeline(route, message) {
       if (username) {
         await reply(`Pushing TN to Door43 for user **${username}**...`);
         const chPad = String(chapter).padStart(book.toUpperCase() === 'PSA' ? 3 : 2, '0');
+        const sourcePath = resolveOutputFile(`output/notes/${book}/${book}-${chPad}.tsv`, book)
+          || `output/notes/${book}/${book}-${chPad}.tsv`;
         const pushRes = await door43Push({
           type: 'tn', book, chapter, username,
           branch: buildBranchName(book, chapter),
-          source: `output/notes/${book}/${book}-${chPad}.tsv`,
+          source: sourcePath,
         });
         await reply(`door43-push TN: ${pushRes.branchUrl || pushRes.details || (pushRes.success ? 'ok' : 'failed')}`);
       }

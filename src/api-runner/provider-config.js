@@ -4,16 +4,16 @@ const fs = require('fs');
 
 const DEFAULT_PROVIDER_CONFIGS = {
   claude: {
-    defaultModel: 'claude-opus-4-6',
+    defaultModel: 'claude-opus-4-7',
     secretName: 'anthropic_api_key',
     envName: 'ANTHROPIC_API_KEY',
     modelAliases: {
-      opus: 'claude-opus-4-6',
+      opus: 'claude-opus-4-7',
       sonnet: 'claude-sonnet-4-6',
       haiku: 'claude-haiku-4-5-20251001',
     },
     models: {
-      'claude-opus-4-6': { label: 'Claude Opus 4.6', inputPer1M: 15.0, outputPer1M: 75.0 },
+      'claude-opus-4-7': { label: 'Claude Opus 4.7', inputPer1M: 5.0, outputPer1M: 25.0 },
       'claude-sonnet-4-6': { label: 'Claude Sonnet 4.6', inputPer1M: 3.0, outputPer1M: 15.0 },
       'claude-haiku-4-5-20251001': { label: 'Claude Haiku 4.5', inputPer1M: 0.8, outputPer1M: 4.0 },
     },

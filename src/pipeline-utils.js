@@ -11,6 +11,29 @@ const MIN_TIMEOUT_MS = 10 * 60 * 1000;   // 10 min floor
 const MAX_TIMEOUT_MS = 90 * 60 * 1000;   // 90 min cap (post-MCP migration)
 const MS_PER_VERSE_OP = 7 * 60 * 1000;   // 7 min per verse per operation (post-MCP)
 
+function buildOutputSearchDirs(dir, book) {
+  const dirs = [];
+  const seen = new Set();
+
+  const push = (value) => {
+    const normalized = value ? path.posix.normalize(String(value)) : '.';
+    if (seen.has(normalized)) return;
+    seen.add(normalized);
+    dirs.push(normalized);
+  };
+
+  push(dir);
+  if (book) push(path.posix.join(dir, book));
+
+  const lastSegment = path.posix.basename(dir);
+  if (book && lastSegment === book) {
+    const parentDir = path.posix.dirname(dir);
+    push(parentDir === '.' ? '' : parentDir);
+  }
+
+  return dirs;
+}
+
 // --- Resolve door43-users.json path (data dir takes precedence over app dir) ---
 function getDoor43UsersPath() {
   const dataPath = '/app/data/door43-users.json';
@@ -77,23 +100,26 @@ function resolveOutputFile(relPath, book, verseSuffix) {
 
   const parts = relPath.split('/');
   const filename = parts.pop();
+  const searchDirs = buildOutputSearchDirs(parts.join('/'), book);
 
-  // Try with book subdirectory (unpadded)
-  const altPath = [...parts, book, filename].join('/');
-  if (fs.existsSync(path.join(CSKILLBP_DIR, altPath))) return altPath;
+  for (const dir of searchDirs) {
+    const candidate = dir && dir !== '.'
+      ? path.posix.join(dir, filename)
+      : filename;
+    if (fs.existsSync(path.join(CSKILLBP_DIR, candidate))) return candidate;
+  }
 
   // Try zero-padded chapter numbers — 2-digit and 3-digit
   for (const width of [2, 3]) {
     const padded = filename.replace(/-(\d+)([-.])/, (_, n, sep) => `-${n.padStart(width, '0')}${sep}`);
     if (padded === filename) continue;
 
-    // Flat
-    const paddedDirect = [...parts, padded].join('/');
-    if (fs.existsSync(path.join(CSKILLBP_DIR, paddedDirect))) return paddedDirect;
-
-    // Subdirectory
-    const paddedAlt = [...parts, book, padded].join('/');
-    if (fs.existsSync(path.join(CSKILLBP_DIR, paddedAlt))) return paddedAlt;
+    for (const dir of searchDirs) {
+      const paddedCandidate = dir && dir !== '.'
+        ? path.posix.join(dir, padded)
+        : padded;
+      if (fs.existsSync(path.join(CSKILLBP_DIR, paddedCandidate))) return paddedCandidate;
+    }
   }
 
   // Try verse-suffixed variants (e.g. HAB-03.tsv -> HAB-03-v1-2.tsv)
@@ -122,7 +148,7 @@ function resolveOutputFile(relPath, book, verseSuffix) {
     // Match any verse-range suffix (any format: -vv, -v, bare digits after dash)
     suffixFilter = (f) => f.startsWith(base + '-') && f.endsWith(ext) && f !== base + ext;
   }
-  for (const dir of [parts.join('/'), [...parts, book].join('/')]) {
+  for (const dir of searchDirs) {
     const searchDir = path.join(CSKILLBP_DIR, dir);
     if (!fs.existsSync(searchDir)) continue;
     const matches = fs.readdirSync(searchDir)
@@ -149,10 +175,7 @@ function discoverFreshOutput(dir, book, pattern, afterMs) {
   let best = null;
   let bestMtime = 0;
 
-  const searchDirs = [
-    dir,
-    path.join(dir, book),
-  ];
+  const searchDirs = buildOutputSearchDirs(dir, book);
 
   for (const searchDir of searchDirs) {
     const absDir = path.join(CSKILLBP_DIR, searchDir);

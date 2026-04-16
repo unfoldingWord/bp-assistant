@@ -815,10 +815,15 @@ function cleanupNotesArtifacts({ book, chapter, verseStart, verseEnd }) {
     `output/issues/${book}/${tag}.tsv`,
     `output/issues/${book}/${verseTag}.tsv`,
     // notes
+    `output/notes/${tag}.tsv`,
+    `output/notes/${verseTag}.tsv`,
     `output/notes/${book}/${tag}.tsv`,
     `output/notes/${book}/${verseTag}.tsv`,
     // quality
+    `output/quality/${tag}-quality.md`,
+    `output/quality/${tag}-quality.json`,
     `output/quality/${book}/${tag}-quality.md`,
+    `output/quality/${book}/${tag}-quality.json`,
   ];
 
   for (const rel of candidates) {
@@ -846,6 +851,76 @@ function cleanupNotesArtifacts({ book, chapter, verseStart, verseEnd }) {
       }
     }
   } catch (_) { /* non-fatal */ }
+}
+
+function analyzeIssuesTsvShape(issuesPath) {
+  const absPath = path.resolve(CSKILLBP_DIR, issuesPath);
+  if (!fs.existsSync(absPath)) {
+    return {
+      exists: false,
+      rowCount: 0,
+      blankSrefRows: 0,
+      blankQuoteRows: 0,
+      blankBothRows: 0,
+      blankSrefRatio: 0,
+      blankQuoteRatio: 0,
+      blankBothRatio: 0,
+    };
+  }
+
+  const lines = fs.readFileSync(absPath, 'utf8').split('\n').filter((line) => line.trim());
+  let rowCount = 0;
+  let blankSrefRows = 0;
+  let blankQuoteRows = 0;
+  let blankBothRows = 0;
+
+  for (const line of lines) {
+    const cols = line.split('\t');
+    if ((cols[0] || '').toLowerCase() === 'book') continue;
+    rowCount++;
+    const sref = String(cols[2] || '').trim();
+    const quote = String(cols[3] || '').trim();
+    if (!sref) blankSrefRows++;
+    if (!quote) blankQuoteRows++;
+    if (!sref && !quote) blankBothRows++;
+  }
+
+  return {
+    exists: true,
+    rowCount,
+    blankSrefRows,
+    blankQuoteRows,
+    blankBothRows,
+    blankSrefRatio: rowCount ? blankSrefRows / rowCount : 0,
+    blankQuoteRatio: rowCount ? blankQuoteRows / rowCount : 0,
+    blankBothRatio: rowCount ? blankBothRows / rowCount : 0,
+  };
+}
+
+function isMalformedIssuesShape(shape) {
+  if (!shape || !shape.exists || shape.rowCount < 5) return false;
+  return shape.blankSrefRatio >= 0.8 && shape.blankQuoteRatio >= 0.8 && shape.blankBothRatio >= 0.8;
+}
+
+function backupIssuesFile({ issuesPath, pipeDir }) {
+  if (!issuesPath || !pipeDir) return null;
+  const absIssues = path.resolve(CSKILLBP_DIR, issuesPath);
+  if (!fs.existsSync(absIssues)) return null;
+  const backupRel = path.join(pipeDir, 'issues_pre_review.tsv');
+  const backupAbs = path.resolve(CSKILLBP_DIR, backupRel);
+  fs.mkdirSync(path.dirname(backupAbs), { recursive: true });
+  fs.copyFileSync(absIssues, backupAbs);
+  return backupRel;
+}
+
+function restoreIssuesBackup({ backupRel, issuesPath }) {
+  if (!backupRel || !issuesPath) return false;
+  const backupAbs = path.resolve(CSKILLBP_DIR, backupRel);
+  const issuesAbs = path.resolve(CSKILLBP_DIR, issuesPath);
+  if (!fs.existsSync(backupAbs)) return false;
+  fs.mkdirSync(path.dirname(issuesAbs), { recursive: true });
+  fs.copyFileSync(backupAbs, issuesAbs);
+  return true;
 }
 
 function refreshChapterNotesFromShards(book, tag, chapterRel) {
@@ -1487,6 +1562,7 @@ async function notesPipeline(route, message) {
     const hasAIArtifacts = missing.length === 0;
 
     let issuesPath;
+    let issuesBackupPath = null;
     let failedSkill = null;
     const chapterStart = Date.now();
     let chapterIntroHintArgs = '';
@@ -1565,6 +1641,7 @@ async function notesPipeline(route, message) {
           model: 'sonnet',      // validation/reconciliation — Sonnet suffices at lower cost
           ops: 1,
         });
+        issuesBackupPath = backupIssuesFile({ issuesPath, pipeDir });
       }
     } else {
       // No AI artifacts -> deep-issue-id path (fetches from Door43 master)
@@ -2105,6 +2182,31 @@ async function notesPipeline(route, message) {
           }
         }
         if (issueProducerSkillNames.has(skill.name)) {
+          if (skill.name === 'post-edit-review' && issuesPath) {
+            const shape = analyzeIssuesTsvShape(issuesPath);
+            if (isMalformedIssuesShape(shape)) {
+              restoreIssuesBackup({ backupRel: issuesBackupPath, issuesPath });
+              failedSkill = skill.name;
+              const shapeSummary = `rows=${shape.rowCount}, blank_sref=${shape.blankSrefRows}, blank_quote=${shape.blankQuoteRows}, blank_both=${shape.blankBothRows}`;
+              await status(`**${skill.name}** failed for ${ref} — malformed issues TSV after review (${shapeSummary}). Restored pre-review issues snapshot.`);
+              setCheckpoint(checkpointRef, {
+                state: 'failed',
+                totalSuccess,
+                totalFail,
+                current: {
+                  chapter: ch,
+                  skill: skill.name,
+                  status: 'failed',
+                  errorKind: 'malformed_output',
+                  outputStatus: 'malformed',
+                  outputPath: issuesPath,
+                  details: shapeSummary,
+                },
+                resume: { chapter: ch, skill: skill.name },
+              });
+              break;
+            }
+          }
           await runIssueNormalizationStage();
           // Sanity check: verify the issues TSV starts with an uppercase book code (not a row number)
           if (skill.name === 'post-edit-review' && issuesPath) {
@@ -2543,6 +2645,8 @@ module.exports = {
   _applySkillSpecificGuardrails: applySkillSpecificGuardrails,
   _getSkillToolConfig: getSkillToolConfig,
   _appendIssueTagsToTsv: appendIssueTagsToTsv,
+  _analyzeIssuesTsvShape: analyzeIssuesTsvShape,
   _collectUnresolvedQuoteFindings: collectUnresolvedQuoteFindings,
+  _isMalformedIssuesShape: isMalformedIssuesShape,
   _postProcessNotesTsv: postProcessNotesTsv,
 };

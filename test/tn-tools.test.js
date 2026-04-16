@@ -8,6 +8,7 @@ const {
   prepareNotes,
   prepareATContext,
   verifyBoldMatches,
+  _resolveGlQuotes,
   _parseExplanationDirectives,
   _resolveTemplateSelection,
   _deriveStyleProfile,
@@ -228,6 +229,82 @@ test('prepareATContext keys off canonical at_required', () => {
   assert.equal(atCtx.packets[0].id, 'b222');
   assert.equal(atCtx.packets[0].quote_scope_mode, 'focused_span');
   assert.equal(atCtx.packets[0].exact_ult_span, 'new text');
+});
+
+test('resolveGlQuotes preserves contiguous aligned spans instead of unioning repeated Hebrew tokens', () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tn-tools-resolvegl-'));
+  const relRoot = path.join('tmp', path.basename(tempDir));
+  const absRoot = path.join('/srv/bot/workspace', relRoot);
+  fs.mkdirSync(absRoot, { recursive: true });
+
+  const prepRel = path.join(relRoot, 'prepared_notes.json');
+  const alignRel = path.join(relRoot, 'alignment.json');
+
+  fs.writeFileSync(path.join('/srv/bot/workspace', prepRel), JSON.stringify({
+    items: [
+      {
+        id: 'fbp0',
+        reference: '3:2',
+        sref: 'figs-metaphor',
+        gl_quote: 'a firebrand rescued from the fire',
+        issue_span_gl_quote: 'a firebrand rescued from the fire',
+        orig_quote: 'הַ⁠שָּׂטָ֗ן יִגְעַ֨ר יְהוָ֤ה בְּ⁠ךָ֙ הַ⁠שָּׂטָ֔ן וְ⁠יִגְעַ֤ר יְהוָה֙ בְּ⁠ךָ֔ הַ⁠בֹּחֵ֖ר בִּ⁠ירֽוּשָׁלִָ֑ם הֲ⁠ל֧וֹא זֶ֦ה א֖וּד מֻצָּ֥ל מֵ⁠אֵֽשׁ',
+        writer_packet: {
+          issue_span_gl_quote: 'a firebrand rescued from the fire',
+          gl_quote: 'a firebrand rescued from the fire',
+        },
+        prompt: 'Reference: 3:2\nQuote (scoped): a firebrand rescued from the fire\nULT verse: ...',
+      },
+      {
+        id: 'uhvf',
+        reference: '3:3',
+        sref: 'figs-metaphor',
+        gl_quote: 'filthy garments',
+        issue_span_gl_quote: 'filthy garments',
+        orig_quote: 'בְּגָדִ֣ים צוֹאִ֑ים',
+        writer_packet: {
+          issue_span_gl_quote: 'filthy garments',
+          gl_quote: 'filthy garments',
+        },
+        prompt: 'Reference: 3:3\nQuote (scoped): filthy garments\nULT verse: ...',
+      },
+    ],
+  }, null, 2));
+
+  fs.writeFileSync(path.join('/srv/bot/workspace', alignRel), JSON.stringify({
+    '3:2': [
+      { eng: 'Yahweh', heb: 'יְהוָ֤ה' },
+      { eng: 'rebuke', heb: 'יִגְעַ֨ר' },
+      { eng: 'Yahweh', heb: 'יְהוָה֙' },
+      { eng: 'rebuke', heb: 'יִגְעַ֤ר' },
+      { eng: 'Is', heb: 'הֲ⁠ל֧וֹא' },
+      { eng: 'this', heb: 'זֶ֦ה' },
+      { eng: 'a', heb: 'א֖וּד' },
+      { eng: 'firebrand', heb: 'א֖וּד' },
+      { eng: 'rescued', heb: 'מֻצָּ֥ל' },
+      { eng: 'from', heb: 'מֵ⁠אֵֽשׁ' },
+      { eng: 'the', heb: 'מֵ⁠אֵֽשׁ' },
+      { eng: 'fire', heb: 'מֵ⁠אֵֽשׁ' },
+    ],
+    '3:3': [
+      { eng: 'in', heb: 'בְּ' },
+      { eng: 'filthy', heb: 'צוֹאִ֑ים' },
+      { eng: 'garments', heb: 'בְּגָדִ֣ים' },
+    ],
+  }, null, 2));
+
+  const summary = _resolveGlQuotes({ preparedJson: prepRel, alignmentJson: alignRel });
+  const prepared = JSON.parse(fs.readFileSync(path.join('/srv/bot/workspace', prepRel), 'utf8'));
+  const fbp0 = prepared.items.find((item) => item.id === 'fbp0');
+  const uhvf = prepared.items.find((item) => item.id === 'uhvf');
+
+  assert.match(summary, /Updated 0 gl_quotes/);
+  assert.equal(fbp0.issue_span_gl_quote, 'a firebrand rescued from the fire');
+  assert.equal(fbp0.writer_packet.issue_span_gl_quote, 'a firebrand rescued from the fire');
+  assert.match(fbp0.prompt, /Quote \(scoped\): a firebrand rescued from the fire/);
+  assert.equal(uhvf.issue_span_gl_quote, 'filthy garments');
+  assert.equal(uhvf.writer_packet.issue_span_gl_quote, 'filthy garments');
+  assert.match(uhvf.prompt, /Quote \(scoped\): filthy garments/);
 });
 
 test('quote scope selector marks parallelism rows as full_parallelism', () => {

@@ -632,6 +632,43 @@ function resolveGlQuotes({ preparedJson, alignmentJson, dryRun }) {
   const data = JSON.parse(fs.readFileSync(path.resolve(CSKILLBP_DIR, preparedJson), 'utf8'));
   const alignData = JSON.parse(fs.readFileSync(path.resolve(CSKILLBP_DIR, alignmentJson), 'utf8'));
   const CANT = /[\u0591-\u05AF\u2060\u05BE]/g;
+  const normalizeHeb = (value) => String(value || '').replace(CANT, '');
+
+  function buildAlignedSpan(entries, start, length) {
+    const spanEntries = entries.slice(start, start + length);
+    const words = [];
+    let previous = null;
+    for (const entry of spanEntries) {
+      const eng = normalizeWhitespace(entry.eng || '');
+      if (!eng) continue;
+      if (eng === previous) continue;
+      words.push(eng);
+      previous = eng;
+    }
+    return normalizeWhitespace(words.join(' '));
+  }
+
+  function findContiguousSpan(entries, hebWords) {
+    if (!entries.length || !hebWords.length) return '';
+    const normalizedTarget = hebWords.map(normalizeHeb).filter(Boolean);
+    if (!normalizedTarget.length) return '';
+
+    for (let start = 0; start < entries.length; start++) {
+      if (normalizeHeb(entries[start].heb) !== normalizedTarget[0]) continue;
+      let cursor = start;
+      let matched = 0;
+      while (cursor < entries.length && matched < normalizedTarget.length) {
+        if (normalizeHeb(entries[cursor].heb) !== normalizedTarget[matched]) break;
+        cursor++;
+        matched++;
+      }
+      if (matched === normalizedTarget.length) {
+        return buildAlignedSpan(entries, start, matched);
+      }
+    }
+    return '';
+  }
+
   let updated = 0;
   const log = [];
 
@@ -641,19 +678,10 @@ function resolveGlQuotes({ preparedJson, alignmentJson, dryRun }) {
     const entries = alignData[alignRef] || alignData[item.reference] || [];
     if (!entries.length) continue;
 
-    // Build set of target Hebrew words (stripped of cantillation)
     const hebWords = item.orig_quote.split(/\s+/);
-    const targetSet = new Set(hebWords.map(w => w.replace(CANT, '')));
+    const span = findContiguousSpan(entries, hebWords);
+    if (!span) continue;
 
-    // Single pass through entries in ULT word order — collect all matches
-    const matched = entries.filter(e => {
-      const stripped = e.heb.replace(CANT, '');
-      return targetSet.has(stripped) || targetSet.has(e.heb);
-    });
-
-    if (!matched.length) continue;
-
-    const span = matched.map(e => e.eng).join(' ');
     const currentScoped = item.issue_span_gl_quote || item.gl_quote || '';
     if (span && span !== currentScoped) {
       log.push(`${item.reference}: "${currentScoped}" -> "${span}"`);
@@ -664,6 +692,7 @@ function resolveGlQuotes({ preparedJson, alignmentJson, dryRun }) {
           item.writer_packet.issue_span_gl_quote = span;
           item.writer_packet.gl_quote = span;
         }
+        item.prompt = buildWriterPrompt(item);
       }
       updated++;
     }
@@ -2039,5 +2068,6 @@ module.exports = {
   _maybeBuildProgrammaticNote: maybeBuildProgrammaticNote,
   _normalizeAssembledNoteText: normalizeAssembledNoteText,
   _inspectOpeningBold: inspectOpeningBold,
+  _resolveGlQuotes: resolveGlQuotes,
   _stripAlternateTranslation: stripAlternateTranslation,
 };

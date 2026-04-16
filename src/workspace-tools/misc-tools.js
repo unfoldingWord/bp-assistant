@@ -6,6 +6,7 @@ const fs = require('fs');
 const path = require('path');
 const https = require('https');
 const { readSecret } = require('../secrets');
+const { resolveOutputFile } = require('../pipeline-utils');
 
 const CSKILLBP_DIR = process.env.CSKILLBP_DIR || '/srv/bot/workspace';
 const GITEA_API = 'https://git.door43.org/api/v1';
@@ -265,8 +266,8 @@ function prepareTq({ book, chapter, wholeBook, tqRepo, ultPath, ustPath, output 
   if (!ultFile) {
     const width = bookUpper === 'PSA' ? 3 : 2;
     const tag = `${bookUpper}-${String(chapter || 1).padStart(width, '0')}`;
-    const aiPath = `output/AI-ULT/${bookUpper}/${tag}.usfm`;
-    if (fs.existsSync(path.join(CSKILLBP_DIR, aiPath))) ultFile = aiPath;
+    const aiPath = resolveOutputFile(`output/AI-ULT/${bookUpper}/${tag}.usfm`, bookUpper);
+    if (aiPath) ultFile = aiPath;
     else if (num) {
       const pubPath = `data/published_ult_english/${num}-${bookUpper}.usfm`;
       if (fs.existsSync(path.join(CSKILLBP_DIR, pubPath))) ultFile = pubPath;

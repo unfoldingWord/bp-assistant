@@ -5,7 +5,7 @@ const { runAgentLoop } = require('./agent-loop');
 const { buildSkillPrompt } = require('./prompt-builder');
 const { getProviderConfig, resolveProviderModel } = require('./provider-config');
 const { getToolSchemas } = require('./tools');
-const { normalizeBookName } = require('../pipeline-utils');
+const { normalizeBookName, resolveOutputFile, discoverFreshOutput } = require('../pipeline-utils');
 const { buildGenerateContext } = require('../pipeline-context');
 const { getProviderSystemAppend } = require('./provider-nudges');
 const { createAlignedUsfm, mergeAlignedUsfm } = require('../workspace-tools/usfm-tools');
@@ -57,14 +57,30 @@ function buildCanonicalPaths(cwd, book, chapter) {
   };
 }
 
-function verifyOutputFile(filePath, label) {
-  if (!fs.existsSync(filePath)) {
+function toWorkspaceRel(cwd, absPath) {
+  return path.relative(cwd, absPath).split(path.sep).join('/');
+}
+
+function resolveWorkspaceOutput(cwd, canonicalPath, book, pattern, afterMs = null) {
+  const relPath = toWorkspaceRel(cwd, canonicalPath);
+  const dirRel = path.posix.dirname(relPath);
+  const found = pattern
+    ? discoverFreshOutput(dirRel, book, pattern, afterMs)
+    : resolveOutputFile(relPath, book);
+  if (!found) return null;
+  return path.join(cwd, found);
+}
+
+function verifyOutputFile(filePath, label, book, pattern, afterMs = null, cwd = '/srv/bot/workspace') {
+  const resolvedPath = resolveWorkspaceOutput(cwd, filePath, book, pattern, afterMs) || filePath;
+  if (!fs.existsSync(resolvedPath)) {
     throw new Error(`${label} missing: ${path.relative('/srv/bot/workspace', filePath)}`);
   }
-  const stat = fs.statSync(filePath);
+  const stat = fs.statSync(resolvedPath);
   if (stat.size === 0) {
-    throw new Error(`${label} empty: ${path.relative('/srv/bot/workspace', filePath)}`);
+    throw new Error(`${label} empty: ${path.relative('/srv/bot/workspace', resolvedPath)}`);
   }
+  return resolvedPath;
 }
 
 function countVersesInUsfm(filePath) {
@@ -248,18 +264,19 @@ async function runInitialPipeline(prompt, opts = {}) {
   const cwd = opts.cwd || '/srv/bot/workspace';
   const outputs = buildCanonicalPaths(cwd, book, chapter);
   const stageResults = [];
+  const tag = chapterTag(book, chapter);
 
   const ultPrompt = `${book} ${chapter}`;
   const ultResult = await executeNativeStage('ULT-gen', ultPrompt, opts);
-  verifyOutputFile(outputs.ult, 'ULT output');
+  const ultPath = verifyOutputFile(outputs.ult, 'ULT output', book, new RegExp(`^${tag}(-(?!.*aligned).*)?\\.usfm$`), null, cwd);
   stageResults.push(ultResult);
 
   const { dirPath, contextPath } = buildGenerateContext({
     book,
     chapter,
-    ultPath: path.relative(cwd, outputs.ult),
+    ultPath: toWorkspaceRel(cwd, ultPath),
     issuesPath: null,
-    ultFullPath: path.relative(cwd, outputs.ult),
+    ultFullPath: toWorkspaceRel(cwd, ultPath),
   });
   seedIssueStageArtifacts(cwd, dirPath);
 
@@ -272,22 +289,22 @@ async function runInitialPipeline(prompt, opts = {}) {
       'Perform the issue-identification work yourself in one pass and write the canonical TSV to output/issues.',
     ].join('\n'),
   });
-  verifyOutputFile(outputs.issues, 'Issues TSV');
+  const issuesPath = verifyOutputFile(outputs.issues, 'Issues TSV', book, new RegExp(`^${tag}(-.*)?\\.tsv$`), null, cwd);
   stageResults.push(issueResult);
 
   buildGenerateContext({
     book,
     chapter,
-    ultPath: path.relative(cwd, outputs.ult),
+    ultPath: toWorkspaceRel(cwd, ultPath),
     ustPath: null,
-    issuesPath: path.relative(cwd, outputs.issues),
-    ultFullPath: path.relative(cwd, outputs.ult),
+    issuesPath: toWorkspaceRel(cwd, issuesPath),
+    ultFullPath: toWorkspaceRel(cwd, ultPath),
     dirPath,
   });
 
   const ustPrompt = `${book} ${chapter} --context ${contextPath}`;
   const ustResult = await executeNativeStage('UST-gen', ustPrompt, opts);
-  verifyOutputFile(outputs.ust, 'UST output');
+  verifyOutputFile(outputs.ust, 'UST output', book, new RegExp(`^${tag}(-(?!.*aligned).*)?\\.usfm$`), null, cwd);
   stageResults.push(ustResult);
 
   return summarizeStageResults('initial-pipeline', stageResults);
@@ -298,33 +315,36 @@ async function runAlignmentPipeline(prompt, opts = {}) {
   const cwd = opts.cwd || '/srv/bot/workspace';
   const outputs = buildCanonicalPaths(cwd, book, chapter);
   const stageResults = [];
-  const verseCount = countVersesInUsfm(outputs.ult);
+  const tag = chapterTag(book, chapter);
+  const ultSourcePath = verifyOutputFile(outputs.ult, 'ULT output', book, new RegExp(`^${tag}(-(?!.*aligned).*)?\\.usfm$`), null, cwd);
+  const ustSourcePath = verifyOutputFile(outputs.ust, 'UST output', book, new RegExp(`^${tag}(-(?!.*aligned).*)?\\.usfm$`), null, cwd);
+  const verseCount = countVersesInUsfm(ultSourcePath);
   const versesArg = verseCount > 0 ? ` --verses 1-${verseCount}` : '';
 
-  const ultPrompt = `${book} ${chapter} --ult ${path.relative(cwd, outputs.ult)}${versesArg}`;
+  const ultPrompt = `${book} ${chapter} --ult ${toWorkspaceRel(cwd, ultSourcePath)}${versesArg}`;
   const ultResult = await executeNativeStage('ULT-alignment', ultPrompt, opts);
   finalizeAlignmentOutputs({
     cwd,
     book,
     chapter,
-    sourceRelPath: path.relative(cwd, outputs.ult),
+    sourceRelPath: toWorkspaceRel(cwd, ultSourcePath),
     outputRelPath: path.relative(cwd, outputs.ultAligned),
     ust: false,
   });
-  verifyOutputFile(outputs.ultAligned, 'Aligned ULT output');
+  verifyOutputFile(outputs.ultAligned, 'Aligned ULT output', book, new RegExp(`^${tag}(-.*)?-aligned\\.usfm$`), null, cwd);
   stageResults.push(ultResult);
 
-  const ustPrompt = `${book} ${chapter} --ust ${path.relative(cwd, outputs.ust)}${versesArg}`;
+  const ustPrompt = `${book} ${chapter} --ust ${toWorkspaceRel(cwd, ustSourcePath)}${versesArg}`;
   const ustResult = await executeNativeStage('UST-alignment', ustPrompt, opts);
   finalizeAlignmentOutputs({
     cwd,
     book,
     chapter,
-    sourceRelPath: path.relative(cwd, outputs.ust),
+    sourceRelPath: toWorkspaceRel(cwd, ustSourcePath),
     outputRelPath: path.relative(cwd, outputs.ustAligned),
     ust: true,
   });
-  verifyOutputFile(outputs.ustAligned, 'Aligned UST output');
+  verifyOutputFile(outputs.ustAligned, 'Aligned UST output', book, new RegExp(`^${tag}(-.*)?-aligned\\.usfm$`), null, cwd);
   stageResults.push(ustResult);
 
   return summarizeStageResults('align-all-parallel', stageResults);

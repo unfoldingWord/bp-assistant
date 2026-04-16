@@ -1,5 +1,9 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const fs = require('fs');
+const https = require('https');
+const os = require('os');
+const path = require('path');
 
 const { buildSyntheticRoute } = require('../src/router');
 const {
@@ -12,6 +16,8 @@ const {
   buildParsedNotesRequest,
   shouldRunIntro,
   buildChapterIntroPrompt,
+  _analyzeIssuesTsvShape,
+  _isMalformedIssuesShape,
 } = require('../src/notes-pipeline');
 const { buildParallelismIntroHintArgs } = require('../src/issue-normalizer');
 
@@ -110,4 +116,119 @@ test('chapter intro prompt has no hint when signal is absent', () => {
   });
   const prompt = buildChapterIntroPrompt('ISA 51', 'output/issues/ISA/ISA-051.tsv', '', hint);
   assert.equal(prompt.includes('--parallelism-signal'), false);
+});
+
+test('output discovery falls back to flat notes files when expected path includes a book subdirectory', () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pipeline-utils-'));
+  const oldBaseDir = process.env.CSKILLBP_DIR;
+  process.env.CSKILLBP_DIR = tempDir;
+
+  const modulePath = require.resolve('../src/pipeline-utils');
+  delete require.cache[modulePath];
+  const { resolveOutputFile, discoverFreshOutput } = require('../src/pipeline-utils');
+
+  try {
+    const flatDir = path.join(tempDir, 'output', 'notes');
+    fs.mkdirSync(flatDir, { recursive: true });
+    const flatFile = path.join(flatDir, 'PSA-039.tsv');
+    fs.writeFileSync(flatFile, 'Reference\tID\nPSA 39:1\ta1b2\n');
+
+    const afterMs = Date.now() - 1000;
+    const discovered = discoverFreshOutput('output/notes/PSA', 'PSA', /^PSA-0*39(-.*)?\.tsv$/, afterMs);
+    const resolved = resolveOutputFile('output/notes/PSA/PSA-039.tsv', 'PSA');
+
+    assert.equal(discovered, 'output/notes/PSA-039.tsv');
+    assert.equal(resolved, 'output/notes/PSA-039.tsv');
+  } finally {
+    if (oldBaseDir == null) delete process.env.CSKILLBP_DIR;
+    else process.env.CSKILLBP_DIR = oldBaseDir;
+    delete require.cache[modulePath];
+  }
+});
+
+test('checkUltEdits finds flat aligned ULT outputs', async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'check-ult-edits-'));
+  const alignedDir = path.join(tempDir, 'output', 'AI-ULT');
+  fs.mkdirSync(alignedDir, { recursive: true });
+  fs.writeFileSync(path.join(alignedDir, 'PSA-039-aligned.usfm'), '\\id PSA\n\\c 39\n\\v 1 changed text\n');
+  const oldBaseDir = process.env.CSKILLBP_DIR;
+  process.env.CSKILLBP_DIR = tempDir;
+
+  const pipelineUtilsPath = require.resolve('../src/pipeline-utils');
+  const checkUltEditsPath = require.resolve('../src/check-ult-edits');
+  delete require.cache[pipelineUtilsPath];
+  delete require.cache[checkUltEditsPath];
+
+  const originalGet = https.get;
+  https.get = (url, callback) => {
+    const { EventEmitter } = require('events');
+    const response = new EventEmitter();
+    response.statusCode = 200;
+    response.headers = {};
+    response.setEncoding = () => {};
+    response.resume = () => {};
+    process.nextTick(() => {
+      callback(response);
+      response.emit('data', '\\id PSA\n\\c 39\n\\v 1 original text\n');
+      response.emit('end');
+    });
+    return { on() { return this; } };
+  };
+
+  try {
+    const { checkUltEdits } = require('../src/check-ult-edits');
+    const result = await checkUltEdits({
+      book: 'PSA',
+      chapter: 39,
+      workspaceDir: tempDir,
+      pipeDir: 'tmp/pipeline/PSA-039',
+    });
+
+    assert.equal(result.hasEdits, true);
+    assert.equal(result.masterPath, 'tmp/pipeline/PSA-039/ult_master_plain.usfm');
+    assert.equal(fs.existsSync(path.join(tempDir, result.masterPath)), true);
+  } finally {
+    https.get = originalGet;
+    if (oldBaseDir == null) delete process.env.CSKILLBP_DIR;
+    else process.env.CSKILLBP_DIR = oldBaseDir;
+    delete require.cache[pipelineUtilsPath];
+    delete require.cache[checkUltEditsPath];
+  }
+});
+
+test('malformed issues TSV shape is detected when issue type and quote are blank across the chapter', () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'issues-shape-'));
+  const oldBaseDir = process.env.CSKILLBP_DIR;
+  process.env.CSKILLBP_DIR = tempDir;
+
+  const notesPipelinePath = require.resolve('../src/notes-pipeline');
+  delete require.cache[notesPipelinePath];
+  const { _analyzeIssuesTsvShape, _isMalformedIssuesShape } = require('../src/notes-pipeline');
+
+  try {
+    const issuesRel = 'output/issues/PSA/PSA-039.tsv';
+    const issuesAbs = path.join(tempDir, issuesRel);
+    fs.mkdirSync(path.dirname(issuesAbs), { recursive: true });
+    fs.writeFileSync(
+      issuesAbs,
+      [
+        "PSA\t39:1\t\t\t\t\tlong direct quotation of David's inner resolve",
+        'PSA\t39:1\t\t\t\t\tmetaphor - behavior as path to walk',
+        'PSA\t39:2\t\t\t\t\tsynonymous parallelism - both clauses express same idea',
+        'PSA\t39:3\t\t\t\t\tquote margin introducing direct speech',
+        'PSA\t39:4\t\t\t\t\tabstract noun - could be \"when I will die\"',
+      ].join('\n')
+    );
+
+    const shape = _analyzeIssuesTsvShape(issuesRel);
+    assert.equal(shape.rowCount, 5);
+    assert.equal(shape.blankSrefRows, 5);
+    assert.equal(shape.blankQuoteRows, 5);
+    assert.equal(shape.blankBothRows, 5);
+    assert.equal(_isMalformedIssuesShape(shape), true);
+  } finally {
+    if (oldBaseDir == null) delete process.env.CSKILLBP_DIR;
+    else process.env.CSKILLBP_DIR = oldBaseDir;
+    delete require.cache[notesPipelinePath];
+  }
 });

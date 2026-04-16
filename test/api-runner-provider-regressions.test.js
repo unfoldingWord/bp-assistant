@@ -166,6 +166,92 @@ test('openai native initial-pipeline expands into ULT, issues, and UST stages', 
   }
 });
 
+test('openai native initial-pipeline accepts flat output layouts', async () => {
+  const agentLoopPath = require.resolve('../src/api-runner/agent-loop');
+  const stageRunnerPath = require.resolve('../src/api-runner/openai-native-stage-runner');
+  const pipelineUtilsPath = require.resolve('../src/pipeline-utils');
+  const agentLoopModule = require(agentLoopPath);
+  const originalRunAgentLoop = agentLoopModule.runAgentLoop;
+  const oldBaseDir = process.env.CSKILLBP_DIR;
+  const cwd = '/srv/bot/workspace';
+  const tag = 'JON-09';
+  const outputs = buildCanonicalPaths(cwd, 'JON', 9);
+  const flatUlt = path.join(cwd, 'output/AI-ULT', `${tag}.usfm`);
+  const flatIssues = path.join(cwd, 'output/issues', `${tag}.tsv`);
+  const flatUst = path.join(cwd, 'output/AI-UST', `${tag}.usfm`);
+  const pipelineDir = path.join(cwd, 'tmp/pipeline', tag);
+
+  for (const target of [
+    outputs.ult,
+    outputs.issues,
+    outputs.ust,
+    flatUlt,
+    flatIssues,
+    flatUst,
+    pipelineDir,
+  ]) {
+    if (fs.existsSync(target)) {
+      fs.rmSync(target, { recursive: true, force: true });
+    }
+  }
+
+  agentLoopModule.runAgentLoop = async (opts) => {
+    const system = String(opts.system || '');
+    if (system.includes('name: ULT-gen')) {
+      fs.mkdirSync(path.dirname(flatUlt), { recursive: true });
+      fs.writeFileSync(flatUlt, '\\id JON\n\\c 9\n\\v 1 test\n');
+    } else if (system.includes('name: deep-issue-id')) {
+      fs.mkdirSync(path.dirname(flatIssues), { recursive: true });
+      fs.writeFileSync(flatIssues, 'Reference\tID\tTags\tSupportReference\tQuote\tOccurrence\tNote\nJON 9:1\ta1b2\tfigs-metaphor\t\tfish\t1\tTest\n');
+    } else if (system.includes('name: UST-gen')) {
+      fs.mkdirSync(path.dirname(flatUst), { recursive: true });
+      fs.writeFileSync(flatUst, '\\id JON\n\\c 9\n\\v 1 test\n');
+    }
+
+    return {
+      turns: 1,
+      inputTokens: 10,
+      outputTokens: 5,
+      cost: 0.01,
+      durationMs: 5,
+      finalText: 'ok',
+    };
+  };
+
+  process.env.CSKILLBP_DIR = cwd;
+  delete require.cache[pipelineUtilsPath];
+  delete require.cache[stageRunnerPath];
+
+  try {
+    const { runOpenAiNativeSkill } = require(stageRunnerPath);
+    const result = await runOpenAiNativeSkill('initial-pipeline', 'jon 9', {
+      provider: 'openai',
+      runtime: 'openai-native',
+      cwd,
+      apiKey: 'test-key',
+      apiKeyResolver: () => 'test-key',
+    });
+
+    assert.deepEqual(result.steps.map((step) => step.skill), ['ULT-gen', 'deep-issue-id', 'UST-gen']);
+    assert.equal(fs.existsSync(flatUlt), true);
+    assert.equal(fs.existsSync(flatIssues), true);
+    assert.equal(fs.existsSync(flatUst), true);
+    assert.equal(fs.existsSync(outputs.ult), false);
+    assert.equal(fs.existsSync(outputs.issues), false);
+    assert.equal(fs.existsSync(outputs.ust), false);
+  } finally {
+    agentLoopModule.runAgentLoop = originalRunAgentLoop;
+    if (oldBaseDir == null) delete process.env.CSKILLBP_DIR;
+    else process.env.CSKILLBP_DIR = oldBaseDir;
+    delete require.cache[pipelineUtilsPath];
+    delete require.cache[stageRunnerPath];
+    for (const target of [flatUlt, flatIssues, flatUst]) {
+      if (fs.existsSync(target)) fs.rmSync(target, { force: true });
+    }
+    if (fs.existsSync(pipelineDir)) fs.rmSync(pipelineDir, { recursive: true, force: true });
+  }
+});
+
 test('runWithSystem forwards cwd into the openai native runtime', async () => {
   const runnerPath = require.resolve('../src/api-runner/runner');
   const nativePath = require.resolve('../src/api-runner/openai-native');

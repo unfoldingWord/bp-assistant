@@ -5,6 +5,7 @@ const fs = require('fs');
 const path = require('path');
 const https = require('https');
 const http = require('http');
+const { resolveOutputFile } = require('./pipeline-utils');
 
 const DOOR43_BASE = 'https://git.door43.org/unfoldingWord';
 
@@ -110,13 +111,15 @@ async function checkUltEdits({ book, chapter, workspaceDir, pipeDir }) {
 
   const width = bookUpper === 'PSA' ? 3 : 2;
   const chPadded = String(chapter).padStart(width, '0');
-  const alignedRelPath = 'output/AI-ULT/' + bookUpper + '/' + bookUpper + '-' + chPadded + '-aligned.usfm';
-  const alignedAbsPath = path.resolve(workspaceDir, alignedRelPath);
-
-  if (!fs.existsSync(alignedAbsPath)) {
-    console.log('[check-ult-edits] Aligned file not found: ' + alignedRelPath + ' — skipping diff');
+  const alignedRelPath = resolveOutputFile(
+    'output/AI-ULT/' + bookUpper + '/' + bookUpper + '-' + chPadded + '-aligned.usfm',
+    bookUpper,
+  );
+  if (!alignedRelPath) {
+    console.log('[check-ult-edits] Aligned file not found: output/AI-ULT/' + bookUpper + '/' + bookUpper + '-' + chPadded + '-aligned.usfm — skipping diff');
     return { hasEdits: false, masterPath: null };
   }
+  const alignedAbsPath = path.resolve(workspaceDir, alignedRelPath);
 
   const alignedUsfm = fs.readFileSync(alignedAbsPath, 'utf8');
   const alignedChapter = extractChapter(alignedUsfm, chapter);
