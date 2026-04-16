@@ -5,6 +5,7 @@ This module provides a multi-provider, tool-using runner that is parallel to the
 It is intentionally additive:
 - Existing SDK routes and pipelines remain unchanged.
 - API runner is used only when `route.type` is `api` or when directly invoking its CLI.
+- Runtime selection is explicit: existing runs stay on `generic-api` unless a route or CLI call opts into `openai-native`.
 
 ## Contents
 
@@ -16,6 +17,7 @@ It is intentionally additive:
 - `api-pipeline.js` - Zulip pipeline entry point for `type: "api"`
 - `cli.js` - standalone local/ops entry point
 - `providers/` - model provider integrations
+- `openai-native.js` - OpenAI Agents SDK runtime for OpenAI-native execution
 
 ## Route Usage
 
@@ -33,16 +35,26 @@ Example Zulip command:
 
 `api generate LAM 2:4-5 --provider openai`
 
+Route/runtime note:
+- `route.runtime` is optional.
+- Supported values: `generic-api`, `openai-native`
+- `openai-native` is only valid with `provider: "openai"`
+
 ## CLI Usage
 
 Run from `app/`:
 
 ```bash
 node src/api-runner/cli.js --provider openai --skill ULT-gen --prompt "LAM 2:4-5"
+node src/api-runner/cli.js --provider openai --runtime openai-native --skill ULT-gen --prompt "LAM 2:4-5"
 node src/api-runner/cli.js --provider gemini --skill ULT-gen --prompt "LAM 2:4-5"
 node src/api-runner/cli.js --provider claude --skill ULT-gen --prompt "LAM 2:4-5"
 node src/api-runner/cli.js --provider openai --skill ULT-gen --prompt "LAM 2:4-5" --dry-run
 ```
+
+Runtime behavior:
+- `generic-api` uses the existing provider-agnostic tool loop.
+- `openai-native` uses the OpenAI Agents SDK with Responses-backed sessions and the same repo tool inventory.
 
 Supported providers:
 - `claude`
@@ -72,7 +84,7 @@ Claude API path also supports aliases through config:
 Cross-provider equivalents are handled with the same alias keys per provider:
 - OpenAI example: `sonnet -> gpt-5.3`
 - Gemini example: `sonnet -> gemini-2.5-pro`
-- xAI example: `sonnet -> grok-4-1-fast-reasoning`
+- xAI example: `opus -> grok-4.20-reasoning`, `sonnet -> grok-4.20-reasoning`
 
 This alias resolution is API-runner-only and does not alter the existing Claude SDK path (`opus`/`sonnet`/`haiku`).
 
@@ -114,6 +126,7 @@ Quick checks:
 ```bash
 node src/api-runner/cli.js --provider claude --skill ULT-gen --prompt "LAM 2:4-5" --dry-run
 node src/api-runner/cli.js --provider openai --skill ULT-gen --prompt "LAM 2:4-5" --dry-run
+node src/api-runner/cli.js --provider openai --runtime openai-native --skill ULT-gen --prompt "LAM 2:4-5" --dry-run
 node src/api-runner/cli.js --provider gemini --skill ULT-gen --prompt "LAM 2:4-5" --dry-run
 node src/test-pipeline.js "api generate LAM 2:4-5" --provider openai --dry-run
 ```

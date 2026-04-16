@@ -5,8 +5,9 @@ const path = require('path');
 const { door43Push } = require('../door43-push');
 const { getDoor43Username, normalizeBookName, buildBranchName, discoverFreshOutput, checkPrerequisites, CSKILLBP_DIR } = require('../pipeline-utils');
 const { buildNotesContext, readContext, writeContext } = require('../pipeline-context');
-const { extractAlignmentData, prepareNotes, fillOrigQuotes, resolveGlQuotes, flagNarrowQuotes } = require('../workspace-tools/tn-tools');
+const { extractAlignmentData, prepareNotes, fillOrigQuotes, resolveGlQuotes, flagNarrowQuotes, generateIds } = require('../workspace-tools/tn-tools');
 const { checkUltEdits } = require('../check-ult-edits');
+const { getProviderSystemAppend } = require('./provider-nudges');
 
 function parseRegexLiteral(literal) {
   if (typeof literal !== 'string') return null;
@@ -32,6 +33,11 @@ function parseSkillSpec(spec) {
 
 function parseProviderFromMessage(content) {
   const match = String(content || '').match(/--provider\s+([a-z0-9_-]+)/i);
+  return match ? match[1].toLowerCase() : null;
+}
+
+function parseRuntimeFromMessage(content) {
+  const match = String(content || '').match(/--runtime\s+([a-z0-9_-]+)/i);
   return match ? match[1].toLowerCase() : null;
 }
 
@@ -68,6 +74,7 @@ async function apiPipeline(route, message) {
   if (args) prompt = `${args} ${prompt}`.trim();
 
   const provider = parseProviderFromMessage(message.content) || route.provider || 'openai';
+  const runtime = parseRuntimeFromMessage(message.content) || route.runtime || null;
   const model = route.model || null;
   let selectedCwd = route.cwd || '/workspace';
   const primarySkillPath = path.join(selectedCwd, '.claude', 'skills', skillName, 'SKILL.md');
@@ -142,7 +149,7 @@ async function apiPipeline(route, message) {
           await reply(`AI artifacts found with human edits — running post-edit-review...`);
           issueResult = await runSkill('post-edit-review',
             `--issues ${issuesPath} --context ${contextPath}`,
-            { provider, model: 'sonnet', thinking: 'medium', maxTurns: 60, timeout: 20, cwd: selectedCwd });
+            { provider, runtime, model: 'sonnet', thinking: 'medium', maxTurns: 60, timeout: 20, cwd: selectedCwd });
           await reply(`post-edit-review done (turns: ${issueResult.turns}, cost: $${(issueResult.cost || 0).toFixed(4)}).`);
         } else {
           await reply(`AI artifacts found, no human edits — using existing issues TSV.`);
@@ -151,7 +158,7 @@ async function apiPipeline(route, message) {
         await reply(`No AI artifacts (missing: ${prereqs.missing.join(', ')}) — running deep-issue-id...`);
         issueResult = await runSkill('deep-issue-id',
           `${book} ${chapter} --context ${contextPath}`,
-          { provider, model: route.model || null, thinking: 'medium', maxTurns: 100, timeout: 30, cwd: selectedCwd });
+          { provider, runtime, model: route.model || null, thinking: 'medium', maxTurns: 100, timeout: 30, cwd: selectedCwd });
         await reply(`deep-issue-id done (turns: ${issueResult.turns}, cost: $${(issueResult.cost || 0).toFixed(4)}).`);
 
         // Re-resolve issues path now that deep-issue-id has written it
@@ -200,17 +207,30 @@ async function apiPipeline(route, message) {
 
       flagNarrowQuotes({ preparedJson: ctx.runtime.preparedNotes });
 
+      const prepPath = path.resolve(CSKILLBP_DIR, ctx.runtime.preparedNotes);
+      const prepData = JSON.parse(fs.readFileSync(prepPath, 'utf8'));
+      const needsId = (prepData.items || []).filter((item) => !item.id);
+      if (needsId.length > 0) {
+        const idStr = await generateIds({ book: prepData.book || book, count: needsId.length });
+        const newIds = idStr.split('\n').filter(Boolean);
+        let idx = 0;
+        for (const item of prepData.items || []) {
+          if (!item.id) item.id = newIds[idx++] || '';
+        }
+        fs.writeFileSync(prepPath, JSON.stringify(prepData, null, 2));
+      }
+
       // 5. tn-writer (Opus by default)
       await reply(`Preprocessing done (${prepCount} items). Running tn-writer...`);
       const writerResult = await runSkill('tn-writer',
         `${book} ${chapter} --context ${contextPath}`,
-        { provider, model: route.model || null, thinking: 'medium', maxTurns: route.maxTurns || 150, timeout: route.timeout || 45, cwd: selectedCwd, toolChoice: route.toolChoice });
+        { provider, runtime, model: route.model || null, thinking: 'medium', maxTurns: route.maxTurns || 150, timeout: route.timeout || 45, cwd: selectedCwd, toolChoice: route.toolChoice });
       await reply(`tn-writer done (turns: ${writerResult.turns}, cost: $${(writerResult.cost || 0).toFixed(4)}). Running tn-quality-check...`);
 
       // 6. tn-quality-check (Sonnet)
       const qcResult = await runSkill('tn-quality-check',
         `${book} ${chapter} --context ${contextPath}`,
-        { provider, model: 'sonnet', thinking: 'medium', maxTurns: 60, timeout: 20, cwd: selectedCwd });
+        { provider, runtime, model: 'sonnet', thinking: 'medium', maxTurns: 60, timeout: 20, cwd: selectedCwd });
       await reply(`tn-quality-check done (turns: ${qcResult.turns}, cost: $${(qcResult.cost || 0).toFixed(4)}).`);
 
       // 7. door43-push (TN)
@@ -236,11 +256,14 @@ async function apiPipeline(route, message) {
     }
 
     // --- Normal single-skill flow ---
-    await reply(`Running **${skillName}** via **${provider}** for \`${prompt}\`...`);
+    const runtimeLabel = runtime ? ` via **${runtime}**` : '';
+    await reply(`Running **${skillName}** via **${provider}**${runtimeLabel} for \`${prompt}\`...`);
 
     const startTime = Date.now();
+    const skillContext = parseBookChapterUser(prompt, message.sender_email);
     const result = await runSkill(skillName, prompt, {
       provider,
+      runtime,
       model,
       thinking: route.thinking || 'medium',
       maxTurns: route.maxTurns || 100,
@@ -249,6 +272,7 @@ async function apiPipeline(route, message) {
       verbose: !!route.verbose,
       dryRun: isDryRun,
       toolChoice: route.toolChoice,
+      systemAppend: getProviderSystemAppend(provider, skillName, skillContext),
     });
 
     await removeReaction(msgId, 'working_on_it');
@@ -268,15 +292,18 @@ async function apiPipeline(route, message) {
         const alignRef = `${book} ${chapter} --ult --ust`; // always align both for now
         const alignResult = await runSkill('align-all-parallel', alignRef, {
           provider,
+          runtime,
           model: 'sonnet', // use sonnet for alignment as it's cheaper/faster
           thinking: 'medium',
           maxTurns: 50,
           cwd: selectedCwd,
+          systemAppend: getProviderSystemAppend(provider, 'align-all-parallel', { book, chapter }),
         });
 
         const tag = `${book}-${String(chapter).padStart(book === 'PSA' ? 3 : 2, '0')}`;
-        const ultAligned = discoverFreshOutput('output/AI-ULT', book, new RegExp(`^${tag}-.*-aligned\\.usfm$`), startTime);
-        const ustAligned = discoverFreshOutput('output/AI-UST', book, new RegExp(`^${tag}-.*-aligned\\.usfm$`), startTime);
+        const alignedPattern = new RegExp(`^${tag}(?:-.*)?-aligned\\.usfm$`);
+        const ultAligned = discoverFreshOutput('output/AI-ULT', book, alignedPattern, startTime);
+        const ustAligned = discoverFreshOutput('output/AI-UST', book, alignedPattern, startTime);
 
         if (!ultAligned && !ustAligned) {
           throw new Error('Alignment phase failed: no aligned USFM files were produced.');
@@ -311,7 +338,7 @@ async function apiPipeline(route, message) {
   } catch (error) {
     await removeReaction(msgId, 'working_on_it');
     await addReaction(msgId, 'warning');
-    await reply(`API run failed for **${skillName}** via **${provider}**: ${error.message}`);
+    await reply(`API run failed for **${skillName}** via **${provider}**${runtime ? ` / **${runtime}**` : ''}: ${error.message}`);
   }
 }
 

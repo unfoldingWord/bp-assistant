@@ -90,6 +90,26 @@ const TOOL_SCHEMAS = [
   ...WORKSPACE_TOOL_REGISTRY.schemas,
 ];
 
+function getToolSchemas(opts = {}) {
+  const {
+    excludeAgentTools = false,
+    includeNames = null,
+  } = opts;
+
+  let schemas = TOOL_SCHEMAS;
+
+  if (excludeAgentTools) {
+    schemas = schemas.filter((schema) => !isAgentTool(schema.name));
+  }
+
+  if (Array.isArray(includeNames) && includeNames.length > 0) {
+    const allowed = new Set(includeNames);
+    schemas = schemas.filter((schema) => allowed.has(schema.name));
+  }
+
+  return schemas;
+}
+
 function buildWorkspaceToolRegistry() {
   const workspaceToolsServer = createWorkspaceTools(
     (config) => config,
@@ -375,10 +395,12 @@ async function executeWorkspaceTool(name, params) {
 
 module.exports = {
   TOOL_SCHEMAS,
+  getToolSchemas,
   toGeminiTools,
   toOpenAITools,
   toClaudeTools,
   executeTool,
   listToolNames,
   getToolDescriptions,
+  strictifySchema,
 };

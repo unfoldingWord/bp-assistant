@@ -2,6 +2,7 @@
 // Manages named teams of agents, each with their own provider/model/conversation state.
 
 const MAX_DEPTH = 3;
+const { isConfiguredModel, resolveProviderModel } = require('./provider-config');
 
 // Global state
 const teams = new Map();   // teamName → Team
@@ -76,8 +77,10 @@ async function spawnAgent(opts, parentOpts, runAgentLoopFn) {
     return `Error: Maximum agent nesting depth (${MAX_DEPTH}) reached. Cannot spawn "${opts.name}".`;
   }
 
-  const provider = opts.provider || parentOpts.provider || 'gemini';
-  const model = opts.model || (provider === parentOpts.provider ? parentOpts.model : undefined);
+  const provider = resolveAgentProvider(opts, parentOpts);
+  const runtime = resolveAgentRuntime(opts, parentOpts);
+  const requestedModel = opts.model || (provider === parentOpts.provider ? parentOpts.model : undefined);
+  const model = normalizeAgentModel(provider, requestedModel);
   const thinking = opts.thinking || parentOpts.thinking || 'medium';
   const cwd = parentOpts.cwd || '/srv/bot/workspace';
   const apiKey = parentOpts.apiKeyResolver ? parentOpts.apiKeyResolver(provider) : parentOpts.apiKey;
@@ -85,7 +88,7 @@ async function spawnAgent(opts, parentOpts, runAgentLoopFn) {
   // Build system prompt for the sub-agent
   const system = opts.system || `You are "${opts.name}", a specialist sub-agent. Complete your assigned task thoroughly and return your final answer as text.`;
 
-  console.log(`[team-manager] Spawning agent "${opts.name}" (provider: ${provider}, model: ${model || 'default'}, depth: ${depth})`);
+  console.log(`[team-manager] Spawning agent "${opts.name}" (provider: ${provider}, runtime: ${runtime}, model: ${model || 'default'}, depth: ${depth})`);
 
   // Register in team if specified
   let agentState;
@@ -100,9 +103,11 @@ async function spawnAgent(opts, parentOpts, runAgentLoopFn) {
       name: opts.name,
       systemPrompt: system,
       provider,
+      runtime,
       model,
       thinking,
       messages: [],
+      session: null,
       status: 'running',
       lastResult: '',
     };
@@ -112,6 +117,7 @@ async function spawnAgent(opts, parentOpts, runAgentLoopFn) {
   try {
     const result = await runAgentLoopFn({
       provider,
+      runtime,
       model,
       system,
       userMessage: opts.prompt,
@@ -122,6 +128,7 @@ async function spawnAgent(opts, parentOpts, runAgentLoopFn) {
       thinking,
       apiKey,
       depth: depth + 1,
+      lockProvider: !!parentOpts.lockProvider,
     });
 
     const finalText = result.finalText || '(no output)';
@@ -131,6 +138,7 @@ async function spawnAgent(opts, parentOpts, runAgentLoopFn) {
       agentState.status = 'completed';
       agentState.lastResult = finalText;
       agentState.messages = result._messages || [];
+      agentState.session = result._session || null;
     }
 
     console.log(`[team-manager] Agent "${opts.name}" completed — ${result.turns} turns, $${result.cost.toFixed(4)}`);
@@ -178,10 +186,12 @@ async function sendMessageToAgent(opts, parentOpts, runAgentLoopFn) {
   try {
     const result = await runAgentLoopFn({
       provider: agent.provider,
-      model: agent.model,
+      runtime: agent.runtime,
+      model: normalizeAgentModel(agent.provider, agent.model),
       system: agent.systemPrompt,
       userMessage: opts.message,
       existingMessages: agent.messages,
+      session: agent.session || undefined,
       maxTurns: 50,
       timeoutMs: 15 * 60 * 1000,
       cwd: parentOpts.cwd || '/srv/bot/workspace',
@@ -189,11 +199,13 @@ async function sendMessageToAgent(opts, parentOpts, runAgentLoopFn) {
       thinking: agent.thinking,
       apiKey,
       depth: (parentOpts.depth || 0) + 1,
+      lockProvider: !!parentOpts.lockProvider,
     });
 
     agent.status = 'completed';
     agent.lastResult = result.finalText || '(no output)';
     agent.messages = result._messages || [];
+    agent.session = result._session || null;
 
     console.log(`[team-manager] Agent "${opts.to}" responded — ${result.turns} turns, $${result.cost.toFixed(4)}`);
     return agent.lastResult;
@@ -244,6 +256,29 @@ function getTask(id) {
   return { id, status: entry.status, result: entry.result };
 }
 
+function normalizeAgentModel(provider, requestedModel) {
+  if (!requestedModel) return undefined;
+  const resolved = resolveProviderModel(provider, requestedModel);
+  if (isConfiguredModel(provider, resolved)) {
+    return resolved;
+  }
+  return undefined;
+}
+
+function resolveAgentProvider(opts, parentOpts) {
+  if (parentOpts?.lockProvider && parentOpts?.provider) {
+    return parentOpts.provider;
+  }
+  return opts.provider || parentOpts.provider || 'gemini';
+}
+
+function resolveAgentRuntime(opts, parentOpts) {
+  if (parentOpts?.lockProvider && parentOpts?.runtime) {
+    return parentOpts.runtime;
+  }
+  return opts.runtime || parentOpts.runtime || 'generic-api';
+}
+
 module.exports = {
   createTeam,
   deleteTeam,
@@ -253,4 +288,7 @@ module.exports = {
   createTask,
   getTask,
   MAX_DEPTH,
+  normalizeAgentModel,
+  resolveAgentProvider,
+  resolveAgentRuntime,
 };

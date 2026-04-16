@@ -7,6 +7,7 @@
 const path = require('path');
 const { readSecret } = require('../secrets');
 const { getProviderNames, getProviderConfig } = require('./provider-config');
+const { DEFAULT_RUNTIME, VALID_RUNTIMES, resolveRuntime } = require('./runtime-config');
 
 // Load env from bot config
 try {
@@ -28,6 +29,7 @@ try {
 function parseArgs(argv) {
   const args = {
     provider: 'gemini',
+    runtime: DEFAULT_RUNTIME,
     model: null,
     thinking: 'medium',
     skill: null,
@@ -45,6 +47,7 @@ function parseArgs(argv) {
     const arg = argv[i];
     switch (arg) {
       case '--provider': args.provider = argv[++i]; break;
+      case '--runtime': args.runtime = argv[++i]; break;
       case '--model': args.model = argv[++i]; break;
       case '--thinking': args.thinking = argv[++i]; break;
       case '--skill': args.skill = argv[++i]; break;
@@ -75,6 +78,7 @@ function parseArgs(argv) {
 
 function printUsage() {
   const providerList = getProviderNames().join(', ');
+  const runtimeList = Array.from(VALID_RUNTIMES).join(', ');
   console.log(`
 Multi-Provider API Runner for Workspace Skills
 
@@ -83,6 +87,7 @@ Usage:
 
 Options:
   --provider <name>     Provider: ${providerList} (default: gemini)
+  --runtime <name>      Runtime: ${runtimeList} (default: ${DEFAULT_RUNTIME})
   --model <id>          Model ID (provider-specific, default: provider flagship)
   --thinking <level>    Thinking level: low, medium, high, max (default: medium)
   --skill <name>        Single skill name from workspace
@@ -138,6 +143,13 @@ async function main() {
     process.exit(1);
   }
 
+  try {
+    args.runtime = resolveRuntime(args.provider, args.runtime);
+  } catch (err) {
+    console.error(`Error: ${err.message}`);
+    process.exit(1);
+  }
+
   // Check API key
   const providerConfig = getProviderConfig(args.provider);
   const apiKey = readSecret(providerConfig.secretName, providerConfig.envName);
@@ -148,6 +160,7 @@ async function main() {
 
   const opts = {
     provider: args.provider,
+    runtime: args.runtime,
     model: args.model,
     thinking: args.thinking,
     toolChoice: args.toolChoice,
@@ -158,7 +171,7 @@ async function main() {
     dryRun: args.dryRun,
   };
 
-  console.log(`[cli] Provider: ${args.provider}, Model: ${args.model || '(default)'}, Thinking: ${args.thinking}`);
+  console.log(`[cli] Provider: ${args.provider}, Runtime: ${args.runtime}, Model: ${args.model || '(default)'}, Thinking: ${args.thinking}`);
   console.log(`[cli] ${args.skill ? `Skill: ${args.skill}` : `Pipeline: ${args.pipeline}`}`);
   console.log(`[cli] Prompt: ${args.prompt}`);
   console.log('');

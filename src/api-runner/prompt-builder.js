@@ -18,6 +18,7 @@ const DEFAULT_WORKSPACE = '/srv/bot/workspace';
 function buildSkillPrompt(skillName, opts = {}) {
   const cwd = opts.cwd || DEFAULT_WORKSPACE;
   const date = opts.date || new Date().toISOString().split('T')[0];
+  const toolSchemas = opts.toolSchemas || TOOL_SCHEMAS;
 
   const skillPath = path.join(cwd, '.claude', 'skills', skillName, 'SKILL.md');
   const skillExists = fs.existsSync(skillPath);
@@ -32,7 +33,7 @@ function buildSkillPrompt(skillName, opts = {}) {
     claudeMd = fs.readFileSync(claudeMdPath, 'utf8');
   }
 
-  return assemblePreamble(cwd, date) + '\n\n' + buildToolCatalog() + '\n\n' + claudeMd + '\n\n---\n\n' + skillContent;
+  return assemblePreamble(cwd, date) + '\n\n' + buildToolCatalog(toolSchemas) + '\n\n' + claudeMd + '\n\n---\n\n' + skillContent;
 }
 
 /**
@@ -45,8 +46,9 @@ function buildSkillPrompt(skillName, opts = {}) {
 function buildCustomPrompt(systemText, opts = {}) {
   const cwd = opts.cwd || DEFAULT_WORKSPACE;
   const date = opts.date || new Date().toISOString().split('T')[0];
+  const toolSchemas = opts.toolSchemas || TOOL_SCHEMAS;
 
-  return assemblePreamble(cwd, date) + '\n\n' + buildToolCatalog() + '\n\n' + systemText;
+  return assemblePreamble(cwd, date) + '\n\n' + buildToolCatalog(toolSchemas) + '\n\n' + systemText;
 }
 
 /**
@@ -63,7 +65,7 @@ function assemblePreamble(cwd, date) {
 /**
  * Build a dynamic tool catalog from TOOL_SCHEMAS, grouped by category.
  */
-function buildToolCatalog() {
+function buildToolCatalog(toolSchemas = TOOL_SCHEMAS) {
   const categories = {
     'File Tools': ['Read', 'Write', 'Edit', 'Glob', 'Grep'],
     'Bible Translation Data': ['get_verse_data', 'get_existing_notes', 'get_template'],
@@ -78,7 +80,7 @@ function buildToolCatalog() {
 
   // Collect workspace tools (everything not in a known category, excluding MCP-prefixed duplicates)
   const workspaceTools = [];
-  for (const schema of TOOL_SCHEMAS) {
+  for (const schema of toolSchemas) {
     if (!categorized.has(schema.name) && !schema.name.startsWith('mcp__')) {
       workspaceTools.push(schema);
     }
@@ -93,7 +95,7 @@ function buildToolCatalog() {
   for (const [category, toolNames] of Object.entries(categories)) {
     lines.push('', `## ${category}`);
     for (const toolName of toolNames) {
-      const schema = TOOL_SCHEMAS.find(s => s.name === toolName);
+      const schema = toolSchemas.find(s => s.name === toolName);
       if (schema) {
         lines.push(`- **${schema.name}** — ${schema.description}`);
       }
@@ -106,8 +108,13 @@ function buildToolCatalog() {
   lines.push('- Before using an issue type, validate it with get_template');
   lines.push('- When encountering unfamiliar Hebrew, look it up via build_strongs_index');
   lines.push('- Use Grep/Glob to explore workspace files before assuming structure');
-  lines.push('- For multi-step work, use Agent to delegate sub-tasks to specialists');
-  lines.push('- Each Agent can use a different provider/model — pick the best fit for the task');
+  const hasAgentTool = toolSchemas.some((schema) => schema.name === 'Agent');
+  if (hasAgentTool) {
+    lines.push('- For multi-step work, use Agent to delegate sub-tasks to specialists');
+    lines.push('- Each Agent can use a different provider/model — pick the best fit for the task');
+  } else {
+    lines.push('- Agent/team delegation tools are not available in this run; complete the task yourself using the available tools');
+  }
 
   return lines.join('\n');
 }

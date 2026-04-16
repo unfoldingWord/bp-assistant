@@ -2,7 +2,7 @@
 // Provider-agnostic: works with any provider module (gemini, openai, claude)
 
 const { executeTool, TOOL_SCHEMAS, toGeminiTools, toOpenAITools, toClaudeTools } = require('./tools');
-const { getProviderConfig, resolveXaiModel } = require('./provider-config');
+const { getFallbackModel, getProviderConfig, resolveXaiModel } = require('./provider-config');
 const { isAgentTool } = require('./agent-tools');
 const { MAX_DEPTH } = require('./team-manager');
 
@@ -64,14 +64,16 @@ async function runAgentLoop({
   toolChoice,
   depth = 0,
   apiKeyResolver,
+  lockProvider = false,
+  toolSchemas,
 }) {
   const providerMod = PROVIDERS[providerName]();
 
   // Determine which tools are available at this depth
   // Sub-agents at max depth don't get agent tools (prevents infinite recursion)
-  let schemas = TOOL_SCHEMAS;
+  let schemas = toolSchemas || TOOL_SCHEMAS;
   if (depth >= MAX_DEPTH) {
-    schemas = TOOL_SCHEMAS.filter(s => !isAgentTool(s.name));
+    schemas = schemas.filter(s => !isAgentTool(s.name));
   }
   const tools = getToolsForProvider(providerName, schemas);
 
@@ -104,6 +106,7 @@ async function runAgentLoop({
   let activeToolChoice = toolChoice;
   const startTime = Date.now();
   const deadline = startTime + timeoutMs;
+  const attemptedModels = new Set();
 
   // Build agent context for agent tools (allows sub-agent spawning)
   const agentContext = {
@@ -116,6 +119,7 @@ async function runAgentLoop({
       apiKey,
       apiKeyResolver,
       depth,
+      lockProvider,
     },
     runAgentLoopFn: runAgentLoop,
   };
@@ -135,32 +139,58 @@ async function runAgentLoop({
 
     let response;
     const maxRetries = 3;
-    for (let attempt = 1; attempt <= maxRetries; attempt++) {
-      try {
-        response = await providerMod.sendRequest({
-          model: resolvedModel,
-          system,
-          messages,
-          tools,
-          thinking: resolvedThinking,
-          apiKey,
-          baseUrl,
-          toolChoice: activeToolChoice,
-        });
-        break; // success
-      } catch (err) {
-        const isTransient = /503|502|500|529|overloaded|unavailable|service\s+temporarily|fetch\s+failed|network|ECONNRESET|ETIMEDOUT|ENOTFOUND/i.test(err.message);
-        const isRateLimit = /429|rate.?limit|too.many.requests/i.test(err.message);
-        const shouldRetry = (isTransient || isRateLimit) && attempt < maxRetries;
-        if (shouldRetry) {
-          const delayMs = isRateLimit ? 60000 : 15000 * attempt;
-          console.warn(`[agent-loop] ${depthPrefix}Turn ${turns} attempt ${attempt} failed (${err.message.slice(0, 80)}...) — retrying in ${delayMs / 1000}s`);
-          await new Promise(r => setTimeout(r, delayMs));
-        } else {
+    let modelForTurn = resolvedModel;
+    while (true) {
+      attemptedModels.add(modelForTurn || providerMod.DEFAULT_MODEL);
+      let fallbackTriggered = false;
+      for (let attempt = 1; attempt <= maxRetries; attempt++) {
+        try {
+          response = await providerMod.sendRequest({
+            providerName,
+            model: modelForTurn,
+            system,
+            messages,
+            tools,
+            thinking: resolvedThinking,
+            apiKey,
+            baseUrl,
+            toolChoice: activeToolChoice,
+          });
+          resolvedModel = modelForTurn;
+          break;
+        } catch (err) {
+          const isTransient = /503|502|500|529|overloaded|unavailable|service\s+temporarily|fetch\s+failed|network|ECONNRESET|ETIMEDOUT|ENOTFOUND/i.test(err.message);
+          const isRateLimit = /429|rate.?limit|too.many.requests/i.test(err.message);
+          const shouldRetry = (isTransient || isRateLimit) && attempt < maxRetries;
+          if (shouldRetry) {
+            const delayMs = isRateLimit ? 60000 : 15000 * attempt;
+            console.warn(`[agent-loop] ${depthPrefix}Turn ${turns} attempt ${attempt} failed (${err.message.slice(0, 80)}...) — retrying in ${delayMs / 1000}s`);
+            await new Promise(r => setTimeout(r, delayMs));
+            continue;
+          }
+
+          const fallbackModel = (isTransient || isRateLimit)
+            ? getFallbackModel(providerName, modelForTurn || providerMod.DEFAULT_MODEL, attemptedModels)
+            : null;
+          if (fallbackModel) {
+            console.warn(`[agent-loop] ${depthPrefix}Switching ${providerName} model from ${modelForTurn || providerMod.DEFAULT_MODEL} to fallback ${fallbackModel} after API failures`);
+            modelForTurn = fallbackModel;
+            if (providerName === 'xai') {
+              const xaiConfig = getProviderConfig('xai');
+              if (!xaiConfig.reasoningEffortModels.includes(modelForTurn)) {
+                resolvedThinking = undefined;
+              }
+            }
+            fallbackTriggered = true;
+            break;
+          }
+
           console.error(`[agent-loop] ${depthPrefix}API error on turn ${turns}: ${err.message}`);
           throw err;
         }
       }
+      if (response) break;
+      if (!fallbackTriggered) break;
     }
 
     totalInputTokens += response.usage.inputTokens;

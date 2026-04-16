@@ -3,6 +3,9 @@
 
 const { buildSkillPrompt, buildCustomPrompt } = require('./prompt-builder');
 const { runAgentLoop } = require('./agent-loop');
+const { runOpenAiNative } = require('./openai-native');
+const { runOpenAiNativeSkill } = require('./openai-native-stage-runner');
+const { DEFAULT_RUNTIME, resolveRuntime } = require('./runtime-config');
 const { readSecret } = require('../secrets');
 const { getProviderConfig } = require('./provider-config');
 
@@ -27,26 +30,29 @@ const { getProviderConfig } = require('./provider-config');
  */
 async function runSkill(name, prompt, opts = {}) {
   const cwd = opts.cwd || '/srv/bot/workspace';
+  const provider = opts.provider || 'gemini';
+  const runtime = resolveRuntime(provider, opts.runtime);
+
+  if (provider === 'openai' && runtime === 'openai-native') {
+    return runOpenAiNativeSkill(name, prompt, {
+      ...opts,
+      provider,
+      runtime,
+      cwd,
+      apiKey: resolveApiKey(provider, opts.apiKeys || {}),
+      apiKeyResolver: (p) => resolveApiKey(p, opts.apiKeys || {}),
+    });
+  }
+
   const system = buildSkillPrompt(name, { cwd }) + (opts.systemAppend ? '\n\n' + opts.systemAppend : '');
 
   if (opts.dryRun) {
     return dryRun(system, prompt, opts);
   }
 
-  const provider = opts.provider || 'gemini';
-  return runAgentLoop({
+  return runWithSystem(system, prompt, {
+    ...opts,
     provider,
-    model: opts.model,
-    system,
-    userMessage: prompt,
-    maxTurns: opts.maxTurns || 100,
-    timeoutMs: (opts.timeout || 30) * 60 * 1000,
-    cwd,
-    verbose: opts.verbose || false,
-    thinking: opts.thinking || 'medium',
-    apiKey: resolveApiKey(provider, opts.apiKeys || {}),
-    toolChoice: opts.toolChoice,
-    apiKeyResolver: (p) => resolveApiKey(p, opts.apiKeys || {}),
   });
 }
 
@@ -67,8 +73,21 @@ async function runCustom(systemText, prompt, opts = {}) {
   }
 
   const provider = opts.provider || 'gemini';
-  return runAgentLoop({
+  return runWithSystem(system, prompt, {
+    ...opts,
     provider,
+  });
+}
+
+async function runWithSystem(system, prompt, opts = {}) {
+  const provider = opts.provider || 'gemini';
+  const cwd = opts.cwd || '/srv/bot/workspace';
+  const runtime = resolveRuntime(provider, opts.runtime);
+  const runner = runtime === 'openai-native' ? runOpenAiNative : runAgentLoop;
+
+  return runner({
+    provider,
+    runtime,
     model: opts.model,
     system,
     userMessage: prompt,
@@ -80,6 +99,8 @@ async function runCustom(systemText, prompt, opts = {}) {
     apiKey: resolveApiKey(provider, opts.apiKeys || {}),
     toolChoice: opts.toolChoice,
     apiKeyResolver: (p) => resolveApiKey(p, opts.apiKeys || {}),
+    lockProvider: !!opts.lockProvider,
+    session: opts.session,
   });
 }
 
@@ -105,7 +126,7 @@ function listProviders() {
   return getProviderNames();
 }
 
-module.exports = { runSkill, runCustom, resolveApiKey, listProviders };
+module.exports = { runSkill, runCustom, resolveApiKey, listProviders, runWithSystem };
 
 function dryRun(system, prompt, opts) {
   console.log('=== DRY RUN ===\n');
@@ -115,6 +136,7 @@ function dryRun(system, prompt, opts) {
   console.log(prompt);
   console.log('\n--- Options ---');
   console.log(`Provider: ${opts.provider || 'gemini'}`);
+  console.log(`Runtime: ${opts.runtime || DEFAULT_RUNTIME}`);
   console.log(`Model: ${opts.model || '(default)'}`);
   console.log(`Thinking: ${opts.thinking || 'medium'}`);
   console.log(`Tool Choice: ${opts.toolChoice || '(default)'}`);
