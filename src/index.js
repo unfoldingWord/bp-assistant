@@ -145,18 +145,19 @@ async function main() {
 
   // Auto-recheck pending merges every hour — if the conflicting PR was
   // closed/merged externally, resume insertion without waiting for "merged"
-  setInterval(async () => {
-    try {
-      const pendingMerges = getAllPendingMerges();
-      if (pendingMerges.length === 0) return;
-      console.log(`[bot] Auto-rechecking ${pendingMerges.length} pending merge(s)...`);
-      for (const pm of pendingMerges) {
-        await resumeInsertion(pm.sessionKey, pm.originalMessage);
-      }
-    } catch (err) {
-      console.error(`[bot] Auto-recheck failed: ${err.message}`);
-    }
-  }, 60 * 60 * 1000);
+  // NOTE: disabled — re-enable when not testing manual merge flow
+  // setInterval(async () => {
+  //   try {
+  //     const pendingMerges = getAllPendingMerges();
+  //     if (pendingMerges.length === 0) return;
+  //     console.log(`[bot] Auto-rechecking ${pendingMerges.length} pending merge(s)...`);
+  //     for (const pm of pendingMerges) {
+  //       await resumeInsertion(pm.sessionKey, pm.originalMessage);
+  //     }
+  //   } catch (err) {
+  //     console.error(`[bot] Auto-recheck failed: ${err.message}`);
+  //   }
+  // }, 60 * 60 * 1000);
 
   // If the loop exits (queue expired), restart everything
   while (true) {
