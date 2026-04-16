@@ -28,6 +28,7 @@ const REQUIRED_ARTIFACT_KEYS = ['ult', 'ultAligned', 'ust', 'ustAligned', 'issue
 const { runCustom, runSkill } = require(path.join(SRC, 'api-runner/runner'));
 const { getProviderConfig, resolveProviderModel } = require(path.join(SRC, 'api-runner/provider-config'));
 const { getProviderSystemAppend } = require(path.join(SRC, 'api-runner/provider-nudges'));
+const { DEFAULT_RUNTIME, resolveRuntime } = require(path.join(SRC, 'api-runner/runtime-config'));
 const { buildNotesContext, readContext, writeContext } = require(path.join(SRC, 'pipeline-context'));
 const {
   extractAlignmentData,
@@ -50,6 +51,7 @@ function patchConsoleWithTimestamps() {
 function parseArgs(argv) {
   const out = {
     provider: null,
+    runtime: DEFAULT_RUNTIME,
     opusModel: null,
     sonnetModel: null,
     resumeFrom: null,
@@ -62,6 +64,7 @@ function parseArgs(argv) {
     const arg = argv[i];
     switch (arg) {
       case '--provider': out.provider = argv[++i]; break;
+      case '--runtime': out.runtime = argv[++i]; break;
       case '--opus-model': out.opusModel = argv[++i]; break;
       case '--sonnet-model': out.sonnetModel = argv[++i]; break;
       case '--resume-from': out.resumeFrom = argv[++i]; break;
@@ -76,6 +79,7 @@ function parseArgs(argv) {
   if (!SUPPORTED_PROVIDERS.includes(out.provider)) {
     throw new Error(`Unknown provider: ${out.provider}`);
   }
+  out.runtime = resolveRuntime(out.provider, out.runtime);
   if (out.resumeFrom && !STEP_ORDER.includes(out.resumeFrom)) {
     throw new Error(`--resume-from must be one of: ${STEP_ORDER.join(', ')}`);
   }
@@ -114,9 +118,14 @@ function outputPaths(book, chapter) {
   };
 }
 
-function destPaths(provider, book, chapter) {
+function destDirName(provider, runtime = DEFAULT_RUNTIME) {
+  if (provider === 'openai' && runtime === 'openai-native') return 'openai-native';
+  return `${provider}-api`;
+}
+
+function destPaths(provider, book, chapter, runtime = DEFAULT_RUNTIME) {
   const tag = chapterTag(book, chapter);
-  const dir = path.join(TEST_ROOT, `${provider}-api`);
+  const dir = path.join(TEST_ROOT, destDirName(provider, runtime));
   return {
     dir,
     ult: path.join(dir, `${tag}.usfm`),
@@ -137,24 +146,39 @@ function getHarnessModels(provider, overrides = {}) {
   };
 }
 
-function clearOutput(book, chapter) {
+function getCleanupTargets(book, chapter, provider, runtime = DEFAULT_RUNTIME) {
   const tag = chapterTag(book, chapter);
-  for (const subdir of [`output/AI-ULT/${book}`, `output/AI-UST/${book}`, `output/issues/${book}`, `output/notes/${book}`]) {
-    const dir = path.join(WORKSPACE, subdir);
-    if (!fs.existsSync(dir)) continue;
-    for (const file of fs.readdirSync(dir)) {
-      if (file.startsWith(tag)) fs.rmSync(path.join(dir, file), { force: true });
-    }
-  }
+  const dst = destPaths(provider, book, chapter, runtime);
+  return [
+    path.join(WORKSPACE, `output/AI-ULT/${book}/${tag}.usfm`),
+    path.join(WORKSPACE, `output/AI-ULT/${book}/${tag}-aligned.usfm`),
+    path.join(WORKSPACE, `output/AI-UST/${book}/${tag}.usfm`),
+    path.join(WORKSPACE, `output/AI-UST/${book}/${tag}-aligned.usfm`),
+    path.join(WORKSPACE, `output/AI-UST/${book}/${tag}-alignment.json`),
+    path.join(WORKSPACE, `output/AI-UST/hints/${book}/${tag}.json`),
+    path.join(WORKSPACE, `output/issues/${book}/${tag}.tsv`),
+    path.join(WORKSPACE, `output/notes/${book}/${tag}.tsv`),
+    path.join(WORKSPACE, `output/quality/${book}/${tag}.json`),
+    path.join(WORKSPACE, `output/quality/${book}/${tag}-quality.md`),
+    path.join(WORKSPACE, `tmp/alignments/${book}/${tag}-mapping.json`),
+    path.join(WORKSPACE, `tmp/alignments/${book}/${tag}-ult-fixed.json`),
+    path.join(WORKSPACE, `tmp/alignments/${book}/${tag}-ult.json`),
+    path.join(WORKSPACE, `tmp/alignments/${book}/${tag}-ust.json`),
+    path.join(WORKSPACE, `tmp/${tag}-alignment-mapping.json`),
+    path.join(WORKSPACE, `tmp/pipeline/${tag}`),
+    path.join(WORKSPACE, `tmp/pipeline-${tag}`),
+    dst.dir,
+  ];
 }
 
-function clearSnapshot(provider, book, chapter) {
-  const tag = chapterTag(book, chapter);
-  const dst = destPaths(provider, book, chapter);
-  if (!fs.existsSync(dst.dir)) return;
-  for (const file of fs.readdirSync(dst.dir)) {
-    if (file === 'MODELS.md' || file.startsWith(tag)) {
-      fs.rmSync(path.join(dst.dir, file), { force: true });
+function clearOutput(book, chapter, provider, runtime = DEFAULT_RUNTIME) {
+  for (const target of getCleanupTargets(book, chapter, provider, runtime)) {
+    if (!fs.existsSync(target)) continue;
+    const stat = fs.statSync(target);
+    if (stat.isDirectory()) {
+      fs.rmSync(target, { recursive: true, force: true });
+    } else {
+      fs.rmSync(target, { force: true });
     }
   }
 }
@@ -186,7 +210,7 @@ function validateRequiredArtifacts(paths) {
   };
 }
 
-async function runGeminiSmokeGate({ provider, model, thinking = 'medium' }) {
+async function runGeminiSmokeGate({ provider, runtime = DEFAULT_RUNTIME, model, thinking = 'medium' }) {
   if (provider !== 'gemini') return [];
 
   const observations = [];
@@ -197,6 +221,7 @@ async function runGeminiSmokeGate({ provider, model, thinking = 'medium' }) {
     'Return OK only.',
     {
       provider,
+      runtime,
       model,
       thinking,
       cwd: APP_ROOT,
@@ -222,6 +247,7 @@ async function runGeminiSmokeGate({ provider, model, thinking = 'medium' }) {
     'Use the required tool call, then reply in the requested format.',
     {
       provider,
+      runtime,
       model,
       thinking,
       cwd: APP_ROOT,
@@ -262,9 +288,10 @@ function snapshotPartials(out, dst) {
   copyIfExists(out.notes, dst.notes);
 }
 
-function writeModelsMd({ provider, opusModel, sonnetModel, book, chapter, steps, observations, failed, durationMs, dstDir, dst }) {
+function writeModelsMd({ provider, runtime = DEFAULT_RUNTIME, opusModel, sonnetModel, book, chapter, steps, observations, failed, durationMs, dstDir, dst }) {
   const lines = [];
-  lines.push(`# ${provider.toUpperCase()} API run — ${book} ${chapter}`);
+  const runtimeLabel = runtime === 'openai-native' ? 'native' : 'API';
+  lines.push(`# ${provider.toUpperCase()} ${runtimeLabel} run — ${book} ${chapter}`);
   lines.push('');
   lines.push(`Run timestamp: ${new Date().toISOString()}`);
   lines.push(`Wall-clock: ${(durationMs / 60000).toFixed(2)} min`);
@@ -278,6 +305,7 @@ function writeModelsMd({ provider, opusModel, sonnetModel, book, chapter, steps,
   lines.push('## Provider & models');
   lines.push('');
   lines.push(`- Provider: \`${provider}\``);
+  lines.push(`- Runtime: \`${runtime}\``);
   lines.push(`- Opus-tier model (initial-pipeline, tn-writer): \`${opusModel}\``);
   lines.push(`- Sonnet-tier model (alignment, tn-quality-check): \`${sonnetModel}\``);
   lines.push('- Thinking level: medium');
@@ -314,12 +342,12 @@ function writeModelsMd({ provider, opusModel, sonnetModel, book, chapter, steps,
 }
 
 async function runProvider(opts) {
-  const { provider, book, chapter } = opts;
+  const { provider, runtime, book, chapter } = opts;
   const { opus: opusModel, sonnet: sonnetModel } = getHarnessModels(provider, opts);
   const startWall = Date.now();
   const steps = [];
   const observations = [];
-  const dst = destPaths(provider, book, chapter);
+  const dst = destPaths(provider, book, chapter, runtime);
   const out = outputPaths(book, chapter);
   const resumeIdx = opts.resumeFrom ? STEP_ORDER.indexOf(opts.resumeFrom) : 0;
   fs.mkdirSync(dst.dir, { recursive: true });
@@ -350,6 +378,7 @@ async function runProvider(opts) {
     recordStep(step, model, null, message);
     writeModelsMd({
       provider,
+      runtime,
       opusModel,
       sonnetModel,
       book,
@@ -374,12 +403,12 @@ async function runProvider(opts) {
   }
 
   if (!opts.keepOutput && resumeIdx === 0) {
-    clearOutput(book, chapter);
-    clearSnapshot(provider, book, chapter);
+    clearOutput(book, chapter, provider, runtime);
     console.log(`[clear] removed prior output and snapshot for ${chapterTag(book, chapter)}`);
   }
 
   const baseOpts = {
+    runtime,
     thinking: 'medium',
     cwd: WORKSPACE,
     verbose: false,
@@ -390,6 +419,7 @@ async function runProvider(opts) {
     try {
       observations.push(...await runGeminiSmokeGate({
         provider,
+        runtime,
         model: opusModel,
         thinking: baseOpts.thinking,
       }));
@@ -603,6 +633,7 @@ async function runProvider(opts) {
 
   writeModelsMd({
     provider,
+    runtime,
     opusModel,
     sonnetModel,
     book,
@@ -639,8 +670,9 @@ module.exports = {
   classifyError,
   chapterTag,
   clearOutput,
-  clearSnapshot,
+  destDirName,
   destPaths,
+  getCleanupTargets,
   getHarnessModels,
   outputPaths,
   parseArgs,

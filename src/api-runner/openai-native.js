@@ -35,6 +35,7 @@ async function runOpenAiNative({
   lockProvider = false,
   runtime = 'openai-native',
   session,
+  toolSchemas = TOOL_SCHEMAS,
 }) {
   if (providerName !== 'openai') {
     throw new Error(`OpenAI native runtime only supports provider "openai" (received "${providerName}")`);
@@ -76,6 +77,7 @@ async function runOpenAiNative({
         apiKeyResolver,
         lockProvider,
         runtime,
+        toolSchemas,
       }),
       modelSettings: buildModelSettings({ model: modelId, thinking, toolChoice }),
     });
@@ -118,7 +120,8 @@ async function runOpenAiNative({
 }
 
 function buildOpenAiNativeTools(parentOpts) {
-  return TOOL_SCHEMAS.map((schema) => tool({
+  const toolSchemas = parentOpts.toolSchemas || TOOL_SCHEMAS;
+  return toolSchemas.map((schema) => tool({
     name: schema.name,
     description: schema.description,
     parameters: strictifySchema(schema.parameters),

@@ -16,14 +16,195 @@ const {
 const geminiProvider = require('../src/api-runner/providers/gemini');
 const {
   getHarnessModels,
+  getCleanupTargets,
   validateRequiredArtifacts,
+  destDirName,
 } = require('../scripts/test-providers-zec3');
 const {
   resolveAgentProvider,
   resolveAgentRuntime,
 } = require('../src/api-runner/team-manager');
 const { getProviderSystemAppend } = require('../src/api-runner/provider-nudges');
+const {
+  OPENAI_TOOL_SCHEMAS,
+  buildCanonicalPaths,
+  verifyOutputFile,
+} = require('../src/api-runner/openai-native-stage-runner');
 const { readPreparedNotes } = require('../src/workspace-tools/tn-tools');
+
+test('openai native tool catalog excludes recursive agent tools', () => {
+  const names = OPENAI_TOOL_SCHEMAS.map((schema) => schema.name);
+  assert.equal(names.includes('Agent'), false);
+  assert.equal(names.includes('TeamCreate'), false);
+  assert.equal(names.includes('SendMessage'), false);
+  assert.equal(names.includes('TaskCreate'), false);
+  assert.equal(names.includes('TaskGet'), false);
+  assert.equal(names.includes('Read'), true);
+  assert.equal(names.includes('mcp__workspace-tools__read_prepared_notes'), true);
+});
+
+test('openai native output verification rejects missing and empty files', () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'openai-native-verify-'));
+  const missingPath = path.join(tempDir, 'missing.tsv');
+  assert.throws(() => verifyOutputFile(missingPath, 'notes'), /missing/);
+
+  const emptyPath = path.join(tempDir, 'empty.tsv');
+  fs.writeFileSync(emptyPath, '');
+  assert.throws(() => verifyOutputFile(emptyPath, 'notes'), /empty/);
+
+  const okPath = path.join(tempDir, 'ok.tsv');
+  fs.writeFileSync(okPath, 'Reference\tID\nZEC 3:1\ta1b2\n');
+  assert.doesNotThrow(() => verifyOutputFile(okPath, 'notes'));
+});
+
+test('runSkill delegates openai native skills to the native stage runner', async () => {
+  const runnerPath = require.resolve('../src/api-runner/runner');
+  const stageRunnerPath = require.resolve('../src/api-runner/openai-native-stage-runner');
+  const stageRunnerModule = require(stageRunnerPath);
+  const originalRunOpenAiNativeSkill = stageRunnerModule.runOpenAiNativeSkill;
+
+  let received = null;
+  stageRunnerModule.runOpenAiNativeSkill = async (skillName, prompt, opts) => {
+    received = { skillName, prompt, opts };
+    return {
+      turns: 1,
+      inputTokens: 10,
+      outputTokens: 5,
+      cost: 0.01,
+      durationMs: 5,
+      finalText: 'ok',
+    };
+  };
+
+  delete require.cache[runnerPath];
+
+  try {
+    const runner = require(runnerPath);
+    const result = await runner.runSkill('tn-writer', 'ZEC 3 --context tmp/pipeline/ZEC-03/context.json', {
+      provider: 'openai',
+      runtime: 'openai-native',
+      cwd: '/srv/bot/workspace',
+      apiKeys: { openai: 'test-key' },
+    });
+
+    assert.equal(received.skillName, 'tn-writer');
+    assert.equal(received.prompt, 'ZEC 3 --context tmp/pipeline/ZEC-03/context.json');
+    assert.equal(received.opts.runtime, 'openai-native');
+    assert.equal(result.finalText, 'ok');
+  } finally {
+    stageRunnerModule.runOpenAiNativeSkill = originalRunOpenAiNativeSkill;
+    delete require.cache[runnerPath];
+  }
+});
+
+test('openai native initial-pipeline expands into ULT, issues, and UST stages', async () => {
+  const agentLoopPath = require.resolve('../src/api-runner/agent-loop');
+  const stageRunnerPath = require.resolve('../src/api-runner/openai-native-stage-runner');
+  const agentLoopModule = require(agentLoopPath);
+  const originalRunAgentLoop = agentLoopModule.runAgentLoop;
+  const tempTag = `JON-${String(9).padStart(2, '0')}`;
+  const cwd = '/srv/bot/workspace';
+  const outputs = buildCanonicalPaths(cwd, 'JON', 9);
+  const pipelineDir = path.join(cwd, 'tmp/pipeline', tempTag);
+
+  for (const target of [
+    outputs.ult,
+    outputs.ust,
+    outputs.issues,
+    pipelineDir,
+  ]) {
+    if (fs.existsSync(target)) {
+      fs.rmSync(target, { recursive: true, force: true });
+    }
+  }
+
+  agentLoopModule.runAgentLoop = async (opts) => {
+    const system = String(opts.system || '');
+    if (system.includes('name: ULT-gen')) {
+      fs.mkdirSync(path.dirname(outputs.ult), { recursive: true });
+      fs.writeFileSync(outputs.ult, '\\id JON\n\\c 9\n\\v 1 test\n');
+    } else if (system.includes('name: deep-issue-id')) {
+      fs.mkdirSync(path.dirname(outputs.issues), { recursive: true });
+      fs.writeFileSync(outputs.issues, 'Reference\tID\tTags\tSupportReference\tQuote\tOccurrence\tNote\nJON 9:1\ta1b2\tfigs-metaphor\t\tfish\t1\tTest\n');
+    } else if (system.includes('name: UST-gen')) {
+      fs.mkdirSync(path.dirname(outputs.ust), { recursive: true });
+      fs.writeFileSync(outputs.ust, '\\id JON\n\\c 9\n\\v 1 test\n');
+    }
+
+    return {
+      turns: 1,
+      inputTokens: 10,
+      outputTokens: 5,
+      cost: 0.01,
+      durationMs: 5,
+      finalText: 'ok',
+    };
+  };
+
+  delete require.cache[stageRunnerPath];
+
+  try {
+    const { runOpenAiNativeSkill } = require(stageRunnerPath);
+    const result = await runOpenAiNativeSkill('initial-pipeline', 'jon 9', {
+      provider: 'openai',
+      runtime: 'openai-native',
+      cwd,
+      apiKey: 'test-key',
+      apiKeyResolver: () => 'test-key',
+    });
+
+    assert.deepEqual(result.steps.map((step) => step.skill), ['ULT-gen', 'deep-issue-id', 'UST-gen']);
+    assert.equal(fs.existsSync(outputs.ult), true);
+    assert.equal(fs.existsSync(outputs.issues), true);
+    assert.equal(fs.existsSync(outputs.ust), true);
+  } finally {
+    agentLoopModule.runAgentLoop = originalRunAgentLoop;
+    if (fs.existsSync(outputs.ult)) fs.rmSync(outputs.ult, { force: true });
+    if (fs.existsSync(outputs.ust)) fs.rmSync(outputs.ust, { force: true });
+    if (fs.existsSync(outputs.issues)) fs.rmSync(outputs.issues, { force: true });
+    if (fs.existsSync(pipelineDir)) fs.rmSync(pipelineDir, { recursive: true, force: true });
+  }
+});
+
+test('runWithSystem forwards cwd into the openai native runtime', async () => {
+  const runnerPath = require.resolve('../src/api-runner/runner');
+  const nativePath = require.resolve('../src/api-runner/openai-native');
+  const originalNativeModule = require.cache[nativePath];
+  const nativeModule = require(nativePath);
+  const originalRunOpenAiNative = nativeModule.runOpenAiNative;
+
+  let receivedOpts = null;
+  nativeModule.runOpenAiNative = async (opts) => {
+    receivedOpts = opts;
+    return {
+      turns: 0,
+      inputTokens: 0,
+      outputTokens: 0,
+      cost: 0,
+      durationMs: 0,
+      finalText: 'ok',
+    };
+  };
+
+  delete require.cache[runnerPath];
+
+  try {
+    const runner = require(runnerPath);
+    await runner.runWithSystem('system', 'prompt', {
+      provider: 'openai',
+      runtime: 'openai-native',
+      cwd: '/tmp/native-cwd',
+      apiKeys: { openai: 'test-key' },
+    });
+
+    assert.equal(receivedOpts.cwd, '/tmp/native-cwd');
+    assert.equal(receivedOpts.runtime, 'openai-native');
+  } finally {
+    nativeModule.runOpenAiNative = originalRunOpenAiNative;
+    delete require.cache[runnerPath];
+    if (originalNativeModule) require.cache[nativePath] = originalNativeModule;
+  }
+});
 
 test('openai aliases resolve to current runner defaults', () => {
   assert.equal(resolveProviderModel('openai', 'opus'), 'gpt-5.4');
@@ -79,6 +260,51 @@ test('gemini ZEC harness defaults follow provider-config aliases', () => {
   assert.equal(models.sonnet, resolveProviderModel('gemini', 'sonnet'));
   assert.equal(models.opus, 'gemini-3.1-pro-preview');
   assert.equal(models.sonnet, 'gemini-2.5-pro');
+});
+
+test('zec harness parses runtime flag for openai native runs', () => {
+  const args = require('../scripts/test-providers-zec3').parseArgs([
+    'node',
+    'scripts/test-providers-zec3.js',
+    '--provider', 'openai',
+    '--runtime', 'openai-native',
+  ]);
+
+  assert.equal(args.provider, 'openai');
+  assert.equal(args.runtime, 'openai-native');
+});
+
+test('zec harness keeps generic api as the default runtime', () => {
+  const args = require('../scripts/test-providers-zec3').parseArgs([
+    'node',
+    'scripts/test-providers-zec3.js',
+    '--provider', 'openai',
+  ]);
+
+  assert.equal(args.runtime, DEFAULT_RUNTIME);
+});
+
+test('zec harness files openai native snapshots in a sibling folder', () => {
+  assert.equal(destDirName('openai', DEFAULT_RUNTIME), 'openai-api');
+  assert.equal(destDirName('openai', 'openai-native'), 'openai-native');
+  assert.equal(destDirName('gemini', DEFAULT_RUNTIME), 'gemini-api');
+});
+
+test('zec harness cleanup includes live zec 3 output and temp artifacts', () => {
+  const targets = getCleanupTargets('ZEC', 3, 'openai', 'openai-native');
+
+  assert.ok(targets.some((target) => target.endsWith('/workspace/output/AI-ULT/ZEC/ZEC-03.usfm')));
+  assert.ok(targets.some((target) => target.endsWith('/workspace/output/AI-UST/ZEC/ZEC-03-aligned.usfm')));
+  assert.ok(targets.some((target) => target.endsWith('/workspace/output/issues/ZEC/ZEC-03.tsv')));
+  assert.ok(targets.some((target) => target.endsWith('/workspace/output/notes/ZEC/ZEC-03.tsv')));
+  assert.ok(targets.some((target) => target.endsWith('/workspace/output/quality/ZEC/ZEC-03-quality.md')));
+  assert.ok(targets.some((target) => target.endsWith('/workspace/output/AI-UST/hints/ZEC/ZEC-03.json')));
+  assert.ok(targets.some((target) => target.endsWith('/workspace/tmp/alignments/ZEC/ZEC-03-mapping.json')));
+  assert.ok(targets.some((target) => target.endsWith('/workspace/tmp/ZEC-03-alignment-mapping.json')));
+  assert.ok(targets.some((target) => target.endsWith('/workspace/tmp/pipeline/ZEC-03')));
+  assert.ok(targets.some((target) => target.endsWith('/workspace/tmp/pipeline-ZEC-03')));
+  assert.ok(targets.some((target) => target.endsWith('/workspace/test/zec-03/openai-native')));
+  assert.equal(targets.some((target) => target.endsWith('/workspace/test/zec-03/openai-api')), false);
 });
 
 test('gemini tool results preserve upstream tool call ids', () => {

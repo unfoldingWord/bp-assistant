@@ -321,7 +321,18 @@ async function buildNotesContext({ book, chapter, verseStart, verseEnd, issuesPa
  * @param {number} [opts.verseEnd]
  * @returns {{dirPath: string, contextPath: string}}
  */
-function buildGenerateContext({ book, chapter, ultPath, ustPath, verseStart, verseEnd, dirPath: existingDirPath = null }) {
+function buildGenerateContext({
+  book,
+  chapter,
+  ultPath,
+  ustPath,
+  issuesPath = null,
+  ultFullPath = null,
+  ustFullPath = null,
+  verseStart,
+  verseEnd,
+  dirPath: existingDirPath = null,
+}) {
   const dirPath = existingDirPath || createPipelineDir({ book, chapter, verseStart, verseEnd, reset: true });
   const bookUpper = book.toUpperCase();
   const num = BOOK_NUMBERS[bookUpper];
@@ -338,7 +349,10 @@ function buildGenerateContext({ book, chapter, ultPath, ustPath, verseStart, ver
     sources: {
       ult: ultPath,
       ust: ustPath || null,
+      ultFull: ultFullPath || ultPath,
+      ustFull: ustFullPath || ustPath || null,
       hebrew: hebrewPath,
+      issues: issuesPath,
     },
     sourceOrigin: {
       ult: { from: 'pipeline', skill: 'initial-pipeline' },

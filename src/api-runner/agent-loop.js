@@ -65,14 +65,15 @@ async function runAgentLoop({
   depth = 0,
   apiKeyResolver,
   lockProvider = false,
+  toolSchemas,
 }) {
   const providerMod = PROVIDERS[providerName]();
 
   // Determine which tools are available at this depth
   // Sub-agents at max depth don't get agent tools (prevents infinite recursion)
-  let schemas = TOOL_SCHEMAS;
+  let schemas = toolSchemas || TOOL_SCHEMAS;
   if (depth >= MAX_DEPTH) {
-    schemas = TOOL_SCHEMAS.filter(s => !isAgentTool(s.name));
+    schemas = schemas.filter(s => !isAgentTool(s.name));
   }
   const tools = getToolsForProvider(providerName, schemas);
 
