@@ -78,6 +78,7 @@ async function spawnAgent(opts, parentOpts, runAgentLoopFn) {
   }
 
   const provider = resolveAgentProvider(opts, parentOpts);
+  const runtime = resolveAgentRuntime(opts, parentOpts);
   const requestedModel = opts.model || (provider === parentOpts.provider ? parentOpts.model : undefined);
   const model = normalizeAgentModel(provider, requestedModel);
   const thinking = opts.thinking || parentOpts.thinking || 'medium';
@@ -87,7 +88,7 @@ async function spawnAgent(opts, parentOpts, runAgentLoopFn) {
   // Build system prompt for the sub-agent
   const system = opts.system || `You are "${opts.name}", a specialist sub-agent. Complete your assigned task thoroughly and return your final answer as text.`;
 
-  console.log(`[team-manager] Spawning agent "${opts.name}" (provider: ${provider}, model: ${model || 'default'}, depth: ${depth})`);
+  console.log(`[team-manager] Spawning agent "${opts.name}" (provider: ${provider}, runtime: ${runtime}, model: ${model || 'default'}, depth: ${depth})`);
 
   // Register in team if specified
   let agentState;
@@ -102,9 +103,11 @@ async function spawnAgent(opts, parentOpts, runAgentLoopFn) {
       name: opts.name,
       systemPrompt: system,
       provider,
+      runtime,
       model,
       thinking,
       messages: [],
+      session: null,
       status: 'running',
       lastResult: '',
     };
@@ -114,6 +117,7 @@ async function spawnAgent(opts, parentOpts, runAgentLoopFn) {
   try {
     const result = await runAgentLoopFn({
       provider,
+      runtime,
       model,
       system,
       userMessage: opts.prompt,
@@ -134,6 +138,7 @@ async function spawnAgent(opts, parentOpts, runAgentLoopFn) {
       agentState.status = 'completed';
       agentState.lastResult = finalText;
       agentState.messages = result._messages || [];
+      agentState.session = result._session || null;
     }
 
     console.log(`[team-manager] Agent "${opts.name}" completed — ${result.turns} turns, $${result.cost.toFixed(4)}`);
@@ -181,10 +186,12 @@ async function sendMessageToAgent(opts, parentOpts, runAgentLoopFn) {
   try {
     const result = await runAgentLoopFn({
       provider: agent.provider,
+      runtime: agent.runtime,
       model: normalizeAgentModel(agent.provider, agent.model),
       system: agent.systemPrompt,
       userMessage: opts.message,
       existingMessages: agent.messages,
+      session: agent.session || undefined,
       maxTurns: 50,
       timeoutMs: 15 * 60 * 1000,
       cwd: parentOpts.cwd || '/srv/bot/workspace',
@@ -198,6 +205,7 @@ async function sendMessageToAgent(opts, parentOpts, runAgentLoopFn) {
     agent.status = 'completed';
     agent.lastResult = result.finalText || '(no output)';
     agent.messages = result._messages || [];
+    agent.session = result._session || null;
 
     console.log(`[team-manager] Agent "${opts.to}" responded — ${result.turns} turns, $${result.cost.toFixed(4)}`);
     return agent.lastResult;
@@ -264,6 +272,13 @@ function resolveAgentProvider(opts, parentOpts) {
   return opts.provider || parentOpts.provider || 'gemini';
 }
 
+function resolveAgentRuntime(opts, parentOpts) {
+  if (parentOpts?.lockProvider && parentOpts?.runtime) {
+    return parentOpts.runtime;
+  }
+  return opts.runtime || parentOpts.runtime || 'generic-api';
+}
+
 module.exports = {
   createTeam,
   deleteTeam,
@@ -275,4 +290,5 @@ module.exports = {
   MAX_DEPTH,
   normalizeAgentModel,
   resolveAgentProvider,
+  resolveAgentRuntime,
 };

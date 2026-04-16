@@ -381,4 +381,5 @@ module.exports = {
   executeTool,
   listToolNames,
   getToolDescriptions,
+  strictifySchema,
 };

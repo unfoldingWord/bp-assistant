@@ -8,12 +8,20 @@ const {
   getProviderConfig,
   resolveProviderModel,
 } = require('../src/api-runner/provider-config');
+const { parseArgs } = require('../src/api-runner/cli');
+const {
+  DEFAULT_RUNTIME,
+  resolveRuntime,
+} = require('../src/api-runner/runtime-config');
 const geminiProvider = require('../src/api-runner/providers/gemini');
 const {
   getHarnessModels,
   validateRequiredArtifacts,
 } = require('../scripts/test-providers-zec3');
-const { resolveAgentProvider } = require('../src/api-runner/team-manager');
+const {
+  resolveAgentProvider,
+  resolveAgentRuntime,
+} = require('../src/api-runner/team-manager');
 const { getProviderSystemAppend } = require('../src/api-runner/provider-nudges');
 const { readPreparedNotes } = require('../src/workspace-tools/tn-tools');
 
@@ -23,6 +31,35 @@ test('openai aliases resolve to current runner defaults', () => {
   assert.equal(resolveProviderModel('openai', 'haiku'), 'gpt-5.4-nano');
   assert.equal(resolveProviderModel('xai', 'opus'), 'grok-4.20-reasoning');
   assert.equal(resolveProviderModel('xai', 'sonnet'), 'grok-4.20-reasoning');
+});
+
+test('runtime config defaults to generic api and restricts openai-native to openai', () => {
+  assert.equal(resolveRuntime('openai'), DEFAULT_RUNTIME);
+  assert.equal(resolveRuntime('openai', 'openai-native'), 'openai-native');
+  assert.throws(
+    () => resolveRuntime('gemini', 'openai-native'),
+    /only supported with provider "openai"/
+  );
+  assert.throws(
+    () => resolveRuntime('openai', 'made-up-runtime'),
+    /Unknown runtime/
+  );
+});
+
+test('cli parses runtime flag for api runner selection', () => {
+  const args = parseArgs([
+    'node',
+    'src/api-runner/cli.js',
+    '--provider', 'openai',
+    '--runtime', 'openai-native',
+    '--skill', 'ULT-gen',
+    '--prompt', 'PSA 133',
+  ]);
+
+  assert.equal(args.provider, 'openai');
+  assert.equal(args.runtime, 'openai-native');
+  assert.equal(args.skill, 'ULT-gen');
+  assert.equal(args.prompt, 'PSA 133');
 });
 
 test('gemini provider config exposes fallback models for transient overloads', () => {
@@ -101,6 +138,17 @@ test('locked provider runs keep sub-agents on the parent provider', () => {
   assert.equal(
     resolveAgentProvider({}, { provider: 'gemini', lockProvider: true }),
     'gemini'
+  );
+});
+
+test('locked runtime runs keep sub-agents on the parent runtime', () => {
+  assert.equal(
+    resolveAgentRuntime({ runtime: 'generic-api' }, { runtime: 'openai-native', lockProvider: true }),
+    'openai-native'
+  );
+  assert.equal(
+    resolveAgentRuntime({}, { runtime: 'generic-api', lockProvider: false }),
+    'generic-api'
   );
 });
 
