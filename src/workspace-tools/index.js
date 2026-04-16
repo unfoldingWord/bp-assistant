@@ -373,9 +373,10 @@ function createWorkspaceTools(createSdkMcpServer, tool, z) {
         hebrewUsfm: z.string().optional().describe('Hebrew USFM path (auto-detected from book code if omitted)'),
         output: z.string().optional().describe('Output path (defaults to in-place overwrite)'),
       }, async (args) => ({ content: [{ type: 'text', text: fixUnicodeQuotes(args) }] })),
-      tool('verify_bold_matches', 'Strip bold markers from note text where the bolded word does not exactly match the ULT verse (post-assembly)', {
+      tool('verify_bold_matches', 'Strip invalid bold markers and restore safe opening bold text when it can be derived from prepared note metadata and the ULT (post-assembly)', {
         tsvFile: z.string().describe('TN TSV file path'),
         ultUsfm: z.string().describe('Plain ULT USFM file path for verse text lookup'),
+        preparedJson: z.string().optional().describe('Prepared notes JSON path for safe opening-bold repair'),
         output: z.string().optional().describe('Output path (defaults to in-place overwrite)'),
       }, async (args) => ({ content: [{ type: 'text', text: verifyBoldMatches(args) }] })),
 
@@ -484,9 +485,10 @@ function createTnWriterTools(createSdkMcpServer, tool, z) {
         hebrewUsfm: z.string().optional().describe('Hebrew USFM path (auto-detected from book code if omitted)'),
         output: z.string().optional().describe('Output path (defaults to in-place overwrite)'),
       }, async (args) => ({ content: [{ type: 'text', text: fixUnicodeQuotes(args) }] })),
-      tool('verify_bold_matches', 'Strip bold markers from note text where the bolded word does not exactly match the ULT verse (post-assembly)', {
+      tool('verify_bold_matches', 'Strip invalid bold markers and restore safe opening bold text when it can be derived from prepared note metadata and the ULT (post-assembly)', {
         tsvFile: z.string().describe('TN TSV file path'),
         ultUsfm: z.string().describe('Plain ULT USFM file path for verse text lookup'),
+        preparedJson: z.string().optional().describe('Prepared notes JSON path for safe opening-bold repair'),
         output: z.string().optional().describe('Output path (defaults to in-place overwrite)'),
       }, async (args) => ({ content: [{ type: 'text', text: verifyBoldMatches(args) }] })),
       tool('read_prepared_notes', 'Read a bounded slice of prepared_notes.json items. Use this instead of the raw Read tool to avoid the 10K-token file-read limit. Call with summaryOnly:true first to get total count and IDs, then fetch items in batches of ≤20.', {

@@ -313,11 +313,11 @@ function deriveAtRequirement({
   if (provided) {
     return { at_policy: 'provided', at_required: false, selected_template_has_at_slot: templateHasAtSlot, reason: 'provided_at' };
   }
-  if (noAtRestricted) {
-    return { at_policy: 'forbidden', at_required: false, selected_template_has_at_slot: templateHasAtSlot, reason: 'no_at_rule' };
-  }
   if (templateHasAtSlot) {
     return { at_policy: 'required', at_required: true, selected_template_has_at_slot: true, reason: 'template_requires_at' };
+  }
+  if (noAtRestricted) {
+    return { at_policy: 'forbidden', at_required: false, selected_template_has_at_slot: templateHasAtSlot, reason: 'no_at_rule' };
   }
   if (!selectedTemplate && needsAt) {
     return { at_policy: 'required', at_required: true, selected_template_has_at_slot: false, reason: 'needs_at_without_template' };
@@ -707,6 +707,165 @@ function normalizeAssembledNoteText(noteText) {
     // Catch bare AT text (no quotes or brackets) — e.g. "Alternate translation: some text"
     .replace(/Alternate translation:\s+(?![\["\u201C])(.+?)$/gm, 'Alternate translation: [$1]')
     .trim();
+}
+
+function parsePlainUsfmVerses(usfmPath) {
+  const verses = {};
+  if (!usfmPath) return verses;
+  const resolvedPath = path.resolve(CSKILLBP_DIR, usfmPath);
+  if (!fs.existsSync(resolvedPath)) return verses;
+
+  const text = fs.readFileSync(resolvedPath, 'utf8');
+  let ch = 0;
+  for (const line of text.split('\n')) {
+    const trimmed = line.trim();
+    const cm = trimmed.match(/^\\c\s+(\d+)/);
+    if (cm) {
+      ch = parseInt(cm[1], 10);
+      continue;
+    }
+    const vm = trimmed.match(/^\\v\s+(\d+[-\d]*)\s*(.*)/);
+    if (!vm) continue;
+    let verseText = vm[2] || '';
+    verseText = verseText
+      .replace(/\\zaln-[se][^*]*\*/g, '')
+      .replace(/\\w\s+([^|]*?)\|[^\\]*?\\w\*/g, '$1')
+      .replace(/\\[a-z]+\d?\s+/g, ' ')
+      .replace(/\\[a-z]+\d?\*/g, '')
+      .replace(/\s+/g, ' ')
+      .trim();
+    verses[`${ch}:${vm[1].split('-')[0]}`] = verseText;
+  }
+  return verses;
+}
+
+function stripBoldMarkers(text) {
+  return String(text || '').replace(/\*\*/g, '');
+}
+
+function flattenBraceSupplies(text) {
+  return String(text || '').replace(/\{([^}]*)\}/g, '$1').replace(/\s+/g, ' ').trim();
+}
+
+function normalizeMatchText(text) {
+  return String(text || '')
+    .replace(/[\u2018\u2019]/g, "'")
+    .replace(/[\u201C\u201D]/g, '"')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function escapeRegExp(value) {
+  return String(value || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function countCaseInsensitiveOccurrences(haystack, needle) {
+  const source = normalizeMatchText(haystack).toLowerCase();
+  const target = normalizeMatchText(needle).toLowerCase();
+  if (!source || !target) return 0;
+  let count = 0;
+  let idx = 0;
+  while ((idx = source.indexOf(target, idx)) !== -1) {
+    count++;
+    idx += target.length;
+  }
+  return count;
+}
+
+function extractOpeningBoldSlot(templateText) {
+  const template = stripAlternateTranslation(templateText || '');
+  const placeholderMatch = template.match(/\*\*([^*]+)\*\*/);
+  if (!placeholderMatch) return null;
+
+  const before = normalizeWhitespace(template.slice(0, placeholderMatch.index));
+  const afterRaw = template.slice(placeholderMatch.index + placeholderMatch[0].length);
+  const after = normalizeWhitespace(afterRaw);
+  const suffixWordMatch = after.match(/^([A-Za-z][A-Za-z-]*)/);
+  return {
+    prefix: before,
+    suffixWord: suffixWordMatch ? suffixWordMatch[1] : '',
+  };
+}
+
+function inspectOpeningBold({ noteText, prepItem = {}, ultVerse = '' }) {
+  const note = String(noteText || '');
+  const openingSlot = extractOpeningBoldSlot(prepItem.template_text || '');
+  if (!openingSlot) {
+    return { expectsOpeningBold: false, status: 'not_applicable', validBoldTexts: [] };
+  }
+
+  const openingLimit = Math.min(note.length, 220);
+  const opening = note.slice(0, openingLimit);
+  const scopedQuote = normalizeWhitespace(flattenBraceSupplies(prepItem.issue_span_gl_quote || prepItem.gl_quote || ''));
+  const quoteWordCount = scopedQuote ? scopedQuote.split(/\s+/).length : 0;
+  const validBoldTexts = [];
+  const invalidBoldTexts = [];
+  const boldMatches = [...opening.matchAll(/\*\*([^*]+)\*\*/g)];
+  for (const match of boldMatches) {
+    const boldText = normalizeWhitespace(match[1]);
+    if (boldText && countCaseInsensitiveOccurrences(ultVerse, boldText) > 0) validBoldTexts.push(boldText);
+    else invalidBoldTexts.push(boldText);
+  }
+  if (validBoldTexts.length) {
+    return { expectsOpeningBold: true, status: 'valid', validBoldTexts, invalidBoldTexts, candidate: scopedQuote };
+  }
+
+  const openingPlain = normalizeMatchText(stripBoldMarkers(opening));
+  const prefix = normalizeMatchText(openingSlot.prefix);
+  const suffixWord = normalizeMatchText(openingSlot.suffixWord);
+  const candidate = normalizeMatchText(scopedQuote);
+  const openingHasPrefix = prefix ? openingPlain.toLowerCase().startsWith(prefix.toLowerCase()) : true;
+
+  if (!candidate || quoteWordCount < 2) {
+    return {
+      expectsOpeningBold: true,
+      status: invalidBoldTexts.length ? 'invalid' : 'ambiguous',
+      reason: 'candidate_too_short',
+      invalidBoldTexts,
+      candidate,
+      openingHasPrefix,
+    };
+  }
+
+  const occurrenceCount = countCaseInsensitiveOccurrences(ultVerse, candidate);
+  if (occurrenceCount !== 1) {
+    return {
+      expectsOpeningBold: true,
+      status: invalidBoldTexts.length ? 'invalid' : 'ambiguous',
+      reason: occurrenceCount > 1 ? 'candidate_repeated' : 'candidate_not_in_ult',
+      invalidBoldTexts,
+      candidate,
+      openingHasPrefix,
+    };
+  }
+
+  const replacementRe = new RegExp(
+    `^(${escapeRegExp(prefix)}\\s*)(?!\\*\\*)(${escapeRegExp(candidate)})(\\s+${escapeRegExp(suffixWord)}\\b)`,
+    'i'
+  );
+  const replacementMatch = suffixWord ? opening.match(replacementRe) : null;
+  if (replacementMatch) {
+    return {
+      expectsOpeningBold: true,
+      status: invalidBoldTexts.length ? 'repairable_invalid' : 'repairable_missing',
+      invalidBoldTexts,
+      candidate,
+      openingHasPrefix,
+      replacement: {
+        start: replacementMatch.index + replacementMatch[1].length,
+        end: replacementMatch.index + replacementMatch[1].length + replacementMatch[2].length,
+      },
+    };
+  }
+
+  return {
+    expectsOpeningBold: true,
+    status: invalidBoldTexts.length ? 'invalid' : (openingHasPrefix ? 'missing' : 'ambiguous'),
+    reason: openingHasPrefix ? 'opening_candidate_not_localized' : 'opening_not_canonical',
+    invalidBoldTexts,
+    candidate,
+    openingHasPrefix,
+  };
 }
 
 function assembleNotes({ preparedJson, generatedJson, output }) {
@@ -1198,30 +1357,21 @@ function fixUnicodeQuotes({ tsvFile, hebrewUsfm, output }) {
 
 /**
  * Verify bold text in notes matches ULT verse exactly.
- * Strips bold markers from any **word** that doesn't appear as-is in the ULT.
+ * Strips invalid bold markers, and restores a missing opening bold only when
+ * the scoped quote safely matches the canonical opening slot and the ULT.
  * Operates on assembled TSV (post-assembly, alongside curly_quotes / fix_unicode).
  */
-function verifyBoldMatches({ tsvFile, ultUsfm, output }) {
+function verifyBoldMatches({ tsvFile, ultUsfm, preparedJson, output }) {
   const tsvPath = path.resolve(CSKILLBP_DIR, tsvFile);
   const tsvContent = fs.readFileSync(tsvPath, 'utf8');
-
-  // Parse ULT verses
-  const ultVerses = {};
-  if (ultUsfm) {
-    const ultPath = path.resolve(CSKILLBP_DIR, ultUsfm);
-    if (fs.existsSync(ultPath)) {
-      const text = fs.readFileSync(ultPath, 'utf8');
-      let ch = 0;
-      for (const l of text.split('\n')) {
-        const cm = l.trim().match(/^\\c\s+(\d+)/);
-        if (cm) { ch = parseInt(cm[1], 10); continue; }
-        const vm = l.trim().match(/^\\v\s+(\d+[-\d]*)\s*(.*)/);
-        if (vm) {
-          let txt = vm[2] || '';
-          txt = txt.replace(/\\zaln-[se][^*]*\*/g, '').replace(/\\w\s+([^|]*?)\|[^\\]*?\\w\*/g, '$1')
-            .replace(/\\[a-z]+\d?\s+/g, ' ').replace(/\\[a-z]+\d?\*/g, '').replace(/\s+/g, ' ').trim();
-          ultVerses[`${ch}:${vm[1].split('-')[0]}`] = txt;
-        }
+  const ultVerses = parsePlainUsfmVerses(ultUsfm);
+  const preparedItems = new Map();
+  if (preparedJson) {
+    const prepPath = path.resolve(CSKILLBP_DIR, preparedJson);
+    if (fs.existsSync(prepPath)) {
+      const prepared = JSON.parse(fs.readFileSync(prepPath, 'utf8'));
+      for (const item of (prepared.items || [])) {
+        if (item.id) preparedItems.set(item.id, item);
       }
     }
   }
@@ -1231,9 +1381,11 @@ function verifyBoldMatches({ tsvFile, ultUsfm, output }) {
   const cols0 = header.split('\t');
   const noteIdx = cols0.indexOf('Note');
   const refIdx = cols0.indexOf('Reference');
+  const idIdx = cols0.indexOf('ID');
   if (noteIdx === -1 || refIdx === -1) return 'ERROR: TSV missing Note or Reference column';
 
   let stripped = 0;
+  let restored = 0;
   const log = [];
 
   for (let i = 1; i < lines.length; i++) {
@@ -1242,8 +1394,10 @@ function verifyBoldMatches({ tsvFile, ultUsfm, output }) {
     if (cols.length <= noteIdx) continue;
 
     const ref = cols[refIdx];
+    const id = idIdx >= 0 ? (cols[idIdx] || '') : '';
     const ult = ultVerses[ref] || '';
     if (!ult) continue;
+    const prepItem = id ? preparedItems.get(id) : null;
 
     let note = cols[noteIdx];
     let changed = false;
@@ -1256,6 +1410,14 @@ function verifyBoldMatches({ tsvFile, ultUsfm, output }) {
       return boldText; // remove ** markers
     });
 
+    const boldStatus = inspectOpeningBold({ noteText: note, prepItem, ultVerse: ult });
+    if (boldStatus.replacement) {
+      note = `${note.slice(0, boldStatus.replacement.start)}**${note.slice(boldStatus.replacement.start, boldStatus.replacement.end)}**${note.slice(boldStatus.replacement.end)}`;
+      restored++;
+      changed = true;
+      log.push(`${ref}: restored opening bold for "${boldStatus.candidate}"`);
+    }
+
     if (changed) {
       cols[noteIdx] = note;
       lines[i] = cols.join('\t');
@@ -1266,7 +1428,7 @@ function verifyBoldMatches({ tsvFile, ultUsfm, output }) {
   fs.mkdirSync(path.dirname(outPath), { recursive: true });
   fs.writeFileSync(outPath, lines.join('\n'));
 
-  const result = [`Bold check: stripped ${stripped} non-matching bold(s) in ${path.basename(tsvFile)}`];
+  const result = [`Bold check: stripped ${stripped} non-matching bold(s), restored ${restored} missing bold(s) in ${path.basename(tsvFile)}`];
   if (log.length) result.push(log.join('\n'));
   result.push(outPath);
   return result.join('\n');
@@ -1876,5 +2038,6 @@ module.exports = {
   _buildWriterPrompt: buildWriterPrompt,
   _maybeBuildProgrammaticNote: maybeBuildProgrammaticNote,
   _normalizeAssembledNoteText: normalizeAssembledNoteText,
+  _inspectOpeningBold: inspectOpeningBold,
   _stripAlternateTranslation: stripAlternateTranslation,
 };

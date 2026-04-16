@@ -7,6 +7,7 @@ const path = require('path');
 const {
   prepareNotes,
   prepareATContext,
+  verifyBoldMatches,
   _parseExplanationDirectives,
   _resolveTemplateSelection,
   _deriveStyleProfile,
@@ -44,17 +45,17 @@ test('resolveTemplateSelection locks a single exact template hint match', () => 
   assert.equal(selected.candidate_templates.length, 1);
 });
 
-test('deriveStyleProfile enforces no-at rules unless i: explicitly overrides them', () => {
-  const forbidden = _deriveStyleProfile({
+test('deriveStyleProfile keeps no-at style rule metadata without suppressing template AT requirements', () => {
+  const templateStrict = _deriveStyleProfile({
     sref: 'writing-background',
     mustInclude: [],
     atProvided: '',
     needsAt: true,
-    selectedTemplate: { template: 'Background template.' },
+    selectedTemplate: { template: 'Background template. Alternate translation: [ALT]' },
   });
-  assert.equal(forbidden.at_policy, 'forbidden');
-  assert.equal(forbidden.at_required, false);
-  assert.ok(forbidden.style_rules.includes('no_at'));
+  assert.equal(templateStrict.at_policy, 'required');
+  assert.equal(templateStrict.at_required, true);
+  assert.ok(templateStrict.style_rules.includes('no_at'));
 
   const overridden = _deriveStyleProfile({
     sref: 'writing-background',
@@ -191,6 +192,20 @@ test('prepareNotes keeps at_required false when selected template has no AT slot
   assert.equal(item.at_required, false);
 });
 
+test('deriveAtRequirement treats template AT slots as authoritative over no-at style rules', () => {
+  const decision = _deriveAtRequirement({
+    atProvided: '',
+    needsAt: false,
+    selectedTemplate: { template: 'Here the author is providing background information. Alternate translation: [ALT]' },
+    styleRules: ['no_at'],
+    hasAtPolicyOverride: false,
+  });
+
+  assert.equal(decision.at_policy, 'required');
+  assert.equal(decision.at_required, true);
+  assert.equal(decision.reason, 'template_requires_at');
+});
+
 test('prepareATContext keys off canonical at_required', () => {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tn-tools-atctx-'));
   const root = path.join('/srv/bot/workspace', 'tmp', path.basename(tempDir));
@@ -232,4 +247,141 @@ test('normalizeAssembledNoteText decodes visible unicode escapes and brackets ba
 
   assert.match(normalized, /Alternate translation: \[the wicked person’s place\]/);
   assert.doesNotMatch(normalized, /\\u2019/);
+});
+
+test('verifyBoldMatches restores missing bold when scoped opening quote matches ULT exactly', () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tn-tools-bold-add-'));
+  const relRoot = path.join('tmp', path.basename(tempDir));
+  const absRoot = path.join('/srv/bot/workspace', relRoot);
+  fs.mkdirSync(absRoot, { recursive: true });
+
+  const tsvRel = path.join(relRoot, 'notes.tsv');
+  const ultRel = path.join(relRoot, 'ult.usfm');
+  const prepRel = path.join(relRoot, 'prepared_notes.json');
+
+  fs.writeFileSync(path.join('/srv/bot/workspace', tsvRel), [
+    'Reference\tID\tTags\tSupportReference\tQuote\tOccurrence\tNote',
+    '1:1\ta1b2\t\trc://*/ta/man/translate/figs-metonymy\tמֶלֶךְ\t1\tHere, the king represents royal authority. If it would be helpful in your language, you could state the meaning plainly.',
+  ].join('\n'));
+  fs.writeFileSync(path.join('/srv/bot/workspace', ultRel), '\\c 1\n\\v 1 The king spoke to his people.\n');
+  fs.writeFileSync(path.join('/srv/bot/workspace', prepRel), JSON.stringify({
+    items: [{
+      id: 'a1b2',
+      reference: '1:1',
+      sref: 'figs-metonymy',
+      issue_span_gl_quote: 'the king',
+      gl_quote: 'the king',
+      ult_verse: 'The king spoke to his people.',
+      template_text: 'Here, **text** represents “WORD.” If it would be helpful in your language, you could use an equivalent expression or plain language.',
+    }],
+  }, null, 2));
+
+  const summary = verifyBoldMatches({ tsvFile: tsvRel, ultUsfm: ultRel, preparedJson: prepRel });
+  const content = fs.readFileSync(path.join('/srv/bot/workspace', tsvRel), 'utf8');
+
+  assert.match(summary, /restored 1 missing bold/);
+  assert.match(content, /Here, \*\*the king\*\* represents royal authority/);
+});
+
+test('verifyBoldMatches strips invalid bold when no safe replacement exists', () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tn-tools-bold-strip-'));
+  const relRoot = path.join('tmp', path.basename(tempDir));
+  const absRoot = path.join('/srv/bot/workspace', relRoot);
+  fs.mkdirSync(absRoot, { recursive: true });
+
+  const tsvRel = path.join(relRoot, 'notes.tsv');
+  const ultRel = path.join(relRoot, 'ult.usfm');
+  const prepRel = path.join(relRoot, 'prepared_notes.json');
+
+  fs.writeFileSync(path.join('/srv/bot/workspace', tsvRel), [
+    'Reference\tID\tTags\tSupportReference\tQuote\tOccurrence\tNote',
+    '1:1\ta1b2\t\trc://*/ta/man/translate/figs-metonymy\tמֶלֶךְ\t1\tHere, **royal authority** represents the reign of the king.',
+  ].join('\n'));
+  fs.writeFileSync(path.join('/srv/bot/workspace', ultRel), '\\c 1\n\\v 1 The king spoke to his people.\n');
+  fs.writeFileSync(path.join('/srv/bot/workspace', prepRel), JSON.stringify({
+    items: [{
+      id: 'a1b2',
+      reference: '1:1',
+      sref: 'figs-metonymy',
+      issue_span_gl_quote: 'king',
+      gl_quote: 'king',
+      ult_verse: 'The king spoke to his people.',
+      template_text: 'Here, **text** represents “WORD.” If it would be helpful in your language, you could use an equivalent expression or plain language.',
+    }],
+  }, null, 2));
+
+  const summary = verifyBoldMatches({ tsvFile: tsvRel, ultUsfm: ultRel, preparedJson: prepRel });
+  const content = fs.readFileSync(path.join('/srv/bot/workspace', tsvRel), 'utf8');
+
+  assert.match(summary, /stripped 1 non-matching bold/);
+  assert.doesNotMatch(content, /\*\*royal authority\*\*/);
+  assert.doesNotMatch(content, /\*\*king\*\*/);
+});
+
+test('verifyBoldMatches does not auto-bold single-word openings for common matches', () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tn-tools-bold-single-'));
+  const relRoot = path.join('tmp', path.basename(tempDir));
+  const absRoot = path.join('/srv/bot/workspace', relRoot);
+  fs.mkdirSync(absRoot, { recursive: true });
+
+  const tsvRel = path.join(relRoot, 'notes.tsv');
+  const ultRel = path.join(relRoot, 'ult.usfm');
+  const prepRel = path.join(relRoot, 'prepared_notes.json');
+
+  fs.writeFileSync(path.join('/srv/bot/workspace', tsvRel), [
+    'Reference\tID\tTags\tSupportReference\tQuote\tOccurrence\tNote',
+    '1:1\ta1b2\t\trc://*/ta/man/translate/writing-pronouns\tהוּא\t1\tThe pronoun he refers to Yahweh. It may be helpful to clarify this for your readers.',
+  ].join('\n'));
+  fs.writeFileSync(path.join('/srv/bot/workspace', ultRel), '\\c 1\n\\v 1 He spoke to his people.\n');
+  fs.writeFileSync(path.join('/srv/bot/workspace', prepRel), JSON.stringify({
+    items: [{
+      id: 'a1b2',
+      reference: '1:1',
+      sref: 'writing-pronouns',
+      issue_span_gl_quote: 'he',
+      gl_quote: 'he',
+      ult_verse: 'He spoke to his people.',
+      template_text: 'The pronoun **pronoun** refers to PERSON. It may be helpful to clarify this for your readers.',
+    }],
+  }, null, 2));
+
+  const summary = verifyBoldMatches({ tsvFile: tsvRel, ultUsfm: ultRel, preparedJson: prepRel });
+  const content = fs.readFileSync(path.join('/srv/bot/workspace', tsvRel), 'utf8');
+
+  assert.match(summary, /restored 0 missing bold/);
+  assert.doesNotMatch(content, /\*\*he\*\*/i);
+});
+
+test('verifyBoldMatches does not scan beyond the opening to add bold', () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tn-tools-bold-body-'));
+  const relRoot = path.join('tmp', path.basename(tempDir));
+  const absRoot = path.join('/srv/bot/workspace', relRoot);
+  fs.mkdirSync(absRoot, { recursive: true });
+
+  const tsvRel = path.join(relRoot, 'notes.tsv');
+  const ultRel = path.join(relRoot, 'ult.usfm');
+  const prepRel = path.join(relRoot, 'prepared_notes.json');
+
+  fs.writeFileSync(path.join('/srv/bot/workspace', tsvRel), [
+    'Reference\tID\tTags\tSupportReference\tQuote\tOccurrence\tNote',
+    '1:1\ta1b2\t\trc://*/ta/man/translate/figs-explicit\tעֹמֵד עַל־יְמִינוֹ\t1\tThe implication is that this scene resembles a courtroom. Later in the note, the accuser stands on his right in the position of an accuser.',
+  ].join('\n'));
+  fs.writeFileSync(path.join('/srv/bot/workspace', ultRel), '\\c 1\n\\v 1 Joshua stood before the angel, and the adversary stood on his right to accuse him.\n');
+  fs.writeFileSync(path.join('/srv/bot/workspace', prepRel), JSON.stringify({
+    items: [{
+      id: 'a1b2',
+      reference: '1:1',
+      sref: 'figs-explicit',
+      issue_span_gl_quote: 'stood on his right',
+      gl_quote: 'stood on his right',
+      ult_verse: 'Joshua stood before the angel, and the adversary stood on his right to accuse him.',
+      template_text: 'The implication is that IMPLIED. You could include this information if that would be helpful to your readers.',
+    }],
+  }, null, 2));
+
+  const summary = verifyBoldMatches({ tsvFile: tsvRel, ultUsfm: ultRel, preparedJson: prepRel });
+  const content = fs.readFileSync(path.join('/srv/bot/workspace', tsvRel), 'utf8');
+
+  assert.match(summary, /restored 0 missing bold/);
+  assert.doesNotMatch(content, /\*\*stood on his right\*\*/);
 });

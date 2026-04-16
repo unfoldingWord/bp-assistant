@@ -6,7 +6,7 @@ const fs = require('fs');
 const path = require('path');
 const https = require('https');
 
-const { loadTemplateMap, resolveAtRequirement } = require('./tn-tools');
+const { loadTemplateMap, resolveAtRequirement, _inspectOpeningBold } = require('./tn-tools');
 
 const CSKILLBP_DIR = process.env.CSKILLBP_DIR || '/srv/bot/workspace';
 
@@ -658,7 +658,28 @@ async function checkTnQuality({ tsvPath, preparedJson, ultUsfm, ustUsfm, book, h
       }
     }
 
-    // 24. "Here" rule compliance
+    // 24. Opening bold compliance
+    {
+      const openingBold = _inspectOpeningBold({
+        noteText: n.note,
+        prepItem,
+        ultVerse: prepItem?.ult_verse || ultVerse,
+      });
+      if (openingBold.expectsOpeningBold) {
+        if (openingBold.status === 'invalid' || openingBold.status === 'repairable_invalid') {
+          addFinding(n.row, n.ref, n.id, 'warning', 'invalid_opening_bold',
+            'Opening bold text is present but does not match the ULT exactly');
+        } else if (openingBold.status === 'missing' || openingBold.status === 'repairable_missing') {
+          addFinding(n.row, n.ref, n.id, 'warning', 'missing_opening_bold',
+            'Canonical opening appears to be missing the expected bold quote');
+        } else if (openingBold.status === 'ambiguous') {
+          addFinding(n.row, n.ref, n.id, 'warning', 'ambiguous_opening_bold',
+            'Canonical opening may need bold, but no safe repair candidate could be derived');
+        }
+      }
+    }
+
+    // 24b. "Here" rule compliance
     //     Whitelist canonical template openings that start with "Here" — these are
     //     structurally correct and should not trigger the "bolded lowercase quote" rule.
     if (/^Here[, ]/.test(n.note)) {

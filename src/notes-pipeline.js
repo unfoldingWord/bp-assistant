@@ -725,6 +725,7 @@ async function runATGeneration({ notesPath, pipeDir, status }) {
       notesPath,
       ultUsfm: ctx.sources.ultPlain || ctx.sources.ult,
       hebrewUsfm: ctx.sources.hebrew,
+      preparedJson: ctx.runtime.preparedNotes,
     });
     console.log(`[notes] Final post-processing after AT generation: ${postSummary}`);
   }
@@ -734,7 +735,7 @@ async function runATGeneration({ notesPath, pipeDir, status }) {
   return summary;
 }
 
-function postProcessNotesTsv({ notesPath, ultUsfm, hebrewUsfm }) {
+function postProcessNotesTsv({ notesPath, ultUsfm, hebrewUsfm, preparedJson }) {
   const steps = [];
   steps.push(`curlyQuotes: ${curlyQuotes({ input: notesPath, inPlace: true })}`);
 
@@ -745,7 +746,7 @@ function postProcessNotesTsv({ notesPath, ultUsfm, hebrewUsfm }) {
   }
 
   if (ultUsfm && fs.existsSync(path.resolve(CSKILLBP_DIR, ultUsfm))) {
-    steps.push(`verifyBoldMatches: ${verifyBoldMatches({ tsvFile: notesPath, ultUsfm })}`);
+    steps.push(`verifyBoldMatches: ${verifyBoldMatches({ tsvFile: notesPath, ultUsfm, preparedJson })}`);
   } else {
     steps.push('verifyBoldMatches: skipped (no ULT USFM available)');
   }
