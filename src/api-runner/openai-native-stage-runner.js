@@ -8,7 +8,12 @@ const { getToolSchemas } = require('./tools');
 const { normalizeBookName, resolveOutputFile, discoverFreshOutput } = require('../pipeline-utils');
 const { buildGenerateContext } = require('../pipeline-context');
 const { getProviderSystemAppend } = require('./provider-nudges');
-const { createAlignedUsfm, mergeAlignedUsfm } = require('../workspace-tools/usfm-tools');
+const {
+  createAlignedUsfm,
+  mergeAlignedUsfm,
+  validateAlignedUsfmMarkup,
+  summarizeAlignedUsfmMarkupFindings,
+} = require('../workspace-tools/usfm-tools');
 
 const OPENAI_TOOL_SCHEMAS = getToolSchemas({ excludeAgentTools: true });
 const OPENAI_DEFAULT_MODEL = getProviderConfig('openai').defaultModel;
@@ -22,6 +27,8 @@ const STAGE_PRESETS = {
   'tn-writer': { model: 'opus', thinking: 'medium', maxTurns: 150, timeout: 45, toolChoice: 'auto' },
   'tn-quality-check': { model: 'sonnet', thinking: 'medium', maxTurns: 60, timeout: 20, toolChoice: 'auto' },
 };
+
+const ALIGNMENT_VALIDATION_RETRIES = 2;
 
 function chapterTag(book, chapter) {
   const width = String(book).toUpperCase() === 'PSA' ? 3 : 2;
@@ -148,6 +155,25 @@ function finalizeAlignmentOutputs({ cwd, book, chapter, sourceRelPath, outputRel
   }
 }
 
+function finalizeAndValidateAlignmentOutputs({ cwd, book, chapter, sourceRelPath, outputRelPath, ust = false, maxRetries = ALIGNMENT_VALIDATION_RETRIES }) {
+  let validation = null;
+  let attempts = 0;
+
+  for (let attempt = 1; attempt <= maxRetries + 1; attempt++) {
+    attempts = attempt;
+    finalizeAlignmentOutputs({ cwd, book, chapter, sourceRelPath, outputRelPath, ust });
+    validation = validateAlignedUsfmMarkup({ alignedUsfm: outputRelPath });
+    if (validation.ok) {
+      return { ok: true, degraded: false, attempts, findings: [], summary: validation.summary };
+    }
+  }
+
+  const findings = validation?.findings || [];
+  const summary = `Alignment markup degraded after ${attempts} attempt(s): ${summarizeAlignedUsfmMarkupFindings(findings)}`;
+  console.warn(`[openai-native-stage-runner] ${outputRelPath}: ${summary}`);
+  return { ok: true, degraded: true, attempts, findings, summary };
+}
+
 function summarizeStageResults(label, results) {
   const totals = results.reduce((sum, result) => {
     sum.turns += result.turns || 0;
@@ -164,9 +190,15 @@ function summarizeStageResults(label, results) {
     durationMs: 0,
   });
 
+  const warnings = results.flatMap((result) => result.warnings || []);
+  const finalText = warnings.length > 0
+    ? `${label} complete with warnings: ${warnings.join(' | ')}`
+    : `${label} complete.`;
+
   return {
     ...totals,
-    finalText: `${label} complete.`,
+    finalText,
+    warnings,
     steps: results.map((result) => ({
       skill: result.skill,
       turns: result.turns,
@@ -174,6 +206,7 @@ function summarizeStageResults(label, results) {
       outputTokens: result.outputTokens,
       cost: result.cost,
       durationMs: result.durationMs,
+      warnings: result.warnings || [],
     })),
   };
 }
@@ -323,7 +356,7 @@ async function runAlignmentPipeline(prompt, opts = {}) {
 
   const ultPrompt = `${book} ${chapter} --ult ${toWorkspaceRel(cwd, ultSourcePath)}${versesArg}`;
   const ultResult = await executeNativeStage('ULT-alignment', ultPrompt, opts);
-  finalizeAlignmentOutputs({
+  const ultFinalize = finalizeAndValidateAlignmentOutputs({
     cwd,
     book,
     chapter,
@@ -332,11 +365,14 @@ async function runAlignmentPipeline(prompt, opts = {}) {
     ust: false,
   });
   verifyOutputFile(outputs.ultAligned, 'Aligned ULT output', book, new RegExp(`^${tag}(-.*)?-aligned\\.usfm$`), null, cwd);
+  if (ultFinalize.degraded) {
+    ultResult.warnings = [ultFinalize.summary];
+  }
   stageResults.push(ultResult);
 
   const ustPrompt = `${book} ${chapter} --ust ${toWorkspaceRel(cwd, ustSourcePath)}${versesArg}`;
   const ustResult = await executeNativeStage('UST-alignment', ustPrompt, opts);
-  finalizeAlignmentOutputs({
+  const ustFinalize = finalizeAndValidateAlignmentOutputs({
     cwd,
     book,
     chapter,
@@ -345,6 +381,9 @@ async function runAlignmentPipeline(prompt, opts = {}) {
     ust: true,
   });
   verifyOutputFile(outputs.ustAligned, 'Aligned UST output', book, new RegExp(`^${tag}(-.*)?-aligned\\.usfm$`), null, cwd);
+  if (ustFinalize.degraded) {
+    ustResult.warnings = [ustFinalize.summary];
+  }
   stageResults.push(ustResult);
 
   return summarizeStageResults('align-all-parallel', stageResults);
@@ -379,6 +418,7 @@ module.exports = {
   buildCanonicalPaths,
   parseBookChapter,
   verifyOutputFile,
+  finalizeAndValidateAlignmentOutputs,
   runOpenAiNativeSkill,
   runInitialPipeline,
   runAlignmentPipeline,

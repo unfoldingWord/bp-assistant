@@ -555,6 +555,66 @@ function validateAlignmentJson({ files, ust }) {
   return lines.join('\n');
 }
 
+function validateAlignedUsfmMarkup({ alignedUsfm, maxExamples = 10 }) {
+  const filePath = path.resolve(CSKILLBP_DIR, alignedUsfm);
+  if (!fs.existsSync(filePath)) {
+    return {
+      ok: false,
+      findings: [{ ref: '?', token: '', line: 0, snippet: `file not found: ${alignedUsfm}` }],
+      summary: `Aligned USFM missing: ${alignedUsfm}`,
+    };
+  }
+
+  const content = fs.readFileSync(filePath, 'utf8');
+  const lines = content.split('\n');
+  const findings = [];
+  let chapter = null;
+  let verse = null;
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    const chMatch = line.match(/^\\c\s+(\d+)/);
+    if (chMatch) chapter = chMatch[1];
+
+    const verseMatches = [...line.matchAll(/\\v\s+(\d+)/g)];
+    if (verseMatches.length > 0) {
+      verse = verseMatches[verseMatches.length - 1][1];
+    }
+
+    const malformed = [...line.matchAll(/\\w\s+([^|\\\n]+?)(?=(?:\\zaln-e|\\q\d?\b|\\p\b|\\b\b|\\v\s+\d|\\c\s+\d|\\qs\b|$))/g)];
+    for (const match of malformed) {
+      const token = match[1].trim();
+      if (!token) continue;
+      const ref = chapter && verse ? `${chapter}:${verse}` : '?';
+      findings.push({
+        ref,
+        token,
+        line: i + 1,
+        snippet: line.trim().slice(Math.max(0, match.index - 20), match.index + match[0].length + 40),
+      });
+    }
+  }
+
+  const examples = findings.slice(0, maxExamples);
+  const summary = findings.length === 0
+    ? `Aligned USFM markup OK: ${alignedUsfm}`
+    : `Detected ${findings.length} malformed \\w token(s) in ${alignedUsfm}: ${examples.map((item) => `${item.ref} "${item.token}"`).join('; ')}`;
+
+  return {
+    ok: findings.length === 0,
+    findings,
+    summary,
+  };
+}
+
+function summarizeAlignedUsfmMarkupFindings(findings, maxExamples = 5) {
+  if (!Array.isArray(findings) || findings.length === 0) return 'no malformed \\w tokens';
+  return findings
+    .slice(0, maxExamples)
+    .map((item) => `${item.ref} "${item.token}"`)
+    .join('; ');
+}
+
 function countWords(words) {
   const counts = {};
   for (const w of words) {
@@ -861,4 +921,17 @@ function checkUltVoiceMismatch({ alignedUsfm }) {
   return lines3.join('\n');
 }
 
-module.exports = { extractUltEnglish, filterPsalms, curlyQuotes, checkUstPassives, createAlignedUsfm, readUsfmChapter, mergeAlignedUsfm, validateAlignmentJson, validateUltBrackets, checkUltVoiceMismatch };
+module.exports = {
+  extractUltEnglish,
+  filterPsalms,
+  curlyQuotes,
+  checkUstPassives,
+  createAlignedUsfm,
+  readUsfmChapter,
+  mergeAlignedUsfm,
+  validateAlignmentJson,
+  validateAlignedUsfmMarkup,
+  summarizeAlignedUsfmMarkupFindings,
+  validateUltBrackets,
+  checkUltVoiceMismatch,
+};

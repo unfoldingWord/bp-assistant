@@ -58,6 +58,116 @@ test('openai native output verification rejects missing and empty files', () => 
   assert.doesNotThrow(() => verifyOutputFile(okPath, 'notes'));
 });
 
+test('aligned USFM markup validator detects malformed trailing word markers and accepts clean output', () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'aligned-markup-'));
+  const oldBaseDir = process.env.CSKILLBP_DIR;
+  process.env.CSKILLBP_DIR = tempDir;
+
+  const usfmToolsPath = require.resolve('../src/workspace-tools/usfm-tools');
+  delete require.cache[usfmToolsPath];
+  const { validateAlignedUsfmMarkup: validate } = require('../src/workspace-tools/usfm-tools');
+
+  try {
+    const badRel = 'output/AI-UST/PSA/PSA-039-aligned.usfm';
+    const goodRel = 'output/AI-UST/ZEC/ZEC-03-aligned.usfm';
+    const badAbs = path.join(tempDir, badRel);
+    const goodAbs = path.join(tempDir, goodRel);
+    fs.mkdirSync(path.dirname(badAbs), { recursive: true });
+    fs.mkdirSync(path.dirname(goodAbs), { recursive: true });
+
+    fs.writeFileSync(
+      badAbs,
+      '\\id PSA\n\\c 39\n\\v 1 \\zaln-s |x-strong="H1" x-content="א"\\*\\w I|x-occurrence="1" x-occurrences="1"\\w*\n\\w act\\zaln-e\\*\n\\v 13 \\zaln-s |x-strong="H2" x-content="ב"\\*\\w gone.”\\zaln-e\\*\n'
+    );
+    fs.writeFileSync(
+      goodAbs,
+      '\\id ZEC\n\\c 3\n\\v 1 \\zaln-s |x-strong="H1" x-content="א"\\*\\w Joshua|x-occurrence="1" x-occurrences="1"\\w*\\zaln-e\\*\n'
+    );
+
+    const bad = validate({ alignedUsfm: badRel });
+    const good = validate({ alignedUsfm: goodRel });
+
+    assert.equal(bad.ok, false);
+    assert.match(bad.summary, /malformed \\w token/);
+    assert.deepEqual(bad.findings.map((item) => item.token), ['act', 'gone.”']);
+    assert.equal(good.ok, true);
+    assert.equal(good.findings.length, 0);
+  } finally {
+    if (oldBaseDir == null) delete process.env.CSKILLBP_DIR;
+    else process.env.CSKILLBP_DIR = oldBaseDir;
+    delete require.cache[usfmToolsPath];
+  }
+});
+
+test('openai native alignment finalizer retries and degrades instead of failing on malformed output', () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'openai-native-align-degraded-'));
+  const oldBaseDir = process.env.CSKILLBP_DIR;
+  process.env.CSKILLBP_DIR = tempDir;
+
+  const usfmToolsPath = require.resolve('../src/workspace-tools/usfm-tools');
+  const stageRunnerPath = require.resolve('../src/api-runner/openai-native-stage-runner');
+  const usfmToolsModule = require(usfmToolsPath);
+  const originalCreateAlignedUsfm = usfmToolsModule.createAlignedUsfm;
+  const originalMergeAlignedUsfm = usfmToolsModule.mergeAlignedUsfm;
+  const originalValidateAlignedUsfmMarkup = usfmToolsModule.validateAlignedUsfmMarkup;
+
+  let createCalls = 0;
+  let mergeCalls = 0;
+
+  usfmToolsModule.createAlignedUsfm = ({ output }) => {
+    createCalls++;
+    const outputAbs = path.join(tempDir, output);
+    fs.mkdirSync(path.dirname(outputAbs), { recursive: true });
+    fs.writeFileSync(outputAbs, '\\v 1 partial\n');
+    return `Aligned USFM written to ${output}`;
+  };
+  usfmToolsModule.mergeAlignedUsfm = ({ output }) => {
+    mergeCalls++;
+    const outputAbs = path.join(tempDir, output);
+    fs.mkdirSync(path.dirname(outputAbs), { recursive: true });
+    fs.writeFileSync(outputAbs, '\\id PSA\n\\c 39\n\\v 1 \\zaln-s |x-strong="H1" x-content="א"\\*\\w act\\zaln-e\\*\n');
+    return `Merged to ${output}`;
+  };
+  usfmToolsModule.validateAlignedUsfmMarkup = originalValidateAlignedUsfmMarkup;
+
+  delete require.cache[stageRunnerPath];
+
+  try {
+    const { finalizeAndValidateAlignmentOutputs: finalize } = require('../src/api-runner/openai-native-stage-runner');
+
+    const mappingDir = path.join(tempDir, 'tmp', 'zec03_alignments');
+    const hebrewDir = path.join(tempDir, 'data', 'hebrew_bible');
+    fs.mkdirSync(mappingDir, { recursive: true });
+    fs.mkdirSync(hebrewDir, { recursive: true });
+    fs.writeFileSync(path.join(mappingDir, 'PSA-039-v01-v01.json'), '{}');
+    fs.writeFileSync(path.join(hebrewDir, '19-PSA.usfm'), '\\id PSA\n\\c 39\n');
+
+    const result = finalize({
+      cwd: tempDir,
+      book: 'PSA',
+      chapter: 39,
+      sourceRelPath: 'output/AI-UST/PSA/PSA-039.usfm',
+      outputRelPath: 'output/AI-UST/PSA/PSA-039-aligned.usfm',
+      ust: true,
+    });
+
+    assert.equal(result.ok, true);
+    assert.equal(result.degraded, true);
+    assert.equal(result.attempts, 3);
+    assert.match(result.summary, /degraded after 3 attempt/);
+    assert.ok(result.findings.length > 0);
+    assert.equal(createCalls, 3);
+    assert.equal(mergeCalls, 3);
+  } finally {
+    usfmToolsModule.createAlignedUsfm = originalCreateAlignedUsfm;
+    usfmToolsModule.mergeAlignedUsfm = originalMergeAlignedUsfm;
+    usfmToolsModule.validateAlignedUsfmMarkup = originalValidateAlignedUsfmMarkup;
+    if (oldBaseDir == null) delete process.env.CSKILLBP_DIR;
+    else process.env.CSKILLBP_DIR = oldBaseDir;
+    delete require.cache[stageRunnerPath];
+  }
+});
+
 test('runSkill delegates openai native skills to the native stage runner', async () => {
   const runnerPath = require.resolve('../src/api-runner/runner');
   const stageRunnerPath = require.resolve('../src/api-runner/openai-native-stage-runner');

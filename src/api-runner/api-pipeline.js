@@ -6,8 +6,11 @@ const { door43Push } = require('../door43-push');
 const { getDoor43Username, normalizeBookName, buildBranchName, discoverFreshOutput, checkPrerequisites, resolveOutputFile, CSKILLBP_DIR } = require('../pipeline-utils');
 const { buildNotesContext, readContext, writeContext } = require('../pipeline-context');
 const { extractAlignmentData, prepareNotes, fillOrigQuotes, resolveGlQuotes, flagNarrowQuotes, generateIds } = require('../workspace-tools/tn-tools');
+const { createAlignedUsfm, validateAlignedUsfmMarkup, summarizeAlignedUsfmMarkupFindings } = require('../workspace-tools/usfm-tools');
 const { checkUltEdits } = require('../check-ult-edits');
 const { getProviderSystemAppend } = require('./provider-nudges');
+
+const ALIGNMENT_VALIDATION_RETRIES = 2;
 
 function parseRegexLiteral(literal) {
   if (typeof literal !== 'string') return null;
@@ -61,6 +64,77 @@ function parseBookChapterUser(prompt, senderEmail) {
   }
 
   return { book, chapter, username };
+}
+
+function findHebrewSourceRelPath(book) {
+  const hebrewDir = path.join(CSKILLBP_DIR, 'data/hebrew_bible');
+  if (!fs.existsSync(hebrewDir)) return null;
+  const match = fs.readdirSync(hebrewDir).find((name) => name.endsWith(`-${book}.usfm`));
+  return match ? path.posix.join('data/hebrew_bible', match) : null;
+}
+
+function findAlignmentMappingRelPath(book, tag, ust) {
+  const candidates = ust
+    ? [
+        `output/AI-UST/hints/${book}/${tag}.json`,
+        `tmp/${tag}-alignment-mapping.json`,
+        `tmp/alignments/${book}/${tag}-mapping.json`,
+        `output/AI-UST/${book}/${tag}-alignment.json`,
+      ]
+    : [
+        `tmp/alignments/${book}/${tag}-mapping.json`,
+        `tmp/${tag}-alignment-mapping.json`,
+      ];
+
+  return candidates.find((relPath) => fs.existsSync(path.resolve(CSKILLBP_DIR, relPath))) || null;
+}
+
+function bestEffortAlignedOutputRepair({ alignedRelPath, book, chapter, ust, maxRetries = ALIGNMENT_VALIDATION_RETRIES }) {
+  let validation = validateAlignedUsfmMarkup({ alignedUsfm: alignedRelPath });
+  if (validation.ok) {
+    return { ok: true, degraded: false, attempts: 1, findings: [], summary: validation.summary };
+  }
+
+  const width = String(book).toUpperCase() === 'PSA' ? 3 : 2;
+  const tag = `${book}-${String(chapter).padStart(width, '0')}`;
+  const sourceRelPath = alignedRelPath.replace(/-aligned\.usfm$/, '.usfm');
+  const mappingRelPath = findAlignmentMappingRelPath(book, tag, ust);
+  const hebrewRelPath = findHebrewSourceRelPath(book);
+  let attempts = 1;
+
+  if (!fs.existsSync(path.resolve(CSKILLBP_DIR, sourceRelPath)) || !mappingRelPath || !hebrewRelPath) {
+    const missing = [];
+    if (!fs.existsSync(path.resolve(CSKILLBP_DIR, sourceRelPath))) missing.push(`source=${sourceRelPath}`);
+    if (!mappingRelPath) missing.push('mapping');
+    if (!hebrewRelPath) missing.push('hebrew');
+    const summary = `Alignment markup degraded; no deterministic repair inputs available (${missing.join(', ')}): ${summarizeAlignedUsfmMarkupFindings(validation.findings)}`;
+    console.warn(`[api-pipeline] ${alignedRelPath}: ${summary}`);
+    return { ok: true, degraded: true, attempts, findings: validation.findings, summary };
+  }
+
+  for (let retry = 1; retry <= maxRetries; retry++) {
+    attempts++;
+    const result = createAlignedUsfm({
+      hebrew: hebrewRelPath,
+      mapping: mappingRelPath,
+      source: sourceRelPath,
+      output: alignedRelPath,
+      chapter,
+      ust,
+    });
+    if (String(result).startsWith('Error')) {
+      console.warn(`[api-pipeline] ${alignedRelPath}: retry ${retry} failed: ${result}`);
+      continue;
+    }
+    validation = validateAlignedUsfmMarkup({ alignedUsfm: alignedRelPath });
+    if (validation.ok) {
+      return { ok: true, degraded: false, attempts, findings: [], summary: validation.summary };
+    }
+  }
+
+  const summary = `Alignment markup degraded after ${attempts} attempt(s): ${summarizeAlignedUsfmMarkupFindings(validation.findings)}`;
+  console.warn(`[api-pipeline] ${alignedRelPath}: ${summary}`);
+  return { ok: true, degraded: true, attempts, findings: validation.findings, summary };
 }
 
 async function apiPipeline(route, message) {
@@ -306,9 +380,24 @@ async function apiPipeline(route, message) {
         const alignedPattern = new RegExp(`^${tag}(?:-.*)?-aligned\\.usfm$`);
         const ultAligned = discoverFreshOutput('output/AI-ULT', book, alignedPattern, startTime);
         const ustAligned = discoverFreshOutput('output/AI-UST', book, alignedPattern, startTime);
+        const alignmentWarnings = [];
 
         if (!ultAligned && !ustAligned) {
           throw new Error('Alignment phase failed: no aligned USFM files were produced.');
+        }
+
+        if (ultAligned) {
+          const result = bestEffortAlignedOutputRepair({ alignedRelPath: ultAligned, book, chapter, ust: false });
+          if (result.degraded) alignmentWarnings.push(`ULT ${result.summary}`);
+        }
+
+        if (ustAligned) {
+          const result = bestEffortAlignedOutputRepair({ alignedRelPath: ustAligned, book, chapter, ust: true });
+          if (result.degraded) alignmentWarnings.push(`UST ${result.summary}`);
+        }
+
+        if (alignmentWarnings.length > 0) {
+          await reply(`Alignment completed with defects:\n- ${alignmentWarnings.join('\n- ')}`);
         }
 
         // 2. Door43 Push
