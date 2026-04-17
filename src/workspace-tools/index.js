@@ -15,6 +15,12 @@ const { extractAlignmentData, fixHebrewQuotes, flagNarrowQuotes, generateIds, re
 const { validateTnTsv, checkTnQuality } = require('./quality-tools');
 const { giteaPr, prepareCompare, prepareTq, verifyTq, appendQuickref } = require('./misc-tools');
 
+function asTextToolResult(value) {
+  if (typeof value === 'string') return { content: [{ type: 'text', text: value }] };
+  if (value == null) return { content: [{ type: 'text', text: '' }] };
+  return { content: [{ type: 'text', text: JSON.stringify(value, null, 2) }] };
+}
+
 /**
  * Create the SDK MCP server config. Must be called after the SDK is loaded
  * (ESM dynamic import), so callers pass createSdkMcpServer and tool as args.
@@ -401,7 +407,7 @@ function createWorkspaceTools(createSdkMcpServer, tool, z) {
       tool('check_tn_quality', 'Run semantic quality checks on generated translation notes', {
         tsvPath: z.string().describe('Notes TSV path'), preparedJson: z.string().optional(), ultUsfm: z.string().optional(),
         ustUsfm: z.string().optional(), book: z.string().optional(), hebrewUsfm: z.string().optional(), output: z.string().optional(),
-      }, async (args) => ({ content: [{ type: 'text', text: await checkTnQuality(args) }] })),
+      }, async (args) => asTextToolResult(await checkTnQuality(args))),
 
       // --- Misc tools ---
       tool('gitea_pr', 'Create (and optionally merge) a PR on Door43 Gitea', {
@@ -509,7 +515,7 @@ function createQualityTools(createSdkMcpServer, tool, z) {
       tool('check_tn_quality', 'Run semantic quality checks on generated translation notes', {
         tsvPath: z.string(), preparedJson: z.string().optional(), ultUsfm: z.string().optional(),
         ustUsfm: z.string().optional(), book: z.string().optional(), hebrewUsfm: z.string().optional(), output: z.string().optional(),
-      }, async (args) => ({ content: [{ type: 'text', text: checkTnQuality(args) }] })),
+      }, async (args) => asTextToolResult(await checkTnQuality(args))),
       tool('validate_tn_tsv', 'Validate TN TSV against Door43 CI rules', {
         file: z.string(), checks: z.array(z.number()).optional(), maxErrors: z.number().optional(),
       }, async (args) => ({ content: [{ type: 'text', text: validateTnTsv(args) }] })),

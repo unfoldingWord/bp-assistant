@@ -166,6 +166,16 @@ function normalizeComparableAtText(text) {
     .trim();
 }
 
+function compareNormalizedSpanText(text) {
+  return String(text || '')
+    .replace(/\{[^}]*\}/g, ' ')
+    .replace(/\s*(?:\.{3}|\u2026)\s*/g, ' ')
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
 /**
  * Extract AT texts from after "Alternate translation:" lines.
  * Returns array of strings (contents of [...] brackets).
@@ -384,6 +394,7 @@ async function checkTnQuality({ tsvPath, preparedJson, ultUsfm, ustUsfm, book, h
     const ultVerse = prepItem.ult_verse || ultVerses[n.ref] || '';
     const ustVerse = prepItem.ust_verse || ustVerses[n.ref] || '';
     const glQuote = prepItem.issue_span_gl_quote || prepItem.gl_quote || '';
+    const exactSpan = prepItem.exact_ult_span || glQuote;
 
     // Extract ATs for this note
     const ats = extractAts(n.note);
@@ -416,6 +427,19 @@ async function checkTnQuality({ tsvPath, preparedJson, ultUsfm, ustUsfm, book, h
       const cleanGlq = stripBraces(glQuote);
       if (cleanGlq && !ultVerse.toLowerCase().includes(cleanGlq.toLowerCase())) {
         addFinding(n.row, n.ref, n.id, 'warning', 'gl_quote_not_in_ult', `gl_quote "${cleanGlq.slice(0, 50)}" not found in ULT`);
+      }
+    }
+
+    if (glQuote && exactSpan) {
+      const normalizedGlq = compareNormalizedSpanText(glQuote);
+      const normalizedExact = compareNormalizedSpanText(exactSpan);
+      if (normalizedExact
+        && normalizedGlq
+        && normalizedExact !== normalizedGlq
+        && normalizedExact.length < normalizedGlq.length
+        && normalizedGlq.includes(normalizedExact)) {
+        addFinding(n.row, n.ref, n.id, 'warning', 'scope_overreach',
+          `Selected quote is broader than exact aligned span "${exactSpan.slice(0, 50)}"`);
       }
     }
 
@@ -502,8 +526,8 @@ async function checkTnQuality({ tsvPath, preparedJson, ultUsfm, ustUsfm, book, h
     }
 
     // 13. AT capitalization
-    if (glQuote && ultVerse && ats.length) {
-      const cleanGlq = stripBraces(glQuote);
+    if (exactSpan && ultVerse && ats.length) {
+      const cleanGlq = stripBraces(exactSpan);
       const ultStripped = ultVerse.replace(/\{[^}]*\}/g, '');
       const idx = ultStripped.toLowerCase().indexOf(cleanGlq.toLowerCase());
       let position = 'mid_sentence';
@@ -513,11 +537,12 @@ async function checkTnQuality({ tsvPath, preparedJson, ultUsfm, ustUsfm, book, h
         const before = ultStripped.slice(0, idx).trimEnd();
         if (before.length === 0) position = 'verse_start';
         else if (before.endsWith('.')) position = 'after_period';
+        else if (/^[A-Z][^.!?]*,\s*$/.test(before)) position = 'after_vocative';
       }
       for (const at of ats) {
         if (!at) continue;
         const firstChar = at[0];
-        if ((position === 'verse_start' || position === 'after_period') && /[a-z]/.test(firstChar)) {
+        if ((position === 'verse_start' || position === 'after_period' || position === 'after_vocative') && /[a-z]/.test(firstChar)) {
           addFinding(n.row, n.ref, n.id, 'warning', 'at_capitalization', `AT "${at.slice(0, 40)}" should start with uppercase (${position})`);
         } else if (position === 'mid_sentence' && /[A-Z]/.test(firstChar)) {
           const firstWord = at.split(/\s+/)[0];
@@ -525,6 +550,19 @@ async function checkTnQuality({ tsvPath, preparedJson, ultUsfm, ustUsfm, book, h
             addFinding(n.row, n.ref, n.id, 'warning', 'at_capitalization', `AT "${at.slice(0, 40)}" starts uppercase mid-sentence`);
           }
         }
+      }
+    }
+
+    if (ats.length && glQuote && exactSpan) {
+      const normalizedGlq = compareNormalizedSpanText(glQuote);
+      const normalizedExact = compareNormalizedSpanText(exactSpan);
+      if (normalizedExact
+        && normalizedGlq
+        && normalizedExact !== normalizedGlq
+        && normalizedExact.length < normalizedGlq.length
+        && normalizedGlq.includes(normalizedExact)) {
+        addFinding(n.row, n.ref, n.id, 'warning', 'at_scope_mismatch',
+          'AT is being evaluated against a broader selected quote than the exact aligned span');
       }
     }
 

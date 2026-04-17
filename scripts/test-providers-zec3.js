@@ -210,6 +210,36 @@ function validateRequiredArtifacts(paths) {
   };
 }
 
+async function waitForFreshArtifacts(paths, startedAtMs, { timeoutMs = 15000, pollMs = 250 } = {}) {
+  const deadline = Date.now() + timeoutMs;
+  let last = { missing: [...paths], stale: [] };
+
+  while (Date.now() <= deadline) {
+    const missing = [];
+    const stale = [];
+
+    for (const artifactPath of paths) {
+      if (!fs.existsSync(artifactPath)) {
+        missing.push(artifactPath);
+        continue;
+      }
+      const stat = fs.statSync(artifactPath);
+      if (stat.size === 0 || stat.mtimeMs < startedAtMs) {
+        stale.push(artifactPath);
+      }
+    }
+
+    if (missing.length === 0 && stale.length === 0) {
+      return { ok: true, missing: [], stale: [] };
+    }
+
+    last = { missing, stale };
+    await new Promise((resolve) => setTimeout(resolve, pollMs));
+  }
+
+  return { ok: false, missing: last.missing, stale: last.stale };
+}
+
 async function runGeminiSmokeGate({ provider, runtime = DEFAULT_RUNTIME, model, thinking = 'medium' }) {
   if (provider !== 'gemini') return [];
 
@@ -453,6 +483,7 @@ async function runProvider(opts) {
   if (shouldRun('align')) {
     console.log(`\n[align-all-parallel] provider=${provider} model=${sonnetModel}`);
     let result;
+    const alignStartedAt = Date.now();
     try {
       result = await runSkill('align-all-parallel', `${book} ${chapter} --ult --ust`, {
         ...baseOpts,
@@ -467,10 +498,14 @@ async function runProvider(opts) {
     }
     const entry = recordStep('align-all-parallel', sonnetModel, result);
     if (entry.turns >= 50) observations.push('align-all-parallel hit maxTurns (50)');
-    const missingAligned = [out.ultAligned, out.ustAligned].filter((artifactPath) => !fs.existsSync(artifactPath));
-    for (const artifactPath of missingAligned) observations.push(`MISSING after alignment: ${artifactPath}`);
-    if (missingAligned.length > 0) {
-      fail('align-all-parallel', sonnetModel, new Error(`Alignment phase failed: missing aligned output(s): ${missingAligned.join(', ')}`));
+    const alignCheck = await waitForFreshArtifacts([out.ultAligned, out.ustAligned], alignStartedAt);
+    for (const artifactPath of alignCheck.missing) observations.push(`MISSING after alignment: ${artifactPath}`);
+    for (const artifactPath of alignCheck.stale) observations.push(`STALE after alignment: ${artifactPath}`);
+    if (!alignCheck.ok) {
+      const parts = [];
+      if (alignCheck.missing.length > 0) parts.push(`missing aligned output(s): ${alignCheck.missing.join(', ')}`);
+      if (alignCheck.stale.length > 0) parts.push(`stale or empty aligned output(s): ${alignCheck.stale.join(', ')}`);
+      fail('align-all-parallel', sonnetModel, new Error(`Alignment phase failed: ${parts.join('; ')}`));
     }
   }
 
@@ -679,4 +714,5 @@ module.exports = {
   runGeminiSmokeGate,
   runProvider,
   validateRequiredArtifacts,
+  waitForFreshArtifacts,
 };

@@ -16,6 +16,7 @@ const {
   buildParsedNotesRequest,
   shouldRunIntro,
   buildChapterIntroPrompt,
+  _runMechanicalQualityPrep,
   _analyzeIssuesTsvShape,
   _isMalformedIssuesShape,
 } = require('../src/notes-pipeline');
@@ -230,5 +231,76 @@ test('malformed issues TSV shape is detected when issue type and quote are blank
     if (oldBaseDir == null) delete process.env.CSKILLBP_DIR;
     else process.env.CSKILLBP_DIR = oldBaseDir;
     delete require.cache[notesPipelinePath];
+  }
+});
+
+test('runMechanicalQualityPrep forwards Hebrew USFM into quality checks', async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'notes-quality-prep-'));
+  const oldBaseDir = process.env.CSKILLBP_DIR;
+  process.env.CSKILLBP_DIR = tempDir;
+
+  const notesPipelinePath = require.resolve('../src/notes-pipeline');
+  const qualityToolsPath = require.resolve('../src/workspace-tools/quality-tools');
+  delete require.cache[notesPipelinePath];
+  delete require.cache[qualityToolsPath];
+  const { _runMechanicalQualityPrep: runMechanicalQualityPrep } = require('../src/notes-pipeline');
+
+  try {
+    const pipeDir = path.join('tmp', 'pipeline', 'PSA-039');
+    const pipeAbs = path.join(tempDir, pipeDir);
+    fs.mkdirSync(pipeAbs, { recursive: true });
+
+    const notesRel = path.join('output', 'notes', 'PSA', 'PSA-039.tsv');
+    const prepRel = path.join(pipeDir, 'prepared_notes.json');
+    const findingsRel = path.join(pipeDir, 'tn_quality_findings.json');
+    const ultRel = path.join(pipeDir, 'ult.usfm');
+    const ustRel = path.join(pipeDir, 'ust.usfm');
+    const hebRel = path.join(pipeDir, 'hebrew.usfm');
+
+    fs.mkdirSync(path.join(tempDir, 'output', 'notes', 'PSA'), { recursive: true });
+    fs.writeFileSync(path.join(tempDir, notesRel), [
+      'Reference\tID\tTags\tSupportReference\tQuote\tOccurrence\tNote',
+      '39:1\ta1b2\t\trc://*/ta/man/translate/figs-metaphor\tא ב\t1\tTest note. Alternate translation: [test]',
+    ].join('\n'));
+
+    fs.writeFileSync(path.join(tempDir, prepRel), JSON.stringify({
+      book: 'PSA',
+      items: [
+        {
+          id: 'a1b2',
+          reference: '39:1',
+          at_required: true,
+          gl_quote: 'test quote',
+          issue_span_gl_quote: 'test quote',
+          ult_verse: 'test quote',
+          ust_verse: 'test quote ust',
+        },
+      ],
+    }, null, 2));
+
+    fs.writeFileSync(path.join(tempDir, ultRel), '\\c 39\n\\v 1 test quote\n');
+    fs.writeFileSync(path.join(tempDir, ustRel), '\\c 39\n\\v 1 test quote ust\n');
+    fs.writeFileSync(path.join(tempDir, hebRel), '\\c 39\n\\v 1 \\w א|x\\w* \\w ג|x\\w* \\w ב|x\\w*\n');
+
+    fs.writeFileSync(path.join(pipeAbs, 'context.json'), JSON.stringify({
+      book: 'PSA',
+      sources: {
+        ult: ultRel,
+        ust: ustRel,
+        hebrew: hebRel,
+      },
+      runtime: {
+        preparedNotes: prepRel,
+        tnQualityFindings: findingsRel,
+      },
+    }, null, 2));
+
+    const summary = await runMechanicalQualityPrep({ notesPath: notesRel, pipeDir });
+    assert.match(summary, /^Quality check: 1 notes, 1 errors, 2 warnings/);
+  } finally {
+    if (oldBaseDir == null) delete process.env.CSKILLBP_DIR;
+    else process.env.CSKILLBP_DIR = oldBaseDir;
+    delete require.cache[notesPipelinePath];
+    delete require.cache[qualityToolsPath];
   }
 });

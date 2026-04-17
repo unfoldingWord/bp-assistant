@@ -8,6 +8,7 @@ const {
   prepareNotes,
   prepareATContext,
   verifyBoldMatches,
+  fillOrigQuotes,
   _resolveGlQuotes,
   _parseExplanationDirectives,
   _resolveTemplateSelection,
@@ -17,6 +18,7 @@ const {
   _buildWriterPrompt,
   _maybeBuildProgrammaticNote,
   _normalizeAssembledNoteText,
+  substituteAT,
 } = require('../src/workspace-tools/tn-tools');
 
 test('parseExplanationDirectives separates t: and i: instructions deterministically', () => {
@@ -307,6 +309,301 @@ test('resolveGlQuotes preserves contiguous aligned spans instead of unioning rep
   assert.match(uhvf.prompt, /Quote \(scoped\): filthy garments/);
 });
 
+test('resolveGlQuotes narrows to the later repeated occurrence when orig_quote points there', () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tn-tools-resolvegl-late-'));
+  const relRoot = path.join('tmp', path.basename(tempDir));
+  const absRoot = path.join('/srv/bot/workspace', relRoot);
+  fs.mkdirSync(absRoot, { recursive: true });
+
+  const prepRel = path.join(relRoot, 'prepared_notes.json');
+  const alignRel = path.join(relRoot, 'alignment.json');
+
+  fs.writeFileSync(path.join('/srv/bot/workspace', prepRel), JSON.stringify({
+    items: [
+      {
+        id: 'p123',
+        reference: '39:1',
+        sref: 'figs-metaphor',
+        gl_quote: 'Let me guard my ways from sinning with my tongue Let me guard a muzzle for my mouth',
+        issue_span_gl_quote: 'Let me guard my ways from sinning with my tongue Let me guard a muzzle for my mouth',
+        orig_quote: 'אֶשְׁמְרָ֥ה לְ⁠פִ֥י מַחְס֑וֹם',
+        writer_packet: {
+          issue_span_gl_quote: 'Let me guard my ways from sinning with my tongue Let me guard a muzzle for my mouth',
+          gl_quote: 'Let me guard my ways from sinning with my tongue Let me guard a muzzle for my mouth',
+        },
+        prompt: 'Reference: 39:1\nQuote (scoped): Let me guard my ways from sinning with my tongue Let me guard a muzzle for my mouth\nULT verse: ...',
+      },
+    ],
+  }, null, 2));
+
+  fs.writeFileSync(path.join('/srv/bot/workspace', alignRel), JSON.stringify({
+    '39:1': [
+      { eng: 'Let', heb: 'אֶֽשְׁמְרָ֣ה' },
+      { eng: 'me', heb: 'אֶֽשְׁמְרָ֣ה' },
+      { eng: 'guard', heb: 'אֶֽשְׁמְרָ֣ה' },
+      { eng: 'my', heb: 'דְרָכַ⁠י֮' },
+      { eng: 'ways', heb: 'דְרָכַ⁠י֮' },
+      { eng: 'from', heb: 'מֵ⁠חֲט֪וֹא' },
+      { eng: 'sinning', heb: 'מֵ⁠חֲט֪וֹא' },
+      { eng: 'with', heb: 'בִ⁠לְשׁ֫וֹנִ֥⁠י' },
+      { eng: 'my', heb: 'בִ⁠לְשׁ֫וֹנִ֥⁠י' },
+      { eng: 'tongue', heb: 'בִ⁠לְשׁ֫וֹנִ֥⁠י' },
+      { eng: 'Let', heb: 'אֶשְׁמְרָ֥ה' },
+      { eng: 'me', heb: 'אֶשְׁמְרָ֥ה' },
+      { eng: 'guard', heb: 'אֶשְׁמְרָ֥ה' },
+      { eng: 'a', heb: 'מַחְס֑וֹם' },
+      { eng: 'muzzle', heb: 'מַחְס֑וֹם' },
+      { eng: 'for', heb: 'לְ⁠פִ֥⁠י' },
+      { eng: 'my', heb: 'לְ⁠פִ֥⁠י' },
+      { eng: 'mouth', heb: 'לְ⁠פִ֥⁠י' },
+    ],
+  }, null, 2));
+
+  const summary = _resolveGlQuotes({ preparedJson: prepRel, alignmentJson: alignRel });
+  const prepared = JSON.parse(fs.readFileSync(path.join('/srv/bot/workspace', prepRel), 'utf8'));
+  const item = prepared.items.find((row) => row.id === 'p123');
+
+  assert.match(summary, /Updated 1 gl_quotes/);
+  assert.equal(item.issue_span_gl_quote, 'Let me guard a muzzle for my mouth');
+  assert.equal(item.exact_ult_span, 'Let me guard a muzzle for my mouth');
+  assert.equal(item.writer_packet.issue_span_gl_quote, 'Let me guard a muzzle for my mouth');
+  assert.match(item.prompt, /Quote \(scoped\): Let me guard a muzzle for my mouth/);
+});
+
+test('resolveGlQuotes keeps the current scope when repeated later occurrences are ambiguous', () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tn-tools-resolvegl-amb-'));
+  const relRoot = path.join('tmp', path.basename(tempDir));
+  const absRoot = path.join('/srv/bot/workspace', relRoot);
+  fs.mkdirSync(absRoot, { recursive: true });
+
+  const prepRel = path.join(relRoot, 'prepared_notes.json');
+  const alignRel = path.join(relRoot, 'alignment.json');
+
+  fs.writeFileSync(path.join('/srv/bot/workspace', prepRel), JSON.stringify({
+    items: [
+      {
+        id: 'a123',
+        reference: '1:1',
+        sref: 'figs-metaphor',
+        gl_quote: 'word',
+        issue_span_gl_quote: 'word',
+        orig_quote: 'דָבָר',
+        writer_packet: {
+          issue_span_gl_quote: 'word',
+          gl_quote: 'word',
+        },
+        prompt: 'Reference: 1:1\nQuote (scoped): word\nULT verse: ...',
+      },
+    ],
+  }, null, 2));
+
+  fs.writeFileSync(path.join('/srv/bot/workspace', alignRel), JSON.stringify({
+    '1:1': [
+      { eng: 'word', heb: 'דָבָר' },
+      { eng: 'and', heb: 'ו' },
+      { eng: 'word', heb: 'דָבָר' },
+    ],
+  }, null, 2));
+
+  const summary = _resolveGlQuotes({ preparedJson: prepRel, alignmentJson: alignRel });
+  const prepared = JSON.parse(fs.readFileSync(path.join('/srv/bot/workspace', prepRel), 'utf8'));
+  const item = prepared.items.find((row) => row.id === 'a123');
+
+  assert.match(summary, /Updated 0 gl_quotes/);
+  assert.equal(item.issue_span_gl_quote, 'word');
+  assert.equal(item.exact_ult_span, 'word');
+  assert.match(item.prompt, /Quote \(scoped\): word/);
+});
+
+test('fillOrigQuotes keeps repeated stopwords from widening Hebrew spans', () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tn-tools-fillquote-'));
+  const relRoot = path.join('tmp', path.basename(tempDir));
+  const absRoot = path.join('/srv/bot/workspace', relRoot);
+  fs.mkdirSync(absRoot, { recursive: true });
+
+  const prepRel = path.join(relRoot, 'prepared_notes.json');
+  const alignRel = path.join(relRoot, 'alignment.json');
+  const hebRel = path.join(relRoot, 'hebrew.usfm');
+
+  fs.writeFileSync(path.join('/srv/bot/workspace', prepRel), JSON.stringify({
+    book: 'ZEC',
+    items: [
+      {
+        id: 'wa9j',
+        reference: '3:2',
+        sref: 'figs-metaphor',
+        gl_quote: 'a firebrand rescued from the fire',
+        issue_span_gl_quote: 'a firebrand rescued from the fire',
+        orig_quote: '',
+        explanation: '',
+      },
+      {
+        id: 'tequ',
+        reference: '3:8',
+        sref: 'figs-idiom',
+        gl_quote: 'men of a sign',
+        issue_span_gl_quote: 'men of a sign',
+        orig_quote: '',
+        explanation: '',
+      },
+    ],
+  }, null, 2));
+
+  fs.writeFileSync(path.join('/srv/bot/workspace', alignRel), JSON.stringify({
+    '3:2': [
+      { eng: 'And', heb: 'וַ⁠יֹּ֨אמֶר' },
+      { eng: 'Yahweh', heb: 'יְהוָ֜ה' },
+      { eng: 'said', heb: 'וַ⁠יֹּ֨אמֶר' },
+      { eng: 'to', heb: 'אֶל' },
+      { eng: 'the', heb: 'הַ⁠שָּׂטָ֗ן' },
+      { eng: 'adversary', heb: 'הַ⁠שָּׂטָ֗ן' },
+      { eng: 'May', heb: 'יִגְעַ֨ר' },
+      { eng: 'Yahweh', heb: 'יְהוָ֤ה' },
+      { eng: 'rebuke', heb: 'יִגְעַ֨ר' },
+      { eng: 'you', heb: 'בְּ⁠ךָ֙' },
+      { eng: 'the', heb: 'הַ⁠שָּׂטָ֔ן' },
+      { eng: 'adversary', heb: 'הַ⁠שָּׂטָ֔ן' },
+      { eng: 'and', heb: 'וְ⁠יִגְעַ֤ר' },
+      { eng: 'may', heb: 'וְ⁠יִגְעַ֤ר' },
+      { eng: 'Yahweh', heb: 'יְהוָה֙' },
+      { eng: 'who', heb: 'הַ⁠בֹּחֵ֖ר' },
+      { eng: 'is', heb: 'הַ⁠בֹּחֵ֖ר' },
+      { eng: 'choosing', heb: 'הַ⁠בֹּחֵ֖ר' },
+      { eng: 'Jerusalem', heb: 'בִּ⁠ירֽוּשָׁלִָ֑ם' },
+      { eng: 'rebuke', heb: 'וְ⁠יִגְעַ֤ר' },
+      { eng: 'you', heb: 'בְּ⁠ךָ֔' },
+      { eng: 'Is', heb: 'הֲ⁠ל֧וֹא' },
+      { eng: 'this', heb: 'זֶ֦ה' },
+      { eng: 'not', heb: 'הֲ⁠ל֧וֹא' },
+      { eng: 'a', heb: 'א֖וּד' },
+      { eng: 'firebrand', heb: 'א֖וּד' },
+      { eng: 'rescued', heb: 'מֻצָּ֥ל' },
+      { eng: 'from', heb: 'מֵ⁠אֵֽשׁ' },
+      { eng: 'the', heb: 'מֵ⁠אֵֽשׁ' },
+      { eng: 'fire', heb: 'מֵ⁠אֵֽשׁ' },
+    ],
+    '3:8': [
+      { eng: 'Hear', heb: 'שְֽׁמַֽע' },
+      { eng: 'now', heb: 'נָ֞א' },
+      { eng: 'Joshua', heb: 'יְהוֹשֻׁ֣עַ' },
+      { eng: 'the', heb: 'הַ⁠גָּד֗וֹל' },
+      { eng: 'high', heb: 'הַ⁠גָּד֗וֹל' },
+      { eng: 'priest', heb: 'הַ⁠גָּד֗וֹל' },
+      { eng: 'you', heb: 'אַתָּה֙' },
+      { eng: 'and', heb: 'וְ⁠רֵעֶ֨י⁠ךָ֙' },
+      { eng: 'your', heb: 'וְ⁠רֵעֶ֨י⁠ךָ֙' },
+      { eng: 'companions', heb: 'וְ⁠רֵעֶ֨י⁠ךָ֙' },
+      { eng: 'who', heb: 'הַ⁠יֹּשְׁבִ֣ים' },
+      { eng: 'are', heb: 'הַ⁠יֹּשְׁבִ֣ים' },
+      { eng: 'sitting', heb: 'הַ⁠יֹּשְׁבִ֣ים' },
+      { eng: 'to', heb: 'לְ⁠פָנֶ֔י⁠ךָ' },
+      { eng: 'the', heb: 'לְ⁠פָנֶ֔י⁠ךָ' },
+      { eng: 'face', heb: 'לְ⁠פָנֶ֔י⁠ךָ' },
+      { eng: 'of', heb: 'לְ⁠פָנֶ֔י⁠ךָ' },
+      { eng: 'you', heb: 'לְ⁠פָנֶ֔י⁠ךָ' },
+      { eng: 'for', heb: 'כִּֽי' },
+      { eng: 'they', heb: 'הֵ֑מָּה' },
+      { eng: 'are', heb: 'הֵ֑מָּה' },
+      { eng: 'men', heb: 'אַנְשֵׁ֥י' },
+      { eng: 'of', heb: 'אַנְשֵׁ֥י' },
+      { eng: 'a', heb: 'מוֹפֵ֖ת' },
+      { eng: 'sign', heb: 'מוֹפֵ֖ת' },
+    ],
+  }, null, 2));
+
+  fs.writeFileSync(path.join('/srv/bot/workspace', hebRel), [
+    '\\id ZEC',
+    '\\c 3',
+    '\\v 2 \\w וַ⁠יֹּ֨אמֶר|x\\w* \\w יְהוָ֜ה|x\\w* \\w אֶל|x\\w* \\w הַ⁠שָּׂטָ֗ן|x\\w* \\w יִגְעַ֨ר|x\\w* \\w יְהוָ֤ה|x\\w* \\w בְּ⁠ךָ֙|x\\w* \\w הַ⁠שָּׂטָ֔ן|x\\w* \\w וְ⁠יִגְעַ֤ר|x\\w* \\w יְהוָה֙|x\\w* \\w הַ⁠בֹּחֵ֖ר|x\\w* \\w בִּ⁠ירֽוּשָׁלִָ֑ם|x\\w* \\w הֲ⁠ל֧וֹא|x\\w* \\w זֶ֦ה|x\\w* \\w א֖וּד|x\\w* \\w מֻצָּ֥ל|x\\w* \\w מֵ⁠אֵֽשׁ|x\\w*',
+    '\\v 8 \\w שְֽׁמַֽע|x\\w* \\w נָ֞א|x\\w* \\w יְהוֹשֻׁ֣עַ|x\\w* \\w הַ⁠גָּד֗וֹל|x\\w* \\w אַתָּה֙|x\\w* \\w וְ⁠רֵעֶ֨י⁠ךָ֙|x\\w* \\w הַ⁠יֹּשְׁבִ֣ים|x\\w* \\w לְ⁠פָנֶ֔י⁠ךָ|x\\w* \\w כִּֽי|x\\w* \\w הֵ֑מָּה|x\\w* \\w אַנְשֵׁ֥י|x\\w* \\w מוֹפֵ֖ת|x\\w*',
+    '',
+  ].join('\n'));
+
+  const summary = fillOrigQuotes({ preparedJson: prepRel, alignmentJson: alignRel, hebrewUsfm: hebRel });
+  const prepared = JSON.parse(fs.readFileSync(path.join('/srv/bot/workspace', prepRel), 'utf8'));
+  const firebrand = prepared.items.find((item) => item.id === 'wa9j');
+  const sign = prepared.items.find((item) => item.id === 'tequ');
+
+  assert.match(summary, /Resolved: 2 of 2 items/);
+  assert.equal(firebrand.orig_quote, 'א֖וּד מֻצָּ֥ל מֵ⁠אֵֽשׁ');
+  assert.equal(sign.orig_quote, 'אַנְשֵׁ֥י מוֹפֵ֖ת');
+});
+
+test('fillOrigQuotes avoids anchoring rhetorical questions on earlier weak auxiliaries', () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tn-tools-rquestion-'));
+  const relRoot = path.join('tmp', path.basename(tempDir));
+  const absRoot = path.join('/srv/bot/workspace', relRoot);
+  fs.mkdirSync(absRoot, { recursive: true });
+
+  const prepRel = path.join(relRoot, 'prepared_notes.json');
+  const alignRel = path.join(relRoot, 'alignment.json');
+  const hebRel = path.join(relRoot, 'hebrew.usfm');
+
+  fs.writeFileSync(path.join('/srv/bot/workspace', prepRel), JSON.stringify({
+    book: 'ZEC',
+    items: [
+      {
+        id: 'm3n0',
+        reference: '3:2',
+        sref: 'figs-rquestion',
+        gl_quote: 'Is this not a firebrand rescued from the fire?',
+        issue_span_gl_quote: 'Is this not a firebrand rescued from the fire?',
+        orig_quote: '',
+        explanation: 'rhetorical - asserts affirmative answer',
+      },
+    ],
+  }, null, 2));
+
+  fs.writeFileSync(path.join('/srv/bot/workspace', alignRel), JSON.stringify({
+    '3:2': [
+      { eng: 'And', heb: 'וַ⁠יֹּאמֶר' },
+      { eng: 'Yahweh', heb: 'יְהוָ֜ה' },
+      { eng: 'said', heb: 'וַ⁠יֹּאמֶר' },
+      { eng: 'to', heb: 'אֶל' },
+      { eng: 'the', heb: 'הַ⁠שָּׂטָ֗ן' },
+      { eng: 'adversary', heb: 'הַ⁠שָּׂטָ֗ן' },
+      { eng: 'May', heb: 'יִגְעַ֨ר' },
+      { eng: 'Yahweh', heb: 'יְהוָ֤ה' },
+      { eng: 'rebuke', heb: 'יִגְעַ֨ר' },
+      { eng: 'you', heb: 'בְּ⁠ךָ֙' },
+      { eng: 'the', heb: 'הַ⁠שָּׂטָ֔ן' },
+      { eng: 'adversary', heb: 'הַ⁠שָּׂטָ֔ן' },
+      { eng: 'and', heb: 'וְ⁠יִגְעַ֤ר' },
+      { eng: 'may', heb: 'וְ⁠יִגְעַ֤ר' },
+      { eng: 'Yahweh', heb: 'יְהוָה֙' },
+      { eng: 'who', heb: 'הַ⁠בֹּחֵ֖ר' },
+      { eng: 'is', heb: 'הַ⁠בֹּחֵ֖ר' },
+      { eng: 'choosing', heb: 'הַ⁠בֹּחֵ֖ר' },
+      { eng: 'Jerusalem', heb: 'בִּ⁠ירֽוּשָׁלִָ֑ם' },
+      { eng: 'rebuke', heb: 'וְ⁠יִגְעַ֤ר' },
+      { eng: 'you', heb: 'בְּ⁠ךָ֔' },
+      { eng: 'Is', heb: 'הֲ⁠ל֧וֹא' },
+      { eng: 'this', heb: 'זֶ֦ה' },
+      { eng: 'not', heb: 'הֲ⁠ל֧וֹא' },
+      { eng: 'a', heb: 'א֖וּד' },
+      { eng: 'firebrand', heb: 'א֖וּד' },
+      { eng: 'rescued', heb: 'מֻצָּ֥ל' },
+      { eng: 'from', heb: 'מֵ⁠אֵֽשׁ' },
+      { eng: 'the', heb: 'מֵ⁠אֵֽשׁ' },
+      { eng: 'fire', heb: 'מֵ⁠אֵֽשׁ' },
+    ],
+  }, null, 2));
+
+  fs.writeFileSync(path.join('/srv/bot/workspace', hebRel), [
+    '\\id ZEC',
+    '\\c 3',
+    '\\v 2 \\w וַ⁠יֹּאמֶר|x\\w* \\w יְהוָ֜ה|x\\w* \\w אֶל|x\\w* \\w הַ⁠שָּׂטָ֗ן|x\\w* \\w יִגְעַ֨ר|x\\w* \\w יְהוָ֤ה|x\\w* \\w בְּ⁠ךָ֙|x\\w* \\w הַ⁠שָּׂטָ֔ן|x\\w* \\w וְ⁠יִגְעַ֤ר|x\\w* \\w יְהוָה֙|x\\w* \\w הַ⁠בֹּחֵ֖ר|x\\w* \\w בִּ⁠ירֽוּשָׁלִָ֑ם|x\\w* \\w הֲ⁠ל֧וֹא|x\\w* \\w זֶ֦ה|x\\w* \\w א֖וּד|x\\w* \\w מֻצָּ֥ל|x\\w* \\w מֵ⁠אֵֽשׁ|x\\w*',
+    '',
+  ].join('\n'));
+
+  const summary = fillOrigQuotes({ preparedJson: prepRel, alignmentJson: alignRel, hebrewUsfm: hebRel });
+  const prepared = JSON.parse(fs.readFileSync(path.join('/srv/bot/workspace', prepRel), 'utf8'));
+  const question = prepared.items.find((item) => item.id === 'm3n0');
+
+  assert.match(summary, /Resolved: 1 of 1 items/);
+  assert.equal(question.orig_quote, 'הֲ⁠ל֧וֹא זֶ֦ה א֖וּד מֻצָּ֥ל מֵ⁠אֵֽשׁ');
+});
+
 test('quote scope selector marks parallelism rows as full_parallelism', () => {
   const selection = _resolveQuoteScopeSelection({
     sref: 'figs-parallelism',
@@ -324,6 +621,22 @@ test('normalizeAssembledNoteText decodes visible unicode escapes and brackets ba
 
   assert.match(normalized, /Alternate translation: \[the wicked person’s place\]/);
   assert.doesNotMatch(normalized, /\\u2019/);
+});
+
+test('substituteAT matches normalized apostrophes and discontinuous ampersand spans', () => {
+  const apostropheResult = substituteAT(
+    'This is the wicked person’s place.',
+    "the wicked person's place",
+    'the place where the wicked person lives'
+  );
+  assert.equal(apostropheResult, 'This is the place where the wicked person lives.');
+
+  const discontinuousResult = substituteAT(
+    'The king spoke to the people and the city rejoiced.',
+    'The king & the city',
+    'The ruler … the capital'
+  );
+  assert.equal(discontinuousResult, 'The ruler spoke to the people and the capital rejoiced.');
 });
 
 test('verifyBoldMatches restores missing bold when scoped opening quote matches ULT exactly', () => {

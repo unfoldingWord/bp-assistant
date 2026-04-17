@@ -633,9 +633,21 @@ function resolveGlQuotes({ preparedJson, alignmentJson, dryRun }) {
   const alignData = JSON.parse(fs.readFileSync(path.resolve(CSKILLBP_DIR, alignmentJson), 'utf8'));
   const CANT = /[\u0591-\u05AF\u2060\u05BE]/g;
   const normalizeHeb = (value) => String(value || '').replace(CANT, '');
+  const normalizeComparable = (value) => normalizeWhitespace(String(value || ''))
+    .replace(/\{[^}]*\}/g, ' ')
+    .replace(/[^\p{L}\p{N}\s]/gu, ' ')
+    .toLowerCase()
+    .replace(/\s+/g, ' ')
+    .trim();
 
   function buildAlignedSpan(entries, start, length) {
-    const spanEntries = entries.slice(start, start + length);
+    let spanStart = start;
+    let spanEnd = start + length - 1;
+    const startHeb = normalizeHeb(entries[spanStart]?.heb);
+    const endHeb = normalizeHeb(entries[spanEnd]?.heb);
+    while (spanStart > 0 && normalizeHeb(entries[spanStart - 1]?.heb) === startHeb) spanStart--;
+    while (spanEnd + 1 < entries.length && normalizeHeb(entries[spanEnd + 1]?.heb) === endHeb) spanEnd++;
+    const spanEntries = entries.slice(spanStart, spanEnd + 1);
     const words = [];
     let previous = null;
     for (const entry of spanEntries) {
@@ -648,24 +660,77 @@ function resolveGlQuotes({ preparedJson, alignmentJson, dryRun }) {
     return normalizeWhitespace(words.join(' '));
   }
 
-  function findContiguousSpan(entries, hebWords) {
-    if (!entries.length || !hebWords.length) return '';
+  function findAlignedWindowCandidates(entries, hebWords) {
+    if (!entries.length || !hebWords.length) return [];
     const normalizedTarget = hebWords.map(normalizeHeb).filter(Boolean);
-    if (!normalizedTarget.length) return '';
+    if (!normalizedTarget.length) return [];
+    const requiredCounts = new Map();
+    for (const token of normalizedTarget) {
+      requiredCounts.set(token, (requiredCounts.get(token) || 0) + 1);
+    }
 
-    for (let start = 0; start < entries.length; start++) {
-      if (normalizeHeb(entries[start].heb) !== normalizedTarget[0]) continue;
-      let cursor = start;
-      let matched = 0;
-      while (cursor < entries.length && matched < normalizedTarget.length) {
-        if (normalizeHeb(entries[cursor].heb) !== normalizedTarget[matched]) break;
-        cursor++;
-        matched++;
-      }
-      if (matched === normalizedTarget.length) {
-        return buildAlignedSpan(entries, start, matched);
+    const windowCounts = new Map();
+    let satisfied = 0;
+    let start = 0;
+    let bestWidth = Infinity;
+    const candidates = [];
+
+    function addEntry(entry) {
+      const token = normalizeHeb(entry.heb);
+      if (!requiredCounts.has(token)) return;
+      const next = (windowCounts.get(token) || 0) + 1;
+      windowCounts.set(token, next);
+      if (next === requiredCounts.get(token)) satisfied++;
+    }
+
+    function removeEntry(entry) {
+      const token = normalizeHeb(entry.heb);
+      if (!requiredCounts.has(token)) return;
+      const current = windowCounts.get(token) || 0;
+      if (current === requiredCounts.get(token)) satisfied--;
+      if (current <= 1) windowCounts.delete(token);
+      else windowCounts.set(token, current - 1);
+    }
+
+    for (let end = 0; end < entries.length; end++) {
+      addEntry(entries[end]);
+      while (satisfied === requiredCounts.size && start <= end) {
+        const width = end - start + 1;
+        const span = buildAlignedSpan(entries, start, width);
+        if (span) {
+          if (width < bestWidth) {
+            bestWidth = width;
+            candidates.length = 0;
+          }
+          if (width === bestWidth) {
+            candidates.push({ start, length: width, span });
+          }
+        }
+        removeEntry(entries[start]);
+        start++;
       }
     }
+    return candidates;
+  }
+
+  function chooseRefinedSpan(candidates, currentScoped) {
+    if (!candidates.length) return '';
+    if (candidates.length === 1) return candidates[0].span;
+
+    const normalizedCurrent = normalizeComparable(currentScoped);
+    if (!normalizedCurrent) return '';
+
+    const exactMatches = candidates.filter((candidate) => normalizeComparable(candidate.span) === normalizedCurrent);
+    if (exactMatches.length === 1) return exactMatches[0].span;
+    if (exactMatches.length > 1) return '';
+
+    const narrowerMatches = candidates.filter((candidate) => {
+      const normalizedCandidate = normalizeComparable(candidate.span);
+      return normalizedCandidate
+        && normalizedCandidate.length < normalizedCurrent.length
+        && normalizedCurrent.includes(normalizedCandidate);
+    });
+    if (narrowerMatches.length === 1) return narrowerMatches[0].span;
     return '';
   }
 
@@ -679,18 +744,28 @@ function resolveGlQuotes({ preparedJson, alignmentJson, dryRun }) {
     if (!entries.length) continue;
 
     const hebWords = item.orig_quote.split(/\s+/);
-    const span = findContiguousSpan(entries, hebWords);
-    if (!span) continue;
-
     const currentScoped = item.issue_span_gl_quote || item.gl_quote || '';
-    if (span && span !== currentScoped) {
-      log.push(`${item.reference}: "${currentScoped}" -> "${span}"`);
+    if (!dryRun && currentScoped && !item.exact_ult_span) {
+      item.exact_ult_span = currentScoped;
+      if (item.writer_packet && !item.writer_packet.exact_ult_span) item.writer_packet.exact_ult_span = currentScoped;
+    }
+    const candidates = findAlignedWindowCandidates(entries, hebWords);
+    const exactSpan = chooseRefinedSpan(candidates, currentScoped);
+    if (!exactSpan) continue;
+
+    if (!dryRun) {
+      item.exact_ult_span = exactSpan;
+      if (item.writer_packet) item.writer_packet.exact_ult_span = exactSpan;
+    }
+
+    if (exactSpan !== currentScoped) {
+      log.push(`${item.reference}: "${currentScoped}" -> "${exactSpan}"`);
       if (!dryRun) {
-        item.issue_span_gl_quote = span;
-        item.gl_quote = span;
+        item.issue_span_gl_quote = exactSpan;
+        item.gl_quote = exactSpan;
         if (item.writer_packet) {
-          item.writer_packet.issue_span_gl_quote = span;
-          item.writer_packet.gl_quote = span;
+          item.writer_packet.issue_span_gl_quote = exactSpan;
+          item.writer_packet.gl_quote = exactSpan;
         }
         item.prompt = buildWriterPrompt(item);
       }
@@ -1147,6 +1222,7 @@ function prepareNotes({ inputTsv, ultUsfm, ustUsfm, output, alignedUsfm, alignme
     } else {
       item.note_type = item.at_required ? 'writes_at' : 'given_at';
     }
+    item.exact_ult_span = item.issue_span_gl_quote;
     item.system_prompt_key = item.at_required ? 'ai_writes_at_agent' : 'given_at_agent';
     item.programmatic_note = maybeBuildProgrammaticNote(item);
     item.writer_packet = buildWriterPacket(item);
@@ -1489,6 +1565,14 @@ function fillOrigQuotes({ preparedJson, alignmentJson, hebrewUsfm, masterUltUsfm
   const STRIP_RE = /[\u0591-\u05AF\u2060\u05BD\u05C3]/g;
   const PUNC = /[{},;:.!?'""\u2018\u2019\u201C\u201D\u2014\u2013()]/g;
   const STOP_WORDS = new Set(['a','an','the','of','in','on','at','to','for','by','as','and','or','but','not','with','from']);
+  const WEAK_ANCHOR_WORDS = new Set([
+    ...STOP_WORDS,
+    'am', 'is', 'are', 'was', 'were', 'be', 'been', 'being',
+    'do', 'does', 'did', 'have', 'has', 'had',
+    'may', 'might', 'can', 'could', 'shall', 'should', 'will', 'would',
+    'this', 'that', 'these', 'those',
+    'who', 'whom', 'whose', 'which',
+  ]);
 
   function stripForSearch(s) {
     return s.replace(/[\u0591-\u05AF\u2060\u05BD\u05C3]/g, '');
@@ -1616,56 +1700,87 @@ function fillOrigQuotes({ preparedJson, alignmentJson, hebrewUsfm, masterUltUsfm
     const usedIndices = new Set();
     const allHeb = [];
 
+    function normalizeEntryWord(text) {
+      return String(text || '').replace(PUNC, '').toLowerCase();
+    }
+
+    function compareCandidateMatches(left, right, words) {
+      if (!left) return right;
+      if (!right) return left;
+
+      const strongPositions = words
+        .map((word, index) => (!WEAK_ANCHOR_WORDS.has(word) ? index : -1))
+        .filter(index => index >= 0);
+      const spanForPositions = (indices, positions) => {
+        if (!positions.length) return indices[indices.length - 1] - indices[0];
+        return indices[positions[positions.length - 1]] - indices[positions[0]];
+      };
+      const leftCoreSpan = spanForPositions(left, strongPositions);
+      const rightCoreSpan = spanForPositions(right, strongPositions);
+      if (leftCoreSpan !== rightCoreSpan) return leftCoreSpan < rightCoreSpan ? left : right;
+
+      const leftSpan = left[left.length - 1] - left[0];
+      const rightSpan = right[right.length - 1] - right[0];
+      if (leftSpan !== rightSpan) return leftSpan < rightSpan ? left : right;
+
+      const gapCount = (indices) => indices.slice(1).reduce((sum, idx, pos) => sum + Math.max(0, idx - indices[pos] - 1), 0);
+      const leftGaps = gapCount(left);
+      const rightGaps = gapCount(right);
+      if (leftGaps !== rightGaps) return leftGaps < rightGaps ? left : right;
+
+      return left[0] <= right[0] ? left : right;
+    }
+
+    function matchSequentialWords(words, startIndex) {
+      const memo = new Map();
+
+      function search(wordIndex, cursor) {
+        const key = `${wordIndex}:${cursor}`;
+        if (memo.has(key)) return memo.get(key);
+        if (wordIndex >= words.length) return [];
+
+        let best = null;
+        for (let i = cursor; i < entries.length; i++) {
+          if (usedIndices.has(i)) continue;
+          if (normalizeEntryWord(entries[i].eng) !== words[wordIndex]) continue;
+          const tail = search(wordIndex + 1, i + 1);
+          if (!tail) continue;
+          best = compareCandidateMatches(best, [i, ...tail], words);
+        }
+
+        memo.set(key, best);
+        return best;
+      }
+
+      return search(0, startIndex);
+    }
+
+    function collectHebrew(indices) {
+      return indices.map((idx) => entries[idx]?.heb).filter(Boolean);
+    }
+
     for (const seg of segments) {
       const words = seg.trim().split(/\s+/).filter(Boolean)
         .map(t => t.replace(PUNC, '').toLowerCase()).filter(Boolean);
       if (!words.length) continue;
 
-      // Pass 1: exact match (all words)
-      const pass1Used = new Set();
-      const pass1Heb = [];
-      let pass1All = true;
-      for (const w of words) {
-        let found = false;
-        for (let i = 0; i < entries.length; i++) {
-          if (usedIndices.has(i) || pass1Used.has(i)) continue;
-          const engNorm = (entries[i].eng || '').replace(PUNC, '').toLowerCase();
-          if (engNorm === w) {
-            pass1Used.add(i);
-            if (entries[i].heb) pass1Heb.push(entries[i].heb);
-            found = true;
-            break;
-          }
-        }
-        if (!found) { pass1All = false; }
-      }
-
-      if (pass1All && pass1Heb.length) {
-        for (const idx of pass1Used) usedIndices.add(idx);
+      // Pass 1: exact sequential match preserves verse order and avoids
+      // earlier stopword matches from widening the Hebrew span.
+      const pass1Matches = matchSequentialWords(words, 0);
+      const pass1Heb = pass1Matches ? collectHebrew(pass1Matches) : null;
+      if (pass1Matches && pass1Heb.length) {
+        for (const idx of pass1Matches) usedIndices.add(idx);
         allHeb.push(...pass1Heb);
         continue;
       }
 
-      // Pass 2: content-words-only (skip stop words), require >= 50% match
+      // Pass 2: content-words-only sequential match
       const contentWords = words.filter(w => !STOP_WORDS.has(w));
       const wordsToTry = contentWords.length ? contentWords : words;
-      const pass2Used = new Set();
-      const pass2Heb = [];
-      let matched = 0;
-      for (const w of wordsToTry) {
-        for (let i = 0; i < entries.length; i++) {
-          if (usedIndices.has(i) || pass2Used.has(i)) continue;
-          const engNorm = (entries[i].eng || '').replace(PUNC, '').toLowerCase();
-          if (engNorm === w) {
-            pass2Used.add(i);
-            if (entries[i].heb) pass2Heb.push(entries[i].heb);
-            matched++;
-            break;
-          }
-        }
-      }
-      if (matched < Math.ceil(wordsToTry.length / 2) || !pass2Heb.length) return null;
-      for (const idx of pass2Used) usedIndices.add(idx);
+      const pass2Matches = matchSequentialWords(wordsToTry, 0);
+      const pass2Heb = pass2Matches ? collectHebrew(pass2Matches) : null;
+      if (!pass2Matches || !pass2Heb.length) return null;
+      for (const idx of pass2Matches) usedIndices.add(idx);
       allHeb.push(...pass2Heb);
     }
 
@@ -1895,36 +2010,109 @@ function prepareAndValidate({ inputTsv, ultUsfm, ustUsfm, alignedUsfm, output })
 function substituteAT(verse, glQuote, atText) {
   if (!verse || !glQuote || !atText) return null;
 
-  // Handle discontinuous quotes: "first part … second part"
+  function buildComparableIndex(text) {
+    const normalizedChars = [];
+    const offsets = [];
+    let pendingSpace = false;
+
+    for (let i = 0; i < text.length; i++) {
+      const ch = text[i];
+      if (ch === '{') {
+        const end = text.indexOf('}', i + 1);
+        if (end !== -1) {
+          for (let j = i + 1; j < end; j++) {
+            const inner = text[j];
+            if (/\s/.test(inner)) {
+              pendingSpace = normalizedChars.length > 0;
+              continue;
+            }
+            if (pendingSpace && normalizedChars.length > 0 && normalizedChars[normalizedChars.length - 1] !== ' ') {
+              normalizedChars.push(' ');
+              offsets.push(j);
+            }
+            pendingSpace = false;
+            normalizedChars.push(inner.toLowerCase());
+            offsets.push(j);
+          }
+          i = end;
+          continue;
+        }
+      }
+
+      let next = ch;
+      if (/[\u2018\u2019]/.test(ch)) next = '\'';
+      else if (/[\u201C\u201D]/.test(ch)) next = '"';
+      else if (/[\u2010-\u2015]/.test(ch)) next = '-';
+
+      if (/\s/.test(next)) {
+        pendingSpace = normalizedChars.length > 0;
+        continue;
+      }
+      if (pendingSpace && normalizedChars.length > 0 && normalizedChars[normalizedChars.length - 1] !== ' ') {
+        normalizedChars.push(' ');
+        offsets.push(i);
+      }
+      pendingSpace = false;
+      normalizedChars.push(next.toLowerCase());
+      offsets.push(i);
+    }
+
+    while (normalizedChars[0] === ' ') {
+      normalizedChars.shift();
+      offsets.shift();
+    }
+    while (normalizedChars[normalizedChars.length - 1] === ' ') {
+      normalizedChars.pop();
+      offsets.pop();
+    }
+
+    return { text: normalizedChars.join(''), offsets };
+  }
+
+  function findComparableSpan(haystack, needle, fromOriginalIndex = 0) {
+    const hay = buildComparableIndex(haystack);
+    const ndl = buildComparableIndex(needle).text;
+    if (!hay.text || !ndl) return null;
+
+    let fromNormalizedIndex = 0;
+    while (fromNormalizedIndex < hay.offsets.length && hay.offsets[fromNormalizedIndex] < fromOriginalIndex) {
+      fromNormalizedIndex++;
+    }
+    const idx = hay.text.indexOf(ndl, fromNormalizedIndex);
+    if (idx === -1) return null;
+    return {
+      start: hay.offsets[idx],
+      end: hay.offsets[idx + ndl.length - 1] + 1,
+    };
+  }
+
   const ellipsis = '\u2026';
-  if (glQuote.includes(ellipsis) || glQuote.includes('...')) {
-    const separator = glQuote.includes(ellipsis) ? ellipsis : '...';
-    const parts = glQuote.split(separator).map(p => p.trim());
+  if (/(?:\u2026|\.{3}| & )/.test(glQuote)) {
+    const separator = glQuote.includes(ellipsis) ? ellipsis : (glQuote.includes('...') ? '...' : ' & ');
+    const parts = glQuote.split(separator).map(p => p.trim()).filter(Boolean);
     const atParts = atText.includes(ellipsis)
       ? atText.split(ellipsis).map(p => p.trim())
       : atText.includes('...')
         ? atText.split('...').map(p => p.trim())
-        : [atText]; // AT has no separator — replace first part only
+        : atText.includes(' & ')
+          ? atText.split(' & ').map(p => p.trim())
+          : [atText];
 
     let result = verse;
+    let searchFrom = 0;
     for (let i = 0; i < parts.length; i++) {
       const replacement = atParts[i] || atParts[atParts.length - 1] || '';
-      const idx = result.indexOf(parts[i]);
-      if (idx === -1) return null; // part not found
-      result = result.slice(0, idx) + replacement + result.slice(idx + parts[i].length);
+      const span = findComparableSpan(result, parts[i], searchFrom);
+      if (!span) return null;
+      result = result.slice(0, span.start) + replacement + result.slice(span.end);
+      searchFrom = span.start + replacement.length;
     }
     return result;
   }
 
-  // Simple contiguous quote
-  const idx = verse.indexOf(glQuote);
-  if (idx === -1) {
-    // Try case-insensitive match
-    const lowerIdx = verse.toLowerCase().indexOf(glQuote.toLowerCase());
-    if (lowerIdx === -1) return null;
-    return verse.slice(0, lowerIdx) + atText + verse.slice(lowerIdx + glQuote.length);
-  }
-  return verse.slice(0, idx) + atText + verse.slice(idx + glQuote.length);
+  const span = findComparableSpan(verse, glQuote);
+  if (!span) return null;
+  return verse.slice(0, span.start) + atText + verse.slice(span.end);
 }
 
 /**
@@ -1982,7 +2170,7 @@ function prepareATContext({ preparedJson, generatedJson, output }) {
       reference: item.reference,
       issue_type: item.sref,
       quote_scope_mode: item.scope_mode || 'focused_span',
-      exact_ult_span: scopedQuote,
+      exact_ult_span: item.exact_ult_span || scopedQuote,
       full_verse: verseCtx.current,
       verse_context: {
         prev: verseCtx.prev,

@@ -43,6 +43,7 @@ const DEEP_ISSUE_ID_HINT =
 const TN_QUALITY_CHECK_HINT =
   'Mechanical checks have already run. Read runtime.tnQualityFindings from context.json — ' +
   'this is the starting findings list. Do not re-run fix_trailing_newlines or check_tn_quality before reviewing. ' +
+  'Do not guess alternate file paths or probe missing runtime files outside context.json. ' +
   'Do the full semantic review (Steps 3a-3j), fix issues found, then re-run check_tn_quality ' +
   'at most once to verify fixes. If issues still persist after that one re-check, report them ' +
   'as unresolved and stop. Do not loop further.';
@@ -50,6 +51,7 @@ const TN_QUALITY_CHECK_HINT =
 const TN_WRITER_HINT =
   'The pipeline has already run all mechanical preparation (prepare_notes, fill_orig_quotes, resolve_gl_quotes, flag_narrow_quotes). ' +
   'Read runtime.preparedNotes from context.json — all fields are populated. Do not re-run preparation MCP tools. ' +
+  'Never use the raw Read tool on prepared_notes.json. Use read_prepared_notes with summaryOnly:true first, then fetch bounded slices. ' +
   'Stay in the tn-writer lane. Do not use Task/Agent/Team tools, web tools, SendMessage, or notebook editing. ' +
   'Do not hunt for alternate templates or run exploratory repair loops. ' +
   'Use only the prepared inputs, especially writer_packet, named canonical references, and workspace MCP tools needed for the documented tn-writer sequence. ' +
@@ -769,6 +771,7 @@ async function runMechanicalQualityPrep({ notesPath, pipeDir }) {
     preparedJson: ctx.runtime.preparedNotes,
     ultUsfm: ctx.sources.ultPlain || ctx.sources.ult,
     ustUsfm: ctx.sources.ustPlain || ctx.sources.ust,
+    hebrewUsfm: ctx.sources.hebrew,
     book: ctx.book,
     output: ctx.runtime.tnQualityFindings,
   });
@@ -1151,7 +1154,7 @@ function readQualityFindings(qualityRelPath) {
 
 function collectUnresolvedQuoteFindings(qualityJson) {
   const findings = Array.isArray(qualityJson?.findings) ? qualityJson.findings : [];
-  return findings.filter((f) => ['empty_quote', 'no_hebrew_in_quote', 'gl_quote_not_in_ult'].includes(String(f.category || '')));
+  return findings.filter((f) => ['empty_quote', 'no_hebrew_in_quote', 'gl_quote_not_in_ult', 'scope_overreach', 'at_scope_mismatch'].includes(String(f.category || '')));
 }
 
 function appendIssueTagsToTsv(tsvRelPath, unresolvedFindings) {
@@ -2649,4 +2652,5 @@ module.exports = {
   _collectUnresolvedQuoteFindings: collectUnresolvedQuoteFindings,
   _isMalformedIssuesShape: isMalformedIssuesShape,
   _postProcessNotesTsv: postProcessNotesTsv,
+  _runMechanicalQualityPrep: runMechanicalQualityPrep,
 };

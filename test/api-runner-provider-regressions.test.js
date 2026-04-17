@@ -19,6 +19,7 @@ const {
   getCleanupTargets,
   validateRequiredArtifacts,
   destDirName,
+  waitForFreshArtifacts,
 } = require('../scripts/test-providers-zec3');
 const {
   resolveAgentProvider,
@@ -506,6 +507,21 @@ test('zec harness artifact gate rejects missing or empty required outputs', () =
   assert.equal(result.ok, false);
   assert.deepEqual(result.missing.map((entry) => entry.key), ['notes']);
   assert.deepEqual(result.empty.map((entry) => entry.key), ['ust']);
+});
+
+test('zec harness waits briefly for freshly-written aligned artifacts', async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'zec3-wait-'));
+  const target = path.join(tempDir, 'ZEC-03-aligned.usfm');
+  const startedAt = Date.now();
+
+  setTimeout(() => {
+    fs.writeFileSync(target, '\\id ZEC\n');
+  }, 150);
+
+  const result = await waitForFreshArtifacts([target], startedAt, { timeoutMs: 2000, pollMs: 50 });
+  assert.equal(result.ok, true);
+  assert.deepEqual(result.missing, []);
+  assert.deepEqual(result.stale, []);
 });
 
 test('readPreparedNotes accepts object-backed prepared_notes packets', () => {

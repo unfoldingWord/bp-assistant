@@ -3,7 +3,9 @@ const assert = require('node:assert/strict');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+const { z } = require('zod');
 
+const { createQualityTools } = require('../src/workspace-tools');
 const { checkTnQuality } = require('../src/workspace-tools/quality-tools');
 
 test('checkTnQuality uses at_required as the missing_at contract', async () => {
@@ -189,4 +191,133 @@ test('checkTnQuality distinguishes invalid bold, missing expected bold, and ambi
   assert.ok(categoriesById.get('a1b2').includes('invalid_opening_bold'));
   assert.ok(categoriesById.get('a2b3').includes('missing_opening_bold'));
   assert.ok(categoriesById.get('a3b4').includes('ambiguous_opening_bold'));
+});
+
+test('checkTnQuality flags scope overreach when prepared metadata proves a narrower exact span', async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'quality-tools-scope-'));
+  const relRoot = path.join('tmp', path.basename(tempDir));
+  const absRoot = path.join('/srv/bot/workspace', relRoot);
+  fs.mkdirSync(absRoot, { recursive: true });
+
+  const tsvRel = path.join(relRoot, 'tn.tsv');
+  const prepRel = path.join(relRoot, 'prepared_notes.json');
+  const ultRel = path.join(relRoot, 'ult.usfm');
+  const ustRel = path.join(relRoot, 'ust.usfm');
+  const findingsRel = path.join(relRoot, 'findings.json');
+
+  fs.writeFileSync(path.join('/srv/bot/workspace', tsvRel), [
+    'Reference\tID\tTags\tSupportReference\tQuote\tOccurrence\tNote',
+    '39:1\tp123\t\trc://*/ta/man/translate/figs-metaphor\tאֶשְׁמְרָ֥ה לְ⁠פִ֥⁠י מַחְס֑וֹם\t1\tHere the psalmist is speaking as if his speech were restrained by a **muzzle**. Alternate translation: [I will keep myself from speaking]',
+  ].join('\n'));
+
+  fs.writeFileSync(path.join('/srv/bot/workspace', prepRel), JSON.stringify({
+    items: [
+      {
+        id: 'p123',
+        reference: '39:1',
+        at_required: true,
+        gl_quote: 'Let me guard my ways from sinning with my tongue Let me guard a muzzle for my mouth',
+        issue_span_gl_quote: 'Let me guard my ways from sinning with my tongue Let me guard a muzzle for my mouth',
+        exact_ult_span: 'Let me guard a muzzle for my mouth',
+        ult_verse: 'I said, “Let me guard my ways from sinning with my tongue. Let me guard a muzzle for my mouth.”',
+        ust_verse: 'I said that I would keep myself from speaking.',
+      },
+    ],
+  }, null, 2));
+
+  fs.writeFileSync(path.join('/srv/bot/workspace', ultRel), '\\c 39\n\\v 1 I said, “Let me guard my ways from sinning with my tongue. Let me guard a muzzle for my mouth.”\n');
+  fs.writeFileSync(path.join('/srv/bot/workspace', ustRel), '\\c 39\n\\v 1 I said that I would keep myself from speaking.\n');
+
+  await checkTnQuality({
+    tsvPath: tsvRel,
+    preparedJson: prepRel,
+    ultUsfm: ultRel,
+    ustUsfm: ustRel,
+    output: findingsRel,
+  });
+
+  const findings = JSON.parse(fs.readFileSync(path.join('/srv/bot/workspace', findingsRel), 'utf8')).findings || [];
+  assert.ok(findings.some((f) => f.id === 'p123' && f.category === 'scope_overreach'));
+});
+
+test('checkTnQuality flags AT scope mismatch against the exact selected span', async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'quality-tools-atfit-'));
+  const relRoot = path.join('tmp', path.basename(tempDir));
+  const absRoot = path.join('/srv/bot/workspace', relRoot);
+  fs.mkdirSync(absRoot, { recursive: true });
+
+  const tsvRel = path.join(relRoot, 'tn.tsv');
+  const prepRel = path.join(relRoot, 'prepared_notes.json');
+  const ultRel = path.join(relRoot, 'ult.usfm');
+  const ustRel = path.join(relRoot, 'ust.usfm');
+  const findingsRel = path.join(relRoot, 'findings.json');
+
+  fs.writeFileSync(path.join('/srv/bot/workspace', tsvRel), [
+    'Reference\tID\tTags\tSupportReference\tQuote\tOccurrence\tNote',
+    '39:10\ti8qv\t\trc://*/ta/man/translate/figs-metonymy\tמִ⁠תִּגְרַ֥ת יָ֝דְ⁠ךָ֗\t1\tHere, **your hand** represents Yahweh’s power. If it would be helpful in your language, you could use an equivalent expression or state the meaning plainly. Alternate translation: [of your might]',
+    '39:12\tgyud\t\trc://*/ta/man/translate/figs-imperative\tהוֹדִ֘יעֵ֤⁠נִי\t1\tThis is an imperative, but it communicates a polite request rather than a command. Alternate translation: [please let me know my end, Yahweh]',
+  ].join('\n'));
+
+  fs.writeFileSync(path.join('/srv/bot/workspace', prepRel), JSON.stringify({
+    items: [
+      {
+        id: 'i8qv',
+        reference: '39:10',
+        at_required: true,
+        gl_quote: 'from the blow of your hand',
+        issue_span_gl_quote: 'from the blow of your hand',
+        exact_ult_span: 'your hand',
+        ult_verse: 'I am finished from the blow of your hand.',
+        ust_verse: 'I am finished because you struck me.',
+      },
+      {
+        id: 'gyud',
+        reference: '39:12',
+        at_required: true,
+        gl_quote: 'make me know my end',
+        issue_span_gl_quote: 'make me know my end',
+        exact_ult_span: 'make me know my end',
+        ult_verse: 'Yahweh, make me know my end.',
+        ust_verse: 'Yahweh, tell me when my life will end.',
+      },
+    ],
+  }, null, 2));
+
+  fs.writeFileSync(path.join('/srv/bot/workspace', ultRel), '\\c 39\n\\v 10 I am finished from the blow of your hand.\n\\v 12 Yahweh, make me know my end.\n');
+  fs.writeFileSync(path.join('/srv/bot/workspace', ustRel), '\\c 39\n\\v 10 I am finished because you struck me.\n\\v 12 Yahweh, tell me when my life will end.\n');
+
+  await checkTnQuality({
+    tsvPath: tsvRel,
+    preparedJson: prepRel,
+    ultUsfm: ultRel,
+    ustUsfm: ustRel,
+    output: findingsRel,
+  });
+
+  const findings = JSON.parse(fs.readFileSync(path.join('/srv/bot/workspace', findingsRel), 'utf8')).findings || [];
+  assert.ok(findings.some((f) => f.id === 'i8qv' && f.category === 'at_scope_mismatch'));
+  assert.ok(findings.some((f) => f.id === 'gyud' && f.category === 'at_capitalization'));
+});
+
+test('check_tn_quality MCP handler always returns schema-valid text content', async () => {
+  const { CallToolResultSchema } = await import('../node_modules/@modelcontextprotocol/sdk/dist/esm/types.js');
+  const sdk = await import('@anthropic-ai/claude-agent-sdk');
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'quality-tools-mcp-'));
+  const relRoot = path.join('tmp', path.basename(tempDir));
+  const absRoot = path.join('/srv/bot/workspace', relRoot);
+  fs.mkdirSync(absRoot, { recursive: true });
+
+  const tsvRel = path.join(relRoot, 'tn.tsv');
+  fs.writeFileSync(path.join('/srv/bot/workspace', tsvRel), [
+    'Reference\tID\tTags\tSupportReference\tQuote\tOccurrence\tNote',
+    '1:1\ta1b2\t\trc://*/ta/man/translate/figs-metaphor\tמֶלֶךְ\t1\tTest note',
+  ].join('\n'));
+
+  const server = createQualityTools(sdk.createSdkMcpServer, sdk.tool, z);
+  const handler = server.instance._registeredTools.check_tn_quality.handler;
+  const result = await handler({ tsvPath: tsvRel });
+  const parsed = CallToolResultSchema.safeParse(result);
+
+  assert.equal(parsed.success, true, parsed.success ? '' : parsed.error.message);
+  assert.equal(typeof parsed.data.content[0].text, 'string');
 });
