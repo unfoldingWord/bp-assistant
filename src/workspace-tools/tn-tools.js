@@ -56,6 +56,274 @@ function normalizeWhitespace(value) {
   return String(value || '').replace(/\s+/g, ' ').trim();
 }
 
+const ALIGNMENT_PUNC_RE = /[{},;:.!?'"“”‘’\u2018\u2019\u201C\u201D\u2014\u2013()]/g;
+const ALIGNMENT_STOP_WORDS = new Set(['a', 'an', 'the', 'of', 'in', 'on', 'at', 'to', 'for', 'by', 'as', 'and', 'or', 'but', 'not', 'with', 'from']);
+const ALIGNMENT_WEAK_ANCHOR_WORDS = new Set([
+  ...ALIGNMENT_STOP_WORDS,
+  'am', 'is', 'are', 'was', 'were', 'be', 'been', 'being',
+  'do', 'does', 'did', 'have', 'has', 'had',
+  'may', 'might', 'can', 'could', 'shall', 'should', 'will', 'would',
+  'this', 'that', 'these', 'those',
+  'who', 'whom', 'whose', 'which',
+  'i', 'me', 'my', 'mine', 'myself',
+  'we', 'us', 'our', 'ours', 'ourselves',
+  'you', 'your', 'yours', 'yourself', 'yourselves',
+  'he', 'him', 'his', 'himself',
+  'she', 'her', 'hers', 'herself',
+  'it', 'its', 'itself',
+  'they', 'them', 'their', 'theirs', 'themselves',
+]);
+
+function normalizeComparableQuoteText(value) {
+  return normalizeWhitespace(String(value || ''))
+    .replace(/\{[^}]*\}/g, ' ')
+    .replace(/[^\p{L}\p{N}\s]/gu, ' ')
+    .toLowerCase()
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function normalizeAlignmentEntryWord(text) {
+  return String(text || '').replace(ALIGNMENT_PUNC_RE, '').toLowerCase();
+}
+
+function tokenizeAlignmentQuote(segment) {
+  return String(segment || '')
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean)
+    .map(normalizeAlignmentEntryWord)
+    .filter(Boolean);
+}
+
+function compareAlignmentCandidates(left, right, words) {
+  if (!left) return right;
+  if (!right) return left;
+
+  const strongPositions = words
+    .map((word, index) => (!ALIGNMENT_WEAK_ANCHOR_WORDS.has(word) ? index : -1))
+    .filter((index) => index >= 0);
+  const spanForPositions = (indices, positions) => {
+    if (!positions.length) return indices[indices.length - 1] - indices[0];
+    return indices[positions[positions.length - 1]] - indices[positions[0]];
+  };
+  const leftCoreSpan = spanForPositions(left, strongPositions);
+  const rightCoreSpan = spanForPositions(right, strongPositions);
+  if (leftCoreSpan !== rightCoreSpan) return leftCoreSpan < rightCoreSpan ? left : right;
+
+  const leftSpan = left[left.length - 1] - left[0];
+  const rightSpan = right[right.length - 1] - right[0];
+  if (leftSpan !== rightSpan) return leftSpan < rightSpan ? left : right;
+
+  const gapCount = (indices) => indices.slice(1).reduce((sum, idx, pos) => sum + Math.max(0, idx - indices[pos] - 1), 0);
+  const leftGaps = gapCount(left);
+  const rightGaps = gapCount(right);
+  if (leftGaps !== rightGaps) return leftGaps < rightGaps ? left : right;
+
+  return left[0] <= right[0] ? left : right;
+}
+
+function findBestSequentialAlignmentMatch(entries, words, usedIndices = new Set()) {
+  const memo = new Map();
+
+  function search(wordIndex, cursor) {
+    const key = `${wordIndex}:${cursor}`;
+    if (memo.has(key)) return memo.get(key);
+    if (wordIndex >= words.length) return [];
+
+    let best = null;
+    for (let i = cursor; i < entries.length; i++) {
+      if (usedIndices.has(i)) continue;
+      if (normalizeAlignmentEntryWord(entries[i].eng) !== words[wordIndex]) continue;
+      const tail = search(wordIndex + 1, i + 1);
+      if (!tail) continue;
+      best = compareAlignmentCandidates(best, [i, ...tail], words.slice(wordIndex));
+    }
+
+    memo.set(key, best);
+    return best;
+  }
+
+  return search(0, 0);
+}
+
+function selectBestAlignmentSegmentMatch(entries, words, usedIndices = new Set()) {
+  if (!entries.length || !words.length) return null;
+  const variants = [];
+  const seen = new Set();
+  const fullIndices = findBestSequentialAlignmentMatch(entries, words, usedIndices);
+  const pushVariant = (start, end) => {
+    if (start > end) return;
+    const trimmedWords = words.slice(start, end + 1);
+    if (!trimmedWords.length) return;
+    const key = `${start}:${end}:${trimmedWords.join(' ')}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    variants.push({ startTrim: start, endTrim: words.length - 1 - end, words: trimmedWords });
+  };
+
+  pushVariant(0, words.length - 1);
+
+  let maxWeakPrefix = 0;
+  while (maxWeakPrefix < words.length && ALIGNMENT_WEAK_ANCHOR_WORDS.has(words[maxWeakPrefix])) maxWeakPrefix++;
+  let maxWeakSuffix = 0;
+  while (maxWeakSuffix < words.length && ALIGNMENT_WEAK_ANCHOR_WORDS.has(words[words.length - 1 - maxWeakSuffix])) maxWeakSuffix++;
+
+  const canTrimPrefix = !!(fullIndices && maxWeakPrefix > 0 && fullIndices.slice(0, maxWeakPrefix).some((_, index) => {
+    if (index + 1 >= fullIndices.length) return false;
+    return fullIndices[index + 1] - fullIndices[index] > 1;
+  }));
+  const canTrimSuffix = !!(fullIndices && maxWeakSuffix > 0 && fullIndices.slice(fullIndices.length - maxWeakSuffix).some((_, index, suffix) => {
+    const absoluteIndex = fullIndices.length - maxWeakSuffix + index;
+    if (absoluteIndex <= 0) return false;
+    return fullIndices[absoluteIndex] - fullIndices[absoluteIndex - 1] > 1;
+  }));
+
+  for (let startTrim = 0; startTrim <= (canTrimPrefix ? maxWeakPrefix : 0); startTrim++) {
+    for (let endTrim = 0; endTrim <= (canTrimSuffix ? maxWeakSuffix : 0); endTrim++) {
+      if (startTrim === 0 && endTrim === 0) continue;
+      pushVariant(startTrim, words.length - 1 - endTrim);
+    }
+  }
+
+  let best = null;
+  for (const variant of variants) {
+    const indices = findBestSequentialAlignmentMatch(entries, variant.words, usedIndices);
+    if (!indices || !indices.length) continue;
+    const strongPositions = variant.words
+      .map((word, index) => (!ALIGNMENT_WEAK_ANCHOR_WORDS.has(word) ? index : -1))
+      .filter((index) => index >= 0);
+    const strongCount = strongPositions.length;
+    const score = {
+      strongSpan: strongCount
+        ? indices[strongPositions[strongPositions.length - 1]] - indices[strongPositions[0]]
+        : indices[indices.length - 1] - indices[0],
+      span: indices[indices.length - 1] - indices[0],
+      trimmedBoundaryWords: variant.startTrim + variant.endTrim,
+      matchedStrongWords: strongCount,
+      matchedWords: variant.words.length,
+      start: indices[0],
+    };
+    const candidate = { variant, indices, score };
+    if (!best) {
+      best = candidate;
+      continue;
+    }
+
+    const cmp = [
+      ['strongSpan', 1],
+      ['span', 1],
+      ['trimmedBoundaryWords', 1],
+      ['matchedStrongWords', -1],
+      ['matchedWords', -1],
+      ['start', 1],
+    ];
+    let better = false;
+    for (const [key, dir] of cmp) {
+      if (candidate.score[key] === best.score[key]) continue;
+      better = dir === 1 ? candidate.score[key] < best.score[key] : candidate.score[key] > best.score[key];
+      break;
+    }
+    if (better) best = candidate;
+  }
+
+  return best;
+}
+
+function buildAlignedSpan(entries, start, length, normalizeHeb = (value) => value) {
+  let spanStart = start;
+  let spanEnd = start + length - 1;
+  const startHeb = normalizeHeb(entries[spanStart]?.heb);
+  const endHeb = normalizeHeb(entries[spanEnd]?.heb);
+  while (spanStart > 0 && normalizeHeb(entries[spanStart - 1]?.heb) === startHeb) spanStart--;
+  while (spanEnd + 1 < entries.length && normalizeHeb(entries[spanEnd + 1]?.heb) === endHeb) spanEnd++;
+  const spanEntries = entries.slice(spanStart, spanEnd + 1);
+  const words = [];
+  let previous = null;
+  for (const entry of spanEntries) {
+    const eng = normalizeWhitespace(entry.eng || '');
+    if (!eng) continue;
+    if (eng === previous) continue;
+    words.push(eng);
+    previous = eng;
+  }
+  return normalizeWhitespace(words.join(' '));
+}
+
+function findAlignedWindowCandidates(entries, hebWords, normalizeHeb = (value) => value) {
+  if (!entries.length || !hebWords.length) return [];
+  const normalizedTarget = hebWords.map(normalizeHeb).filter(Boolean);
+  if (!normalizedTarget.length) return [];
+  const requiredCounts = new Map();
+  for (const token of normalizedTarget) {
+    requiredCounts.set(token, (requiredCounts.get(token) || 0) + 1);
+  }
+
+  const windowCounts = new Map();
+  let satisfied = 0;
+  let start = 0;
+  let bestWidth = Infinity;
+  const candidates = [];
+
+  function addEntry(entry) {
+    const token = normalizeHeb(entry.heb);
+    if (!requiredCounts.has(token)) return;
+    const next = (windowCounts.get(token) || 0) + 1;
+    windowCounts.set(token, next);
+    if (next === requiredCounts.get(token)) satisfied++;
+  }
+
+  function removeEntry(entry) {
+    const token = normalizeHeb(entry.heb);
+    if (!requiredCounts.has(token)) return;
+    const current = windowCounts.get(token) || 0;
+    if (current === requiredCounts.get(token)) satisfied--;
+    if (current <= 1) windowCounts.delete(token);
+    else windowCounts.set(token, current - 1);
+  }
+
+  for (let end = 0; end < entries.length; end++) {
+    addEntry(entries[end]);
+    while (satisfied === requiredCounts.size && start <= end) {
+      const width = end - start + 1;
+      const span = buildAlignedSpan(entries, start, width, normalizeHeb);
+      if (span) {
+        if (width < bestWidth) {
+          bestWidth = width;
+          candidates.length = 0;
+        }
+        if (width === bestWidth) {
+          candidates.push({ start, length: width, span });
+        }
+      }
+      removeEntry(entries[start]);
+      start++;
+    }
+  }
+  return candidates;
+}
+
+function chooseRefinedAlignedSpan(candidates, currentScoped) {
+  if (!candidates.length) return '';
+  if (candidates.length === 1) return candidates[0].span;
+
+  const normalizedCurrent = normalizeComparableQuoteText(currentScoped);
+  if (!normalizedCurrent) return '';
+
+  const exactMatches = candidates.filter((candidate) => normalizeComparableQuoteText(candidate.span) === normalizedCurrent);
+  if (exactMatches.length === 1) return exactMatches[0].span;
+  if (exactMatches.length > 1) return '';
+
+  const narrowerMatches = candidates.filter((candidate) => {
+    const normalizedCandidate = normalizeComparableQuoteText(candidate.span);
+    return normalizedCandidate
+      && normalizedCandidate.length < normalizedCurrent.length
+      && normalizedCurrent.includes(normalizedCandidate);
+  });
+  if (narrowerMatches.length === 1) return narrowerMatches[0].span;
+  return '';
+}
+
 function decodeVisibleUnicodeEscapes(text) {
   let value = String(text || '');
   let previous;
@@ -633,106 +901,6 @@ function resolveGlQuotes({ preparedJson, alignmentJson, dryRun }) {
   const alignData = JSON.parse(fs.readFileSync(path.resolve(CSKILLBP_DIR, alignmentJson), 'utf8'));
   const CANT = /[\u0591-\u05AF\u2060\u05BE]/g;
   const normalizeHeb = (value) => String(value || '').replace(CANT, '');
-  const normalizeComparable = (value) => normalizeWhitespace(String(value || ''))
-    .replace(/\{[^}]*\}/g, ' ')
-    .replace(/[^\p{L}\p{N}\s]/gu, ' ')
-    .toLowerCase()
-    .replace(/\s+/g, ' ')
-    .trim();
-
-  function buildAlignedSpan(entries, start, length) {
-    let spanStart = start;
-    let spanEnd = start + length - 1;
-    const startHeb = normalizeHeb(entries[spanStart]?.heb);
-    const endHeb = normalizeHeb(entries[spanEnd]?.heb);
-    while (spanStart > 0 && normalizeHeb(entries[spanStart - 1]?.heb) === startHeb) spanStart--;
-    while (spanEnd + 1 < entries.length && normalizeHeb(entries[spanEnd + 1]?.heb) === endHeb) spanEnd++;
-    const spanEntries = entries.slice(spanStart, spanEnd + 1);
-    const words = [];
-    let previous = null;
-    for (const entry of spanEntries) {
-      const eng = normalizeWhitespace(entry.eng || '');
-      if (!eng) continue;
-      if (eng === previous) continue;
-      words.push(eng);
-      previous = eng;
-    }
-    return normalizeWhitespace(words.join(' '));
-  }
-
-  function findAlignedWindowCandidates(entries, hebWords) {
-    if (!entries.length || !hebWords.length) return [];
-    const normalizedTarget = hebWords.map(normalizeHeb).filter(Boolean);
-    if (!normalizedTarget.length) return [];
-    const requiredCounts = new Map();
-    for (const token of normalizedTarget) {
-      requiredCounts.set(token, (requiredCounts.get(token) || 0) + 1);
-    }
-
-    const windowCounts = new Map();
-    let satisfied = 0;
-    let start = 0;
-    let bestWidth = Infinity;
-    const candidates = [];
-
-    function addEntry(entry) {
-      const token = normalizeHeb(entry.heb);
-      if (!requiredCounts.has(token)) return;
-      const next = (windowCounts.get(token) || 0) + 1;
-      windowCounts.set(token, next);
-      if (next === requiredCounts.get(token)) satisfied++;
-    }
-
-    function removeEntry(entry) {
-      const token = normalizeHeb(entry.heb);
-      if (!requiredCounts.has(token)) return;
-      const current = windowCounts.get(token) || 0;
-      if (current === requiredCounts.get(token)) satisfied--;
-      if (current <= 1) windowCounts.delete(token);
-      else windowCounts.set(token, current - 1);
-    }
-
-    for (let end = 0; end < entries.length; end++) {
-      addEntry(entries[end]);
-      while (satisfied === requiredCounts.size && start <= end) {
-        const width = end - start + 1;
-        const span = buildAlignedSpan(entries, start, width);
-        if (span) {
-          if (width < bestWidth) {
-            bestWidth = width;
-            candidates.length = 0;
-          }
-          if (width === bestWidth) {
-            candidates.push({ start, length: width, span });
-          }
-        }
-        removeEntry(entries[start]);
-        start++;
-      }
-    }
-    return candidates;
-  }
-
-  function chooseRefinedSpan(candidates, currentScoped) {
-    if (!candidates.length) return '';
-    if (candidates.length === 1) return candidates[0].span;
-
-    const normalizedCurrent = normalizeComparable(currentScoped);
-    if (!normalizedCurrent) return '';
-
-    const exactMatches = candidates.filter((candidate) => normalizeComparable(candidate.span) === normalizedCurrent);
-    if (exactMatches.length === 1) return exactMatches[0].span;
-    if (exactMatches.length > 1) return '';
-
-    const narrowerMatches = candidates.filter((candidate) => {
-      const normalizedCandidate = normalizeComparable(candidate.span);
-      return normalizedCandidate
-        && normalizedCandidate.length < normalizedCurrent.length
-        && normalizedCurrent.includes(normalizedCandidate);
-    });
-    if (narrowerMatches.length === 1) return narrowerMatches[0].span;
-    return '';
-  }
 
   let updated = 0;
   const log = [];
@@ -749,8 +917,8 @@ function resolveGlQuotes({ preparedJson, alignmentJson, dryRun }) {
       item.exact_ult_span = currentScoped;
       if (item.writer_packet && !item.writer_packet.exact_ult_span) item.writer_packet.exact_ult_span = currentScoped;
     }
-    const candidates = findAlignedWindowCandidates(entries, hebWords);
-    const exactSpan = chooseRefinedSpan(candidates, currentScoped);
+    const candidates = findAlignedWindowCandidates(entries, hebWords, normalizeHeb);
+    const exactSpan = chooseRefinedAlignedSpan(candidates, currentScoped);
     if (!exactSpan) continue;
 
     if (!dryRun) {
@@ -1563,19 +1731,10 @@ function fillOrigQuotes({ preparedJson, alignmentJson, hebrewUsfm, masterUltUsfm
   const hebrewContent = fs.readFileSync(hebrewPath, 'utf8');
 
   const STRIP_RE = /[\u0591-\u05AF\u2060\u05BD\u05C3]/g;
-  const PUNC = /[{},;:.!?'""\u2018\u2019\u201C\u201D\u2014\u2013()]/g;
-  const STOP_WORDS = new Set(['a','an','the','of','in','on','at','to','for','by','as','and','or','but','not','with','from']);
-  const WEAK_ANCHOR_WORDS = new Set([
-    ...STOP_WORDS,
-    'am', 'is', 'are', 'was', 'were', 'be', 'been', 'being',
-    'do', 'does', 'did', 'have', 'has', 'had',
-    'may', 'might', 'can', 'could', 'shall', 'should', 'will', 'would',
-    'this', 'that', 'these', 'those',
-    'who', 'whom', 'whose', 'which',
-  ]);
+  const normalizeHeb = (value) => String(value || '').replace(STRIP_RE, '');
 
   function stripForSearch(s) {
-    return s.replace(/[\u0591-\u05AF\u2060\u05BD\u05C3]/g, '');
+    return s.replace(STRIP_RE, '');
   }
 
   // Build verse map (same logic as fixUnicodeQuotes)
@@ -1662,6 +1821,65 @@ function fillOrigQuotes({ preparedJson, alignmentJson, hebrewUsfm, masterUltUsfm
     return rawSpan(rawVerse, offsetMap, minStart, maxEnd, strippedVerse.length);
   }
 
+  function extractHebrewQuote(ref, hebWords) {
+    const rawVerse = verseMap[ref];
+    if (!rawVerse || !hebWords.length) return null;
+    const { text: strippedVerse, offsetMap } = buildStripped(rawVerse);
+    const occurrencesByToken = new Map();
+
+    const recordOccurrences = (token) => {
+      if (!token || occurrencesByToken.has(token)) return;
+      const locations = [];
+      let searchFrom = 0;
+      while (searchFrom < strippedVerse.length) {
+        const pos = strippedVerse.indexOf(token, searchFrom);
+        if (pos < 0) break;
+        const end = pos + token.length - 1;
+        const exact = rawSpan(rawVerse, offsetMap, pos, end, strippedVerse.length);
+        locations.push({ start: pos, end, exact });
+        searchFrom = pos + token.length;
+      }
+      occurrencesByToken.set(token, locations);
+    };
+
+    const selected = [];
+    for (const heb of hebWords) {
+      const token = stripForSearch(heb);
+      if (!token) continue;
+      recordOccurrences(token);
+      const locations = occurrencesByToken.get(token) || [];
+      const location = locations.shift();
+      if (!location) continue;
+      selected.push(location);
+    }
+
+    if (!selected.length) return null;
+    selected.sort((left, right) => left.start - right.start);
+
+    const groups = [];
+    for (const location of selected) {
+      const last = groups[groups.length - 1];
+      if (!last) {
+        groups.push({ start: location.start, end: location.end });
+        continue;
+      }
+      const directlyAdjacent = last.end + 1 >= location.start;
+      const rawGap = directlyAdjacent
+        ? ''
+        : rawSpan(rawVerse, offsetMap, last.end + 1, location.start - 1, strippedVerse.length);
+      if (directlyAdjacent || /^[\s\u05BE\u05C3\u2060׀]*$/.test(rawGap)) {
+        last.end = location.end;
+      } else {
+        groups.push({ start: location.start, end: location.end });
+      }
+    }
+
+    return groups
+      .map((group) => rawSpan(rawVerse, offsetMap, group.start, group.end, strippedVerse.length))
+      .filter(Boolean)
+      .join(' & ');
+  }
+
   // Extract [heb:...] hint from explanation and try direct UHB match
   function extractHebrewHint(explanation) {
     const m = String(explanation || '').match(/\[heb:([^\]]+)\]/);
@@ -1691,7 +1909,6 @@ function fillOrigQuotes({ preparedJson, alignmentJson, hebrewUsfm, masterUltUsfm
     return rawSpan(rawVerse, offsetMap, startPos, endPos, strippedVerse.length);
   }
 
-  // --- Shared resolution: &-split + two-pass (exact then content-word) ---
   function resolveWithAlignment(glQuote, entries) {
     const cleanGlq = glQuote.replace(/\{[^}]*\}/g, '').trim();
     if (!cleanGlq) return null;
@@ -1700,91 +1917,41 @@ function fillOrigQuotes({ preparedJson, alignmentJson, hebrewUsfm, masterUltUsfm
     const usedIndices = new Set();
     const allHeb = [];
 
-    function normalizeEntryWord(text) {
-      return String(text || '').replace(PUNC, '').toLowerCase();
-    }
-
-    function compareCandidateMatches(left, right, words) {
-      if (!left) return right;
-      if (!right) return left;
-
-      const strongPositions = words
-        .map((word, index) => (!WEAK_ANCHOR_WORDS.has(word) ? index : -1))
-        .filter(index => index >= 0);
-      const spanForPositions = (indices, positions) => {
-        if (!positions.length) return indices[indices.length - 1] - indices[0];
-        return indices[positions[positions.length - 1]] - indices[positions[0]];
-      };
-      const leftCoreSpan = spanForPositions(left, strongPositions);
-      const rightCoreSpan = spanForPositions(right, strongPositions);
-      if (leftCoreSpan !== rightCoreSpan) return leftCoreSpan < rightCoreSpan ? left : right;
-
-      const leftSpan = left[left.length - 1] - left[0];
-      const rightSpan = right[right.length - 1] - right[0];
-      if (leftSpan !== rightSpan) return leftSpan < rightSpan ? left : right;
-
-      const gapCount = (indices) => indices.slice(1).reduce((sum, idx, pos) => sum + Math.max(0, idx - indices[pos] - 1), 0);
-      const leftGaps = gapCount(left);
-      const rightGaps = gapCount(right);
-      if (leftGaps !== rightGaps) return leftGaps < rightGaps ? left : right;
-
-      return left[0] <= right[0] ? left : right;
-    }
-
-    function matchSequentialWords(words, startIndex) {
-      const memo = new Map();
-
-      function search(wordIndex, cursor) {
-        const key = `${wordIndex}:${cursor}`;
-        if (memo.has(key)) return memo.get(key);
-        if (wordIndex >= words.length) return [];
-
-        let best = null;
-        for (let i = cursor; i < entries.length; i++) {
-          if (usedIndices.has(i)) continue;
-          if (normalizeEntryWord(entries[i].eng) !== words[wordIndex]) continue;
-          const tail = search(wordIndex + 1, i + 1);
-          if (!tail) continue;
-          best = compareCandidateMatches(best, [i, ...tail], words);
-        }
-
-        memo.set(key, best);
-        return best;
-      }
-
-      return search(0, startIndex);
-    }
-
     function collectHebrew(indices) {
-      return indices.map((idx) => entries[idx]?.heb).filter(Boolean);
+      return indices
+        .map((idx) => entries[idx]?.heb)
+        .filter(Boolean)
+        .filter((heb, index, arr) => index === 0 || normalizeHeb(arr[index - 1]) !== normalizeHeb(heb));
     }
 
     for (const seg of segments) {
-      const words = seg.trim().split(/\s+/).filter(Boolean)
-        .map(t => t.replace(PUNC, '').toLowerCase()).filter(Boolean);
+      const words = tokenizeAlignmentQuote(seg);
       if (!words.length) continue;
 
-      // Pass 1: exact sequential match preserves verse order and avoids
-      // earlier stopword matches from widening the Hebrew span.
-      const pass1Matches = matchSequentialWords(words, 0);
-      const pass1Heb = pass1Matches ? collectHebrew(pass1Matches) : null;
-      if (pass1Matches && pass1Heb.length) {
-        for (const idx of pass1Matches) usedIndices.add(idx);
-        allHeb.push(...pass1Heb);
+      const exactMatch = selectBestAlignmentSegmentMatch(entries, words, usedIndices);
+      const exactHeb = exactMatch ? collectHebrew(exactMatch.indices) : null;
+      if (exactMatch && exactHeb.length) {
+        for (const idx of exactMatch.indices) usedIndices.add(idx);
+        allHeb.push(...exactHeb);
         continue;
       }
 
-      // Pass 2: content-words-only sequential match
-      const contentWords = words.filter(w => !STOP_WORDS.has(w));
-      const wordsToTry = contentWords.length ? contentWords : words;
-      const pass2Matches = matchSequentialWords(wordsToTry, 0);
-      const pass2Heb = pass2Matches ? collectHebrew(pass2Matches) : null;
-      if (!pass2Matches || !pass2Heb.length) return null;
-      for (const idx of pass2Matches) usedIndices.add(idx);
-      allHeb.push(...pass2Heb);
+      const contentWords = words.filter((word) => !ALIGNMENT_STOP_WORDS.has(word));
+      const fallbackWords = contentWords.length ? contentWords : words;
+      const fallbackMatch = selectBestAlignmentSegmentMatch(entries, fallbackWords, usedIndices);
+      const fallbackHeb = fallbackMatch ? collectHebrew(fallbackMatch.indices) : null;
+      if (!fallbackMatch || !fallbackHeb.length) return null;
+      for (const idx of fallbackMatch.indices) usedIndices.add(idx);
+      allHeb.push(...fallbackHeb);
     }
 
     return allHeb.length ? allHeb : null;
+  }
+
+  function resolveAlignmentSpan(glQuote, entries, ref) {
+    const hebWords = resolveWithAlignment(glQuote, entries);
+    if (!hebWords || !hebWords.length) return null;
+    return extractHebrewQuote(ref, hebWords);
   }
 
   // --- Parse master ULT \zaln-s alignment markers into per-verse entries ---
@@ -1869,8 +2036,7 @@ function fillOrigQuotes({ preparedJson, alignmentJson, hebrewUsfm, masterUltUsfm
     const entries = alignData[alignRef] || alignData[item.reference] || [];
 
     // Step 2: AI alignment + &-split + content-word fallback
-    let hebWords = entries.length ? resolveWithAlignment(scopedGlQuote, entries) : null;
-    let span = hebWords ? extractHebrewSpan(alignRef, hebWords) : null;
+    let span = entries.length ? resolveAlignmentSpan(scopedGlQuote, entries, alignRef) : null;
 
     if (span) {
       item.orig_quote = span;
@@ -1885,8 +2051,7 @@ function fillOrigQuotes({ preparedJson, alignmentJson, hebrewUsfm, masterUltUsfm
     if (masterAlignData) {
       const masterEntries = masterAlignData[alignRef] || [];
       if (masterEntries.length) {
-        hebWords = resolveWithAlignment(scopedGlQuote, masterEntries);
-        span = hebWords ? extractHebrewSpan(alignRef, hebWords) : null;
+        span = resolveAlignmentSpan(scopedGlQuote, masterEntries, alignRef);
         if (span) {
           item.orig_quote = span;
           resolved++;

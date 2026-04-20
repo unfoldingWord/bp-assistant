@@ -604,6 +604,123 @@ test('fillOrigQuotes avoids anchoring rhetorical questions on earlier weak auxil
   assert.equal(question.orig_quote, 'הֲ⁠ל֧וֹא זֶ֦ה א֖וּד מֻצָּ֥ל מֵ⁠אֵֽשׁ');
 });
 
+test('fillOrigQuotes narrows Psalm 40:12 quotes instead of overexpanding repeated weak pronouns', () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tn-tools-psa40-'));
+  const relRoot = path.join('tmp', path.basename(tempDir));
+  const absRoot = path.join('/srv/bot/workspace', relRoot);
+  fs.mkdirSync(absRoot, { recursive: true });
+
+  const prepRel = path.join(relRoot, 'prepared_notes.json');
+  const alignRel = path.join(relRoot, 'alignment.json');
+  const hebRel = path.join(relRoot, 'hebrew.usfm');
+
+  fs.writeFileSync(path.join('/srv/bot/workspace', prepRel), JSON.stringify({
+    book: 'PSA',
+    items: [
+      {
+        id: 'c6b2',
+        reference: '40:12',
+        sref: 'figs-metaphor',
+        gl_quote: 'Troubles that cannot be numbered surround me',
+        issue_span_gl_quote: 'Troubles that cannot be numbered surround me',
+        orig_quote: '',
+        explanation: 'Here troubles are spoken of as if they were objects that surround and trap the speaker.',
+      },
+      {
+        id: 'ra9w',
+        reference: '40:12',
+        sref: 'figs-litotes',
+        gl_quote: 'that cannot be numbered',
+        issue_span_gl_quote: 'that cannot be numbered',
+        orig_quote: '',
+        explanation: 'This is stated in negative form to intensify the number.',
+      },
+      {
+        id: 'qng1',
+        reference: '40:12',
+        sref: 'figs-personification',
+        gl_quote: 'have caught up with me',
+        issue_span_gl_quote: 'have caught up with me',
+        orig_quote: '',
+        explanation: 'The writer’s iniquities are spoken of as if they were his enemies who were harming him.',
+      },
+    ],
+  }, null, 2));
+
+  fs.writeFileSync(path.join('/srv/bot/workspace', alignRel), JSON.stringify({
+    '40:12': [
+      { eng: 'Troubles', heb: 'רָע֡וֹת' },
+      { eng: 'that', heb: 'כִּ֤י' },
+      { eng: 'cannot', heb: 'אֵ֬ין' },
+      { eng: 'be', heb: 'מִסְפָּ֗ר' },
+      { eng: 'numbered', heb: 'מִסְפָּ֗ר' },
+      { eng: 'surround', heb: 'אָפְפ֥וּ' },
+      { eng: 'me', heb: 'עָצְמ֥וּ' },
+      { eng: 'my', heb: 'עֲ֭וֺנֹתַ⁠י' },
+      { eng: 'iniquities', heb: 'עֲ֭וֺנֹתַ⁠י' },
+      { eng: 'have', heb: 'עַד' },
+      { eng: 'caught', heb: 'עַד' },
+      { eng: 'up', heb: 'עָלַ֨⁠י' },
+      { eng: 'with', heb: 'הִשִּׂיג֣וּ⁠נִי' },
+      { eng: 'me', heb: 'הִשִּׂיג֣וּ⁠נִי' },
+      { eng: 'so', heb: 'הִשִּׂיג֣וּ⁠נִי' },
+      { eng: 'that', heb: 'הִשִּׂיג֣וּ⁠נִי' },
+      { eng: 'I', heb: 'וְ⁠לֹא' },
+      { eng: 'am', heb: 'וְ⁠לֹא' },
+      { eng: 'no', heb: 'וְ⁠לֹא' },
+      { eng: 'longer', heb: 'וְ⁠לֹא' },
+      { eng: 'able', heb: 'יָכֹ֣לְתִּי' },
+      { eng: 'to', heb: 'לִ⁠רְא֑וֹת' },
+      { eng: 'see', heb: 'לִ⁠רְא֑וֹת' },
+      { eng: 'anything', heb: 'לִ⁠רְא֑וֹת' },
+      { eng: 'they', heb: 'מִ⁠שַּֽׂעֲר֥וֹת' },
+      { eng: 'are', heb: 'מִ⁠שַּֽׂעֲר֥וֹת' },
+      { eng: 'more', heb: 'מִ⁠שַּֽׂעֲר֥וֹת' },
+      { eng: 'than', heb: 'מִ⁠שַּֽׂעֲר֥וֹת' },
+      { eng: 'the', heb: 'מִ⁠שַּֽׂעֲר֥וֹת' },
+      { eng: 'hairs', heb: 'מִ⁠שַּֽׂעֲר֥וֹת' },
+      { eng: 'on', heb: 'רֹ֝אשִׁ֗⁠י' },
+      { eng: 'my', heb: 'רֹ֝אשִׁ֗⁠י' },
+      { eng: 'head', heb: 'רֹ֝אשִׁ֗⁠י' },
+      { eng: 'and', heb: 'וְ⁠לִבִּ֥⁠י' },
+      { eng: 'my', heb: 'וְ⁠לִבִּ֥⁠י' },
+      { eng: 'heart', heb: 'וְ⁠לִבִּ֥⁠י' },
+      { eng: 'has', heb: 'עֲזָבָֽ⁠נִי' },
+      { eng: 'failed', heb: 'עֲזָבָֽ⁠נִי' },
+      { eng: 'me', heb: 'עֲזָבָֽ⁠נִי' },
+    ],
+  }, null, 2));
+
+  fs.writeFileSync(path.join('/srv/bot/workspace', hebRel), [
+    '\\id PSA',
+    '\\c 40',
+    '\\v 12',
+    '\\w כִּ֤י|x\\w*',
+    '\\w אָפְפ֥וּ|x\\w*־\\w עָלַ֨⁠י|x\\w* ׀',
+    '\\w רָע֡וֹת|x\\w*',
+    '\\w עַד|x\\w*־\\w אֵ֬ין|x\\w*',
+    '\\w מִסְפָּ֗ר|x\\w*',
+    '\\w הִשִּׂיג֣וּ⁠נִי|x\\w*',
+    '\\w עֲ֭וֺנֹתַ⁠י|x\\w*',
+    '\\w וְ⁠לֹא|x\\w*־\\w יָכֹ֣לְתִּי|x\\w*',
+    '\\w לִ⁠רְא֑וֹת|x\\w*',
+    '\\w עָצְמ֥וּ|x\\w*',
+    '\\w מִ⁠שַּֽׂעֲר֥וֹת|x\\w*',
+    '\\w רֹ֝אשִׁ֗⁠י|x\\w*',
+    '\\w וְ⁠לִבִּ֥⁠י|x\\w*',
+    '\\w עֲזָבָֽ⁠נִי|x\\w*׃',
+    '',
+  ].join('\n'));
+
+  const summary = fillOrigQuotes({ preparedJson: prepRel, alignmentJson: alignRel, hebrewUsfm: hebRel });
+  const prepared = JSON.parse(fs.readFileSync(path.join('/srv/bot/workspace', prepRel), 'utf8'));
+
+  assert.match(summary, /Resolved: 3 of 3 items/);
+  assert.equal(prepared.items.find((item) => item.id === 'c6b2').orig_quote, 'כִּ֤י אָפְפ֥וּ & רָע֡וֹת & אֵ֬ין מִסְפָּ֗ר & עָצְמ֥וּ');
+  assert.equal(prepared.items.find((item) => item.id === 'ra9w').orig_quote, 'כִּ֤י & אֵ֬ין מִסְפָּ֗ר');
+  assert.equal(prepared.items.find((item) => item.id === 'qng1').orig_quote, 'עָלַ֨⁠י & עַד & הִשִּׂיג֣וּ⁠נִי');
+});
+
 test('quote scope selector marks parallelism rows as full_parallelism', () => {
   const selection = _resolveQuoteScopeSelection({
     sref: 'figs-parallelism',
