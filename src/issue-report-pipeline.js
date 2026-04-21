@@ -47,14 +47,14 @@ Analyze the report and respond with ONLY valid JSON (no prose, no markdown code 
 
 Rules:
 - First decompose the report into atomic complaints. Do not skip this step.
-- Do not collapse distinct failure modes into one issue unless the same root cause clearly explains them.
-- Prefer multiple focused issues over one omnibus issue when symptoms would likely be fixed in different places.
+- Complaints stay atomic, but issue creation stays repo-scoped: return at most one issue per repo.
+- When multiple complaints belong to the same repo, combine them into a single well-structured issue and include all relevant complaint_ids.
 - Every issue must reference one or more complaint_ids from the complaints array.
 - Use repository ownership based on root cause, not shallow keyword matching.
 - Open issues in both repos only when the report plausibly spans both layers.
 - Keep repo targets limited to bp-assistant and bp-assistant-skills.
 - When both repos are implicated, choose a primary_repo and secondary_repo.
-- Each repo listed in ownership.repositories must appear in at least one issue.`;
+- Each repo listed in ownership.repositories must appear in exactly one issue.`;
 
 function stripLeadingMention(content) {
   return String(content || '').replace(/^@\*\*[^*]+\*\*\s*/, '').trim();
@@ -267,8 +267,24 @@ function parseClassifierOutput(raw) {
     throw new Error('Classifier returned duplicate issue ids');
   }
 
-  const issueRepos = new Set(normalizedIssues.map((issue) => issue.repo));
-  if (issueRepos.size !== uniqueRepos.length || uniqueRepos.some((repo) => !issueRepos.has(repo))) {
+  const issuesByRepo = new Map();
+  for (const issue of normalizedIssues) {
+    const repoIssues = issuesByRepo.get(issue.repo) || [];
+    repoIssues.push(issue);
+    issuesByRepo.set(issue.repo, repoIssues);
+  }
+
+  for (const repo of uniqueRepos) {
+    const repoIssues = issuesByRepo.get(repo) || [];
+    if (repoIssues.length === 0) {
+      throw new Error('Classifier ownership.repositories does not match issue repos');
+    }
+    if (repoIssues.length > 1) {
+      throw new Error(`Classifier returned multiple issues for repo ${repo}`);
+    }
+  }
+
+  if (issuesByRepo.size !== uniqueRepos.length) {
     throw new Error('Classifier ownership.repositories does not match issue repos');
   }
 
