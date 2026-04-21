@@ -30,6 +30,13 @@ const REQUIRED_INITIAL_PIPELINE_FILES = [
   '.claude/skills/issue-identification/merge-procedure.md',
   '.claude/skills/issue-identification/gemini-review-wave.md',
 ];
+const INITIAL_PIPELINE_COMPLETION_GUARDRAIL = [
+  'Do not return success for initial-pipeline until the full Wave 1-6 flow has finished.',
+  'Wave 1 and Wave 2 outputs are intermediate only and are never valid terminal success.',
+  'Completion is only valid after the final required outputs exist on disk for this chapter:',
+  'output/AI-ULT/<BOOK>/<BOOK>-<CH>.usfm, output/issues/<BOOK>/<BOOK>-<CH>.tsv, and output/AI-UST/<BOOK>/<BOOK>-<CH>.usfm.',
+  'If any of those required outputs are missing, continue the pipeline or return a failure instead of success.',
+].join(' ');
 
 function hasFreshFlag(content) {
   return /--fresh\b/i.test(String(content || '')) || /--new\b/i.test(String(content || ''));
@@ -158,6 +165,49 @@ function buildParsedGenerateRequest(route, content) {
 function hasRequiredGeneratedOutputs(contentTypes, outputs) {
   const neededTypes = Array.isArray(contentTypes) && contentTypes.length ? contentTypes : ['ult', 'ust'];
   return neededTypes.every((type) => (type === 'ult' ? outputs.hasUlt : outputs.hasUst));
+}
+
+function buildChapterTag(book, chapter) {
+  const width = book.toUpperCase() === 'PSA' ? 3 : 2;
+  return `${book}-${String(chapter).padStart(width, '0')}`;
+}
+
+function getInitialPipelineOutputStatus({ book, chapter, verseStart, verseEnd }) {
+  const chapterTag = buildChapterTag(book, chapter);
+  const verseSuffix = verseStart != null && verseEnd != null ? `-vv${verseStart}-${verseEnd}` : null;
+  const required = [
+    { label: 'ULT', path: `output/AI-ULT/${chapterTag}.usfm` },
+    { label: 'issues TSV', path: `output/issues/${chapterTag}.tsv`, verseSuffix },
+    { label: 'UST', path: `output/AI-UST/${chapterTag}.usfm` },
+  ];
+
+  const found = {};
+  const missing = [];
+  for (const output of required) {
+    const resolved = resolveOutputFile(output.path, book, output.verseSuffix);
+    if (resolved) found[output.label] = resolved;
+    else missing.push(output.label);
+  }
+
+  const tempDirs = [
+    path.join(CSKILLBP_DIR, 'tmp', `pipeline-${book}-${chapter}`),
+    path.join(CSKILLBP_DIR, 'tmp', `pipeline-${book}-${String(chapter).padStart(2, '0')}`),
+    path.join(CSKILLBP_DIR, 'tmp', `pipeline-${book}-${String(chapter).padStart(3, '0')}`),
+  ];
+  const observedTempArtifacts = [];
+  for (const tempDir of tempDirs) {
+    if (!fs.existsSync(tempDir)) continue;
+    try {
+      for (const entry of fs.readdirSync(tempDir).sort()) {
+        observedTempArtifacts.push(path.relative(CSKILLBP_DIR, path.join(tempDir, entry)));
+      }
+    } catch (_) {
+      // best-effort diagnostics only
+    }
+    if (observedTempArtifacts.length > 0) break;
+  }
+
+  return { missing, found, observedTempArtifacts };
 }
 
 function isUsageLimitError(text) {
@@ -473,6 +523,7 @@ async function generatePipeline(route, message) {
             model,
             betas,
             skill,
+            appendSystemPrompt: isInitialPipelineSkill ? INITIAL_PIPELINE_COMPLETION_GUARDRAIL : undefined,
             tools: DEFAULT_RESTRICTED_TOOLS,
             disallowedTools: ['Bash'],
             disableLocalSettings: true,
@@ -601,6 +652,49 @@ async function generatePipeline(route, message) {
         resume: { chapter: ch, skill },
       });
       continue;
+    }
+
+    if (runInitialSkill && isInitialPipelineSkill && !isDryRun) {
+      const initialPipelineStatus = getInitialPipelineOutputStatus({
+        book,
+        chapter: ch,
+        verseStart: hasVerseRange ? verseStart : null,
+        verseEnd: hasVerseRange ? verseEnd : null,
+      });
+      if (initialPipelineStatus.missing.length > 0) {
+        const observedArtifacts = [
+          ...Object.values(initialPipelineStatus.found),
+          ...initialPipelineStatus.observedTempArtifacts,
+        ];
+        const observedLabel = observedArtifacts.length > 0
+          ? ` Observed artifacts: ${observedArtifacts.join(', ')}.`
+          : '';
+        console.error(
+          `[generate] initial-pipeline exited before final outputs for ${book} ${ch}; missing=${initialPipelineStatus.missing.join(', ')}; observed=${observedArtifacts.join(', ')}`
+        );
+        await status(
+          `Failed to generate **${book} ${ch}**: initial-pipeline exited before writing required outputs ` +
+          `(missing: ${initialPipelineStatus.missing.join(', ')}).${observedLabel}`
+        );
+        fail++;
+        setCheckpoint(checkpointRef, {
+          state: 'failed',
+          success,
+          fail,
+          completedChapters,
+          current: {
+            chapter: ch,
+            skill,
+            status: 'failed',
+            errorKind: 'initial_pipeline_early_exit',
+            outputStatus: 'incomplete',
+            missingOutputs: initialPipelineStatus.missing,
+            observedArtifacts,
+          },
+          resume: { chapter: ch, skill },
+        });
+        continue;
+      }
     }
 
     if (!hasRequiredGeneratedOutputs(contentTypes, { hasUlt, hasUst })) {

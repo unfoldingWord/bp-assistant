@@ -4,3 +4,4 @@ door43-users.json
 config.local.json
 logs/
 data/
+.claude/worktrees/
