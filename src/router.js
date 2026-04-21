@@ -138,6 +138,18 @@ function buildConfirmMessage(template, captures) {
   });
 }
 
+function buildGenerateConfirmText(baseText, rawContent) {
+  if (!baseText) return baseText;
+  const content = String(rawContent || '');
+  if (!/^generate\b/i.test(content)) return baseText;
+  if (!/--text-only\b/i.test(content)) return baseText;
+
+  return baseText.replace(
+    'generate the initial content (ULT & UST, issues draft)',
+    'generate the ULT & UST files only'
+  );
+}
+
 function normalizeScopeText(scopeText) {
   if (!scopeText) return null;
   return scopeText
@@ -977,6 +989,9 @@ async function routeMessage(message) {
       let confirmText = activeRoute._contentTypes
         ? activeRoute.confirmMessage
         : buildConfirmMessage(activeRoute.confirmMessage, captures);
+      if (activeRoute.name === 'generate-content') {
+        confirmText = buildGenerateConfirmText(confirmText, message.content);
+      }
       const timeoutMs = calcTimeout(activeRoute, captures);
 
       // Pre-flight usage check for generate/notes pipelines
@@ -1081,6 +1096,9 @@ async function routeMessage(message) {
               ? [intent.book, String(intent.startChapter)]
               : [intent.book, String(intent.startChapter), String(intent.endChapter)]);
           let confirmText = buildConfirmMessage(syntheticRoute.confirmMessage, captures);
+          if (syntheticRoute.name === 'generate-content') {
+            confirmText = buildGenerateConfirmText(confirmText, message.content);
+          }
           const timeoutMs = calcTimeout(syntheticRoute, captures);
 
           // Pre-flight usage check for generate/notes pipelines
@@ -1158,6 +1176,7 @@ module.exports = {
   hasPendingAction,
   hasActiveSession,
   extractContentTypes,
+  buildGenerateConfirmText,
   buildSyntheticRoute,
   parseIntentScope,
 };

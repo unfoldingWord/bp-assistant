@@ -5,11 +5,12 @@ const https = require('https');
 const os = require('os');
 const path = require('path');
 
-const { buildSyntheticRoute } = require('../src/router');
+const { buildSyntheticRoute, buildGenerateConfirmText } = require('../src/router');
 const {
   parseGenerateCommand,
   buildParsedGenerateRequest,
   hasRequiredGeneratedOutputs,
+  shouldUseFileResponseMode,
 } = require('../src/generate-pipeline');
 const {
   parseWriteNotesCommand,
@@ -69,6 +70,21 @@ test('generate parser preserves verse ranges and ULT-only requirements', () => {
   assert.equal(hasRequiredGeneratedOutputs(['ust'], { hasUlt: false, hasUst: true }), true);
 });
 
+test('generate parser recognizes text-only mode', () => {
+  const parsed = parseGenerateCommand('generate zech 5 --text-only');
+  assert.equal(parsed.book, 'ZEC');
+  assert.equal(parsed.start, 5);
+  assert.equal(parsed.end, 5);
+  assert.equal(parsed.textOnly, true);
+});
+
+test('text-only mode uses file-response delivery even for non-file users', () => {
+  assert.equal(shouldUseFileResponseMode({ isFileResponse: false, noAlign: false, textOnly: true }), true);
+  assert.equal(shouldUseFileResponseMode({ isFileResponse: false, noAlign: false, textOnly: false }), false);
+  assert.equal(shouldUseFileResponseMode({ isFileResponse: true, noAlign: false, textOnly: false }), true);
+  assert.equal(shouldUseFileResponseMode({ isFileResponse: false, noAlign: true, textOnly: false }), true);
+});
+
 test('synthetic generate route preserves verse ranges from intent scopeText', () => {
   const route = buildSyntheticRoute({
     intent: 'generate',
@@ -84,6 +100,17 @@ test('synthetic generate route preserves verse ranges from intent scopeText', ()
   const parsed = buildParsedGenerateRequest(route, 'generate isa 51:1-6');
   assert.equal(parsed.verseStart, 1);
   assert.equal(parsed.verseEnd, 6);
+});
+
+test('generate confirmation reflects text-only mode', () => {
+  const confirm = buildGenerateConfirmText(
+    "I'll generate the initial content (ULT & UST, issues draft) for **ZECH 5**. Sound right? (yes/no)",
+    'generate zech 5 --text-only'
+  );
+  assert.equal(
+    confirm,
+    "I'll generate the ULT & UST files only for **ZECH 5**. Sound right? (yes/no)"
+  );
 });
 
 test('write notes defaults to running chapter intro unless explicitly disabled', () => {

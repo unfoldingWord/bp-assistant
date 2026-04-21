@@ -90,7 +90,8 @@ function parseGenerateCommand(content) {
   const contentTypes = extractContentTypes(content);
   const noAlign = /--no-align\b/i.test(String(content || ''));
   const alignOnly = /--align-only\b/i.test(String(content || ''));
-  const extra = { fresh, contentTypes, noAlign, alignOnly };
+  const textOnly = /--text-only\b/i.test(String(content || ''));
+  const extra = { fresh, contentTypes, noAlign, alignOnly, textOnly };
 
   // Verse range in a single chapter: generate lam 2:1-3
   const verseMatch = input.match(/generate\s+([a-z0-9]+)\s+(\d+):(\d+)\s*[-\u2013\u2014]\s*(\d+)/);
@@ -157,9 +158,14 @@ function buildParsedGenerateRequest(route, content) {
       contentTypes: extractContentTypes(content),
       noAlign: /--no-align\b/i.test(String(content || '')),
       alignOnly: /--align-only\b/i.test(String(content || '')),
+      textOnly: /--text-only\b/i.test(String(content || '')),
     };
   }
   return parseGenerateCommand(content);
+}
+
+function shouldUseFileResponseMode({ isFileResponse, noAlign, textOnly }) {
+  return Boolean(isFileResponse || noAlign || textOnly);
 }
 
 function hasRequiredGeneratedOutputs(contentTypes, outputs) {
@@ -318,7 +324,8 @@ async function generatePipeline(route, message) {
     return;
   }
 
-  const { book, start, end, verseStart, verseEnd, fresh, contentTypes, noAlign, alignOnly } = parsed;
+  const { book, start, end, verseStart, verseEnd, fresh, contentTypes, noAlign, alignOnly, textOnly } = parsed;
+  const useFileResponseMode = shouldUseFileResponseMode({ isFileResponse, noAlign, textOnly });
   const sessionKey = stream ? `stream-${stream}-${topic}` : `dm-${message.sender_id}`;
   const checkpointRef = {
     sessionKey,
@@ -346,7 +353,7 @@ async function generatePipeline(route, message) {
 
   // --- Non-file-response pre-checks: Door43 username ---
   let username = null;
-  if (!isFileResponse) {
+  if (!useFileResponseMode) {
     username = getDoor43Username(message.sender_email);
     if (!username) {
       username = emailToFallbackUsername(message.sender_email);
@@ -368,8 +375,8 @@ async function generatePipeline(route, message) {
   // Signal working
   await addReaction(msgId, 'working_on_it');
   const typeLabel = contentTypes.length === 1 ? `${contentTypes[0].toUpperCase()}-only` : 'full pipeline';
-  const alignLabel = noAlign ? 'files-only' : alignOnly ? 'align-only' : 'align + repo-insert';
-  const modeLabel = isFileResponse ? 'files-only' : `${typeLabel} (${alignLabel})`;
+  const alignLabel = textOnly ? 'text-only uploads' : noAlign ? 'files-only' : alignOnly ? 'align-only' : 'align + repo-insert';
+  const modeLabel = useFileResponseMode ? alignLabel : `${typeLabel} (${alignLabel})`;
   const refLabel = hasVerseRange ? `${book} ${start}:${verseStart}-${verseEnd}` : `${book} ${start}\u2013${end}`;
   await status(`Starting generation for **${refLabel}** (${chapterCount} chapter(s), mode: ${modeLabel}, ~${estimatedTotal} tokens estimated)`);
 
@@ -763,7 +770,7 @@ async function generatePipeline(route, message) {
     });
 
     // --- File-response path: upload files only (also used for --no-align) ---
-    if (isFileResponse || noAlign) {
+    if (useFileResponseMode) {
       const links = [];
 
       if (hasUlt) {
@@ -1062,7 +1069,7 @@ async function generatePipeline(route, message) {
   // =========================================================================
   // Phase 2: Repo insert \u2014 push to master (non-file-response users only)
   // =========================================================================
-  if (!isFileResponse && !noAlign && completedChapters.length > 0) {
+  if (!useFileResponseMode && completedChapters.length > 0) {
     // Pre-flight: verify DCS token before spending time on repo-insert
     const dcsCheck = await verifyDcsToken();
     if (!dcsCheck.valid) {
@@ -1301,7 +1308,7 @@ async function generatePipeline(route, message) {
   }
 
   // Final message
-  if (!isFileResponse && !noAlign && success > 0) {
+  if (!useFileResponseMode && success > 0) {
     const rangeLabel = hasVerseRange
       ? `${book} ${start}:${verseStart}-${verseEnd}`
       : (start === end ? `${book} ${start}` : `${book} ${start}\u2013${end}`);
@@ -1332,4 +1339,5 @@ module.exports = {
   parseGenerateCommand,
   buildParsedGenerateRequest,
   hasRequiredGeneratedOutputs,
+  shouldUseFileResponseMode,
 };
