@@ -7,8 +7,9 @@ const {
 
 function parseLimit(argv) {
   const index = argv.indexOf('--limit');
-  if (index === -1) return 3;
+  if (index === -1) return null;
   const raw = argv[index + 1];
+  if (raw == null || raw === '' || raw.toLowerCase() === 'all') return null;
   const value = Number.parseInt(raw, 10);
   if (!Number.isInteger(value) || value < 1) {
     throw new Error(`Invalid --limit value: ${raw}`);

@@ -2,18 +2,19 @@
 # Log triage — runs at noon and 5pm Eastern via system cron
 set -euo pipefail
 
-LOG="/srv/bot/app/logs/cron-log-triage.log"
-PROMPT_FILE="/srv/bot/.claude/cron-prompts/log-triage.md"
-TMPOUT=$(mktemp)
-
-export HOME="/home/ubuntu"
-export PATH="/home/ubuntu/.local/bin:/usr/local/bin:/usr/bin:/bin:$PATH"
-
-# Load Zulip credentials
-set -a
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BP_BOOTSTRAP_LOG="${BP_BOOTSTRAP_LOG:-${HOME:-/home/ubuntu}/bp-bot/logs/cron-log-triage.log}"
 # shellcheck source=/dev/null
-source /srv/bot/app/.env
-set +a
+source "${SCRIPT_DIR}/lib/host-cron-bootstrap.sh"
+bp_init_host_cron || exit 1
+bp_require_zulip || exit 1
+bp_require_command claude || exit 1
+bp_require_command curl || exit 1
+bp_require_file "${BP_PROMPTS_DIR}/log-triage.md" 'log triage prompt' || exit 1
+
+LOG="${BP_LOG_DIR}/cron-log-triage.log"
+PROMPT_FILE="${BP_PROMPTS_DIR}/log-triage.md"
+TMPOUT=$(mktemp)
 
 mkdir -p "$(dirname "$LOG")"
 
@@ -23,7 +24,7 @@ log "=== Log triage starting ==="
 
 claude \
   --print "$(cat "$PROMPT_FILE")" \
-  --cwd /srv/bot \
+  --cwd "$BP_CODEX_CWD" \
   --allowedTools "Bash Read Grep Glob" \
   2>&1 | tee -a "$LOG" "$TMPOUT"
 

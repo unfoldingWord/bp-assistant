@@ -1,11 +1,18 @@
 #!/usr/bin/env bash
-# Nightly restart + Claude update for zulip-bot
+# Nightly restart + Claude update for the local zulip-bot container.
+# This is runtime-only host maintenance and should be disabled after Fly cutover.
 # Runs at midnight Eastern via cron
 set -euo pipefail
 
-BOT_DIR="/srv/bot/app"
-LOG="/srv/bot/app/logs/nightly-restart.log"
-CONTAINER="zulip-bot"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BP_BOOTSTRAP_LOG="${BP_BOOTSTRAP_LOG:-${HOME:-/home/ubuntu}/bp-bot/logs/nightly-restart.log}"
+# shellcheck source=/dev/null
+source "${SCRIPT_DIR}/lib/host-cron-bootstrap.sh"
+bp_init_host_cron || exit 1
+bp_require_command docker || exit 1
+
+LOG="${BP_LOG_DIR}/nightly-restart.log"
+CONTAINER="${BP_RUNTIME_CONTAINER}"
 
 mkdir -p "$(dirname "$LOG")"
 
