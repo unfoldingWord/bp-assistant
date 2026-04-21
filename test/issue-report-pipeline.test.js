@@ -773,57 +773,61 @@ test('issueReportPipeline avoids duplicate issue creation after partial dual-rep
   assert.match(store.issues['bp-assistant'][0].body, /bp-assistant-skills#1/);
 });
 
-test('issueReportPipeline treats the Psalm 38 sample as an intelligent dual-ownership candidate', async () => {
+// Psalm 38 regression: real proofreader feedback that spans both repos.
+// The classifier is mocked to return dual ownership — this test asserts the
+// pipeline correctly opens two linked issues, NOT just one skills-only issue.
+test('Psalm 38 regression: dual-ownership report opens two cross-linked issues', async () => {
   const classifierInputs = [];
   const sentReplies = [];
   const { fetchImpl, store } = createGithubFetchStub();
-  const runtime = createRuntime({
-    classifierPayload: buildClassifierPayload({
-      complaints: [
-        {
-          id: 'c1',
-          summary: 'AT output falls back to an ellipsis instead of the full phrase',
-          evidence: ['adding a "…" to the AT instead of putting the whole phrase'],
-          likely_layers: ['bp-assistant', 'bp-assistant-skills'],
-        },
-        {
-          id: 'c2',
-          summary: 'Split snippets still appear',
-          evidence: ['still seeing a lot of split snippets'],
-          likely_layers: ['bp-assistant-skills'],
-        },
-        {
-          id: 'c3',
-          summary: 'Abstract noun notes are merged across both lines',
-          evidence: ['combined abstractnoun notes that cover both lines instead of a note for each line'],
-          likely_layers: ['bp-assistant-skills'],
-        },
-      ],
-      ownership: {
-        repositories: ['bp-assistant', 'bp-assistant-skills'],
-        primary_repo: 'bp-assistant-skills',
-        secondary_repo: 'bp-assistant',
-        rationale: 'The note-writing symptoms are skill-facing, but app-side context shaping or post-processing could also explain the ellipsis behavior.',
+  const dualOwnershipPayload = buildClassifierPayload({
+    complaints: [
+      {
+        id: 'c1',
+        summary: 'AT output falls back to an ellipsis instead of the full phrase',
+        evidence: ['adding a "…" to the AT instead of putting the whole phrase'],
+        likely_layers: ['bp-assistant', 'bp-assistant-skills'],
       },
-      issues: [
-        {
-          id: 'i1',
-          repo: 'bp-assistant-skills',
-          complaint_ids: ['c1', 'c2', 'c3'],
-          title: 'Refine Psalm 38 note splitting and AT phrase handling',
-          body: '## Summary\n\nPsalm 38 output still splits snippets, uses an ellipsis in the AT, and merges abstract noun notes across both lines.\n\n## Steps to Reproduce\n\n1. Run tn-writer on Psalm 38 content matching the reported case.\n\n## Expected Behavior\n\nWhole-phrase AT output, stable snippets, and one abstract noun note per line.\n\n## Actual Behavior\n\nThe AI sometimes inserts an ellipsis in the AT, still splits snippets, and combines abstract noun notes across lines.\n\n## Reporter\n\nProof Reader',
-          labels: ['bug', 'ai-quality'],
-        },
-        {
-          id: 'i2',
-          repo: 'bp-assistant',
-          complaint_ids: ['c1'],
-          title: 'Audit Psalm 38 AT post-processing and report context shaping',
-          body: '## Summary\n\nThe Psalm 38 report may reflect app-side context packaging, preprocessing, or post-processing that turns a full phrase into an ellipsis before the final note is posted.\n\n## Steps to Reproduce\n\n1. Submit the reported Psalm 38 feedback through the explicit report flow.\n\n## Expected Behavior\n\nThe bot should preserve enough context for triage and avoid introducing AT ellipsis regressions.\n\n## Actual Behavior\n\nThe report plausibly points to app-side context shaping or post-processing around the generated note.\n\n## Reporter\n\nProof Reader',
-          labels: ['bug'],
-        },
-      ],
-    }),
+      {
+        id: 'c2',
+        summary: 'Split snippets still appear',
+        evidence: ['still seeing a lot of split snippets'],
+        likely_layers: ['bp-assistant-skills'],
+      },
+      {
+        id: 'c3',
+        summary: 'Abstract noun notes are merged across both lines',
+        evidence: ['combined abstractnoun notes that cover both lines instead of a note for each line'],
+        likely_layers: ['bp-assistant-skills'],
+      },
+    ],
+    ownership: {
+      repositories: ['bp-assistant', 'bp-assistant-skills'],
+      primary_repo: 'bp-assistant-skills',
+      secondary_repo: 'bp-assistant',
+      rationale: 'The note-writing symptoms are skill-facing, but app-side context shaping or post-processing could also explain the ellipsis behavior.',
+    },
+    issues: [
+      {
+        id: 'i1',
+        repo: 'bp-assistant-skills',
+        complaint_ids: ['c1', 'c2', 'c3'],
+        title: 'Refine Psalm 38 note splitting and AT phrase handling',
+        body: '## Summary\n\nPsalm 38 output still splits snippets, uses an ellipsis in the AT, and merges abstract noun notes across both lines.\n\n## Steps to Reproduce\n\n1. Run tn-writer on Psalm 38 content matching the reported case.\n\n## Expected Behavior\n\nWhole-phrase AT output, stable snippets, and one abstract noun note per line.\n\n## Actual Behavior\n\nThe AI sometimes inserts an ellipsis in the AT, still splits snippets, and combines abstract noun notes across lines.\n\n## Reporter\n\nProof Reader',
+        labels: ['bug', 'ai-quality'],
+      },
+      {
+        id: 'i2',
+        repo: 'bp-assistant',
+        complaint_ids: ['c1'],
+        title: 'Audit Psalm 38 AT post-processing and report context shaping',
+        body: '## Summary\n\nThe Psalm 38 report may reflect app-side context packaging, preprocessing, or post-processing that turns a full phrase into an ellipsis before the final note is posted.\n\n## Steps to Reproduce\n\n1. Submit the reported Psalm 38 feedback through the explicit report flow.\n\n## Expected Behavior\n\nThe bot should preserve enough context for triage and avoid introducing AT ellipsis regressions.\n\n## Actual Behavior\n\nThe report plausibly points to app-side context shaping or post-processing around the generated note.\n\n## Reporter\n\nProof Reader',
+        labels: ['bug'],
+      },
+    ],
+  });
+  const runtime = createRuntime({
+    classifierPayload: dualOwnershipPayload,
     fetchImpl,
     sentReplies,
     classifierInputs,
@@ -835,12 +839,24 @@ test('issueReportPipeline treats the Psalm 38 sample as an intelligent dual-owne
     content: psalm38Report,
   }), runtime);
 
-  assert.equal(store.issues['bp-assistant'].length, 1);
-  assert.equal(store.issues['bp-assistant-skills'].length, 1);
-  assert.match(classifierInputs[0], /Ps38/);
-  assert.match(classifierInputs[0], /Psalm 38/);
-  assert.match(classifierInputs[0], /split snippets/);
-  assert.match(classifierInputs[0], /abstractnoun notes/);
-  assert.match(sentReplies[0].text, /bp-assistant#1/);
-  assert.match(sentReplies[0].text, /bp-assistant-skills#1/);
+  // Core regression: dual ownership must produce two issues, not skills-only.
+  assert.equal(dualOwnershipPayload.ownership.repositories.length, 2, 'ownership.repositories must have 2 entries');
+  assert.equal(store.issues['bp-assistant'].length, 1, 'app issue created');
+  assert.equal(store.issues['bp-assistant-skills'].length, 1, 'skills issue created');
+
+  // Reciprocal cross-links must be present.
+  assert.match(store.issues['bp-assistant-skills'][0].body, /## Related issue/, 'skills issue has Related issue section');
+  assert.match(store.issues['bp-assistant-skills'][0].body, /bp-assistant#1/, 'skills issue links to app issue');
+  assert.match(store.issues['bp-assistant'][0].body, /bp-assistant-skills#1/, 'app issue links to skills issue');
+
+  // Classifier received the sample text with reporter and stream context.
+  assert.match(classifierInputs[0], /Ps38/, 'classifier received Ps38 reference');
+  assert.match(classifierInputs[0], /split snippets/, 'classifier received split snippets text');
+  assert.match(classifierInputs[0], /abstractnoun notes/, 'classifier received abstractnoun notes text');
+  assert.match(classifierInputs[0], /Reporter: Proof Reader/, 'classifier received reporter name');
+  assert.match(classifierInputs[0], /Stream: BP Proofreading/, 'classifier received stream context');
+
+  // Reply mentions both issue URLs.
+  assert.match(sentReplies[0].text, /bp-assistant#1/, 'reply mentions app issue');
+  assert.match(sentReplies[0].text, /bp-assistant-skills#1/, 'reply mentions skills issue');
 });
