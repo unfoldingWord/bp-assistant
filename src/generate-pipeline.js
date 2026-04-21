@@ -33,6 +33,8 @@ const REQUIRED_INITIAL_PIPELINE_FILES = [
 const INITIAL_PIPELINE_COMPLETION_GUARDRAIL = [
   'Do not return success for initial-pipeline until the full Wave 1-6 flow has finished.',
   'Wave 1 and Wave 2 outputs are intermediate only and are never valid terminal success.',
+  'When agents are running in the background, you must actively supervise them with TaskGet or TaskList; do not merely say you are waiting.',
+  'Before starting each next wave, confirm the required agents are completed and the required intermediate files exist.',
   'Completion is only valid after the final required outputs exist on disk for this chapter:',
   'output/AI-ULT/<BOOK>/<BOOK>-<CH>.usfm, output/issues/<BOOK>/<BOOK>-<CH>.tsv, and output/AI-UST/<BOOK>/<BOOK>-<CH>.usfm.',
   'If any of those required outputs are missing, continue the pipeline or return a failure instead of success.',
