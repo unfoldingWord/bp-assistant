@@ -304,9 +304,20 @@ function buildIssueMarker(messageId, issueId) {
   return `issue-report:${messageId}:${issueId}`;
 }
 
-function injectMetadata(body, marker) {
+function buildIssueDedupeMarker(messageId, repo, complaintIds) {
+  const stableComplaintIds = [...new Set((Array.isArray(complaintIds) ? complaintIds : [])
+    .filter((item) => typeof item === 'string')
+    .map((item) => item.trim())
+    .filter(Boolean))]
+    .sort();
+  return `issue-report:${messageId}:${repo}:${stableComplaintIds.join('+')}`;
+}
+
+function injectMetadata(body, markers) {
   const trimmed = String(body || '').trim();
-  return `${trimmed}\n\n<!-- ${marker} -->`;
+  const uniqueMarkers = [...new Set((Array.isArray(markers) ? markers : [markers]).filter(Boolean))];
+  const metadata = uniqueMarkers.map((marker) => `<!-- ${marker} -->`).join('\n');
+  return `${trimmed}\n\n${metadata}`;
 }
 
 function addOrReplaceRelatedIssueSection(body, repo, allIssues, ownership) {
@@ -352,6 +363,14 @@ async function searchExistingIssue(fetchImpl, token, repo, marker) {
   const payload = await response.json();
   const issue = payload.items?.[0] || null;
   return issue ? { ...issue, repo } : null;
+}
+
+async function searchExistingIssueByMarkers(fetchImpl, token, repo, markers) {
+  for (const marker of markers) {
+    const existing = await searchExistingIssue(fetchImpl, token, repo, marker);
+    if (existing) return existing;
+  }
+  return null;
 }
 
 async function createGithubIssue(fetchImpl, token, repo, payload) {
@@ -430,7 +449,13 @@ async function issueReportPipeline(route, message, overrides = {}) {
     const issueRecords = [];
     for (const issuePlan of classified.issues) {
       const marker = buildIssueMarker(message.id, issuePlan.id);
-      const existing = await searchExistingIssue(deps.fetchImpl, githubToken, issuePlan.repo, marker);
+      const dedupeMarker = buildIssueDedupeMarker(message.id, issuePlan.repo, issuePlan.complaint_ids);
+      const existing = await searchExistingIssueByMarkers(
+        deps.fetchImpl,
+        githubToken,
+        issuePlan.repo,
+        [dedupeMarker, marker]
+      );
       if (existing) {
         issueRecords.push({ ...existing, issue_id: issuePlan.id, complaint_ids: issuePlan.complaint_ids });
         continue;
@@ -438,7 +463,7 @@ async function issueReportPipeline(route, message, overrides = {}) {
 
       const created = await createGithubIssue(deps.fetchImpl, githubToken, issuePlan.repo, {
         title: issuePlan.title,
-        body: injectMetadata(issuePlan.body, marker),
+        body: injectMetadata(issuePlan.body, [dedupeMarker, marker]),
         labels: issuePlan.labels,
       });
       console.log(`[issue-report] Created ${issuePlan.repo}#${created.number}: ${issuePlan.title}`);
@@ -448,8 +473,15 @@ async function issueReportPipeline(route, message, overrides = {}) {
     if (issueRecords.length > 1) {
       const bodyById = new Map(classified.issues.map((issue) => [issue.id, issue.body]));
       for (const issueRecord of issueRecords) {
+        const issuePlan = classified.issues.find((issue) => issue.id === issueRecord.issue_id);
+        if (!issuePlan) {
+          throw new Error(`Classifier returned issue ${issueRecord.issue_id} without a matching plan`);
+        }
         const desiredBody = addOrReplaceRelatedIssueSection(
-          injectMetadata(bodyById.get(issueRecord.issue_id), buildIssueMarker(message.id, issueRecord.issue_id)),
+          injectMetadata(bodyById.get(issueRecord.issue_id), [
+            buildIssueDedupeMarker(message.id, issueRecord.repo, issuePlan.complaint_ids),
+            buildIssueMarker(message.id, issueRecord.issue_id),
+          ]),
           issueRecord.repo,
           issueRecords.filter((candidate) => candidate.issue_id !== issueRecord.issue_id),
           classified.ownership
@@ -485,5 +517,6 @@ module.exports = {
   _buildClassifierInput: buildClassifierInput,
   _parseClassifierOutput: parseClassifierOutput,
   _buildIssueMarker: buildIssueMarker,
+  _buildIssueDedupeMarker: buildIssueDedupeMarker,
   _addOrReplaceRelatedIssueSection: addOrReplaceRelatedIssueSection,
 };

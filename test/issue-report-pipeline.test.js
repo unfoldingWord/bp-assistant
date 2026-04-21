@@ -709,7 +709,7 @@ test('issueReportPipeline rejects multiple issues for the same repo in one repor
 });
 
 test('issueReportPipeline avoids duplicate issue creation after partial dual-repo failure and retry', async () => {
-  const classifierPayload = buildClassifierPayload({
+  const firstClassifierPayload = buildClassifierPayload({
     complaints: [
       {
         id: 'c1',
@@ -749,10 +749,65 @@ test('issueReportPipeline avoids duplicate issue creation after partial dual-rep
       },
     ],
   });
+  const secondClassifierPayload = buildClassifierPayload({
+    complaints: [
+      {
+        id: 'c1',
+        summary: 'Ellipses still appear',
+        evidence: ['flips between ellipses'],
+        likely_layers: ['bp-assistant'],
+      },
+      {
+        id: 'c2',
+        summary: 'Split snippets still happen',
+        evidence: ['split snippets'],
+        likely_layers: ['bp-assistant-skills'],
+      },
+    ],
+    ownership: {
+      repositories: ['bp-assistant', 'bp-assistant-skills'],
+      primary_repo: 'bp-assistant',
+      secondary_repo: 'bp-assistant-skills',
+      rationale: 'Both repos are involved.',
+    },
+    issues: [
+      {
+        id: 'i9',
+        repo: 'bp-assistant',
+        complaint_ids: ['c1'],
+        title: 'Harden report triage ownership routing',
+        body: '## Summary\n\nApp-side triage concern.\n\n## Steps to Reproduce\n\n1. Report Psalm 38 issue.\n\n## Expected Behavior\n\nCross-repo routing.\n\n## Actual Behavior\n\nOnly one repo gets filed.\n\n## Reporter\n\nProof Reader',
+        labels: ['bug'],
+      },
+      {
+        id: 'i8',
+        repo: 'bp-assistant-skills',
+        complaint_ids: ['c2'],
+        title: 'Refine Psalm 38 split snippet guidance',
+        body: '## Summary\n\nSkills-side formatting concern.\n\n## Steps to Reproduce\n\n1. Run tn-writer for Psalm 38.\n\n## Expected Behavior\n\nWhole phrase handling.\n\n## Actual Behavior\n\nEllipsis and split snippets.\n\n## Reporter\n\nProof Reader',
+        labels: ['bug'],
+      },
+    ],
+  });
   const classifierInputs = [];
   const sentReplies = [];
   const { fetchImpl, store } = createGithubFetchStub({ failNextPostForRepo: 'bp-assistant-skills' });
-  const runtime = createRuntime({ classifierPayload, fetchImpl, sentReplies, classifierInputs });
+  const runtime = createRuntime({
+    classifierPayload: firstClassifierPayload,
+    fetchImpl,
+    sentReplies,
+    classifierInputs,
+  });
+  runtime.AnthropicClient = createAnthropicSequenceStub([
+    {
+      stop_reason: 'end_turn',
+      content: [{ text: JSON.stringify(firstClassifierPayload) }],
+    },
+    {
+      stop_reason: 'end_turn',
+      content: [{ text: JSON.stringify(secondClassifierPayload) }],
+    },
+  ], classifierInputs);
 
   await issueReportPipeline({}, buildMessage({
     content: 'issue: Psalm 38 still flips between ellipses and split snippets.',
@@ -771,6 +826,7 @@ test('issueReportPipeline avoids duplicate issue creation after partial dual-rep
   assert.equal(store.issues['bp-assistant'].length, 1);
   assert.equal(store.issues['bp-assistant-skills'].length, 1);
   assert.match(store.issues['bp-assistant'][0].body, /bp-assistant-skills#1/);
+  assert.equal(classifierInputs.length, 2);
 });
 
 // Psalm 38 regression: real proofreader feedback that spans both repos.
