@@ -25,3 +25,8 @@ jobs:
         run: flyctl deploy --remote-only
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+
+      - name: Update workspace skills
+        run: flyctl ssh console --command "cd /data/workspace && git pull --ff-only 2>&1 || echo 'workspace pull failed (non-fatal)'"
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
