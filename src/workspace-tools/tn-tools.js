@@ -147,8 +147,9 @@ function findBestSequentialAlignmentMatch(entries, words, usedIndices = new Set(
   return search(0, 0);
 }
 
-function selectBestAlignmentSegmentMatch(entries, words, usedIndices = new Set()) {
+function selectBestAlignmentSegmentMatch(entries, words, usedIndices = new Set(), options = {}) {
   if (!entries.length || !words.length) return null;
+  const preserveLeadingWeakAnchors = !!options.preserveLeadingWeakAnchors;
   const variants = [];
   const seen = new Set();
   const fullIndices = findBestSequentialAlignmentMatch(entries, words, usedIndices);
@@ -169,7 +170,7 @@ function selectBestAlignmentSegmentMatch(entries, words, usedIndices = new Set()
   let maxWeakSuffix = 0;
   while (maxWeakSuffix < words.length && ALIGNMENT_WEAK_ANCHOR_WORDS.has(words[words.length - 1 - maxWeakSuffix])) maxWeakSuffix++;
 
-  const canTrimPrefix = !!(fullIndices && maxWeakPrefix > 0 && fullIndices.slice(0, maxWeakPrefix).some((_, index) => {
+  const canTrimPrefix = !!(!preserveLeadingWeakAnchors && fullIndices && maxWeakPrefix > 0 && fullIndices.slice(0, maxWeakPrefix).some((_, index) => {
     if (index + 1 >= fullIndices.length) return false;
     return fullIndices[index + 1] - fullIndices[index] > 1;
   }));
@@ -1928,7 +1929,10 @@ function fillOrigQuotes({ preparedJson, alignmentJson, hebrewUsfm, masterUltUsfm
       const words = tokenizeAlignmentQuote(seg);
       if (!words.length) continue;
 
-      const exactMatch = selectBestAlignmentSegmentMatch(entries, words, usedIndices);
+      const preserveLeadingWeakAnchors = /\?/.test(seg);
+      const exactMatch = selectBestAlignmentSegmentMatch(entries, words, usedIndices, {
+        preserveLeadingWeakAnchors,
+      });
       const exactHeb = exactMatch ? collectHebrew(exactMatch.indices) : null;
       if (exactMatch && exactHeb.length) {
         for (const idx of exactMatch.indices) usedIndices.add(idx);
@@ -1938,7 +1942,9 @@ function fillOrigQuotes({ preparedJson, alignmentJson, hebrewUsfm, masterUltUsfm
 
       const contentWords = words.filter((word) => !ALIGNMENT_STOP_WORDS.has(word));
       const fallbackWords = contentWords.length ? contentWords : words;
-      const fallbackMatch = selectBestAlignmentSegmentMatch(entries, fallbackWords, usedIndices);
+      const fallbackMatch = selectBestAlignmentSegmentMatch(entries, fallbackWords, usedIndices, {
+        preserveLeadingWeakAnchors,
+      });
       const fallbackHeb = fallbackMatch ? collectHebrew(fallbackMatch.indices) : null;
       if (!fallbackMatch || !fallbackHeb.length) return null;
       for (const idx of fallbackMatch.indices) usedIndices.add(idx);
