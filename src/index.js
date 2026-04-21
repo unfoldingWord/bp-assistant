@@ -8,6 +8,7 @@ const { resumeInsertion } = require('./insertion-resume');
 const { verifyDcsToken } = require('./repo-verify');
 const { startResourceMonitor } = require('./resource-monitor');
 const { ensureClaudeConfig } = require('./claude-config-init');
+const { startWeeklyRefresh } = require('./cron-weekly-refresh');
 
 // Prepend ISO timestamp to every console line
 ['log', 'warn', 'error'].forEach(method => {
@@ -170,6 +171,7 @@ async function main() {
 }
 
 startMcpServer();
+startWeeklyRefresh();
 
 const METRICS_FILE = require('path').resolve(__dirname, '../data/metrics/usage.jsonl');
 require('fs').mkdirSync(require('path').dirname(METRICS_FILE), { recursive: true });
