@@ -1,0 +1,29 @@
+app = "uw-bt-bot"
+primary_region = "dfw"
+
+kill_signal = "SIGINT"
+kill_timeout = 30
+
+[build]
+  dockerfile = "Dockerfile.fly"
+
+[deploy]
+  release_command = "bash -c 'cd /data/workspace && git pull --ff-only 2>&1 || true'"
+
+[env]
+  NODE_ENV = "production"
+  CSKILLBP_DIR = "/data/workspace"
+  DOOR43_REPOS_PATH = "/data/workspace/door43-repos"
+  HEBREW_DIR = "/data/workspace/data/hebrew_bible"
+  CLAUDE_CONFIG_DIR = "/data/claude-config"
+  MODEL_PROVIDER_CONFIG_FILE = "/config/model-provider-config.json"
+
+[[vm]]
+  memory = "4gb"
+  cpu_kind = "shared"
+  cpus = 4
+
+[[mounts]]
+  source = "workspace_vol"
+  destination = "/data"
+  initial_size = "25gb"
