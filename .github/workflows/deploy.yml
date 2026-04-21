@@ -1,0 +1,27 @@
+name: Deploy to Fly.io
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Confirm no pipeline is currently running (yes/no)'
+        required: true
+        default: 'no'
+
+jobs:
+  deploy:
+    name: Deploy
+    runs-on: ubuntu-latest
+    if: ${{ github.event.inputs.confirm == 'yes' }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup flyctl
+        uses: superfly/flyctl-actions/setup-flyctl@master
+
+      - name: Deploy
+        run: flyctl deploy --remote-only
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
