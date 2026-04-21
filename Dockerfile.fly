@@ -1,0 +1,35 @@
+FROM node:22-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git curl ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN useradd -m -s /bin/bash -u 1001 botuser
+
+# Claude Code CLI (required by the agent SDK)
+USER botuser
+RUN curl -fsSL https://claude.ai/install.sh | bash
+ENV PATH="/home/botuser/.local/bin:${PATH}"
+USER root
+
+ENV CLAUDE_CONFIG_DIR=/data/claude-config
+ENV CSKILLBP_DIR=/data/workspace
+ENV DISABLE_AUTOUPDATER=1
+
+# /data is the single Fly volume — subdirs created at runtime by entrypoint.sh
+RUN mkdir -p /data /config && chown botuser:botuser /data
+
+WORKDIR /app
+COPY package.json package-lock.json ./
+RUN npm ci --production
+COPY . .
+RUN ln -s /data/workspace /cSkillBP
+
+# model-provider-config.json is not sensitive — bake it into the image
+COPY model-provider-config.json /config/model-provider-config.json
+
+RUN chmod +x /app/entrypoint.sh && \
+    chown -R botuser:botuser /app
+
+USER botuser
+CMD ["/bin/bash", "/app/entrypoint.sh"]

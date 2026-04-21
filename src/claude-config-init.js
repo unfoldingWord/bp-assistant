@@ -4,7 +4,7 @@
 
 const fs = require('fs');
 
-const CLAUDE_JSON_PATH = '/claude-config/.claude.json';
+const CLAUDE_JSON_PATH = `${process.env.CLAUDE_CONFIG_DIR || '/claude-config'}/.claude.json`;
 const NEEDED_TOOLS = [
   'Read', 'Write', 'Edit', 'Glob', 'Grep',
   'Task', 'TaskOutput', 'Skill', 'SendMessage',

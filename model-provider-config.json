@@ -1,0 +1,267 @@
+{
+    "providers": {
+        "claude": {
+            "defaultModel": "claude-opus-4-7",
+            "secretName": "anthropic_api_key",
+            "envName": "ANTHROPIC_API_KEY",
+            "modelAliases": {
+                "opus": "claude-opus-4-7",
+                "sonnet": "claude-sonnet-4-6",
+                "haiku": "claude-haiku-4-5-20251001"
+            },
+            "models": {
+                "claude-opus-4-7": {
+                    "label": "Claude Opus 4.7",
+                    "inputPer1M": 5.0,
+                    "outputPer1M": 25.0
+                },
+                "claude-sonnet-4-6": {
+                    "label": "Claude Sonnet 4.6",
+                    "inputPer1M": 3.0,
+                    "outputPer1M": 15.0
+                },
+                "claude-haiku-4-5-20251001": {
+                    "label": "Claude Haiku 4.5",
+                    "inputPer1M": 0.8,
+                    "outputPer1M": 4.0
+                }
+            }
+        },
+        "openai": {
+            "defaultModel": "gpt-5.4",
+            "secretName": "openai_api_key",
+            "envName": "OPENAI_API_KEY",
+            "modelAliases": {
+                "opus": "gpt-5.4",
+                "sonnet": "gpt-5.4-mini",
+                "haiku": "gpt-5.4-nano",
+                "gpt-5.1-mini": "gpt-5.4-mini"
+            },
+            "models": {
+                "gpt-4.1": {
+                    "label": "GPT 4.1",
+                    "inputPer1M": 2.0,
+                    "outputPer1M": 8.0
+                },
+                "gpt-5.3": {
+                    "label": "GPT 5.3",
+                    "inputPer1M": 4.0,
+                    "outputPer1M": 16.0
+                },
+                "gpt-5.4": {
+                    "label": "GPT 5.4",
+                    "inputPer1M": 5.0,
+                    "outputPer1M": 20.0
+                },
+                "gpt-5.4-mini": {
+                    "label": "GPT 5.4 mini",
+                    "inputPer1M": 0.8,
+                    "outputPer1M": 3.2
+                },
+                "gpt-5.4-nano": {
+                    "label": "GPT 5.4 nano",
+                    "inputPer1M": 0.2,
+                    "outputPer1M": 0.8
+                },
+                "o3": {
+                    "label": "o3",
+                    "inputPer1M": 2.5,
+                    "outputPer1M": 10.0
+                },
+                "o4-mini": {
+                    "label": "o4 mini",
+                    "inputPer1M": 0.5,
+                    "outputPer1M": 2.0
+                }
+            }
+        },
+        "gemini": {
+            "defaultModel": "gemini-3.1-pro-preview",
+            "secretName": "google_api_key",
+            "envName": "GOOGLE_API_KEY",
+            "modelAliases": {
+                "opus": "gemini-3.1-pro-preview",
+                "sonnet": "gemini-2.5-pro",
+                "haiku": "gemini-3-flash-preview"
+            },
+            "models": {
+                "gemini-3.1-pro-preview": {
+                    "label": "Gemini 3.1 Pro (preview)",
+                    "inputPer1M": 1.25,
+                    "outputPer1M": 10.0
+                },
+                "gemini-3-pro-preview": {
+                    "label": "Gemini 3 Pro (preview)",
+                    "inputPer1M": 1.25,
+                    "outputPer1M": 10.0
+                },
+                "gemini-3-flash-preview": {
+                    "label": "Gemini 3 Flash (preview)",
+                    "inputPer1M": 0.15,
+                    "outputPer1M": 0.6
+                },
+                "gemini-2.5-pro": {
+                    "label": "Gemini 2.5 Pro",
+                    "inputPer1M": 1.25,
+                    "outputPer1M": 10.0
+                },
+                "gemini-2.5-flash": {
+                    "label": "Gemini 2.5 Flash",
+                    "inputPer1M": 0.15,
+                    "outputPer1M": 0.6
+                }
+            },
+            "fallbackModels": {
+                "gemini-3.1-pro-preview": [
+                    "gemini-3-pro-preview",
+                    "gemini-2.5-pro"
+                ],
+                "gemini-3-pro-preview": [
+                    "gemini-2.5-pro"
+                ],
+                "gemini-3-flash-preview": [
+                    "gemini-2.5-flash"
+                ]
+            }
+        },
+        "xai": {
+            "defaultModel": "grok-4.20-reasoning",
+            "secretName": "xai_api_key",
+            "envName": "XAI_API_KEY",
+            "baseUrl": "https://api.x.ai/v1",
+            "modelAliases": {
+                "opus": "grok-4.20-reasoning",
+                "sonnet": "grok-4.20-reasoning",
+                "haiku": "grok-4-1-fast-non-reasoning"
+            },
+            "models": {
+                "grok-4.20-reasoning": {
+                    "label": "Grok 4.20 (reasoning)",
+                    "inputPer1M": 3.0,
+                    "outputPer1M": 15.0
+                },
+                "grok-4-0709": {
+                    "label": "Grok 4",
+                    "inputPer1M": 3.0,
+                    "outputPer1M": 9.0
+                },
+                "grok-4-1-fast-reasoning": {
+                    "label": "Grok 4.1 Fast (reasoning)",
+                    "inputPer1M": 3.0,
+                    "outputPer1M": 9.0
+                },
+                "grok-4-1-fast-non-reasoning": {
+                    "label": "Grok 4.1 Fast (no CoT)",
+                    "inputPer1M": 3.0,
+                    "outputPer1M": 9.0
+                },
+                "grok-3": {
+                    "label": "Grok 3",
+                    "inputPer1M": 3.0,
+                    "outputPer1M": 15.0
+                },
+                "grok-3-mini": {
+                    "label": "Grok 3 Mini",
+                    "inputPer1M": 0.3,
+                    "outputPer1M": 0.5
+                }
+            },
+            "autoModelByThinking": {
+                "low": "grok-4-1-fast-non-reasoning",
+                "medium": "grok-4.20-reasoning",
+                "high": "grok-4.20-reasoning",
+                "max": "grok-4.20-reasoning",
+                "none": "grok-4-1-fast-non-reasoning"
+            },
+            "reasoningEffortModels": [
+                "grok-3-mini"
+            ],
+            "fallbackModels": {
+                "grok-4.20-reasoning": [
+                    "grok-4-1-fast-reasoning",
+                    "grok-4-0709",
+                    "grok-4-1-fast-non-reasoning",
+                    "grok-3-mini"
+                ],
+                "grok-4-1-fast-reasoning": [
+                    "grok-4-0709",
+                    "grok-4-1-fast-non-reasoning",
+                    "grok-3-mini"
+                ],
+                "grok-4-0709": [
+                    "grok-4-1-fast-non-reasoning",
+                    "grok-3-mini"
+                ]
+            }
+        },
+        "groq": {
+            "defaultModel": "meta-llama/llama-4-scout-17b-16e-instruct",
+            "secretName": "openai_api_key",
+            "envName": "OPENAI_API_KEY",
+            "baseUrl": "https://api.groq.com/openai/v1",
+            "modelAliases": {
+                "opus": "qwen/qwen3-32b",
+                "sonnet": "meta-llama/llama-4-scout-17b-16e-instruct",
+                "haiku": "meta-llama/llama-4-scout-17b-16e-instruct"
+            },
+            "models": {
+                "meta-llama/llama-4-scout-17b-16e-instruct": {
+                    "label": "Llama 4 Scout",
+                    "inputPer1M": 0.2,
+                    "outputPer1M": 0.2
+                },
+                "qwen/qwen3-32b": {
+                    "label": "Qwen3 32B",
+                    "inputPer1M": 0.29,
+                    "outputPer1M": 0.39
+                }
+            }
+        },
+        "deepseek": {
+            "defaultModel": "deepseek-chat",
+            "secretName": "openai_api_key",
+            "envName": "OPENAI_API_KEY",
+            "baseUrl": "https://api.deepseek.com",
+            "modelAliases": {
+                "opus": "deepseek-reasoner",
+                "sonnet": "deepseek-chat",
+                "haiku": "deepseek-chat"
+            },
+            "models": {
+                "deepseek-chat": {
+                    "label": "DeepSeek Chat",
+                    "inputPer1M": 0.27,
+                    "outputPer1M": 1.1
+                },
+                "deepseek-reasoner": {
+                    "label": "DeepSeek Reasoner",
+                    "inputPer1M": 0.55,
+                    "outputPer1M": 2.19
+                }
+            }
+        },
+        "mistral": {
+            "defaultModel": "mistral-large-latest",
+            "secretName": "openai_api_key",
+            "envName": "OPENAI_API_KEY",
+            "baseUrl": "https://api.mistral.ai/v1",
+            "modelAliases": {
+                "opus": "mistral-large-latest",
+                "sonnet": "mistral-medium-latest",
+                "haiku": "mistral-medium-latest"
+            },
+            "models": {
+                "mistral-large-latest": {
+                    "label": "Mistral Large",
+                    "inputPer1M": 2.0,
+                    "outputPer1M": 6.0
+                },
+                "mistral-medium-latest": {
+                    "label": "Mistral Medium",
+                    "inputPer1M": 0.6,
+                    "outputPer1M": 1.8
+                }
+            }
+        }
+    }
+}
