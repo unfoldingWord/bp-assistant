@@ -9,7 +9,9 @@ const path = require('path');
 const { fetchDoor43, getDoor43FileInfo } = require('./workspace-tools/fetch-tools');
 const { readUsfmChapter } = require('./workspace-tools/usfm-tools');
 
-const CSKILLBP_DIR = process.env.CSKILLBP_DIR || path.resolve(__dirname, '../../workspace');
+function getCskillbpDir() {
+  return process.env.CSKILLBP_DIR || path.resolve(__dirname, '../../workspace');
+}
 
 /**
  * Strip alignment markers from USFM text, producing plain readable USFM.
@@ -84,14 +86,14 @@ function archivePipelineDir(absPath, dirName) {
 
 /**
  * Create a per-chapter pipeline working directory.
- * Returns the path relative to CSKILLBP_DIR.
+ * Returns the path relative to the current CSKILLBP_DIR.
  * When reset=true and the directory already exists, it is archived with a
  * timestamp suffix so previous run data is preserved for debugging.
  */
 function createPipelineDir({ book, chapter, verseStart, verseEnd, reset = true }) {
   const dirName = buildPipeDirName(book, chapter, verseStart, verseEnd);
   const relPath = `tmp/pipeline/${dirName}`;
-  const absPath = path.resolve(CSKILLBP_DIR, relPath);
+  const absPath = path.resolve(getCskillbpDir(), relPath);
   // Archive any stale directory from a previous run instead of deleting it.
   if (reset && fs.existsSync(absPath)) {
     archivePipelineDir(absPath, dirName);
@@ -117,7 +119,7 @@ function buildRuntimePaths(dirPath) {
 function preCreateStubs(dirPath) {
   const runtime = buildRuntimePaths(dirPath);
   for (const relPath of Object.values(runtime)) {
-    const absPath = path.resolve(CSKILLBP_DIR, relPath);
+    const absPath = path.resolve(getCskillbpDir(), relPath);
     if (!fs.existsSync(absPath)) {
       // Use '{}' for JSON stubs so Read/JSON.parse don't choke on empty files
       const isJson = relPath.endsWith('.json');
@@ -130,7 +132,7 @@ function preCreateStubs(dirPath) {
  * Write context.json to the pipeline directory.
  */
 function writeContext(dirPath, contextObj) {
-  const absPath = path.resolve(CSKILLBP_DIR, dirPath, 'context.json');
+  const absPath = path.resolve(getCskillbpDir(), dirPath, 'context.json');
   fs.writeFileSync(absPath, JSON.stringify(contextObj, null, 2));
 }
 
@@ -138,7 +140,7 @@ function writeContext(dirPath, contextObj) {
  * Read and parse context.json from a pipeline directory.
  */
 function readContext(dirPath) {
-  const absPath = path.resolve(CSKILLBP_DIR, dirPath, 'context.json');
+  const absPath = path.resolve(getCskillbpDir(), dirPath, 'context.json');
   return JSON.parse(fs.readFileSync(absPath, 'utf8'));
 }
 
@@ -172,7 +174,7 @@ function extractChapterToDir(dirPath, { sourceFile, chapter, targetFilename }) {
     throw new Error(chapterContent);
   }
   const relPath = `${dirPath}/${targetFilename}`;
-  const absPath = path.resolve(CSKILLBP_DIR, relPath);
+  const absPath = path.resolve(getCskillbpDir(), relPath);
   fs.writeFileSync(absPath, chapterContent);
   return relPath;
 }
@@ -187,7 +189,7 @@ function cleanupPipelineDir(dirPath) {
     console.warn(`[pipeline-context] Refusing to clean non-pipeline dir: ${dirPath}`);
     return;
   }
-  const absPath = path.resolve(CSKILLBP_DIR, dirPath);
+  const absPath = path.resolve(getCskillbpDir(), dirPath);
   if (fs.existsSync(absPath)) {
     const dirName = path.basename(absPath);
     archivePipelineDir(absPath, dirName);
@@ -202,7 +204,7 @@ const THIRTY_DAYS_MS = 30 * 24 * 60 * 60 * 1000;
  * Scans all dirs in tmp/pipeline/ — both active run dirs and timestamped archives.
  */
 function cleanupStalePipelineDirs(maxAgeMs = THIRTY_DAYS_MS) {
-  const pipelineRoot = path.resolve(CSKILLBP_DIR, 'tmp/pipeline');
+  const pipelineRoot = path.resolve(getCskillbpDir(), 'tmp/pipeline');
   if (!fs.existsSync(pipelineRoot)) return;
   const now = Date.now();
   let cleaned = 0;
@@ -260,14 +262,14 @@ async function buildNotesContext({ book, chapter, verseStart, verseEnd, issuesPa
   // Write plain (alignment-stripped) versions for model readability
   const ultChapterPlainPath = `${dirPath}/ult_chapter_plain.usfm`;
   const ustChapterPlainPath = `${dirPath}/ust_chapter_plain.usfm`;
-  const ultChapterAbs = path.resolve(CSKILLBP_DIR, ultChapterPath);
-  const ustChapterAbs = path.resolve(CSKILLBP_DIR, ustChapterPath);
+  const ultChapterAbs = path.resolve(getCskillbpDir(), ultChapterPath);
+  const ustChapterAbs = path.resolve(getCskillbpDir(), ustChapterPath);
   fs.writeFileSync(
-    path.resolve(CSKILLBP_DIR, ultChapterPlainPath),
+    path.resolve(getCskillbpDir(), ultChapterPlainPath),
     stripAlignmentMarkers(fs.readFileSync(ultChapterAbs, 'utf8'))
   );
   fs.writeFileSync(
-    path.resolve(CSKILLBP_DIR, ustChapterPlainPath),
+    path.resolve(getCskillbpDir(), ustChapterPlainPath),
     stripAlignmentMarkers(fs.readFileSync(ustChapterAbs, 'utf8'))
   );
 
@@ -393,7 +395,7 @@ async function buildUstContext({ book, chapter, verseStart, verseEnd, localUltPa
   };
 
   if (localUltPath) {
-    const localAbsPath = path.resolve(CSKILLBP_DIR, localUltPath);
+    const localAbsPath = path.resolve(getCskillbpDir(), localUltPath);
     if (fs.existsSync(localAbsPath)) {
       const localStat = fs.statSync(localAbsPath);
       const localModifiedAt = new Date(localStat.mtimeMs).toISOString();

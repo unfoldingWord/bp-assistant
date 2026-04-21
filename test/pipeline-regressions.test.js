@@ -323,7 +323,7 @@ test('runMechanicalQualityPrep forwards Hebrew USFM into quality checks', async 
     }, null, 2));
 
     const summary = await runMechanicalQualityPrep({ notesPath: notesRel, pipeDir });
-    assert.match(summary, /^Quality check: 1 notes, 1 errors, 2 warnings/);
+    assert.match(summary, /^Quality check: 1 notes, 1 errors, 3 warnings/);
   } finally {
     if (oldBaseDir == null) delete process.env.CSKILLBP_DIR;
     else process.env.CSKILLBP_DIR = oldBaseDir;

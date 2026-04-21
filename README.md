@@ -46,25 +46,7 @@ docker logs zulip-bot --tail 30 -f
 
 ### Host cron automation
 
-Host-side automation is separate from the Dockerized bot runtime and is designed to survive the Fly.io move.
-
-```bash
-# Long-term host layout:
-#   /home/ubuntu/bp-bot/bp-assistant
-#   /home/ubuntu/bp-bot/bp-assistant-skills
-#   /home/ubuntu/bp-bot/config
-#   /home/ubuntu/bp-bot/logs
-
-mkdir -p /home/ubuntu/bp-bot/config /home/ubuntu/bp-bot/logs
-cp cron.env.example /home/ubuntu/bp-bot/config/cron.env
-# Edit cron.env for the current host layout.
-
-# Secrets are read from BP_SECRETS_DIR via BOT_SECRETS_DIR.
-# For the current /srv/bot layout, point BP_SECRETS_DIR at /srv/bot/config/secrets
-# or migrate the secret files into /home/ubuntu/bp-bot/config/secrets.
-```
-
-For a staged cutover, keep the real repos in `/srv/bot/app` and `/srv/bot/workspace` for now, set those paths in `cron.env`, run `NIGHTLY_FIX_DRY_RUN=1 app/scripts/cron-nightly-fix.sh`, and only switch `cron.env` to `/home/ubuntu/bp-bot/...` after the repos move.
+Host-side automation now lives in the separate `bp-assistant-auto-issue-handler` repo. This app repo no longer owns cron scripts or host cron configuration.
 
 ### Local development
 
