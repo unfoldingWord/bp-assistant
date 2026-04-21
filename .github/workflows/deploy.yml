@@ -6,7 +6,7 @@ on:
       confirm:
         description: 'Confirm no pipeline is currently running (yes/no)'
         required: true
-        default: 'no'
+        default: 'yes'
 
 jobs:
   deploy:
