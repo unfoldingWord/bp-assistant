@@ -4,6 +4,7 @@
 const http = require('http');
 const https = require('https');
 const fs = require('fs');
+const path = require('path');
 const { McpServer } = require('@modelcontextprotocol/sdk/server/mcp.js');
 const { StreamableHTTPServerTransport } = require('@modelcontextprotocol/sdk/server/streamableHttp.js');
 const { z } = require('zod');
@@ -193,11 +194,29 @@ function stripMarkup(verseUsfm) {
 function loadCache() {
   if (cache.validIssues && cache.templates) return;
 
-  const issuesPath = '/workspace/data/translation-issues.csv';
-  const templatesPath = '/workspace/data/templates.csv';
+  const workspaceDir = process.env.CSKILLBP_DIR || '';
+  const dataDirCandidates = [
+    workspaceDir ? path.join(workspaceDir, 'data') : null,
+    '/data/workspace/data',
+    '/srv/bot/workspace/data',
+    '/workspace/data',
+    '/srv/bot/app/data',
+  ].filter(Boolean);
 
-  if (!fs.existsSync(issuesPath) || !fs.existsSync(templatesPath)) {
-    console.warn(`[mcp] Cache preload skipped: ${!fs.existsSync(issuesPath) ? issuesPath : templatesPath} not found.`);
+  let issuesPath = null;
+  let templatesPath = null;
+  for (const dataDir of dataDirCandidates) {
+    const issuesCandidate = path.join(dataDir, 'translation-issues.csv');
+    const templatesCandidate = path.join(dataDir, 'templates.csv');
+    if (fs.existsSync(issuesCandidate) && fs.existsSync(templatesCandidate)) {
+      issuesPath = issuesCandidate;
+      templatesPath = templatesCandidate;
+      break;
+    }
+  }
+
+  if (!issuesPath || !templatesPath) {
+    console.warn(`[mcp] Cache preload skipped: translation CSVs not found in any candidate data dir: ${dataDirCandidates.join(', ')}`);
     return;
   }
 
@@ -278,6 +297,9 @@ async function getExistingNotes({ book, chapter }) {
 
 function getTemplate({ issue_type }) {
   loadCache();
+  if (!cache.validIssues || !cache.templates) {
+    throw new Error('Template cache unavailable: translation CSV files were not found in known data directories.');
+  }
 
   const issueKey = issue_type.trim().toLowerCase();
 
@@ -413,7 +435,11 @@ function startMcpServer() {
 
   try {
     loadCache();
-    console.log(`[mcp] Loaded ${cache.validIssues.size} issue types, ${cache.templates.size} template entries`);
+    if (cache.validIssues && cache.templates) {
+      console.log(`[mcp] Loaded ${cache.validIssues.size} issue types, ${cache.templates.size} template entries`);
+    } else {
+      console.warn('[mcp] Cache not loaded at startup; will retry on first template request.');
+    }
   } catch (err) {
     console.warn(`[mcp] Cache preload failed (will retry on first request): ${err.message}`);
     cache.validIssues = null;
