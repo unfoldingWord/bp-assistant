@@ -6,6 +6,7 @@ const fs = require('fs');
 const path = require('path');
 const Anthropic = require('@anthropic-ai/sdk');
 const { resolveProviderModel } = require('../api-runner/provider-config');
+const { getAnthropicApiKey } = require('../anthropic-env');
 
 const CSKILLBP_DIR = process.env.CSKILLBP_DIR || '/srv/bot/workspace';
 
@@ -36,7 +37,7 @@ async function optimizeIssuesResolved() {
     }
   }
 
-  const apiKey = process.env.ANTHROPIC_API_KEY;
+  const apiKey = getAnthropicApiKey();
   if (!apiKey) {
     return 'Skipped: ANTHROPIC_API_KEY not set';
   }
