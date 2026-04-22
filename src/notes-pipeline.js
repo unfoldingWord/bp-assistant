@@ -603,7 +603,7 @@ async function runATGeneration({ notesPath, pipeDir, status }) {
         cwd: CSKILLBP_DIR,
         model: 'sonnet',
         maxTurns: 2,
-        timeoutMs: 60 * 1000,
+        timeoutMs: AT_GENERATION_TIMEOUT_MS,
         appendSystemPrompt: atSystemPrompt,
         tools: [],
         disallowedTools: ['Bash', 'Read', 'Write', 'Edit', 'Glob', 'Grep', 'Agent', 'Task', 'Skill'],
@@ -634,7 +634,7 @@ async function runATGeneration({ notesPath, pipeDir, status }) {
         cwd: CSKILLBP_DIR,
         model: 'haiku',
         maxTurns: 2,
-        timeoutMs: 30 * 1000,
+        timeoutMs: AT_VALIDATION_TIMEOUT_MS,
         appendSystemPrompt: validatorSystemPrompt,
         tools: [],
         disallowedTools: ['Bash', 'Read', 'Write', 'Edit', 'Glob', 'Grep', 'Agent', 'Task', 'Skill'],
@@ -661,7 +661,7 @@ async function runATGeneration({ notesPath, pipeDir, status }) {
         cwd: CSKILLBP_DIR,
         model: 'sonnet',
         maxTurns: 2,
-        timeoutMs: 60 * 1000,
+        timeoutMs: AT_RETRY_TIMEOUT_MS,
         appendSystemPrompt: atSystemPrompt,
         tools: [],
         disallowedTools: ['Bash', 'Read', 'Write', 'Edit', 'Glob', 'Grep', 'Agent', 'Task', 'Skill'],
@@ -1125,6 +1125,9 @@ function buildAtGenerationCheckpoint({
 // Default verse chunk size for parallel tn-writer batching
 const TN_WRITER_CHUNK_SIZE = 7;
 const TN_WRITER_PARALLEL_MIN_VERSES = Number((config.notesGuardrails || {}).tnWriterParallelMinVerses || 35);
+const AT_GENERATION_TIMEOUT_MS = 5 * 60 * 1000;
+const AT_VALIDATION_TIMEOUT_MS = 5 * 60 * 1000;
+const AT_RETRY_TIMEOUT_MS = 5 * 60 * 1000;
 const TN_WRITER_MAX_TURNS = Number((config.notesGuardrails || {}).tnWriterMaxTurns || 1000);
 const TN_WRITER_MAX_TOOL_CALLS = Number((config.notesGuardrails || {}).tnWriterMaxToolCalls || 1000);
 const RESCUE_MAX_PASSES = Number((config.notesGuardrails || {}).rescueMaxPasses || 1);
@@ -2776,4 +2779,9 @@ module.exports = {
   _hasPauseBeforeATsFlag: hasPauseBeforeATsFlag,
   _buildAtGenerationCheckpoint: buildAtGenerationCheckpoint,
   _classifyRunClaudeEmpty: classifyRunClaudeEmpty,
+  _AT_TIMEOUTS: {
+    generationMs: AT_GENERATION_TIMEOUT_MS,
+    validationMs: AT_VALIDATION_TIMEOUT_MS,
+    retryMs: AT_RETRY_TIMEOUT_MS,
+  },
 };
