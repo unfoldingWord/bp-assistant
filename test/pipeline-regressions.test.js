@@ -20,6 +20,7 @@ const {
   _runMechanicalQualityPrep,
   _analyzeIssuesTsvShape,
   _isMalformedIssuesShape,
+  _buildAtGenerationCheckpoint,
 } = require('../src/notes-pipeline');
 const { buildParallelismIntroHintArgs } = require('../src/issue-normalizer');
 
@@ -119,6 +120,23 @@ test('write notes defaults to running chapter intro unless explicitly disabled',
 
   const disabledParsed = parseWriteNotesCommand('write notes for isa 51 --no-intro');
   assert.equal(disabledParsed.withIntro, false);
+});
+
+test('write notes pause-before-ats flag is parsed and checkpoints resume at AT generation', () => {
+  const parsed = parseWriteNotesCommand('write notes for isa 41 --pause-before-ats');
+  assert.equal(parsed.pauseBeforeATs, true);
+
+  const checkpoint = _buildAtGenerationCheckpoint({
+    totalSuccess: 1,
+    totalFail: 0,
+    skillOutputs: { 41: { 'tn-writer': 'output/notes/ISA/ISA-041.tsv' } },
+    chapter: 41,
+  });
+
+  assert.equal(checkpoint.state, 'failed');
+  assert.equal(checkpoint.current.status, 'paused_before_at_generation');
+  assert.equal(checkpoint.current.skill, 'tn-quality-check');
+  assert.equal(checkpoint.resume.skill, 'tn-quality-check');
 });
 
 test('chapter intro is auto-skipped for Psalms', () => {

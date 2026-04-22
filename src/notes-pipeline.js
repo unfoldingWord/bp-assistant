@@ -111,6 +111,14 @@ function hasFreshFlag(content) {
   return /--fresh\b/i.test(String(content || '')) || /--new\b/i.test(String(content || ''));
 }
 
+function hasPauseBeforeATsFlag(content) {
+  const text = String(content || '');
+  return /--pause-before-ats\b/i.test(text)
+    || /--pause-ats\b/i.test(text)
+    || /\bpause[\s-]+before[\s-]+ats\b/i.test(text)
+    || /\bpause[\s-]+before[\s-]+alternate[\s-]+translations\b/i.test(text);
+}
+
 /**
  * Run all mechanical prep steps in Node.js before invoking tn-writer.
  * This replaces ~100 Claude MCP tool calls with direct function calls:
@@ -998,6 +1006,7 @@ function buildUsageLimitResetTag(errorText) {
 function parseWriteNotesCommand(content) {
   // Range: write notes PSA 66-72 or write notes for PSA 66-72
   const withIntro = !hasNoIntroFlag(content) || hasWithIntroFlag(content);
+  const pauseBeforeATs = hasPauseBeforeATsFlag(content);
 
   const rangeMatch = content.match(/write notes(?:\s+for)?\s+(\w+)\s+(\d+)\s*[-\u2013\u2014to]+\s*(\d+)/i);
   if (rangeMatch) {
@@ -1007,6 +1016,7 @@ function parseWriteNotesCommand(content) {
       endChapter: parseInt(rangeMatch[3], 10),
       withIntro,
       fresh: hasFreshFlag(content),
+      pauseBeforeATs,
     };
   }
 
@@ -1022,6 +1032,7 @@ function parseWriteNotesCommand(content) {
       verseEnd: parseInt(verseMatch[4], 10),
       withIntro,
       fresh: hasFreshFlag(content),
+      pauseBeforeATs,
     };
   }
 
@@ -1035,6 +1046,7 @@ function parseWriteNotesCommand(content) {
       endChapter: ch,
       withIntro,
       fresh: hasFreshFlag(content),
+      pauseBeforeATs,
     };
   }
 
@@ -1051,9 +1063,31 @@ function buildParsedNotesRequest(route, content) {
       verseEnd: route._verseEnd ?? null,
       withIntro: !hasNoIntroFlag(content) || hasWithIntroFlag(content),
       fresh: hasFreshFlag(content),
+      pauseBeforeATs: hasPauseBeforeATsFlag(content),
     };
   }
   return parseWriteNotesCommand(content);
+}
+
+function buildAtGenerationCheckpoint({
+  totalSuccess,
+  totalFail,
+  skillOutputs,
+  chapter,
+}) {
+  return {
+    state: 'failed',
+    totalSuccess,
+    totalFail,
+    skillOutputs,
+    current: {
+      chapter,
+      skill: 'tn-quality-check',
+      status: 'paused_before_at_generation',
+      errorKind: 'awaiting_at_generation',
+    },
+    resume: { chapter, skill: 'tn-quality-check' },
+  };
 }
 
 // Default verse chunk size for parallel tn-writer batching
@@ -1456,7 +1490,7 @@ async function notesPipeline(route, message) {
     return;
   }
 
-  const { book, startChapter, endChapter, verseStart, verseEnd, withIntro, fresh } = parsed;
+  const { book, startChapter, endChapter, verseStart, verseEnd, withIntro, fresh, pauseBeforeATs } = parsed;
   const sessionKey = stream ? `stream-${stream}-${topic}` : `dm-${message.sender_id}`;
   const debugRunId = `notes-${message.id || Date.now()}`;
   const checkpointRef = {
@@ -1830,6 +1864,17 @@ async function notesPipeline(route, message) {
 
       // --- AT generation: run between tn-writer and tn-quality-check ---
       if (skill.name === 'tn-quality-check' && !atGenerationDone && pipeDir) {
+        if (pauseBeforeATs && chapterCount === 1 && ch === resumeChapter && resumeSkill !== 'tn-quality-check') {
+          setCheckpoint(checkpointRef, buildAtGenerationCheckpoint({
+            totalSuccess,
+            totalFail,
+            skillOutputs,
+            chapter: ch,
+          }));
+          await status(`**${ref}**: Notes are written. Pausing before alternate translations so you can resume AT generation from Zulip.`);
+          await reply(`Notes for **${ref}** are written and saved. Say **resume** in this topic when you want me to generate the alternate translations.`);
+          return;
+        }
         try {
           const writerNotesPath = skills.find(s => s.name === 'tn-writer')?.resolvedOutput
             || skills.find(s => s.name === 'tn-writer')?.expectedOutput;
@@ -2654,4 +2699,6 @@ module.exports = {
   _isMalformedIssuesShape: isMalformedIssuesShape,
   _postProcessNotesTsv: postProcessNotesTsv,
   _runMechanicalQualityPrep: runMechanicalQualityPrep,
+  _hasPauseBeforeATsFlag: hasPauseBeforeATsFlag,
+  _buildAtGenerationCheckpoint: buildAtGenerationCheckpoint,
 };
