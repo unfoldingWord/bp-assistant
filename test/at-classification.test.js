@@ -1,7 +1,10 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 
-const { _classifyRunClaudeEmpty: classify } = require('../src/notes-pipeline');
+const {
+  _classifyRunClaudeEmpty: classify,
+  _AT_TIMEOUTS: atTimeouts,
+} = require('../src/notes-pipeline');
 
 test('classifyRunClaudeEmpty: local timeout outcome → timeout_<phase>', () => {
   const timeoutResult = {
@@ -44,4 +47,12 @@ test('classifyRunClaudeEmpty: timedOut=true on non-timeout subtype still classif
   // Defensive: if a caller sets timedOut without the canonical subtype.
   const weirdTimeout = { subtype: 'success', timedOut: true };
   assert.equal(classify(weirdTimeout, 'generate'), 'timeout_generate');
+});
+
+test('AT stage timeouts are extended to five minutes for generate, validate, and retry', () => {
+  assert.deepEqual(atTimeouts, {
+    generationMs: 5 * 60 * 1000,
+    validationMs: 5 * 60 * 1000,
+    retryMs: 5 * 60 * 1000,
+  });
 });
