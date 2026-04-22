@@ -532,7 +532,7 @@ async function runATGeneration({ notesPath, pipeDir, status }) {
   await status(`Generating **${atCtx.packets.length} alternate translations** via SDK...`);
   console.log(`[notes] AT generation: ${atCtx.packets.length} items`);
 
-  const CONCURRENCY = Math.max(1, parseInt(process.env.AT_CONCURRENCY, 10) || 4);
+  const CONCURRENCY = Math.max(1, parseInt(process.env.AT_CONCURRENCY, 10) || DEFAULT_AT_CONCURRENCY);
   console.log(`[notes] AT concurrency: ${CONCURRENCY}`);
   const results = {
     success: 0, failed: 0, validated: 0, retried: 0,
@@ -1128,6 +1128,7 @@ const TN_WRITER_PARALLEL_MIN_VERSES = Number((config.notesGuardrails || {}).tnWr
 const AT_GENERATION_TIMEOUT_MS = 5 * 60 * 1000;
 const AT_VALIDATION_TIMEOUT_MS = 5 * 60 * 1000;
 const AT_RETRY_TIMEOUT_MS = 5 * 60 * 1000;
+const DEFAULT_AT_CONCURRENCY = 2;
 const TN_WRITER_MAX_TURNS = Number((config.notesGuardrails || {}).tnWriterMaxTurns || 1000);
 const TN_WRITER_MAX_TOOL_CALLS = Number((config.notesGuardrails || {}).tnWriterMaxToolCalls || 1000);
 const RESCUE_MAX_PASSES = Number((config.notesGuardrails || {}).rescueMaxPasses || 1);
@@ -2784,4 +2785,5 @@ module.exports = {
     validationMs: AT_VALIDATION_TIMEOUT_MS,
     retryMs: AT_RETRY_TIMEOUT_MS,
   },
+  _DEFAULT_AT_CONCURRENCY: DEFAULT_AT_CONCURRENCY,
 };

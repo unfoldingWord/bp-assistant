@@ -4,6 +4,7 @@ const assert = require('node:assert/strict');
 const {
   _classifyRunClaudeEmpty: classify,
   _AT_TIMEOUTS: atTimeouts,
+  _DEFAULT_AT_CONCURRENCY: defaultAtConcurrency,
 } = require('../src/notes-pipeline');
 
 test('classifyRunClaudeEmpty: local timeout outcome → timeout_<phase>', () => {
@@ -55,4 +56,8 @@ test('AT stage timeouts are extended to five minutes for generate, validate, and
     validationMs: 5 * 60 * 1000,
     retryMs: 5 * 60 * 1000,
   });
+});
+
+test('AT generation defaults to lower concurrency to reduce rate-limit pressure', () => {
+  assert.equal(defaultAtConcurrency, 2);
 });
