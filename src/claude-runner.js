@@ -156,15 +156,26 @@ async function runClaudeOnce({
   let turnCount = 0;
   let lastTool = null;
   const queryStart = Date.now();
+  const queryDeadline = queryStart + timeout;
+  const queryId = Math.random().toString(36).slice(2, 8);
+  let localTimeoutFired = false;
   const toolErrorSigs = new Map();
   let consecutiveToolErrors = 0;
 
   const timer = setTimeout(() => {
-    const elapsed = Math.round((Date.now() - queryStart) / 1000);
-    console.warn(`[claude-runner] Timeout reached after ${elapsed}s — ${turnCount} tool calls, last tool: ${lastTool || 'none'} — aborting query`);
+    localTimeoutFired = true;
+    const elapsedMs = Date.now() - queryStart;
+    // driftMs = how late the timeout callback fired relative to the scheduled deadline.
+    // Positive = event loop was busy and couldn't service the timer on schedule.
+    const driftMs = elapsedMs - timeout;
+    console.warn(
+      `[claude-runner q=${queryId}] Timeout fired — ` +
+      `configured=${timeout}ms elapsed=${elapsedMs}ms drift=${driftMs}ms ` +
+      `turns=${turnCount} lastTool=${lastTool || 'none'} — aborting query`
+    );
     if (onProgress) {
       try {
-        const p = onProgress({ turnCount, lastTool, elapsedMs: Date.now() - queryStart, timedOut: true });
+        const p = onProgress({ queryId, turnCount, lastTool, elapsedMs, timedOut: true, configuredTimeoutMs: timeout, driftMs });
         if (p && typeof p.catch === 'function') p.catch(() => {});
       } catch (_) {}
     }
@@ -194,9 +205,9 @@ async function runClaudeOnce({
     mcpServers: { 'workspace-tools': wsTools },
   });
 
-  console.log(`[claude-runner] Starting query in ${cwd}`);
-  console.log(`[claude-runner] Prompt: ${fullPrompt.slice(0, 200)}`);
-  console.log(`[claude-runner] maxTurns: ${options.maxTurns}, timeout: ${timeout / 1000}s`);
+  console.log(`[claude-runner q=${queryId}] Starting query in ${cwd}`);
+  console.log(`[claude-runner q=${queryId}] Prompt: ${fullPrompt.slice(0, 200)}`);
+  console.log(`[claude-runner q=${queryId}] maxTurns: ${options.maxTurns}, timeout: ${timeout / 1000}s, deadline: ${new Date(queryDeadline).toISOString()}`);
 
   const conversation = query({ prompt: fullPrompt, options });
 
@@ -268,8 +279,14 @@ async function runClaudeOnce({
     }
   } catch (err) {
     if (err.name === 'AbortError' || abortController.signal.aborted) {
-      const elapsed = Math.round((Date.now() - queryStart) / 1000);
-      console.warn(`[claude-runner] Query aborted after ${elapsed}s — ${turnCount} tool calls, last tool: ${lastTool || 'none'}`);
+      const elapsedMs = Date.now() - queryStart;
+      const driftMs = elapsedMs - timeout;
+      console.warn(
+        `[claude-runner q=${queryId}] Query aborted — ` +
+        `elapsed=${elapsedMs}ms${localTimeoutFired ? ` drift=${driftMs}ms` : ''} ` +
+        `turns=${turnCount} lastTool=${lastTool || 'none'} ` +
+        `reason=${localTimeoutFired ? 'timeout_local_abort' : 'external_abort'}`
+      );
     } else {
       // Detect rate limit errors and calibrate the window budget
       const msg = (err.message || '').toLowerCase();
@@ -290,25 +307,55 @@ async function runClaudeOnce({
   }
 
   if (result) {
-    console.log(`[claude-runner] Finished — subtype: ${result.subtype}, turns: ${result.num_turns}, cost: $${result.total_cost_usd?.toFixed(4) || '?'}, duration: ${(result.duration_ms / 1000).toFixed(1)}s`);
+    console.log(`[claude-runner q=${queryId}] Finished — subtype: ${result.subtype}, turns: ${result.num_turns}, cost: $${result.total_cost_usd?.toFixed(4) || '?'}, duration: ${(result.duration_ms / 1000).toFixed(1)}s`);
     if (result.subtype !== 'success' && result.result) {
-      console.error(`[claude-runner] Result text: ${result.result.slice(0, 500)}`);
+      console.error(`[claude-runner q=${queryId}] Result text: ${result.result.slice(0, 500)}`);
     }
     // Detect rate limit in result subtype or error message
     const resultMsg = (result.subtype || '') + ' ' + (result.error || '');
     const isRateLimit = /rate.?limit|429|too.many.requests/i.test(resultMsg);
     if (isRateLimit) {
-      console.warn(`[claude-runner] Rate limit in result subtype -- calibrating window budget`);
+      console.warn(`[claude-runner q=${queryId}] Rate limit in result subtype -- calibrating window budget`);
       try {
         const room = await getHeadroom();
         recordRateLimit({ windowUsed: room.used, source: 'claude-runner-result' });
       } catch { /* non-fatal */ }
     }
-  } else {
-    console.warn(`[claude-runner] Query ended without a result message (timeout or abort)`);
+    return result;
   }
 
-  return result;
+  // No result message was produced. Distinguish local-timeout from other causes
+  // so callers can classify AT failures precisely instead of lumping everything
+  // into "empty response".
+  const elapsedMs = Date.now() - queryStart;
+  if (localTimeoutFired || abortController.signal.aborted) {
+    const driftMs = elapsedMs - timeout;
+    console.warn(
+      `[claude-runner q=${queryId}] Returning timeout outcome — ` +
+      `reason=timeout_local_abort elapsed=${elapsedMs}ms configured=${timeout}ms drift=${driftMs}ms`
+    );
+    return {
+      subtype: 'timeout',
+      timedOut: true,
+      reason: 'timeout_local_abort',
+      queryId,
+      elapsedMs,
+      configuredTimeoutMs: timeout,
+      driftMs,
+      turnCount,
+      lastTool,
+    };
+  }
+  console.warn(`[claude-runner q=${queryId}] Query ended without a result message (elapsed=${elapsedMs}ms) — reason=no_result_message`);
+  return {
+    subtype: 'no_result',
+    reason: 'no_result_message',
+    queryId,
+    elapsedMs,
+    configuredTimeoutMs: timeout,
+    turnCount,
+    lastTool,
+  };
 }
 
 function isUsageCapMessage(text) {

@@ -8,6 +8,7 @@ const fs = require('fs');
 const path = require('path');
 const https = require('https');
 const crypto = require('crypto');
+const { normalizeIntroRow } = require('../lib/insert-tn-rows');
 
 const CSKILLBP_DIR = process.env.CSKILLBP_DIR || '/srv/bot/workspace';
 
@@ -1215,10 +1216,30 @@ function assembleNotes({ preparedJson, generatedJson, output }) {
     const sref = item.sref ? `rc://*/ta/man/translate/${item.sref}` : '';
     rows.push({ ref: item.reference, id: item.id, tags: '', sref, quote, occurrence: quote ? '1' : '', note, _rk: refKey(item.reference), _ik: intraKey(item) });
   }
-  rows.sort((a, b) => { const r = a._rk[0] - b._rk[0] || a._rk[1] - b._rk[1]; return r !== 0 ? r : a._ik[0] - b._ik[0] || a._ik[1] - b._ik[1]; });
+  // Include intro rows in the sort pass so a well-formed Reference lands them
+  // at the top of the chapter (intro → vs=-2). prepareNotes already normalized
+  // intro_rows to the canonical 7-col shape.
+  const chapterFromPrepared = prepared.chapter ? parseInt(prepared.chapter, 10) : null;
+  const introIds = new Set();
+  const introRowObjs = [];
+  for (const rawIntro of (prepared.intro_rows || [])) {
+    const normalized = normalizeIntroRow(rawIntro.replace(/\r\n|\r|\n/g, '\\n'), {
+      chapter: chapterFromPrepared,
+      existingIds: introIds,
+    });
+    if (!normalized) continue;
+    const cols = normalized.split('\t');
+    introRowObjs.push({
+      ref: cols[0], id: cols[1], tags: cols[2] || '',
+      sref: cols[3] || '', quote: cols[4] || '',
+      occurrence: cols[5] || '', note: cols[6] || '',
+      _rk: refKey(cols[0]), _ik: [-1, 0],
+    });
+  }
+  const allRows = [...introRowObjs, ...rows];
+  allRows.sort((a, b) => { const r = a._rk[0] - b._rk[0] || a._rk[1] - b._rk[1]; return r !== 0 ? r : a._ik[0] - b._ik[0] || a._ik[1] - b._ik[1]; });
   const lines = ['Reference\tID\tTags\tSupportReference\tQuote\tOccurrence\tNote'];
-  for (const intro of (prepared.intro_rows || [])) lines.push(intro.replace(/\r\n|\r|\n/g, '\\n'));
-  for (const row of rows) lines.push(`${row.ref}\t${row.id}\t${row.tags}\t${row.sref}\t${row.quote}\t${row.occurrence}\t${row.note}`);
+  for (const row of allRows) lines.push(`${row.ref}\t${row.id}\t${row.tags}\t${row.sref}\t${row.quote}\t${row.occurrence}\t${row.note}`);
   fs.mkdirSync(path.dirname(outPath), { recursive: true });
   fs.writeFileSync(outPath, lines.join('\n') + '\n');
   const res = [`Assembled ${rows.length} notes to ${outPath}`];
@@ -1241,6 +1262,8 @@ function prepareNotes({ inputTsv, ultUsfm, ustUsfm, output, alignedUsfm, alignme
   // Detect format from first line, then map columns to canonical positions.
   const fnM0 = path.basename(inputPath).match(/([A-Z0-9]+)-(\d+)/i);
   const fileBook = fnM0 ? fnM0[1].toUpperCase() : '';
+  const fileChapter = fnM0 ? parseInt(fnM0[2], 10) : null;
+  const introIdSet = new Set();
 
   let colMap = null; // null = canonical positional mapping
   let skipFirstLine = false;
@@ -1318,7 +1341,14 @@ function prepareNotes({ inputTsv, ultUsfm, ustUsfm, output, alignedUsfm, alignme
     while (cols.length < 7) cols.push('');
 
     const row = extractRow(cols);
-    if (row.reference.includes(':intro') || row.reference === 'intro') { introRows.push(line); continue; }
+    if (row.reference.includes(':intro') || row.reference === 'intro') {
+      const normalized = normalizeIntroRow(line, {
+        chapter: fileChapter,
+        existingIds: introIdSet,
+      });
+      if (normalized) introRows.push(normalized);
+      continue;
+    }
     // Validate reference looks like chapter:verse
     if (!/^\d+:\d+/.test(row.reference)) continue;
 
