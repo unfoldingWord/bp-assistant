@@ -1560,10 +1560,40 @@ async function notesPipeline(route, message) {
 
     // --- Check prerequisites to decide branch ---
     const hasVerseRange = verseStart != null && startChapter === endChapter;
-    const { missing, resolved } = checkPrerequisites(book, ch,
-      hasVerseRange ? verseStart : undefined,
-      hasVerseRange ? verseEnd : undefined);
-    const hasAIArtifacts = missing.length === 0;
+
+    // Checkpoint-first: if resuming this chapter at a downstream skill and
+    // the cached issue-producer output still exists on disk, honor the
+    // checkpoint and skip the AI-artifact-driven restart. Prevents a full
+    // deep-issue-id re-run after a mid-pipeline crash (e.g. OOM) when the
+    // notes TSV was already produced.
+    const chOutputsForResume = skillOutputs[ch] || {};
+    const downstreamResumeSkills = new Set(['tn-writer', 'tn-quality-check', 'door43-push', 'door43-push-done']);
+    const isResumingThisChapter = !fresh && canResumeFromCheckpoint
+      && ch === resumeChapter && !!resumeSkill;
+    let resumeIssueProducer = null;
+    let resumeIssuesPath = null;
+    if (isResumingThisChapter && downstreamResumeSkills.has(resumeSkill)) {
+      for (const name of ['post-edit-review', 'deep-issue-id']) {
+        const cachedRel = chOutputsForResume[name];
+        if (cachedRel && fs.existsSync(path.resolve(CSKILLBP_DIR, cachedRel))) {
+          resumeIssueProducer = name;
+          resumeIssuesPath = cachedRel;
+          break;
+        }
+      }
+      if (resumeIssueProducer) {
+        await status(`**${ref}**: resuming from checkpoint at ${resumeSkill} (skipping AI artifact check; using cached ${resumeIssueProducer})`);
+      }
+    }
+
+    const { missing, resolved } = resumeIssueProducer
+      ? { missing: [], resolved: {} }
+      : checkPrerequisites(book, ch,
+          hasVerseRange ? verseStart : undefined,
+          hasVerseRange ? verseEnd : undefined);
+    const hasAIArtifacts = resumeIssueProducer
+      ? (resumeIssueProducer === 'post-edit-review')
+      : missing.length === 0;
 
     let issuesPath;
     let issuesBackupPath = null;
@@ -1602,7 +1632,19 @@ async function notesPipeline(route, message) {
     const skills = [];
     const issueProducerSkillNames = new Set(['deep-issue-id', 'post-edit-review']);
 
-    if (hasAIArtifacts) {
+    if (resumeIssueProducer) {
+      // Placeholder for cached issue-producer output — never invoked at
+      // runtime; the resume logic advances startSkillIndex past it and
+      // reattaches resolvedOutput from skillOutputs.
+      issuesPath = resumeIssuesPath;
+      skills.push({
+        name: resumeIssueProducer,
+        prompt: `${skillRef}${ctxFlag}`,
+        expectedOutput: resumeIssuesPath,
+        skipPreClean: true,
+        ops: 1,
+      });
+    } else if (hasAIArtifacts) {
       // AI artifacts found -> run mechanical diff gate before committing to post-edit-review
       issuesPath = resolved['issues TSV'];
 
