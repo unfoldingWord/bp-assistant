@@ -1,60 +1,40 @@
 'use strict';
 
-const Anthropic = require('@anthropic-ai/sdk');
+const fs = require('fs');
+const path = require('path');
 const { sendMessage, sendDM, addReaction, removeReaction } = require('./zulip-client');
 const { readSecret } = require('./secrets');
-const { resolveProviderModel } = require('./api-runner/provider-config');
+const { runClaude } = require('./claude-runner');
+const { CSKILLBP_DIR } = require('./pipeline-utils');
 
 const GITHUB_ORG = 'unfoldingWord';
 const VALID_REPOS = new Set(['bp-assistant', 'bp-assistant-skills']);
 const VALID_LABELS = new Set(['bug', 'enhancement', 'ai-quality', 'template-compliance']);
 const TRIGGER_RE = /^(?:report|feedback|issue|bug)[:\s]\s*([\s\S]+)/i;
-const CLASSIFIER_MAX_TOKENS = [2048, 8192];
+const CLASSIFIER_MAX_ATTEMPTS = 2;
+const ISSUE_REPORT_TIMEOUT_MS = 2 * 60 * 1000;
+const ISSUE_REPORT_SKILL_SOURCE = path.resolve(__dirname, '../resources/claude-skills/issue-report/SKILL.md');
+const ISSUE_REPORT_SKILL_DEST = path.resolve(CSKILLBP_DIR, '.claude/skills/issue-report/SKILL.md');
+const ISSUE_REPORT_APPEND_SYSTEM_PROMPT = [
+  'Return only a single JSON object.',
+  'Do not wrap the JSON in markdown fences.',
+  'Do not call tools.',
+  'Do not add explanation before or after the JSON.',
+].join(' ');
 
-const SYSTEM_PROMPT = `You are an issue classifier for a Bible translation AI pipeline with two GitHub repositories:
+function ensureIssueReportSkill() {
+  const source = fs.readFileSync(ISSUE_REPORT_SKILL_SOURCE, 'utf8');
+  let current = null;
 
-1. **bp-assistant** (app repo): The Zulip bot infrastructure — message routing, route config, pipeline dispatch, Docker setup, Zulip client, Door43/Gitea git push, usage tracking, session state, authentication, timeout logic. Choose this repo when the issue is about bot behavior, message handling, context packaging, tool/MCP exposure, preprocessing, post-processing, chunking, merging, or infrastructure.
+  try {
+    current = fs.readFileSync(ISSUE_REPORT_SKILL_DEST, 'utf8');
+  } catch (_) {}
 
-2. **bp-assistant-skills** (skills repo): AI behavior and prompts — translation note writing (tn-writer skill), quality checks (tn-quality-check), template compliance, AT (Alternate Translation) matching, note formatting, split snippets, issue identification, and TN-writing guidance. Choose this repo when the issue is about what the AI writes, how it formats notes, or how it follows skill instructions.
+  if (current === source) return;
 
-Analyze the report and respond with ONLY valid JSON (no prose, no markdown code fences) in this shape:
-{
-  "complaints": [
-    {
-      "id": "c1",
-      "summary": "one atomic complaint from the report",
-      "evidence": ["short direct quote or paraphrase from the report"],
-      "likely_layers": ["bp-assistant"] or ["bp-assistant-skills"] or ["bp-assistant", "bp-assistant-skills"]
-    }
-  ],
-  "ownership": {
-    "repositories": ["bp-assistant"] or ["bp-assistant-skills"] or ["bp-assistant", "bp-assistant-skills"],
-    "primary_repo": "bp-assistant" or "bp-assistant-skills",
-    "secondary_repo": "bp-assistant" or "bp-assistant-skills" or null,
-    "rationale": "short explanation of why these repo assignments fit"
-  },
-  "issues": [
-    {
-      "id": "i1",
-      "repo": "bp-assistant" or "bp-assistant-skills",
-      "complaint_ids": ["c1"],
-      "title": "concise issue title (under 72 chars)",
-      "body": "well-formatted GitHub issue body in markdown with sections: ## Summary, ## Steps to Reproduce (if applicable), ## Expected Behavior, ## Actual Behavior, ## Reporter",
-      "labels": ["bug"]
-    }
-  ]
+  fs.mkdirSync(path.dirname(ISSUE_REPORT_SKILL_DEST), { recursive: true });
+  fs.writeFileSync(ISSUE_REPORT_SKILL_DEST, source, 'utf8');
 }
-
-Rules:
-- First decompose the report into atomic complaints. Do not skip this step.
-- Complaints stay atomic, but issue creation stays repo-scoped: return at most one issue per repo.
-- When multiple complaints belong to the same repo, combine them into a single well-structured issue and include all relevant complaint_ids.
-- Every issue must reference one or more complaint_ids from the complaints array.
-- Use repository ownership based on root cause, not shallow keyword matching.
-- Open issues in both repos only when the report plausibly spans both layers.
-- Keep repo targets limited to bp-assistant and bp-assistant-skills.
-- When both repos are implicated, choose a primary_repo and secondary_repo.
-- Each repo listed in ownership.repositories must appear in exactly one issue.`;
 
 function stripLeadingMention(content) {
   return String(content || '').replace(/^@\*\*[^*]+\*\*\s*/, '').trim();
@@ -134,23 +114,36 @@ function shouldRetryClassifierJson(raw, stopReason) {
   return text.startsWith('{') && !text.endsWith('}');
 }
 
-async function classifyIssueReport(client, deps, classifierInput) {
+async function classifyIssueReport(deps, classifierInput) {
   let lastRaw = '';
   let lastStopReason = 'unknown';
 
-  for (let index = 0; index < CLASSIFIER_MAX_TOKENS.length; index++) {
-    const maxTokens = CLASSIFIER_MAX_TOKENS[index];
-    const response = await client.messages.create({
-      model: deps.resolveProviderModel('claude', 'sonnet'),
-      max_tokens: maxTokens,
-      system: SYSTEM_PROMPT,
-      messages: [{
-        role: 'user',
-        content: classifierInput,
-      }],
+  for (let attempt = 0; attempt < CLASSIFIER_MAX_ATTEMPTS; attempt++) {
+    const prompt = attempt === 0
+      ? classifierInput
+      : `${classifierInput}\n\nPrevious response was invalid or truncated. Return the full JSON object now.`;
+    const response = await deps.runClaude({
+      cwd: CSKILLBP_DIR,
+      skill: 'issue-report',
+      prompt,
+      model: 'sonnet',
+      maxTurns: 1,
+      timeoutMs: ISSUE_REPORT_TIMEOUT_MS,
+      appendSystemPrompt: ISSUE_REPORT_APPEND_SYSTEM_PROMPT,
+      allowedTools: [],
+      tools: [],
     });
 
-    const raw = response.content?.[0]?.text?.trim() || '';
+    if (!response) {
+      throw new Error('Empty response from classifier');
+    }
+
+    if (response.subtype !== 'success') {
+      const detail = response.error || response.result || `non-success subtype: ${response.subtype}`;
+      throw new Error(`Classifier failed: ${detail}`);
+    }
+
+    const raw = String(response.result || '').trim();
     const stopReason = response.stop_reason || 'unknown';
     lastRaw = raw;
     lastStopReason = stopReason;
@@ -162,11 +155,11 @@ async function classifyIssueReport(client, deps, classifierInput) {
     try {
       return parseClassifierOutput(raw);
     } catch (error) {
-      const canRetry = index < CLASSIFIER_MAX_TOKENS.length - 1
+      const canRetry = attempt < CLASSIFIER_MAX_ATTEMPTS - 1
         && error.message.startsWith('Classifier returned invalid JSON')
         && shouldRetryClassifierJson(raw, stopReason);
       if (!canRetry) throw error;
-      console.warn(`[issue-report] Retrying classifier after ${stopReason} with max_tokens=${CLASSIFIER_MAX_TOKENS[index + 1]}`);
+      console.warn(`[issue-report] Retrying classifier after ${stopReason} with SDK attempt ${attempt + 2}`);
     }
   }
 
@@ -409,13 +402,12 @@ function summarizeIssues(issues) {
 
 function getRuntimeDeps(overrides = {}) {
   return {
-    AnthropicClient: overrides.AnthropicClient || Anthropic,
     sendMessage: overrides.sendMessage || sendMessage,
     sendDM: overrides.sendDM || sendDM,
     addReaction: overrides.addReaction || addReaction,
     removeReaction: overrides.removeReaction || removeReaction,
     readSecret: overrides.readSecret || readSecret,
-    resolveProviderModel: overrides.resolveProviderModel || resolveProviderModel,
+    runClaude: overrides.runClaude || runClaude,
     fetchImpl: overrides.fetchImpl || fetch,
   };
 }
@@ -438,11 +430,8 @@ async function issueReportPipeline(route, message, overrides = {}) {
   try { await deps.addReaction(message.id, 'eyes'); } catch (_) {}
 
   try {
-    const apiKey = process.env.ANTHROPIC_API_KEY || deps.readSecret('anthropic_api_key', 'ANTHROPIC_API_KEY');
-    if (!apiKey) throw new Error('ANTHROPIC_API_KEY not configured');
-
-    const client = new deps.AnthropicClient({ apiKey });
-    const classified = await classifyIssueReport(client, deps, buildClassifierInput(message, feedbackText));
+    ensureIssueReportSkill();
+    const classified = await classifyIssueReport(deps, buildClassifierInput(message, feedbackText));
     const githubToken = deps.readSecret('github_token', 'GITHUB_TOKEN');
     if (!githubToken) throw new Error('github_token secret not configured');
 

@@ -22,37 +22,28 @@ function buildMessage(overrides = {}) {
   };
 }
 
-function buildClassifierResponse(payload) {
-  return {
-    content: [{ text: JSON.stringify(payload) }],
-  };
-}
-
 function wrapInJsonFence(text) {
   return `\`\`\`json\n${text}\n\`\`\``;
 }
 
-function createAnthropicStub(payload) {
-  return class AnthropicStub {
-    constructor() {
-      this.messages = {
-        create: async () => buildClassifierResponse(payload),
-      };
-    }
+function buildRunClaudeResult(payload, overrides = {}) {
+  return {
+    subtype: 'success',
+    stop_reason: 'end_turn',
+    result: JSON.stringify(payload),
+    ...overrides,
   };
 }
 
-function createRuntime({ classifierPayload, fetchImpl, sentReplies, classifierInputs }) {
+function createRuntime({ classifierPayload, fetchImpl, sentReplies, classifierInputs, runClaudeResults, runClaudeRequests }) {
+  const queued = Array.isArray(runClaudeResults) && runClaudeResults.length > 0
+    ? [...runClaudeResults]
+    : [buildRunClaudeResult(classifierPayload)];
   return {
-    AnthropicClient: class AnthropicStub {
-      constructor() {
-        this.messages = {
-          create: async (request) => {
-            classifierInputs.push(request.messages[0].content);
-            return buildClassifierResponse(classifierPayload);
-          },
-        };
-      }
+    runClaude: async (request) => {
+      if (Array.isArray(runClaudeRequests)) runClaudeRequests.push(request);
+      classifierInputs.push(request.prompt);
+      return queued.shift() || buildRunClaudeResult(classifierPayload);
     },
     sendMessage: async (stream, topic, text) => {
       sentReplies.push({ stream, topic, text });
@@ -63,28 +54,10 @@ function createRuntime({ classifierPayload, fetchImpl, sentReplies, classifierIn
     addReaction: async () => {},
     removeReaction: async () => {},
     readSecret: (name) => {
-      if (name === 'anthropic_api_key') return 'anthropic-test-key';
       if (name === 'github_token') return 'github-test-token';
       return null;
     },
-    resolveProviderModel: () => 'claude-sonnet-test',
     fetchImpl,
-  };
-}
-
-function createAnthropicSequenceStub(responses, classifierInputs) {
-  let index = 0;
-  return class AnthropicStub {
-    constructor() {
-      this.messages = {
-        create: async (request) => {
-          classifierInputs.push(request.messages[0].content);
-          const next = responses[Math.min(index, responses.length - 1)];
-          index += 1;
-          return next;
-        },
-      };
-    }
   };
 }
 
@@ -288,17 +261,16 @@ test('issueReportPipeline retries classifier when JSON is truncated at max_token
     }],
   });
   const runtime = {
-    ...createRuntime({ classifierPayload: payload, fetchImpl, sentReplies, classifierInputs }),
-    AnthropicClient: createAnthropicSequenceStub([
-      {
-        stop_reason: 'max_tokens',
-        content: [{ text: '{\n  "complaints": [\n    { "id": "c1", "summary": "Split snippets still happen"' }],
-      },
-      {
-        stop_reason: 'end_turn',
-        content: [{ text: JSON.stringify(payload) }],
-      },
-    ], classifierInputs),
+    ...createRuntime({
+      classifierPayload: payload,
+      fetchImpl,
+      sentReplies,
+      classifierInputs,
+      runClaudeResults: [
+        { subtype: 'success', stop_reason: 'max_tokens', result: '{\n  "complaints": [\n    { "id": "c1", "summary": "Split snippets still happen"' },
+        buildRunClaudeResult(payload),
+      ],
+    }),
   };
 
   await issueReportPipeline({}, buildMessage({
@@ -337,17 +309,16 @@ test('issueReportPipeline retries classifier when fenced JSON is truncated at ma
     }],
   });
   const runtime = {
-    ...createRuntime({ classifierPayload: payload, fetchImpl, sentReplies, classifierInputs }),
-    AnthropicClient: createAnthropicSequenceStub([
-      {
-        stop_reason: 'max_tokens',
-        content: [{ text: '```json\n{\n  "complaints": [\n    { "id": "c1", "summary": "Template choice is wrong",\n      "evidence"' }],
-      },
-      {
-        stop_reason: 'end_turn',
-        content: [{ text: wrapInJsonFence(JSON.stringify(payload)) }],
-      },
-    ], classifierInputs),
+    ...createRuntime({
+      classifierPayload: payload,
+      fetchImpl,
+      sentReplies,
+      classifierInputs,
+      runClaudeResults: [
+        { subtype: 'success', stop_reason: 'max_tokens', result: '```json\n{\n  "complaints": [\n    { "id": "c1", "summary": "Template choice is wrong",\n      "evidence"' },
+        buildRunClaudeResult(payload, { result: wrapInJsonFence(JSON.stringify(payload)) }),
+      ],
+    }),
   };
 
   await issueReportPipeline({}, buildMessage({
@@ -386,17 +357,16 @@ test('issueReportPipeline retries classifier when fenced JSON is truncated witho
     }],
   });
   const runtime = {
-    ...createRuntime({ classifierPayload: payload, fetchImpl, sentReplies, classifierInputs }),
-    AnthropicClient: createAnthropicSequenceStub([
-      {
-        stop_reason: 'end_turn',
-        content: [{ text: '```json\n{\n  "complaints": [\n    { "id": "c1", "summary": "Template choice is wrong",\n      "evidence"' }],
-      },
-      {
-        stop_reason: 'end_turn',
-        content: [{ text: wrapInJsonFence(JSON.stringify(payload)) }],
-      },
-    ], classifierInputs),
+    ...createRuntime({
+      classifierPayload: payload,
+      fetchImpl,
+      sentReplies,
+      classifierInputs,
+      runClaudeResults: [
+        { subtype: 'success', stop_reason: 'end_turn', result: '```json\n{\n  "complaints": [\n    { "id": "c1", "summary": "Template choice is wrong",\n      "evidence"' },
+        buildRunClaudeResult(payload, { result: wrapInJsonFence(JSON.stringify(payload)) }),
+      ],
+    }),
   };
 
   await issueReportPipeline({}, buildMessage({
@@ -410,6 +380,7 @@ test('issueReportPipeline retries classifier when fenced JSON is truncated witho
 
 test('issueReportPipeline files a single bp-assistant issue', async () => {
   const classifierInputs = [];
+  const runClaudeRequests = [];
   const sentReplies = [];
   const { fetchImpl, store } = createGithubFetchStub();
   const runtime = createRuntime({
@@ -438,6 +409,7 @@ test('issueReportPipeline files a single bp-assistant issue', async () => {
     fetchImpl,
     sentReplies,
     classifierInputs,
+    runClaudeRequests,
   });
 
   await issueReportPipeline({}, buildMessage({
@@ -449,6 +421,9 @@ test('issueReportPipeline files a single bp-assistant issue', async () => {
   assert.match(store.issues['bp-assistant'][0].body, /issue-report:4242:i1/);
   assert.match(sentReplies[0].text, /bp-assistant#1/);
   assert.match(classifierInputs[0], /The app passed the wrong context to Sonnet/);
+  assert.equal(runClaudeRequests[0].skill, 'issue-report');
+  assert.equal(runClaudeRequests[0].model, 'sonnet');
+  assert.deepEqual(runClaudeRequests[0].tools, []);
 });
 
 test('issueReportPipeline summary uses repo names from live GitHub-shaped responses', async () => {
@@ -610,13 +585,7 @@ test('issueReportPipeline reports invalid classifier JSON', async () => {
       sentReplies,
       classifierInputs: [],
     }),
-    AnthropicClient: class AnthropicStub {
-      constructor() {
-        this.messages = {
-          create: async () => ({ content: [{ text: '{not-json' }] }),
-        };
-      }
-    },
+    runClaude: async () => ({ subtype: 'success', stop_reason: 'end_turn', result: '{not-json' }),
   };
 
   await issueReportPipeline({}, buildMessage(), runtime);
@@ -797,17 +766,11 @@ test('issueReportPipeline avoids duplicate issue creation after partial dual-rep
     fetchImpl,
     sentReplies,
     classifierInputs,
+    runClaudeResults: [
+      buildRunClaudeResult(firstClassifierPayload),
+      buildRunClaudeResult(secondClassifierPayload),
+    ],
   });
-  runtime.AnthropicClient = createAnthropicSequenceStub([
-    {
-      stop_reason: 'end_turn',
-      content: [{ text: JSON.stringify(firstClassifierPayload) }],
-    },
-    {
-      stop_reason: 'end_turn',
-      content: [{ text: JSON.stringify(secondClassifierPayload) }],
-    },
-  ], classifierInputs);
 
   await issueReportPipeline({}, buildMessage({
     content: 'issue: Psalm 38 still flips between ellipses and split snippets.',
