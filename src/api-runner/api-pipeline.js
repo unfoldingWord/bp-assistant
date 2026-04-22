@@ -272,6 +272,7 @@ async function apiPipeline(route, message) {
         fillOrigQuotes({
           preparedJson: ctx.runtime.preparedNotes,
           alignmentJson: ctx.runtime.alignmentData,
+          masterUltUsfm: ctx.sources.ultAligned,
         });
         resolveGlQuotes({
           preparedJson: ctx.runtime.preparedNotes,

@@ -557,7 +557,11 @@ async function runProvider(opts) {
     observations.push(`preprocessing: ${prepCount} items`);
 
     if (hasAligned) {
-      fillOrigQuotes({ preparedJson: context.runtime.preparedNotes, alignmentJson: context.runtime.alignmentData });
+      fillOrigQuotes({
+        preparedJson: context.runtime.preparedNotes,
+        alignmentJson: context.runtime.alignmentData,
+        masterUltUsfm: context.sources.ultAligned,
+      });
       resolveGlQuotes({ preparedJson: context.runtime.preparedNotes, alignmentJson: context.runtime.alignmentData });
     }
     flagNarrowQuotes({ preparedJson: context.runtime.preparedNotes });

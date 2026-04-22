@@ -161,6 +161,7 @@ async function runMechanicalPrep({ issuesPath, pipeDir, status }) {
     const fillResult = fillOrigQuotes({
       preparedJson: ctx.runtime.preparedNotes,
       alignmentJson: ctx.runtime.alignmentData,
+      masterUltUsfm: ctx.sources.ultAligned,
     });
     fillSummary = fillResult.split('\n')[0];
   } else {

@@ -721,6 +721,224 @@ test('fillOrigQuotes narrows Psalm 40:12 quotes instead of overexpanding repeate
   assert.equal(prepared.items.find((item) => item.id === 'qng1').orig_quote, 'עָלַ֨⁠י & עַד & הִשִּׂיג֣וּ⁠נִי');
 });
 
+test('fillOrigQuotes resolves Fly ZEC 3 reordered and punctuation-bound quotes to Hebrew', () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tn-tools-zec3-fly-'));
+  const relRoot = path.join('tmp', path.basename(tempDir));
+  const absRoot = path.join('/srv/bot/workspace', relRoot);
+  fs.mkdirSync(absRoot, { recursive: true });
+
+  const prepRel = path.join(relRoot, 'prepared_notes.json');
+  const alignRel = path.join(relRoot, 'alignment.json');
+  const hebRel = path.join(relRoot, 'hebrew.usfm');
+
+  fs.writeFileSync(path.join('/srv/bot/workspace', prepRel), JSON.stringify({
+    book: 'ZEC',
+    items: [
+      { id: 'aaja', reference: '3:4', sref: 'writing-quotations', gl_quote: 'And he answered and said', issue_span_gl_quote: 'And he answered and said', orig_quote: '', explanation: '' },
+      { id: 'xbnr', reference: '3:7', sref: 'figs-metaphor', gl_quote: 'walk in my ways', issue_span_gl_quote: 'walk in my ways', orig_quote: '', explanation: '' },
+      { id: 'u4gr', reference: '3:7', sref: 'figs-idiom', gl_quote: 'keep my charge', issue_span_gl_quote: 'keep my charge', orig_quote: '', explanation: '' },
+      { id: 'oje0', reference: '3:7', sref: 'figs-metaphor', gl_quote: 'judge my house', issue_span_gl_quote: 'judge my house', orig_quote: '', explanation: '' },
+      { id: 'q56l', reference: '3:9', sref: 'figs-abstractnouns', gl_quote: 'the declaration of Yahweh of Armies', issue_span_gl_quote: 'the declaration of Yahweh of Armies', orig_quote: '', explanation: '' },
+      { id: 'gkzo', reference: '3:9', sref: 'writing-quotations', gl_quote: 'the declaration of Yahweh of Armies', issue_span_gl_quote: 'the declaration of Yahweh of Armies', orig_quote: '', explanation: '' },
+      { id: 'hjj2', reference: '3:10', sref: 'writing-quotations', gl_quote: 'the declaration of Yahweh of Armies', issue_span_gl_quote: 'the declaration of Yahweh of Armies', orig_quote: '', explanation: '' },
+    ],
+  }, null, 2));
+
+  fs.writeFileSync(path.join('/srv/bot/workspace', alignRel), JSON.stringify({
+    '3:4': [
+      { eng: 'And', heb: 'וַ⁠יַּ֣עַן' },
+      { eng: 'he', heb: 'וַ⁠יַּ֣עַן' },
+      { eng: 'answered', heb: 'וַ⁠יַּ֣עַן' },
+      { eng: 'and', heb: 'וַ⁠יֹּ֗אמֶר' },
+      { eng: 'said', heb: 'וַ⁠יֹּ֗אמֶר' },
+    ],
+    '3:7': [
+      { eng: '“Thus', heb: 'כֹּה' },
+      { eng: 'says', heb: 'אָמַ֞ר' },
+      { eng: 'Yahweh', heb: 'יְהוָ֣ה' },
+      { eng: 'of', heb: 'צְבָא֗וֹת' },
+      { eng: 'Armies', heb: 'צְבָא֗וֹת' },
+      { eng: '‘If', heb: 'אִם' },
+      { eng: 'you', heb: 'תֵּלֵךְ֙' },
+      { eng: 'will', heb: 'תֵּלֵךְ֙' },
+      { eng: 'walk', heb: 'תֵּלֵךְ֙' },
+      { eng: 'in', heb: 'בִּ⁠דְרָכַ֤⁠י' },
+      { eng: 'my', heb: 'בִּ⁠דְרָכַ֤⁠י' },
+      { eng: 'ways', heb: 'בִּ⁠דְרָכַ֤⁠י' },
+      { eng: 'and', heb: 'וְ⁠אִ֣ם' },
+      { eng: 'if', heb: 'וְ⁠אִ֣ם' },
+      { eng: 'you', heb: 'תִשְׁמֹ֔ר' },
+      { eng: 'will', heb: 'תִשְׁמֹ֔ר' },
+      { eng: 'keep', heb: 'תִשְׁמֹ֔ר' },
+      { eng: 'my', heb: 'מִשְׁמַרְתִּ֣⁠י' },
+      { eng: 'charge', heb: 'מִשְׁמַרְתִּ֣⁠י' },
+      { eng: 'then', heb: 'וְ⁠גַם' },
+      { eng: 'you', heb: 'אַתָּה֙' },
+      { eng: 'also', heb: 'וְ⁠גַם' },
+      { eng: 'will', heb: 'תָּדִ֣ין' },
+      { eng: 'judge', heb: 'תָּדִ֣ין' },
+      { eng: 'my', heb: 'בֵּיתִ֔⁠י' },
+      { eng: 'house', heb: 'בֵּיתִ֔⁠י' },
+    ],
+    '3:9': [
+      { eng: 'For', heb: 'כִּ֣י' },
+      { eng: 'behold', heb: 'הִנֵּ֣ה' },
+      { eng: 'the', heb: 'הָ⁠אֶ֗בֶן' },
+      { eng: 'stone', heb: 'הָ⁠אֶ֗בֶן' },
+      { eng: 'that', heb: 'אֲשֶׁ֤ר' },
+      { eng: 'I', heb: 'נָתַ֨תִּי֙' },
+      { eng: 'have', heb: 'נָתַ֨תִּי֙' },
+      { eng: 'set', heb: 'נָתַ֨תִּי֙' },
+      { eng: 'to', heb: 'לִ⁠פְנֵ֣י' },
+      { eng: 'the', heb: 'לִ⁠פְנֵ֣י' },
+      { eng: 'face', heb: 'לִ⁠פְנֵ֣י' },
+      { eng: 'of', heb: 'לִ⁠פְנֵ֣י' },
+      { eng: 'Joshua', heb: 'יְהוֹשֻׁ֔עַ' },
+      { eng: 'Behold', heb: 'הִנְ⁠נִ֧י' },
+      { eng: 'I', heb: 'מְפַתֵּ֣חַ' },
+      { eng: 'am', heb: 'מְפַתֵּ֣חַ' },
+      { eng: 'engraving', heb: 'מְפַתֵּ֣חַ' },
+      { eng: 'its', heb: 'פִּתֻּחָ֗⁠הּ' },
+      { eng: 'engraving—the', heb: 'פִּתֻּחָ֗⁠הּ' },
+      { eng: 'declaration', heb: 'נְאֻם֙' },
+      { eng: 'of', heb: 'נְאֻם֙' },
+      { eng: 'Yahweh', heb: 'יְהוָ֣ה' },
+      { eng: 'of', heb: 'צְבָא֔וֹת' },
+      { eng: 'Armies—and', heb: 'צְבָא֔וֹת' },
+    ],
+    '3:10': [
+      { eng: 'In', heb: 'בַּ⁠יּ֣וֹם' },
+      { eng: 'that', heb: 'הַ⁠ה֗וּא' },
+      { eng: 'day—the', heb: 'בַּ⁠יּ֣וֹם' },
+      { eng: 'declaration', heb: 'נְאֻם֙' },
+      { eng: 'of', heb: 'נְאֻם֙' },
+      { eng: 'Yahweh', heb: 'יְהוָ֣ה' },
+      { eng: 'of', heb: 'צְבָא֔וֹת' },
+      { eng: 'Armies—you', heb: 'צְבָא֔וֹת' },
+    ],
+  }, null, 2));
+
+  fs.writeFileSync(path.join('/srv/bot/workspace', hebRel), [
+    '\\id ZEC',
+    '\\c 3',
+    '\\v 4 \\w וַ⁠יַּ֣עַן|x\\w* \\w וַ⁠יֹּ֗אמֶר|x\\w*',
+    '\\v 7 \\w כֹּה|x\\w*־\\w אָמַ֞ר|x\\w* \\w יְהוָ֣ה|x\\w* \\w צְבָא֗וֹת|x\\w* \\w אִם|x\\w*־\\w בִּ⁠דְרָכַ֤⁠י|x\\w* \\w תֵּלֵךְ֙|x\\w* \\w וְ⁠אִ֣ם|x\\w* \\w מִשְׁמַרְתִּ֣⁠י|x\\w* \\w תִשְׁמֹ֔ר|x\\w* \\w וְ⁠גַם|x\\w*־\\w אַתָּה֙|x\\w* \\w תָּדִ֣ין|x\\w* \\w בֵּיתִ֔⁠י|x\\w*',
+    '\\v 9 \\w כִּ֣י|x\\w* \\w הִנֵּ֣ה|x\\w* \\w הָ⁠אֶ֗בֶן|x\\w* \\w אֲשֶׁ֤ר|x\\w* \\w נָתַ֨תִּי֙|x\\w* \\w לִ⁠פְנֵ֣י|x\\w* \\w יְהוֹשֻׁ֔עַ|x\\w* \\w הִנְ⁠נִ֧י|x\\w* \\w מְפַתֵּ֣חַ|x\\w* \\w פִּתֻּחָ֗⁠הּ|x\\w* \\w נְאֻם֙|x\\w* \\w יְהוָ֣ה|x\\w* \\w צְבָא֔וֹת|x\\w*',
+    '\\v 10 \\w בַּ⁠יּ֣וֹם|x\\w* \\w הַ⁠ה֗וּא|x\\w* \\w נְאֻם֙|x\\w* \\w יְהוָ֣ה|x\\w* \\w צְבָא֔וֹת|x\\w*',
+    '',
+  ].join('\n'));
+
+  const summary = fillOrigQuotes({ preparedJson: prepRel, alignmentJson: alignRel, hebrewUsfm: hebRel });
+  const prepared = JSON.parse(fs.readFileSync(path.join('/srv/bot/workspace', prepRel), 'utf8'));
+
+  assert.match(summary, /Resolved: 7 of 7 items/);
+  assert.equal(prepared.items.find((item) => item.id === 'aaja').orig_quote, 'וַ⁠יַּ֣עַן וַ⁠יֹּ֗אמֶר');
+  assert.equal(prepared.items.find((item) => item.id === 'xbnr').orig_quote, 'בִּ⁠דְרָכַ֤⁠י תֵּלֵךְ֙');
+  assert.equal(prepared.items.find((item) => item.id === 'u4gr').orig_quote, 'מִשְׁמַרְתִּ֣⁠י תִשְׁמֹ֔ר');
+  assert.equal(prepared.items.find((item) => item.id === 'oje0').orig_quote, 'תָּדִ֣ין בֵּיתִ֔⁠י');
+  assert.equal(prepared.items.find((item) => item.id === 'q56l').orig_quote, 'נְאֻם֙ יְהוָ֣ה צְבָא֔וֹת');
+  assert.equal(prepared.items.find((item) => item.id === 'gkzo').orig_quote, 'נְאֻם֙ יְהוָ֣ה צְבָא֔וֹת');
+  assert.equal(prepared.items.find((item) => item.id === 'hjj2').orig_quote, 'נְאֻם֙ יְהוָ֣ה צְבָא֔וֹת');
+});
+
+test('fillOrigQuotes falls back to alignment-derived Hebrew when exact-source extraction fails', () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tn-tools-zec3-fallback-'));
+  const relRoot = path.join('tmp', path.basename(tempDir));
+  const absRoot = path.join('/srv/bot/workspace', relRoot);
+  fs.mkdirSync(absRoot, { recursive: true });
+
+  const prepRel = path.join(relRoot, 'prepared_notes.json');
+  const alignRel = path.join(relRoot, 'alignment.json');
+  const hebRel = path.join(relRoot, 'hebrew.usfm');
+
+  fs.writeFileSync(path.join('/srv/bot/workspace', prepRel), JSON.stringify({
+    book: 'ZEC',
+    items: [
+      { id: 'fallback1', reference: '3:7', sref: 'figs-metaphor', gl_quote: 'walk in my ways', issue_span_gl_quote: 'walk in my ways', orig_quote: '', explanation: '' },
+    ],
+  }, null, 2));
+
+  fs.writeFileSync(path.join('/srv/bot/workspace', alignRel), JSON.stringify({
+    '3:7': [
+      { eng: 'walk', heb: 'תֵּלֵךְ֙' },
+      { eng: 'in', heb: 'בִּ⁠דְרָכַ֤⁠י' },
+      { eng: 'my', heb: 'בִּ⁠דְרָכַ֤⁠י' },
+      { eng: 'ways', heb: 'בִּ⁠דְרָכַ֤⁠י' },
+    ],
+  }, null, 2));
+
+  fs.writeFileSync(path.join('/srv/bot/workspace', hebRel), [
+    '\\id ZEC',
+    '\\c 3',
+    '\\v 7 \\w מילהאחרת|x\\w*',
+    '',
+  ].join('\n'));
+
+  const summary = fillOrigQuotes({ preparedJson: prepRel, alignmentJson: alignRel, hebrewUsfm: hebRel });
+  const prepared = JSON.parse(fs.readFileSync(path.join('/srv/bot/workspace', prepRel), 'utf8'));
+
+  assert.match(summary, /via alignment-derived Hebrew fallback/);
+  assert.equal(prepared.items[0].orig_quote, 'תֵּלֵךְ֙ בִּ⁠דְרָכַ֤⁠י');
+});
+
+test('fillOrigQuotes prefers master ULT alignment when primary alignment yields a suspicious discontinuous quote', () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tn-tools-zec3-master-'));
+  const relRoot = path.join('tmp', path.basename(tempDir));
+  const absRoot = path.join('/srv/bot/workspace', relRoot);
+  fs.mkdirSync(absRoot, { recursive: true });
+
+  const prepRel = path.join(relRoot, 'prepared_notes.json');
+  const alignRel = path.join(relRoot, 'alignment.json');
+  const hebRel = path.join(relRoot, 'hebrew.usfm');
+  const masterRel = path.join(relRoot, 'ult-aligned.usfm');
+
+  fs.writeFileSync(path.join('/srv/bot/workspace', prepRel), JSON.stringify({
+    book: 'ZEC',
+    items: [
+      { id: 'master1', reference: '3:10', sref: 'writing-quotations', gl_quote: 'the declaration of Yahweh of Armies', issue_span_gl_quote: 'the declaration of Yahweh of Armies', orig_quote: '', explanation: '' },
+    ],
+  }, null, 2));
+
+  fs.writeFileSync(path.join('/srv/bot/workspace', alignRel), JSON.stringify({
+    '3:10': [
+      { eng: 'day-the', heb: 'בַּ⁠יּ֣וֹם' },
+      { eng: 'declaration', heb: 'נְאֻם֙' },
+      { eng: 'of', heb: 'נְאֻם֙' },
+      { eng: 'Yahweh', heb: 'יְהוָ֣ה' },
+      { eng: 'of', heb: 'תִּקְרְא֖וּ' },
+      { eng: 'Armies-you', heb: 'תִּקְרְא֖וּ' },
+    ],
+  }, null, 2));
+
+  fs.writeFileSync(path.join('/srv/bot/workspace', hebRel), [
+    '\\id ZEC',
+    '\\c 3',
+    '\\v 10 \\w בַּ⁠יּ֣וֹם|x\\w* \\w הַ⁠ה֗וּא|x\\w* \\w נְאֻם֙|x\\w* \\w יְהוָ֣ה|x\\w* \\w צְבָא֔וֹת|x\\w* \\w תִּקְרְא֖וּ|x\\w*',
+    '',
+  ].join('\n'));
+
+  fs.writeFileSync(path.join('/srv/bot/workspace', masterRel), [
+    '\\id ZEC',
+    '\\c 3',
+    '\\v 10 In that day',
+    '\\zaln-s |x-content="נְאֻם֙"\\* \\w declaration|x\\w* \\zaln-e\\*',
+    '\\zaln-s |x-content="יְהוָ֣ה"\\* \\w Yahweh|x\\w* \\zaln-e\\*',
+    '\\zaln-s |x-content="צְבָא֔וֹת"\\* \\w Armies|x\\w* \\zaln-e\\*',
+    '',
+  ].join('\n'));
+
+  const summary = fillOrigQuotes({
+    preparedJson: prepRel,
+    alignmentJson: alignRel,
+    hebrewUsfm: hebRel,
+    masterUltUsfm: masterRel,
+  });
+  const prepared = JSON.parse(fs.readFileSync(path.join('/srv/bot/workspace', prepRel), 'utf8'));
+
+  assert.match(summary, /via master ULT/);
+  assert.equal(prepared.items[0].orig_quote, 'נְאֻם֙ יְהוָ֣ה צְבָא֔וֹת');
+});
+
 test('quote scope selector marks parallelism rows as full_parallelism', () => {
   const selection = _resolveQuoteScopeSelection({
     sref: 'figs-parallelism',

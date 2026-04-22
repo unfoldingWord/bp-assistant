@@ -83,16 +83,19 @@ function normalizeComparableQuoteText(value) {
     .trim();
 }
 
-function normalizeAlignmentEntryWord(text) {
-  return String(text || '').replace(ALIGNMENT_PUNC_RE, '').toLowerCase();
-}
-
 function tokenizeAlignmentQuote(segment) {
   return String(segment || '')
     .trim()
     .split(/\s+/)
-    .filter(Boolean)
-    .map(normalizeAlignmentEntryWord)
+    .flatMap((word) => tokenizeAlignmentEntryWords(word))
+    .filter(Boolean);
+}
+
+function tokenizeAlignmentEntryWords(text) {
+  return String(text || '')
+    .replace(ALIGNMENT_PUNC_RE, ' ')
+    .toLowerCase()
+    .split(/\s+/)
     .filter(Boolean);
 }
 
@@ -134,7 +137,7 @@ function findBestSequentialAlignmentMatch(entries, words, usedIndices = new Set(
     let best = null;
     for (let i = cursor; i < entries.length; i++) {
       if (usedIndices.has(i)) continue;
-      if (normalizeAlignmentEntryWord(entries[i].eng) !== words[wordIndex]) continue;
+      if (!tokenizeAlignmentEntryWords(entries[i].eng).includes(words[wordIndex])) continue;
       const tail = search(wordIndex + 1, i + 1);
       if (!tail) continue;
       best = compareAlignmentCandidates(best, [i, ...tail], words.slice(wordIndex));
@@ -153,6 +156,16 @@ function selectBestAlignmentSegmentMatch(entries, words, usedIndices = new Set()
   const variants = [];
   const seen = new Set();
   const fullIndices = findBestSequentialAlignmentMatch(entries, words, usedIndices);
+  const matchedWordHasEntryPrefixNoise = (entryIndex, word) => {
+    const tokens = tokenizeAlignmentEntryWords(entries[entryIndex]?.eng);
+    const tokenIndex = tokens.indexOf(word);
+    return tokenIndex > 0;
+  };
+  const matchedWordHasEntrySuffixNoise = (entryIndex, word) => {
+    const tokens = tokenizeAlignmentEntryWords(entries[entryIndex]?.eng);
+    const tokenIndex = tokens.indexOf(word);
+    return tokenIndex >= 0 && tokenIndex < tokens.length - 1;
+  };
   const pushVariant = (start, end) => {
     if (start > end) return;
     const trimmedWords = words.slice(start, end + 1);
@@ -170,12 +183,14 @@ function selectBestAlignmentSegmentMatch(entries, words, usedIndices = new Set()
   let maxWeakSuffix = 0;
   while (maxWeakSuffix < words.length && ALIGNMENT_WEAK_ANCHOR_WORDS.has(words[words.length - 1 - maxWeakSuffix])) maxWeakSuffix++;
 
-  const canTrimPrefix = !!(!preserveLeadingWeakAnchors && fullIndices && maxWeakPrefix > 0 && fullIndices.slice(0, maxWeakPrefix).some((_, index) => {
+  const canTrimPrefix = !!(!preserveLeadingWeakAnchors && fullIndices && maxWeakPrefix > 0 && fullIndices.slice(0, maxWeakPrefix).some((entryIndex, index) => {
+    if (matchedWordHasEntryPrefixNoise(entryIndex, words[index])) return true;
     if (index + 1 >= fullIndices.length) return false;
     return fullIndices[index + 1] - fullIndices[index] > 1;
   }));
-  const canTrimSuffix = !!(fullIndices && maxWeakSuffix > 0 && fullIndices.slice(fullIndices.length - maxWeakSuffix).some((_, index, suffix) => {
+  const canTrimSuffix = !!(fullIndices && maxWeakSuffix > 0 && fullIndices.slice(fullIndices.length - maxWeakSuffix).some((entryIndex, index) => {
     const absoluteIndex = fullIndices.length - maxWeakSuffix + index;
+    if (matchedWordHasEntrySuffixNoise(entryIndex, words[absoluteIndex])) return true;
     if (absoluteIndex <= 0) return false;
     return fullIndices[absoluteIndex] - fullIndices[absoluteIndex - 1] > 1;
   }));
@@ -249,6 +264,33 @@ function buildAlignedSpan(entries, start, length, normalizeHeb = (value) => valu
     previous = eng;
   }
   return normalizeWhitespace(words.join(' '));
+}
+
+function dedupeConsecutiveHebrewWords(hebWords, normalizeHeb = (value) => value) {
+  const deduped = [];
+  for (const heb of (hebWords || [])) {
+    if (!heb) continue;
+    if (!deduped.length || normalizeHeb(deduped[deduped.length - 1]) !== normalizeHeb(heb)) {
+      deduped.push(heb);
+    }
+  }
+  return deduped;
+}
+
+function normalizeHebrewGapForJoin(rawGap) {
+  return String(rawGap || '')
+    .replace(/[\s\u05BE\u05C3\u2060׀]/g, '')
+    .replace(/[\u0591-\u05BD\u05BF-\u05C7]/g, '');
+}
+
+function isHebrewConnectorGap(rawGap) {
+  const normalizedGap = normalizeHebrewGapForJoin(rawGap);
+  return !normalizedGap;
+}
+
+function isHebrewJoinableFunctionGap(rawGap) {
+  const normalizedGap = normalizeHebrewGapForJoin(rawGap);
+  return normalizedGap === 'את';
 }
 
 function findAlignedWindowCandidates(entries, hebWords, normalizeHeb = (value) => value) {
@@ -1794,6 +1836,70 @@ function fillOrigQuotes({ preparedJson, alignmentJson, hebrewUsfm, masterUltUsfm
     return raw.slice(rawStart, end);
   }
 
+  function findHebrewTokenLocations(rawVerse, strippedVerse, offsetMap, heb) {
+    const token = stripForSearch(heb);
+    if (!token) return [];
+
+    const normToken = token.normalize('NFKD');
+    const normStripped = strippedVerse.normalize('NFKD');
+    const normToStripped = [];
+    for (let si = 0, ni = 0; si < strippedVerse.length && ni < normStripped.length; si++) {
+      const normalizedChar = strippedVerse[si].normalize('NFKD');
+      for (let k = 0; k < normalizedChar.length && ni < normStripped.length; k++, ni++) {
+        normToStripped[ni] = si;
+      }
+    }
+
+    const locations = [];
+    let searchFrom = 0;
+    while (searchFrom < normStripped.length) {
+      const pos = normStripped.indexOf(normToken, searchFrom);
+      if (pos < 0) break;
+      const strippedStart = normToStripped[pos];
+      const strippedEnd = normToStripped[pos + normToken.length - 1];
+      if (strippedStart == null || strippedEnd == null) break;
+      locations.push({
+        start: strippedStart,
+        end: strippedEnd,
+        exact: rawSpan(rawVerse, offsetMap, strippedStart, strippedEnd, strippedVerse.length),
+      });
+      searchFrom = pos + normToken.length;
+    }
+    return locations;
+  }
+
+  function assembleHebrewQuoteFromLocations(rawVerse, strippedVerse, offsetMap, locations) {
+    if (!locations.length) return '';
+
+    const pieces = [];
+    let current = { start: locations[0].start, end: locations[0].end };
+
+    const flushCurrent = () => {
+      const piece = rawSpan(rawVerse, offsetMap, current.start, current.end, strippedVerse.length);
+      if (piece) pieces.push(piece);
+    };
+
+    for (let index = 1; index < locations.length; index++) {
+      const location = locations[index];
+      const directlyAdjacent = current.end + 1 >= location.start;
+      const rawGap = directlyAdjacent
+        ? ''
+        : rawSpan(rawVerse, offsetMap, current.end + 1, location.start - 1, strippedVerse.length);
+
+      if (directlyAdjacent || isHebrewConnectorGap(rawGap)) {
+        current.end = location.end;
+        continue;
+      }
+
+      flushCurrent();
+      pieces.push(isHebrewJoinableFunctionGap(rawGap) ? ' ' : ' & ');
+      current = { start: location.start, end: location.end };
+    }
+
+    flushCurrent();
+    return pieces.join('');
+  }
+
   function extractHebrewSpan(ref, hebWords) {
     const rawVerse = verseMap[ref];
     if (!rawVerse) return null;
@@ -1827,24 +1933,15 @@ function fillOrigQuotes({ preparedJson, alignmentJson, hebrewUsfm, masterUltUsfm
     if (!rawVerse || !hebWords.length) return null;
     const { text: strippedVerse, offsetMap } = buildStripped(rawVerse);
     const occurrencesByToken = new Map();
+    const targetWords = dedupeConsecutiveHebrewWords(hebWords, normalizeHeb);
 
     const recordOccurrences = (token) => {
       if (!token || occurrencesByToken.has(token)) return;
-      const locations = [];
-      let searchFrom = 0;
-      while (searchFrom < strippedVerse.length) {
-        const pos = strippedVerse.indexOf(token, searchFrom);
-        if (pos < 0) break;
-        const end = pos + token.length - 1;
-        const exact = rawSpan(rawVerse, offsetMap, pos, end, strippedVerse.length);
-        locations.push({ start: pos, end, exact });
-        searchFrom = pos + token.length;
-      }
-      occurrencesByToken.set(token, locations);
+      occurrencesByToken.set(token, findHebrewTokenLocations(rawVerse, strippedVerse, offsetMap, token));
     };
 
     const selected = [];
-    for (const heb of hebWords) {
+    for (const heb of targetWords) {
       const token = stripForSearch(heb);
       if (!token) continue;
       recordOccurrences(token);
@@ -1857,28 +1954,29 @@ function fillOrigQuotes({ preparedJson, alignmentJson, hebrewUsfm, masterUltUsfm
     if (!selected.length) return null;
     selected.sort((left, right) => left.start - right.start);
 
-    const groups = [];
-    for (const location of selected) {
-      const last = groups[groups.length - 1];
-      if (!last) {
-        groups.push({ start: location.start, end: location.end });
-        continue;
+    return assembleHebrewQuoteFromLocations(rawVerse, strippedVerse, offsetMap, selected);
+  }
+
+  function buildHebrewFallbackQuote(ref, hebWords) {
+    const rawVerse = verseMap[ref];
+    const targetWords = dedupeConsecutiveHebrewWords(hebWords, normalizeHeb);
+    if (!targetWords.length) return '';
+    if (!rawVerse) return targetWords.join(' ');
+
+    const { text: strippedVerse, offsetMap } = buildStripped(rawVerse);
+    const locations = [];
+    for (const heb of targetWords) {
+      const tokenLocations = findHebrewTokenLocations(rawVerse, strippedVerse, offsetMap, heb);
+      if (!tokenLocations.length) {
+        return targetWords.join(' ');
       }
-      const directlyAdjacent = last.end + 1 >= location.start;
-      const rawGap = directlyAdjacent
-        ? ''
-        : rawSpan(rawVerse, offsetMap, last.end + 1, location.start - 1, strippedVerse.length);
-      if (directlyAdjacent || /^[\s\u05BE\u05C3\u2060׀]*$/.test(rawGap)) {
-        last.end = location.end;
-      } else {
-        groups.push({ start: location.start, end: location.end });
-      }
+      locations.push(tokenLocations[0]);
     }
 
-    return groups
-      .map((group) => rawSpan(rawVerse, offsetMap, group.start, group.end, strippedVerse.length))
-      .filter(Boolean)
-      .join(' & ');
+    if (!locations.length) return targetWords.join(' ');
+    locations.sort((left, right) => left.start - right.start);
+
+    return assembleHebrewQuoteFromLocations(rawVerse, strippedVerse, offsetMap, locations) || targetWords.join(' ');
   }
 
   // Extract [heb:...] hint from explanation and try direct UHB match
@@ -1916,13 +2014,13 @@ function fillOrigQuotes({ preparedJson, alignmentJson, hebrewUsfm, masterUltUsfm
     const segments = cleanGlq.split(/\s*&\s*/);
 
     const usedIndices = new Set();
-    const allHeb = [];
+    const matches = [];
 
     function collectHebrew(indices) {
-      return indices
+      return dedupeConsecutiveHebrewWords(indices
         .map((idx) => entries[idx]?.heb)
         .filter(Boolean)
-        .filter((heb, index, arr) => index === 0 || normalizeHeb(arr[index - 1]) !== normalizeHeb(heb));
+      , normalizeHeb);
     }
 
     for (const seg of segments) {
@@ -1936,7 +2034,7 @@ function fillOrigQuotes({ preparedJson, alignmentJson, hebrewUsfm, masterUltUsfm
       const exactHeb = exactMatch ? collectHebrew(exactMatch.indices) : null;
       if (exactMatch && exactHeb.length) {
         for (const idx of exactMatch.indices) usedIndices.add(idx);
-        allHeb.push(...exactHeb);
+        matches.push({ segment: seg, indices: exactMatch.indices.slice(), hebWords: exactHeb, source: 'exact' });
         continue;
       }
 
@@ -1948,16 +2046,61 @@ function fillOrigQuotes({ preparedJson, alignmentJson, hebrewUsfm, masterUltUsfm
       const fallbackHeb = fallbackMatch ? collectHebrew(fallbackMatch.indices) : null;
       if (!fallbackMatch || !fallbackHeb.length) return null;
       for (const idx of fallbackMatch.indices) usedIndices.add(idx);
-      allHeb.push(...fallbackHeb);
+      matches.push({ segment: seg, indices: fallbackMatch.indices.slice(), hebWords: fallbackHeb, source: 'content_fallback' });
     }
 
-    return allHeb.length ? allHeb : null;
+    if (!matches.length) return null;
+    return {
+      matches,
+      hebWords: matches.flatMap((match) => match.hebWords),
+    };
   }
 
   function resolveAlignmentSpan(glQuote, entries, ref) {
-    const hebWords = resolveWithAlignment(glQuote, entries);
-    if (!hebWords || !hebWords.length) return null;
-    return extractHebrewQuote(ref, hebWords);
+    const alignment = resolveWithAlignment(glQuote, entries);
+    if (!alignment || !alignment.hebWords.length) return null;
+    const exactSpan = extractHebrewQuote(ref, alignment.hebWords);
+    const fallbackQuote = buildHebrewFallbackQuote(ref, alignment.hebWords);
+    return {
+      exactSpan: exactSpan || '',
+      fallbackQuote: fallbackQuote || '',
+      matches: alignment.matches,
+      hebWords: alignment.hebWords,
+    };
+  }
+
+  function resolutionOutput(resolution) {
+    if (!resolution) return '';
+    return resolution.exactSpan || resolution.fallbackQuote || '';
+  }
+
+  function isSuspiciousContiguousResolution(glQuote, resolution) {
+    const cleanGlq = String(glQuote || '').replace(/\{[^}]*\}/g, '').trim();
+    if (!cleanGlq || cleanGlq.includes('&')) return false;
+    const output = resolutionOutput(resolution);
+    return output.includes(' & ');
+  }
+
+  function choosePreferredResolution(primary, master, glQuote) {
+    if (!master) return primary;
+    if (!primary) return master;
+
+    const primaryOutput = resolutionOutput(primary);
+    const masterOutput = resolutionOutput(master);
+    if (!masterOutput) return primary;
+    if (!primaryOutput) return master;
+
+    const primarySuspicious = isSuspiciousContiguousResolution(glQuote, primary);
+    const masterSuspicious = isSuspiciousContiguousResolution(glQuote, master);
+    if (primarySuspicious !== masterSuspicious) {
+      return masterSuspicious ? primary : master;
+    }
+
+    if (!!primary.exactSpan !== !!master.exactSpan) {
+      return master.exactSpan ? master : primary;
+    }
+
+    return primary;
   }
 
   // --- Parse master ULT \zaln-s alignment markers into per-verse entries ---
@@ -2015,6 +2158,7 @@ function fillOrigQuotes({ preparedJson, alignmentJson, hebrewUsfm, masterUltUsfm
   let resolved = 0;
   let resolvedViaHint = 0;
   let resolvedViaMaster = 0;
+  let resolvedViaFallback = 0;
   const unresolved = [];
 
   for (const item of (data.items || [])) {
@@ -2042,41 +2186,55 @@ function fillOrigQuotes({ preparedJson, alignmentJson, hebrewUsfm, masterUltUsfm
     const entries = alignData[alignRef] || alignData[item.reference] || [];
 
     // Step 2: AI alignment + &-split + content-word fallback
-    let span = entries.length ? resolveAlignmentSpan(scopedGlQuote, entries, alignRef) : null;
+    const primaryResolution = entries.length ? resolveAlignmentSpan(scopedGlQuote, entries, alignRef) : null;
+    let resolution = primaryResolution;
+    let usedMasterResolution = false;
 
-    if (span) {
-      item.orig_quote = span;
-      resolved++;
-      continue;
-    }
-
-    // Step 3: Master ULT alignment fallback
+    // Step 3: Master ULT alignment fallback / tie-breaker
     if (!masterAlignData) {
       masterAlignData = loadMasterUltAlignments(bookCode, masterUltUsfm);
     }
     if (masterAlignData) {
       const masterEntries = masterAlignData[alignRef] || [];
-      if (masterEntries.length) {
-        span = resolveAlignmentSpan(scopedGlQuote, masterEntries, alignRef);
-        if (span) {
-          item.orig_quote = span;
-          resolved++;
-          resolvedViaMaster++;
-          continue;
+      if (masterEntries.length && (!resolutionOutput(primaryResolution) || isSuspiciousContiguousResolution(scopedGlQuote, primaryResolution))) {
+        const masterResolution = resolveAlignmentSpan(scopedGlQuote, masterEntries, alignRef);
+        const preferredResolution = choosePreferredResolution(primaryResolution, masterResolution, scopedGlQuote);
+        if (preferredResolution && preferredResolution !== primaryResolution) {
+          resolution = preferredResolution;
+          usedMasterResolution = true;
         }
       }
     }
 
+    if (resolution?.exactSpan) {
+      item.orig_quote = resolution.exactSpan;
+      resolved++;
+      if (usedMasterResolution) resolvedViaMaster++;
+      continue;
+    }
+    if (resolution?.fallbackQuote) {
+      item.orig_quote = resolution.fallbackQuote;
+      resolved++;
+      resolvedViaFallback++;
+      if (usedMasterResolution) resolvedViaMaster++;
+      continue;
+    }
+
     // Step 4: Unresolved
     const cleanGlq = scopedGlQuote.replace(/\{[^}]*\}/g, '').trim();
-    unresolved.push(`${item.id} ${alignRef}: "${cleanGlq.slice(0, 40)}" — no alignment match`);
+    if (resolution?.matches?.length) {
+      unresolved.push(`${item.id} ${alignRef}: "${cleanGlq.slice(0, 40)}" — alignment match found but no Hebrew quote could be assembled`);
+    } else {
+      unresolved.push(`${item.id} ${alignRef}: "${cleanGlq.slice(0, 40)}" — no alignment match`);
+    }
   }
 
   fs.writeFileSync(prepPath, JSON.stringify(data, null, 2));
 
   const hintNote = resolvedViaHint ? `, ${resolvedViaHint} via Hebrew hint` : '';
   const masterNote = resolvedViaMaster ? `, ${resolvedViaMaster} via master ULT` : '';
-  const lines = [`Resolved: ${resolved} of ${resolved + unresolved.length} items (${resolved - resolvedViaHint - resolvedViaMaster} via AI alignment${hintNote}${masterNote}). Unresolved: ${unresolved.length} items:`];
+  const fallbackNote = resolvedViaFallback ? `, ${resolvedViaFallback} via alignment-derived Hebrew fallback` : '';
+  const lines = [`Resolved: ${resolved} of ${resolved + unresolved.length} items (${resolved - resolvedViaHint - resolvedViaMaster} via AI alignment${hintNote}${masterNote}${fallbackNote}). Unresolved: ${unresolved.length} items:`];
   for (const u of unresolved) lines.push(`  ${u}`);
   return lines.join('\n');
 }
