@@ -502,6 +502,18 @@ async function runPerNoteGeneration({ pipeDir, outputPath, status, book }) {
  * @param {function} args.status - Status reporting function
  * @returns {Promise<string>} Summary of AT generation results
  */
+// Classify why a runClaude() call returned with no usable text.
+// Returns a reason code tagged with the phase (e.g. "generate", "validate", "retry")
+// so mass AT failure modes show up clearly in the run summary instead of all
+// collapsing into a single "empty response" bucket.
+function classifyRunClaudeEmpty(result, phase) {
+  if (!result) return `no_result_${phase}`;
+  if (result.timedOut || result.subtype === 'timeout') return `timeout_${phase}`;
+  if (result.subtype === 'no_result') return `no_result_${phase}`;
+  if (result.subtype === 'success') return `empty_text_after_success_${phase}`;
+  return `non_success_${phase}:${result.subtype || 'unknown'}`;
+}
+
 async function runATGeneration({ notesPath, pipeDir, status }) {
   const ctx = readContext(pipeDir);
 
@@ -520,8 +532,16 @@ async function runATGeneration({ notesPath, pipeDir, status }) {
   await status(`Generating **${atCtx.packets.length} alternate translations** via SDK...`);
   console.log(`[notes] AT generation: ${atCtx.packets.length} items`);
 
-  const CONCURRENCY = 10;
-  const results = { success: 0, failed: 0, validated: 0, retried: 0 };
+  const CONCURRENCY = Math.max(1, parseInt(process.env.AT_CONCURRENCY, 10) || 4);
+  console.log(`[notes] AT concurrency: ${CONCURRENCY}`);
+  const results = {
+    success: 0, failed: 0, validated: 0, retried: 0,
+    reasons: Object.create(null),
+  };
+  const bumpReason = (reason) => {
+    const key = reason || 'unknown';
+    results.reasons[key] = (results.reasons[key] || 0) + 1;
+  };
 
   // AT Writer system prompt
   const atSystemPrompt = [
@@ -574,6 +594,8 @@ async function runATGeneration({ notesPath, pipeDir, status }) {
       `QUOTE SCOPE MODE: ${packet.quote_scope_mode || 'focused_span'}`,
     ].filter(Boolean).join('\n');
 
+    const classifyEmpty = (result, phase) => classifyRunClaudeEmpty(result, phase);
+
     try {
       // Step 1: Generate AT with Sonnet via SDK
       const atResult = await runClaude({
@@ -591,7 +613,7 @@ async function runATGeneration({ notesPath, pipeDir, status }) {
       atText = atText.replace(/^\[|\]$/g, '').replace(/^Alternate translation:\s*/i, '').trim();
 
       if (!atText) {
-        return { id: packet.id, success: false, reason: 'empty response' };
+        return { id: packet.id, success: false, reason: classifyEmpty(atResult, 'generate') };
       }
 
       // Step 2: Programmatic substitution
@@ -648,14 +670,18 @@ async function runATGeneration({ notesPath, pipeDir, status }) {
       retryAt = retryAt.replace(/^\[|\]$/g, '').replace(/^Alternate translation:\s*/i, '').trim();
 
       if (!retryAt) {
-        return { id: packet.id, success: true, at: atText, validated: false, tag: 'at-fit' };
+        // First attempt's AT survives; tag for human review. Log retry failure reason
+        // so the summary still shows when retries are timing out under load.
+        const retryReason = classifyEmpty(retryResult, 'retry');
+        console.warn(`[notes] AT retry produced no text for ${packet.id}: ${retryReason} — keeping first attempt`);
+        return { id: packet.id, success: true, at: atText, validated: false, tag: 'at-fit', retryReason };
       }
 
       // Accept retry without re-validating (tag for human review if first was rejected)
       return { id: packet.id, success: true, at: retryAt, validated: false, tag: 'at-fit' };
     } catch (err) {
       console.error(`[notes] AT generation failed for ${packet.id}: ${err.message}`);
-      return { id: packet.id, success: false, reason: err.message };
+      return { id: packet.id, success: false, reason: `error:${err.message}` };
     }
   }
 
@@ -689,12 +715,14 @@ async function runATGeneration({ notesPath, pipeDir, status }) {
     if (r.success && r.at) {
       results.success++;
       if (r.validated) results.validated++;
+      if (r.retryReason) bumpReason(r.retryReason);
       // Append AT to the note text
       const existingNote = generatedNotes[r.id] || '';
       generatedNotes[r.id] = `${existingNote} Alternate translation: [${r.at}]`;
       if (r.tag) tagsToApply.set(r.id, r.tag);
     } else {
       results.failed++;
+      bumpReason(r.reason);
       console.warn(`[notes] AT failed for ${r.id}: ${r.reason || 'unknown'}`);
       // Leave note without AT — quality check will flag it
     }
@@ -741,7 +769,11 @@ async function runATGeneration({ notesPath, pipeDir, status }) {
     console.log(`[notes] Final post-processing after AT generation: ${postSummary}`);
   }
 
-  const summary = `${results.success}/${atCtx.packets.length} ATs generated (${results.validated} validated, ${results.retried} retried, ${results.failed} failed)`;
+  const reasonEntries = Object.entries(results.reasons)
+    .sort((a, b) => b[1] - a[1])
+    .map(([k, v]) => `${k}: ${v}`);
+  const reasonBreakdown = reasonEntries.length ? ` [reasons — ${reasonEntries.join(', ')}]` : '';
+  const summary = `${results.success}/${atCtx.packets.length} ATs generated (${results.validated} validated, ${results.retried} retried, ${results.failed} failed)${reasonBreakdown}`;
   console.log(`[notes] AT generation complete: ${summary}`);
   return summary;
 }
@@ -1594,10 +1626,40 @@ async function notesPipeline(route, message) {
 
     // --- Check prerequisites to decide branch ---
     const hasVerseRange = verseStart != null && startChapter === endChapter;
-    const { missing, resolved } = checkPrerequisites(book, ch,
-      hasVerseRange ? verseStart : undefined,
-      hasVerseRange ? verseEnd : undefined);
-    const hasAIArtifacts = missing.length === 0;
+
+    // Checkpoint-first: if resuming this chapter at a downstream skill and
+    // the cached issue-producer output still exists on disk, honor the
+    // checkpoint and skip the AI-artifact-driven restart. Prevents a full
+    // deep-issue-id re-run after a mid-pipeline crash (e.g. OOM) when the
+    // notes TSV was already produced.
+    const chOutputsForResume = skillOutputs[ch] || {};
+    const downstreamResumeSkills = new Set(['tn-writer', 'tn-quality-check', 'door43-push', 'door43-push-done']);
+    const isResumingThisChapter = !fresh && canResumeFromCheckpoint
+      && ch === resumeChapter && !!resumeSkill;
+    let resumeIssueProducer = null;
+    let resumeIssuesPath = null;
+    if (isResumingThisChapter && downstreamResumeSkills.has(resumeSkill)) {
+      for (const name of ['post-edit-review', 'deep-issue-id']) {
+        const cachedRel = chOutputsForResume[name];
+        if (cachedRel && fs.existsSync(path.resolve(CSKILLBP_DIR, cachedRel))) {
+          resumeIssueProducer = name;
+          resumeIssuesPath = cachedRel;
+          break;
+        }
+      }
+      if (resumeIssueProducer) {
+        await status(`**${ref}**: resuming from checkpoint at ${resumeSkill} (skipping AI artifact check; using cached ${resumeIssueProducer})`);
+      }
+    }
+
+    const { missing, resolved } = resumeIssueProducer
+      ? { missing: [], resolved: {} }
+      : checkPrerequisites(book, ch,
+          hasVerseRange ? verseStart : undefined,
+          hasVerseRange ? verseEnd : undefined);
+    const hasAIArtifacts = resumeIssueProducer
+      ? (resumeIssueProducer === 'post-edit-review')
+      : missing.length === 0;
 
     let issuesPath;
     let issuesBackupPath = null;
@@ -1636,7 +1698,19 @@ async function notesPipeline(route, message) {
     const skills = [];
     const issueProducerSkillNames = new Set(['deep-issue-id', 'post-edit-review']);
 
-    if (hasAIArtifacts) {
+    if (resumeIssueProducer) {
+      // Placeholder for cached issue-producer output — never invoked at
+      // runtime; the resume logic advances startSkillIndex past it and
+      // reattaches resolvedOutput from skillOutputs.
+      issuesPath = resumeIssuesPath;
+      skills.push({
+        name: resumeIssueProducer,
+        prompt: `${skillRef}${ctxFlag}`,
+        expectedOutput: resumeIssuesPath,
+        skipPreClean: true,
+        ops: 1,
+      });
+    } else if (hasAIArtifacts) {
       // AI artifacts found -> run mechanical diff gate before committing to post-edit-review
       issuesPath = resolved['issues TSV'];
 
@@ -2701,4 +2775,5 @@ module.exports = {
   _runMechanicalQualityPrep: runMechanicalQualityPrep,
   _hasPauseBeforeATsFlag: hasPauseBeforeATsFlag,
   _buildAtGenerationCheckpoint: buildAtGenerationCheckpoint,
+  _classifyRunClaudeEmpty: classifyRunClaudeEmpty,
 };

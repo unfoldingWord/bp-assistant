@@ -19,7 +19,7 @@ kill_timeout = 30
   MODEL_PROVIDER_CONFIG_FILE = "/config/model-provider-config.json"
 
 [[vm]]
-  memory = "1gb"
+  memory = "2gb"
   cpu_kind = "shared"
   cpus = 1
 

@@ -24,6 +24,87 @@ function isIntroRef(ref) {
   return parts.length === 2 && parts[1] === 'intro';
 }
 
+// Canonical 7-col TN row: Reference\tID\tTags\tSupportReference\tQuote\tOccurrence\tNote
+const INTRO_ID_RE = /^[a-z][a-z0-9]{3}$/;
+const INTRO_REF_RE = /^(?:front|\d+):(?:intro|front)$/;
+
+function generateIntroId(existingIds) {
+  const letters = 'abcdefghijklmnopqrstuvwxyz';
+  const chars = 'abcdefghijklmnopqrstuvwxyz0123456789';
+  for (let attempt = 0; attempt < 100; attempt++) {
+    let id = letters[Math.floor(Math.random() * 26)];
+    for (let j = 0; j < 3; j++) id += chars[Math.floor(Math.random() * 36)];
+    if (!existingIds || !existingIds.has(id)) return id;
+  }
+  // Fallback: deterministic from timestamp
+  const ts = Date.now().toString(36);
+  return ('x' + ts.slice(-3)).slice(0, 4);
+}
+
+/**
+ * Normalize a raw TSV intro line into the canonical 7-column shape.
+ * Handles column drift (e.g. "intro" landing in the ID column) and
+ * non-canonical source formats (6-col issues TSV, missing SupportReference, etc.).
+ *
+ * @param {string} rawLine - Tab-separated row as read from a TSV
+ * @param {object} opts
+ * @param {number|string} opts.chapter - Chapter number (used for Reference fallback)
+ * @param {Set<string>} [opts.existingIds] - IDs already present in the chapter
+ * @param {(msg: string) => void} [opts.warn] - Optional warning logger
+ * @returns {string} Canonical 7-col line, or empty string if row is empty
+ */
+function normalizeIntroRow(rawLine, { chapter, existingIds, warn } = {}) {
+  if (!rawLine || !rawLine.trim()) return '';
+  const cols = rawLine.split('\t').map(c => (c == null ? '' : c));
+  const chapterStr = chapter != null ? String(chapter) : '';
+  const emitWarn = (msg) => { if (typeof warn === 'function') warn(msg); };
+
+  // Happy path: already canonical (7 cols, valid ref in col 0, valid id in col 1).
+  if (cols.length === 7 && INTRO_REF_RE.test(cols[0].trim()) && INTRO_ID_RE.test(cols[1].trim())) {
+    return cols.join('\t');
+  }
+
+  // 1) Find a reference cell matching chapter:intro / front:intro
+  let reference = '';
+  for (const c of cols) {
+    const s = (c || '').trim();
+    if (INTRO_REF_RE.test(s)) { reference = s; break; }
+  }
+  if (!reference) {
+    reference = chapterStr ? `${chapterStr}:intro` : 'front:intro';
+    emitWarn(`normalizeIntroRow: missing/invalid Reference, defaulted to "${reference}"`);
+  }
+
+  // 2) ID lives at column 1 in the canonical format. Only trust that position;
+  //    scanning other columns could misidentify a 4-char word in the note body
+  //    (e.g. "body", "also") as an ID.
+  let id = '';
+  const colOneId = (cols[1] || '').trim();
+  if (INTRO_ID_RE.test(colOneId)) {
+    id = colOneId;
+  } else {
+    id = generateIntroId(existingIds);
+    emitWarn(`normalizeIntroRow: invalid/missing ID at col 1 ("${colOneId}"), generated "${id}"`);
+  }
+  if (existingIds) existingIds.add(id);
+
+  // 3) Note body: last non-empty cell that is not the reference cell.
+  //    In both canonical tn and issue-TSV formats, the note/content is the
+  //    rightmost populated column.
+  let note = '';
+  for (let i = cols.length - 1; i >= 0; i--) {
+    const s = (cols[i] || '').trim();
+    if (!s) continue;
+    if (s === reference) continue;
+    if (s === colOneId && s !== id) continue;
+    note = cols[i];
+    break;
+  }
+
+  // Canonical: Reference, ID, Tags, SupportReference, Quote, Occurrence, Note
+  return [reference, id, '', '', '', '', note].join('\t');
+}
+
 function getTags(row) {
   const parts = row.split('\t');
   return parts.length > 2 ? parts[2] : '';
@@ -410,8 +491,33 @@ function doFullChapter(bookRows, sourceRows, chapter, skipIntro, ultVerses, log)
     log.push(`  Deduplicated ${dedupCount} source row(s) against KEEP notes`);
   }
 
+  // Defensive: normalize any intro rows to canonical 7-col shape before merge.
+  // Fixes column drift (e.g. id="intro") on preserved upstream rows and
+  // missing/blank Reference that would otherwise sort intros to the end.
+  const chapterIds = new Set();
+  for (const row of [...bookRows, ...sourceRows]) {
+    const cols = row.split('\t');
+    const id = (cols[1] || '').trim();
+    if (INTRO_ID_RE.test(id)) chapterIds.add(id);
+  }
+  const normalizeIntros = (rows) => rows.map(row => {
+    const cols = row.split('\t');
+    const ref = (cols[0] || '').trim();
+    const id = (cols[1] || '').trim();
+    // Only normalize intros, and only when they are not already canonical.
+    if (!isIntroRef(ref) && id !== 'intro') return row;
+    if (INTRO_REF_RE.test(ref) && INTRO_ID_RE.test(id) && cols.length === 7) return row;
+    return normalizeIntroRow(row, {
+      chapter,
+      existingIds: chapterIds,
+      warn: (msg) => log.push(`  WARNING: ${msg}`),
+    });
+  });
+  const normalizedPreserveIntro = normalizeIntros(preserveIntro);
+  const filteredSourceNormalized = normalizeIntros(filteredSource);
+
   // Build combined rows
-  const combined = [...preserveIntro, ...filteredSource, ...keepRows, ...preservedRows];
+  const combined = [...normalizedPreserveIntro, ...filteredSourceNormalized, ...keepRows, ...preservedRows];
 
   // Sort by reference with optional ULT ordering
   if (ultVerses && Object.keys(ultVerses).length) {
@@ -503,4 +609,4 @@ function insertTnRows({ bookFile, sourceFile, chapter, skipIntro = false, ultFil
   return log.join('\n');
 }
 
-module.exports = { insertTnRows };
+module.exports = { insertTnRows, normalizeIntroRow, INTRO_ID_RE, INTRO_REF_RE };
