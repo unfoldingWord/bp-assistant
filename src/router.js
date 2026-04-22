@@ -989,6 +989,9 @@ async function routeMessage(message) {
       let confirmText = activeRoute._contentTypes
         ? activeRoute.confirmMessage
         : buildConfirmMessage(activeRoute.confirmMessage, captures);
+      if (activeRoute.name === 'write-notes' && /--pause-before-ats\b/i.test(message.content)) {
+        confirmText += `\n\nPause mode enabled: I will stop after writing notes and wait for \`resume\` before alternate translations.`;
+      }
       if (activeRoute.name === 'generate-content') {
         confirmText = buildGenerateConfirmText(confirmText, message.content);
       }
@@ -1096,6 +1099,9 @@ async function routeMessage(message) {
               ? [intent.book, String(intent.startChapter)]
               : [intent.book, String(intent.startChapter), String(intent.endChapter)]);
           let confirmText = buildConfirmMessage(syntheticRoute.confirmMessage, captures);
+          if (syntheticRoute.name === 'write-notes' && /--pause-before-ats\b/i.test(message.content)) {
+            confirmText += `\n\nPause mode enabled: I will stop after writing notes and wait for \`resume\` before alternate translations.`;
+          }
           if (syntheticRoute.name === 'generate-content') {
             confirmText = buildGenerateConfirmText(confirmText, message.content);
           }
