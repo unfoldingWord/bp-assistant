@@ -75,6 +75,14 @@
       "operations": 1
     },
     {
+      "name": "write-tqs",
+      "match": "/write\\s+tqs?(?:\\s+for)?\\s+(\\w+)(?:\\s+(\\d+(?:\\s*[-–—]\\s*\\d+)?))?\\s*$/i",
+      "type": "tqs",
+      "reply": false,
+      "confirmMessage": "I'll write translation questions for **$1 $2**. Sound right? (yes/no)",
+      "operations": 1
+    },
+    {
       "name": "editor-review",
       "match": "/(\\w+)\\s+(\\d+(?:\\s*,\\s*\\d+)*(?:\\s*,?\\s*and\\s+\\d+)?).*?(?:review|compare)/i",
       "type": "interactive-dm",

@@ -6,6 +6,7 @@ const path = require('path');
 
 const HEBREW_DIR = process.env.HEBREW_DIR || '/srv/bot/workspace/data/hebrew_bible';
 const cache = new Map();
+const chapterCountCache = new Map();
 
 // Map 3-letter book codes to their Hebrew Bible filenames
 let fileIndex = null;
@@ -86,4 +87,30 @@ function getTotalVerses(book, chapters) {
   return chapters.reduce((sum, ch) => sum + getVerseCount(book, ch), 0);
 }
 
-module.exports = { getVerseCount, getTotalVerses };
+function getChapterCount(book) {
+  const { normalizeBookName } = require('./pipeline-utils');
+  book = normalizeBookName(book);
+
+  if (chapterCountCache.has(book)) return chapterCountCache.get(book);
+
+  const index = buildFileIndex();
+  const filePath = index[book];
+  if (!filePath) {
+    console.warn(`[verse-counts] Book "${book}" not found in file index, defaulting chapter count to 1`);
+    chapterCountCache.set(book, 1);
+    return 1;
+  }
+
+  try {
+    const content = fs.readFileSync(filePath, 'utf8');
+    const count = (content.match(/^\\c\s+\d+/gm) || []).length || 1;
+    chapterCountCache.set(book, count);
+    return count;
+  } catch (err) {
+    console.warn(`[verse-counts] Error reading ${filePath}: ${err.message}`);
+    chapterCountCache.set(book, 1);
+    return 1;
+  }
+}
+
+module.exports = { getVerseCount, getTotalVerses, getChapterCount };

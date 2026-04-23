@@ -58,6 +58,7 @@ const SYSTEM_PROMPT = `You classify Zulip messages about Bible translation work.
 Extract the intent and parameters as JSON. Valid intents:
 - "generate": user wants ULT and/or UST generated for chapters
 - "notes": user wants translation notes produced for chapters
+- "tqs": user wants translation questions written for a chapter, chapter range, or whole book
 - "editor-review": user wants to review/compare editor changes against AI output (ULT/UST ONLY — never for translation notes/TN)
 - "editor-note": user wants to file an observation or note about a book/passage for future reference
 - "unknown": doesn't match any pattern
@@ -66,7 +67,8 @@ If the user asks to review or compare translation notes (TN), classify as "unkno
 
 Always extract book as a 3-letter code (PSA for Psalms, GEN for Genesis, EXO for Exodus, JER for Jeremiah, etc.) and chapter range.
 If only one chapter is mentioned, startChapter and endChapter should be the same.
-If you can't determine the book or chapters, use intent "unknown".
+For "tqs" only, a whole-book request may omit startChapter/endChapter if the book is clear.
+If you can't determine the book, use intent "unknown".
 
 For editor-review, also extract contentTypes: ["ult"] if user mentions only ULT, ["ust"] if only UST, ["ult","ust"] if both or neither specified.
 
@@ -149,7 +151,7 @@ async function classifyIntent(messageContent) {
 
   try {
     const parsed = JSON.parse(text);
-    if (!parsed.intent || !['generate', 'notes', 'editor-review', 'editor-note', 'unknown'].includes(parsed.intent)) {
+    if (!parsed.intent || !['generate', 'notes', 'tqs', 'editor-review', 'editor-note', 'unknown'].includes(parsed.intent)) {
       return { intent: 'unknown', book: null, startChapter: null, endChapter: null, contentTypes: ['ult', 'ust'] };
     }
     const contentTypes = Array.isArray(parsed.contentTypes) && parsed.contentTypes.length > 0

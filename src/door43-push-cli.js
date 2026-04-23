@@ -14,7 +14,7 @@ function printUsage() {
   console.error(`Usage: node door43-push-cli.js [options]
 
 Required:
-  --type <tn|ult|ust>    Content type
+  --type <tn|tq|ult|ust> Content type
   --book <BOOK>          3-letter book code (e.g. PSA)
   --chapter <N>          Chapter number
   --username <name>      Door43 username

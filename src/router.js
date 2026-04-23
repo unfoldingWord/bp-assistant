@@ -2,7 +2,7 @@ const config = require('./config');
 const { runPipeline } = require('./pipeline-runner');
 const { sendMessage, sendDM, addReaction, removeReaction } = require('./zulip-client');
 const { getSession, clearSession, hasActiveStreamSession } = require('./session-store');
-const { getTotalVerses } = require('./verse-counts');
+const { getTotalVerses, getChapterCount } = require('./verse-counts');
 const { classifyIntent } = require('./intent-classifier');
 const { preflightCheck, estimateTokens } = require('./usage-tracker');
 const { getPendingMerge, clearPendingMerge, getAllPendingMerges } = require('./pending-merges');
@@ -148,6 +148,35 @@ function buildGenerateConfirmText(baseText, rawContent) {
     'generate the initial content (ULT & UST, issues draft)',
     'generate the ULT & UST files only'
   );
+}
+
+function buildWriteTqsConfirmText(route, captures) {
+  let book = null;
+  let startChapter = null;
+  let endChapter = null;
+  let wholeBook = false;
+
+  if (route && route._synthetic) {
+    book = route._book || null;
+    startChapter = route._startChapter ?? null;
+    endChapter = route._endChapter ?? startChapter;
+    wholeBook = !!route._wholeBook;
+  } else {
+    const parsed = getParsedRouteScope(route || { type: 'tqs' }, captures || []);
+    book = parsed.book;
+    startChapter = parsed.chapters.length ? Math.min(...parsed.chapters) : null;
+    endChapter = parsed.chapters.length ? Math.max(...parsed.chapters) : startChapter;
+    wholeBook = !!parsed.wholeBook;
+  }
+
+  const label = !book
+    ? 'that scope'
+    : wholeBook
+      ? book
+      : startChapter === endChapter
+        ? `${book} ${startChapter}`
+        : `${book} ${startChapter}-${endChapter}`;
+  return `I'll write translation questions for **${label}**. Sound right? (yes/no)`;
 }
 
 function normalizeScopeText(scopeText) {
@@ -317,13 +346,41 @@ function parseBookChapters(captures) {
   return { book, chapters: chapterNums.length ? chapterNums : [1], verseStart, verseEnd };
 }
 
+function getParsedRouteScope(route, captures) {
+  if (route && route._synthetic) {
+    const start = route._startChapter;
+    const end = route._endChapter ?? start;
+    const chapters = [];
+    if (Number.isFinite(start) && Number.isFinite(end)) {
+      for (let i = start; i <= end; i++) chapters.push(i);
+    }
+    return {
+      book: route._book || null,
+      chapters,
+      verseStart: route._verseStart ?? null,
+      verseEnd: route._verseEnd ?? null,
+      wholeBook: !!route._wholeBook,
+    };
+  }
+
+  const parsed = parseBookChapters(captures || []);
+  if (route?.type === 'tqs' && parsed.book && (!captures || !captures[1])) {
+    const end = getChapterCount(parsed.book);
+    const chapters = [];
+    for (let ch = 1; ch <= end; ch++) chapters.push(ch);
+    return { book: parsed.book, chapters, verseStart: null, verseEnd: null, wholeBook: true };
+  }
+
+  return { ...parsed, wholeBook: false };
+}
+
 /**
  * Calculate timeout based on actual verse counts.
  * timeout = totalVerses x operations x 5min/verse/op
  * route.operations: number of distinct operations (e.g., 3 for generate = ULT+UST+issues)
  */
 function calcTimeout(route, captures) {
-  const { book, chapters } = parseBookChapters(captures);
+  const { book, chapters } = getParsedRouteScope(route, captures);
   const ops = route.operations || 1;
   const totalVerses = book ? getTotalVerses(book, chapters) : chapters.length * 20;
   const total = totalVerses * ops * MS_PER_VERSE_OP;
@@ -338,20 +395,14 @@ function calcTimeout(route, captures) {
 function getPipelineType(route) {
   if (route.type === 'sdk') return 'generate';
   if (route.type === 'notes') return 'notes';
+  if (route.type === 'tqs') return 'tqs';
   return null;
 }
 
 function getResumeCheckpoint(route, sessionKey, captures) {
   const pipelineType = getPipelineType(route);
   if (!pipelineType) return null;
-  const parsed = route._synthetic
-    ? {
-        book: route._book,
-        chapters: [route._startChapter, route._endChapter].filter((n) => Number.isFinite(n)),
-        verseStart: route._verseStart ?? null,
-        verseEnd: route._verseEnd ?? null,
-      }
-    : parseBookChapters(captures || []);
+  const parsed = getParsedRouteScope(route, captures || []);
   if (!parsed.book || !parsed.chapters || parsed.chapters.length === 0) return null;
   const startChapter = Math.min(...parsed.chapters);
   const endChapter = Math.max(...parsed.chapters);
@@ -375,14 +426,7 @@ function getResumeCheckpoint(route, sessionKey, captures) {
 function getActiveCheckpoint(route, sessionKey, captures) {
   const pipelineType = getPipelineType(route);
   if (!pipelineType) return null;
-  const parsed = route._synthetic
-    ? {
-        book: route._book,
-        chapters: [route._startChapter, route._endChapter].filter((n) => Number.isFinite(n)),
-        verseStart: route._verseStart ?? null,
-        verseEnd: route._verseEnd ?? null,
-      }
-    : parseBookChapters(captures || []);
+  const parsed = getParsedRouteScope(route, captures || []);
   if (!parsed.book || !parsed.chapters || parsed.chapters.length === 0) return null;
   const startChapter = Math.min(...parsed.chapters);
   const endChapter = Math.max(...parsed.chapters);
@@ -528,6 +572,7 @@ function buildSyntheticRoute(intent, senderName) {
   const routeNameMap = {
     'generate': 'generate-content',
     'notes': 'write-notes',
+    'tqs': 'write-tqs',
     'editor-review': 'editor-review',
   };
   const targetName = routeNameMap[intent.intent];
@@ -559,6 +604,33 @@ function buildSyntheticRoute(intent, senderName) {
     };
   }
 
+  if (intent.intent === 'tqs') {
+    const wholeBook = !intent.scopeText && !Number.isFinite(intent.startChapter) && !Number.isFinite(intent.endChapter);
+    const wholeBookEnd = wholeBook ? getChapterCount(intent.book) : null;
+    const parsedScope = wholeBook
+      ? { scopeText: null, startChapter: 1, endChapter: wholeBookEnd, verseStart: null, verseEnd: null }
+      : parseIntentScope(intent.scopeText, intent.startChapter, intent.endChapter);
+
+    return {
+      ...baseRoute,
+      _synthetic: true,
+      _book: intent.book,
+      _startChapter: parsedScope.startChapter,
+      _endChapter: parsedScope.endChapter,
+      _scopeText: parsedScope.scopeText,
+      _verseStart: null,
+      _verseEnd: null,
+      _wholeBook: wholeBook,
+      confirmMessage: buildWriteTqsConfirmText({
+        _synthetic: true,
+        _book: intent.book,
+        _startChapter: parsedScope.startChapter,
+        _endChapter: parsedScope.endChapter,
+        _wholeBook: wholeBook,
+      }),
+    };
+  }
+
   return {
     ...baseRoute,
     _synthetic: true,
@@ -578,7 +650,7 @@ function buildSyntheticRoute(intent, senderName) {
  * Build a synthetic route from a paused checkpoint so the pipeline can resume.
  */
 function buildResumeRoute(checkpoint) {
-  const routeNameMap = { generate: 'generate-content', notes: 'write-notes' };
+  const routeNameMap = { generate: 'generate-content', notes: 'write-notes', tqs: 'write-tqs' };
   const targetName = routeNameMap[checkpoint.pipelineType];
   const baseRoute = targetName ? config.routes.find(r => r.name === targetName) : null;
   if (!baseRoute) return null;
@@ -598,8 +670,11 @@ function buildResumeRoute(checkpoint) {
     _endChapter: scope.endChapter,
     _verseStart: scope.verseStart || null,
     _verseEnd: scope.verseEnd || null,
+    _wholeBook: scope.startChapter === 1 && scope.endChapter === getChapterCount(scope.book),
     _scopeText: rangeLabel.replace(/^\S+\s+/, ''), // chapter/verse part only
-    confirmMessage: `I'll resume ${checkpoint.pipelineType} for **${rangeLabel}**. Sound right? (yes/no)`,
+    confirmMessage: checkpoint.pipelineType === 'tqs'
+      ? `I'll resume translation questions for **${rangeLabel}**. Sound right? (yes/no)`
+      : `I'll resume ${checkpoint.pipelineType} for **${rangeLabel}**. Sound right? (yes/no)`,
   };
 }
 
@@ -610,7 +685,11 @@ function calcResumeTimeout(checkpoint) {
   const scope = checkpoint.scope;
   const chapters = [];
   for (let i = scope.startChapter; i <= scope.endChapter; i++) chapters.push(i);
-  const routeName = checkpoint.pipelineType === 'generate' ? 'generate-content' : 'write-notes';
+  const routeName = checkpoint.pipelineType === 'generate'
+    ? 'generate-content'
+    : checkpoint.pipelineType === 'tqs'
+      ? 'write-tqs'
+      : 'write-notes';
   const baseRoute = config.routes.find(r => r.name === routeName);
   const ops = baseRoute?.operations || 1;
   const totalVerses = getTotalVerses(scope.book, chapters);
@@ -622,22 +701,15 @@ function calcResumeTimeout(checkpoint) {
  * Returns an array of keys, or null for route types that don't need conflict detection.
  */
 function getPipelineKeys(route, message) {
-  if (route.type !== 'sdk' && route.type !== 'notes') return null;
+  if (route.type !== 'sdk' && route.type !== 'notes' && route.type !== 'tqs') return null;
 
   let book, chapters;
 
-  if (route._synthetic) {
-    book = route._book;
-    const start = route._startChapter;
-    const end = route._endChapter;
-    chapters = [];
-    for (let i = start; i <= end; i++) chapters.push(i);
-  } else {
-    const { captures } = matchRoute(message.content);
-    const parsed = parseBookChapters(captures);
-    book = parsed.book;
-    chapters = parsed.chapters;
-  }
+  const parsed = route._synthetic
+    ? getParsedRouteScope(route, [])
+    : getParsedRouteScope(route, matchRoute(message.content).captures);
+  book = parsed.book;
+  chapters = parsed.chapters;
 
   if (!book || !chapters.length) return null;
   return chapters.map(ch => `${route.name}-${book}-${ch}`);
@@ -652,7 +724,7 @@ function firePipeline(route, message) {
   let activeCp = null;
 
   // Guard against duplicate retriggers for the same scope while resume/work is in progress.
-  if (route.type === 'sdk' || route.type === 'notes') {
+  if (route.type === 'sdk' || route.type === 'notes' || route.type === 'tqs') {
     const captures = route._synthetic ? [] : matchRoute(message.content).captures;
     const sessionKey = message.type === 'stream'
       ? `stream-${message.display_recipient}-${message.subject}`
@@ -717,6 +789,8 @@ function firePipeline(route, message) {
 const HELP_TEXT = `I can help with:\n` +
   `- **generate PSA 79** -- run the initial pipeline for a chapter\n` +
   `- **write notes for PSA 82** -- generate translation notes\n` +
+  `- **write tqs for HAB** -- generate translation questions for a whole book\n` +
+  `- **write tqs for PSA 1-10** -- generate translation questions for a chapter range\n` +
   `- **PSA 82 review** -- review editor changes against AI output\n` +
   `  - add **ULT** or **UST** to review just one (default: both)\n` +
   `- **note HAB 3 lots of parallelism** -- file an observation for a book/chapter`;
@@ -986,9 +1060,11 @@ async function routeMessage(message) {
     // Stream messages get confirmation before running (if route has confirmMessage)
     if (isStream && activeRoute.confirmMessage) {
       // editor-review confirmMessage is already baked in; others need placeholder substitution
-      let confirmText = activeRoute._contentTypes
-        ? activeRoute.confirmMessage
-        : buildConfirmMessage(activeRoute.confirmMessage, captures);
+      let confirmText = activeRoute.name === 'write-tqs'
+        ? buildWriteTqsConfirmText(activeRoute, captures)
+        : activeRoute._contentTypes
+          ? activeRoute.confirmMessage
+          : buildConfirmMessage(activeRoute.confirmMessage, captures);
       if (activeRoute.name === 'write-notes' && /--pause-before-ats\b/i.test(message.content)) {
         confirmText += `\n\nPause mode enabled: I will stop after writing notes and wait for \`resume\` before alternate translations.`;
       }
@@ -1000,7 +1076,7 @@ async function routeMessage(message) {
       // Pre-flight usage check for generate/notes pipelines
       const pipelineType = getPipelineType(activeRoute);
       if (pipelineType) {
-        const { book: pfBook, chapters: pfChapters, verseStart: pfVS, verseEnd: pfVE } = parseBookChapters(captures);
+          const { book: pfBook, chapters: pfChapters, verseStart: pfVS, verseEnd: pfVE } = getParsedRouteScope(activeRoute, captures);
         if (pfBook && pfChapters.length) {
           const pfStart = Math.min(...pfChapters);
           const pfEnd = Math.max(...pfChapters);
@@ -1090,15 +1166,19 @@ async function routeMessage(message) {
             `@**${message.sender_full_name}** ${confirmText}`);
           haikuMatched = true;
         }
-      } else if (intent.intent !== 'unknown' && intent.book && intent.startChapter) {
+      } else if (intent.intent !== 'unknown' && intent.book && (intent.startChapter || intent.intent === 'tqs')) {
         const syntheticRoute = buildSyntheticRoute(intent, message.sender_full_name);
         if (syntheticRoute) {
           const captures = intent.scopeText
             ? [intent.book, intent.scopeText]
-            : (intent.startChapter === intent.endChapter
+            : (!intent.startChapter && intent.intent === 'tqs')
+              ? [intent.book]
+              : (intent.startChapter === intent.endChapter
               ? [intent.book, String(intent.startChapter)]
               : [intent.book, String(intent.startChapter), String(intent.endChapter)]);
-          let confirmText = buildConfirmMessage(syntheticRoute.confirmMessage, captures);
+          let confirmText = syntheticRoute.name === 'write-tqs'
+            ? buildWriteTqsConfirmText(syntheticRoute, captures)
+            : buildConfirmMessage(syntheticRoute.confirmMessage, captures);
           if (syntheticRoute.name === 'write-notes' && /--pause-before-ats\b/i.test(message.content)) {
             confirmText += `\n\nPause mode enabled: I will stop after writing notes and wait for \`resume\` before alternate translations.`;
           }
@@ -1111,8 +1191,8 @@ async function routeMessage(message) {
           const pipelineType = getPipelineType(syntheticRoute);
           if (pipelineType) {
             const preflight = await preflightCheck({
-              pipeline: pipelineType, book: intent.book,
-              startCh: intent.startChapter, endCh: intent.endChapter,
+              pipeline: pipelineType, book: syntheticRoute._book,
+              startCh: syntheticRoute._startChapter, endCh: syntheticRoute._endChapter,
             });
 
             if (preflight.decision === 'reject') {
@@ -1183,6 +1263,7 @@ module.exports = {
   hasActiveSession,
   extractContentTypes,
   buildGenerateConfirmText,
+  buildWriteTqsConfirmText,
   buildSyntheticRoute,
   parseIntentScope,
 };

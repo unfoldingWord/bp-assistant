@@ -117,6 +117,7 @@ const BOOTSTRAP_DEFAULTS = {
   'notes|tn-quality-check':           95000,   // 15 runs, median 94,570
   'notes|chapter-intro':             124000,   // 2 runs, median 123,795
   'notes|deep-issue-id':       36000,   // 1 run, 36,438
+  'tqs|tq-writer':                   150000,
   '*|repo-insert':                    47000,   // 23 runs, blended gen+notes median
 };
 
@@ -130,6 +131,7 @@ const TIME_BOOTSTRAP_DEFAULTS = {
   'notes|tn-quality-check':           30,   // was 23 pre-MCP
   'notes|chapter-intro':              35,   // was 25 pre-MCP
   'notes|deep-issue-id':              55,   // was 14 pre-MCP — biggest jump (Task polling overhead)
+  'tqs|tq-writer':                    45,
   '*|repo-insert':                    15,   // was 12 pre-MCP
 };
 
@@ -138,6 +140,7 @@ const TIME_BOOTSTRAP_DEFAULTS = {
 const SKILL_CHAINS = {
   generate: ['initial-pipeline', 'align-all-parallel', 'repo-insert'],
   notes: ['deep-issue-id', 'tn-writer', 'tn-quality-check', 'repo-insert'],
+  tqs: ['tq-writer', 'repo-insert'],
 };
 
 // ---------------------------------------------------------------------------

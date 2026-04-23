@@ -76,7 +76,7 @@ const ORG = 'unfoldingWord';
 
 const CSKILLBP_DIR = process.env.CSKILLBP_DIR || '/srv/bot/workspace';
 // Repo name for each content type
-const REPO_MAP = { tn: 'en_tn', ult: 'en_ult', ust: 'en_ust' };
+const REPO_MAP = { tn: 'en_tn', tq: 'en_tq', ult: 'en_ult', ust: 'en_ust' };
 
 // Book code → USFM file number prefix (e.g. PSA → 19)
 const BOOK_NUMBERS = {
@@ -478,6 +478,9 @@ function getRepoFilename(type, book) {
   if (type === 'tn') {
     return `tn_${bookUpper}.tsv`;
   }
+  if (type === 'tq') {
+    return `tq_${bookUpper}.tsv`;
+  }
   // ULT/UST use numbered USFM files like 19-PSA.usfm
   return `${num}-${bookUpper}.usfm`;
 }
@@ -583,11 +586,11 @@ function insertContent({ type, book, chapter, source, verses, repoDir, repoFilen
     throw new Error(`Book file not found: ${bookFilePath}`);
   }
 
-  if (type === 'tn') {
-    console.log(`${LOG_PREFIX} Inserting TN rows: ${source} → ${repoFilename}`);
+  if (type === 'tn' || type === 'tq') {
+    console.log(`${LOG_PREFIX} Inserting ${type.toUpperCase()} rows: ${source} → ${repoFilename}`);
     let ultFile;
     const bookNum = BOOK_NUMBERS[book.toUpperCase()];
-    if (bookNum) {
+    if (type === 'tn' && bookNum) {
       const candidate = path.join(CSKILLBP_DIR, 'data', 'published_ult_english',
                                   `${bookNum}-${book.toUpperCase()}.usfm`);
       if (fs.existsSync(candidate)) ultFile = candidate;
@@ -596,7 +599,7 @@ function insertContent({ type, book, chapter, source, verses, repoDir, repoFilen
       bookFile: bookFilePath,
       sourceFile: sourcePath,
       chapter,
-      skipIntro: book.toUpperCase() === 'PSA',
+      skipIntro: type === 'tn' && book.toUpperCase() === 'PSA',
       ultFile,
       backup: true,
     });
@@ -765,7 +768,7 @@ async function createAndMergePR(token, repo, branch, title, baseBranch = 'master
  * Push content to Door43 via direct git + API operations.
  *
  * @param {object} opts
- * @param {string} opts.type - 'tn', 'ult', or 'ust'
+ * @param {string} opts.type - 'tn', 'tq', 'ult', or 'ust'
  * @param {string} opts.book - 3-letter book code (e.g. 'PSA')
  * @param {number} opts.chapter - chapter number
  * @param {string} opts.username - Door43 username for PR title
@@ -778,7 +781,7 @@ async function door43Push(opts) {
   const { type, book, chapter, username, branch, source, verses, branchOnly } = opts;
   const repo = REPO_MAP[type];
   if (!repo) {
-    return { success: false, details: `Unknown type: ${type}. Expected tn, ult, or ust.` };
+    return { success: false, details: `Unknown type: ${type}. Expected tn, tq, ult, or ust.` };
   }
 
   const config = getConfig();

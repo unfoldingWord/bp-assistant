@@ -7,6 +7,10 @@ async function runPipeline(route, message) {
     console.log(`[pipeline] Running notes pipeline (route: ${route.name})`);
     const { notesPipeline } = require('./notes-pipeline');
     await notesPipeline(route, message);
+  } else if (route.type === 'tqs') {
+    console.log(`[pipeline] Running TQ pipeline (route: ${route.name})`);
+    const { tqsPipeline } = require('./tqs-pipeline');
+    await tqsPipeline(route, message);
   } else if (route.type === 'editor-note') {
     console.log(`[pipeline] Running editor-note pipeline (route: ${route.name})`);
     const { editorNotePipeline } = require('./note-pipeline');
