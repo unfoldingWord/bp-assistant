@@ -1248,6 +1248,207 @@ function assembleNotes({ preparedJson, generatedJson, output }) {
   return res.join('\n');
 }
 
+const HEBREW_QUOTE_STRIP_RE = /[\u0591-\u05AF\u2060\u05BD\u05C3]/g;
+
+function stripHebrewQuoteMarks(value) {
+  return String(value || '').replace(HEBREW_QUOTE_STRIP_RE, '');
+}
+
+function buildStrippedHebrewText(raw) {
+  const stripped = [];
+  const offsetMap = [];
+  for (let i = 0; i < raw.length; i++) {
+    const c = raw[i];
+    if (!HEBREW_QUOTE_STRIP_RE.test(c)) {
+      stripped.push(c);
+      offsetMap.push(i);
+    }
+    HEBREW_QUOTE_STRIP_RE.lastIndex = 0;
+  }
+  return { text: stripped.join(''), offsetMap };
+}
+
+function rawHebrewSpan(raw, offsetMap, rStart, rEnd, strippedLen) {
+  const rawStart = offsetMap[rStart];
+  const rawEndExcl = (rEnd + 1 < strippedLen) ? offsetMap[rEnd + 1] : raw.length;
+  let end = rawEndExcl;
+  while (end > rawStart && (raw[end - 1] === ' ' || raw[end - 1] === '\u05C3')) end--;
+  return raw.slice(rawStart, end);
+}
+
+function mapNormalizedIndexToStrippedIndex(strippedText) {
+  const normalized = strippedText.normalize('NFKD');
+  const normToStripped = [];
+  for (let si = 0, ni = 0; si < strippedText.length && ni < normalized.length; si++) {
+    const normalizedChar = strippedText[si].normalize('NFKD');
+    for (let k = 0; k < normalizedChar.length && ni < normalized.length; k++, ni++) {
+      normToStripped[ni] = si;
+    }
+  }
+  return { normalized, normToStripped };
+}
+
+function findCanonicalHebrewSegment(rawVerse, segment) {
+  const { text: strippedVerse, offsetMap } = buildStrippedHebrewText(rawVerse);
+  const strippedSegment = stripHebrewQuoteMarks(segment);
+  if (!strippedVerse || !strippedSegment) return null;
+
+  const { normalized: normVerse, normToStripped } = mapNormalizedIndexToStrippedIndex(strippedVerse);
+  const normSegment = strippedSegment.normalize('NFKD');
+  const pos = normVerse.indexOf(normSegment);
+  if (pos < 0) return null;
+
+  const strippedStart = normToStripped[pos];
+  const strippedEnd = normToStripped[pos + normSegment.length - 1];
+  if (strippedStart == null || strippedEnd == null) return null;
+
+  return rawHebrewSpan(rawVerse, offsetMap, strippedStart, strippedEnd, strippedVerse.length);
+}
+
+function extractCanonicalHebrewQuote(rawVerse, logicalQuote) {
+  if (!rawVerse || !logicalQuote) return null;
+  const segments = String(logicalQuote).split(/\s*&\s*/).map((segment) => segment.trim()).filter(Boolean);
+  if (!segments.length) return null;
+
+  const copiedSegments = [];
+  for (const segment of segments) {
+    const copied = findCanonicalHebrewSegment(rawVerse, segment);
+    if (!copied) return null;
+    copiedSegments.push(copied);
+  }
+
+  return copiedSegments.join(' & ');
+}
+
+function extractHebrewDisplayText(block) {
+  let text = String(block || '');
+  text = text.replace(/\r\n?/g, '\n');
+  text = text.replace(/^\\v\s+\d+[-\d]*\s*/m, '');
+  text = text.replace(/\\w\s+([^|\\]+?)\|[^\\]*?\\w\*/g, '$1');
+  text = text.replace(/\\zaln-[se]\s+\|[^\\]*?\\\*/g, '');
+  text = text.replace(/\\zaln-[se]\\\*/g, '');
+  text = text.replace(/\\k-s\s+\|[^\\]*?\\\*/g, '');
+  text = text.replace(/\\k-e\\\*/g, '');
+  text = text.replace(/\\f\s+\+[\s\S]*?\\f\*/g, '');
+  text = text.replace(/\\x\s+\+[\s\S]*?\\x\*/g, '');
+  text = text.replace(/\\[a-z0-9-]+\*?/gi, ' ');
+  text = text.replace(/\n+/g, ' ');
+  text = text.replace(/\s+/g, ' ').trim();
+  return text;
+}
+
+function parseHebrewVerseMapFromUsfm(hebrewContent) {
+  const verseMap = {};
+  let ch = 0;
+  let curVerse = null;
+  let curBlock = [];
+
+  function flushVerse() {
+    if (!curVerse || !curBlock.length) return;
+    verseMap[curVerse] = extractHebrewDisplayText(curBlock.join('\n'));
+  }
+
+  for (const line of String(hebrewContent || '').split('\n')) {
+    const trimmed = line.trim();
+    const cm = trimmed.match(/^\\c\s+(\d+)/);
+    if (cm) {
+      flushVerse();
+      ch = parseInt(cm[1], 10);
+      curVerse = null;
+      curBlock = [];
+      continue;
+    }
+    const vm = trimmed.match(/^\\v\s+(\d+[-\d]*)/);
+    if (vm) {
+      flushVerse();
+      curVerse = `${ch}:${vm[1].split('-')[0]}`;
+      curBlock = [trimmed];
+      continue;
+    }
+    if (curVerse) curBlock.push(trimmed);
+  }
+  flushVerse();
+  return verseMap;
+}
+
+function syncCanonicalHebrewQuotes({ tsvFile, preparedJson, hebrewUsfm, output, mismatchPolicy = 'tag' }) {
+  const tsvPath = path.resolve(CSKILLBP_DIR, tsvFile);
+  const tsvContent = fs.readFileSync(tsvPath, 'utf8');
+  const hebrewPath = path.resolve(CSKILLBP_DIR, hebrewUsfm);
+  const hebrewContent = fs.readFileSync(hebrewPath, 'utf8');
+  const verseMap = parseHebrewVerseMapFromUsfm(hebrewContent);
+
+  const preparedById = new Map();
+  if (preparedJson) {
+    const prepPath = path.resolve(CSKILLBP_DIR, preparedJson);
+    if (fs.existsSync(prepPath)) {
+      const prepared = JSON.parse(fs.readFileSync(prepPath, 'utf8'));
+      for (const item of (prepared.items || [])) {
+        if (item.id) preparedById.set(item.id, item);
+      }
+    }
+  }
+
+  const lines = tsvContent.split('\n');
+  const header = lines[0] || '';
+  const cols0 = header.split('\t');
+  const refIdx = cols0.indexOf('Reference');
+  const idIdx = cols0.indexOf('ID');
+  const tagsIdx = cols0.indexOf('Tags');
+  const quoteIdx = cols0.indexOf('Quote');
+  if (refIdx === -1 || idIdx === -1 || quoteIdx === -1) {
+    return 'ERROR: TSV missing Reference, ID, or Quote column';
+  }
+
+  let synced = 0;
+  let unresolved = 0;
+  const warnings = [];
+
+  for (let i = 1; i < lines.length; i++) {
+    if (!lines[i].trim()) continue;
+    const cols = lines[i].split('\t');
+    const ref = cols[refIdx] || '';
+    const id = cols[idIdx] || '';
+    const currentQuote = cols[quoteIdx] || '';
+    const prepItem = preparedById.get(id);
+    const logicalQuote = prepItem?.orig_quote || currentQuote;
+    if (!ref || !logicalQuote || !/[\u0590-\u05FF]/.test(logicalQuote)) continue;
+
+    const rawVerse = verseMap[ref];
+    const copied = rawVerse ? extractCanonicalHebrewQuote(rawVerse, logicalQuote) : null;
+    if (!copied) {
+      unresolved++;
+      warnings.push(`${ref}${id ? ` (${id})` : ''}`);
+      if (mismatchPolicy === 'tag' && tagsIdx >= 0) {
+        const existingTags = String(cols[tagsIdx] || '')
+          .split(',')
+          .map((tag) => tag.trim())
+          .filter(Boolean);
+        if (!existingTags.includes('ISSUE:MATCH_FAIL')) existingTags.push('ISSUE:MATCH_FAIL');
+        cols[tagsIdx] = existingTags.join(', ');
+        lines[i] = cols.join('\t');
+      }
+      continue;
+    }
+
+    if (copied !== currentQuote) {
+      cols[quoteIdx] = copied;
+      lines[i] = cols.join('\t');
+      synced++;
+    }
+  }
+
+  const outPath = output ? path.resolve(CSKILLBP_DIR, output) : tsvPath;
+  fs.mkdirSync(path.dirname(outPath), { recursive: true });
+  fs.writeFileSync(outPath, lines.join('\n'));
+
+  const result = [`Synced ${synced} canonical Hebrew quote${synced === 1 ? '' : 's'} in ${path.basename(tsvFile)}`];
+  if (unresolved) result.push(`Unresolved ${unresolved}`);
+  if (warnings.length) result.push(`Warnings:\n  ${warnings.slice(0, 10).join('\n  ')}`);
+  result.push(outPath);
+  return result.join('\n');
+}
+
 function prepareNotes({ inputTsv, ultUsfm, ustUsfm, output, alignedUsfm, alignmentJson }) {
   const inputPath = path.resolve(CSKILLBP_DIR, inputTsv);
   const content = fs.readFileSync(inputPath, 'utf8');
@@ -1515,190 +1716,25 @@ function prepareNotes({ inputTsv, ultUsfm, ustUsfm, output, alignedUsfm, alignme
  * Hebrew quote from the UHB source so the bytes match exactly.
  */
 function fixUnicodeQuotes({ tsvFile, hebrewUsfm, output }) {
-  // --- Resolve Hebrew USFM path ---
-  const tsvPath = path.resolve(CSKILLBP_DIR, tsvFile);
-  const tsvContent = fs.readFileSync(tsvPath, 'utf8');
   const bookMatch = path.basename(tsvFile).match(/([A-Z0-9]{3})/i);
   const bookCode = bookMatch ? bookMatch[1].toUpperCase() : '';
 
   let hebrewPath;
   if (hebrewUsfm) {
-    hebrewPath = path.resolve(CSKILLBP_DIR, hebrewUsfm);
+    hebrewPath = hebrewUsfm;
   } else {
     const dir = path.join(CSKILLBP_DIR, 'data/hebrew_bible');
     const files = fs.existsSync(dir) ? fs.readdirSync(dir).filter(f => f.toUpperCase().includes(bookCode) && f.endsWith('.usfm')) : [];
     if (!files.length) return `ERROR: No Hebrew USFM found for ${bookCode}`;
-    hebrewPath = path.join(dir, files[0]);
+    hebrewPath = path.relative(CSKILLBP_DIR, path.join(dir, files[0]));
   }
-  const hebrewContent = fs.readFileSync(hebrewPath, 'utf8');
-
-  // Marks to strip from source to build "reduced source" (matching what TN quotes contain)
-  const STRIP_RE = /[\u0591-\u05AF\u2060\u05BD\u05C3]/g;
-
-  // --- Build verse map from Hebrew USFM ---
-  // Verse text may span multiple lines: \v on its own line, \w tokens on following lines.
-  // Preserves inter-word connectors like maqqeph.
-  const verseMap = {};  // { "ch:vs": rawText }
-  let ch = 0, curVerse = null, curLines = [];
-
-  function extractVerseText(lines) {
-    const text = lines.join(' ');
-    const parts = [];
-    let lastEnd = 0;
-    const WRE = /\\w\s+([^|]+)\|[^\\]*?\\w\*/g;
-    let m;
-    while ((m = WRE.exec(text)) !== null) {
-      const between = text.slice(lastEnd, m.index);
-      if (parts.length && between.includes('\u05BE')) parts.push('\u05BE');
-      else if (parts.length) parts.push(' ');
-      parts.push(m[1].trim());
-      lastEnd = m.index + m[0].length;
-    }
-    return parts.join('');
-  }
-
-  for (const line of hebrewContent.split('\n')) {
-    const trimmed = line.trim();
-    const cm = trimmed.match(/^\\c\s+(\d+)/);
-    if (cm) {
-      if (curVerse && curLines.length) verseMap[curVerse] = extractVerseText(curLines);
-      ch = parseInt(cm[1], 10); curVerse = null; curLines = [];
-      continue;
-    }
-    const vm = trimmed.match(/^\\v\s+(\d+[-\d]*)/);
-    if (vm) {
-      if (curVerse && curLines.length) verseMap[curVerse] = extractVerseText(curLines);
-      const vs = vm[1].split('-')[0];
-      curVerse = `${ch}:${vs}`; curLines = [];
-    }
-    if (curVerse && trimmed) curLines.push(trimmed);
-  }
-  if (curVerse && curLines.length) verseMap[curVerse] = extractVerseText(curLines);
-
-  // --- Build stripped version + offset map back to raw ---
-  // We strip marks from BOTH the quote and the raw verse for fuzzy matching,
-  // then map the match back to the FULL raw verse (preserving all marks).
-  function buildStripped(raw) {
-    const stripped = [];
-    const offsetMap = [];  // offsetMap[i] = index in raw for stripped[i]
-    for (let i = 0; i < raw.length; i++) {
-      const c = raw[i];
-      if (!STRIP_RE.test(c)) {
-        stripped.push(c);
-        offsetMap.push(i);
-      }
-      STRIP_RE.lastIndex = 0;  // reset stateful regex
-    }
-    return { text: stripped.join(''), offsetMap };
-  }
-
-  // Given a match span [rStart, rEnd] in stripped text, return the
-  // corresponding full span from raw (including all marks).
-  function rawSpan(raw, offsetMap, rStart, rEnd, strippedLen) {
-    const rawStart = offsetMap[rStart];
-    // For the end: find the start of the NEXT stripped char, or end of raw
-    const rawEndExcl = (rEnd + 1 < strippedLen) ? offsetMap[rEnd + 1] : raw.length;
-    // Trim trailing spaces/sof-pasuq from the span
-    let end = rawEndExcl;
-    while (end > rawStart && (raw[end - 1] === ' ' || raw[end - 1] === '\u05C3')) end--;
-    return raw.slice(rawStart, end);
-  }
-
-  // --- Fix each TSV row ---
-  const lines = tsvContent.split('\n');
-  const header = lines[0];
-  const cols0 = header.split('\t');
-  const quoteIdx = cols0.indexOf('Quote');
-  const refIdx = cols0.indexOf('Reference');
-  if (quoteIdx === -1 || refIdx === -1) return 'ERROR: TSV missing Quote or Reference column';
-
-  let fixed = 0, skipped = 0, notFound = 0;
-  const warnings = [];
-
-  for (let i = 1; i < lines.length; i++) {
-    if (!lines[i].trim()) continue;
-    const cols = lines[i].split('\t');
-    if (cols.length <= quoteIdx) continue;
-    const quote = cols[quoteIdx];
-    if (!quote || !/[\u0590-\u05FF]/.test(quote)) continue;  // skip non-Hebrew
-
-    const ref = cols[refIdx];
-    const chVs = ref.includes(':') ? ref : null;
-    if (!chVs) continue;
-
-    const rawVerse = verseMap[chVs];
-    if (!rawVerse) { skipped++; continue; }
-
-    // Handle discontinuous quotes (separated by &)
-    const segments = quote.split(/\s*&\s*/);
-    const fixedSegments = [];
-    let allMatched = true;
-
-    for (const seg of segments) {
-      const { text: strippedVerse, offsetMap } = buildStripped(rawVerse);
-      // Strip the quote too (it may or may not have marks)
-      const strippedQuote = seg.replace(STRIP_RE, () => { STRIP_RE.lastIndex = 0; return ''; });
-      STRIP_RE.lastIndex = 0;
-
-      // Normalize both for matching (handles combining mark reordering)
-      const normQuote = strippedQuote.normalize('NFKD');
-      const normStripped = strippedVerse.normalize('NFKD');
-
-      // Build map: normStripped index -> strippedVerse index
-      const nrMap = [];
-      let si = 0;
-      for (let ni = 0; ni < normStripped.length; ni++) {
-        if (si < strippedVerse.length) {
-          nrMap.push(si);
-          const charNorm = strippedVerse[si].normalize('NFKD');
-          if (charNorm.length > 1) {
-            for (let k = 1; k < charNorm.length && ni + k < normStripped.length; k++) {
-              nrMap.push(si);
-            }
-            ni += charNorm.length - 1;
-          }
-          si++;
-        }
-      }
-
-      const pos = normStripped.indexOf(normQuote);
-      if (pos === -1) {
-        allMatched = false;
-        warnings.push(`${ref}: quote segment not found: "${seg.slice(0, 30)}..."`);
-        fixedSegments.push(seg);  // keep original
-        continue;
-      }
-
-      // Map: normStripped pos -> strippedVerse pos -> raw pos
-      const sStart = (pos < nrMap.length) ? nrMap[pos] : 0;
-      const endNorm = pos + normQuote.length - 1;
-      const sEnd = (endNorm < nrMap.length) ? nrMap[endNorm] : strippedVerse.length - 1;
-
-      // Extract the FULL raw span (with all marks) from the original verse
-      const fixedSeg = rawSpan(rawVerse, offsetMap, sStart, sEnd, strippedVerse.length);
-      fixedSegments.push(fixedSeg);
-    }
-
-    const fixedQuote = fixedSegments.join(' & ');
-    if (fixedQuote !== quote) {
-      cols[quoteIdx] = fixedQuote;
-      lines[i] = cols.join('\t');
-      fixed++;
-    }
-    if (!allMatched) notFound++;
-  }
-
-  // --- Write output ---
-  const outPath = output ? path.resolve(CSKILLBP_DIR, output) : tsvPath;
-  fs.mkdirSync(path.dirname(outPath), { recursive: true });
-  fs.writeFileSync(outPath, lines.join('\n'));
-
-  const result = [`Fixed ${fixed} Hebrew quotes in ${path.basename(tsvFile)}`];
-  if (skipped) result.push(`Skipped ${skipped} (verse not in Hebrew source)`);
-  if (notFound) result.push(`${notFound} quotes had unmatched segments`);
-  if (warnings.length) result.push('Warnings:\n  ' + warnings.slice(0, 10).join('\n  '));
-  result.push(outPath);
-  return result.join('\n');
+  const result = syncCanonicalHebrewQuotes({
+    tsvFile,
+    hebrewUsfm: hebrewPath,
+    output,
+    mismatchPolicy: 'keep',
+  });
+  return result.replace(/^Synced/, 'Fixed');
 }
 
 /**
@@ -2595,6 +2631,7 @@ module.exports = {
   assembleNotes,
   prepareNotes,
   prepareAndValidate,
+  syncCanonicalHebrewQuotes,
   fixUnicodeQuotes,
   verifyBoldMatches,
   fillTsvIds,

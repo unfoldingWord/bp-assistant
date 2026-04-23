@@ -5,7 +5,7 @@ const path = require('path');
 const { door43Push } = require('../door43-push');
 const { getDoor43Username, normalizeBookName, buildBranchName, discoverFreshOutput, checkPrerequisites, resolveOutputFile, CSKILLBP_DIR } = require('../pipeline-utils');
 const { buildNotesContext, readContext, writeContext } = require('../pipeline-context');
-const { extractAlignmentData, prepareNotes, fillOrigQuotes, resolveGlQuotes, flagNarrowQuotes, generateIds } = require('../workspace-tools/tn-tools');
+const { extractAlignmentData, prepareNotes, fillOrigQuotes, resolveGlQuotes, flagNarrowQuotes, generateIds, syncCanonicalHebrewQuotes } = require('../workspace-tools/tn-tools');
 const { createAlignedUsfm, validateAlignedUsfmMarkup, summarizeAlignedUsfmMarkupFindings } = require('../workspace-tools/usfm-tools');
 const { checkUltEdits } = require('../check-ult-edits');
 const { getProviderSystemAppend } = require('./provider-nudges');
@@ -135,6 +135,16 @@ function bestEffortAlignedOutputRepair({ alignedRelPath, book, chapter, ust, max
   const summary = `Alignment markup degraded after ${attempts} attempt(s): ${summarizeAlignedUsfmMarkupFindings(validation.findings)}`;
   console.warn(`[api-pipeline] ${alignedRelPath}: ${summary}`);
   return { ok: true, degraded: true, attempts, findings: validation.findings, summary };
+}
+
+function finalizeNotesBeforePush({ notesPath, preparedJson, hebrewUsfm }) {
+  if (!notesPath || !preparedJson || !hebrewUsfm) return 'syncCanonicalHebrewQuotes: skipped (missing notes, prepared JSON, or Hebrew USFM)';
+  return syncCanonicalHebrewQuotes({
+    tsvFile: notesPath,
+    preparedJson,
+    hebrewUsfm,
+    mismatchPolicy: 'tag',
+  });
 }
 
 async function apiPipeline(route, message) {
@@ -314,6 +324,12 @@ async function apiPipeline(route, message) {
         const chPad = String(chapter).padStart(book.toUpperCase() === 'PSA' ? 3 : 2, '0');
         const sourcePath = resolveOutputFile(`output/notes/${book}/${book}-${chPad}.tsv`, book)
           || `output/notes/${book}/${book}-${chPad}.tsv`;
+        const finalSyncSummary = finalizeNotesBeforePush({
+          notesPath: sourcePath,
+          preparedJson: ctx.runtime.preparedNotes,
+          hebrewUsfm: ctx.sources.hebrew,
+        });
+        console.log(`[api-pipeline] Final canonical Hebrew quote sync: ${finalSyncSummary}`);
         const pushRes = await door43Push({
           type: 'tn', book, chapter, username,
           branch: buildBranchName(book, chapter),
@@ -434,4 +450,4 @@ async function apiPipeline(route, message) {
   }
 }
 
-module.exports = { apiPipeline };
+module.exports = { apiPipeline, _finalizeNotesBeforePush: finalizeNotesBeforePush };

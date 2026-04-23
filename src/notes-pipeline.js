@@ -14,7 +14,7 @@ const { sendMessage, sendDM, addReaction, removeReaction } = require('./zulip-cl
 const { runClaude, DEFAULT_RESTRICTED_TOOLS, isTransientOutageError } = require('./claude-runner');
 const { getDoor43Username, emailToFallbackUsername, buildBranchName, resolveOutputFile, discoverFreshOutput, checkPrerequisites, calcSkillTimeout, normalizeBookName, resolveConflictMention, parsePartialTsv, truncatePartialTsv, parseChunkRange, CSKILLBP_DIR } = require('./pipeline-utils');
 const { splitTsv, fixTrailingNewlines } = require('./workspace-tools/tsv-tools');
-const { fillTsvIds, generateIds, prepareNotes, fillOrigQuotes, resolveGlQuotes, flagNarrowQuotes, extractAlignmentData, prepareATContext, substituteAT, fixUnicodeQuotes, verifyBoldMatches } = require('./workspace-tools/tn-tools');
+const { fillTsvIds, generateIds, prepareNotes, fillOrigQuotes, resolveGlQuotes, flagNarrowQuotes, extractAlignmentData, prepareATContext, substituteAT, fixUnicodeQuotes, verifyBoldMatches, syncCanonicalHebrewQuotes } = require('./workspace-tools/tn-tools');
 const { checkTnQuality } = require('./workspace-tools/quality-tools');
 const { normalizeIssuesFile, buildParallelismIntroHintArgs } = require('./issue-normalizer');
 const { curlyQuotes } = require('./workspace-tools/usfm-tools');
@@ -795,6 +795,16 @@ function postProcessNotesTsv({ notesPath, ultUsfm, hebrewUsfm, preparedJson }) {
   }
 
   return steps.join('; ');
+}
+
+function finalCanonicalHebrewQuoteSync({ notesPath, preparedJson, hebrewUsfm }) {
+  if (!notesPath || !preparedJson || !hebrewUsfm) return 'syncCanonicalHebrewQuotes: skipped (missing notes, prepared JSON, or Hebrew USFM)';
+  return syncCanonicalHebrewQuotes({
+    tsvFile: notesPath,
+    preparedJson,
+    hebrewUsfm,
+    mismatchPolicy: 'tag',
+  });
 }
 
 /**
@@ -2509,6 +2519,13 @@ async function notesPipeline(route, message) {
       }
     }
 
+    const finalQuoteSyncSummary = finalCanonicalHebrewQuoteSync({
+      notesPath: notesSource,
+      preparedJson: ctx.runtime.preparedNotes,
+      hebrewUsfm: ctx.sources.hebrew,
+    });
+    console.log(`[notes] Final canonical Hebrew quote sync: ${finalQuoteSyncSummary}`);
+
     setCheckpoint(checkpointRef, {
       state: 'running',
       totalSuccess,
@@ -2776,6 +2793,7 @@ module.exports = {
   _collectUnresolvedQuoteFindings: collectUnresolvedQuoteFindings,
   _isMalformedIssuesShape: isMalformedIssuesShape,
   _postProcessNotesTsv: postProcessNotesTsv,
+  _finalCanonicalHebrewQuoteSync: finalCanonicalHebrewQuoteSync,
   _runMechanicalQualityPrep: runMechanicalQualityPrep,
   _hasPauseBeforeATsFlag: hasPauseBeforeATsFlag,
   _buildAtGenerationCheckpoint: buildAtGenerationCheckpoint,

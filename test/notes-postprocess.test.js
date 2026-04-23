@@ -5,6 +5,7 @@ const os = require('os');
 const path = require('path');
 
 const { _postProcessNotesTsv } = require('../src/notes-pipeline');
+const { syncCanonicalHebrewQuotes } = require('../src/workspace-tools/tn-tools');
 
 test('postProcessNotesTsv applies curly quote normalization to final TSV after AT assembly', () => {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'notes-postprocess-'));
@@ -77,4 +78,130 @@ test('postProcessNotesTsv performs safe ZEC-style opening bold repair when prepa
   assert.match(summary, /restored 1 missing bold/);
   assert.match(content, /Here, \*\*the angel of Yahweh\*\* represents being in the presence of Yahweh/);
   assert.doesNotMatch(content, /Alternate translation:.*\*\*made me see\*\*/);
+});
+
+test('syncCanonicalHebrewQuotes restores exact source substring with combining marks and spacing from prepared orig_quote', () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'notes-canonical-sync-'));
+  const relRoot = path.join('tmp', path.basename(tempDir));
+  const absRoot = path.join('/srv/bot/workspace', relRoot);
+  fs.mkdirSync(absRoot, { recursive: true });
+
+  const notesRel = path.join(relRoot, 'notes.tsv');
+  const prepRel = path.join(relRoot, 'prepared_notes.json');
+  const hebRel = path.join(relRoot, 'heb.usfm');
+
+  const canonicalQuote = 'יְהוָ֣ה צְבָא֗וֹת';
+
+  fs.writeFileSync(path.join('/srv/bot/workspace', notesRel), [
+    'Reference\tID\tTags\tSupportReference\tQuote\tOccurrence\tNote',
+    '3:7\tab12\t\trc://*/ta/man/translate/writing-quotations\tYahweh of Armies\t1\tTest note',
+  ].join('\n'));
+  fs.writeFileSync(path.join('/srv/bot/workspace', prepRel), JSON.stringify({
+    items: [
+      {
+        id: 'ab12',
+        reference: '3:7',
+        orig_quote: canonicalQuote,
+      },
+    ],
+  }, null, 2));
+  fs.writeFileSync(path.join('/srv/bot/workspace', hebRel), [
+    '\\id ZEC',
+    '\\c 3',
+    '\\v 7 \\w כֹּה־אָמַ֞ר|x\\w* \\w יְהוָ֣ה|x\\w* \\w צְבָא֗וֹת|x\\w* \\w אִם־בִּדְרָכַ֤י|x\\w*',
+  ].join('\n'));
+
+  const summary = syncCanonicalHebrewQuotes({
+    tsvFile: notesRel,
+    preparedJson: prepRel,
+    hebrewUsfm: hebRel,
+  });
+  const content = fs.readFileSync(path.join('/srv/bot/workspace', notesRel), 'utf8');
+
+  assert.match(summary, /Synced 1 canonical Hebrew quote/);
+  assert.match(content, new RegExp(`\\t${canonicalQuote}\\t1\\t`));
+  assert.doesNotMatch(content, /\tYahweh of Armies\t1\t/);
+});
+
+test('syncCanonicalHebrewQuotes preserves discontinuous segment order and separator policy', () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'notes-canonical-discontinuous-'));
+  const relRoot = path.join('tmp', path.basename(tempDir));
+  const absRoot = path.join('/srv/bot/workspace', relRoot);
+  fs.mkdirSync(absRoot, { recursive: true });
+
+  const notesRel = path.join(relRoot, 'notes.tsv');
+  const prepRel = path.join(relRoot, 'prepared_notes.json');
+  const hebRel = path.join(relRoot, 'heb.usfm');
+
+  const canonicalQuote = 'אֶת־יְהוֹשֻׁ֨עַ֙ & וְהַשָּׂטָ֛ן';
+
+  fs.writeFileSync(path.join('/srv/bot/workspace', notesRel), [
+    'Reference\tID\tTags\tSupportReference\tQuote\tOccurrence\tNote',
+    '3:1\tcd34\t\trc://*/ta/man/translate/figs-explicit\tbad quote\t1\tTest note',
+  ].join('\n'));
+  fs.writeFileSync(path.join('/srv/bot/workspace', prepRel), JSON.stringify({
+    items: [
+      {
+        id: 'cd34',
+        reference: '3:1',
+        orig_quote: canonicalQuote,
+      },
+    ],
+  }, null, 2));
+  fs.writeFileSync(path.join('/srv/bot/workspace', hebRel), [
+    '\\id ZEC',
+    '\\c 3',
+    '\\v 1 \\w וַיַּרְאֵ֗נִי|x\\w* \\w אֶת־יְהוֹשֻׁ֨עַ֙|x\\w* \\w הַכֹּהֵ֣ן|x\\w* \\w וְהַשָּׂטָ֛ן|x\\w* \\w עֹמֵ֥ד|x\\w*',
+  ].join('\n'));
+
+  syncCanonicalHebrewQuotes({
+    tsvFile: notesRel,
+    preparedJson: prepRel,
+    hebrewUsfm: hebRel,
+  });
+  const content = fs.readFileSync(path.join('/srv/bot/workspace', notesRel), 'utf8');
+
+  assert.match(content, /\tאֶת־יְהוֹשֻׁ֨עַ֙ & וְהַשָּׂטָ֛ן\t1\t/);
+});
+
+test('syncCanonicalHebrewQuotes tags unresolved rows and continues', () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'notes-canonical-unresolved-'));
+  const relRoot = path.join('tmp', path.basename(tempDir));
+  const absRoot = path.join('/srv/bot/workspace', relRoot);
+  fs.mkdirSync(absRoot, { recursive: true });
+
+  const notesRel = path.join(relRoot, 'notes.tsv');
+  const prepRel = path.join(relRoot, 'prepared_notes.json');
+  const hebRel = path.join(relRoot, 'heb.usfm');
+
+  fs.writeFileSync(path.join('/srv/bot/workspace', notesRel), [
+    'Reference\tID\tTags\tSupportReference\tQuote\tOccurrence\tNote',
+    '3:7\tef56\t\trc://*/ta/man/translate/writing-quotations\tcurrent quote\t1\tTest note',
+  ].join('\n'));
+  fs.writeFileSync(path.join('/srv/bot/workspace', prepRel), JSON.stringify({
+    items: [
+      {
+        id: 'ef56',
+        reference: '3:7',
+        orig_quote: 'לֹא קַיָּם',
+      },
+    ],
+  }, null, 2));
+  fs.writeFileSync(path.join('/srv/bot/workspace', hebRel), [
+    '\\id ZEC',
+    '\\c 3',
+    '\\v 7 \\w כֹּה־אָמַ֞ר|x\\w* \\w יְהוָ֣ה|x\\w* \\w צְבָא֗וֹת|x\\w*',
+  ].join('\n'));
+
+  const summary = syncCanonicalHebrewQuotes({
+    tsvFile: notesRel,
+    preparedJson: prepRel,
+    hebrewUsfm: hebRel,
+    mismatchPolicy: 'tag',
+  });
+  const content = fs.readFileSync(path.join('/srv/bot/workspace', notesRel), 'utf8');
+
+  assert.match(summary, /Unresolved 1/);
+  assert.match(content, /^3:7\tef56\tISSUE:MATCH_FAIL\t/m);
+  assert.match(content, /\tcurrent quote\t1\t/);
 });

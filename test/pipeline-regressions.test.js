@@ -21,7 +21,9 @@ const {
   _analyzeIssuesTsvShape,
   _isMalformedIssuesShape,
   _buildAtGenerationCheckpoint,
+  _finalCanonicalHebrewQuoteSync,
 } = require('../src/notes-pipeline');
+const { _finalizeNotesBeforePush: apiFinalizeNotesBeforePush } = require('../src/api-runner/api-pipeline');
 const { buildParallelismIntroHintArgs } = require('../src/issue-normalizer');
 
 test('synthetic notes route preserves verse ranges from intent scopeText', () => {
@@ -240,6 +242,83 @@ test('checkUltEdits finds flat aligned ULT outputs', async () => {
     delete require.cache[pipelineUtilsPath];
     delete require.cache[checkUltEditsPath];
   }
+});
+
+test('notes pipeline final canonical quote sync runs after quality and tags unresolved rows', () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'notes-final-sync-'));
+  const relRoot = path.join('tmp', path.basename(tempDir));
+  const absRoot = path.join('/srv/bot/workspace', relRoot);
+  fs.mkdirSync(absRoot, { recursive: true });
+
+  const notesRel = path.join(relRoot, 'notes.tsv');
+  const prepRel = path.join(relRoot, 'prepared_notes.json');
+  const hebRel = path.join(relRoot, 'heb.usfm');
+
+  fs.writeFileSync(path.join('/srv/bot/workspace', notesRel), [
+    'Reference\tID\tTags\tSupportReference\tQuote\tOccurrence\tNote',
+    '3:7\tab12\t\trc://*/ta/man/translate/writing-quotations\tbad quote\t1\tTest note',
+    '3:8\tcd34\t\trc://*/ta/man/translate/writing-quotations\tstill bad\t1\tTest note',
+  ].join('\n'));
+  fs.writeFileSync(path.join('/srv/bot/workspace', prepRel), JSON.stringify({
+    items: [
+      { id: 'ab12', reference: '3:7', orig_quote: 'יְהוָ֣ה צְבָא֗וֹת' },
+      { id: 'cd34', reference: '3:8', orig_quote: 'לֹא קַיָּם' },
+    ],
+  }, null, 2));
+  fs.writeFileSync(path.join('/srv/bot/workspace', hebRel), [
+    '\\id ZEC',
+    '\\c 3',
+    '\\v 7 \\w כֹּה־אָמַ֞ר|x\\w* \\w יְהוָ֣ה|x\\w* \\w צְבָא֗וֹת|x\\w*',
+    '\\v 8 \\w שְׁמַע־נָ֞א|x\\w* \\w יְהוֹשֻׁ֣עַ|x\\w*',
+  ].join('\n'));
+
+  const summary = _finalCanonicalHebrewQuoteSync({
+    notesPath: notesRel,
+    preparedJson: prepRel,
+    hebrewUsfm: hebRel,
+  });
+  const content = fs.readFileSync(path.join('/srv/bot/workspace', notesRel), 'utf8');
+
+  assert.match(summary, /Synced 1 canonical Hebrew quote/);
+  assert.match(summary, /Unresolved 1/);
+  assert.match(content, /\tיְהוָ֣ה צְבָא֗וֹת\t1\t/);
+  assert.match(content, /^3:8\tcd34\tISSUE:MATCH_FAIL\t/m);
+});
+
+test('api runner finalizer syncs canonical Hebrew quotes before push', () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'api-final-sync-'));
+  const relRoot = path.join('tmp', path.basename(tempDir));
+  const absRoot = path.join('/srv/bot/workspace', relRoot);
+  fs.mkdirSync(absRoot, { recursive: true });
+
+  const notesRel = path.join(relRoot, 'notes.tsv');
+  const prepRel = path.join(relRoot, 'prepared_notes.json');
+  const hebRel = path.join(relRoot, 'heb.usfm');
+
+  fs.writeFileSync(path.join('/srv/bot/workspace', notesRel), [
+    'Reference\tID\tTags\tSupportReference\tQuote\tOccurrence\tNote',
+    '3:1\tab12\t\trc://*/ta/man/translate/figs-explicit\tenglish only\t1\tTest note',
+  ].join('\n'));
+  fs.writeFileSync(path.join('/srv/bot/workspace', prepRel), JSON.stringify({
+    items: [
+      { id: 'ab12', reference: '3:1', orig_quote: 'אֶת־יְהוֹשֻׁ֨עַ֙' },
+    ],
+  }, null, 2));
+  fs.writeFileSync(path.join('/srv/bot/workspace', hebRel), [
+    '\\id ZEC',
+    '\\c 3',
+    '\\v 1 \\w וַיַּרְאֵ֗נִי|x\\w* \\w אֶת־יְהוֹשֻׁ֨עַ֙|x\\w* \\w הַכֹּהֵ֣ן|x\\w*',
+  ].join('\n'));
+
+  const summary = apiFinalizeNotesBeforePush({
+    notesPath: notesRel,
+    preparedJson: prepRel,
+    hebrewUsfm: hebRel,
+  });
+  const content = fs.readFileSync(path.join('/srv/bot/workspace', notesRel), 'utf8');
+
+  assert.match(summary, /Synced 1 canonical Hebrew quote/);
+  assert.match(content, /\tאֶת־יְהוֹשֻׁ֨עַ֙\t1\t/);
 });
 
 test('malformed issues TSV shape is detected when issue type and quote are blank across the chapter', () => {
