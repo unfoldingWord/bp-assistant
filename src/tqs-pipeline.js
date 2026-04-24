@@ -10,6 +10,7 @@ const { getCheckpoint, setCheckpoint, clearCheckpoint } = require('./pipeline-ch
 const { recordMetrics, getCumulativeTokens, recordRunSummary } = require('./usage-tracker');
 const { verifyTq } = require('./workspace-tools/misc-tools');
 const { getChapterCount } = require('./verse-counts');
+const { publishAdminStatus } = require('./admin-status');
 
 function cleanContent(content) {
   return String(content || '').replace(/^@\*\*[^*]+\*\*\s*/, '').trim();
@@ -69,14 +70,19 @@ function hasVerifyErrors(output) {
 }
 
 async function tqsPipeline(route, message) {
-  const adminUserId = config.adminUserId;
   const stream = message.type === 'stream' ? message.display_recipient : null;
   const topic = message.subject || '';
   const msgId = message.id;
 
   async function status(text) {
-    try { await sendDM(adminUserId, text); } catch (err) {
-      console.error(`[tqs] Failed to send status DM: ${err.message}`);
+    try {
+      await publishAdminStatus({
+        source: 'tqs-pipeline',
+        pipelineType: 'tqs',
+        message: text,
+      });
+    } catch (err) {
+      console.error(`[tqs] Failed to publish admin status: ${err.message}`);
     }
   }
 

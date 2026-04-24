@@ -20,6 +20,7 @@ const { door43Push, checkConflictingBranches, REPO_MAP, getRepoFilename } = requ
 const { setPendingMerge } = require('./pending-merges');
 const { getCheckpoint, setCheckpoint, clearCheckpoint } = require('./pipeline-checkpoints');
 const { buildGenerateContext, buildUstContext } = require('./pipeline-context');
+const { publishAdminStatus } = require('./admin-status');
 
 const LOG_DIR = path.resolve(__dirname, '../logs');
 const REQUIRED_INITIAL_PIPELINE_FILES = [
@@ -284,7 +285,6 @@ function isFreshOutput(relPath, minMs) {
 }
 
 async function generatePipeline(route, message) {
-  const adminUserId = config.adminUserId;
   const stream = message.type === 'stream' ? message.display_recipient : null;
   const topic = message.subject || '';
   const msgId = message.id;
@@ -297,9 +297,13 @@ async function generatePipeline(route, message) {
   // Helper: DM status to admin
   async function status(text) {
     try {
-      await sendDM(adminUserId, text);
+      await publishAdminStatus({
+        source: 'generate-pipeline',
+        pipelineType: 'generate',
+        message: text,
+      });
     } catch (err) {
-      console.error(`[generate] Failed to send status DM: ${err.message}`);
+      console.error(`[generate] Failed to publish admin status: ${err.message}`);
     }
   }
 

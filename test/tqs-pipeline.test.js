@@ -30,7 +30,9 @@ function buildMessage(content, overrides = {}) {
 function createHarness({ runClaudeImpl, verifyTqImpl, conflictChapters = new Set() } = {}) {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tqs-pipeline-'));
   const oldBaseDir = process.env.CSKILLBP_DIR;
+  const oldStatusFile = process.env.ADMIN_STATUS_FILE;
   process.env.CSKILLBP_DIR = tempDir;
+  process.env.ADMIN_STATUS_FILE = path.join(tempDir, 'admin-status.jsonl');
 
   const pipelinePath = require.resolve('../src/tqs-pipeline');
   const configPath = require.resolve('../src/config');
@@ -42,6 +44,7 @@ function createHarness({ runClaudeImpl, verifyTqImpl, conflictChapters = new Set
   const checkpointsPath = require.resolve('../src/pipeline-checkpoints');
   const usageTrackerPath = require.resolve('../src/usage-tracker');
   const miscToolsPath = require.resolve('../src/workspace-tools/misc-tools');
+  const adminStatusPath = require.resolve('../src/admin-status');
 
   const sent = { stream: [], dm: [], reactions: [] };
   const runClaudeCalls = [];
@@ -51,6 +54,7 @@ function createHarness({ runClaudeImpl, verifyTqImpl, conflictChapters = new Set
   const summaries = [];
 
   delete require.cache[pipelinePath];
+  delete require.cache[adminStatusPath];
 
   installStub(configPath, { adminUserId: 1 });
   installStub(zulipPath, {
@@ -123,6 +127,13 @@ function createHarness({ runClaudeImpl, verifyTqImpl, conflictChapters = new Set
     verifyCalls,
     checkpoints,
     summaries,
+    readStatusTexts() {
+      if (!fs.existsSync(process.env.ADMIN_STATUS_FILE)) return [];
+      return fs.readFileSync(process.env.ADMIN_STATUS_FILE, 'utf8')
+        .split('\n')
+        .filter(Boolean)
+        .map((line) => JSON.parse(line).message);
+    },
     tqsPipeline,
     cleanup() {
       delete require.cache[pipelinePath];
@@ -135,8 +146,11 @@ function createHarness({ runClaudeImpl, verifyTqImpl, conflictChapters = new Set
       delete require.cache[checkpointsPath];
       delete require.cache[usageTrackerPath];
       delete require.cache[miscToolsPath];
+      delete require.cache[adminStatusPath];
       if (oldBaseDir == null) delete process.env.CSKILLBP_DIR;
       else process.env.CSKILLBP_DIR = oldBaseDir;
+      if (oldStatusFile == null) delete process.env.ADMIN_STATUS_FILE;
+      else process.env.ADMIN_STATUS_FILE = oldStatusFile;
     },
   };
 }
@@ -204,7 +218,7 @@ test('tqsPipeline blocks push when expected output file is missing', async () =>
 
     assert.equal(harness.pushCalls.length, 0);
     assert.equal(harness.summaries.at(-1).success, false);
-    assert.ok(harness.sent.dm.some(({ text }) => text.includes('expected output file missing')));
+    assert.ok(harness.readStatusTexts().some((text) => text.includes('expected output file missing')));
   } finally {
     harness.cleanup();
   }
@@ -253,7 +267,7 @@ test('tqsPipeline blocks push for chapters with conflicting branches', async () 
 
     assert.equal(harness.pushCalls.length, 0);
     assert.equal(harness.summaries.at(-1).success, false);
-    assert.ok(harness.sent.dm.some(({ text }) => text.includes('conflicting branches')));
+    assert.ok(harness.readStatusTexts().some((text) => text.includes('conflicting branches')));
   } finally {
     harness.cleanup();
   }

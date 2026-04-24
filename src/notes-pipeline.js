@@ -27,6 +27,7 @@ const { getCheckpoint, setCheckpoint, clearCheckpoint } = require('./pipeline-ch
 const { buildNotesContext, updateContextArtifacts, readContext, writeContext } = require('./pipeline-context');
 const { checkUltEdits } = require('./check-ult-edits');
 const { getVerseCount } = require('./verse-counts');
+const { publishAdminStatus } = require('./admin-status');
 
 const LOG_DIR = path.resolve(__dirname, '../logs');
 
@@ -1515,7 +1516,6 @@ async function runParallelTnWriter({
 
 // --- Main pipeline ---
 async function notesPipeline(route, message) {
-  const adminUserId = config.adminUserId;
   const stream = message.type === 'stream' ? message.display_recipient : null;
   const topic = message.subject || '';
   const msgId = message.id;
@@ -1524,8 +1524,14 @@ async function notesPipeline(route, message) {
   const isDryRun = process.env.DRY_RUN === '1';
 
   async function status(text) {
-    try { await sendDM(adminUserId, text); } catch (err) {
-      console.error(`[notes] Failed to send status DM: ${err.message}`);
+    try {
+      await publishAdminStatus({
+        source: 'notes-pipeline',
+        pipelineType: 'notes',
+        message: text,
+      });
+    } catch (err) {
+      console.error(`[notes] Failed to publish admin status: ${err.message}`);
     }
   }
 
