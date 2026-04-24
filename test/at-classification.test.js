@@ -3,6 +3,7 @@ const assert = require('node:assert/strict');
 
 const {
   _classifyRunClaudeEmpty: classify,
+  _buildAtValidatorSystemPrompt: buildValidatorPrompt,
   _AT_TIMEOUTS: atTimeouts,
   _DEFAULT_AT_CONCURRENCY: defaultAtConcurrency,
 } = require('../src/notes-pipeline');
@@ -60,4 +61,11 @@ test('AT stage timeouts are extended to five minutes for generate, validate, and
 
 test('AT generation defaults to lower concurrency to reduce rate-limit pressure', () => {
   assert.equal(defaultAtConcurrency, 2);
+});
+
+test('AT validator prompt prioritizes solving the note issue over mere naturalness', () => {
+  const prompt = buildValidatorPrompt();
+  assert.match(prompt, /First, confirm that it actually SOLVES the translation problem named in the note\./);
+  assert.match(prompt, /passive voice is the issue, reject any candidate that still uses passive voice\./);
+  assert.match(prompt, /metaphor should be changed, reject any candidate that still uses the metaphor instead of a simile or plain meaning\./);
 });

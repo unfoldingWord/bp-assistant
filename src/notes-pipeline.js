@@ -560,9 +560,7 @@ async function runATGeneration({ notesPath, pipeDir, status }) {
   ].join('\n');
 
   // Haiku validator system prompt
-  const validatorSystemPrompt =
-    'Answer YES or NO only, then one sentence explaining why. Do not use any tools.\n\n' +
-    'Does the modified verse read as natural English AND address the issue described in the note?';
+  const validatorSystemPrompt = buildAtValidatorSystemPrompt();
 
   // Helper to extract text from SDK result
   function extractResultText(result) {
@@ -1144,6 +1142,24 @@ const TN_WRITER_MAX_TOOL_CALLS = Number((config.notesGuardrails || {}).tnWriterM
 const RESCUE_MAX_PASSES = Number((config.notesGuardrails || {}).rescueMaxPasses || 1);
 const USE_PER_NOTE_GENERATION = Boolean((config.notesGuardrails || {}).usePerNoteGeneration);
 const TN_WRITER_RESTRICTED_TOOLS = DEFAULT_RESTRICTED_TOOLS.filter((tool) => !TN_WRITER_TOOL_BLOCKLIST.includes(tool));
+
+function buildAtValidatorSystemPrompt() {
+  return [
+    'Answer YES or NO only, then one sentence explaining why. Do not use any tools.',
+    '',
+    'Judge the candidate alternate translation by these priorities:',
+    '1. First, confirm that it actually SOLVES the translation problem named in the note.',
+    '2. Second, confirm that the modified verse reads as natural English.',
+    '',
+    'A candidate fails if it leaves the original problem in place, even if the English sounds natural.',
+    'Examples:',
+    '- If the note says passive voice is the issue, reject any candidate that still uses passive voice.',
+    '- If the note says a metaphor should be changed, reject any candidate that still uses the metaphor instead of a simile or plain meaning.',
+    '- If the note says a figure should be made explicit, reject any candidate that still leaves the meaning implicit.',
+    '',
+    'Does the modified verse read as natural English AND clearly resolve the issue described in the note?',
+  ].join('\n');
+}
 
 function countIssueRows(tsvRelPath) {
   try {
@@ -2798,6 +2814,7 @@ module.exports = {
   _hasPauseBeforeATsFlag: hasPauseBeforeATsFlag,
   _buildAtGenerationCheckpoint: buildAtGenerationCheckpoint,
   _classifyRunClaudeEmpty: classifyRunClaudeEmpty,
+  _buildAtValidatorSystemPrompt: buildAtValidatorSystemPrompt,
   _AT_TIMEOUTS: {
     generationMs: AT_GENERATION_TIMEOUT_MS,
     validationMs: AT_VALIDATION_TIMEOUT_MS,
