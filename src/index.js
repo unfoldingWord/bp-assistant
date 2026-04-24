@@ -1,5 +1,5 @@
 const config = require('./config');
-const { startMcpServer } = require('./mcp-server');
+const { startAdminServer, startMcpServer } = require('./mcp-server');
 const { getClient, sendMessage } = require('./zulip-client');
 const { routeMessage, hasPendingAction, hasActiveSession } = require('./router');
 const { ensureFreshToken } = require('./auth-refresh');
@@ -170,6 +170,7 @@ async function main() {
   }
 }
 
+startAdminServer();
 startMcpServer();
 startWeeklyRefresh();
 

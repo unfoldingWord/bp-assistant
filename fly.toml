@@ -12,11 +12,18 @@ kill_timeout = 30
 
 [env]
   NODE_ENV = "production"
+  PORT = "8080"
   CSKILLBP_DIR = "/data/workspace"
   DOOR43_REPOS_PATH = "/data/workspace/door43-repos"
   HEBREW_DIR = "/data/workspace/data/hebrew_bible"
   CLAUDE_CONFIG_DIR = "/data/claude-config"
   MODEL_PROVIDER_CONFIG_FILE = "/config/model-provider-config.json"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_start_machines = true
+  auto_stop_machines = "off"
 
 [[vm]]
   memory = "2gb"

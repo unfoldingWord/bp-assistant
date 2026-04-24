@@ -12,7 +12,9 @@ const { z } = require('zod');
 const { readSecret } = require('./secrets');
 const { readAdminStatus } = require('./admin-status');
 
-const MCP_PORT = 3001;
+const ADMIN_PORT = Number(process.env.PORT || 8080);
+const MCP_PORT = Number(process.env.MCP_PORT || 3001);
+const MCP_BIND_HOST = process.env.MCP_BIND_HOST || '127.0.0.1';
 const DOOR43_BASE = 'https://git.door43.org/unfoldingWord';
 
 // ---------------------------------------------------------------------------
@@ -611,7 +613,6 @@ function requireAdminAuth(req, res, password) {
 }
 
 function createHttpServer() {
-  const token = readSecret('bt_mcp_api_token', 'BT_MCP_API_TOKEN');
   const adminPassword = readSecret('admin_page_password', 'ADMIN_PAGE_PASSWORD');
   return http.createServer(async (req, res) => {
     res.setHeader('Access-Control-Allow-Origin', '*');
@@ -653,12 +654,34 @@ function createHttpServer() {
       return;
     }
 
+    res.writeHead(404, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'not found' }));
+  });
+}
+
+function createMcpHttpServer(token) {
+  return http.createServer(async (req, res) => {
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS, DELETE');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, Mcp-Session-Id');
+    res.setHeader('Access-Control-Expose-Headers', 'Mcp-Session-Id');
+
+    if (req.method === 'OPTIONS') {
+      res.writeHead(204);
+      res.end();
+      return;
+    }
+
+    const reqUrl = new URL(req.url, 'http://localhost');
+    const urlPath = reqUrl.pathname;
+
+    if (req.method === 'GET' && urlPath === '/health') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: true, service: 'bt-pipeline-mcp' }));
+      return;
+    }
+
     if (urlPath === '/mcp') {
-      if (!token) {
-        res.writeHead(503, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: 'mcp_disabled' }));
-        return;
-      }
       const auth = req.headers.authorization || '';
       const urlToken = reqUrl.searchParams.get('token') || '';
       const authed = auth === `Bearer ${token}` || urlToken === token;
@@ -688,6 +711,13 @@ function createHttpServer() {
   });
 }
 
+function startAdminServer() {
+  const httpServer = createHttpServer();
+  httpServer.listen(ADMIN_PORT, '0.0.0.0', () => {
+    console.log(`[admin] Admin server listening on port ${ADMIN_PORT}`);
+  });
+}
+
 function startMcpServer() {
   const token = readSecret('bt_mcp_api_token', 'BT_MCP_API_TOKEN');
   if (!token) {
@@ -708,11 +738,11 @@ function startMcpServer() {
     cache.templates = null;
   }
 
-  const httpServer = createHttpServer();
+  const httpServer = createMcpHttpServer(token);
 
-  httpServer.listen(MCP_PORT, '0.0.0.0', () => {
-    console.log(`[mcp] MCP server listening on port ${MCP_PORT}`);
+  httpServer.listen(MCP_PORT, MCP_BIND_HOST, () => {
+    console.log(`[mcp] MCP server listening on ${MCP_BIND_HOST}:${MCP_PORT}`);
   });
 }
 
-module.exports = { startMcpServer, createHttpServer };
+module.exports = { startAdminServer, startMcpServer, createHttpServer, createMcpHttpServer };
