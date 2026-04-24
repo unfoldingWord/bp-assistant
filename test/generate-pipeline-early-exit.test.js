@@ -30,7 +30,9 @@ function buildMessage(content, overrides = {}) {
 function createHarness({ runClaudeImpl }) {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'generate-pipeline-'));
   const oldBaseDir = process.env.CSKILLBP_DIR;
+  const oldStatusFile = process.env.ADMIN_STATUS_FILE;
   process.env.CSKILLBP_DIR = tempDir;
+  process.env.ADMIN_STATUS_FILE = path.join(tempDir, 'admin-status.jsonl');
   const requiredSkillFiles = [
     '.claude/skills/initial-pipeline/SKILL.md',
     '.claude/skills/issue-identification/orchestration-conventions.md',
@@ -58,6 +60,7 @@ function createHarness({ runClaudeImpl }) {
   const checkpointsPath = require.resolve('../src/pipeline-checkpoints');
   const pipelineContextPath = require.resolve('../src/pipeline-context');
   const pipelineUtilsPath = require.resolve('../src/pipeline-utils');
+  const adminStatusPath = require.resolve('../src/admin-status');
 
   const sent = {
     stream: [],
@@ -71,6 +74,7 @@ function createHarness({ runClaudeImpl }) {
 
   delete require.cache[generatePath];
   delete require.cache[pipelineUtilsPath];
+  delete require.cache[adminStatusPath];
 
   installStub(configPath, {
     adminUserId: 1,
@@ -148,6 +152,13 @@ function createHarness({ runClaudeImpl }) {
     runClaudeCalls,
     checkpoints,
     runSummaries,
+    readStatusTexts() {
+      if (!fs.existsSync(process.env.ADMIN_STATUS_FILE)) return [];
+      return fs.readFileSync(process.env.ADMIN_STATUS_FILE, 'utf8')
+        .split('\n')
+        .filter(Boolean)
+        .map((line) => JSON.parse(line).message);
+    },
     generatePipeline,
     cleanup() {
       delete require.cache[generatePath];
@@ -163,8 +174,11 @@ function createHarness({ runClaudeImpl }) {
       delete require.cache[pendingMergesPath];
       delete require.cache[checkpointsPath];
       delete require.cache[pipelineContextPath];
+      delete require.cache[adminStatusPath];
       if (oldBaseDir == null) delete process.env.CSKILLBP_DIR;
       else process.env.CSKILLBP_DIR = oldBaseDir;
+      if (oldStatusFile == null) delete process.env.ADMIN_STATUS_FILE;
+      else process.env.ADMIN_STATUS_FILE = oldStatusFile;
     },
   };
 }
@@ -189,8 +203,9 @@ test('generatePipeline classifies initial-pipeline early exit when only Wave 2 a
     );
 
     assert.equal(harness.runClaudeCalls.length, 1);
-    assert.ok(harness.sent.dm.some(({ text }) => text.includes('initial-pipeline exited before writing required outputs')));
-    assert.ok(harness.sent.dm.some(({ text }) => text.includes('issues TSV, UST')));
+    const statusTexts = harness.readStatusTexts();
+    assert.ok(statusTexts.some((text) => text.includes('initial-pipeline exited before writing required outputs')));
+    assert.ok(statusTexts.some((text) => text.includes('issues TSV, UST')));
     assert.ok(harness.checkpoints.some((patch) => patch.current?.errorKind === 'initial_pipeline_early_exit'));
     assert.deepEqual(harness.runSummaries.at(-1), {
       pipeline: 'generate',

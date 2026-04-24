@@ -3,14 +3,12 @@
 
 const fs = require('fs');
 const path = require('path');
-const config = require('./config');
 const { sendMessage, sendDM, addReaction, removeReaction } = require('./zulip-client');
 const { checkExistingBranch, buildBranchName, CSKILLBP_DIR } = require('./pipeline-utils');
 const { verifyRepoPush } = require('./repo-verify');
 const { door43Push, checkConflictingBranches, getRepoFilename } = require('./door43-push');
 const { getPendingMerge, setPendingMerge, clearPendingMerge } = require('./pending-merges');
-
-const adminUserId = config.adminUserId;
+const { publishAdminStatus } = require('./admin-status');
 
 // Extract --source value from legacy repoInsertPrompt strings
 function extractSourceFromPrompt(prompt) {
@@ -20,8 +18,14 @@ function extractSourceFromPrompt(prompt) {
 }
 
 async function status(text) {
-  try { await sendDM(adminUserId, text); } catch (err) {
-    console.error(`[insertion-resume] Failed to send status DM: ${err.message}`);
+  try {
+    await publishAdminStatus({
+      source: 'insertion-resume',
+      pipelineType: 'resume',
+      message: text,
+    });
+  } catch (err) {
+    console.error(`[insertion-resume] Failed to publish admin status: ${err.message}`);
   }
 }
 

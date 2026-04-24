@@ -5,10 +5,12 @@ const http = require('http');
 const https = require('https');
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 const { McpServer } = require('@modelcontextprotocol/sdk/server/mcp.js');
 const { StreamableHTTPServerTransport } = require('@modelcontextprotocol/sdk/server/streamableHttp.js');
 const { z } = require('zod');
 const { readSecret } = require('./secrets');
+const { readAdminStatus } = require('./admin-status');
 
 const MCP_PORT = 3001;
 const DOOR43_BASE = 'https://git.door43.org/unfoldingWord';
@@ -426,6 +428,266 @@ function createMcpServer() {
 // HTTP server
 // ---------------------------------------------------------------------------
 
+function safeCompare(left, right) {
+  const a = Buffer.from(String(left || ''), 'utf8');
+  const b = Buffer.from(String(right || ''), 'utf8');
+  if (a.length !== b.length) return false;
+  return crypto.timingSafeEqual(a, b);
+}
+
+function escapeHtml(text) {
+  return String(text || '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+function renderAdminPage(events, filters) {
+  const initialEvents = JSON.stringify(events);
+  const listMarkup = events.length
+    ? events.map((event) => {
+      const parts = [
+        `<time>${escapeHtml(event.timestamp)}</time>`,
+        event.pipelineType ? `<span class="pipe">${escapeHtml(event.pipelineType)}</span>` : '',
+        event.scope ? `<span class="scope">${escapeHtml(event.scope)}</span>` : '',
+        event.phase ? `<span class="phase">${escapeHtml(event.phase)}</span>` : '',
+        `<span class="sev">${escapeHtml(event.severity)}</span>`,
+      ].filter(Boolean).join('');
+      return `<li class="event severity-${escapeHtml(event.severity)}"><div class="meta">${parts}</div><div class="message">${escapeHtml(event.message)}</div></li>`;
+    }).join('')
+    : '<li class="empty">No status events yet.</li>';
+
+  return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Admin Status Board</title>
+  <style>
+    :root { color-scheme: light; --bg:#f6f1e5; --panel:#fffdf8; --ink:#1c1d19; --muted:#6f7268; --line:#d8d1bf; --active:#0f766e; --success:#3f6212; --warn:#b45309; --error:#b91c1c; }
+    * { box-sizing: border-box; }
+    body { margin: 0; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; background: linear-gradient(180deg, #ece4d2 0%, #f7f3e9 100%); color: var(--ink); }
+    main { max-width: 1100px; margin: 0 auto; padding: 24px 16px 40px; }
+    h1 { margin: 0 0 8px; font-size: 28px; }
+    p { margin: 0 0 20px; color: var(--muted); }
+    form { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; background: var(--panel); border: 1px solid var(--line); padding: 14px; border-radius: 14px; position: sticky; top: 12px; }
+    label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 6px; text-transform: uppercase; letter-spacing: 0.08em; }
+    input, select, button { width: 100%; border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; font: inherit; background: #fff; color: var(--ink); }
+    button { background: #1c1d19; color: #fff; cursor: pointer; }
+    ul { list-style: none; padding: 0; margin: 18px 0 0; display: grid; gap: 12px; }
+    .event, .empty { background: var(--panel); border: 1px solid var(--line); border-left: 6px solid var(--line); border-radius: 12px; padding: 14px; }
+    .severity-active { border-left-color: var(--active); }
+    .severity-success { border-left-color: var(--success); }
+    .severity-warn { border-left-color: var(--warn); }
+    .severity-error { border-left-color: var(--error); }
+    .meta { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 8px; color: var(--muted); font-size: 12px; }
+    .meta span, .meta time { background: #f4efe2; padding: 2px 6px; border-radius: 999px; }
+    .message { white-space: pre-wrap; line-height: 1.45; }
+    .empty { color: var(--muted); }
+    @media (max-width: 800px) { form { grid-template-columns: 1fr 1fr; } }
+    @media (max-width: 560px) { form { grid-template-columns: 1fr; } }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Admin Status Board</h1>
+    <p>Curated operator status only. Use Fly for full logs.</p>
+    <form id="filters">
+      <div>
+        <label for="scope">Scope</label>
+        <input id="scope" name="scope" value="${escapeHtml(filters.scope || '')}" placeholder="NUM 17">
+      </div>
+      <div>
+        <label for="pipelineType">Pipeline</label>
+        <select id="pipelineType" name="pipelineType">
+          <option value="">All</option>
+          <option value="generate"${filters.pipelineType === 'generate' ? ' selected' : ''}>generate</option>
+          <option value="notes"${filters.pipelineType === 'notes' ? ' selected' : ''}>notes</option>
+          <option value="tqs"${filters.pipelineType === 'tqs' ? ' selected' : ''}>tqs</option>
+          <option value="resume"${filters.pipelineType === 'resume' ? ' selected' : ''}>resume</option>
+          <option value="system"${filters.pipelineType === 'system' ? ' selected' : ''}>system</option>
+        </select>
+      </div>
+      <div>
+        <label for="severity">Severity</label>
+        <select id="severity" name="severity">
+          <option value="">All</option>
+          <option value="active"${filters.severity === 'active' ? ' selected' : ''}>active</option>
+          <option value="success"${filters.severity === 'success' ? ' selected' : ''}>success</option>
+          <option value="warn"${filters.severity === 'warn' ? ' selected' : ''}>warn</option>
+          <option value="error"${filters.severity === 'error' ? ' selected' : ''}>error</option>
+          <option value="info"${filters.severity === 'info' ? ' selected' : ''}>info</option>
+        </select>
+      </div>
+      <div>
+        <label>&nbsp;</label>
+        <button type="submit">Refresh</button>
+      </div>
+    </form>
+    <ul id="events">${listMarkup}</ul>
+  </main>
+  <script>
+    const initialEvents = ${initialEvents};
+    const list = document.getElementById('events');
+    const form = document.getElementById('filters');
+
+    function esc(text) {
+      return String(text || '').replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;').replaceAll('"', '&quot;');
+    }
+
+    function render(events) {
+      if (!events.length) {
+        list.innerHTML = '<li class="empty">No status events yet.</li>';
+        return;
+      }
+      list.innerHTML = events.map((event) => {
+        const parts = [
+          '<time>' + esc(event.timestamp) + '</time>',
+          event.pipelineType ? '<span class="pipe">' + esc(event.pipelineType) + '</span>' : '',
+          event.scope ? '<span class="scope">' + esc(event.scope) + '</span>' : '',
+          event.phase ? '<span class="phase">' + esc(event.phase) + '</span>' : '',
+          '<span class="sev">' + esc(event.severity) + '</span>',
+        ].filter(Boolean).join('');
+        return '<li class="event severity-' + esc(event.severity) + '"><div class="meta">' + parts + '</div><div class="message">' + esc(event.message) + '</div></li>';
+      }).join('');
+    }
+
+    async function refresh() {
+      const params = new URLSearchParams();
+      for (const key of ['scope', 'pipelineType', 'severity']) {
+        const value = form.elements[key].value.trim();
+        if (value) params.set(key, value);
+      }
+      const res = await fetch('/admin/status?' + params.toString(), { headers: { 'Accept': 'application/json' } });
+      if (!res.ok) return;
+      const payload = await res.json();
+      render(payload.events || []);
+    }
+
+    form.addEventListener('submit', (event) => {
+      event.preventDefault();
+      refresh().catch(() => {});
+    });
+
+    render(initialEvents);
+    setInterval(() => { refresh().catch(() => {}); }, 5000);
+  </script>
+</body>
+</html>`;
+}
+
+function requireAdminAuth(req, res, password) {
+  if (!password) {
+    res.writeHead(503, { 'Content-Type': 'text/plain; charset=utf-8' });
+    res.end('ADMIN_PAGE_PASSWORD is not configured.');
+    return false;
+  }
+
+  const auth = req.headers.authorization || '';
+  if (!auth.startsWith('Basic ')) {
+    res.writeHead(401, { 'WWW-Authenticate': 'Basic realm="BP Admin"' });
+    res.end('Authentication required.');
+    return false;
+  }
+
+  let decoded = '';
+  try {
+    decoded = Buffer.from(auth.slice(6), 'base64').toString('utf8');
+  } catch (_) {
+    decoded = '';
+  }
+  const sep = decoded.indexOf(':');
+  const username = sep === -1 ? '' : decoded.slice(0, sep);
+  const suppliedPassword = sep === -1 ? '' : decoded.slice(sep + 1);
+
+  if (!safeCompare(username, 'admin') || !safeCompare(suppliedPassword, password)) {
+    res.writeHead(401, { 'WWW-Authenticate': 'Basic realm="BP Admin"' });
+    res.end('Authentication required.');
+    return false;
+  }
+
+  return true;
+}
+
+function createHttpServer() {
+  const token = readSecret('bt_mcp_api_token', 'BT_MCP_API_TOKEN');
+  const adminPassword = readSecret('admin_page_password', 'ADMIN_PAGE_PASSWORD');
+  return http.createServer(async (req, res) => {
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS, DELETE');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, Mcp-Session-Id');
+    res.setHeader('Access-Control-Expose-Headers', 'Mcp-Session-Id');
+
+    if (req.method === 'OPTIONS') {
+      res.writeHead(204);
+      res.end();
+      return;
+    }
+
+    const reqUrl = new URL(req.url, 'http://localhost');
+    const urlPath = reqUrl.pathname;
+
+    if (req.method === 'GET' && urlPath === '/health') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: true, service: 'bt-pipeline-mcp' }));
+      return;
+    }
+
+    if (urlPath === '/admin' || urlPath === '/admin/status') {
+      if (!requireAdminAuth(req, res, adminPassword)) return;
+      const filters = {
+        scope: reqUrl.searchParams.get('scope') || '',
+        pipelineType: reqUrl.searchParams.get('pipelineType') || '',
+        severity: reqUrl.searchParams.get('severity') || '',
+        limit: Number(reqUrl.searchParams.get('limit') || 200),
+      };
+      const events = readAdminStatus(filters);
+      if (urlPath === '/admin/status') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ events }));
+        return;
+      }
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+      res.end(renderAdminPage(events, filters));
+      return;
+    }
+
+    if (urlPath === '/mcp') {
+      if (!token) {
+        res.writeHead(503, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'mcp_disabled' }));
+        return;
+      }
+      const auth = req.headers.authorization || '';
+      const urlToken = reqUrl.searchParams.get('token') || '';
+      const authed = auth === `Bearer ${token}` || urlToken === token;
+      if (!authed) {
+        res.writeHead(401, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'unauthorized' }));
+        return;
+      }
+
+      const mcpServer = createMcpServer();
+      const transport = new StreamableHTTPServerTransport({
+        sessionIdGenerator: undefined,
+      });
+
+      res.on('close', () => {
+        transport.close();
+        mcpServer.close();
+      });
+
+      await mcpServer.connect(transport);
+      await transport.handleRequest(req, res);
+      return;
+    }
+
+    res.writeHead(404, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'not found' }));
+  });
+}
+
 function startMcpServer() {
   const token = readSecret('bt_mcp_api_token', 'BT_MCP_API_TOKEN');
   if (!token) {
@@ -446,59 +708,11 @@ function startMcpServer() {
     cache.templates = null;
   }
 
-  const httpServer = http.createServer(async (req, res) => {
-    res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS, DELETE');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, Mcp-Session-Id');
-    res.setHeader('Access-Control-Expose-Headers', 'Mcp-Session-Id');
-
-    if (req.method === 'OPTIONS') {
-      res.writeHead(204);
-      res.end();
-      return;
-    }
-
-    if (req.method === 'GET' && req.url === '/health') {
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ ok: true, service: 'bt-pipeline-mcp' }));
-      return;
-    }
-
-    const reqUrl = new URL(req.url, "http://localhost");
-    const urlPath = reqUrl.pathname;
-
-    if (urlPath === "/mcp") {
-      const auth = req.headers.authorization || '';
-      const urlToken = reqUrl.searchParams.get("token") || '';
-      const authed = auth === `Bearer ${token}` || urlToken === token;
-      if (!authed) {
-        res.writeHead(401, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: 'unauthorized' }));
-        return;
-      }
-
-      const mcpServer = createMcpServer();
-      const transport = new StreamableHTTPServerTransport({
-        sessionIdGenerator: undefined, // stateless
-      });
-
-      res.on('close', () => {
-        transport.close();
-        mcpServer.close();
-      });
-
-      await mcpServer.connect(transport);
-      await transport.handleRequest(req, res);
-      return;
-    }
-
-    res.writeHead(404, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ error: 'not found' }));
-  });
+  const httpServer = createHttpServer();
 
   httpServer.listen(MCP_PORT, '0.0.0.0', () => {
     console.log(`[mcp] MCP server listening on port ${MCP_PORT}`);
   });
 }
 
-module.exports = { startMcpServer };
+module.exports = { startMcpServer, createHttpServer };

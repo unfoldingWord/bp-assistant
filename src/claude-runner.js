@@ -4,8 +4,7 @@
 const { ensureFreshToken } = require('./auth-refresh');
 const { recordRateLimit, getHeadroom } = require('./usage-tracker');
 const { createWorkspaceTools, createTnWriterTools, createQualityTools, createIssueIdTools } = require('./workspace-tools');
-const config = require('./config');
-const { sendDM } = require('./zulip-client');
+const { publishAdminStatus } = require('./admin-status');
 
 let _query = null;
 let _sdkCreateSdkMcpServer = null;
@@ -404,10 +403,14 @@ function sleep(ms) {
 
 async function notifyAdminDowntime(text) {
   try {
-    if (!config.adminUserId) return;
-    await sendDM(config.adminUserId, text);
+    await publishAdminStatus({
+      source: 'claude-runner',
+      pipelineType: 'system',
+      severity: 'warn',
+      message: text,
+    });
   } catch (err) {
-    console.warn(`[claude-runner] Failed to send downtime DM: ${err.message}`);
+    console.warn(`[claude-runner] Failed to publish downtime status: ${err.message}`);
   }
 }
 
