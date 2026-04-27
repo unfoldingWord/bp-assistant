@@ -22,37 +22,22 @@ function buildMessage(overrides = {}) {
   };
 }
 
-function buildClassifierResponse(payload) {
-  return {
-    content: [{ text: JSON.stringify(payload) }],
-  };
-}
-
 function wrapInJsonFence(text) {
   return `\`\`\`json\n${text}\n\`\`\``;
 }
 
-function createAnthropicStub(payload) {
-  return class AnthropicStub {
-    constructor() {
-      this.messages = {
-        create: async () => buildClassifierResponse(payload),
-      };
-    }
+function buildClassifierResult(payload) {
+  return {
+    raw: JSON.stringify(payload),
+    stopReason: 'end_turn',
   };
 }
 
 function createRuntime({ classifierPayload, fetchImpl, sentReplies, classifierInputs }) {
   return {
-    AnthropicClient: class AnthropicStub {
-      constructor() {
-        this.messages = {
-          create: async (request) => {
-            classifierInputs.push(request.messages[0].content);
-            return buildClassifierResponse(classifierPayload);
-          },
-        };
-      }
+    runClassifierQuery: async ({ classifierInput }) => {
+      classifierInputs.push(classifierInput);
+      return buildClassifierResult(classifierPayload);
     },
     sendMessage: async (stream, topic, text) => {
       sentReplies.push({ stream, topic, text });
@@ -63,28 +48,21 @@ function createRuntime({ classifierPayload, fetchImpl, sentReplies, classifierIn
     addReaction: async () => {},
     removeReaction: async () => {},
     readSecret: (name) => {
-      if (name === 'anthropic_api_key') return 'anthropic-test-key';
+      if (name === 'anthropic_api_key') throw new Error('anthropic_api_key should not be read');
       if (name === 'github_token') return 'github-test-token';
       return null;
     },
-    resolveProviderModel: () => 'claude-sonnet-test',
     fetchImpl,
   };
 }
 
-function createAnthropicSequenceStub(responses, classifierInputs) {
+function createClassifierSequenceStub(responses, classifierInputs) {
   let index = 0;
-  return class AnthropicStub {
-    constructor() {
-      this.messages = {
-        create: async (request) => {
-          classifierInputs.push(request.messages[0].content);
-          const next = responses[Math.min(index, responses.length - 1)];
-          index += 1;
-          return next;
-        },
-      };
-    }
+  return async ({ classifierInput }) => {
+    classifierInputs.push(classifierInput);
+    const next = responses[Math.min(index, responses.length - 1)];
+    index += 1;
+    return next;
   };
 }
 
@@ -289,14 +267,14 @@ test('issueReportPipeline retries classifier when JSON is truncated at max_token
   });
   const runtime = {
     ...createRuntime({ classifierPayload: payload, fetchImpl, sentReplies, classifierInputs }),
-    AnthropicClient: createAnthropicSequenceStub([
+    runClassifierQuery: createClassifierSequenceStub([
       {
-        stop_reason: 'max_tokens',
-        content: [{ text: '{\n  "complaints": [\n    { "id": "c1", "summary": "Split snippets still happen"' }],
+        stopReason: 'max_tokens',
+        raw: '{\n  "complaints": [\n    { "id": "c1", "summary": "Split snippets still happen"',
       },
       {
-        stop_reason: 'end_turn',
-        content: [{ text: JSON.stringify(payload) }],
+        stopReason: 'end_turn',
+        raw: JSON.stringify(payload),
       },
     ], classifierInputs),
   };
@@ -338,14 +316,14 @@ test('issueReportPipeline retries classifier when fenced JSON is truncated at ma
   });
   const runtime = {
     ...createRuntime({ classifierPayload: payload, fetchImpl, sentReplies, classifierInputs }),
-    AnthropicClient: createAnthropicSequenceStub([
+    runClassifierQuery: createClassifierSequenceStub([
       {
-        stop_reason: 'max_tokens',
-        content: [{ text: '```json\n{\n  "complaints": [\n    { "id": "c1", "summary": "Template choice is wrong",\n      "evidence"' }],
+        stopReason: 'max_tokens',
+        raw: '```json\n{\n  "complaints": [\n    { "id": "c1", "summary": "Template choice is wrong",\n      "evidence"',
       },
       {
-        stop_reason: 'end_turn',
-        content: [{ text: wrapInJsonFence(JSON.stringify(payload)) }],
+        stopReason: 'end_turn',
+        raw: wrapInJsonFence(JSON.stringify(payload)),
       },
     ], classifierInputs),
   };
@@ -387,14 +365,14 @@ test('issueReportPipeline retries classifier when fenced JSON is truncated witho
   });
   const runtime = {
     ...createRuntime({ classifierPayload: payload, fetchImpl, sentReplies, classifierInputs }),
-    AnthropicClient: createAnthropicSequenceStub([
+    runClassifierQuery: createClassifierSequenceStub([
       {
-        stop_reason: 'end_turn',
-        content: [{ text: '```json\n{\n  "complaints": [\n    { "id": "c1", "summary": "Template choice is wrong",\n      "evidence"' }],
+        stopReason: 'end_turn',
+        raw: '```json\n{\n  "complaints": [\n    { "id": "c1", "summary": "Template choice is wrong",\n      "evidence"',
       },
       {
-        stop_reason: 'end_turn',
-        content: [{ text: wrapInJsonFence(JSON.stringify(payload)) }],
+        stopReason: 'end_turn',
+        raw: wrapInJsonFence(JSON.stringify(payload)),
       },
     ], classifierInputs),
   };
@@ -610,13 +588,7 @@ test('issueReportPipeline reports invalid classifier JSON', async () => {
       sentReplies,
       classifierInputs: [],
     }),
-    AnthropicClient: class AnthropicStub {
-      constructor() {
-        this.messages = {
-          create: async () => ({ content: [{ text: '{not-json' }] }),
-        };
-      }
-    },
+    runClassifierQuery: async () => ({ raw: '{not-json', stopReason: 'end_turn' }),
   };
 
   await issueReportPipeline({}, buildMessage(), runtime);
@@ -798,14 +770,14 @@ test('issueReportPipeline avoids duplicate issue creation after partial dual-rep
     sentReplies,
     classifierInputs,
   });
-  runtime.AnthropicClient = createAnthropicSequenceStub([
+  runtime.runClassifierQuery = createClassifierSequenceStub([
     {
-      stop_reason: 'end_turn',
-      content: [{ text: JSON.stringify(firstClassifierPayload) }],
+      stopReason: 'end_turn',
+      raw: JSON.stringify(firstClassifierPayload),
     },
     {
-      stop_reason: 'end_turn',
-      content: [{ text: JSON.stringify(secondClassifierPayload) }],
+      stopReason: 'end_turn',
+      raw: JSON.stringify(secondClassifierPayload),
     },
   ], classifierInputs);
 
