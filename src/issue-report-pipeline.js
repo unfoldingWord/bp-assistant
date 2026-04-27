@@ -146,7 +146,7 @@ async function runAgentSdkClassifierQuery({ classifierInput, getClaudeQuery = ge
   await ensureFreshToken();
   const queryFn = await getClaudeQuery();
   const abortController = new AbortController();
-  const timer = setTimeout(() => abortController.abort(), 30000);
+  const timer = setTimeout(() => abortController.abort(), 300000);
   const options = {
     cwd: process.cwd(),
     abortController,
@@ -178,6 +178,11 @@ async function runAgentSdkClassifierQuery({ classifierInput, getClaudeQuery = ge
         if (!raw && typeof event.result === 'string') raw = event.result;
       }
     }
+  } catch (err) {
+    if (abortController.signal.aborted) {
+      throw new Error('Classifier timed out');
+    }
+    throw err;
   } finally {
     clearTimeout(timer);
     try { conversation.close(); } catch (_) {}
