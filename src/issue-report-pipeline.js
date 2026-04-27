@@ -1,9 +1,17 @@
 'use strict';
 
-const Anthropic = require('@anthropic-ai/sdk');
 const { sendMessage, sendDM, addReaction, removeReaction } = require('./zulip-client');
 const { readSecret } = require('./secrets');
-const { resolveProviderModel } = require('./api-runner/provider-config');
+const { ensureFreshToken } = require('./auth-refresh');
+
+let _query = null;
+async function getQuery() {
+  if (!_query) {
+    const sdk = await import('@anthropic-ai/claude-agent-sdk');
+    _query = sdk.query;
+  }
+  return _query;
+}
 
 const GITHUB_ORG = 'unfoldingWord';
 const VALID_REPOS = new Set(['bp-assistant', 'bp-assistant-skills']);
@@ -134,24 +142,68 @@ function shouldRetryClassifierJson(raw, stopReason) {
   return text.startsWith('{') && !text.endsWith('}');
 }
 
-async function classifyIssueReport(client, deps, classifierInput) {
+async function runAgentSdkClassifierQuery({ classifierInput, getClaudeQuery = getQuery }) {
+  await ensureFreshToken();
+  const queryFn = await getClaudeQuery();
+  const abortController = new AbortController();
+  const timer = setTimeout(() => abortController.abort(), 30000);
+  const options = {
+    cwd: process.cwd(),
+    abortController,
+    maxTurns: 1,
+    allowedTools: [],
+    permissionMode: 'bypassPermissions',
+    allowDangerouslySkipPermissions: true,
+    persistSession: false,
+    model: 'sonnet',
+    systemPrompt: SYSTEM_PROMPT,
+  };
+
+  const conversation = queryFn({
+    prompt: `Classify this issue report and respond with JSON only:\n\n${classifierInput}`,
+    options,
+  });
+  let raw = '';
+  let stopReason = 'unknown';
+
+  try {
+    for await (const event of conversation) {
+      if (abortController.signal.aborted) break;
+      if (event.type === 'assistant' && event.message?.content) {
+        for (const block of event.message.content) {
+          if (block && typeof block.text === 'string') raw += block.text;
+        }
+      } else if (event.type === 'result') {
+        stopReason = event.stop_reason || event.subtype || stopReason;
+        if (!raw && typeof event.result === 'string') raw = event.result;
+      }
+    }
+  } finally {
+    clearTimeout(timer);
+    try { conversation.close(); } catch (_) {}
+  }
+
+  if (abortController.signal.aborted) {
+    throw new Error('Classifier timed out');
+  }
+
+  return { raw: raw.trim(), stopReason };
+}
+
+async function classifyIssueReport(deps, classifierInput) {
   let lastRaw = '';
   let lastStopReason = 'unknown';
 
   for (let index = 0; index < CLASSIFIER_MAX_TOKENS.length; index++) {
     const maxTokens = CLASSIFIER_MAX_TOKENS[index];
-    const response = await client.messages.create({
-      model: deps.resolveProviderModel('claude', 'sonnet'),
-      max_tokens: maxTokens,
-      system: SYSTEM_PROMPT,
-      messages: [{
-        role: 'user',
-        content: classifierInput,
-      }],
+    const response = await deps.runClassifierQuery({
+      classifierInput,
+      maxTokens,
+      attempt: index + 1,
     });
 
-    const raw = response.content?.[0]?.text?.trim() || '';
-    const stopReason = response.stop_reason || 'unknown';
+    const raw = response?.raw?.trim() || '';
+    const stopReason = response?.stopReason || 'unknown';
     lastRaw = raw;
     lastStopReason = stopReason;
 
@@ -409,13 +461,15 @@ function summarizeIssues(issues) {
 
 function getRuntimeDeps(overrides = {}) {
   return {
-    AnthropicClient: overrides.AnthropicClient || Anthropic,
+    runClassifierQuery: overrides.runClassifierQuery || ((args) => runAgentSdkClassifierQuery({
+      ...args,
+      getClaudeQuery: overrides.getClaudeQuery || getQuery,
+    })),
     sendMessage: overrides.sendMessage || sendMessage,
     sendDM: overrides.sendDM || sendDM,
     addReaction: overrides.addReaction || addReaction,
     removeReaction: overrides.removeReaction || removeReaction,
     readSecret: overrides.readSecret || readSecret,
-    resolveProviderModel: overrides.resolveProviderModel || resolveProviderModel,
     fetchImpl: overrides.fetchImpl || fetch,
   };
 }
@@ -438,11 +492,7 @@ async function issueReportPipeline(route, message, overrides = {}) {
   try { await deps.addReaction(message.id, 'eyes'); } catch (_) {}
 
   try {
-    const apiKey = process.env.ANTHROPIC_API_KEY || deps.readSecret('anthropic_api_key', 'ANTHROPIC_API_KEY');
-    if (!apiKey) throw new Error('ANTHROPIC_API_KEY not configured');
-
-    const client = new deps.AnthropicClient({ apiKey });
-    const classified = await classifyIssueReport(client, deps, buildClassifierInput(message, feedbackText));
+    const classified = await classifyIssueReport(deps, buildClassifierInput(message, feedbackText));
     const githubToken = deps.readSecret('github_token', 'GITHUB_TOKEN');
     if (!githubToken) throw new Error('github_token secret not configured');
 
