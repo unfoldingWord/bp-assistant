@@ -233,6 +233,30 @@ test('prepareATContext keys off canonical at_required', () => {
   assert.equal(atCtx.packets[0].exact_ult_span, 'new text');
 });
 
+test('prepareATContext skips items whose generated note already contains an AT (idempotent re-runs)', () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tn-tools-atctx-idem-'));
+  const preparedRel = path.join('tmp', path.basename(tempDir), 'prepared_notes.json');
+  const generatedRel = path.join('tmp', path.basename(tempDir), 'generated_notes.json');
+  fs.mkdirSync(path.join('/srv/bot/workspace', 'tmp', path.basename(tempDir)), { recursive: true });
+
+  fs.writeFileSync(path.join('/srv/bot/workspace', preparedRel), JSON.stringify({
+    book: 'PSA',
+    chapter: '1',
+    items: [
+      { id: 'has_at', reference: '1:1', sref: 'figs-metaphor', at_required: true, gl_quote: 'foo', issue_span_gl_quote: 'foo', ult_verse: 'foo bar', ust_verse: 'ust one', scope_mode: 'focused_span' },
+      { id: 'no_at', reference: '1:2', sref: 'figs-metaphor', at_required: true, gl_quote: 'baz', issue_span_gl_quote: 'baz', ult_verse: 'baz qux', ust_verse: 'ust two', scope_mode: 'focused_span' },
+    ],
+  }, null, 2));
+  fs.writeFileSync(path.join('/srv/bot/workspace', generatedRel), JSON.stringify({
+    has_at: 'Existing note text. Alternate translation: [already filled]',
+    no_at: 'Existing note text without an AT.',
+  }, null, 2));
+
+  const atCtx = JSON.parse(prepareATContext({ preparedJson: preparedRel, generatedJson: generatedRel }));
+  assert.equal(atCtx.item_count, 1);
+  assert.equal(atCtx.packets[0].id, 'no_at');
+});
+
 test('resolveGlQuotes preserves contiguous aligned spans instead of unioning repeated Hebrew tokens', () => {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tn-tools-resolvegl-'));
   const relRoot = path.join('tmp', path.basename(tempDir));

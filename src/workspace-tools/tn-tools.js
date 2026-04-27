@@ -2557,6 +2557,9 @@ function prepareATContext({ preparedJson, generatedJson, output }) {
     if (item.programmatic_note) continue; // "see how" notes already have ATs
 
     const noteText = generatedNotes[item.id] || '';
+    // Idempotency: if this item's stored note already has an AT clause, skip it.
+    // Lets resume-to-fill-missing-ATs runs avoid double-appending (ZEC 3 incident).
+    if (/Alternate translation:/i.test(noteText)) continue;
     const verseCtx = getVerseContext(item.reference);
     const scopedQuote = item.issue_span_gl_quote || item.gl_quote || '';
 
