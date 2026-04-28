@@ -99,6 +99,44 @@ test('aligned USFM markup validator detects malformed trailing word markers and 
   }
 });
 
+test('aligned USFM completeness validator flags low alignment coverage with concrete verse examples', () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'aligned-completeness-'));
+  const oldBaseDir = process.env.CSKILLBP_DIR;
+  process.env.CSKILLBP_DIR = tempDir;
+
+  const usfmToolsPath = require.resolve('../src/workspace-tools/usfm-tools');
+  delete require.cache[usfmToolsPath];
+  const { validateAlignedUsfmCompleteness: validate } = require('../src/workspace-tools/usfm-tools');
+
+  try {
+    const lowRel = 'output/AI-ULT/ISA/ISA-52-aligned.usfm';
+    const okRel = 'output/AI-ULT/ISA/ISA-53-aligned.usfm';
+    const lowAbs = path.join(tempDir, lowRel);
+    const okAbs = path.join(tempDir, okRel);
+    fs.mkdirSync(path.dirname(lowAbs), { recursive: true });
+    fs.writeFileSync(
+      lowAbs,
+      '\\id ISA\n\\c 52\n\\v 1 \\w one|x\\w* \\w two|x\\w* \\w three|x\\w*\n\\v 2 plain text with no markers\n'
+    );
+    fs.writeFileSync(
+      okAbs,
+      '\\id ISA\n\\c 53\n\\v 1 \\zaln-s |x-strong="H1"\\*\\w one|x\\w* \\w two|x\\w* \\w three|x\\w* \\w four|x\\w* \\w five|x\\w* \\w six|x\\w* \\w seven|x\\w* \\w eight|x\\w* \\w nine|x\\w* \\w ten|x\\w*\\zaln-e\\*\n'
+    );
+
+    const low = validate({ alignedUsfm: lowRel });
+    const ok = validate({ alignedUsfm: okRel });
+
+    assert.equal(low.ok, false);
+    assert.ok(low.reasons.includes('low_verse_coverage'));
+    assert.match(low.summary, /no-alignment verses: 52:1, 52:2|no-alignment verses: 52:2/);
+    assert.equal(ok.ok, true);
+  } finally {
+    if (oldBaseDir == null) delete process.env.CSKILLBP_DIR;
+    else process.env.CSKILLBP_DIR = oldBaseDir;
+    delete require.cache[usfmToolsPath];
+  }
+});
+
 test('openai native alignment finalizer retries and degrades instead of failing on malformed output', () => {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'openai-native-align-degraded-'));
   const oldBaseDir = process.env.CSKILLBP_DIR;

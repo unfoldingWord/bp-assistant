@@ -21,6 +21,7 @@ const { setPendingMerge } = require('./pending-merges');
 const { getCheckpoint, setCheckpoint, clearCheckpoint } = require('./pipeline-checkpoints');
 const { buildGenerateContext, buildUstContext } = require('./pipeline-context');
 const { publishAdminStatus } = require('./admin-status');
+const { validateAlignedUsfmCompleteness } = require('./workspace-tools/usfm-tools');
 
 const LOG_DIR = path.resolve(__dirname, '../logs');
 const REQUIRED_INITIAL_PIPELINE_FILES = [
@@ -282,6 +283,14 @@ function isFreshOutput(relPath, minMs) {
   } catch {
     return false;
   }
+}
+
+function summarizeAlignmentValidation({ book, chapter, ultCheck, ustCheck }) {
+  const parts = [];
+  const ref = `${book} ${chapter}`;
+  if (ultCheck) parts.push(`ULT: ${ultCheck.summary}`);
+  if (ustCheck) parts.push(`UST: ${ustCheck.summary}`);
+  return `${ref} — ${parts.join(' || ')}`;
 }
 
 async function generatePipeline(route, message) {
@@ -867,7 +876,7 @@ async function generatePipeline(route, message) {
       }
     }
 
-    await status(`Running **align-all-parallel** for ${book} ${ch}...`);
+      await status(`Running **align-all-parallel** for ${book} ${ch} at ${new Date().toISOString()}...`);
     setCheckpoint(checkpointRef, {
       state: 'running',
       success,
@@ -945,41 +954,116 @@ async function generatePipeline(route, message) {
         success: alignResult?.subtype === 'success', userId: message.sender_id,
       });
 
-      // Discover aligned output files by recency — handles any naming variant
-      const alignPat = new RegExp(`^${book}-0*${ch}(-.*)?-aligned\\.usfm$`);
       const needUlt = contentTypes.includes('ult');
       const needUst = contentTypes.includes('ust');
-      const alignedUltRel = needUlt ? discoverFreshOutput('output/AI-ULT', book, alignPat, chapterStart) : null;
-      const alignedUstRel = needUst ? discoverFreshOutput('output/AI-UST', book, alignPat, chapterStart) : null;
+      let alignedUltRel = null;
+      let alignedUstRel = null;
+      let alignmentValidated = false;
+      let alignmentTerminalFailure = false;
+      let finalValidationSummary = '';
 
-      if ((needUlt && !alignedUltRel) || (needUst && !alignedUstRel)) {
-        const missing = [needUlt && !alignedUltRel && 'ULT', needUst && !alignedUstRel && 'UST'].filter(Boolean).join(', ');
-        await status(`**align-all-parallel** failed for ${book} ${ch} \u2014 aligned ${missing} file(s) not found (${alignDuration}s)`);
+      for (let alignAttempt = 1; alignAttempt <= 2; alignAttempt++) {
+        // Discover aligned output files by recency — handles any naming variant
+        const alignPat = new RegExp(`^${book}-0*${ch}(-.*)?-aligned\\.usfm$`);
+        alignedUltRel = needUlt ? discoverFreshOutput('output/AI-ULT', book, alignPat, chapterStart) : null;
+        alignedUstRel = needUst ? discoverFreshOutput('output/AI-UST', book, alignPat, chapterStart) : null;
+
+        if ((needUlt && !alignedUltRel) || (needUst && !alignedUstRel)) {
+          const missing = [needUlt && !alignedUltRel && 'ULT', needUst && !alignedUstRel && 'UST'].filter(Boolean).join(', ');
+          await status(`**align-all-parallel** failed for ${book} ${ch} at ${new Date().toISOString()} — aligned ${missing} file(s) not found (${alignDuration}s)`);
+          fail++;
+          setCheckpoint(checkpointRef, {
+            state: 'failed',
+            success,
+            fail,
+            completedChapters,
+            current: { chapter: ch, skill: 'align-all-parallel', status: 'failed', errorKind: 'missing_output', outputStatus: 'missing' },
+            resume: { chapter: ch, skill: 'align-all-parallel' },
+          });
+          alignmentTerminalFailure = true;
+          break;
+        }
+        if ((needUlt && !isFreshOutput(alignedUltRel, chapterStart)) || (needUst && !isFreshOutput(alignedUstRel, chapterStart))) {
+          await status(`**align-all-parallel** failed for ${book} ${ch} at ${new Date().toISOString()} — aligned output appears stale from an earlier run`);
+          fail++;
+          setCheckpoint(checkpointRef, {
+            state: 'failed',
+            success,
+            fail,
+            completedChapters,
+            current: { chapter: ch, skill: 'align-all-parallel', status: 'failed', errorKind: 'stale_output', outputStatus: 'stale' },
+            resume: { chapter: ch, skill: 'align-all-parallel' },
+          });
+          alignmentTerminalFailure = true;
+          break;
+        }
+
+        const ultCheck = needUlt ? validateAlignedUsfmCompleteness({ alignedUsfm: alignedUltRel }) : null;
+        const ustCheck = needUst ? validateAlignedUsfmCompleteness({ alignedUsfm: alignedUstRel }) : null;
+        finalValidationSummary = summarizeAlignmentValidation({ book, chapter: ch, ultCheck, ustCheck });
+        const validationOk = (!ultCheck || ultCheck.ok) && (!ustCheck || ustCheck.ok);
+        if (validationOk) {
+          alignmentValidated = true;
+          break;
+        }
+
+        await status(`Alignment validation failed for ${book} ${ch} (attempt ${alignAttempt}/2): ${finalValidationSummary}`);
+        if (alignAttempt === 2) break;
+
+        // Retry once: remove detected outputs and rerun alignment
+        for (const rel of [alignedUltRel, alignedUstRel].filter(Boolean)) {
+          try { fs.unlinkSync(path.resolve(CSKILLBP_DIR, rel)); } catch (_) { /* ignore */ }
+        }
+        await status(`Retrying **align-all-parallel** for ${book} ${ch} after degraded alignment check...`);
+        const retryResult = await runClaude({
+          prompt: `${alignRef} ${alignTypeFlags}${genCtxFlag}`,
+          cwd: CSKILLBP_DIR,
+          model: model || 'sonnet',
+          betas,
+          skill: 'align-all-parallel',
+          tools: DEFAULT_RESTRICTED_TOOLS,
+          disallowedTools: ['Bash'],
+          disableLocalSettings: true,
+          forceNoAutoBashSandbox: true,
+          timeoutMs: alignTimeout,
+          onProgress: ({ turnCount, lastTool, elapsedMs, timedOut }) => {
+            const elapsed = Math.round(elapsedMs / 60000);
+            const suffix = timedOut ? ' — **timed out**, aborting' : '';
+            return status(`Still aligning **${book} ${ch}** retry — ${elapsed}min, ${turnCount} tool calls${lastTool ? `, last: \`${lastTool}\`` : ''}${suffix}`);
+          },
+        });
+        if (!retryResult || retryResult.subtype !== 'success') {
+          finalValidationSummary = !retryResult
+            ? 'retry timed out or was aborted (no result returned)'
+            : (retryResult.error || retryResult.result || `retry non-success subtype: "${retryResult.subtype}"`);
+          break;
+        }
+      }
+
+      if (alignmentTerminalFailure) continue;
+
+      if (!alignmentValidated) {
+        await status(`**align-all-parallel** failed for ${book} ${ch} at ${new Date().toISOString()} — degraded alignment (${finalValidationSummary})`);
         fail++;
         setCheckpoint(checkpointRef, {
           state: 'failed',
           success,
           fail,
           completedChapters,
-          current: { chapter: ch, skill: 'align-all-parallel', status: 'failed', errorKind: 'missing_output', outputStatus: 'missing' },
+          current: {
+            chapter: ch,
+            skill: 'align-all-parallel',
+            status: 'failed',
+            errorKind: 'degraded_alignment',
+            outputStatus: 'degraded',
+            validationSummary: finalValidationSummary,
+          },
           resume: { chapter: ch, skill: 'align-all-parallel' },
         });
         continue;
       }
-      if ((needUlt && !isFreshOutput(alignedUltRel, chapterStart)) || (needUst && !isFreshOutput(alignedUstRel, chapterStart))) {
-        await status(`**align-all-parallel** failed for ${book} ${ch} \u2014 aligned output appears stale from an earlier run`);
-        fail++;
-        setCheckpoint(checkpointRef, {
-          state: 'failed',
-          success,
-          fail,
-          completedChapters,
-          current: { chapter: ch, skill: 'align-all-parallel', status: 'failed', errorKind: 'stale_output', outputStatus: 'stale' },
-          resume: { chapter: ch, skill: 'align-all-parallel' },
-        });
-        continue;
-      }
-      await status(`**align-all-parallel** done for ${book} ${ch} (${alignDuration}s)`);
+
+      await status(`**align-all-parallel** done for ${book} ${ch} (${alignDuration}s) — ${finalValidationSummary}`);
 
       // Collect for Phase 2 insertion (must be inside try block — alignedUltRel/alignedUstRel are block-scoped)
       if (!completedChapters.some((c) => c.ch === ch)) {
