@@ -41,3 +41,14 @@ test('publishAdminStatus persists events and readAdminStatus returns newest firs
   }
 });
 
+test('inferSeverity treats "succeeded with 0 failed" terminal summaries as success', () => {
+  const { inferSeverity } = require('../src/admin-status');
+  const severity = inferSeverity('Generation complete for **ZEC 4-4**: 1 succeeded, 0 failed.');
+  assert.equal(severity, 'success');
+});
+
+test('inferSeverity treats terminal failures as error', () => {
+  const { inferSeverity } = require('../src/admin-status');
+  assert.equal(inferSeverity('Notes pipeline for PSA 39 failed — all 1 chapter(s) had errors.'), 'error');
+  assert.equal(inferSeverity('Generation complete for **ZEC 4-4**: 0 succeeded, 1 failed.'), 'error');
+});
