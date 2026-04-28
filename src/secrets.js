@@ -1,5 +1,6 @@
 const fs = require('fs');
 const path = require('path');
+const { ANTHROPIC_API_KEY_ALIAS } = require('./anthropic-env');
 
 function readSecretFile(filePath) {
   if (!filePath) return null;
@@ -26,6 +27,10 @@ function readSecret(name, envFallback) {
 
   if (envFallback && process.env[envFallback]) {
     return process.env[envFallback];
+  }
+
+  if (envFallback === 'ANTHROPIC_API_KEY' && process.env[ANTHROPIC_API_KEY_ALIAS]) {
+    return process.env[ANTHROPIC_API_KEY_ALIAS];
   }
 
   return null;

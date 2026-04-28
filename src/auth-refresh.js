@@ -9,6 +9,7 @@
 const fs = require('fs');
 const path = require('path');
 const https = require('https');
+const { prioritizeClaudeOauth } = require('./anthropic-env');
 
 const CREDENTIALS_PATH = path.join(
   process.env.CLAUDE_CONFIG_DIR || path.join(require('os').homedir(), '.claude'),
@@ -45,6 +46,7 @@ async function ensureFreshToken() {
       if (token) process.env.CLAUDE_CODE_OAUTH_TOKEN = token;
     } catch (_) {}
   }
+  prioritizeClaudeOauth();
   if (process.env.CLAUDE_CODE_OAUTH_TOKEN) {
     return true;
   }
