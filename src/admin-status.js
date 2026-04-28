@@ -38,6 +38,14 @@ function inferPhase(message) {
 
 function inferSeverity(message) {
   const plain = stripMarkup(message).toLowerCase();
+  const terminalSummary = plain.match(/\b(\d+)\s+succeeded\b.*\b(\d+)\s+failed\b/);
+  if (terminalSummary) {
+    const failedCount = Number(terminalSummary[2]);
+    return failedCount === 0 ? 'success' : 'error';
+  }
+  if (/\b(done|complete|completed|ok|merged to master|restored)\b/.test(plain) && /\b0\s+failed\b/.test(plain)) {
+    return 'success';
+  }
   if (/\b(failed|error|aborting|abort)\b/.test(plain)) return 'error';
   if (/\b(done|complete|completed|ok|merged to master|restored)\b/.test(plain)) return 'success';
   if (/\b(paused|waiting|deferred|skipped|missing|blocked|could not|invalid|retry window exhausted)\b/.test(plain)) return 'warn';
