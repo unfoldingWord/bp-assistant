@@ -278,3 +278,85 @@ test('generatePipeline does not apply initial-pipeline guardrails to direct ULT-
     harness.cleanup();
   }
 });
+
+test('generatePipeline retries alignment once and fails with degraded_alignment when quality stays low', async () => {
+  let alignCalls = 0;
+  const harness = createHarness({
+    runClaudeImpl: async ({ options, tempDir }) => {
+      if (options.skill === 'initial-pipeline') {
+        fs.mkdirSync(path.join(tempDir, 'output', 'AI-ULT', 'ISA'), { recursive: true });
+        fs.mkdirSync(path.join(tempDir, 'output', 'AI-UST', 'ISA'), { recursive: true });
+        fs.mkdirSync(path.join(tempDir, 'output', 'issues', 'ISA'), { recursive: true });
+        fs.writeFileSync(path.join(tempDir, 'output', 'AI-ULT', 'ISA', 'ISA-52.usfm'), '\\id ISA\n\\c 52\n\\v 1 ult\n');
+        fs.writeFileSync(path.join(tempDir, 'output', 'AI-UST', 'ISA', 'ISA-52.usfm'), '\\id ISA\n\\c 52\n\\v 1 ust\n');
+        fs.writeFileSync(path.join(tempDir, 'output', 'issues', 'ISA', 'ISA-52.tsv'), 'Reference\tID\nISA 52:1\ta1b2\n');
+        return { subtype: 'success', usage: {}, total_cost_usd: 0 };
+      }
+      if (options.skill === 'align-all-parallel') {
+        alignCalls++;
+        fs.mkdirSync(path.join(tempDir, 'output', 'AI-ULT', 'ISA'), { recursive: true });
+        fs.mkdirSync(path.join(tempDir, 'output', 'AI-UST', 'ISA'), { recursive: true });
+        const degraded = '\\id ISA\n\\c 52\n\\v 1 \\w one|x\\w* \\w two|x\\w* \\w three|x\\w* \\w four|x\\w* \\w five|x\\w* \\w six|x\\w* \\w seven|x\\w* \\w eight|x\\w* \\w nine|x\\w* \\w ten|x\\w*\n';
+        fs.writeFileSync(path.join(tempDir, 'output', 'AI-ULT', 'ISA', 'ISA-52-aligned.usfm'), degraded);
+        fs.writeFileSync(path.join(tempDir, 'output', 'AI-UST', 'ISA', 'ISA-52-aligned.usfm'), degraded);
+        return { subtype: 'success', usage: {}, total_cost_usd: 0 };
+      }
+      return { subtype: 'success', usage: {}, total_cost_usd: 0 };
+    },
+  });
+
+  try {
+    await harness.generatePipeline(
+      { _synthetic: true, _book: 'ISA', _startChapter: 52, _endChapter: 52, skill: 'initial-pipeline', operations: 6 },
+      buildMessage('generate isa 52', { sender_id: 7 })
+    );
+
+    assert.equal(alignCalls, 2);
+    assert.ok(harness.checkpoints.some((patch) => patch.current?.errorKind === 'degraded_alignment'));
+    assert.ok(harness.readStatusTexts().some((text) => text.includes('Retrying **align-all-parallel**')));
+  } finally {
+    harness.cleanup();
+  }
+});
+
+test('generatePipeline reruns align-all-parallel when first post-align validation fails', async () => {
+  let alignCalls = 0;
+  const harness = createHarness({
+    runClaudeImpl: async ({ options, tempDir }) => {
+      if (options.skill === 'initial-pipeline') {
+        fs.mkdirSync(path.join(tempDir, 'output', 'AI-ULT', 'ISA'), { recursive: true });
+        fs.mkdirSync(path.join(tempDir, 'output', 'AI-UST', 'ISA'), { recursive: true });
+        fs.mkdirSync(path.join(tempDir, 'output', 'issues', 'ISA'), { recursive: true });
+        fs.writeFileSync(path.join(tempDir, 'output', 'AI-ULT', 'ISA', 'ISA-52.usfm'), '\\id ISA\n\\c 52\n\\v 1 ult\n');
+        fs.writeFileSync(path.join(tempDir, 'output', 'AI-UST', 'ISA', 'ISA-52.usfm'), '\\id ISA\n\\c 52\n\\v 1 ust\n');
+        fs.writeFileSync(path.join(tempDir, 'output', 'issues', 'ISA', 'ISA-52.tsv'), 'Reference\tID\nISA 52:1\ta1b2\n');
+        return { subtype: 'success', usage: {}, total_cost_usd: 0 };
+      }
+      if (options.skill === 'align-all-parallel') {
+        alignCalls++;
+        fs.mkdirSync(path.join(tempDir, 'output', 'AI-ULT', 'ISA'), { recursive: true });
+        fs.mkdirSync(path.join(tempDir, 'output', 'AI-UST', 'ISA'), { recursive: true });
+        const degraded = '\\id ISA\n\\c 52\n\\v 1 plain text no milestones\n';
+        const good = '\\id ISA\n\\c 52\n\\v 1 \\zaln-s |x-strong="H1" x-content="א"\\*\\w Joshua|x-occurrence="1" x-occurrences="1"\\w*\\zaln-e\\*\n';
+        const out = alignCalls === 1 ? degraded : good;
+        fs.writeFileSync(path.join(tempDir, 'output', 'AI-ULT', 'ISA', 'ISA-52-aligned.usfm'), out);
+        fs.writeFileSync(path.join(tempDir, 'output', 'AI-UST', 'ISA', 'ISA-52-aligned.usfm'), out);
+        return { subtype: 'success', usage: {}, total_cost_usd: 0 };
+      }
+      return { subtype: 'success', usage: {}, total_cost_usd: 0 };
+    },
+  });
+
+  try {
+    await harness.generatePipeline(
+      { _synthetic: true, _book: 'ISA', _startChapter: 52, _endChapter: 52, skill: 'initial-pipeline', operations: 6 },
+      buildMessage('generate isa 52', { sender_id: 7 })
+    );
+
+    assert.equal(alignCalls, 2);
+    assert.ok(harness.readStatusTexts().some((text) => text.includes('Alignment validation failed for ISA 52 (attempt 1/2)')));
+    assert.ok(harness.readStatusTexts().some((text) => text.includes('Retrying **align-all-parallel** for ISA 52')));
+  } finally {
+    harness.cleanup();
+  }
+});

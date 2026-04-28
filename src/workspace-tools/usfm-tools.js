@@ -615,6 +615,71 @@ function summarizeAlignedUsfmMarkupFindings(findings, maxExamples = 5) {
     .join('; ');
 }
 
+function validateAlignedUsfmCompleteness({
+  alignedUsfm,
+  minVerseCoverage = 0.6,
+  minWordMarkers = 1,
+  maxExamples = 5,
+}) {
+  const filePath = path.resolve(CSKILLBP_DIR, alignedUsfm);
+  if (!fs.existsSync(filePath)) {
+    return {
+      ok: false,
+      summary: `Aligned USFM missing: ${alignedUsfm}`,
+      reasons: ['missing_file'],
+      malformed: null,
+      metrics: { verseCount: 0, alignedVerseCount: 0, verseCoverage: 0, wordMarkerCount: 0, zalnStartCount: 0 },
+      examples: [],
+    };
+  }
+
+  const malformed = validateAlignedUsfmMarkup({ alignedUsfm, maxExamples });
+  const content = fs.readFileSync(filePath, 'utf8');
+  const verses = [];
+  const lines = content.split('\n');
+  let chapter = null;
+
+  for (const line of lines) {
+    const chMatch = line.match(/^\\c\s+(\d+)/);
+    if (chMatch) chapter = chMatch[1];
+    const verseMatch = line.match(/\\v\s+(\d+)/);
+    if (!verseMatch) continue;
+    const verse = verseMatch[1];
+    const ref = chapter ? `${chapter}:${verse}` : `?:${verse}`;
+    const hasZaln = /\\zaln-s\b/.test(line);
+    const wordCount = (line.match(/\\w\s+/g) || []).length;
+    verses.push({ ref, hasZaln, wordCount });
+  }
+
+  const verseCount = verses.length;
+  const alignedVerseCount = verses.filter((v) => v.hasZaln).length;
+  const verseCoverage = verseCount > 0 ? alignedVerseCount / verseCount : 0;
+  const wordMarkerCount = (content.match(/\\w\s+/g) || []).length;
+  const zalnStartCount = (content.match(/\\zaln-s\b/g) || []).length;
+  const missingVerseExamples = verses.filter((v) => !v.hasZaln).slice(0, maxExamples).map((v) => v.ref);
+
+  const reasons = [];
+  if (!malformed.ok) reasons.push('malformed_markup');
+  if (verseCount > 0 && verseCoverage < minVerseCoverage) reasons.push('low_verse_coverage');
+  if (wordMarkerCount < minWordMarkers || zalnStartCount === 0) reasons.push('low_marker_density');
+
+  const summaryParts = [];
+  summaryParts.push(
+    `coverage=${alignedVerseCount}/${verseCount} verses (${(verseCoverage * 100).toFixed(1)}%), markers: \\zaln-s=${zalnStartCount}, \\w=${wordMarkerCount}`
+  );
+  if (!malformed.ok) summaryParts.push(`malformed: ${summarizeAlignedUsfmMarkupFindings(malformed.findings, maxExamples)}`);
+  if (missingVerseExamples.length > 0) summaryParts.push(`no-alignment verses: ${missingVerseExamples.join(', ')}`);
+
+  return {
+    ok: reasons.length === 0,
+    summary: `${reasons.length === 0 ? 'Alignment quality OK' : 'Alignment quality degraded'} for ${alignedUsfm} — ${summaryParts.join(' | ')}`,
+    reasons,
+    malformed,
+    metrics: { verseCount, alignedVerseCount, verseCoverage, wordMarkerCount, zalnStartCount },
+    examples: missingVerseExamples,
+  };
+}
+
 function countWords(words) {
   const counts = {};
   for (const w of words) {
@@ -932,6 +997,7 @@ module.exports = {
   validateAlignmentJson,
   validateAlignedUsfmMarkup,
   summarizeAlignedUsfmMarkupFindings,
+  validateAlignedUsfmCompleteness,
   validateUltBrackets,
   checkUltVoiceMismatch,
 };
