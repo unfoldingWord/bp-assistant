@@ -445,12 +445,27 @@ function escapeHtml(text) {
     .replace(/"/g, '&quot;');
 }
 
+function fmtTime(ts) {
+  try {
+    return new Date(ts).toLocaleString('en-US', {
+      timeZone: 'America/Chicago',
+      month: 'short',
+      day: 'numeric',
+      hour: 'numeric',
+      minute: '2-digit',
+      hour12: true,
+    });
+  } catch (_) {
+    return String(ts || '');
+  }
+}
+
 function renderAdminPage(events, filters) {
   const initialEvents = JSON.stringify(events);
   const listMarkup = events.length
     ? events.map((event) => {
       const parts = [
-        `<time>${escapeHtml(event.timestamp)}</time>`,
+        `<time title="${escapeHtml(event.timestamp)}">${escapeHtml(fmtTime(event.timestamp))}</time>`,
         event.pipelineType ? `<span class="pipe">${escapeHtml(event.pipelineType)}</span>` : '',
         event.scope ? `<span class="scope">${escapeHtml(event.scope)}</span>` : '',
         event.phase ? `<span class="phase">${escapeHtml(event.phase)}</span>` : '',
@@ -538,6 +553,21 @@ function renderAdminPage(events, filters) {
       return String(text || '').replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;').replaceAll('"', '&quot;');
     }
 
+    function fmtTime(ts) {
+      try {
+        return new Date(ts).toLocaleString('en-US', {
+          timeZone: 'America/Chicago',
+          month: 'short',
+          day: 'numeric',
+          hour: 'numeric',
+          minute: '2-digit',
+          hour12: true,
+        });
+      } catch (_) {
+        return String(ts || '');
+      }
+    }
+
     function render(events) {
       if (!events.length) {
         list.innerHTML = '<li class="empty">No status events yet.</li>';
@@ -545,7 +575,7 @@ function renderAdminPage(events, filters) {
       }
       list.innerHTML = events.map((event) => {
         const parts = [
-          '<time>' + esc(event.timestamp) + '</time>',
+          '<time title="' + esc(event.timestamp) + '">' + esc(fmtTime(event.timestamp)) + '</time>',
           event.pipelineType ? '<span class="pipe">' + esc(event.pipelineType) + '</span>' : '',
           event.scope ? '<span class="scope">' + esc(event.scope) + '</span>' : '',
           event.phase ? '<span class="phase">' + esc(event.phase) + '</span>' : '',
