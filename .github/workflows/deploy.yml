@@ -1,6 +1,9 @@
 name: Deploy to Fly.io
 
 on:
+  push:
+    branches:
+      - main
   workflow_dispatch:
     inputs:
       confirm:
@@ -12,7 +15,7 @@ jobs:
   deploy:
     name: Deploy
     runs-on: ubuntu-latest
-    if: ${{ github.event.inputs.confirm == 'yes' }}
+    if: ${{ github.event_name == 'push' || github.event.inputs.confirm == 'yes' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v5

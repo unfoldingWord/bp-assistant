@@ -1,0 +1,115 @@
+name: Review Gate
+
+on:
+  pull_request:
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - ready_for_review
+
+concurrency:
+  group: review-gate-bp-assistant-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  review:
+    if: ${{ !github.event.pull_request.draft }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: superfly/flyctl-actions/setup-flyctl@master
+
+      - name: Start Fly Machine
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+          FLY_APP_NAME: ${{ secrets.FLY_APP_NAME }}
+          FLY_MACHINE_ID: ${{ secrets.FLY_MACHINE_ID }}
+        run: |
+          test -n "$FLY_API_TOKEN"
+          test -n "$FLY_APP_NAME"
+          test -n "$FLY_MACHINE_ID"
+          flyctl machine start "$FLY_MACHINE_ID" --app "$FLY_APP_NAME" || true
+
+      - name: Run Remote Review
+        id: review
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+          FLY_APP_NAME: ${{ secrets.FLY_APP_NAME }}
+          REVIEW_REPO: ${{ github.repository }}
+          REVIEW_PR: ${{ github.event.pull_request.number }}
+          REVIEW_BASE: ${{ github.event.pull_request.base.sha }}
+          REVIEW_HEAD: ${{ github.event.pull_request.head.sha }}
+          REVIEW_PROVIDER: both
+        run: |
+          set -euo pipefail
+          cmd="env RUN_MODE=pr-review PR_REVIEW_REPO=${REVIEW_REPO} PR_REVIEW_NUMBER=${REVIEW_PR} PR_REVIEW_BASE_SHA=${REVIEW_BASE} PR_REVIEW_HEAD_SHA=${REVIEW_HEAD} PR_REVIEW_PROVIDER=${REVIEW_PROVIDER} /app/scripts/fly/run-hourly-once.sh"
+          review_json=""
+          for attempt in 1 2 3 4 5 6; do
+            if review_json="$(flyctl ssh console --app "$FLY_APP_NAME" --command "$cmd")"; then
+              break
+            fi
+            if [ "$attempt" -eq 6 ]; then
+              exit 1
+            fi
+            sleep 10
+          done
+          printf '%s\n' "$review_json" > review-result.json
+          decision="$(node -e "const fs=require('fs'); const data=JSON.parse(fs.readFileSync('review-result.json','utf8')); process.stdout.write(String(data.decision||''));")"
+          summary="$(node -e "const fs=require('fs'); const data=JSON.parse(fs.readFileSync('review-result.json','utf8')); process.stdout.write(String(data.summary||''));")"
+          {
+            echo 'decision<<EOF'
+            echo "$decision"
+            echo EOF
+            echo 'summary<<EOF'
+            echo "$summary"
+            echo EOF
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Publish Summary
+        env:
+          SUMMARY: ${{ steps.review.outputs.summary }}
+          DECISION: ${{ steps.review.outputs.decision }}
+        run: |
+          {
+            echo "## Remote Review Gate"
+            echo
+            echo "- Decision: ${DECISION}"
+            echo
+            printf '%s\n' "$SUMMARY"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Comment PR
+        uses: actions/github-script@v7
+        env:
+          SUMMARY: ${{ steps.review.outputs.summary }}
+          DECISION: ${{ steps.review.outputs.decision }}
+        with:
+          script: |
+            const marker = '<!-- bp-review-gate -->';
+            const body = [
+              marker,
+              '## Remote Review Gate',
+              '',
+              `- Decision: ${process.env.DECISION}`,
+              '',
+              process.env.SUMMARY,
+            ].join('\n');
+            const { owner, repo } = context.repo;
+            const issue_number = context.payload.pull_request.number;
+            const comments = await github.paginate(github.rest.issues.listComments, { owner, repo, issue_number, per_page: 100 });
+            const existing = comments.find((comment) => comment.body && comment.body.includes(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body });
+            } else {
+              await github.rest.issues.createComment({ owner, repo, issue_number, body });
+            }
+
+      - name: Enforce Gate
+        env:
+          DECISION: ${{ steps.review.outputs.decision }}
+        run: |
+          test "$DECISION" = "PASS"
