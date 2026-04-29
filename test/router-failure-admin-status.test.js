@@ -50,7 +50,7 @@ test('router publishes admin-status event when pipeline dispatch throws', async 
   });
   installStub(pipelineRunnerPath, {
     runPipeline: async () => {
-      throw new Error('ctx is not defined');
+      throw new Error('simulated pipeline failure');
     },
   });
   installStub(zulipPath, {
@@ -104,7 +104,7 @@ test('router publishes admin-status event when pipeline dispatch throws', async 
       type: 'private',
       sender_id: 100,
       sender_full_name: 'Admin User',
-      content: 'write notes for zech 5',
+      content: 'write notes for psa 39',
     });
 
     await new Promise((resolve) => setTimeout(resolve, 25));
@@ -117,8 +117,8 @@ test('router publishes admin-status event when pipeline dispatch throws', async 
     assert.equal(latest.pipelineType, 'notes');
     assert.equal(latest.phase, 'router-dispatch');
     assert.equal(latest.severity, 'error');
-    assert.equal(latest.scope, 'ZEC 5');
-    assert.match(latest.message, /ctx is not defined/i);
+    assert.equal(latest.scope, 'PSA 39');
+    assert.match(latest.message, /simulated pipeline failure/i);
   } finally {
     delete require.cache[routerPath];
     delete require.cache[configPath];
