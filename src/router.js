@@ -11,6 +11,7 @@ const { listCheckpoints } = require('./pipeline-checkpoints');
 const { resumeInsertion } = require('./insertion-resume');
 const { normalizeBookName, isValidBook } = require('./pipeline-utils');
 const { isTransientOutageError } = require('./claude-runner');
+const { publishAdminStatus } = require('./admin-status');
 
 // In-memory pending confirmations for stream messages
 const pendingConfirmations = new Map();
@@ -399,6 +400,51 @@ function getPipelineType(route) {
   return null;
 }
 
+function getAdminPipelineType(route) {
+  if (route?.type === 'sdk') return 'generate';
+  if (route?.type === 'notes') return 'notes';
+  if (route?.type === 'tqs') return 'tqs';
+  if (route?.type === 'issue-report') return 'issue-report';
+  return 'system';
+}
+
+function inferRouteScope(route, message) {
+  if (route?._book && Number.isFinite(route?._startChapter) && Number.isFinite(route?._endChapter)) {
+    const start = route._startChapter;
+    const end = route._endChapter;
+    const scope = start === end ? `${route._book} ${start}` : `${route._book} ${start}-${end}`;
+    if (Number.isFinite(route?._verseStart) && Number.isFinite(route?._verseEnd) && start === end) {
+      return `${route._book} ${start}:${route._verseStart}-${route._verseEnd}`;
+    }
+    return scope;
+  }
+
+  const content = String(message?.content || '');
+  const match = content.match(/\b([1-3]?[A-Za-z]{2,})\s+(\d+(?::\d+(?:[-–—]\d+)?)?(?:\s*[-–—]\s*\d+)?)\b/);
+  if (!match) return null;
+  const book = normalizeBookName(match[1]);
+  if (!book) return null;
+  return `${book} ${String(match[2]).replace(/\s+/g, '')}`;
+}
+
+async function publishRouterFailure(route, message, err) {
+  const routeName = route?.name || 'unknown';
+  const errorMessage = err?.message || String(err);
+  const statusMessage = `Pipeline "${routeName}" failed: ${errorMessage}`;
+  try {
+    await publishAdminStatus({
+      source: 'router',
+      pipelineType: getAdminPipelineType(route),
+      scope: inferRouteScope(route, message),
+      phase: 'router-dispatch',
+      severity: 'error',
+      message: statusMessage,
+    });
+  } catch (statusErr) {
+    console.error(`[router] Failed to publish admin status for pipeline failure: ${statusErr.message}`);
+  }
+}
+
 function getResumeCheckpoint(route, sessionKey, captures) {
   const pipelineType = getPipelineType(route);
   if (!pipelineType) return null;
@@ -778,7 +824,10 @@ function firePipeline(route, message) {
   }
 
   runPipeline(route, message)
-    .catch(err => console.error(`[router] Pipeline "${route.name}" failed: ${err.message}`))
+    .catch(async (err) => {
+      console.error(`[router] Pipeline "${route.name}" failed: ${err.message}`);
+      await publishRouterFailure(route, message, err);
+    })
     .finally(() => {
       if (keys) {
         for (const k of keys) activePipelines.delete(k);
