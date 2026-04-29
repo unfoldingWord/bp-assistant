@@ -2542,10 +2542,11 @@ async function notesPipeline(route, message) {
       }
     }
 
+    const ctxForSync = pipeDir ? readContext(pipeDir) : null;
     const finalQuoteSyncSummary = finalCanonicalHebrewQuoteSync({
       notesPath: notesSource,
-      preparedJson: ctx.runtime.preparedNotes,
-      hebrewUsfm: ctx.sources.hebrew,
+      preparedJson: ctxForSync?.runtime?.preparedNotes,
+      hebrewUsfm: ctxForSync?.sources?.hebrew,
     });
     console.log(`[notes] Final canonical Hebrew quote sync: ${finalQuoteSyncSummary}`);
 
