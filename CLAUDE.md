@@ -9,11 +9,17 @@ The bot runs as the Fly.io app `uw-bt-bot` (single machine, region `dfw`).
   go through `gh workflow run deploy.yml -f confirm=yes`.
 
 ## Safety
-- **Before redeploying**, check for active pipelines with
+- The deploy workflow polls `https://uw-bt-bot.fly.dev/health/pipelines`
+  before running `flyctl deploy` and waits (up to 90 minutes) for `active`
+  to reach `0`. The endpoint reports `running` checkpoints whose `updatedAt`
+  is after this bot process started and within the last 60 minutes.
+- To bypass the guard (e.g. bot is crashed and unreachable), trigger the
+  workflow manually with `skip_pipeline_check=yes`:
+  `gh workflow run deploy.yml -f confirm=yes -f skip_pipeline_check=yes`.
+- For an ad-hoc check, snapshot fly logs as well:
   `flyctl logs -a uw-bt-bot --no-tail | tail -50`. Look for `[notes] Running`,
   `[generate] Processing`, or `[claude-runner] Starting` lines without a
-  corresponding completion — `--strategy immediate` will kill any in-progress
-  pipeline.
+  corresponding completion.
 - `[claude-runner]` lines that appear between a `[self-diagnosis] Starting`
   and a `[self-diagnosis] Done` boundary belong to the diagnosis sub-agent,
   not a user pipeline — those are safe to interrupt.

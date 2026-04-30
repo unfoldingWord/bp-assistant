@@ -11,11 +11,41 @@ const { StreamableHTTPServerTransport } = require('@modelcontextprotocol/sdk/ser
 const { z } = require('zod');
 const { readSecret } = require('./secrets');
 const { readAdminStatus } = require('./admin-status');
+const { listCheckpoints } = require('./pipeline-checkpoints');
 
 const ADMIN_PORT = Number(process.env.PORT || 8080);
 const MCP_PORT = Number(process.env.MCP_PORT || 3001);
 const MCP_BIND_HOST = process.env.MCP_BIND_HOST || '127.0.0.1';
 const DOOR43_BASE = 'https://git.door43.org/unfoldingWord';
+
+const PROCESS_STARTED_AT_MS = Date.now();
+
+// Checkpoints not touched within this window are treated as crashed/stale even
+// if the bot didn't restart — prevents a hung pipeline from blocking deploys
+// forever.
+const CHECKPOINT_FRESHNESS_MS = 60 * 60 * 1000;
+
+function getActivePipelines() {
+  const now = Date.now();
+  const rows = [];
+  for (const cp of listCheckpoints()) {
+    if (cp?.state !== 'running') continue;
+    const updatedMs = Date.parse(cp.updatedAt || '');
+    if (!Number.isFinite(updatedMs)) continue;
+    // Stale: checkpoint predates this process (left over from a kill).
+    if (updatedMs < PROCESS_STARTED_AT_MS) continue;
+    const ageMs = now - updatedMs;
+    if (ageMs > CHECKPOINT_FRESHNESS_MS) continue;
+    rows.push({
+      key: cp.key,
+      pipelineType: cp.pipelineType,
+      scope: cp.scope,
+      updatedAt: cp.updatedAt,
+      ageSeconds: Math.round(ageMs / 1000),
+    });
+  }
+  return rows;
+}
 
 // ---------------------------------------------------------------------------
 // Book number map
@@ -662,6 +692,17 @@ function createHttpServer() {
     if (req.method === 'GET' && urlPath === '/health') {
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ ok: true, service: 'bt-pipeline-mcp' }));
+      return;
+    }
+
+    if (req.method === 'GET' && urlPath === '/health/pipelines') {
+      const pipelines = getActivePipelines();
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        active: pipelines.length,
+        processStartedAt: new Date(PROCESS_STARTED_AT_MS).toISOString(),
+        pipelines,
+      }));
       return;
     }
 
