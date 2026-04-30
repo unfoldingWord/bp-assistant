@@ -59,9 +59,7 @@ jobs:
           REVIEW_PR: ${{ github.event.pull_request.number }}
           REVIEW_BASE: ${{ github.event.pull_request.base.sha }}
           REVIEW_HEAD: ${{ github.event.pull_request.head.sha }}
-          # Codex-on-Fly needs an OPENAI_API_KEY secret on the reviewer app
-          # before "both" works; until then, run claude-only.
-          REVIEW_PROVIDER: claude
+          REVIEW_PROVIDER: both
         run: |
           set -euo pipefail
           # --restart no keeps the machine from auto-looping on non-zero exits,
