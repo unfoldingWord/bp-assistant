@@ -1,0 +1,59 @@
+name: Start Fly Issue Handler Machine (Issue Events)
+
+on:
+  issues:
+    types:
+      - opened
+      - labeled
+  workflow_dispatch:
+
+concurrency:
+  # Coalesce multiple events for the same issue (open + several labels in
+  # quick succession) into the latest wake. Machine-start is idempotent and
+  # the in-flight wake covers the latest event, so cancelling earlier ones
+  # avoids piling up workflow minutes.
+  group: fly-start-issue-${{ github.event.issue.id || github.run_id }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  start-machine:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.issue.user.login == 'deferredreward'
+    runs-on: ubuntu-latest
+    steps:
+      # Pinned to a SHA to remove supply-chain risk from a moving @master ref
+      # being repointed (the action is colocated with FLY_API_TOKEN). v1.6.
+      - uses: superfly/flyctl-actions/setup-flyctl@ed8efb33836e8b2096c7fd3ba1c8afe303ebbff1
+      - name: Start Fly Machine
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+          FLY_APP_NAME: ${{ secrets.FLY_APP_NAME }}
+        run: |
+          set -euo pipefail
+          test -n "$FLY_API_TOKEN"
+          test -n "$FLY_APP_NAME"
+          machine_id="$(flyctl machines list --app "$FLY_APP_NAME" --json \
+            | node -e "let s=''; process.stdin.on('data',c=>s+=c); process.stdin.on('end',()=>{ try { const j=JSON.parse(s); const m=Array.isArray(j)?j.find(x=>x&&x.id&&String(x.state||'').toLowerCase()!=='destroyed'):null; if (m) process.stdout.write(m.id); } catch {} });")"
+          if [ -z "$machine_id" ]; then
+            echo "Could not resolve a non-destroyed machine for app $FLY_APP_NAME" >&2
+            flyctl machines list --app "$FLY_APP_NAME" >&2 || true
+            exit 1
+          fi
+          echo "Resolved machine: $machine_id"
+          # Tolerate the case where review-gate has already started this machine
+          # in pr-review mode: don't clobber its restart policy and don't fail
+          # on a redundant `start`. The hourly cron will re-pick the issue if
+          # the in-flight run doesn't get to it.
+          state="$(flyctl machines list --app "$FLY_APP_NAME" --json \
+            | node -e "let s=''; process.stdin.on('data',c=>s+=c); process.stdin.on('end',()=>{ try { const j=JSON.parse(s); const m=Array.isArray(j)?j.find(x=>x&&x.id===process.argv[1]):null; if (m) process.stdout.write(String(m.state||'')); } catch {} });" "$machine_id" || echo "")"
+          echo "Current machine state: ${state:-(unknown)}"
+          if [ "$state" = "started" ] || [ "$state" = "starting" ]; then
+            echo "Machine already running; skipping update + start."
+            exit 0
+          fi
+          flyctl machine update "$machine_id" --app "$FLY_APP_NAME" --yes --skip-start --restart no
+          flyctl machine start "$machine_id" --app "$FLY_APP_NAME" || true
