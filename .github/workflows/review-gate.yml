@@ -83,12 +83,15 @@ jobs:
           set -euo pipefail
           flyctl machine start "$FLY_MACHINE_ID" --app "$FLY_APP_NAME"
           # Poll until the machine returns to a stopped state (entrypoint exited).
-          # Cap at ~15 minutes; review runs typically finish in a few minutes.
+          # `flyctl machine status` doesn't accept --json, so use `machines list
+          # --json` and filter by id. Cap at ~15 minutes; review runs typically
+          # finish in a few minutes.
           deadline=$((SECONDS + 900))
           state=""
           while [ "$SECONDS" -lt "$deadline" ]; do
-            state="$(flyctl machine status "$FLY_MACHINE_ID" --app "$FLY_APP_NAME" --json 2>/dev/null \
-              | node -e "let s=''; process.stdin.on('data',c=>s+=c); process.stdin.on('end',()=>{ try { const j=JSON.parse(s); process.stdout.write(String(j.state||j.Status||'')); } catch { process.stdout.write(''); } });" \
+            state="$(flyctl machines list --app "$FLY_APP_NAME" --json 2>/dev/null \
+              | node -e "let s=''; process.stdin.on('data',c=>s+=c); process.stdin.on('end',()=>{ try { const j=JSON.parse(s); const m=Array.isArray(j)?j.find(x=>x&&x.id===process.argv[1]):null; if (m) process.stdout.write(String(m.state||'')); } catch {} });" \
+                "$FLY_MACHINE_ID" \
               || echo "")"
             if [ "$state" = "stopped" ] || [ "$state" = "destroyed" ]; then
               break
