@@ -1,9 +1,22 @@
 # Zulip Bot App
 
+## Runtime
+
+The bot runs as the Fly.io app `uw-bt-bot` (single machine, region `dfw`).
+- Live logs: `flyctl logs -a uw-bt-bot` (or `--no-tail` for a snapshot).
+- Deploy: push to `main` triggers `.github/workflows/deploy.yml`, which runs
+  `flyctl deploy --remote-only --strategy immediate --ha=false`. Manual deploys
+  go through `gh workflow run deploy.yml -f confirm=yes`.
+
 ## Safety
-- **Before rebuilding/restarting the bot**, always run `docker logs zulip-bot --tail 30` and check for active running pipelines. Look for `[notes] Running` or `[generate] Processing` or `[claude-runner] Starting` lines without a corresponding completion. A restart will kill any in-progress pipeline.
-- `[claude-runner]` lines that appear between a `[self-diagnosis] Starting` and a `[self-diagnosis] Done` boundary belong to the diagnosis sub-agent, not a user pipeline — those are safe to interrupt.
-- Rebuild command: `cd /srv/bot/app && docker compose down && docker compose build && docker compose up -d`
+- **Before redeploying**, check for active pipelines with
+  `flyctl logs -a uw-bt-bot --no-tail | tail -50`. Look for `[notes] Running`,
+  `[generate] Processing`, or `[claude-runner] Starting` lines without a
+  corresponding completion — `--strategy immediate` will kill any in-progress
+  pipeline.
+- `[claude-runner]` lines that appear between a `[self-diagnosis] Starting`
+  and a `[self-diagnosis] Done` boundary belong to the diagnosis sub-agent,
+  not a user pipeline — those are safe to interrupt.
 
 ## Branch Awareness
 At the start of a session, run `git branch` to check the current branch. If not on `main`, flag it to the user before making changes — they may have been left on a feature branch from a previous session.
@@ -14,10 +27,13 @@ At the start of a session, run `git branch` to check the current branch. If not 
 
 ## Known Constraints
 
-### Docker container (Chainguard Node.js)
-- No bash, no Python, no native git binary — only Node.js
-- Node v25 (not v18 like the host) — different HTTP behavior
-- `door43-push.js` uses a **custom HTTP handler** (native `https`) instead of isomorphic-git's default `simple-get` module, which aborts on large repos (en_ult, en_ust) under Node v25 in containers. Do not revert to the default `require('isomorphic-git/http/node')`.
+### door43-push HTTP handler
+- `door43-push.js` uses a **custom HTTP handler** (native `https`) instead of
+  isomorphic-git's default `simple-get` module. The default aborts on large
+  repos (en_ult, en_ust) under newer Node versions in containers. Do not
+  revert to `require('isomorphic-git/http/node')`.
+- Originally hardened for the Chainguard container; the constraint persists
+  on Fly.io with the current Node version.
 
 ### Pipeline checkpoints
 - Checkpoint state must be one of: `running`, `failed`, `paused_for_outage`, `paused_for_usage_limit`
