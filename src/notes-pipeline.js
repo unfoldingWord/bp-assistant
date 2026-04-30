@@ -28,6 +28,7 @@ const { buildNotesContext, updateContextArtifacts, readContext, writeContext } =
 const { checkUltEdits } = require('./check-ult-edits');
 const { getVerseCount } = require('./verse-counts');
 const { publishAdminStatus } = require('./admin-status');
+const { dispatchSelfDiagnosis } = require('./self-diagnosis');
 
 const LOG_DIR = path.resolve(__dirname, '../logs');
 
@@ -1526,14 +1527,22 @@ async function notesPipeline(route, message) {
 
   async function status(text) {
     try {
-      await publishAdminStatus({
+      return await publishAdminStatus({
         source: 'notes-pipeline',
         pipelineType: 'notes',
         message: text,
       });
     } catch (err) {
       console.error(`[notes] Failed to publish admin status: ${err.message}`);
+      return null;
     }
+  }
+
+  function fireDiagnosis(event, extra = {}) {
+    if (!event || event.severity !== 'error') return;
+    dispatchSelfDiagnosis({ event, ...extra }).catch((err) => {
+      console.error(`[notes] dispatchSelfDiagnosis threw: ${err && err.message}`);
+    });
   }
 
   async function reply(text) {
@@ -2471,8 +2480,12 @@ async function notesPipeline(route, message) {
         skillOutputs,
         resume: { chapter: ch, skill: failedSkill },
       });
-      await status(`Chapter ${ref} failed at **${failedSkill}** after ${chapterDuration}s`);
+      const chapterFailEvent = await status(`Chapter ${ref} failed at **${failedSkill}** after ${chapterDuration}s`);
       if (abortForUsageLimit || abortForOutage) break;
+      fireDiagnosis(chapterFailEvent, {
+        checkpoint: getCheckpoint(checkpointRef),
+        errorText: `Skill that failed: ${failedSkill}\nChapter: ${ref}\nDuration: ${chapterDuration}s\nSkill outputs (truncated):\n${JSON.stringify(skillOutputs, null, 2).slice(0, 2000)}`,
+      });
       // Continue to next chapter instead of aborting the whole pipeline
       continue;
     }
@@ -2660,7 +2673,11 @@ async function notesPipeline(route, message) {
         current: { chapter: ch, skill: 'door43-push', status: 'failed', errorKind: 'push_failed' },
         resume: { chapter: ch, skill: 'door43-push' },
       });
-      await status(`Chapter ${ref} failed at **repo-insert/verify** after ${chapterDuration}s`);
+      const repoInsertFailEvent = await status(`Chapter ${ref} failed at **repo-insert/verify** after ${chapterDuration}s`);
+      fireDiagnosis(repoInsertFailEvent, {
+        checkpoint: getCheckpoint(checkpointRef),
+        errorText: `Repo-insert/verify failed for ${ref} after ${chapterDuration}s.`,
+      });
       continue;
     }
 

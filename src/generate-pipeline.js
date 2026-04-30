@@ -21,6 +21,7 @@ const { setPendingMerge } = require('./pending-merges');
 const { getCheckpoint, setCheckpoint, clearCheckpoint } = require('./pipeline-checkpoints');
 const { buildGenerateContext, buildUstContext } = require('./pipeline-context');
 const { publishAdminStatus } = require('./admin-status');
+const { dispatchSelfDiagnosis } = require('./self-diagnosis');
 const { validateAlignedUsfmCompleteness } = require('./workspace-tools/usfm-tools');
 
 const LOG_DIR = path.resolve(__dirname, '../logs');
@@ -306,14 +307,22 @@ async function generatePipeline(route, message) {
   // Helper: DM status to admin
   async function status(text) {
     try {
-      await publishAdminStatus({
+      return await publishAdminStatus({
         source: 'generate-pipeline',
         pipelineType: 'generate',
         message: text,
       });
     } catch (err) {
       console.error(`[generate] Failed to publish admin status: ${err.message}`);
+      return null;
     }
+  }
+
+  function fireDiagnosis(event, extra = {}) {
+    if (!event || event.severity !== 'error') return;
+    dispatchSelfDiagnosis({ event, ...extra }).catch((err) => {
+      console.error(`[generate] dispatchSelfDiagnosis threw: ${err && err.message}`);
+    });
   }
 
   // Helper: reply to the originating stream
@@ -633,7 +642,7 @@ async function generatePipeline(route, message) {
         });
         break;
       }
-      await status(`Failed to generate **${book} ${ch}**: ${errText}`);
+      const sdkErrEvent = await status(`Failed to generate **${book} ${ch}**: ${errText}`);
       fail++;
       setCheckpoint(checkpointRef, {
         state: 'failed',
@@ -642,6 +651,10 @@ async function generatePipeline(route, message) {
         completedChapters,
         current: { chapter: ch, skill, status: 'failed', errorKind: 'sdk_error', error: errText },
         resume: { chapter: ch, skill },
+      });
+      fireDiagnosis(sdkErrEvent, {
+        checkpoint: getCheckpoint(checkpointRef),
+        errorText: `Skill: ${skill}\nChapter: ${book} ${ch}\nSDK error:\n${errText}`,
       });
       continue;
     }
@@ -663,7 +676,7 @@ async function generatePipeline(route, message) {
         });
         break;
       }
-      await status(`Failed to generate **${book} ${ch}**: ${errText}`);
+      const nonSuccessEvent = await status(`Failed to generate **${book} ${ch}**: ${errText}`);
       fail++;
       setCheckpoint(checkpointRef, {
         state: 'failed',
@@ -672,6 +685,10 @@ async function generatePipeline(route, message) {
         completedChapters,
         current: { chapter: ch, skill, status: 'failed', errorKind: 'non_success_result', error: errText },
         resume: { chapter: ch, skill },
+      });
+      fireDiagnosis(nonSuccessEvent, {
+        checkpoint: getCheckpoint(checkpointRef),
+        errorText: `Skill: ${skill}\nChapter: ${book} ${ch}\nNon-success subtype: ${claudeResult?.subtype || 'unknown'}\nError:\n${errText}`,
       });
       continue;
     }
@@ -721,7 +738,7 @@ async function generatePipeline(route, message) {
 
     if (!hasRequiredGeneratedOutputs(contentTypes, { hasUlt, hasUst })) {
       const missingTypes = contentTypes.filter((type) => (type === 'ult' ? !hasUlt : !hasUst)).map((type) => type.toUpperCase());
-      await status(`Failed to generate **${book} ${ch}**. Missing expected output: ${missingTypes.join(', ')}.${hasUlt || hasUst ? ' Some artifacts exist but may be incomplete.' : ''} Check logs for details.`);
+      const missingEvent = await status(`Failed to generate **${book} ${ch}**. Missing expected output: ${missingTypes.join(', ')}.${hasUlt || hasUst ? ' Some artifacts exist but may be incomplete.' : ''} Check logs for details.`);
       fail++;
       setCheckpoint(checkpointRef, {
         state: 'failed',
@@ -738,12 +755,16 @@ async function generatePipeline(route, message) {
         },
         resume: { chapter: ch, skill },
       });
+      fireDiagnosis(missingEvent, {
+        checkpoint: getCheckpoint(checkpointRef),
+        errorText: `Skill: ${skill}\nChapter: ${book} ${ch}\nMissing types: ${missingTypes.join(', ')}\nhasUlt=${hasUlt} hasUst=${hasUst}`,
+      });
       continue;
     }
 
     const freshnessTarget = contentTypes.includes('ust') ? ustRel : ultRel;
     if (runInitialSkill && !hasVerseRange && freshnessTarget && !isFreshOutput(freshnessTarget, chapterStart)) {
-      await status(`Failed to generate **${book} ${ch}**: output appears stale from an earlier run (${freshnessTarget}).`);
+      const staleEvent = await status(`Failed to generate **${book} ${ch}**: output appears stale from an earlier run (${freshnessTarget}).`);
       fail++;
       setCheckpoint(checkpointRef, {
         state: 'failed',
@@ -752,6 +773,10 @@ async function generatePipeline(route, message) {
         completedChapters,
         current: { chapter: ch, skill, status: 'failed', errorKind: 'stale_output', outputStatus: 'stale', outputPath: freshnessTarget },
         resume: { chapter: ch, skill },
+      });
+      fireDiagnosis(staleEvent, {
+        checkpoint: getCheckpoint(checkpointRef),
+        errorText: `Skill: ${skill}\nChapter: ${book} ${ch}\nStale output path: ${freshnessTarget}`,
       });
       continue;
     }

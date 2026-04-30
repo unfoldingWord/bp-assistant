@@ -11,6 +11,7 @@ const { recordMetrics, getCumulativeTokens, recordRunSummary } = require('./usag
 const { verifyTq } = require('./workspace-tools/misc-tools');
 const { getChapterCount } = require('./verse-counts');
 const { publishAdminStatus } = require('./admin-status');
+const { dispatchSelfDiagnosis } = require('./self-diagnosis');
 
 function cleanContent(content) {
   return String(content || '').replace(/^@\*\*[^*]+\*\*\s*/, '').trim();
@@ -76,14 +77,22 @@ async function tqsPipeline(route, message) {
 
   async function status(text) {
     try {
-      await publishAdminStatus({
+      return await publishAdminStatus({
         source: 'tqs-pipeline',
         pipelineType: 'tqs',
         message: text,
       });
     } catch (err) {
       console.error(`[tqs] Failed to publish admin status: ${err.message}`);
+      return null;
     }
+  }
+
+  function fireDiagnosis(event, extra = {}) {
+    if (!event || event.severity !== 'error') return;
+    dispatchSelfDiagnosis({ event, ...extra }).catch((err) => {
+      console.error(`[tqs] dispatchSelfDiagnosis threw: ${err && err.message}`);
+    });
   }
 
   async function reply(text) {
@@ -202,8 +211,12 @@ async function tqsPipeline(route, message) {
         resume: { chapter, skill: 'tq-writer' },
       });
       recordRunSummary({ pipeline: 'tqs', book, startCh: startChapter, endCh: endChapter, tokensBefore, success: false, userId: message.sender_id });
-      await status(`**${ref}** failed during tq-writer: ${err.message}`);
+      const writerEvent = await status(`**${ref}** failed during tq-writer: ${err.message}`);
       await reply(`Translation questions failed for **${ref}**: ${err.message}`);
+      fireDiagnosis(writerEvent, {
+        checkpoint: getCheckpoint(checkpointRef),
+        errorText: err && err.stack ? err.stack : err && err.message,
+      });
       return;
     }
 
@@ -217,8 +230,12 @@ async function tqsPipeline(route, message) {
         resume: { chapter, skill: 'tq-writer' },
       });
       recordRunSummary({ pipeline: 'tqs', book, startCh: startChapter, endCh: endChapter, tokensBefore, success: false, userId: message.sender_id });
-      await status(`**${ref}** failed: expected output file missing: ${outputRel}`);
+      const missingEvent = await status(`**${ref}** failed: expected output file missing: ${outputRel}`);
       await reply(`Translation questions failed for **${ref}** because the expected output file is missing.`);
+      fireDiagnosis(missingEvent, {
+        checkpoint: getCheckpoint(checkpointRef),
+        errorText: `Expected output path: ${outputPath}\nWriter result subtype: ${result?.subtype || 'unknown'}\nWriter result text head: ${(typeof result?.result === 'string' ? result.result : '').slice(0, 1000)}`,
+      });
       return;
     }
 
@@ -233,8 +250,12 @@ async function tqsPipeline(route, message) {
         resume: { chapter, skill: 'tq-writer' },
       });
       recordRunSummary({ pipeline: 'tqs', book, startCh: startChapter, endCh: endChapter, tokensBefore, success: false, userId: message.sender_id });
-      await status(`**${ref}** failed verification:\n${verifyOutput}`);
+      const verifyEvent = await status(`**${ref}** failed verification:\n${verifyOutput}`);
       await reply(`Translation questions failed verification for **${ref}**.`);
+      fireDiagnosis(verifyEvent, {
+        checkpoint: getCheckpoint(checkpointRef),
+        errorText: `verifyTq output:\n${verifyOutput}`,
+      });
       return;
     }
 
@@ -297,8 +318,12 @@ async function tqsPipeline(route, message) {
         resume: { chapter, skill: 'door43-push' },
       });
       recordRunSummary({ pipeline: 'tqs', book, startCh: startChapter, endCh: endChapter, tokensBefore, success: false, userId: message.sender_id });
-      await status(`**${ref}** push failed: ${pushResult.details}`);
+      const pushEvent = await status(`**${ref}** push failed: ${pushResult.details}`);
       await reply(`Translation questions failed to push for **${ref}**.`);
+      fireDiagnosis(pushEvent, {
+        checkpoint: getCheckpoint(checkpointRef),
+        errorText: `Door43 push failed.\nDetails: ${pushResult.details}`,
+      });
       return;
     }
 
@@ -313,8 +338,12 @@ async function tqsPipeline(route, message) {
         resume: { chapter, skill: 'door43-push' },
       });
       recordRunSummary({ pipeline: 'tqs', book, startCh: startChapter, endCh: endChapter, tokensBefore, success: false, userId: message.sender_id });
-      await status(`**${ref}** push verification failed: ${verifyPush.details}`);
+      const verifyPushEvent = await status(`**${ref}** push verification failed: ${verifyPush.details}`);
       await reply(`Translation questions could not be verified on Door43 for **${ref}**.`);
+      fireDiagnosis(verifyPushEvent, {
+        checkpoint: getCheckpoint(checkpointRef),
+        errorText: `Push verify failed.\nDetails: ${verifyPush.details}`,
+      });
       return;
     }
 

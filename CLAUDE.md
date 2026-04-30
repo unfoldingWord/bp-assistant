@@ -2,6 +2,7 @@
 
 ## Safety
 - **Before rebuilding/restarting the bot**, always run `docker logs zulip-bot --tail 30` and check for active running pipelines. Look for `[notes] Running` or `[generate] Processing` or `[claude-runner] Starting` lines without a corresponding completion. A restart will kill any in-progress pipeline.
+- `[claude-runner]` lines that appear between a `[self-diagnosis] Starting` and a `[self-diagnosis] Done` boundary belong to the diagnosis sub-agent, not a user pipeline — those are safe to interrupt.
 - Rebuild command: `cd /srv/bot/app && docker compose down && docker compose build && docker compose up -d`
 
 ## Branch Awareness
