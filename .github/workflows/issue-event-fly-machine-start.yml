@@ -11,6 +11,9 @@ concurrency:
   group: fly-start-issue-${{ github.event.issue.id || github.run_id }}
   cancel-in-progress: false
 
+permissions:
+  contents: read
+
 jobs:
   start-machine:
     if: >-
@@ -35,5 +38,16 @@ jobs:
             exit 1
           fi
           echo "Resolved machine: $machine_id"
+          # Tolerate the case where review-gate has already started this machine
+          # in pr-review mode: don't clobber its restart policy and don't fail
+          # on a redundant `start`. The hourly cron will re-pick the issue if
+          # the in-flight run doesn't get to it.
+          state="$(flyctl machines list --app "$FLY_APP_NAME" --json \
+            | node -e "let s=''; process.stdin.on('data',c=>s+=c); process.stdin.on('end',()=>{ try { const j=JSON.parse(s); const m=Array.isArray(j)?j.find(x=>x&&x.id===process.argv[1]):null; if (m) process.stdout.write(String(m.state||'')); } catch {} });" "$machine_id" || echo "")"
+          echo "Current machine state: ${state:-(unknown)}"
+          if [ "$state" = "started" ] || [ "$state" = "starting" ]; then
+            echo "Machine already running; skipping update + start."
+            exit 0
+          fi
           flyctl machine update "$machine_id" --app "$FLY_APP_NAME" --yes --skip-start --restart no
-          flyctl machine start "$machine_id" --app "$FLY_APP_NAME"
+          flyctl machine start "$machine_id" --app "$FLY_APP_NAME" || true
