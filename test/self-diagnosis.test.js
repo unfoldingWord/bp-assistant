@@ -12,10 +12,22 @@ const {
   FINGERPRINT_PREFIX,
 } = require('../src/self-diagnosis');
 
-const {
-  buildFingerprint: vendoredBuildFingerprint,
-  classifyRepo: vendoredClassifyRepo,
-} = require('../../bp-assistant-auto-issue-handler/src/pipeline-failure-handler');
+// Parity tests against the source-of-truth fingerprint algorithm in
+// bp-assistant-auto-issue-handler. The sibling repo is only required when
+// developing both repos side-by-side; in CI / fresh checkouts it may not
+// exist, so load it lazily and skip those tests rather than crashing the
+// whole file.
+let vendoredBuildFingerprint = null;
+let vendoredClassifyRepo = null;
+try {
+  ({
+    buildFingerprint: vendoredBuildFingerprint,
+    classifyRepo: vendoredClassifyRepo,
+  } = require('../../bp-assistant-auto-issue-handler/src/pipeline-failure-handler'));
+} catch (err) {
+  if (err && err.code !== 'MODULE_NOT_FOUND') throw err;
+}
+const VENDORED_AVAILABLE = vendoredBuildFingerprint !== null;
 
 function makePsa1Event(overrides = {}) {
   return {
@@ -94,12 +106,12 @@ const VALID_AGENT_OUTPUT = `\`\`\`json
 }
 \`\`\``;
 
-test('buildFingerprint matches the vendored auto-issue-handler implementation', () => {
+test('buildFingerprint matches the vendored auto-issue-handler implementation', { skip: !VENDORED_AVAILABLE }, () => {
   const event = makePsa1Event();
   assert.equal(buildFingerprint(event), vendoredBuildFingerprint(event));
 });
 
-test('classifyRepo matches the vendored auto-issue-handler implementation (default)', () => {
+test('classifyRepo matches the vendored auto-issue-handler implementation (default)', { skip: !VENDORED_AVAILABLE }, () => {
   const event = makePsa1Event();
   const ours = classifyRepo(event);
   const theirs = vendoredClassifyRepo(event);

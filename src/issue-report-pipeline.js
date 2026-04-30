@@ -4,8 +4,6 @@ const { sendMessage, sendDM, addReaction, removeReaction } = require('./zulip-cl
 const { readSecret } = require('./secrets');
 const { ensureFreshToken } = require('./auth-refresh');
 const {
-  buildGithubHeaders,
-  searchExistingIssue,
   searchExistingIssueByMarkers,
   createGithubIssue,
   updateGithubIssue,
@@ -20,7 +18,6 @@ async function getQuery() {
   return _query;
 }
 
-const GITHUB_ORG = 'unfoldingWord';
 const VALID_REPOS = new Set(['bp-assistant', 'bp-assistant-skills']);
 const VALID_LABELS = new Set(['bug', 'enhancement', 'ai-quality', 'template-compliance']);
 const TRIGGER_RE = /^(?:report|feedback|issue|bug)[:\s]\s*([\s\S]+)/i;

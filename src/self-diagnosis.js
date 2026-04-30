@@ -239,6 +239,14 @@ async function dispatchSelfDiagnosis({
     return { ok: false, reason: 'invalid-event' };
   }
 
+  // Boundary log markers so the restart-safety check in CLAUDE.md can
+  // distinguish a diagnosis sub-agent's [claude-runner] lines from a real
+  // in-progress pipeline session. Any [claude-runner] activity that falls
+  // between [self-diagnosis] Starting and [self-diagnosis] Done belongs to
+  // the diagnosis run, not to a user-initiated pipeline.
+  const scopeLabel = event.scope || '(no-scope)';
+  console.log(`[self-diagnosis] Starting (pipelineType=${event.pipelineType || 'unknown'} scope=${scopeLabel})`);
+
   try {
     const fingerprint = buildFingerprint(event);
     const targetRepo = classifyRepo(event);
@@ -258,6 +266,7 @@ async function dispatchSelfDiagnosis({
     );
     if (existing) {
       console.log(`[self-diagnosis] Existing issue ${existing.html_url} matches fingerprint ${fingerprint}; skipping`);
+      console.log(`[self-diagnosis] Done (action=reused issue=${targetRepo}#${existing.number})`);
       return { ok: true, action: 'reused', issue: existing, fingerprint };
     }
 
@@ -288,6 +297,7 @@ async function dispatchSelfDiagnosis({
       });
     } catch (_) { /* non-fatal */ }
 
+    console.log(`[self-diagnosis] Done (action=created issue=${finalRepo}#${created.number})`);
     return { ok: true, action: 'created', issue: created, fingerprint, classification: diagnosis.classification };
   } catch (err) {
     const reason = err && err.message ? err.message : String(err);
@@ -302,6 +312,7 @@ async function dispatchSelfDiagnosis({
         message: `Self-diagnosis failed for ${event.scope || 'event'}: ${reason.slice(0, 200)}`,
       });
     } catch (_) { /* non-fatal */ }
+    console.log(`[self-diagnosis] Done (action=failed reason=${reason.slice(0, 80)})`);
     return { ok: false, reason };
   }
 }
