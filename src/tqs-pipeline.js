@@ -65,6 +65,76 @@ function getOutputPath(book, chapter) {
   return path.join(CSKILLBP_DIR, 'output', 'tq', book, tag);
 }
 
+function listOutputCandidates(book, chapter) {
+  const dir = path.join(CSKILLBP_DIR, 'output', 'tq', book);
+  let files = [];
+  try {
+    files = fs.readdirSync(dir);
+  } catch (_) {
+    return [];
+  }
+  const chapterNum = Number(chapter);
+  if (!Number.isFinite(chapterNum)) return [];
+  return files.filter((name) => {
+    const m = String(name).match(/^([A-Z0-9]{3})-(\d{1,3})\.tsv$/);
+    if (!m) return false;
+    if (m[1] !== book) return false;
+    return Number(m[2]) === chapterNum;
+  }).sort();
+}
+
+function resolveOutputPath(book, chapter) {
+  const canonicalPath = getOutputPath(book, chapter);
+  const canonicalName = path.basename(canonicalPath);
+  if (fs.existsSync(canonicalPath)) {
+    return {
+      ok: true,
+      path: canonicalPath,
+      normalizedFrom: null,
+      candidates: [canonicalName],
+    };
+  }
+
+  const candidates = listOutputCandidates(book, chapter);
+  if (candidates.length !== 1) {
+    return {
+      ok: false,
+      reason: candidates.length === 0 ? 'missing' : 'ambiguous',
+      path: canonicalPath,
+      candidates,
+    };
+  }
+
+  const chosen = candidates[0];
+  const chosenPath = path.join(path.dirname(canonicalPath), chosen);
+  try {
+    fs.renameSync(chosenPath, canonicalPath);
+    return {
+      ok: true,
+      path: canonicalPath,
+      normalizedFrom: chosen,
+      candidates,
+    };
+  } catch (_) {
+    try {
+      fs.copyFileSync(chosenPath, canonicalPath);
+      return {
+        ok: true,
+        path: canonicalPath,
+        normalizedFrom: chosen,
+        candidates,
+      };
+    } catch (err) {
+      return {
+        ok: false,
+        reason: `normalize_failed:${err.message}`,
+        path: canonicalPath,
+        candidates,
+      };
+    }
+  }
+}
+
 function hasVerifyErrors(output) {
   const match = String(output || '').match(/(\d+)\s+error\(s\):/i);
   return match ? Number(match[1]) > 0 : false;
@@ -220,7 +290,8 @@ async function tqsPipeline(route, message) {
       return;
     }
 
-    if (!fs.existsSync(outputPath)) {
+    const resolvedOutput = resolveOutputPath(book, chapter);
+    if (!resolvedOutput.ok) {
       totalFail++;
       setCheckpoint(checkpointRef, {
         state: 'failed',
@@ -230,13 +301,24 @@ async function tqsPipeline(route, message) {
         resume: { chapter, skill: 'tq-writer' },
       });
       recordRunSummary({ pipeline: 'tqs', book, startCh: startChapter, endCh: endChapter, tokensBefore, success: false, userId: message.sender_id });
-      const missingEvent = await status(`**${ref}** failed: expected output file missing: ${outputRel}`);
+      const outputDir = path.join(CSKILLBP_DIR, 'output', 'tq', book);
+      const siblingText = resolvedOutput.candidates.length > 0
+        ? ` candidates: ${resolvedOutput.candidates.join(', ')}`
+        : '';
+      const detail = resolvedOutput.reason === 'ambiguous'
+        ? `ambiguous output files for chapter ${chapter}:${siblingText}`
+        : `expected output file missing: ${outputRel}${siblingText}`;
+      const missingEvent = await status(`**${ref}** failed: ${detail}`);
       await reply(`Translation questions failed for **${ref}** because the expected output file is missing.`);
       fireDiagnosis(missingEvent, {
         checkpoint: getCheckpoint(checkpointRef),
-        errorText: `Expected output path: ${outputPath}\nWriter result subtype: ${result?.subtype || 'unknown'}\nWriter result text head: ${(typeof result?.result === 'string' ? result.result : '').slice(0, 1000)}`,
+        errorText: `Expected output path: ${outputPath}\nOutput dir: ${outputDir}\nResolved output reason: ${resolvedOutput.reason || 'unknown'}\nCandidates: ${(resolvedOutput.candidates || []).join(', ') || '(none)'}\nWriter result subtype: ${result?.subtype || 'unknown'}\nWriter result text head: ${(typeof result?.result === 'string' ? result.result : '').slice(0, 1000)}`,
       });
       return;
+    }
+
+    if (resolvedOutput.normalizedFrom) {
+      await status(`Normalized output filename for **${ref}**: ${resolvedOutput.normalizedFrom} -> ${path.basename(outputPath)}`);
     }
 
     const verifyOutput = verifyTq({ tsvFile: outputRel });
@@ -367,4 +449,5 @@ module.exports = {
   tqsPipeline,
   parseWriteTqsCommand,
   buildParsedTqsRequest,
+  resolveOutputPath,
 };

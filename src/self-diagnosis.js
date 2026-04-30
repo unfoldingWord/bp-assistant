@@ -257,10 +257,14 @@ async function runDiagnosisAgent({ contextSummary, runClaudeImpl }) {
     timeoutMs: 3 * 60 * 1000,
     guardrails: { maxToolCalls: 25, tokenBudget: 200000 },
   });
-  if (result?.subtype && result.subtype !== 'success') {
-    throw new Error(`Diagnosis agent did not complete cleanly: subtype=${result.subtype}`);
-  }
-  return extractResultText(result);
+  return {
+    subtype: result?.subtype || 'unknown',
+    rawText: extractResultText(result),
+    error: result?.error || '',
+    resultHead: typeof result?.result === 'string'
+      ? result.result.slice(0, 500)
+      : '',
+  };
 }
 
 function appendFingerprintMarker(body, fingerprint) {
@@ -378,7 +382,24 @@ async function dispatchSelfDiagnosis({
     const recentEvents = Array.isArray(recent) ? [...recent].reverse() : [];
 
     const contextSummary = buildContextSummary(event, recentEvents, checkpoint, errorText);
-    const rawText = await runDiagnosisAgent({ contextSummary, runClaudeImpl });
+    const agentResult = await runDiagnosisAgent({ contextSummary, runClaudeImpl });
+    const rawText = agentResult.rawText;
+    const cleanSubtype = agentResult.subtype || 'unknown';
+    const nonSuccess = cleanSubtype !== 'success';
+    if (nonSuccess) {
+      const flavor = rawText ? 'agent_non_success_with_text' : 'agent_non_success_no_text';
+      try {
+        await publishAdminStatus({
+          source: 'self-diagnosis',
+          pipelineType: event.pipelineType || 'system',
+          scope: event.scope || null,
+          phase: 'self-diagnosis',
+          severity: 'warn',
+          message: `Diagnosis agent non-success (${flavor}): subtype=${cleanSubtype}`,
+        });
+      } catch (_) { /* non-fatal */ }
+    }
+
     let diagnosis;
     let usedFallback = false;
     let parseError = null;
@@ -391,6 +412,13 @@ async function dispatchSelfDiagnosis({
         console.error(`[self-diagnosis] Persisted unparseable raw output to ${rawPath}`);
       }
       if (!looksLikeDiagnosisAttempt(rawText)) {
+        if (nonSuccess) {
+          throw new Error(
+            `Diagnosis agent did not complete cleanly: subtype=${cleanSubtype}; ` +
+            `error=${String(agentResult.error || '').slice(0, 200)}; ` +
+            `result_head=${String(agentResult.resultHead || '').slice(0, 200)}`
+          );
+        }
         throw err;
       }
       console.error(`[self-diagnosis] JSON parse failed (${err.message.slice(0, 200)}); filing fallback issue with raw output`);

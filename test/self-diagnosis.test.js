@@ -329,3 +329,58 @@ something happened`;
     assert.ok(files.length > 0, 'expected raw output to be persisted on parse failure');
   }
 });
+
+test('dispatchSelfDiagnosis files an issue when diagnosis subtype is non-success but text is diagnosis-shaped', async () => {
+  const brokenRaw = `\`\`\`json
+{
+  "repo": "bp-assistant",
+  "title": "Pipeline failure: tqs PSA 7 — writer used noncanonical chapter filename",
+  "body": "## Summary
+newline that breaks strict JSON parse.
+
+## Failure signal
+writer produced PSA-07.tsv"
+}`;
+  const event = makePsa1Event({ scope: 'PSA 7' });
+  const calls = {};
+  const fetchImpl = createGithubFetchStub({ captureCalls: calls });
+  const runClaudeImpl = async () => ({
+    subtype: 'error',
+    result: brokenRaw,
+    error: 'tool failure',
+  });
+
+  const result = await dispatchSelfDiagnosis({
+    event,
+    runClaudeImpl,
+    fetchImpl,
+    readSecretImpl: () => 'fake-token',
+    readAdminStatusImpl: () => [event],
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(calls.createCount, 1);
+});
+
+test('dispatchSelfDiagnosis fails with subtype details when diagnosis subtype is non-success and no usable text', async () => {
+  const event = makePsa1Event({ scope: 'PSA 7' });
+  const calls = {};
+  const fetchImpl = createGithubFetchStub({ captureCalls: calls });
+  const runClaudeImpl = async () => ({
+    subtype: 'error',
+    result: '',
+    error: 'no result available',
+  });
+
+  const result = await dispatchSelfDiagnosis({
+    event,
+    runClaudeImpl,
+    fetchImpl,
+    readSecretImpl: () => 'fake-token',
+    readAdminStatusImpl: () => [event],
+  });
+
+  assert.equal(result.ok, false);
+  assert.equal(calls.createCount, 0);
+  assert.match(result.reason, /subtype=error/);
+});

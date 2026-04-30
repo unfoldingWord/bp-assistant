@@ -224,6 +224,57 @@ test('tqsPipeline blocks push when expected output file is missing', async () =>
   }
 });
 
+test('tqsPipeline normalizes noncanonical single chapter filename before verify and push', async () => {
+  const harness = createHarness({
+    runClaudeImpl: async ({ tempDir }) => {
+      const outDir = path.join(tempDir, 'output', 'tq', 'PSA');
+      fs.mkdirSync(outDir, { recursive: true });
+      fs.writeFileSync(path.join(outDir, 'PSA-07.tsv'), 'Reference\tID\tTags\tQuote\tOccurrence\tQuestion\tResponse\n7:1\taaaa\t\t\t\tQ\tA\n');
+      return { subtype: 'success', usage: {}, total_cost_usd: 0 };
+    },
+  });
+
+  try {
+    await harness.tqsPipeline(
+      { _synthetic: true, _book: 'PSA', _startChapter: 7, _endChapter: 7, _wholeBook: false },
+      buildMessage('write tqs for psa 7')
+    );
+
+    const canonical = path.join(harness.tempDir, 'output', 'tq', 'PSA', 'PSA-007.tsv');
+    assert.equal(fs.existsSync(canonical), true);
+    assert.equal(harness.pushCalls.length, 1);
+    assert.equal(harness.summaries.at(-1).success, true);
+    assert.ok(harness.readStatusTexts().some((text) => text.includes('Normalized output filename')));
+  } finally {
+    harness.cleanup();
+  }
+});
+
+test('tqsPipeline fails with explicit ambiguity when multiple noncanonical chapter files exist', async () => {
+  const harness = createHarness({
+    runClaudeImpl: async ({ tempDir }) => {
+      const outDir = path.join(tempDir, 'output', 'tq', 'PSA');
+      fs.mkdirSync(outDir, { recursive: true });
+      fs.writeFileSync(path.join(outDir, 'PSA-7.tsv'), 'Reference\tID\tTags\tQuote\tOccurrence\tQuestion\tResponse\n7:1\taaaa\t\t\t\tQ\tA\n');
+      fs.writeFileSync(path.join(outDir, 'PSA-07.tsv'), 'Reference\tID\tTags\tQuote\tOccurrence\tQuestion\tResponse\n7:1\tbbbb\t\t\t\tQ\tA\n');
+      return { subtype: 'success', usage: {}, total_cost_usd: 0 };
+    },
+  });
+
+  try {
+    await harness.tqsPipeline(
+      { _synthetic: true, _book: 'PSA', _startChapter: 7, _endChapter: 7, _wholeBook: false },
+      buildMessage('write tqs for psa 7')
+    );
+
+    assert.equal(harness.pushCalls.length, 0);
+    assert.equal(harness.summaries.at(-1).success, false);
+    assert.ok(harness.readStatusTexts().some((text) => text.includes('ambiguous output files for chapter 7')));
+  } finally {
+    harness.cleanup();
+  }
+});
+
 test('tqsPipeline blocks push when verifyTq reports errors', async () => {
   const harness = createHarness({
     runClaudeImpl: async ({ tempDir }) => {
