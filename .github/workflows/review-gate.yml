@@ -23,6 +23,29 @@ jobs:
     steps:
       - uses: superfly/flyctl-actions/setup-flyctl@master
 
+      # Resolve the reviewer machine ID dynamically. Fly deploys with
+      # --strategy immediate destroy and recreate the machine, so any
+      # FLY_MACHINE_ID secret goes stale on every deploy. Look it up at
+      # runtime instead.
+      - name: Resolve reviewer machine ID
+        id: resolve
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+          FLY_APP_NAME: ${{ secrets.FLY_APP_NAME }}
+        run: |
+          set -euo pipefail
+          test -n "$FLY_API_TOKEN"
+          test -n "$FLY_APP_NAME"
+          machine_id="$(flyctl machines list --app "$FLY_APP_NAME" --json \
+            | node -e "let s=''; process.stdin.on('data',c=>s+=c); process.stdin.on('end',()=>{ try { const j=JSON.parse(s); const m=Array.isArray(j)?j.find(x=>x&&x.id&&String(x.state||'').toLowerCase()!=='destroyed'):null; if (m) process.stdout.write(m.id); } catch {} });")"
+          if [ -z "$machine_id" ]; then
+            echo "Could not resolve a non-destroyed machine for app $FLY_APP_NAME" >&2
+            flyctl machines list --app "$FLY_APP_NAME" >&2 || true
+            exit 1
+          fi
+          echo "Resolved reviewer machine: $machine_id"
+          echo "machine_id=$machine_id" >> "$GITHUB_OUTPUT"
+
       # The reviewer Fly machine is one-shot: starting it runs run-hourly-once.sh
       # and exits when the script returns. We can't SSH into a stopped machine,
       # so instead we configure the machine's env vars to drive a pr-review run,
@@ -31,7 +54,7 @@ jobs:
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
           FLY_APP_NAME: ${{ secrets.FLY_APP_NAME }}
-          FLY_MACHINE_ID: ${{ secrets.FLY_MACHINE_ID }}
+          FLY_MACHINE_ID: ${{ steps.resolve.outputs.machine_id }}
           REVIEW_REPO: ${{ github.repository }}
           REVIEW_PR: ${{ github.event.pull_request.number }}
           REVIEW_BASE: ${{ github.event.pull_request.base.sha }}
@@ -39,9 +62,6 @@ jobs:
           REVIEW_PROVIDER: both
         run: |
           set -euo pipefail
-          test -n "$FLY_API_TOKEN"
-          test -n "$FLY_APP_NAME"
-          test -n "$FLY_MACHINE_ID"
           flyctl machine update "$FLY_MACHINE_ID" --app "$FLY_APP_NAME" --yes --skip-start \
             --env "RUN_MODE=pr-review" \
             --env "PR_REVIEW_REPO=${REVIEW_REPO}" \
@@ -54,7 +74,7 @@ jobs:
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
           FLY_APP_NAME: ${{ secrets.FLY_APP_NAME }}
-          FLY_MACHINE_ID: ${{ secrets.FLY_MACHINE_ID }}
+          FLY_MACHINE_ID: ${{ steps.resolve.outputs.machine_id }}
         run: |
           set -euo pipefail
           flyctl machine start "$FLY_MACHINE_ID" --app "$FLY_APP_NAME"
@@ -77,11 +97,11 @@ jobs:
           fi
 
       - name: Restore machine to default mode
-        if: always()
+        if: always() && steps.resolve.outputs.machine_id != ''
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
           FLY_APP_NAME: ${{ secrets.FLY_APP_NAME }}
-          FLY_MACHINE_ID: ${{ secrets.FLY_MACHINE_ID }}
+          FLY_MACHINE_ID: ${{ steps.resolve.outputs.machine_id }}
         run: |
           set -euo pipefail
           # Clear pr-review env vars so the next hourly cron triggers an hourly run,
