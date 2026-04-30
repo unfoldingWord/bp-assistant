@@ -59,10 +59,14 @@ jobs:
           REVIEW_PR: ${{ github.event.pull_request.number }}
           REVIEW_BASE: ${{ github.event.pull_request.base.sha }}
           REVIEW_HEAD: ${{ github.event.pull_request.head.sha }}
-          REVIEW_PROVIDER: both
+          # Codex-on-Fly needs an OPENAI_API_KEY secret on the reviewer app
+          # before "both" works; until then, run claude-only.
+          REVIEW_PROVIDER: claude
         run: |
           set -euo pipefail
-          flyctl machine update "$FLY_MACHINE_ID" --app "$FLY_APP_NAME" --yes --skip-start \
+          # --restart no keeps the machine from auto-looping on non-zero exits,
+          # so the wait-for-stopped poll observes a clean terminal state.
+          flyctl machine update "$FLY_MACHINE_ID" --app "$FLY_APP_NAME" --yes --skip-start --restart no \
             --env "RUN_MODE=pr-review" \
             --env "PR_REVIEW_REPO=${REVIEW_REPO}" \
             --env "PR_REVIEW_NUMBER=${REVIEW_PR}" \
