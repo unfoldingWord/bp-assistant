@@ -4,7 +4,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 
-const { _postProcessNotesTsv } = require('../src/notes-pipeline');
+const { _postProcessNotesTsv, _finalCanonicalHebrewQuoteSync } = require('../src/notes-pipeline');
 const { syncCanonicalHebrewQuotes } = require('../src/workspace-tools/tn-tools');
 
 test('postProcessNotesTsv applies curly quote normalization to final TSV after AT assembly', () => {
@@ -204,4 +204,38 @@ test('syncCanonicalHebrewQuotes tags unresolved rows and continues', () => {
   assert.match(summary, /Unresolved 1/);
   assert.match(content, /^3:7\tef56\tISSUE:MATCH_FAIL\t/m);
   assert.match(content, /\tcurrent quote\t1\t/);
+});
+
+// Regression guard for issue #38:
+// The write-notes pipeline crashed with "ctx is not defined" when triggered
+// for Zechariah 5.  The root cause was a bare `ctx` reference in the
+// notesPipeline body at the finalCanonicalHebrewQuoteSync call site; `ctx`
+// was never declared in that scope.  The fix introduced:
+//
+//   const ctxForSync = pipeDir ? readContext(pipeDir) : null;
+//   finalCanonicalHebrewQuoteSync({
+//     preparedJson: ctxForSync?.runtime?.preparedNotes,
+//     hebrewUsfm:   ctxForSync?.sources?.hebrew,
+//   });
+//
+// When buildNotesContext() fails (pipeDir stays null), ctxForSync is null
+// and optional chaining returns undefined for both args.  The function must
+// return its skip message rather than throw.
+test('finalCanonicalHebrewQuoteSync skips gracefully when pipeDir is unavailable (ctx null-guard regression #38)', () => {
+  // Simulates ctxForSync = null  →  ctxForSync?.runtime?.preparedNotes === undefined
+  //                               →  ctxForSync?.sources?.hebrew        === undefined
+  const result = _finalCanonicalHebrewQuoteSync({
+    notesPath: 'output/notes/ZEC/ZEC-05.tsv',
+    preparedJson: undefined,
+    hebrewUsfm: undefined,
+  });
+  assert.match(result, /skipped/i, 'should return skip message, not crash with ctx-not-defined');
+
+  // Also confirm fully-null call (e.g. notesPath not yet resolved)
+  const result2 = _finalCanonicalHebrewQuoteSync({
+    notesPath: null,
+    preparedJson: null,
+    hebrewUsfm: null,
+  });
+  assert.match(result2, /skipped/i);
 });
