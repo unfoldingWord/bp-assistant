@@ -23,22 +23,15 @@ jobs:
     steps:
       - uses: superfly/flyctl-actions/setup-flyctl@master
 
-      - name: Start Fly Machine
+      # The reviewer Fly machine is one-shot: starting it runs run-hourly-once.sh
+      # and exits when the script returns. We can't SSH into a stopped machine,
+      # so instead we configure the machine's env vars to drive a pr-review run,
+      # start it, wait for it to exit, then read the JSON marker out of the logs.
+      - name: Configure machine for pr-review
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
           FLY_APP_NAME: ${{ secrets.FLY_APP_NAME }}
           FLY_MACHINE_ID: ${{ secrets.FLY_MACHINE_ID }}
-        run: |
-          test -n "$FLY_API_TOKEN"
-          test -n "$FLY_APP_NAME"
-          test -n "$FLY_MACHINE_ID"
-          flyctl machine start "$FLY_MACHINE_ID" --app "$FLY_APP_NAME" || true
-
-      - name: Run Remote Review
-        id: review
-        env:
-          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
-          FLY_APP_NAME: ${{ secrets.FLY_APP_NAME }}
           REVIEW_REPO: ${{ github.repository }}
           REVIEW_PR: ${{ github.event.pull_request.number }}
           REVIEW_BASE: ${{ github.event.pull_request.base.sha }}
@@ -46,20 +39,82 @@ jobs:
           REVIEW_PROVIDER: both
         run: |
           set -euo pipefail
-          cmd="env RUN_MODE=pr-review PR_REVIEW_REPO=${REVIEW_REPO} PR_REVIEW_NUMBER=${REVIEW_PR} PR_REVIEW_BASE_SHA=${REVIEW_BASE} PR_REVIEW_HEAD_SHA=${REVIEW_HEAD} PR_REVIEW_PROVIDER=${REVIEW_PROVIDER} /app/scripts/fly/run-hourly-once.sh"
-          review_json=""
-          for attempt in 1 2 3 4 5 6; do
-            if review_json="$(flyctl ssh console --app "$FLY_APP_NAME" --command "$cmd")"; then
+          test -n "$FLY_API_TOKEN"
+          test -n "$FLY_APP_NAME"
+          test -n "$FLY_MACHINE_ID"
+          flyctl machine update "$FLY_MACHINE_ID" --app "$FLY_APP_NAME" --yes --skip-start \
+            --env "RUN_MODE=pr-review" \
+            --env "PR_REVIEW_REPO=${REVIEW_REPO}" \
+            --env "PR_REVIEW_NUMBER=${REVIEW_PR}" \
+            --env "PR_REVIEW_BASE_SHA=${REVIEW_BASE}" \
+            --env "PR_REVIEW_HEAD_SHA=${REVIEW_HEAD}" \
+            --env "PR_REVIEW_PROVIDER=${REVIEW_PROVIDER}"
+
+      - name: Start machine and wait for completion
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+          FLY_APP_NAME: ${{ secrets.FLY_APP_NAME }}
+          FLY_MACHINE_ID: ${{ secrets.FLY_MACHINE_ID }}
+        run: |
+          set -euo pipefail
+          flyctl machine start "$FLY_MACHINE_ID" --app "$FLY_APP_NAME"
+          # Poll until the machine returns to a stopped state (entrypoint exited).
+          # Cap at ~15 minutes; review runs typically finish in a few minutes.
+          deadline=$((SECONDS + 900))
+          state=""
+          while [ "$SECONDS" -lt "$deadline" ]; do
+            state="$(flyctl machine status "$FLY_MACHINE_ID" --app "$FLY_APP_NAME" --json 2>/dev/null \
+              | node -e "let s=''; process.stdin.on('data',c=>s+=c); process.stdin.on('end',()=>{ try { const j=JSON.parse(s); process.stdout.write(String(j.state||j.Status||'')); } catch { process.stdout.write(''); } });" \
+              || echo "")"
+            if [ "$state" = "stopped" ] || [ "$state" = "destroyed" ]; then
               break
-            fi
-            if [ "$attempt" -eq 6 ]; then
-              exit 1
             fi
             sleep 10
           done
+          if [ "$state" != "stopped" ] && [ "$state" != "destroyed" ]; then
+            echo "Machine did not return to stopped state within timeout (last state: $state)" >&2
+            exit 1
+          fi
+
+      - name: Restore machine to default mode
+        if: always()
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+          FLY_APP_NAME: ${{ secrets.FLY_APP_NAME }}
+          FLY_MACHINE_ID: ${{ secrets.FLY_MACHINE_ID }}
+        run: |
+          set -euo pipefail
+          # Clear pr-review env vars so the next hourly cron triggers an hourly run,
+          # not another pr-review against this PR.
+          flyctl machine update "$FLY_MACHINE_ID" --app "$FLY_APP_NAME" --yes --skip-start \
+            --env "RUN_MODE=hourly" \
+            --env "PR_REVIEW_REPO=" \
+            --env "PR_REVIEW_NUMBER=" \
+            --env "PR_REVIEW_BASE_SHA=" \
+            --env "PR_REVIEW_HEAD_SHA=" \
+            --env "PR_REVIEW_PROVIDER=" || true
+
+      - name: Read review result from logs
+        id: review
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+          FLY_APP_NAME: ${{ secrets.FLY_APP_NAME }}
+        run: |
+          set -euo pipefail
+          # Pull recent logs and extract the latest PR_REVIEW_RESULT marker line.
+          # run-pr-review.js emits a single-line marker so we don't need to
+          # reassemble multi-line pretty JSON across log entries.
+          flyctl logs --app "$FLY_APP_NAME" --no-tail > all-logs.txt 2>&1 || true
+          marker_line="$(grep -E 'PR_REVIEW_RESULT:' all-logs.txt | tail -1 || true)"
+          if [ -z "$marker_line" ]; then
+            echo "No PR_REVIEW_RESULT marker found in logs (run may have crashed before emitting)." >&2
+            tail -100 all-logs.txt >&2 || true
+            exit 1
+          fi
+          review_json="$(printf '%s\n' "$marker_line" | sed -E 's/^.*PR_REVIEW_RESULT:[[:space:]]*//')"
           printf '%s\n' "$review_json" > review-result.json
-          decision="$(node -e "const fs=require('fs'); const data=JSON.parse(fs.readFileSync('review-result.json','utf8')); process.stdout.write(String(data.decision||''));")"
-          summary="$(node -e "const fs=require('fs'); const data=JSON.parse(fs.readFileSync('review-result.json','utf8')); process.stdout.write(String(data.summary||''));")"
+          decision="$(node -e "const fs=require('fs'); const d=JSON.parse(fs.readFileSync('review-result.json','utf8')); process.stdout.write(String(d.decision||''));")"
+          summary="$(node -e "const fs=require('fs'); const d=JSON.parse(fs.readFileSync('review-result.json','utf8')); process.stdout.write(String(d.summary||''));")"
           {
             echo 'decision<<EOF'
             echo "$decision"
