@@ -1,6 +1,8 @@
 'use strict';
 
 const crypto = require('crypto');
+const fs = require('fs');
+const path = require('path');
 const { runClaude } = require('./claude-runner');
 const { publishAdminStatus, readAdminStatus } = require('./admin-status');
 const { readSecret } = require('./secrets');
@@ -13,6 +15,9 @@ const DEFAULT_REPO = 'bp-assistant';
 const SKILLS_REPO = 'bp-assistant-skills';
 const VALID_REPOS = new Set([DEFAULT_REPO, SKILLS_REPO]);
 const FINGERPRINT_PREFIX = 'pipeline-failure-fingerprint:';
+const RAW_DIR = process.env.SELF_DIAGNOSIS_RAW_DIR
+  || path.resolve(__dirname, '../data/self-diagnosis-raw');
+const MAX_FALLBACK_BODY_CHARS = 50000;
 
 // Vendored from bp-assistant-auto-issue-handler/src/pipeline-failure-handler.js
 // Source-of-truth: keep these three functions byte-identical so the
@@ -152,23 +157,60 @@ function buildContextSummary(event, contextEvents, checkpoint, errorText) {
   return lines.join('\n');
 }
 
+// Most common diagnosis-agent failure: literal newlines / tabs / CRs sit
+// unescaped inside a JSON string value (typically the markdown body), making
+// JSON.parse choke. Walk the candidate, escape control chars while inside a
+// string, and also strip a few other common offenders (trailing commas).
+function repairAgentJson(candidate) {
+  let out = '';
+  let inString = false;
+  let escape = false;
+  for (let i = 0; i < candidate.length; i++) {
+    const ch = candidate[i];
+    if (escape) { out += ch; escape = false; continue; }
+    if (ch === '\\') { out += ch; escape = true; continue; }
+    if (ch === '"') { inString = !inString; out += ch; continue; }
+    if (inString) {
+      if (ch === '\n') { out += '\\n'; continue; }
+      if (ch === '\r') { out += '\\r'; continue; }
+      if (ch === '\t') { out += '\\t'; continue; }
+    }
+    out += ch;
+  }
+  return out.replace(/,(\s*[}\]])/g, '$1');
+}
+
+function tryParseDiagnosisJson(candidate) {
+  try { return JSON.parse(candidate); } catch { /* fall through */ }
+  const startIdx = candidate.indexOf('{');
+  const endIdx = candidate.lastIndexOf('}');
+  if (startIdx >= 0 && endIdx > startIdx) {
+    const sliced = candidate.slice(startIdx, endIdx + 1);
+    try { return JSON.parse(sliced); } catch { /* fall through */ }
+    try { return JSON.parse(repairAgentJson(sliced)); } catch { /* fall through */ }
+  }
+  try { return JSON.parse(repairAgentJson(candidate)); } catch { /* fall through */ }
+  return null;
+}
+
+// Lower-bar check: does this raw text look like an attempt at the diagnosis
+// JSON shape? Used to decide whether to file a fallback issue with the raw
+// text vs. just logging the failure.
+function looksLikeDiagnosisAttempt(raw) {
+  if (!raw || typeof raw !== 'string') return false;
+  if (!raw.includes('{')) return false;
+  return /"\s*(repo|title|body|classification)\s*"\s*:/i.test(raw);
+}
+
 function extractDiagnosisJson(raw) {
   if (!raw || typeof raw !== 'string') {
     throw new Error('Diagnosis agent returned no text');
   }
   const fenceMatch = raw.match(/```(?:json)?\s*([\s\S]*?)\s*```/i);
   const candidate = fenceMatch ? fenceMatch[1].trim() : raw.trim();
-  let parsed;
-  try {
-    parsed = JSON.parse(candidate);
-  } catch {
-    const startIdx = candidate.indexOf('{');
-    const endIdx = candidate.lastIndexOf('}');
-    if (startIdx >= 0 && endIdx > startIdx) {
-      parsed = JSON.parse(candidate.slice(startIdx, endIdx + 1));
-    } else {
-      throw new Error(`Diagnosis agent returned invalid JSON: ${candidate.slice(0, 200)}`);
-    }
+  const parsed = tryParseDiagnosisJson(candidate);
+  if (parsed === null) {
+    throw new Error(`Diagnosis agent returned invalid JSON: ${candidate.slice(0, 1000)}`);
   }
   if (!parsed || typeof parsed !== 'object') {
     throw new Error('Diagnosis agent returned non-object JSON');
@@ -226,6 +268,67 @@ function appendFingerprintMarker(body, fingerprint) {
   return `${body.trimEnd()}\n\n${marker}\n`;
 }
 
+function persistRawDiagnosisOutput(fingerprint, raw) {
+  try {
+    fs.mkdirSync(RAW_DIR, { recursive: true });
+    const ts = new Date().toISOString().replace(/[:.]/g, '-');
+    const file = path.join(RAW_DIR, `${fingerprint}-${ts}.txt`);
+    fs.writeFileSync(file, String(raw || ''), 'utf8');
+    return file;
+  } catch (err) {
+    console.error(`[self-diagnosis] Failed to persist raw output: ${err.message}`);
+    return null;
+  }
+}
+
+function buildFallbackDiagnosis(event, rawText, parseError, contextSummary) {
+  const targetRepo = classifyRepo(event);
+  const scopeLabel = event.scope || event.pipelineType || 'event';
+  const title = `Pipeline failure: ${event.pipelineType || 'unknown'} ${scopeLabel} — diagnosis JSON parse failed`
+    .slice(0, 120);
+  const truncatedRaw = String(rawText || '').slice(0, MAX_FALLBACK_BODY_CHARS);
+  const truncationNote = String(rawText || '').length > MAX_FALLBACK_BODY_CHARS
+    ? `\n\n_(raw output truncated to ${MAX_FALLBACK_BODY_CHARS} chars)_`
+    : '';
+  const body = [
+    '## Summary',
+    'The self-diagnosis agent ran but returned output that could not be parsed as JSON.',
+    'Filing this issue with the raw agent output so a human (or the auto-issue-handler) can triage.',
+    '',
+    '## Failure event',
+    `- pipelineType: ${event.pipelineType || '(unknown)'}`,
+    `- scope: ${event.scope || '(none)'}`,
+    `- phase: ${event.phase || '(none)'}`,
+    `- severity: ${event.severity || '(unknown)'}`,
+    `- message: ${event.message || '(none)'}`,
+    '',
+    '## Parse error',
+    '```',
+    String(parseError && parseError.message ? parseError.message : parseError).slice(0, 2000),
+    '```',
+    '',
+    '## Raw diagnosis agent output',
+    '```',
+    truncatedRaw + truncationNote,
+    '```',
+    '',
+    '## Diagnosis context (what the agent was given)',
+    '<details><summary>Click to expand</summary>',
+    '',
+    '```',
+    String(contextSummary || '').slice(0, 8000),
+    '```',
+    '</details>',
+  ].join('\n');
+  return {
+    repo: targetRepo,
+    title,
+    body,
+    labels: ['bug', 'pipeline-failure', 'self-diagnosis-parse-failure'],
+    classification: 'self-diagnosis-parse-failure',
+  };
+}
+
 async function dispatchSelfDiagnosis({
   event,
   checkpoint = null,
@@ -276,7 +379,24 @@ async function dispatchSelfDiagnosis({
 
     const contextSummary = buildContextSummary(event, recentEvents, checkpoint, errorText);
     const rawText = await runDiagnosisAgent({ contextSummary, runClaudeImpl });
-    const diagnosis = extractDiagnosisJson(rawText);
+    let diagnosis;
+    let usedFallback = false;
+    let parseError = null;
+    try {
+      diagnosis = extractDiagnosisJson(rawText);
+    } catch (err) {
+      parseError = err;
+      const rawPath = persistRawDiagnosisOutput(fingerprint, rawText);
+      if (rawPath) {
+        console.error(`[self-diagnosis] Persisted unparseable raw output to ${rawPath}`);
+      }
+      if (!looksLikeDiagnosisAttempt(rawText)) {
+        throw err;
+      }
+      console.error(`[self-diagnosis] JSON parse failed (${err.message.slice(0, 200)}); filing fallback issue with raw output`);
+      diagnosis = buildFallbackDiagnosis(event, rawText, err, contextSummary);
+      usedFallback = true;
+    }
 
     const finalRepo = VALID_REPOS.has(diagnosis.repo) ? diagnosis.repo : targetRepo;
     const finalBody = appendFingerprintMarker(diagnosis.body, fingerprint);
@@ -297,8 +417,9 @@ async function dispatchSelfDiagnosis({
       });
     } catch (_) { /* non-fatal */ }
 
-    console.log(`[self-diagnosis] Done (action=created issue=${finalRepo}#${created.number})`);
-    return { ok: true, action: 'created', issue: created, fingerprint, classification: diagnosis.classification };
+    const action = usedFallback ? 'created-fallback' : 'created';
+    console.log(`[self-diagnosis] Done (action=${action} issue=${finalRepo}#${created.number}${usedFallback ? ' parse-error=' + (parseError && parseError.message ? parseError.message.slice(0, 120) : 'unknown') : ''})`);
+    return { ok: true, action, issue: created, fingerprint, classification: diagnosis.classification };
   } catch (err) {
     const reason = err && err.message ? err.message : String(err);
     console.error(`[self-diagnosis] Failed: ${reason}`);
@@ -323,6 +444,9 @@ module.exports = {
   classifyRepo,
   normalizeSignature,
   extractDiagnosisJson,
+  repairAgentJson,
+  looksLikeDiagnosisAttempt,
+  buildFallbackDiagnosis,
   buildContextSummary,
   appendFingerprintMarker,
   FINGERPRINT_PREFIX,

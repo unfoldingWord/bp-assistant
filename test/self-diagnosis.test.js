@@ -3,11 +3,20 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
+
+const RAW_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'self-diagnosis-raw-'));
+process.env.SELF_DIAGNOSIS_RAW_DIR = RAW_DIR;
+
 const {
   dispatchSelfDiagnosis,
   buildFingerprint,
   classifyRepo,
   extractDiagnosisJson,
+  repairAgentJson,
+  looksLikeDiagnosisAttempt,
   appendFingerprintMarker,
   FINGERPRINT_PREFIX,
 } = require('../src/self-diagnosis');
@@ -133,6 +142,49 @@ test('extractDiagnosisJson parses fenced JSON from agent output', () => {
   assert.equal(parsed.classification, 'skills');
 });
 
+test('extractDiagnosisJson repairs unescaped newlines inside string values', () => {
+  // Body has literal newlines instead of \n escapes — the most common mode
+  // we've seen the diagnosis agent emit.
+  const broken = `\`\`\`json
+{
+  "repo": "bp-assistant-skills",
+  "title": "Pipeline failure: tqs PSA 6 — bad chapter padding",
+  "body": "## Summary
+A real newline is inside this string, which technically violates JSON.
+
+## Failure signal
+something broke",
+  "labels": ["bug", "pipeline-failure"],
+  "classification": "skills"
+}
+\`\`\``;
+  const parsed = extractDiagnosisJson(broken);
+  assert.equal(parsed.repo, 'bp-assistant-skills');
+  assert.match(parsed.body, /## Summary/);
+  assert.match(parsed.body, /## Failure signal/);
+});
+
+test('repairAgentJson fixes unescaped newlines in strings without touching whitespace between fields', () => {
+  const broken = `{\n  "a": "line1\nline2",\n  "b": 3\n}`;
+  const repaired = repairAgentJson(broken);
+  const parsed = JSON.parse(repaired);
+  assert.equal(parsed.a, 'line1\nline2');
+  assert.equal(parsed.b, 3);
+});
+
+test('repairAgentJson strips trailing commas', () => {
+  const broken = '{"a": 1, "b": [1, 2, 3,], }';
+  assert.deepEqual(JSON.parse(repairAgentJson(broken)), { a: 1, b: [1, 2, 3] });
+});
+
+test('looksLikeDiagnosisAttempt distinguishes agent JSON from arbitrary text', () => {
+  assert.equal(looksLikeDiagnosisAttempt('not even close to JSON'), false);
+  assert.equal(looksLikeDiagnosisAttempt('{ "repo": "bp-assistant", "title": "x" }'), true);
+  assert.equal(looksLikeDiagnosisAttempt('```json\n{\n  "title": "x"\n}\n```'), true);
+  assert.equal(looksLikeDiagnosisAttempt(''), false);
+  assert.equal(looksLikeDiagnosisAttempt(null), false);
+});
+
 test('extractDiagnosisJson rejects invalid repo', () => {
   const bad = `\`\`\`json
 { "repo": "evil-repo", "title": "x", "body": "y" }
@@ -235,4 +287,45 @@ test('dispatchSelfDiagnosis returns invalid-event for missing message', async ()
   const result = await dispatchSelfDiagnosis({ event: { severity: 'error' } });
   assert.equal(result.ok, false);
   assert.equal(result.reason, 'invalid-event');
+});
+
+test('dispatchSelfDiagnosis files a fallback issue when JSON parse fails on diagnosis-shaped output', async () => {
+  // Truncated / unparseable but clearly a diagnosis attempt — mirrors the
+  // PSA 6 failure mode we hit in production.
+  const brokenRaw = `\`\`\`json
+{
+  "repo": "bp-assistant-skills",
+  "title": "Pipeline failure: tqs PSA 6 — tq-writer uses 2-digit chapter padding instead of 3-digit",
+  "body": "## Summary
+A real newline that breaks JSON parsing.
+
+## Failure signal
+something happened`;
+  const event = makePsa1Event();
+  const calls = {};
+  const fetchImpl = createGithubFetchStub({ captureCalls: calls });
+  const result = await dispatchSelfDiagnosis({
+    event,
+    runClaudeImpl: makeRunClaudeStub(brokenRaw),
+    fetchImpl,
+    readSecretImpl: () => 'fake-token',
+    readAdminStatusImpl: () => [event],
+  });
+  // It might either repair successfully OR fall back. Both are acceptable
+  // outcomes — the contract is that an issue gets filed.
+  assert.equal(result.ok, true);
+  assert.equal(calls.createCount, 1);
+  assert.match(calls.lastCreateBody.body, /pipeline-failure-fingerprint:/);
+  if (result.action === 'created-fallback') {
+    assert.match(calls.lastCreateBody.title, /diagnosis JSON parse failed/);
+    assert.match(calls.lastCreateBody.body, /Raw diagnosis agent output/);
+    assert.match(calls.lastCreateBody.body, /tq-writer uses 2-digit chapter padding/);
+    assert.ok(
+      calls.lastCreateBody.labels.includes('self-diagnosis-parse-failure'),
+      'fallback issue should carry the self-diagnosis-parse-failure label',
+    );
+    // Raw output should also have been persisted to disk for inspection.
+    const files = fs.readdirSync(RAW_DIR);
+    assert.ok(files.length > 0, 'expected raw output to be persisted on parse failure');
+  }
 });
