@@ -27,7 +27,7 @@ function buildMessage(content, overrides = {}) {
   };
 }
 
-function createHarness({ runClaudeImpl, verifyTqImpl, conflictChapters = new Set() } = {}) {
+function createHarness({ runClaudeImpl, verifyTqImpl, deduplicateTqIdsImpl, conflictChapters = new Set() } = {}) {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tqs-pipeline-'));
   const oldBaseDir = process.env.CSKILLBP_DIR;
   const oldStatusFile = process.env.ADMIN_STATUS_FILE;
@@ -115,6 +115,7 @@ function createHarness({ runClaudeImpl, verifyTqImpl, conflictChapters = new Set
   });
   installStub(miscToolsPath, {
     verifyTq: (args) => (verifyTqImpl ? verifyTqImpl(args) : `Verified 1 rows in ${path.basename(args.tsvFile)}\nAll checks passed`),
+    deduplicateTqIds: (args) => (deduplicateTqIdsImpl ? deduplicateTqIdsImpl(args) : `No duplicate IDs found in ${path.basename(args.tsvFile)}`),
   });
 
   const { tqsPipeline } = require('../src/tqs-pipeline');
@@ -321,5 +322,89 @@ test('tqsPipeline blocks push for chapters with conflicting branches', async () 
     assert.ok(harness.readStatusTexts().some((text) => text.includes('conflicting branches')));
   } finally {
     harness.cleanup();
+  }
+});
+
+test('tqsPipeline calls deduplicateTqIds before verify and logs when IDs are fixed', async () => {
+  let dedupCalled = false;
+  const harness = createHarness({
+    runClaudeImpl: async ({ tempDir }) => {
+      const outDir = path.join(tempDir, 'output', 'tq', 'PSA');
+      fs.mkdirSync(outDir, { recursive: true });
+      // Write TSV with duplicate ID 'fhve' — mirrors the Psalms regression (issue #54)
+      fs.writeFileSync(
+        path.join(outDir, 'PSA-005.tsv'),
+        'Reference\tID\tTags\tQuote\tOccurrence\tQuestion\tResponse\n' +
+        '5:1\tfhve\t\t\t1\tWho wrote this psalm?\tDavid\n' +
+        '5:2\tfhve\t\t\t1\tWhat did he request?\tTo be heard\n'
+      );
+      return { subtype: 'success', usage: {}, total_cost_usd: 0 };
+    },
+    deduplicateTqIdsImpl: (_args) => {
+      dedupCalled = true;
+      return 'Deduplicated 1 duplicate ID(s) in PSA-005.tsv';
+    },
+  });
+
+  try {
+    await harness.tqsPipeline(
+      { _synthetic: true, _book: 'PSA', _startChapter: 5, _endChapter: 5, _wholeBook: false },
+      buildMessage('write tqs for psa 5')
+    );
+
+    assert.ok(dedupCalled, 'deduplicateTqIds must be called by the pipeline');
+    assert.equal(harness.pushCalls.length, 1, 'Pipeline must push after dedup fixes duplicate IDs');
+    assert.equal(harness.summaries.at(-1).success, true);
+    assert.ok(
+      harness.readStatusTexts().some((text) => text.includes('Deduplicated')),
+      'Pipeline must emit a status message when duplicate IDs are fixed'
+    );
+  } finally {
+    harness.cleanup();
+  }
+});
+
+// Unit tests for deduplicateTqIds — exercise the real function outside the pipeline harness
+
+test('deduplicateTqIds replaces duplicate IDs in-place and preserves first occurrence', () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tq-dedup-'));
+  const oldBaseDir = process.env.CSKILLBP_DIR;
+  process.env.CSKILLBP_DIR = tempDir;
+
+  // Fresh require so the module picks up the overridden CSKILLBP_DIR
+  const miscToolsPath = require.resolve('../src/workspace-tools/misc-tools');
+  delete require.cache[miscToolsPath];
+  const { deduplicateTqIds } = require('../src/workspace-tools/misc-tools');
+
+  try {
+    const tsvContent = [
+      'Reference\tID\tTags\tQuote\tOccurrence\tQuestion\tResponse',
+      '5:1\tfhve\t\t\t1\tQuestion one?\tAnswer one',
+      '5:2\tfhve\t\t\t1\tQuestion two?\tAnswer two',
+      '5:3\taaaa\t\t\t1\tQuestion three?\tAnswer three',
+    ].join('\n') + '\n';
+    fs.writeFileSync(path.join(tempDir, 'PSA-005.tsv'), tsvContent, 'utf8');
+
+    const result = deduplicateTqIds({ tsvFile: 'PSA-005.tsv' });
+
+    assert.ok(result.includes('Deduplicated 1'), `Expected 1 dedup reported, got: ${result}`);
+
+    const fixed = fs.readFileSync(path.join(tempDir, 'PSA-005.tsv'), 'utf8');
+    const dataRows = fixed.split('\n').slice(1).filter((l) => l.trim());
+    const ids = dataRows.map((l) => l.split('\t')[1]);
+
+    assert.equal(new Set(ids).size, ids.length, 'All IDs must be unique after deduplication');
+    assert.equal(ids[0], 'fhve', 'First occurrence of the duplicate ID must be preserved');
+    assert.notEqual(ids[1], 'fhve', 'Second occurrence must be replaced with a new unique ID');
+    assert.equal(ids[2], 'aaaa', 'Non-duplicate rows must remain unchanged');
+
+    // Running again on the already-fixed file should report no duplicates
+    const result2 = deduplicateTqIds({ tsvFile: 'PSA-005.tsv' });
+    assert.ok(result2.startsWith('No duplicate'), `Second run on clean file must report no dupes, got: ${result2}`);
+  } finally {
+    delete require.cache[miscToolsPath];
+    if (oldBaseDir == null) delete process.env.CSKILLBP_DIR;
+    else process.env.CSKILLBP_DIR = oldBaseDir;
+    fs.rmSync(tempDir, { recursive: true, force: true });
   }
 });

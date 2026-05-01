@@ -335,18 +335,26 @@ function verifyTq({ tsvFile, inputJson }) {
   }
 
   let rowCount = 0;
+  const seenIds = new Map(); // id -> first line number (1-based)
   for (let i = 1; i < lines.length; i++) {
     const line = lines[i].trim();
     if (!line) continue;
     rowCount++;
     const cols = line.split('\t');
     const ref = cols[0] || '';
+    const id = cols[1] || '';
 
     if (cols.length !== 7) errors.push(`Line ${i + 1}: Expected 7 columns, found ${cols.length}`);
     if (!/^\d+:\d+(-\d+)?$/.test(ref)) errors.push(`Line ${i + 1}: Invalid reference "${ref}"`);
     if (!cols[5]) errors.push(`Line ${i + 1}: Empty Question`);
     if (!cols[6]) warnings.push(`Line ${i + 1}: Empty Response`);
-    if (!cols[1]) warnings.push(`Line ${i + 1}: Empty ID`);
+    if (!id) {
+      warnings.push(`Line ${i + 1}: Empty ID`);
+    } else if (seenIds.has(id)) {
+      errors.push(`Line ${i + 1}: Duplicate ID "${id}" (first seen at line ${seenIds.get(id)})`);
+    } else {
+      seenIds.set(id, i + 1);
+    }
     if (/["\u201c\u201d]/.test(cols[5] || '') || /["\u201c\u201d]/.test(cols[6] || '')) {
       warnings.push(`Line ${i + 1}: Direct quotes in Q/A`);
     }
@@ -369,6 +377,62 @@ function verifyTq({ tsvFile, inputJson }) {
   if (warnings.length) { result.push(`${warnings.length} warning(s):`); result.push(...warnings.slice(0, 20)); }
   if (!errors.length && !warnings.length) result.push('All checks passed');
   return result.join('\n');
+}
+
+/**
+ * Deduplicate the ID column of a TQ TSV file in-place.
+ * Any row whose ID collides with a previously seen ID is assigned a freshly
+ * generated unique 4-character random ID (same [a-z][a-z0-9]{3} format used
+ * by the TN pipeline).  The file is rewritten only when at least one duplicate
+ * is found.  Returns a human-readable result string.
+ */
+function deduplicateTqIds({ tsvFile }) {
+  const filePath = path.resolve(CSKILLBP_DIR, tsvFile);
+  const content = fs.readFileSync(filePath, 'utf8');
+  const lines = content.split('\n');
+
+  const chars = 'abcdefghijklmnopqrstuvwxyz0123456789';
+  const letters = 'abcdefghijklmnopqrstuvwxyz';
+  const seenIds = new Set();
+  let duplicatesFixed = 0;
+  const fixedLines = [];
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    // Always keep header and blank lines as-is
+    if (i === 0 || !line.trim()) {
+      fixedLines.push(line);
+      continue;
+    }
+    const cols = line.split('\t');
+    const id = cols[1] || '';
+    if (id && seenIds.has(id)) {
+      // Collision — generate a new unique ID
+      let newId;
+      let attempts = 0;
+      do {
+        newId = letters[Math.floor(Math.random() * 26)];
+        for (let j = 0; j < 3; j++) newId += chars[Math.floor(Math.random() * 36)];
+        attempts++;
+      } while (seenIds.has(newId) && attempts < 200);
+      cols[1] = newId;
+      seenIds.add(newId);
+      duplicatesFixed++;
+      fixedLines.push(cols.join('\t'));
+    } else {
+      if (id) seenIds.add(id);
+      fixedLines.push(line);
+    }
+  }
+
+  if (duplicatesFixed > 0) {
+    fs.writeFileSync(filePath, fixedLines.join('\n'), 'utf8');
+  }
+
+  const basename = path.basename(filePath);
+  return duplicatesFixed > 0
+    ? `Deduplicated ${duplicatesFixed} duplicate ID(s) in ${basename}`
+    : `No duplicate IDs found in ${basename}`;
 }
 
 /**
@@ -407,4 +471,4 @@ function appendQuickref({ file, strong, hebrew, rendering, book = 'ALL', context
   return `Appended to ${csvName}: ${row}`;
 }
 
-module.exports = { giteaPr, prepareCompare, prepareTq, verifyTq, appendQuickref };
+module.exports = { giteaPr, prepareCompare, prepareTq, verifyTq, deduplicateTqIds, appendQuickref };
