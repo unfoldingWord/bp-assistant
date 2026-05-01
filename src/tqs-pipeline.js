@@ -8,7 +8,7 @@ const { door43Push, checkConflictingBranches, getRepoFilename } = require('./doo
 const { verifyRepoPush, verifyDcsToken } = require('./repo-verify');
 const { getCheckpoint, setCheckpoint, clearCheckpoint } = require('./pipeline-checkpoints');
 const { recordMetrics, getCumulativeTokens, recordRunSummary } = require('./usage-tracker');
-const { verifyTq } = require('./workspace-tools/misc-tools');
+const { verifyTq, deduplicateTqIds } = require('./workspace-tools/misc-tools');
 const { getChapterCount } = require('./verse-counts');
 const { publishAdminStatus } = require('./admin-status');
 const { dispatchSelfDiagnosis } = require('./self-diagnosis');
@@ -319,6 +319,11 @@ async function tqsPipeline(route, message) {
 
     if (resolvedOutput.normalizedFrom) {
       await status(`Normalized output filename for **${ref}**: ${resolvedOutput.normalizedFrom} -> ${path.basename(outputPath)}`);
+    }
+
+    const dedupResult = deduplicateTqIds({ tsvFile: outputRel });
+    if (!dedupResult.startsWith('No duplicate')) {
+      await status(`**${ref}** post-processing: ${dedupResult}`);
     }
 
     const verifyOutput = verifyTq({ tsvFile: outputRel });
