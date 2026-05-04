@@ -147,6 +147,15 @@ function parseReference(ref) {
   return [ch, vs];
 }
 
+/**
+ * Return the anchor (start) verse key for a reference that may include a range.
+ * "18:9-10" → "18:9",  "18:9" → "18:9",  "front:intro" → "front:intro"
+ */
+function anchorVerse(ref) {
+  const m = ref.match(/^(\d+):(\d+)/);
+  return m ? `${m[1]}:${m[2]}` : ref;
+}
+
 function refCompare(a, b) {
   const [aCh, aVs] = parseReference(getReference(a));
   const [bCh, bVs] = parseReference(getReference(b));
@@ -373,6 +382,11 @@ function doFullChapter(bookRows, sourceRows, chapter, skipIntro, ultVerses, log)
     if (getChapter(ref) === chapter) sourceRefs.add(ref);
   }
 
+  // Anchor verses covered by the source — used to detect orphaned multi-verse rows
+  // when the generator narrowed a range reference (e.g. 18:9-10 → 18:9).
+  const sourceAnchors = new Set();
+  for (const ref of sourceRefs) sourceAnchors.add(anchorVerse(ref));
+
   const [chapterStart, chapterEnd] = findChapterBounds(newRows, chapter);
 
   // Collect existing intro rows
@@ -448,7 +462,18 @@ function doFullChapter(bookRows, sourceRows, chapter, skipIntro, ultVerses, log)
       if (sourceRefs.has(ref)) {
         if (!hasKeepTag(newRows[i])) indicesToRemove.push(i);
       } else if (isIntroRef(ref) && sourceRefs.has(ref)) {
+        // dead branch kept for clarity
         indicesToRemove.push(i);
+      } else if (!isIntroRef(ref) && anchorVerse(ref) !== ref && sourceAnchors.has(anchorVerse(ref))) {
+        // Orphaned multi-verse row: the source replaced this reference with a narrower
+        // single-verse reference (e.g. existing 18:9-10 → source 18:9).  Remove it
+        // unless it is explicitly KEEP-tagged.
+        if (hasKeepTag(newRows[i])) {
+          preservedRows.push(newRows[i]);
+        } else {
+          indicesToRemove.push(i);
+          log.push(`  ${ref}: orphaned multi-verse row (anchor ${anchorVerse(ref)} covered by source)`);
+        }
       } else {
         if (!(isIntroRef(ref) && ref.split(':')[1] === 'intro')) {
           preservedRows.push(newRows[i]);
