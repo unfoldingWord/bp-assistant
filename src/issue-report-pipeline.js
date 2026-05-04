@@ -8,6 +8,11 @@ const {
   createGithubIssue,
   updateGithubIssue,
 } = require('./github-issues');
+const {
+  findHumanDecisionConflict,
+  formatDecisionConflictPrompt,
+  formatConflictIssueSection,
+} = require('./human-decision-conflicts');
 
 let _query = null;
 async function getQuery() {
@@ -22,6 +27,7 @@ const VALID_REPOS = new Set(['bp-assistant', 'bp-assistant-skills']);
 const VALID_LABELS = new Set(['bug', 'enhancement', 'ai-quality', 'template-compliance']);
 const TRIGGER_RE = /^(?:report|feedback|issue|bug)[:\s]\s*([\s\S]+)/i;
 const CLASSIFIER_MAX_TOKENS = [2048, 8192];
+const pendingHumanDecisionConflicts = new Map();
 
 const SYSTEM_PROMPT = `You are an issue classifier for a Bible translation AI pipeline with two GitHub repositories:
 
@@ -409,6 +415,99 @@ function summarizeIssues(issues) {
     .join(' and ');
 }
 
+function buildPendingConflictKey(message) {
+  if (message?.type === 'stream') {
+    return `stream-${message.display_recipient}-${message.subject}-${message.sender_id}`;
+  }
+  return `dm-${message?.sender_id}`;
+}
+
+function setPendingHumanDecisionConflict(message, pending) {
+  pendingHumanDecisionConflicts.set(buildPendingConflictKey(message), {
+    ...pending,
+    createdAt: new Date().toISOString(),
+  });
+}
+
+function getPendingHumanDecisionConflict(message) {
+  return pendingHumanDecisionConflicts.get(buildPendingConflictKey(message)) || null;
+}
+
+function clearPendingHumanDecisionConflict(message) {
+  pendingHumanDecisionConflicts.delete(buildPendingConflictKey(message));
+}
+
+function addConflictSectionToBody(body, conflict) {
+  const section = formatConflictIssueSection(conflict);
+  if (!section) return body;
+  return `${String(body || '').trim()}\n\n${section}`;
+}
+
+async function createIssuesForClassifiedReport({ message, classified, deps, conflict = null }) {
+  const githubToken = deps.readSecret('github_token', 'GITHUB_TOKEN');
+  if (!githubToken) throw new Error('github_token secret not configured');
+
+  const plannedIssues = classified.issues.map((issue) => ({
+    ...issue,
+    body: conflict ? addConflictSectionToBody(issue.body, conflict) : issue.body,
+  }));
+
+  const issueRecords = [];
+  for (const issuePlan of plannedIssues) {
+    const marker = buildIssueMarker(message.id, issuePlan.id);
+    const dedupeMarker = buildIssueDedupeMarker(message.id, issuePlan.repo, issuePlan.complaint_ids);
+    const existing = await searchExistingIssueByMarkers(
+      deps.fetchImpl,
+      githubToken,
+      issuePlan.repo,
+      [dedupeMarker, marker]
+    );
+    if (existing) {
+      issueRecords.push({ ...existing, issue_id: issuePlan.id, complaint_ids: issuePlan.complaint_ids });
+      continue;
+    }
+
+    const created = await createGithubIssue(deps.fetchImpl, githubToken, issuePlan.repo, {
+      title: issuePlan.title,
+      body: injectMetadata(issuePlan.body, [dedupeMarker, marker]),
+      labels: issuePlan.labels,
+    });
+    console.log(`[issue-report] Created ${issuePlan.repo}#${created.number}: ${issuePlan.title}`);
+    issueRecords.push({ ...created, issue_id: issuePlan.id, complaint_ids: issuePlan.complaint_ids });
+  }
+
+  if (issueRecords.length > 1) {
+    const bodyById = new Map(plannedIssues.map((issue) => [issue.id, issue.body]));
+    for (const issueRecord of issueRecords) {
+      const issuePlan = plannedIssues.find((issue) => issue.id === issueRecord.issue_id);
+      if (!issuePlan) {
+        throw new Error(`Classifier returned issue ${issueRecord.issue_id} without a matching plan`);
+      }
+      const desiredBody = addOrReplaceRelatedIssueSection(
+        injectMetadata(bodyById.get(issueRecord.issue_id), [
+          buildIssueDedupeMarker(message.id, issueRecord.repo, issuePlan.complaint_ids),
+          buildIssueMarker(message.id, issueRecord.issue_id),
+        ]),
+        issueRecord.repo,
+        issueRecords.filter((candidate) => candidate.issue_id !== issueRecord.issue_id),
+        classified.ownership
+      );
+      if (desiredBody !== issueRecord.body) {
+        const updated = await updateGithubIssue(
+          deps.fetchImpl,
+          githubToken,
+          issueRecord.repo,
+          issueRecord.number,
+          { body: desiredBody }
+        );
+        issueRecord.body = updated.body;
+      }
+    }
+  }
+
+  return issueRecords;
+}
+
 function getRuntimeDeps(overrides = {}) {
   return {
     runClassifierQuery: overrides.runClassifierQuery || ((args) => runAgentSdkClassifierQuery({
@@ -421,6 +520,12 @@ function getRuntimeDeps(overrides = {}) {
     removeReaction: overrides.removeReaction || removeReaction,
     readSecret: overrides.readSecret || readSecret,
     fetchImpl: overrides.fetchImpl || fetch,
+    findHumanDecisionConflict: overrides.findHumanDecisionConflict || ((args) => findHumanDecisionConflict({
+      ...args,
+      skillsRoot: overrides.skillsRoot,
+      adjudicateConflict: overrides.adjudicateConflict,
+    })),
+    setPendingHumanDecisionConflict: overrides.setPendingHumanDecisionConflict || setPendingHumanDecisionConflict,
   };
 }
 
@@ -443,62 +548,16 @@ async function issueReportPipeline(route, message, overrides = {}) {
 
   try {
     const classified = await classifyIssueReport(deps, buildClassifierInput(message, feedbackText));
-    const githubToken = deps.readSecret('github_token', 'GITHUB_TOKEN');
-    if (!githubToken) throw new Error('github_token secret not configured');
 
-    const issueRecords = [];
-    for (const issuePlan of classified.issues) {
-      const marker = buildIssueMarker(message.id, issuePlan.id);
-      const dedupeMarker = buildIssueDedupeMarker(message.id, issuePlan.repo, issuePlan.complaint_ids);
-      const existing = await searchExistingIssueByMarkers(
-        deps.fetchImpl,
-        githubToken,
-        issuePlan.repo,
-        [dedupeMarker, marker]
-      );
-      if (existing) {
-        issueRecords.push({ ...existing, issue_id: issuePlan.id, complaint_ids: issuePlan.complaint_ids });
-        continue;
-      }
-
-      const created = await createGithubIssue(deps.fetchImpl, githubToken, issuePlan.repo, {
-        title: issuePlan.title,
-        body: injectMetadata(issuePlan.body, [dedupeMarker, marker]),
-        labels: issuePlan.labels,
-      });
-      console.log(`[issue-report] Created ${issuePlan.repo}#${created.number}: ${issuePlan.title}`);
-      issueRecords.push({ ...created, issue_id: issuePlan.id, complaint_ids: issuePlan.complaint_ids });
+    const conflict = await deps.findHumanDecisionConflict({ message, feedbackText, classified });
+    if (conflict) {
+      deps.setPendingHumanDecisionConflict(message, { route, message, classified, conflict });
+      await sendReplyWith(message, formatDecisionConflictPrompt(conflict), deps);
+      try { await deps.removeReaction(message.id, 'eyes'); } catch (_) {}
+      return;
     }
 
-    if (issueRecords.length > 1) {
-      const bodyById = new Map(classified.issues.map((issue) => [issue.id, issue.body]));
-      for (const issueRecord of issueRecords) {
-        const issuePlan = classified.issues.find((issue) => issue.id === issueRecord.issue_id);
-        if (!issuePlan) {
-          throw new Error(`Classifier returned issue ${issueRecord.issue_id} without a matching plan`);
-        }
-        const desiredBody = addOrReplaceRelatedIssueSection(
-          injectMetadata(bodyById.get(issueRecord.issue_id), [
-            buildIssueDedupeMarker(message.id, issueRecord.repo, issuePlan.complaint_ids),
-            buildIssueMarker(message.id, issueRecord.issue_id),
-          ]),
-          issueRecord.repo,
-          issueRecords.filter((candidate) => candidate.issue_id !== issueRecord.issue_id),
-          classified.ownership
-        );
-        if (desiredBody !== issueRecord.body) {
-          const updated = await updateGithubIssue(
-            deps.fetchImpl,
-            githubToken,
-            issueRecord.repo,
-            issueRecord.number,
-            { body: desiredBody }
-          );
-          issueRecord.body = updated.body;
-        }
-      }
-    }
-
+    const issueRecords = await createIssuesForClassifiedReport({ message, classified, deps });
     await sendReplyWith(message, `Filed ${summarizeIssues(issueRecords)}.`, deps);
 
     try { await deps.removeReaction(message.id, 'eyes'); } catch (_) {}
@@ -511,12 +570,59 @@ async function issueReportPipeline(route, message, overrides = {}) {
   }
 }
 
+async function handlePendingHumanDecisionConflictReply(message, options = {}, overrides = {}) {
+  const pending = getPendingHumanDecisionConflict(message);
+  if (!pending) return false;
+
+  const isYes = options.isYes || (() => false);
+  const isNo = options.isNo || (() => false);
+  const deps = getRuntimeDeps(overrides);
+
+  if (message.sender_id !== pending.message.sender_id) return true;
+
+  if (isYes(message.content)) {
+    clearPendingHumanDecisionConflict(message);
+    try { await deps.addReaction(message.id, 'working_on_it'); } catch (_) {}
+    try {
+      const issueRecords = await createIssuesForClassifiedReport({
+        message: pending.message,
+        classified: pending.classified,
+        deps,
+        conflict: pending.conflict,
+      });
+      await sendReplyWith(pending.message, `Filed ${summarizeIssues(issueRecords)}.`, deps);
+      try { await deps.removeReaction(message.id, 'working_on_it'); } catch (_) {}
+      try { await deps.addReaction(message.id, 'check'); } catch (_) {}
+    } catch (err) {
+      console.error('[issue-report] Error filing confirmed conflict report:', err.message);
+      await sendReplyWith(pending.message, `Failed to file issue: ${err.message}`, deps);
+      try { await deps.removeReaction(message.id, 'working_on_it'); } catch (_) {}
+      try { await deps.addReaction(message.id, 'warning'); } catch (_) {}
+    }
+    return true;
+  }
+
+  if (isNo(message.content)) {
+    clearPendingHumanDecisionConflict(message);
+    await sendReplyWith(pending.message, 'No issue filed.', deps);
+    return true;
+  }
+
+  clearPendingHumanDecisionConflict(message);
+  return false;
+}
+
 module.exports = {
   issueReportPipeline,
+  handlePendingHumanDecisionConflictReply,
   _extractFeedbackText: extractFeedbackText,
   _buildClassifierInput: buildClassifierInput,
   _parseClassifierOutput: parseClassifierOutput,
   _buildIssueMarker: buildIssueMarker,
   _buildIssueDedupeMarker: buildIssueDedupeMarker,
   _addOrReplaceRelatedIssueSection: addOrReplaceRelatedIssueSection,
+  _buildPendingConflictKey: buildPendingConflictKey,
+  _getPendingHumanDecisionConflict: getPendingHumanDecisionConflict,
+  _clearPendingHumanDecisionConflict: clearPendingHumanDecisionConflict,
+  _createIssuesForClassifiedReport: createIssuesForClassifiedReport,
 };
