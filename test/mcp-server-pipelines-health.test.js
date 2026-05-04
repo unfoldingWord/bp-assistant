@@ -30,12 +30,18 @@ function request(server, reqPath) {
   });
 }
 
-async function withServer(makeCheckpoints, handler) {
+async function withServer(makeCheckpoints, handler, options = {}) {
   const checkpointsPath = require.resolve('../src/pipeline-checkpoints');
   const mcpPath = require.resolve('../src/mcp-server');
   let checkpoints = [];
   installStub(checkpointsPath, { listCheckpoints: () => checkpoints });
   delete require.cache[mcpPath];
+  const originalStartedAt = process.env.PROCESS_STARTED_AT_MS;
+  if (options.processStartedAtMs != null) {
+    process.env.PROCESS_STARTED_AT_MS = String(options.processStartedAtMs);
+  } else {
+    delete process.env.PROCESS_STARTED_AT_MS;
+  }
   const { createHttpServer } = require('../src/mcp-server');
   // Module is loaded; PROCESS_STARTED_AT_MS is now fixed. Generate
   // checkpoints against the post-load clock so "fresh" timestamps land after
@@ -51,6 +57,11 @@ async function withServer(makeCheckpoints, handler) {
     await new Promise((resolve) => server.close(resolve));
     delete require.cache[mcpPath];
     delete require.cache[checkpointsPath];
+    if (originalStartedAt == null) {
+      delete process.env.PROCESS_STARTED_AT_MS;
+    } else {
+      process.env.PROCESS_STARTED_AT_MS = originalStartedAt;
+    }
   }
 }
 
@@ -86,16 +97,32 @@ test('/health/pipelines excludes stale running checkpoints from a previous proce
 });
 
 test('/health/pipelines excludes pipelines that have not updated within the freshness window', async () => {
-  // Updated 2 hours ago — past the 60-minute freshness window even if it
-  // somehow predates process start in absolute terms.
-  const stale = new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString();
+  // Updated 13 hours ago — past the default 12-hour freshness window even if it
+  // belongs to this process.
+  const now = Date.now();
+  const stale = new Date(now - 13 * 60 * 60 * 1000).toISOString();
   await withServer([
     { key: 'a', pipelineType: 'generate', state: 'running', updatedAt: stale, scope: { book: 'TIT' } },
   ], async (server) => {
     const res = await request(server, '/health/pipelines');
     const payload = JSON.parse(res.body);
     assert.equal(payload.active, 0);
-  });
+  }, { processStartedAtMs: now - 14 * 60 * 60 * 1000 });
+});
+
+test('/health/pipelines keeps long-running current-process checkpoints active', async () => {
+  const startedAt = Date.now() - 3 * 60 * 60 * 1000;
+  await withServer((now) => {
+    const longRunning = new Date(now - 2 * 60 * 60 * 1000).toISOString();
+    return [
+      { key: 'a', pipelineType: 'generate', state: 'running', updatedAt: longRunning, scope: { book: 'ISA', startChapter: 63, endChapter: 63 } },
+    ];
+  }, async (server) => {
+    const res = await request(server, '/health/pipelines');
+    const payload = JSON.parse(res.body);
+    assert.equal(payload.active, 1);
+    assert.equal(payload.pipelines[0].scope.book, 'ISA');
+  }, { processStartedAtMs: startedAt });
 });
 
 test('/health/pipelines returns active=0 when there are no running checkpoints', async () => {
