@@ -836,13 +836,21 @@ function firePipeline(route, message) {
 }
 
 const HELP_TEXT = `I can help with:\n` +
-  `- **generate PSA 79** -- run the initial pipeline for a chapter\n` +
+  `- **generate PSA 79** -- run initial content for a chapter\n` +
+  `  - also: **generate PSA 79-81**, **generate PSA 79:1-6**, **generate PSA 79 ULT** or **UST**\n` +
+  `  - flags: **--fresh**/**--new** clears old checkpoint/output; **--text-only** uploads just unaligned USFM files; **--no-align** skips alignment/repo insert; **--align-only** reuses generated files and only aligns/inserts\n` +
   `- **write notes for PSA 82** -- generate translation notes\n` +
+  `  - also: **write notes PSA 82-84**, **write notes PSA 82:1-6**\n` +
+  `  - flags: **--fresh**/**--new**, **--no-intro**, **--pause-before-ats**\n` +
   `- **write tqs for HAB** -- generate translation questions for a whole book\n` +
-  `- **write tqs for PSA 1-10** -- generate translation questions for a chapter range\n` +
+  `  - also: **write tqs for PSA 1-10** or **write tq PSA 3**; flag: **--fresh**\n` +
   `- **PSA 82 review** -- review editor changes against AI output\n` +
   `  - add **ULT** or **UST** to review just one (default: both)\n` +
-  `- **note HAB 3 lots of parallelism** -- file an observation for a book/chapter`;
+  `- **note HAB 3 lots of parallelism** -- file an observation for a book/chapter\n` +
+  `- **report: ...** / **issue: ...** / **bug: ...** -- file bot feedback or a bug report\n` +
+  `- **resume** -- resume a paused/failed run in this topic\n` +
+  `- **merged** or **merged PSA 82** -- continue insertion after you merge pending branches\n` +
+  `- **api generate PSA 79** / **api write notes PSA 82** -- use the API runner`;
 
 async function routeMessage(message) {
   const isAdmin = message.sender_id === config.adminUserId;
