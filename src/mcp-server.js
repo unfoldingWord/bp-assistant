@@ -18,12 +18,13 @@ const MCP_PORT = Number(process.env.MCP_PORT || 3001);
 const MCP_BIND_HOST = process.env.MCP_BIND_HOST || '127.0.0.1';
 const DOOR43_BASE = 'https://git.door43.org/unfoldingWord';
 
-const PROCESS_STARTED_AT_MS = Date.now();
+const PROCESS_STARTED_AT_MS = Number(process.env.PROCESS_STARTED_AT_MS || Date.now());
 
 // Checkpoints not touched within this window are treated as crashed/stale even
-// if the bot didn't restart — prevents a hung pipeline from blocking deploys
-// forever.
-const CHECKPOINT_FRESHNESS_MS = 60 * 60 * 1000;
+// if the bot didn't restart. Keep this comfortably longer than normal chapter
+// generation steps, which can spend more than an hour inside one model call.
+const CHECKPOINT_FRESHNESS_MINUTES = Number(process.env.PIPELINE_HEALTH_FRESHNESS_MINUTES || 12 * 60);
+const CHECKPOINT_FRESHNESS_MS = CHECKPOINT_FRESHNESS_MINUTES * 60 * 1000;
 
 function getActivePipelines() {
   const now = Date.now();
