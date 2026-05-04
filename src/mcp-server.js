@@ -33,8 +33,6 @@ function getActivePipelines() {
     if (cp?.state !== 'running') continue;
     const updatedMs = Date.parse(cp.updatedAt || '');
     if (!Number.isFinite(updatedMs)) continue;
-    // Stale: checkpoint predates this process (left over from a kill).
-    if (updatedMs < PROCESS_STARTED_AT_MS) continue;
     const ageMs = now - updatedMs;
     if (ageMs > CHECKPOINT_FRESHNESS_MS) continue;
     rows.push({
@@ -43,6 +41,7 @@ function getActivePipelines() {
       scope: cp.scope,
       updatedAt: cp.updatedAt,
       ageSeconds: Math.round(ageMs / 1000),
+      interrupted: updatedMs < PROCESS_STARTED_AT_MS,
     });
   }
   return rows;

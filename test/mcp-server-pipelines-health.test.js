@@ -83,8 +83,9 @@ test('/health/pipelines reports running checkpoints updated since process start'
   });
 });
 
-test('/health/pipelines excludes stale running checkpoints from a previous process', async () => {
-  // Predates process start by definition (1970).
+test('/health/pipelines excludes old running checkpoints from a previous process', async () => {
+  // Predates process start by definition (1970) and is far outside the
+  // freshness window.
   const ancient = new Date(0).toISOString();
   await withServer([
     { key: 'a', pipelineType: 'generate', state: 'running', updatedAt: ancient, scope: { book: 'TIT' } },
@@ -94,6 +95,22 @@ test('/health/pipelines excludes stale running checkpoints from a previous proce
     assert.equal(payload.active, 0);
     assert.equal(payload.pipelines.length, 0);
   });
+});
+
+test('/health/pipelines reports recent running checkpoints from a previous process', async () => {
+  const startedAt = Date.now();
+  await withServer((now) => {
+    const interrupted = new Date(now - 10 * 60 * 1000).toISOString();
+    return [
+      { key: 'a', pipelineType: 'generate', state: 'running', updatedAt: interrupted, scope: { book: 'HOS', startChapter: 12, endChapter: 12 } },
+    ];
+  }, async (server) => {
+    const res = await request(server, '/health/pipelines');
+    const payload = JSON.parse(res.body);
+    assert.equal(payload.active, 1);
+    assert.equal(payload.pipelines[0].scope.book, 'HOS');
+    assert.equal(payload.pipelines[0].interrupted, true);
+  }, { processStartedAtMs: startedAt });
 });
 
 test('/health/pipelines excludes pipelines that have not updated within the freshness window', async () => {
