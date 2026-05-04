@@ -1,12 +1,24 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
 
 const {
   issueReportPipeline,
+  handlePendingHumanDecisionConflictReply,
   _extractFeedbackText,
   _buildClassifierInput,
   _parseClassifierOutput,
+  _clearPendingHumanDecisionConflict,
 } = require('../src/issue-report-pipeline');
+const {
+  findHumanDecisionConflict,
+  formatDecisionConflictPrompt,
+  loadHumanDecisions,
+  summarizePriorDecision,
+  summarizeHumanFeedback,
+} = require('../src/human-decision-conflicts');
 
 function buildMessage(overrides = {}) {
   return {
@@ -33,8 +45,19 @@ function buildClassifierResult(payload) {
   };
 }
 
+function createEmptySkillsRoot() {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'bp-empty-skills-'));
+  fs.mkdirSync(path.join(root, 'data/quick-ref'), { recursive: true });
+  fs.mkdirSync(path.join(root, 'data/glossary'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'data/quick-ref/ult_decisions.csv'), 'Strong,Hebrew,Rendering,Book,Context,Notes,Date,Source\n');
+  fs.writeFileSync(path.join(root, 'data/quick-ref/ust_decisions.csv'), 'Strong,Hebrew,Rendering,Book,Context,Notes,Date,Source\n');
+  fs.writeFileSync(path.join(root, 'data/glossary/project_glossary.md'), '');
+  return root;
+}
+
 function createRuntime({ classifierPayload, fetchImpl, sentReplies, classifierInputs }) {
   return {
+    skillsRoot: createEmptySkillsRoot(),
     runClassifierQuery: async ({ classifierInput }) => {
       classifierInputs.push(classifierInput);
       return buildClassifierResult(classifierPayload);
@@ -145,6 +168,52 @@ function buildClassifierPayload({ complaints, ownership, issues }) {
   return { complaints, ownership, issues };
 }
 
+function createSkillsRoot({ withAttribution = false } = {}) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'bp-skills-decisions-'));
+  fs.mkdirSync(path.join(root, 'data/quick-ref'), { recursive: true });
+  fs.mkdirSync(path.join(root, 'data/glossary'), { recursive: true });
+  const notes = withAttribution
+    ? '"Never \'Yahweh of hosts\'. Always \'Yahweh of Armies\'. Submitted by: Chris Smith."'
+    : '"Never \'Yahweh of hosts\' (archaic). Always \'Yahweh of Armies\'. See H6635b entry."';
+  fs.writeFileSync(path.join(root, 'data/quick-ref/ult_decisions.csv'), [
+    'Strong,Hebrew,Rendering,Book,Context,Notes,Date,Source',
+    `H3068+H6635,יְהוָה צְבָאוֹת,Yahweh of Armies,ALL,divine title throughout Isaiah,${notes},2026-04-21,human`,
+    'H9999,דמה,unrelated,ALL,unrelated,AI-only row,2026-04-21,AI',
+  ].join('\n'));
+  fs.writeFileSync(path.join(root, 'data/quick-ref/ust_decisions.csv'), 'Strong,Hebrew,Rendering,Book,Context,Notes,Date,Source\n');
+  fs.writeFileSync(path.join(root, 'data/glossary/project_glossary.md'), [
+    '| Hebrew | Strong | ULT | UST | Notes |',
+    '|---|---|---|---|---|',
+    '| צְבָאוֹת | H6635 | armies | hosts | ULT: "Yahweh of Armies" (not "hosts"). |',
+  ].join('\n'));
+  return root;
+}
+
+function buildJeremiahHostsPayload() {
+  return buildClassifierPayload({
+    complaints: [{
+      id: 'c1',
+      summary: 'Jeremiah notes should use Yahweh of hosts',
+      evidence: ['Please use Yahweh of hosts in Jeremiah notes.'],
+      likely_layers: ['bp-assistant-skills'],
+    }],
+    ownership: {
+      repositories: ['bp-assistant-skills'],
+      primary_repo: 'bp-assistant-skills',
+      secondary_repo: null,
+      rationale: 'Skill-side translation preference.',
+    },
+    issues: [{
+      id: 'i1',
+      repo: 'bp-assistant-skills',
+      complaint_ids: ['c1'],
+      title: 'Use Yahweh of hosts in Jeremiah notes',
+      body: '## Summary\n\nJeremiah notes should use Yahweh of hosts instead of Yahweh of Armies.\n\n## Steps to Reproduce\n\n1. Run tn-writer for Jeremiah.\n\n## Expected Behavior\n\nUse Yahweh of hosts.\n\n## Actual Behavior\n\nUses Yahweh of Armies.\n\n## Reporter\n\nProof Reader',
+      labels: ['bug'],
+    }],
+  });
+}
+
 test('extractFeedbackText strips Zulip mentions and explicit trigger prefixes', () => {
   const feedback = _extractFeedbackText('@**bp-bot** feedback: Split snippets still happen in Psalm 38');
   assert.equal(feedback, 'Split snippets still happen in Psalm 38');
@@ -237,6 +306,158 @@ test('parseClassifierOutput accepts valid fenced JSON', () => {
   const parsed = _parseClassifierOutput(wrapInJsonFence(JSON.stringify(payload)));
   assert.equal(parsed.complaints[0].id, 'c1');
   assert.equal(parsed.issues[0].repo, 'bp-assistant-skills');
+});
+
+test('human decision conflict parser detects rejected Yahweh of hosts preference', async () => {
+  const skillsRoot = createSkillsRoot();
+  const decisions = loadHumanDecisions(skillsRoot);
+  assert.ok(decisions.some((decision) => decision.strong === 'H3068+H6635' && decision.source === 'human'));
+  assert.ok(decisions.every((decision) => decision.rendering !== 'unrelated'));
+
+  const conflict = await findHumanDecisionConflict({
+    message: buildMessage({ subject: 'Jeremiah BP' }),
+    feedbackText: 'Please use Yahweh of hosts in Jeremiah notes.',
+    classified: buildJeremiahHostsPayload(),
+    skillsRoot,
+  });
+
+  assert.equal(conflict.decision.strong, 'H3068+H6635');
+  assert.equal(conflict.decision.date, '2026-04-21');
+  assert.equal(conflict.feedbackSummary, 'Jeremiah notes should use Yahweh of hosts');
+  assert.match(formatDecisionConflictPrompt(conflict), /^This conflicts with a human decision recorded on April 21\./);
+  assert.match(formatDecisionConflictPrompt(conflict), /Feedback summary: Jeremiah notes should use Yahweh of hosts/);
+  assert.match(formatDecisionConflictPrompt(conflict), /Prior decision: H3068\+H6635 \/ יְהוָה צְבָאוֹת: use "Yahweh of Armies"\. Never 'Yahweh of hosts'/);
+});
+
+test('human decision conflict prompt uses submitter when decision notes contain one', async () => {
+  const skillsRoot = createSkillsRoot({ withAttribution: true });
+  const conflict = await findHumanDecisionConflict({
+    message: buildMessage({ subject: 'Jeremiah BP' }),
+    feedbackText: 'Please use Yahweh of hosts in Jeremiah notes.',
+    classified: buildJeremiahHostsPayload(),
+    skillsRoot,
+  });
+
+  assert.match(formatDecisionConflictPrompt(conflict), /submitted by Chris Smith on April 21/);
+});
+
+test('summarizeHumanFeedback prefers classifier complaint summary and normalizes capitalization', () => {
+  const summary = summarizeHumanFeedback({
+    feedbackText: 'please use rescue for hiphils of H5337',
+    classified: {
+      complaints: [{ summary: 'use rescue for Hiphil forms of H5337' }],
+      issues: [{ title: 'Fallback title' }],
+    },
+  });
+
+  assert.equal(summary, 'Use rescue for Hiphil forms of H5337');
+});
+
+test('summarizePriorDecision includes rendering scope and notes', () => {
+  const summary = summarizePriorDecision({
+    strong: 'H5337',
+    hebrew: 'נָצַל',
+    rendering: 'deliver',
+    book: 'ALL',
+    notes: "Project preference: 'deliver' not 'rescue' for נצל Hiphil. Editor ISA 47:14.",
+  });
+
+  assert.equal(
+    summary,
+    "H5337 / נָצַל: use \"deliver\". Project preference: 'deliver' not 'rescue' for נצל Hiphil. Editor ISA 47:14."
+  );
+});
+
+test('issueReportPipeline pauses skills issue when feedback conflicts with human decision', async () => {
+  const message = buildMessage({
+    subject: 'Jeremiah BP',
+    content: 'feedback: Please use Yahweh of hosts in Jeremiah notes.',
+  });
+  _clearPendingHumanDecisionConflict(message);
+  const classifierInputs = [];
+  const sentReplies = [];
+  const { fetchImpl, store } = createGithubFetchStub();
+  const runtime = createRuntime({
+    classifierPayload: buildJeremiahHostsPayload(),
+    fetchImpl,
+    sentReplies,
+    classifierInputs,
+  });
+
+  await issueReportPipeline({}, message, { ...runtime, skillsRoot: createSkillsRoot() });
+
+  assert.equal(store.issues['bp-assistant-skills'].length, 0);
+  assert.equal(store.postsByRepo['bp-assistant-skills'], 0);
+  assert.match(sentReplies[0].text, /^This conflicts with a human decision recorded on April 21\./);
+  assert.match(sentReplies[0].text, /Feedback summary: Jeremiah notes should use Yahweh of hosts/);
+  assert.match(sentReplies[0].text, /Do you still wish to file this feedback \(yes\/no\)\?/);
+  _clearPendingHumanDecisionConflict(message);
+});
+
+test('confirmed human-decision conflict files issue with conflict section and markers', async () => {
+  const message = buildMessage({
+    subject: 'Jeremiah BP',
+    content: 'feedback: Please use Yahweh of hosts in Jeremiah notes.',
+  });
+  _clearPendingHumanDecisionConflict(message);
+  const classifierInputs = [];
+  const sentReplies = [];
+  const { fetchImpl, store } = createGithubFetchStub();
+  const runtime = createRuntime({
+    classifierPayload: buildJeremiahHostsPayload(),
+    fetchImpl,
+    sentReplies,
+    classifierInputs,
+  });
+
+  await issueReportPipeline({}, message, { ...runtime, skillsRoot: createSkillsRoot() });
+  const handled = await handlePendingHumanDecisionConflictReply(
+    buildMessage({ ...message, content: 'yes', id: 5000 }),
+    {
+      isYes: (content) => /^yes$/i.test(String(content).trim()),
+      isNo: (content) => /^no$/i.test(String(content).trim()),
+    },
+    runtime
+  );
+
+  assert.equal(handled, true);
+  assert.equal(store.issues['bp-assistant-skills'].length, 1);
+  assert.match(store.issues['bp-assistant-skills'][0].body, /## Conflicts with prior human decision/);
+  assert.match(store.issues['bp-assistant-skills'][0].body, /issue-report:4242:i1/);
+  assert.match(store.issues['bp-assistant-skills'][0].body, /issue-report:4242:bp-assistant-skills:c1/);
+  assert.match(sentReplies[1].text, /Filed \[\*\*bp-assistant-skills#1\*\*\]/);
+});
+
+test('declined human-decision conflict clears pending report without filing', async () => {
+  const message = buildMessage({
+    subject: 'Jeremiah BP',
+    content: 'feedback: Please use Yahweh of hosts in Jeremiah notes.',
+  });
+  _clearPendingHumanDecisionConflict(message);
+  const classifierInputs = [];
+  const sentReplies = [];
+  const { fetchImpl, store } = createGithubFetchStub();
+  const runtime = createRuntime({
+    classifierPayload: buildJeremiahHostsPayload(),
+    fetchImpl,
+    sentReplies,
+    classifierInputs,
+  });
+
+  await issueReportPipeline({}, message, { ...runtime, skillsRoot: createSkillsRoot() });
+  const handled = await handlePendingHumanDecisionConflictReply(
+    buildMessage({ ...message, content: 'no', id: 5001 }),
+    {
+      isYes: (content) => /^yes$/i.test(String(content).trim()),
+      isNo: (content) => /^no$/i.test(String(content).trim()),
+    },
+    runtime
+  );
+
+  assert.equal(handled, true);
+  assert.equal(store.issues['bp-assistant-skills'].length, 0);
+  assert.equal(store.postsByRepo['bp-assistant-skills'], 0);
+  assert.equal(sentReplies[1].text, 'No issue filed.');
 });
 
 test('issueReportPipeline retries classifier when JSON is truncated at max_tokens', async () => {

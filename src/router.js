@@ -12,6 +12,7 @@ const { resumeInsertion } = require('./insertion-resume');
 const { normalizeBookName, isValidBook } = require('./pipeline-utils');
 const { isTransientOutageError } = require('./claude-runner');
 const { publishAdminStatus } = require('./admin-status');
+const { handlePendingHumanDecisionConflictReply } = require('./issue-report-pipeline');
 
 // In-memory pending confirmations for stream messages
 const pendingConfirmations = new Map();
@@ -916,6 +917,9 @@ async function routeMessage(message) {
       return;
     }
   } else {
+    const handledIssueReportConflict = await handlePendingHumanDecisionConflictReply(message, { isYes, isNo });
+    if (handledIssueReportConflict) return;
+
     // Check for pending confirmation BEFORE auth check — otherwise non-authorized
     // users talking in a topic with a pending confirmation get an unauthorized reply
     // instead of being silently ignored.
