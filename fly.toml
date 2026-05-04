@@ -25,6 +25,10 @@ kill_timeout = 30
   auto_start_machines = true
   auto_stop_machines = "off"
 
+[[restart]]
+  policy = "always"
+  processes = ["app"]
+
 [[vm]]
   memory = "2gb"
   cpu_kind = "shared"
