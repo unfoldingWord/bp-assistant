@@ -61,6 +61,7 @@ function createHarness({ runClaudeImpl }) {
   const pipelineContextPath = require.resolve('../src/pipeline-context');
   const pipelineUtilsPath = require.resolve('../src/pipeline-utils');
   const adminStatusPath = require.resolve('../src/admin-status');
+  const selfDiagnosisPath = require.resolve('../src/self-diagnosis');
 
   const sent = {
     stream: [],
@@ -71,10 +72,12 @@ function createHarness({ runClaudeImpl }) {
   const runClaudeCalls = [];
   const checkpoints = [];
   const runSummaries = [];
+  const diagnosisCalls = [];
 
   delete require.cache[generatePath];
   delete require.cache[pipelineUtilsPath];
   delete require.cache[adminStatusPath];
+  delete require.cache[selfDiagnosisPath];
 
   installStub(configPath, {
     adminUserId: 1,
@@ -132,7 +135,7 @@ function createHarness({ runClaudeImpl }) {
     setPendingMerge: () => {},
   });
   installStub(checkpointsPath, {
-    getCheckpoint: () => null,
+    getCheckpoint: () => checkpoints.at(-1) || null,
     setCheckpoint: (_ref, patch) => {
       checkpoints.push(patch);
       return patch;
@@ -143,6 +146,12 @@ function createHarness({ runClaudeImpl }) {
     buildGenerateContext: () => ({ contextPath: 'tmp/context.json', dirPath: 'tmp/pipeline/ISA-52' }),
     buildUstContext: async () => ({ contextPath: 'tmp/ust-context.json', dirPath: 'tmp/pipeline/ISA-52', selectedUltPath: null }),
   });
+  installStub(selfDiagnosisPath, {
+    dispatchSelfDiagnosis: async (payload) => {
+      diagnosisCalls.push(payload);
+      return { ok: true, action: 'created' };
+    },
+  });
 
   const { generatePipeline } = require('../src/generate-pipeline');
 
@@ -152,6 +161,7 @@ function createHarness({ runClaudeImpl }) {
     runClaudeCalls,
     checkpoints,
     runSummaries,
+    diagnosisCalls,
     readStatusTexts() {
       if (!fs.existsSync(process.env.ADMIN_STATUS_FILE)) return [];
       return fs.readFileSync(process.env.ADMIN_STATUS_FILE, 'utf8')
@@ -175,6 +185,7 @@ function createHarness({ runClaudeImpl }) {
       delete require.cache[checkpointsPath];
       delete require.cache[pipelineContextPath];
       delete require.cache[adminStatusPath];
+      delete require.cache[selfDiagnosisPath];
       if (oldBaseDir == null) delete process.env.CSKILLBP_DIR;
       else process.env.CSKILLBP_DIR = oldBaseDir;
       if (oldStatusFile == null) delete process.env.ADMIN_STATUS_FILE;
@@ -207,6 +218,12 @@ test('generatePipeline classifies initial-pipeline early exit when only Wave 2 a
     assert.ok(statusTexts.some((text) => text.includes('initial-pipeline exited before writing required outputs')));
     assert.ok(statusTexts.some((text) => text.includes('issues TSV, UST')));
     assert.ok(harness.checkpoints.some((patch) => patch.current?.errorKind === 'initial_pipeline_early_exit'));
+    assert.equal(harness.diagnosisCalls.length, 1);
+    assert.equal(harness.diagnosisCalls[0].event.severity, 'error');
+    assert.equal(harness.diagnosisCalls[0].checkpoint.current.errorKind, 'initial_pipeline_early_exit');
+    assert.match(harness.diagnosisCalls[0].errorText, /issues TSV, UST/);
+    assert.match(harness.diagnosisCalls[0].errorText, /wave2_structure\.tsv/);
+    assert.match(harness.diagnosisCalls[0].errorText, /Claude returned subtype=success/);
     assert.deepEqual(harness.runSummaries.at(-1), {
       pipeline: 'generate',
       book: 'ISA',
@@ -246,6 +263,7 @@ test('generatePipeline accepts initial-pipeline success when final ULT, issues, 
     assert.equal(harness.sent.uploads.length, 2);
     assert.ok(harness.sent.stream.some(({ text }) => text.includes('ISA 52 ULT.usfm')));
     assert.ok(harness.sent.stream.some(({ text }) => text.includes('ISA 52 UST.usfm')));
+    assert.equal(harness.diagnosisCalls.length, 0);
     assert.equal(harness.runSummaries.at(-1).success, true);
   } finally {
     harness.cleanup();
