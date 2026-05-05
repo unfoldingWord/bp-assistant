@@ -329,6 +329,52 @@ test('human decision conflict parser detects rejected Yahweh of hosts preference
   assert.match(formatDecisionConflictPrompt(conflict), /Prior decision: H3068\+H6635 \/ יְהוָה צְבָאוֹת: use "Yahweh of Armies"\. Never 'Yahweh of hosts'/);
 });
 
+test('human decision conflict ignores unrelated UST word-choice rule on Hebrew alignment feedback', async () => {
+  // Regression: 2026-05-05 — Grant Ailie filed feedback about Hebrew/waw verb
+  // alignment and the bot incorrectly cited a UST decision ('avoid' not 'stay
+  // away from'). The rejected-phrase regex over-extracted "not" from the notes
+  // and matched the LLM-paraphrased "is not pairing" in the issue body.
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'bp-skills-decisions-fp-'));
+  fs.mkdirSync(path.join(root, 'data/quick-ref'), { recursive: true });
+  fs.mkdirSync(path.join(root, 'data/glossary'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'data/quick-ref/ult_decisions.csv'), 'Strong,Hebrew,Rendering,Book,Context,Notes,Date,Source\n');
+  fs.writeFileSync(path.join(root, 'data/quick-ref/ust_decisions.csv'), [
+    'Strong,Hebrew,Rendering,Book,Context,Notes,Date,Source',
+    `,,avoid,ALL,"88:8,18 friends distancing","UST: 'avoid' not 'stay away from'. More concise. Editor PSA 88.",2026-02-17,human`,
+  ].join('\n'));
+  fs.writeFileSync(path.join(root, 'data/glossary/project_glossary.md'), '');
+
+  const conflict = await findHumanDecisionConflict({
+    message: buildMessage({ subject: 'Psalm 88' }),
+    feedbackText: 'in the ULT align the Hebrew verbs with the Hebrew word containing the waw that they are connected to',
+    classified: buildClassifierPayload({
+      complaints: [{
+        id: 'c1',
+        summary: 'ULT alignment is not pairing Hebrew verbs with the waw-prefixed Hebrew word they are grammatically connected to',
+        evidence: ['align the Hebrew verbs with the Hebrew word containing the waw'],
+        likely_layers: ['bp-assistant-skills'],
+      }],
+      ownership: {
+        repositories: ['bp-assistant-skills'],
+        primary_repo: 'bp-assistant-skills',
+        secondary_repo: null,
+        rationale: 'ULT alignment data lives in skills.',
+      },
+      issues: [{
+        id: 'i1',
+        repo: 'bp-assistant-skills',
+        complaint_ids: ['c1'],
+        title: 'ULT should pair Hebrew verbs with their waw-prefixed companion word',
+        body: '## Summary\n\nULT alignment is not pairing the Hebrew verb with the waw-containing word it is grammatically connected to.\n\n## Expected Behavior\n\nThe verb should align with the waw-prefixed word.',
+        labels: ['bug'],
+      }],
+    }),
+    skillsRoot: root,
+  });
+
+  assert.equal(conflict, null);
+});
+
 test('human decision conflict prompt uses submitter when decision notes contain one', async () => {
   const skillsRoot = createSkillsRoot({ withAttribution: true });
   const conflict = await findHumanDecisionConflict({

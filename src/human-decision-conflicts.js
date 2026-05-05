@@ -217,18 +217,25 @@ function loadHumanDecisions(skillsRoot) {
 }
 
 function collectReportText({ message, feedbackText, classified }) {
-  const parts = [
+  const verbatimParts = [
     feedbackText,
     message?.subject,
     message?.display_recipient,
   ];
+  const paraphrasedParts = [];
   for (const complaint of classified?.complaints || []) {
-    parts.push(complaint.summary, ...(complaint.evidence || []));
+    paraphrasedParts.push(complaint.summary, ...(complaint.evidence || []));
   }
   for (const issue of classified?.issues || []) {
-    parts.push(issue.title, issue.body);
+    paraphrasedParts.push(issue.title, issue.body);
   }
-  return parts.filter(Boolean).join('\n');
+  const verbatim = verbatimParts.filter(Boolean).join('\n');
+  const paraphrased = paraphrasedParts.filter(Boolean).join('\n');
+  return {
+    verbatim,
+    paraphrased,
+    combined: [verbatim, paraphrased].filter(Boolean).join('\n'),
+  };
 }
 
 function detectBooks(text) {
@@ -248,14 +255,24 @@ function bookApplies(decision, reportBooks) {
   return reportBooks.has(decision.book);
 }
 
+const REJECTED_PHRASE_STOPWORDS = new Set([
+  'not', 'the', 'a', 'an', 'of', 'to', 'and', 'or', 'is', 'it',
+  'that', 'this', 'as', 'in', 'on', 'for', 'with', 'by',
+]);
+
 function extractRejectedPhrases(notes) {
   const phrases = [];
   const text = String(notes || '');
-  const pattern = /\b(?:never|not|do not|don't|avoid)\b[^."'“”']{0,80}(?:"([^"]+)"|'([^']+)'|“([^”]+)”|‘([^’]+)’)/gi;
-  let match;
-  while ((match = pattern.exec(text))) {
-    const phrase = (match[1] || match[2] || match[3] || match[4] || '').trim();
-    if (phrase && !phrases.includes(phrase)) phrases.push(phrase);
+  // Lookbehind skips keywords sitting inside quoted renderings (e.g. 'avoid'
+  // in "use 'avoid' not 'stay away from'") — those are the desired rendering,
+  // not a rejection clause.
+  const pattern = /(?<!['"“”‘’])\b(?:never|not|do not|don't|avoid)\b[^."'“”']{0,80}(?:"([^"]+)"|'([^']+)'|“([^”]+)”|‘([^’]+)’)/gi;
+  let m;
+  while ((m = pattern.exec(text))) {
+    const phrase = (m[1] || m[2] || m[3] || m[4] || '').trim();
+    if (!phrase) continue;
+    if (REJECTED_PHRASE_STOPWORDS.has(phrase.toLowerCase())) continue;
+    if (!phrases.includes(phrase)) phrases.push(phrase);
   }
   return phrases;
 }
@@ -281,18 +298,34 @@ function phraseAppearsDesired(text, phrase) {
 function scoreDecision(decision, reportText, reportBooks) {
   if (!bookApplies(decision, reportBooks)) return null;
 
-  const normalized = normalizeText(reportText);
+  const verbatim = reportText?.verbatim || '';
+  const paraphrased = reportText?.paraphrased || '';
+  const combined = reportText?.combined || `${verbatim}\n${paraphrased}`;
+  const verbatimNormalized = normalizeText(verbatim);
+  const combinedNormalized = normalizeText(combined);
+
   const reasons = [];
   let score = 0;
+  let hasVerbatimRejectedHit = false;
 
   for (const phrase of extractRejectedPhrases(decision.notes)) {
-    if (phraseAppearsDesired(reportText, phrase)) {
+    const normalizedPhrase = normalizeText(phrase);
+    const inVerbatim = verbatimNormalized.includes(normalizedPhrase);
+    const inCombined = combinedNormalized.includes(normalizedPhrase);
+
+    if (phraseAppearsDesired(verbatim, phrase)) {
       score += 12;
+      hasVerbatimRejectedHit = true;
       reasons.push(`requested rejected phrase "${phrase}"`);
-    } else if (normalized.includes(normalizeText(phrase))) {
+    } else if (phraseAppearsDesired(paraphrased, phrase)) {
+      score += 4;
+      reasons.push(`requested rejected phrase "${phrase}" (paraphrased)`);
+    } else if (inCombined) {
       score += 3;
       reasons.push(`mentioned rejected phrase "${phrase}"`);
     }
+
+    if (inVerbatim) hasVerbatimRejectedHit = true;
   }
 
   for (const [label, value, points] of [
@@ -301,7 +334,7 @@ function scoreDecision(decision, reportText, reportBooks) {
     ['rendering', decision.rendering, 2],
   ]) {
     const term = normalizeText(value);
-    if (term && normalized.includes(term)) {
+    if (term && combinedNormalized.includes(term)) {
       score += points;
       reasons.push(`matched ${label} ${value}`);
     }
@@ -313,6 +346,14 @@ function scoreDecision(decision, reportText, reportBooks) {
   }
 
   if (score < 8) return null;
+
+  // Anchor requirement: a decision with no Strong number and no Hebrew term is
+  // just a free-text rule. Without a literal hit on a rejected phrase in the
+  // user's verbatim feedback, we have no real evidence the topic matches —
+  // only the LLM-paraphrased issue body, which can introduce incidental words.
+  const hasAnchor = Boolean(normalizeText(decision.strong) || normalizeText(decision.hebrew));
+  if (!hasAnchor && !hasVerbatimRejectedHit) return null;
+
   return { decision, score, reasons };
 }
 
@@ -365,7 +406,7 @@ async function findHumanDecisionConflict({
   if (!classified?.issues?.some((issue) => issue.repo === 'bp-assistant-skills')) return null;
 
   const reportText = collectReportText({ message, feedbackText, classified });
-  const reportBooks = detectBooks(reportText);
+  const reportBooks = detectBooks(reportText.combined);
   const candidates = loadHumanDecisions(skillsRoot)
     .map((decision) => scoreDecision(decision, reportText, reportBooks))
     .filter(Boolean)
