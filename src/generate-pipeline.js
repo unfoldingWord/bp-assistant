@@ -43,6 +43,22 @@ const INITIAL_PIPELINE_COMPLETION_GUARDRAIL = [
   'If any of those required outputs are missing, continue the pipeline or return a failure instead of success.',
 ].join(' ');
 
+function buildInitialPipelineContinuationPrompt({ book, chapter, missing = [], observed = [] }) {
+  const chapterTag = buildChapterTag(book, chapter);
+  return [
+    `Continue the existing initial-pipeline run for ${book} ${chapter}.`,
+    'Do not invoke a slash command. Resume from the artifacts already on disk and finish the remaining pipeline waves.',
+    `Current missing final outputs: ${missing.length ? missing.join(', ') : 'unknown'}.`,
+    `Observed artifacts: ${observed.length ? observed.join(', ') : '(none)'}.`,
+    'Wave 1 and Wave 2 outputs are intermediate only.',
+    `Complete Wave 3 challenge/defend, Wave 4 merge/revision, Wave 5 verification if needed, and Wave 6 UST generation for ${book} ${chapter}.`,
+    'Before returning success, verify these final files exist and are non-empty:',
+    `output/AI-ULT/${book}/${chapterTag}.usfm`,
+    `output/issues/${book}/${chapterTag}.tsv`,
+    `output/AI-UST/${book}/${chapterTag}.usfm`,
+  ].join('\n');
+}
+
 function hasFreshFlag(content) {
   return /--fresh\b/i.test(String(content || '')) || /--new\b/i.test(String(content || ''));
 }
@@ -434,13 +450,15 @@ async function generatePipeline(route, message) {
 
   const tokensBefore = getCumulativeTokens();
   let success = Number(existingCheckpoint?.success || 0);
-  let fail = Number(existingCheckpoint?.fail || 0);
+  let fail = existingCheckpoint?.state === 'failed' ? 0 : Number(existingCheckpoint?.fail || 0);
   const completedChapters = Array.isArray(existingCheckpoint?.completedChapters) ? [...existingCheckpoint.completedChapters] : []; // Phase 1 results for non-file-response users
   let abortForUsageLimit = false;
   let abortForOutage = false;
   let usageLimitTag = null;
   let resumeChapter = Number(existingCheckpoint?.resume?.chapter || start);
   let resumeSkill = existingCheckpoint?.resume?.skill || null;
+  let resumeSessionId = existingCheckpoint?.resume?.sessionId || null;
+  let resumeMode = existingCheckpoint?.resume?.mode || null;
 
   const canResumeFromCheckpoint = (
     existingCheckpoint?.resume?.chapter != null &&
@@ -452,13 +470,20 @@ async function generatePipeline(route, message) {
   } else {
     resumeChapter = start;
     resumeSkill = null;
+    resumeSessionId = null;
+    resumeMode = null;
   }
   setCheckpoint(checkpointRef, {
     state: 'running',
     success,
     fail,
     completedChapters,
-    resume: { chapter: resumeChapter, skill: resumeSkill },
+    resume: {
+      chapter: resumeChapter,
+      skill: resumeSkill,
+      sessionId: resumeSessionId || undefined,
+      mode: resumeMode || undefined,
+    },
   });
 
   // =========================================================================
@@ -480,6 +505,13 @@ async function generatePipeline(route, message) {
     let claudeResult = null;
     let sdkError = null;
     const runInitialSkill = !(ch === resumeChapter && resumeSkill === 'align-all-parallel');
+    const resumeInitialPipelineEarlyExit = (
+      ch === resumeChapter &&
+      isInitialPipelineSkill &&
+      resumeSkill === 'initial-pipeline' &&
+      resumeMode === 'continue_after_early_exit' &&
+      !!resumeSessionId
+    );
     let directUstContext = null;
     let directUstUltPath = null;
 
@@ -515,20 +547,48 @@ async function generatePipeline(route, message) {
         fail,
         completedChapters,
         current: { chapter: ch, skill: skill, status: 'running', startedAt: new Date(chapterStart).toISOString() },
-        resume: { chapter: ch, skill },
+        resume: resumeInitialPipelineEarlyExit
+          ? { chapter: ch, skill, sessionId: resumeSessionId, mode: resumeMode }
+          : { chapter: ch, skill },
       });
-      // Delete expected outputs so Claude must recreate them (prevents stale-mtime false failures on resume)
+      // Delete expected outputs so Claude must recreate them (prevents stale-mtime false failures on resume).
+      // When resuming an early-exited initial-pipeline session, keep the ULT/Wave 2 artifacts
+      // so the resumed session can continue downstream instead of restarting the chapter.
       const vDel = hasVerseRange ? `${book}-${ch}-vv${verseStart}-${verseEnd}` : `${book}-${ch}`;
-      for (const rel of [`output/AI-ULT/${vDel}.usfm`, `output/AI-UST/${vDel}.usfm`]) {
-        const resolved = resolveOutputFile(rel, book);
-        if (resolved) {
-          try { fs.unlinkSync(path.resolve(CSKILLBP_DIR, resolved)); } catch (_) { /* fine if missing */ }
+      if (!resumeInitialPipelineEarlyExit) {
+        for (const rel of [`output/AI-ULT/${vDel}.usfm`, `output/AI-UST/${vDel}.usfm`]) {
+          const resolved = resolveOutputFile(rel, book);
+          if (resolved) {
+            try { fs.unlinkSync(path.resolve(CSKILLBP_DIR, resolved)); } catch (_) { /* fine if missing */ }
+          }
         }
       }
       try {
         const timeoutMs = calcSkillTimeout(book, ch, route.operations || 6);
         const skillRef = hasVerseRange ? `${book} ${ch}:${verseStart}-${verseEnd}` : `${book} ${ch}`;
         let initialPrompt = skillRef;
+        let invocationSkill = skill;
+        let invocationResume = null;
+        if (resumeInitialPipelineEarlyExit) {
+          const resumeStatus = getInitialPipelineOutputStatus({
+            book,
+            chapter: ch,
+            verseStart: hasVerseRange ? verseStart : null,
+            verseEnd: hasVerseRange ? verseEnd : null,
+          });
+          const observedArtifacts = [
+            ...Object.values(resumeStatus.found),
+            ...resumeStatus.observedTempArtifacts,
+          ];
+          initialPrompt = buildInitialPipelineContinuationPrompt({
+            book,
+            chapter: ch,
+            missing: resumeStatus.missing,
+            observed: observedArtifacts,
+          });
+          invocationSkill = null;
+          invocationResume = resumeSessionId;
+        }
         if (skill === 'UST-gen') {
           const existingUlt = resolveOutputFile(`output/AI-ULT/${hasVerseRange ? `${book}-${ch}-vv${verseStart}-${verseEnd}` : `${book}-${ch}`}.usfm`, book)
             || discoverFreshOutput('output/AI-ULT', book, new RegExp(`^${book}-0*${ch}(-(?!.*aligned).*)?\\.usfm$`), null);
@@ -553,7 +613,8 @@ async function generatePipeline(route, message) {
             cwd: CSKILLBP_DIR,
             model,
             betas,
-            skill,
+            skill: invocationSkill,
+            resume: invocationResume,
             appendSystemPrompt: isInitialPipelineSkill ? INITIAL_PIPELINE_COMPLETION_GUARDRAIL : undefined,
             tools: DEFAULT_RESTRICTED_TOOLS,
             disallowedTools: ['Bash'],
@@ -617,11 +678,11 @@ async function generatePipeline(route, message) {
     const chPat = new RegExp(`^${book}-0*${ch}(-(?!.*aligned).*)?\.usfm$`);
     // Single-verse runs may leave the UST unchanged (Claude deems existing content sufficient).
     // In that case freshness is not a useful signal — just check that the file exists.
-    const freshnessMs = (runInitialSkill && !hasVerseRange) ? chapterStart : null;
-    const ultRel = discoverFreshOutput('output/AI-ULT', book, chPat, freshnessMs);
-    const ustRel = discoverFreshOutput('output/AI-UST', book, chPat, freshnessMs);
-    const hasUlt = !!ultRel;
-    const hasUst = !!ustRel;
+    const freshnessMs = (runInitialSkill && !hasVerseRange && !resumeInitialPipelineEarlyExit) ? chapterStart : null;
+    let ultRel = discoverFreshOutput('output/AI-ULT', book, chPat, freshnessMs);
+    let ustRel = discoverFreshOutput('output/AI-UST', book, chPat, freshnessMs);
+    let hasUlt = !!ultRel;
+    let hasUst = !!ustRel;
 
     // Log timing
     const logLine = `${new Date().toISOString()} | ${book} ${ch} | sdk=${sdkSuccess} | ult=${hasUlt} | ust=${hasUst} | duration=${duration}s\n`;
@@ -694,55 +755,122 @@ async function generatePipeline(route, message) {
     }
 
     if (runInitialSkill && isInitialPipelineSkill && !isDryRun) {
-      const initialPipelineStatus = getInitialPipelineOutputStatus({
+      let initialPipelineStatus = getInitialPipelineOutputStatus({
         book,
         chapter: ch,
         verseStart: hasVerseRange ? verseStart : null,
         verseEnd: hasVerseRange ? verseEnd : null,
       });
       if (initialPipelineStatus.missing.length > 0) {
-        const observedArtifacts = [
+        let observedArtifacts = [
           ...Object.values(initialPipelineStatus.found),
           ...initialPipelineStatus.observedTempArtifacts,
         ];
-        const observedLabel = observedArtifacts.length > 0
-          ? ` Observed artifacts: ${observedArtifacts.join(', ')}.`
-          : '';
-        console.error(
-          `[generate] initial-pipeline exited before final outputs for ${book} ${ch}; missing=${initialPipelineStatus.missing.join(', ')}; observed=${observedArtifacts.join(', ')}`
-        );
-        const earlyExitEvent = await status(
-          `Failed to generate **${book} ${ch}**: initial-pipeline exited before writing required outputs ` +
-          `(missing: ${initialPipelineStatus.missing.join(', ')}).${observedLabel}`
-        );
-        fail++;
-        setCheckpoint(checkpointRef, {
-          state: 'failed',
-          success,
-          fail,
-          completedChapters,
-          current: {
-            chapter: ch,
-            skill,
-            status: 'failed',
-            errorKind: 'initial_pipeline_early_exit',
-            outputStatus: 'incomplete',
-            missingOutputs: initialPipelineStatus.missing,
-            observedArtifacts,
-          },
-          resume: { chapter: ch, skill },
-        });
-        fireDiagnosis(earlyExitEvent, {
-          checkpoint: getCheckpoint(checkpointRef),
-          errorText: [
-            `Skill: ${skill}`,
-            `Chapter: ${book} ${ch}`,
-            'Claude returned subtype=success before final required outputs existed.',
-            `Missing outputs: ${initialPipelineStatus.missing.join(', ')}`,
-            `Observed artifacts: ${observedArtifacts.length > 0 ? observedArtifacts.join(', ') : '(none)'}`,
-          ].join('\n'),
-        });
-        continue;
+        let continuationErrorText = null;
+        if (!resumeInitialPipelineEarlyExit && claudeResult?.session_id) {
+          await status(
+            `initial-pipeline returned success before final outputs for **${book} ${ch}**; ` +
+            `resuming the same session to finish missing outputs (${initialPipelineStatus.missing.join(', ')}).`
+          );
+          try {
+            const continuationResult = await runClaude({
+              prompt: buildInitialPipelineContinuationPrompt({
+                book,
+                chapter: ch,
+                missing: initialPipelineStatus.missing,
+                observed: observedArtifacts,
+              }),
+              cwd: CSKILLBP_DIR,
+              model,
+              betas,
+              resume: claudeResult.session_id,
+              appendSystemPrompt: INITIAL_PIPELINE_COMPLETION_GUARDRAIL,
+              tools: DEFAULT_RESTRICTED_TOOLS,
+              disallowedTools: ['Bash'],
+              disableLocalSettings: true,
+              forceNoAutoBashSandbox: true,
+              timeoutMs: calcSkillTimeout(book, ch, route.operations || 6),
+              onProgress: ({ turnCount, lastTool, elapsedMs, timedOut }) => {
+                const elapsed = Math.round(elapsedMs / 60000);
+                const suffix = timedOut ? ' — **timed out**, aborting' : '';
+                return status(`Still continuing **${book} ${ch}** (initial-pipeline) — ${elapsed}min, ${turnCount} tool calls${lastTool ? `, last: \`${lastTool}\`` : ''}${suffix}`);
+              },
+            });
+            if (!continuationResult || continuationResult.subtype !== 'success') {
+              continuationErrorText = continuationResult
+                ? (continuationResult.error || continuationResult.result || `non-success subtype: "${continuationResult.subtype}"`)
+                : 'continuation returned no result';
+            } else {
+              claudeResult = continuationResult;
+              initialPipelineStatus = getInitialPipelineOutputStatus({
+                book,
+                chapter: ch,
+                verseStart: hasVerseRange ? verseStart : null,
+                verseEnd: hasVerseRange ? verseEnd : null,
+              });
+              observedArtifacts = [
+                ...Object.values(initialPipelineStatus.found),
+                ...initialPipelineStatus.observedTempArtifacts,
+              ];
+              ultRel = discoverFreshOutput('output/AI-ULT', book, chPat, freshnessMs);
+              ustRel = discoverFreshOutput('output/AI-UST', book, chPat, freshnessMs);
+              hasUlt = !!ultRel;
+              hasUst = !!ustRel;
+            }
+          } catch (err) {
+            continuationErrorText = err.message || String(err);
+            console.error(`[generate] initial-pipeline continuation error for ${book} ${ch}: ${continuationErrorText}`);
+          }
+        }
+        if (initialPipelineStatus.missing.length === 0) {
+          await status(`initial-pipeline continuation completed required outputs for **${book} ${ch}**.`);
+        } else {
+          const observedLabel = observedArtifacts.length > 0
+            ? ` Observed artifacts: ${observedArtifacts.join(', ')}.`
+            : '';
+          console.error(
+            `[generate] initial-pipeline exited before final outputs for ${book} ${ch}; missing=${initialPipelineStatus.missing.join(', ')}; observed=${observedArtifacts.join(', ')}`
+          );
+          const earlyExitEvent = await status(
+            `Failed to generate **${book} ${ch}**: initial-pipeline exited before writing required outputs ` +
+            `(missing: ${initialPipelineStatus.missing.join(', ')}).${observedLabel}`
+          );
+          fail++;
+          setCheckpoint(checkpointRef, {
+            state: 'failed',
+            success,
+            fail,
+            completedChapters,
+            current: {
+              chapter: ch,
+              skill,
+              status: 'failed',
+              errorKind: 'initial_pipeline_early_exit',
+              outputStatus: 'incomplete',
+              missingOutputs: initialPipelineStatus.missing,
+              observedArtifacts,
+              continuationError: continuationErrorText || undefined,
+            },
+            resume: {
+              chapter: ch,
+              skill,
+              sessionId: claudeResult?.session_id || resumeSessionId || null,
+              mode: 'continue_after_early_exit',
+            },
+          });
+          fireDiagnosis(earlyExitEvent, {
+            checkpoint: getCheckpoint(checkpointRef),
+            errorText: [
+              `Skill: ${skill}`,
+              `Chapter: ${book} ${ch}`,
+              'Claude returned subtype=success before final required outputs existed.',
+              `Missing outputs: ${initialPipelineStatus.missing.join(', ')}`,
+              `Observed artifacts: ${observedArtifacts.length > 0 ? observedArtifacts.join(', ') : '(none)'}`,
+              continuationErrorText ? `Continuation error: ${continuationErrorText}` : null,
+            ].filter(Boolean).join('\n'),
+          });
+          continue;
+        }
       }
     }
 
@@ -1456,7 +1584,9 @@ async function generatePipeline(route, message) {
     ? `${book} ${start}:${verseStart}-${verseEnd}`
     : `${book} ${start}\u2013${end}`;
   await status(`Generation complete for **${finalLabel}**: ${success} succeeded, ${fail} failed.`);
-  clearCheckpoint(checkpointRef);
+  if (fail === 0) {
+    clearCheckpoint(checkpointRef);
+  }
 }
 
 module.exports = {
