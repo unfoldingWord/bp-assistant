@@ -27,7 +27,7 @@ function buildMessage(content, overrides = {}) {
   };
 }
 
-function createHarness({ runClaudeImpl }) {
+function createHarness({ runClaudeImpl, initialCheckpoint = null }) {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'generate-pipeline-'));
   const oldBaseDir = process.env.CSKILLBP_DIR;
   const oldStatusFile = process.env.ADMIN_STATUS_FILE;
@@ -70,7 +70,8 @@ function createHarness({ runClaudeImpl }) {
     uploads: [],
   };
   const runClaudeCalls = [];
-  const checkpoints = [];
+  const checkpoints = initialCheckpoint ? [initialCheckpoint] : [];
+  const clearedCheckpoints = [];
   const runSummaries = [];
   const diagnosisCalls = [];
 
@@ -140,7 +141,9 @@ function createHarness({ runClaudeImpl }) {
       checkpoints.push(patch);
       return patch;
     },
-    clearCheckpoint: () => {},
+    clearCheckpoint: () => {
+      clearedCheckpoints.push(true);
+    },
   });
   installStub(pipelineContextPath, {
     buildGenerateContext: () => ({ contextPath: 'tmp/context.json', dirPath: 'tmp/pipeline/ISA-52' }),
@@ -160,6 +163,7 @@ function createHarness({ runClaudeImpl }) {
     sent,
     runClaudeCalls,
     checkpoints,
+    clearedCheckpoints,
     runSummaries,
     diagnosisCalls,
     readStatusTexts() {
@@ -194,16 +198,26 @@ function createHarness({ runClaudeImpl }) {
   };
 }
 
-test('generatePipeline classifies initial-pipeline early exit when only Wave 2 artifacts exist', async () => {
+test('generatePipeline resumes the same initial-pipeline session after Wave 2 early exit', async () => {
   const harness = createHarness({
     runClaudeImpl: async ({ options, tempDir }) => {
+      if (options.resume === 'session-isa-52') {
+        assert.equal(options.skill, undefined);
+        assert.match(options.prompt, /Continue the existing initial-pipeline run/);
+        assert.match(options.prompt, /Wave 3/);
+        fs.mkdirSync(path.join(tempDir, 'output', 'AI-UST', 'ISA'), { recursive: true });
+        fs.mkdirSync(path.join(tempDir, 'output', 'issues', 'ISA'), { recursive: true });
+        fs.writeFileSync(path.join(tempDir, 'output', 'AI-UST', 'ISA', 'ISA-52.usfm'), '\\id ISA\n\\c 52\n\\v 1 ust\n');
+        fs.writeFileSync(path.join(tempDir, 'output', 'issues', 'ISA', 'ISA-52.tsv'), 'isa\t52:1\tfigs-activepassive\tYou were sold\n');
+        return { subtype: 'success', usage: {}, total_cost_usd: 0, session_id: 'session-isa-52' };
+      }
       fs.mkdirSync(path.join(tempDir, 'output', 'AI-ULT', 'ISA'), { recursive: true });
       fs.mkdirSync(path.join(tempDir, 'tmp', 'pipeline-ISA-52'), { recursive: true });
       fs.writeFileSync(path.join(tempDir, 'output', 'AI-ULT', 'ISA', 'ISA-52.usfm'), '\\id ISA\n\\c 52\n\\v 1 test\n');
       fs.writeFileSync(path.join(tempDir, 'tmp', 'pipeline-ISA-52', 'wave2_structure.tsv'), 'isa\t52:1\tfigs-activepassive\tYou were sold\n');
       fs.writeFileSync(path.join(tempDir, 'tmp', 'pipeline-ISA-52', 'wave2_rhetoric.tsv'), 'isa\t52:1\tfigs-doublet\tAwake, awake\n');
       assert.match(options.appendSystemPrompt, /Do not return success/i);
-      return { subtype: 'success', usage: {}, total_cost_usd: 0 };
+      return { subtype: 'success', usage: {}, total_cost_usd: 0, session_id: 'session-isa-52' };
     },
   });
 
@@ -213,11 +227,59 @@ test('generatePipeline classifies initial-pipeline early exit when only Wave 2 a
       buildMessage('generate isa 52')
     );
 
-    assert.equal(harness.runClaudeCalls.length, 1);
+    assert.equal(harness.runClaudeCalls.length, 2);
+    assert.equal(harness.runClaudeCalls[1].resume, 'session-isa-52');
+    const statusTexts = harness.readStatusTexts();
+    assert.ok(statusTexts.some((text) => text.includes('resuming the same session')));
+    assert.ok(statusTexts.some((text) => text.includes('continuation completed required outputs')));
+    assert.equal(harness.checkpoints.some((patch) => patch.current?.errorKind === 'initial_pipeline_early_exit'), false);
+    assert.equal(harness.diagnosisCalls.length, 0);
+    assert.equal(harness.sent.uploads.length, 2);
+    assert.equal(harness.clearedCheckpoints.length, 1);
+    assert.deepEqual(harness.runSummaries.at(-1), {
+      pipeline: 'generate',
+      book: 'ISA',
+      startCh: 52,
+      endCh: 52,
+      tokensBefore: 0,
+      success: true,
+      userId: 42,
+    });
+  } finally {
+    harness.cleanup();
+  }
+});
+
+test('generatePipeline preserves failed checkpoint when initial-pipeline continuation remains incomplete', async () => {
+  const harness = createHarness({
+    runClaudeImpl: async ({ options, tempDir }) => {
+      fs.mkdirSync(path.join(tempDir, 'output', 'AI-ULT', 'ISA'), { recursive: true });
+      fs.mkdirSync(path.join(tempDir, 'tmp', 'pipeline-ISA-52'), { recursive: true });
+      fs.writeFileSync(path.join(tempDir, 'output', 'AI-ULT', 'ISA', 'ISA-52.usfm'), '\\id ISA\n\\c 52\n\\v 1 test\n');
+      fs.writeFileSync(path.join(tempDir, 'tmp', 'pipeline-ISA-52', 'wave2_structure.tsv'), 'isa\t52:1\tfigs-activepassive\tYou were sold\n');
+      fs.writeFileSync(path.join(tempDir, 'tmp', 'pipeline-ISA-52', 'wave2_rhetoric.tsv'), 'isa\t52:1\tfigs-doublet\tAwake, awake\n');
+      if (options.resume === 'session-isa-52') {
+        return { subtype: 'success', usage: {}, total_cost_usd: 0, session_id: 'session-isa-52' };
+      }
+      return { subtype: 'success', usage: {}, total_cost_usd: 0, session_id: 'session-isa-52' };
+    },
+  });
+
+  try {
+    await harness.generatePipeline(
+      { _synthetic: true, _book: 'ISA', _startChapter: 52, _endChapter: 52, skill: 'initial-pipeline', operations: 6 },
+      buildMessage('generate isa 52')
+    );
+
+    assert.equal(harness.runClaudeCalls.length, 2);
     const statusTexts = harness.readStatusTexts();
     assert.ok(statusTexts.some((text) => text.includes('initial-pipeline exited before writing required outputs')));
     assert.ok(statusTexts.some((text) => text.includes('issues TSV, UST')));
-    assert.ok(harness.checkpoints.some((patch) => patch.current?.errorKind === 'initial_pipeline_early_exit'));
+    const failure = harness.checkpoints.find((patch) => patch.current?.errorKind === 'initial_pipeline_early_exit');
+    assert.ok(failure);
+    assert.equal(failure.resume.sessionId, 'session-isa-52');
+    assert.equal(failure.resume.mode, 'continue_after_early_exit');
+    assert.equal(harness.clearedCheckpoints.length, 0);
     assert.equal(harness.diagnosisCalls.length, 1);
     assert.equal(harness.diagnosisCalls[0].event.severity, 'error');
     assert.equal(harness.diagnosisCalls[0].checkpoint.current.errorKind, 'initial_pipeline_early_exit');
@@ -263,6 +325,63 @@ test('generatePipeline accepts initial-pipeline success when final ULT, issues, 
     assert.equal(harness.sent.uploads.length, 2);
     assert.ok(harness.sent.stream.some(({ text }) => text.includes('ISA 52 ULT.usfm')));
     assert.ok(harness.sent.stream.some(({ text }) => text.includes('ISA 52 UST.usfm')));
+    assert.equal(harness.diagnosisCalls.length, 0);
+    assert.equal(harness.clearedCheckpoints.length, 1);
+    assert.equal(harness.runSummaries.at(-1).success, true);
+  } finally {
+    harness.cleanup();
+  }
+});
+
+test('generatePipeline resumes initial-pipeline early-exit checkpoint without deleting existing ULT', async () => {
+  const initialCheckpoint = {
+    state: 'failed',
+    success: 0,
+    fail: 1,
+    completedChapters: [],
+    current: {
+      chapter: 52,
+      skill: 'initial-pipeline',
+      status: 'failed',
+      errorKind: 'initial_pipeline_early_exit',
+    },
+    resume: {
+      chapter: 52,
+      skill: 'initial-pipeline',
+      sessionId: 'session-resume-52',
+      mode: 'continue_after_early_exit',
+    },
+  };
+  const harness = createHarness({
+    initialCheckpoint,
+    runClaudeImpl: async ({ options, tempDir }) => {
+      assert.equal(options.resume, 'session-resume-52');
+      assert.equal(options.skill, null);
+      assert.match(options.prompt, /Continue the existing initial-pipeline run/);
+      assert.ok(fs.existsSync(path.join(tempDir, 'output', 'AI-ULT', 'ISA', 'ISA-52.usfm')));
+      fs.mkdirSync(path.join(tempDir, 'output', 'AI-UST', 'ISA'), { recursive: true });
+      fs.mkdirSync(path.join(tempDir, 'output', 'issues', 'ISA'), { recursive: true });
+      fs.writeFileSync(path.join(tempDir, 'output', 'AI-UST', 'ISA', 'ISA-52.usfm'), '\\id ISA\n\\c 52\n\\v 1 ust\n');
+      fs.writeFileSync(path.join(tempDir, 'output', 'issues', 'ISA', 'ISA-52.tsv'), 'isa\t52:1\tfigs-activepassive\tYou were sold\n');
+      return { subtype: 'success', usage: {}, total_cost_usd: 0, session_id: 'session-resume-52' };
+    },
+  });
+
+  try {
+    fs.mkdirSync(path.join(harness.tempDir, 'output', 'AI-ULT', 'ISA'), { recursive: true });
+    fs.mkdirSync(path.join(harness.tempDir, 'tmp', 'pipeline-ISA-52'), { recursive: true });
+    fs.writeFileSync(path.join(harness.tempDir, 'output', 'AI-ULT', 'ISA', 'ISA-52.usfm'), '\\id ISA\n\\c 52\n\\v 1 existing ult\n');
+    fs.writeFileSync(path.join(harness.tempDir, 'tmp', 'pipeline-ISA-52', 'wave2_structure.tsv'), 'isa\t52:1\tfigs-activepassive\tYou were sold\n');
+    fs.writeFileSync(path.join(harness.tempDir, 'tmp', 'pipeline-ISA-52', 'wave2_rhetoric.tsv'), 'isa\t52:1\tfigs-doublet\tAwake, awake\n');
+
+    await harness.generatePipeline(
+      { _synthetic: true, _book: 'ISA', _startChapter: 52, _endChapter: 52, skill: 'initial-pipeline', operations: 6 },
+      buildMessage('generate isa 52')
+    );
+
+    assert.equal(harness.runClaudeCalls.length, 1);
+    assert.equal(harness.runClaudeCalls[0].resume, 'session-resume-52');
+    assert.equal(fs.readFileSync(path.join(harness.tempDir, 'output', 'AI-ULT', 'ISA', 'ISA-52.usfm'), 'utf8'), '\\id ISA\n\\c 52\n\\v 1 existing ult\n');
     assert.equal(harness.diagnosisCalls.length, 0);
     assert.equal(harness.runSummaries.at(-1).success, true);
   } finally {

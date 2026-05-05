@@ -129,6 +129,7 @@ function buildOptions({
 async function runClaudeOnce({
   prompt,
   cwd,
+  resume,
   model,
   betas,
   allowedTools,
@@ -191,6 +192,7 @@ async function runClaudeOnce({
 
   const options = buildOptions({
     cwd,
+    resume,
     model,
     betas,
     allowedTools,
