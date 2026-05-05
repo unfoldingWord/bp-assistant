@@ -711,7 +711,7 @@ async function generatePipeline(route, message) {
         console.error(
           `[generate] initial-pipeline exited before final outputs for ${book} ${ch}; missing=${initialPipelineStatus.missing.join(', ')}; observed=${observedArtifacts.join(', ')}`
         );
-        await status(
+        const earlyExitEvent = await status(
           `Failed to generate **${book} ${ch}**: initial-pipeline exited before writing required outputs ` +
           `(missing: ${initialPipelineStatus.missing.join(', ')}).${observedLabel}`
         );
@@ -731,6 +731,16 @@ async function generatePipeline(route, message) {
             observedArtifacts,
           },
           resume: { chapter: ch, skill },
+        });
+        fireDiagnosis(earlyExitEvent, {
+          checkpoint: getCheckpoint(checkpointRef),
+          errorText: [
+            `Skill: ${skill}`,
+            `Chapter: ${book} ${ch}`,
+            'Claude returned subtype=success before final required outputs existed.',
+            `Missing outputs: ${initialPipelineStatus.missing.join(', ')}`,
+            `Observed artifacts: ${observedArtifacts.length > 0 ? observedArtifacts.join(', ') : '(none)'}`,
+          ].join('\n'),
         });
         continue;
       }
