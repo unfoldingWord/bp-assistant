@@ -364,6 +364,84 @@ test('tqsPipeline calls deduplicateTqIds before verify and logs when IDs are fix
   }
 });
 
+// Unit tests for checkTqWholeBookIds — post-insertion cross-chapter duplicate guard
+
+test('checkTqWholeBookIds returns no duplicates for a clean whole-book TQ file', () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tq-wholecheck-'));
+  try {
+    const miscToolsPath = require.resolve('../src/workspace-tools/misc-tools');
+    delete require.cache[miscToolsPath];
+    const { checkTqWholeBookIds } = require('../src/workspace-tools/misc-tools');
+
+    const tsvContent = [
+      'Reference\tID\tTags\tQuote\tOccurrence\tQuestion\tResponse',
+      '52:1\tabc1\t\t\t1\tQuestion A?\tAnswer A',
+      '52:2\tabc2\t\t\t1\tQuestion B?\tAnswer B',
+      '53:1\tabc3\t\t\t1\tQuestion C?\tAnswer C',
+      '53:2\tabc4\t\t\t1\tQuestion D?\tAnswer D',
+    ].join('\n') + '\n';
+    const bookFile = path.join(tempDir, 'tq_PSA.tsv');
+    fs.writeFileSync(bookFile, tsvContent, 'utf8');
+
+    const result = checkTqWholeBookIds(bookFile);
+    assert.equal(result.duplicates.length, 0, 'No duplicates expected in a clean file');
+    assert.equal(result.uniqueCount, 4, 'Should count 4 unique IDs');
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('checkTqWholeBookIds detects cross-chapter duplicate IDs (the PSA-53 regression)', () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tq-wholecheck-'));
+  try {
+    const miscToolsPath = require.resolve('../src/workspace-tools/misc-tools');
+    delete require.cache[miscToolsPath];
+    const { checkTqWholeBookIds } = require('../src/workspace-tools/misc-tools');
+
+    // Simulate the regression: fx0w used in chapter 52 and again in chapter 53
+    const tsvContent = [
+      'Reference\tID\tTags\tQuote\tOccurrence\tQuestion\tResponse',
+      '52:1\tabc1\t\t\t1\tQuestion A?\tAnswer A',
+      '52:2\tfx0w\t\t\t1\tQuestion B?\tAnswer B',
+      '53:2\tfx0w\t\t\t1\tQuestion C?\tAnswer C',
+      '53:2-3\tabc4\t\t\t1\tQuestion D?\tAnswer D',
+    ].join('\n') + '\n';
+    const bookFile = path.join(tempDir, 'tq_PSA.tsv');
+    fs.writeFileSync(bookFile, tsvContent, 'utf8');
+
+    const result = checkTqWholeBookIds(bookFile);
+    assert.equal(result.duplicates.length, 1, 'Should detect exactly one duplicate collision');
+    assert.equal(result.duplicates[0].id, 'fx0w', 'Should identify fx0w as the duplicate ID');
+    assert.equal(result.duplicates[0].firstLine, 3, 'First occurrence should be at line 3 (1-based, skipping header)');
+    assert.equal(result.duplicates[0].dupLine, 4, 'Duplicate should be at line 4');
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('checkTqWholeBookIds detects same-chapter duplicate IDs', () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tq-wholecheck-'));
+  try {
+    const miscToolsPath = require.resolve('../src/workspace-tools/misc-tools');
+    delete require.cache[miscToolsPath];
+    const { checkTqWholeBookIds } = require('../src/workspace-tools/misc-tools');
+
+    const tsvContent = [
+      'Reference\tID\tTags\tQuote\tOccurrence\tQuestion\tResponse',
+      '53:2\tfx0w\t\t\t1\tQuestion A?\tAnswer A',
+      '53:2-3\tfx0w\t\t\t1\tQuestion B?\tAnswer B',
+    ].join('\n') + '\n';
+    const bookFile = path.join(tempDir, 'tq_PSA.tsv');
+    fs.writeFileSync(bookFile, tsvContent, 'utf8');
+
+    const result = checkTqWholeBookIds(bookFile);
+    assert.equal(result.duplicates.length, 1, 'Should detect same-chapter duplicate');
+    assert.equal(result.duplicates[0].id, 'fx0w');
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
 // Unit tests for deduplicateTqIds — exercise the real function outside the pipeline harness
 
 test('deduplicateTqIds replaces duplicate IDs in-place and preserves first occurrence', () => {

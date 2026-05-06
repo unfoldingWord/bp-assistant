@@ -471,4 +471,36 @@ function appendQuickref({ file, strong, hebrew, rendering, book = 'ALL', context
   return `Appended to ${csvName}: ${row}`;
 }
 
-module.exports = { giteaPr, prepareCompare, prepareTq, verifyTq, deduplicateTqIds, appendQuickref };
+/**
+ * Scan a TQ whole-book TSV file for duplicate row IDs.
+ *
+ * Reads every data row (skipping the header and blank lines) and collects any
+ * ID value that appears more than once.  This catches cross-chapter collisions
+ * that the per-chapter verifyTq / deduplicateTqIds check cannot detect — those
+ * tools operate on a single chapter file while this function operates on the
+ * assembled whole-book file (e.g. tq_PSA.tsv after insertTnRows).
+ *
+ * @param {string} bookFilePath - Absolute path to the whole-book TQ TSV file
+ * @returns {{ duplicates: Array<{id: string, firstLine: number, dupLine: number}>, uniqueCount: number }}
+ */
+function checkTqWholeBookIds(bookFilePath) {
+  const content = fs.readFileSync(bookFilePath, 'utf8');
+  const lines = content.split('\n');
+  const seenIds = new Map(); // id → first 1-based line number
+  const duplicates = [];
+  for (let i = 1; i < lines.length; i++) {
+    const line = lines[i];
+    if (!line.trim()) continue;
+    const cols = line.split('\t');
+    const id = cols[1] || '';
+    if (!id) continue;
+    if (seenIds.has(id)) {
+      duplicates.push({ id, firstLine: seenIds.get(id), dupLine: i + 1 });
+    } else {
+      seenIds.set(id, i + 1);
+    }
+  }
+  return { duplicates, uniqueCount: seenIds.size };
+}
+
+module.exports = { giteaPr, prepareCompare, prepareTq, verifyTq, deduplicateTqIds, checkTqWholeBookIds, appendQuickref };
