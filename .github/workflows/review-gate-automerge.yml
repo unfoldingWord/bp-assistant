@@ -1,0 +1,153 @@
+name: Review Gate Automerge
+
+on:
+  workflow_run:
+    workflows:
+      - Review Gate
+    types:
+      - completed
+
+concurrency:
+  group: bp-assistant-auto-issue-handler-fly-machine
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  checks: read
+  statuses: read
+
+jobs:
+  automerge:
+    if: ${{ github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.pull_requests[0] }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/github-script@v7
+        id: pr
+        with:
+          script: |
+            const pr = context.payload.workflow_run.pull_requests[0];
+            core.setOutput('number', String(pr.number));
+            core.setOutput('head_sha', context.payload.workflow_run.head_sha);
+            core.setOutput('ref', `${context.repo.owner}/${context.repo.repo}#${pr.number}`);
+
+      - uses: actions/github-script@v7
+        env:
+          HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const ref = process.env.HEAD_SHA;
+            const deadline = Date.now() + 10 * 60 * 1000;
+            const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+            const okConclusions = new Set(['success', 'neutral', 'skipped']);
+
+            while (Date.now() < deadline) {
+              const combined = await github.rest.repos.getCombinedStatusForRef({ owner, repo, ref });
+              const statuses = combined.data.statuses || [];
+              const statusPending = statuses.some((status) => status.state === 'pending');
+              const statusFailed = statuses.find((status) => !['success', 'pending'].includes(status.state));
+
+              const checkRuns = await github.paginate(github.rest.checks.listForRef, {
+                owner,
+                repo,
+                ref,
+                per_page: 100,
+              });
+              const currentRunPath = `/actions/runs/${context.runId}`;
+              const relevantChecks = checkRuns.filter((check) => {
+                if (check.name === 'review') return false;
+                if (String(check.details_url || '').includes(currentRunPath)) return false;
+                return true;
+              });
+              const checkPending = relevantChecks.some((check) => check.status !== 'completed');
+              const checkFailed = relevantChecks.find((check) => !okConclusions.has(check.conclusion || ''));
+
+              if (statusFailed) {
+                core.setFailed(`Status context failed: ${statusFailed.context}=${statusFailed.state}`);
+                return;
+              }
+              if (checkFailed) {
+                core.setFailed(`Check failed: ${checkFailed.name}=${checkFailed.conclusion}`);
+                return;
+              }
+              if (!statusPending && !checkPending) {
+                core.info('All non-review checks/statuses are green or non-blocking.');
+                return;
+              }
+
+              core.info('Waiting for PR checks/statuses to finish before starting auto-reviewer.');
+              await sleep(15000);
+            }
+
+            core.setFailed('Timed out waiting for PR checks/statuses to finish.');
+
+      - uses: superfly/flyctl-actions/setup-flyctl@master
+
+      - name: Resolve reviewer machine ID
+        id: resolve
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+          FLY_APP_NAME: ${{ secrets.FLY_APP_NAME }}
+        run: |
+          set -euo pipefail
+          test -n "$FLY_API_TOKEN"
+          test -n "$FLY_APP_NAME"
+          machine_id="$(flyctl machines list --app "$FLY_APP_NAME" --json \
+            | node -e "let s=''; process.stdin.on('data',c=>s+=c); process.stdin.on('end',()=>{ try { const j=JSON.parse(s); const m=Array.isArray(j)?j.find(x=>x&&x.id&&String(x.state||'').toLowerCase()!=='destroyed'):null; if (m) process.stdout.write(m.id); } catch {} });")"
+          if [ -z "$machine_id" ]; then
+            echo "Could not resolve a non-destroyed machine for app $FLY_APP_NAME" >&2
+            flyctl machines list --app "$FLY_APP_NAME" >&2 || true
+            exit 1
+          fi
+          echo "Resolved reviewer machine: $machine_id"
+          echo "machine_id=$machine_id" >> "$GITHUB_OUTPUT"
+
+      - name: Configure machine for PR auto-reviewer
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+          FLY_APP_NAME: ${{ secrets.FLY_APP_NAME }}
+          FLY_MACHINE_ID: ${{ steps.resolve.outputs.machine_id }}
+          PR_REF: ${{ steps.pr.outputs.ref }}
+        run: |
+          set -euo pipefail
+          flyctl machine update "$FLY_MACHINE_ID" --app "$FLY_APP_NAME" --yes --skip-start --restart no \
+            --env "RUN_MODE=pr-reviewer" \
+            --env "BP_REVIEWER_ONLY_PR=${PR_REF}"
+
+      - name: Start machine and wait for completion
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+          FLY_APP_NAME: ${{ secrets.FLY_APP_NAME }}
+          FLY_MACHINE_ID: ${{ steps.resolve.outputs.machine_id }}
+        run: |
+          set -euo pipefail
+          flyctl machine start "$FLY_MACHINE_ID" --app "$FLY_APP_NAME"
+          deadline=$((SECONDS + 1800))
+          state=""
+          while [ "$SECONDS" -lt "$deadline" ]; do
+            state="$(flyctl machines list --app "$FLY_APP_NAME" --json 2>/dev/null \
+              | node -e "let s=''; process.stdin.on('data',c=>s+=c); process.stdin.on('end',()=>{ try { const j=JSON.parse(s); const m=Array.isArray(j)?j.find(x=>x&&x.id===process.argv[1]):null; if (m) process.stdout.write(String(m.state||'')); } catch {} });" \
+                "$FLY_MACHINE_ID" \
+              || echo "")"
+            if [ "$state" = "stopped" ] || [ "$state" = "destroyed" ]; then
+              break
+            fi
+            sleep 10
+          done
+          if [ "$state" != "stopped" ] && [ "$state" != "destroyed" ]; then
+            echo "Machine did not return to stopped state within timeout (last state: $state)" >&2
+            exit 1
+          fi
+
+      - name: Restore machine to default mode
+        if: always() && steps.resolve.outputs.machine_id != ''
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+          FLY_APP_NAME: ${{ secrets.FLY_APP_NAME }}
+          FLY_MACHINE_ID: ${{ steps.resolve.outputs.machine_id }}
+        run: |
+          set -euo pipefail
+          flyctl machine update "$FLY_MACHINE_ID" --app "$FLY_APP_NAME" --yes --skip-start --restart no \
+            --env "RUN_MODE=hourly" \
+            --env "BP_REVIEWER_ONLY_PR=" || true
