@@ -503,4 +503,74 @@ function checkTqWholeBookIds(bookFilePath) {
   return { duplicates, uniqueCount: seenIds.size };
 }
 
-module.exports = { giteaPr, prepareCompare, prepareTq, verifyTq, deduplicateTqIds, checkTqWholeBookIds, appendQuickref };
+/**
+ * Detect and remap duplicate row IDs in a TQ whole-book TSV file (in-place).
+ *
+ * After `insertTnRows` merges a new chapter into the whole-book file any ID
+ * from the new chapter that collides with an already-committed ID is silently
+ * remapped to a fresh unique ID before the git commit.  This makes the
+ * `door43-push` step self-healing for the rare random cross-chapter collision
+ * rather than fatal.
+ *
+ * The ID format mirrors `deduplicateTqIds`: first character is a lowercase
+ * letter, remaining three characters are lowercase letters or digits.
+ *
+ * @param {string} bookFilePath - Absolute path to the whole-book TQ TSV file
+ * @returns {{ fixed: number, details: string[] }}
+ *   fixed   — number of IDs remapped (0 = no collisions, file untouched)
+ *   details — one human-readable line per remapped ID
+ * @throws {Error} if ID-space is exhausted (should never happen in practice)
+ */
+function fixTqWholeBookIds(bookFilePath) {
+  const content = fs.readFileSync(bookFilePath, 'utf8');
+  const lines = content.split('\n');
+
+  const chars = 'abcdefghijklmnopqrstuvwxyz0123456789';
+  const letters = 'abcdefghijklmnopqrstuvwxyz';
+  const seenIds = new Set();
+  let fixed = 0;
+  const details = [];
+  const fixedLines = [];
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    // Always keep header (i === 0) and blank lines as-is
+    if (i === 0 || !line.trim()) {
+      fixedLines.push(line);
+      continue;
+    }
+    const cols = line.split('\t');
+    const id = cols[1] || '';
+    if (id && seenIds.has(id)) {
+      // Collision — generate a fresh unique ID not already in the whole-book file
+      let newId;
+      let attempts = 0;
+      do {
+        newId = letters[Math.floor(Math.random() * 26)];
+        for (let j = 0; j < 3; j++) newId += chars[Math.floor(Math.random() * 36)];
+        attempts++;
+      } while (seenIds.has(newId) && attempts < 500);
+      if (attempts >= 500) {
+        throw new Error(
+          `fixTqWholeBookIds: exhausted ID space replacing duplicate "${id}" at line ${i + 1} of ${path.basename(bookFilePath)}`
+        );
+      }
+      cols[1] = newId;
+      seenIds.add(newId);
+      fixed++;
+      details.push(`line ${i + 1}: "${id}" → "${newId}"`);
+      fixedLines.push(cols.join('\t'));
+    } else {
+      if (id) seenIds.add(id);
+      fixedLines.push(line);
+    }
+  }
+
+  if (fixed > 0) {
+    fs.writeFileSync(bookFilePath, fixedLines.join('\n'), 'utf8');
+  }
+
+  return { fixed, details };
+}
+
+module.exports = { giteaPr, prepareCompare, prepareTq, verifyTq, deduplicateTqIds, checkTqWholeBookIds, fixTqWholeBookIds, appendQuickref };
