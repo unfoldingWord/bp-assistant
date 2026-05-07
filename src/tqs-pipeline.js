@@ -414,6 +414,19 @@ async function tqsPipeline(route, message) {
       return;
     }
 
+    if (pushResult.noChanges) {
+      totalSuccess++;
+      setCheckpoint(checkpointRef, {
+        state: 'running',
+        totalSuccess,
+        totalFail,
+        current: { chapter, skill: 'door43-push', status: 'succeeded' },
+        resume: { chapter: chapter + 1, skill: 'tq-writer' },
+      });
+      await status(`Completed **${ref}** (no content changes): ${pushResult.details}`);
+      continue; // skip verifyRepoPush — nothing was pushed
+    }
+
     const verifyPush = await verifyRepoPush({ repo: 'en_tq', stagingBranch: branch, since: pushStartTime });
     if (!verifyPush.success) {
       totalFail++;
