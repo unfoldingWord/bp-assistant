@@ -1423,6 +1423,7 @@ async function generatePipeline(route, message) {
       }
 
       let chapterFailed = false;
+      const chPushStart = Date.now();
 
       // Save checkpoint before door43-push so we can resume here on failure
       setCheckpoint(checkpointRef, {
@@ -1550,6 +1551,12 @@ async function generatePipeline(route, message) {
           current: { chapter: chData.ch, skill: 'door43-push', status: 'succeeded' },
           resume: { chapter: chData.ch, skill: 'door43-push-done' },
         });
+        // Notify user after each chapter merges for multi-chapter runs
+        if (completedChapters.length > 1) {
+          const chPushDuration = ((Date.now() - chPushStart) / 1000).toFixed(1);
+          const repoList = [contentTypes.includes('ult') && 'en_ult', contentTypes.includes('ust') && 'en_ust'].filter(Boolean).join(' and ');
+          await reply(`**${book} ${chData.ch}** content merged to master on ${repoList} (${chPushDuration}s)`);
+        }
       }
     }
     } // end DCS token valid else block
