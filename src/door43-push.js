@@ -69,7 +69,7 @@ const { getVerseCount } = require('./verse-counts');
 const { insertTnRows } = require('./lib/insert-tn-rows');
 const { insertUsfmVerses } = require('./lib/insert-usfm-verses');
 const { validateTnTsv } = require('./workspace-tools/quality-tools');
-const { checkTqWholeBookIds } = require('./workspace-tools/misc-tools');
+const { fixTqWholeBookIds } = require('./workspace-tools/misc-tools');
 const { readSecret } = require('./secrets');
 
 const GITEA_API = 'https://git.door43.org/api/v1';
@@ -850,26 +850,29 @@ async function door43Push(opts) {
       }
     }
 
-    // Step 3c: Post-insertion duplicate-ID guard (TQ only)
-    // Scans the assembled whole-book TQ TSV for colliding row IDs and aborts
-    // before any git commit if duplicates are found.  Mirrors the TN CI gate
-    // above and catches cross-chapter collisions that the per-chapter verifyTq
-    // check cannot see (e.g. fx0w used in PSA 52 and again in PSA 53).
+    // Step 3c: Post-insertion duplicate-ID self-healing (TQ only)
+    // After insertTnRows merges the new chapter into the whole-book file,
+    // fixTqWholeBookIds scans for cross-chapter ID collisions (which the
+    // per-chapter deduplicateTqIds step cannot see) and remaps any duplicates
+    // to fresh unique IDs before the git commit.  This makes the pipeline
+    // self-healing for the rare random collision rather than fatally aborting.
+    // Only reverts and throws if the fix itself fails (ID space exhausted).
     if (type === 'tq') {
       const bookFilePathFull = path.join(repoDir, repoFilename);
-      const tqIdCheck = checkTqWholeBookIds(bookFilePathFull);
-      if (tqIdCheck.duplicates.length > 0) {
-        // Revert so we don't leave the local clone in a broken state
+      try {
+        const fixResult = fixTqWholeBookIds(bookFilePathFull);
+        if (fixResult.fixed > 0) {
+          const detailLines = fixResult.details.map(d => `  ${d}`).join('\n');
+          console.warn(`${LOG_PREFIX} Auto-fixed ${fixResult.fixed} cross-chapter TQ ID collision(s) in ${repoFilename}:\n${detailLines}`);
+        } else {
+          console.log(`${LOG_PREFIX} Post-insertion TQ duplicate-ID check passed for ${repoFilename} (no collisions)`);
+        }
+      } catch (fixErr) {
+        // In-place fix failed (e.g. ID space exhausted) — revert and abort
         await git.checkout({ fs, dir: repoDir, filepaths: [repoFilename], force: true });
-        const summary = tqIdCheck.duplicates.slice(0, 5)
-          .map(d => `  "${d.id}" first at line ${d.firstLine}, duplicate at line ${d.dupLine}`)
-          .join('\n');
-        let details = `Duplicate TQ row IDs detected in ${repoFilename} — ${tqIdCheck.duplicates.length} collision(s) after insertion:\n${summary}`;
-        if (tqIdCheck.duplicates.length > 5) details += `\n  ... and ${tqIdCheck.duplicates.length - 5} more`;
-        console.error(`${LOG_PREFIX} ${details}`);
-        throw new Error(details);
+        console.error(`${LOG_PREFIX} ${fixErr.message}`);
+        throw fixErr;
       }
-      console.log(`${LOG_PREFIX} Post-insertion TQ duplicate-ID check passed for ${repoFilename} (${tqIdCheck.uniqueCount} unique IDs scanned)`);
     }
 
     // Step 4: Commit and push
