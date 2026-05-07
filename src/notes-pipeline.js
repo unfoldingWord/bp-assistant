@@ -2709,7 +2709,10 @@ async function notesPipeline(route, message) {
       : `dm-${message.sender_id}`;
     const repoName = REPO_MAP['tn'];
     const targetFile = getRepoFilename('tn', book);
-    const branchList = deferredConflicts.map(c => `\`${c.branch}\``).join(', ');
+    const branchList = deferredConflicts.map(c =>
+      c.pr ? `[${c.branch}](https://git.door43.org/unfoldingWord/${repoName}/pulls/${c.pr})`
+        : `\`${c.branch}\``
+    ).join(', ');
 
     setPendingMerge(sessionKey, {
       sessionKey,

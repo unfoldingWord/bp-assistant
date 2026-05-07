@@ -1361,7 +1361,10 @@ async function generatePipeline(route, message) {
       const sessionKey = stream
         ? `stream-${stream}-${topic}`
         : `dm-${message.sender_id}`;
-      const branchList = dedupedConflicts.map(c => `\`${c.branch}\` (${c.repo})`).join(', ');
+      const branchList = dedupedConflicts.map(c =>
+        c.pr ? `[${c.branch}](https://git.door43.org/unfoldingWord/${c.repo}/pulls/${c.pr}) (${c.repo})`
+          : `\`${c.branch}\` (${c.repo})`
+      ).join(', ');
       const fileList = [...new Set(dedupedConflicts.map(c => `\`${c.file}\``))].join(', ');
 
       setPendingMerge(sessionKey, {
