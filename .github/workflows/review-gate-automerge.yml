@@ -82,7 +82,7 @@ jobs:
                 return true;
               });
               const checkPending = relevantChecks.some((check) => check.status !== 'completed');
-              const checkFailed = relevantChecks.find((check) => !okConclusions.has(check.conclusion || ''));
+              const checkFailed = relevantChecks.find((check) => check.status === 'completed' && !okConclusions.has(check.conclusion || ''));
 
               if (statusFailed) {
                 core.setFailed(`Status context failed: ${statusFailed.context}=${statusFailed.state}`);
