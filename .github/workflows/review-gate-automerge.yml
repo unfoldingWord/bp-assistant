@@ -17,8 +17,15 @@ jobs:
   automerge:
     if: ${{ github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
+    # Per-SHA group keeps automerges from sharing a queue with review-gate
+    # runs. GitHub Actions only ever holds one pending entry per group, so a
+    # shared group between this workflow and review-gate would let a newly
+    # arriving review-gate silently evict a pending automerge. Cross-workflow
+    # serialization on the actual Fly machine is enforced by the
+    # "Wait for machine to be stopped" step below, which acts as a Fly-API
+    # level lock that doesn't have GitHub's pending-queue eviction quirk.
     concurrency:
-      group: bp-assistant-auto-issue-handler-fly-machine
+      group: review-gate-automerge-${{ github.event.workflow_run.head_sha }}
       cancel-in-progress: false
     steps:
       - uses: actions/github-script@v7
@@ -144,6 +151,39 @@ jobs:
               core.setFailed(`PR head advanced past approved SHA (approved=${process.env.HEAD_SHA}, current=${pr.data.head.sha}); refusing to start auto-reviewer.`);
             }
 
+      # Cross-workflow Fly-machine lock. Since we no longer share a concurrency
+      # group with review-gate, the only place we serialize machine access is
+      # here: wait until the machine is in `stopped` state before reconfiguring
+      # it. If a review-gate run is still using the machine, this step blocks
+      # until it finishes. Cap at 30 minutes to avoid hangs on a wedged machine.
+      - name: Wait for machine to be stopped
+        if: ${{ steps.pr.outputs.skip != 'true' }}
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+          FLY_APP_NAME: ${{ secrets.FLY_APP_NAME }}
+          FLY_MACHINE_ID: ${{ steps.resolve.outputs.machine_id }}
+        run: |
+          set -euo pipefail
+          get_state() {
+            flyctl machines list --app "$FLY_APP_NAME" --json 2>/dev/null \
+              | node -e "let s=''; process.stdin.on('data',c=>s+=c); process.stdin.on('end',()=>{ try { const j=JSON.parse(s); const m=Array.isArray(j)?j.find(x=>x&&x.id===process.argv[1]):null; if (m) process.stdout.write(String(m.state||'')); } catch {} });" \
+                "$FLY_MACHINE_ID" \
+              || echo ""
+          }
+          deadline=$((SECONDS + 1800))
+          state=""
+          while [ "$SECONDS" -lt "$deadline" ]; do
+            state="$(get_state)"
+            if [ "$state" = "stopped" ]; then
+              break
+            fi
+            sleep 10
+          done
+          if [ "$state" != "stopped" ]; then
+            echo "Machine never reached stopped state (last: ${state:-<unknown>}); another workflow may be holding the machine." >&2
+            exit 1
+          fi
+
       - name: Configure machine for PR auto-reviewer
         if: ${{ steps.pr.outputs.skip != 'true' }}
         env:
@@ -197,11 +237,16 @@ jobs:
           state=""
           while [ "$SECONDS" -lt "$launch_deadline" ]; do
             state="$(get_state)"
-            [ "$state" != "stopped" ] && break
+            # Treat empty as non-conclusive (transient Fly API error). Only break
+            # once we've observed an actual non-stopped state; otherwise an empty
+            # response would falsely satisfy the != "stopped" check.
+            if [ -n "$state" ] && [ "$state" != "stopped" ]; then
+              break
+            fi
             sleep 2
           done
-          if [ "$state" = "stopped" ]; then
-            echo "Machine did not leave stopped state within 60s; Fly control plane may be unresponsive." >&2
+          if [ -z "$state" ] || [ "$state" = "stopped" ]; then
+            echo "Machine did not leave stopped state within 60s (last state: ${state:-<unknown>}); Fly control plane may be unresponsive." >&2
             exit 1
           fi
 
@@ -233,10 +278,16 @@ jobs:
           FLY_MACHINE_ID: ${{ steps.resolve.outputs.machine_id }}
         run: |
           set -euo pipefail
-          flyctl machine update "$FLY_MACHINE_ID" --app "$FLY_APP_NAME" --yes --skip-start --restart no \
+          # Don't swallow restore failures. If this update fails the machine is
+          # left in pr-reviewer mode and will misbehave on the next hourly run;
+          # surfacing the error gives an explicit signal to fix it manually.
+          if ! flyctl machine update "$FLY_MACHINE_ID" --app "$FLY_APP_NAME" --yes --skip-start --restart no \
             --env "RUN_MODE=hourly" \
             --env "BP_REVIEWER_ONLY_PR=" \
-            --env "BP_REVIEWER_ONLY_SHA=" || true
+            --env "BP_REVIEWER_ONLY_SHA="; then
+            echo "::warning::Failed to restore reviewer machine to default mode; manual intervention may be required (set RUN_MODE=hourly and clear BP_REVIEWER_ONLY_*)." >&2
+            exit 1
+          fi
 
       - name: Read automerge result from logs
         id: result
@@ -249,9 +300,13 @@ jobs:
         run: |
           set -euo pipefail
           flyctl logs --app "$FLY_APP_NAME" --no-tail > all-logs.txt 2>&1 || true
-          # Scope the grep to the current PR number and head SHA so a stale result
-          # from a prior run cannot be mistaken for this run's outcome.
-          marker_line="$(grep -E 'PR_REVIEW_RESULT:\s*\{"decision":' all-logs.txt \
+          # The success-path JSON serializes as `{"request":...,"decision":...,...}`
+          # because executePrReview returns `{ request, ...aggregate, summary }`,
+          # so anchoring on `{"decision":` would only match the catch-block
+          # failure object and silently drop every PASS result.
+          # Scope to this run via the prNumber and headSha downstream filters
+          # (those substrings are emitted in the request block).
+          marker_line="$(grep -E 'PR_REVIEW_RESULT:[[:space:]]*\{' all-logs.txt \
             | grep "\"prNumber\":${PR_NUMBER}" \
             | grep "\"headSha\":\"${HEAD_SHA}\"" \
             | tail -1 || true)"
