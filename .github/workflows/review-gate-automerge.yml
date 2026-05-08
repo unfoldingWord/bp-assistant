@@ -216,7 +216,7 @@ jobs:
         run: |
           set -euo pipefail
           flyctl logs --app "$FLY_APP_NAME" --no-tail > all-logs.txt 2>&1 || true
-          marker_line="$(grep -E 'PR_REVIEW_RESULT:\s*\{' all-logs.txt | tail -1 || true)"
+          marker_line="$(grep -E 'PR_REVIEW_RESULT:\s*\{"decision":' all-logs.txt | tail -1 || true)"
           if [ -z "$marker_line" ]; then
             echo "No PR_REVIEW_RESULT marker found in logs (pr-reviewer run may have crashed or not emitted a result)." >&2
             tail -100 all-logs.txt >&2 || true

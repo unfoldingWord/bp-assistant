@@ -83,6 +83,9 @@ jobs:
         run: |
           set -euo pipefail
           flyctl machine start "$FLY_MACHINE_ID" --app "$FLY_APP_NAME"
+          # Brief pause so the Fly control plane transitions the machine out of
+          # stopped before the poll loop's first iteration can observe it.
+          sleep 5
           # Poll until the machine returns to a stopped state (entrypoint exited).
           # `flyctl machine status` doesn't accept --json, so use `machines list
           # --json` and filter by id. Cap at ~15 minutes; review runs typically
@@ -139,7 +142,7 @@ jobs:
           # run-pr-review.js emits a single-line marker so we don't need to
           # reassemble multi-line pretty JSON across log entries.
           flyctl logs --app "$FLY_APP_NAME" --no-tail > all-logs.txt 2>&1 || true
-          marker_line="$(grep -E 'PR_REVIEW_RESULT:\s*\{' all-logs.txt | tail -1 || true)"
+          marker_line="$(grep -E 'PR_REVIEW_RESULT:\s*\{"decision":' all-logs.txt | tail -1 || true)"
           if [ -z "$marker_line" ]; then
             echo "No PR_REVIEW_RESULT marker found in logs (run may have crashed before emitting)." >&2
             tail -100 all-logs.txt >&2 || true
