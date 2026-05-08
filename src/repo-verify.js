@@ -133,6 +133,38 @@ async function verifyRepoPush({ repo, stagingBranch, since }) {
       };
     }
 
+    // Fallback: Gitea's head-filter is unreliable once the branch is deleted —
+    // the association is silently dropped and the PR disappears from head-filtered
+    // queries.  Scan the most recent closed PRs without a head filter and look
+    // for one whose head branch matches the staging branch and was merged within
+    // the verification window.
+    try {
+      const recentRes = await apiGet(
+        `/repos/${ORG}/${repo}/pulls?state=closed&limit=20`,
+        token,
+      );
+      if (recentRes.status === 200 && Array.isArray(recentRes.data)) {
+        const fallbackMerged = recentRes.data.find((pr) => {
+          const headLabel = pr.head?.label || pr.head?.ref || '';
+          const isBranch =
+            headLabel === stagingBranch || headLabel.endsWith(`:${stagingBranch}`);
+          const isMerged = pr.merged === true || pr.merged_by != null;
+          if (!isBranch || !isMerged) return false;
+          if (pr.merged_at) return new Date(pr.merged_at) >= new Date(effectiveSince);
+          return false;
+        });
+        if (fallbackMerged) {
+          return {
+            success: true,
+            details: `PR #${fallbackMerged.number} merged ${stagingBranch} into master on ${repo} (confirmed via fallback scan; head-filter was unreliable after branch deletion)`,
+          };
+        }
+      }
+    } catch (_) {
+      // Non-fatal: if the fallback scan itself fails, fall through to the
+      // original failure response so the pipeline can retry.
+    }
+
     // Branch doesn't exist AND no merged PR — push likely never happened
     return {
       success: false,
