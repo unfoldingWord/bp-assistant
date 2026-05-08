@@ -9,8 +9,8 @@ on:
       - ready_for_review
 
 concurrency:
-  group: bp-assistant-auto-issue-handler-fly-machine
-  cancel-in-progress: false
+  group: review-gate-bp-assistant-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
@@ -20,6 +20,9 @@ jobs:
   review:
     if: ${{ !github.event.pull_request.draft }}
     runs-on: ubuntu-latest
+    concurrency:
+      group: bp-assistant-auto-issue-handler-fly-machine
+      cancel-in-progress: false
     steps:
       - uses: superfly/flyctl-actions/setup-flyctl@master
 
@@ -91,9 +94,15 @@ jobs:
               | node -e "let s=''; process.stdin.on('data',c=>s+=c); process.stdin.on('end',()=>{ try { const j=JSON.parse(s); const m=Array.isArray(j)?j.find(x=>x&&x.id===process.argv[1]):null; if (m) process.stdout.write(String(m.state||'')); } catch {} });" \
                 "$FLY_MACHINE_ID" \
               || echo "")"
-            if [ "$state" = "stopped" ] || [ "$state" = "destroyed" ]; then
-              break
-            fi
+            case "$state" in
+              stopped|destroyed)
+                break
+                ;;
+              failed|crashed|error|replacing)
+                echo "Fly machine entered failure state: $state" >&2
+                exit 1
+                ;;
+            esac
             sleep 10
           done
           if [ "$state" != "stopped" ] && [ "$state" != "destroyed" ]; then
