@@ -1,0 +1,331 @@
+name: Review Gate Automerge
+
+on:
+  workflow_run:
+    workflows:
+      - Review Gate
+    types:
+      - completed
+
+permissions:
+  contents: read
+  checks: read
+  statuses: read
+  pull-requests: read
+
+jobs:
+  automerge:
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    # Per-SHA group keeps automerges from sharing a queue with review-gate
+    # runs. GitHub Actions only ever holds one pending entry per group, so a
+    # shared group between this workflow and review-gate would let a newly
+    # arriving review-gate silently evict a pending automerge. Cross-workflow
+    # serialization on the actual Fly machine is enforced by the
+    # "Wait for machine to be stopped" step below, which acts as a Fly-API
+    # level lock that doesn't have GitHub's pending-queue eviction quirk.
+    concurrency:
+      group: review-gate-automerge-${{ github.event.workflow_run.head_sha }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/github-script@v7
+        id: pr
+        with:
+          script: |
+            const prs = context.payload.workflow_run.pull_requests;
+            if (!prs || prs.length === 0) {
+              // GitHub omits pull_requests for fork PRs. Automerge is intentionally
+              // skipped for forks (secrets unavailable; unsafe to auto-merge external code).
+              core.warning('No pull_requests in workflow_run payload — likely a fork PR. Automerge is skipped for fork PRs.');
+              core.setOutput('skip', 'true');
+              return;
+            }
+            const pr = prs[0];
+            core.setOutput('skip', 'false');
+            core.setOutput('number', String(pr.number));
+            core.setOutput('head_sha', context.payload.workflow_run.head_sha);
+            core.setOutput('ref', `${context.repo.owner}/${context.repo.repo}#${pr.number}`);
+
+      - uses: actions/github-script@v7
+        if: ${{ steps.pr.outputs.skip != 'true' }}
+        env:
+          HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const ref = process.env.HEAD_SHA;
+            const prNumber = Number(process.env.PR_NUMBER);
+            const deadline = Date.now() + 10 * 60 * 1000;
+            const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+            const okConclusions = new Set(['success', 'neutral', 'skipped']);
+
+            while (Date.now() < deadline) {
+              // Drift guard: if a new commit landed on the PR after Review Gate
+              // approved this SHA, abort. This subsumes any "queued new Review
+              // Gate run" case — the head moved, so this run is stale.
+              const prNow = await github.rest.pulls.get({ owner, repo, pull_number: prNumber });
+              if (prNow.data.head.sha !== ref) {
+                core.setFailed(`PR head advanced past approved SHA (approved=${ref}, current=${prNow.data.head.sha}); aborting automerge.`);
+                return;
+              }
+
+              const combined = await github.rest.repos.getCombinedStatusForRef({ owner, repo, ref });
+              const statuses = combined.data.statuses || [];
+              const statusPending = statuses.some((status) => status.state === 'pending');
+              const statusFailed = statuses.find((status) => !['success', 'pending'].includes(status.state));
+
+              const checkRuns = await github.paginate(github.rest.checks.listForRef, {
+                owner,
+                repo,
+                ref,
+                per_page: 100,
+              });
+              const currentRunPath = `/actions/runs/${context.runId}`;
+              const relevantChecks = checkRuns.filter((check) => {
+                // Don't wait on this automerge run's own check entry.
+                if (String(check.details_url || '').includes(currentRunPath)) return false;
+                return true;
+              });
+              const checkPending = relevantChecks.some((check) => check.status !== 'completed');
+              const checkFailed = relevantChecks.find((check) => check.status === 'completed' && !okConclusions.has(check.conclusion || ''));
+
+              if (statusFailed) {
+                core.setFailed(`Status context failed: ${statusFailed.context}=${statusFailed.state}`);
+                return;
+              }
+              if (checkFailed) {
+                core.setFailed(`Check failed: ${checkFailed.name}=${checkFailed.conclusion}`);
+                return;
+              }
+              if (!statusPending && !checkPending) {
+                core.info('All checks/statuses are green or non-blocking; PR head still matches approved SHA.');
+                return;
+              }
+
+              core.info('Waiting for PR checks/statuses to finish before starting auto-reviewer.');
+              await sleep(15000);
+            }
+
+            core.setFailed('Timed out waiting for PR checks/statuses to finish.');
+
+      - uses: superfly/flyctl-actions/setup-flyctl@master
+        if: ${{ steps.pr.outputs.skip != 'true' }}
+
+      - name: Resolve reviewer machine ID
+        id: resolve
+        if: ${{ steps.pr.outputs.skip != 'true' }}
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+          FLY_APP_NAME: ${{ secrets.FLY_APP_NAME }}
+        run: |
+          set -euo pipefail
+          test -n "$FLY_API_TOKEN"
+          test -n "$FLY_APP_NAME"
+          machine_id="$(flyctl machines list --app "$FLY_APP_NAME" --json \
+            | node -e "let s=''; process.stdin.on('data',c=>s+=c); process.stdin.on('end',()=>{ try { const j=JSON.parse(s); const m=Array.isArray(j)?j.find(x=>x&&x.id&&String(x.state||'').toLowerCase()!=='destroyed'):null; if (m) process.stdout.write(m.id); } catch {} });")"
+          if [ -z "$machine_id" ]; then
+            echo "Could not resolve a non-destroyed machine for app $FLY_APP_NAME" >&2
+            flyctl machines list --app "$FLY_APP_NAME" >&2 || true
+            exit 1
+          fi
+          echo "Resolved reviewer machine: $machine_id"
+          echo "machine_id=$machine_id" >> "$GITHUB_OUTPUT"
+
+      - name: Verify PR head still matches approved SHA
+        if: ${{ steps.pr.outputs.skip != 'true' }}
+        uses: actions/github-script@v7
+        env:
+          HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const pr = await github.rest.pulls.get({
+              owner,
+              repo,
+              pull_number: Number(process.env.PR_NUMBER),
+            });
+            if (pr.data.head.sha !== process.env.HEAD_SHA) {
+              core.setFailed(`PR head advanced past approved SHA (approved=${process.env.HEAD_SHA}, current=${pr.data.head.sha}); refusing to start auto-reviewer.`);
+            }
+
+      # Cross-workflow Fly-machine lock. Since we no longer share a concurrency
+      # group with review-gate, the only place we serialize machine access is
+      # here: wait until the machine is in `stopped` state before reconfiguring
+      # it. If a review-gate run is still using the machine, this step blocks
+      # until it finishes. Cap at 30 minutes to avoid hangs on a wedged machine.
+      - name: Wait for machine to be stopped
+        if: ${{ steps.pr.outputs.skip != 'true' }}
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+          FLY_APP_NAME: ${{ secrets.FLY_APP_NAME }}
+          FLY_MACHINE_ID: ${{ steps.resolve.outputs.machine_id }}
+        run: |
+          set -euo pipefail
+          get_state() {
+            flyctl machines list --app "$FLY_APP_NAME" --json 2>/dev/null \
+              | node -e "let s=''; process.stdin.on('data',c=>s+=c); process.stdin.on('end',()=>{ try { const j=JSON.parse(s); const m=Array.isArray(j)?j.find(x=>x&&x.id===process.argv[1]):null; if (m) process.stdout.write(String(m.state||'')); } catch {} });" \
+                "$FLY_MACHINE_ID" \
+              || echo ""
+          }
+          deadline=$((SECONDS + 1800))
+          state=""
+          while [ "$SECONDS" -lt "$deadline" ]; do
+            state="$(get_state)"
+            if [ "$state" = "stopped" ]; then
+              break
+            fi
+            sleep 10
+          done
+          if [ "$state" != "stopped" ]; then
+            echo "Machine never reached stopped state (last: ${state:-<unknown>}); another workflow may be holding the machine." >&2
+            exit 1
+          fi
+
+      - name: Configure machine for PR auto-reviewer
+        if: ${{ steps.pr.outputs.skip != 'true' }}
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+          FLY_APP_NAME: ${{ secrets.FLY_APP_NAME }}
+          FLY_MACHINE_ID: ${{ steps.resolve.outputs.machine_id }}
+          PR_REF: ${{ steps.pr.outputs.ref }}
+          HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
+        run: |
+          set -euo pipefail
+          flyctl machine update "$FLY_MACHINE_ID" --app "$FLY_APP_NAME" --yes --skip-start --restart no \
+            --env "RUN_MODE=pr-reviewer" \
+            --env "BP_REVIEWER_ONLY_PR=${PR_REF}" \
+            --env "BP_REVIEWER_ONLY_SHA=${HEAD_SHA}"
+
+      - name: Start machine and wait for completion
+        if: ${{ steps.pr.outputs.skip != 'true' }}
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+          FLY_APP_NAME: ${{ secrets.FLY_APP_NAME }}
+          FLY_MACHINE_ID: ${{ steps.resolve.outputs.machine_id }}
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+          HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          # Second drift guard immediately before start. The first check ran as a
+          # separate step; a commit pushed in the gap between that step and here
+          # would otherwise cause the bot to process a stale SHA.
+          current_sha="$(gh api "repos/${REPO}/pulls/${PR_NUMBER}" --jq '.head.sha')"
+          if [ "$current_sha" != "$HEAD_SHA" ]; then
+            echo "PR head advanced past approved SHA (approved=${HEAD_SHA}, current=${current_sha}); aborting." >&2
+            exit 1
+          fi
+
+          flyctl machine start "$FLY_MACHINE_ID" --app "$FLY_APP_NAME"
+
+          # Poll until the machine leaves stopped — confirms the Fly control plane
+          # accepted the start. A fixed sleep is unreliable when the plane is under
+          # load; require an actual state transition before watching for completion.
+          get_state() {
+            flyctl machines list --app "$FLY_APP_NAME" --json 2>/dev/null \
+              | node -e "let s=''; process.stdin.on('data',c=>s+=c); process.stdin.on('end',()=>{ try { const j=JSON.parse(s); const m=Array.isArray(j)?j.find(x=>x&&x.id===process.argv[1]):null; if (m) process.stdout.write(String(m.state||'')); } catch {} });" \
+                "$FLY_MACHINE_ID" \
+              || echo ""
+          }
+
+          launch_deadline=$((SECONDS + 60))
+          state=""
+          while [ "$SECONDS" -lt "$launch_deadline" ]; do
+            state="$(get_state)"
+            # Treat empty as non-conclusive (transient Fly API error). Only break
+            # once we've observed an actual non-stopped state; otherwise an empty
+            # response would falsely satisfy the != "stopped" check.
+            if [ -n "$state" ] && [ "$state" != "stopped" ]; then
+              break
+            fi
+            sleep 2
+          done
+          if [ -z "$state" ] || [ "$state" = "stopped" ]; then
+            echo "Machine did not leave stopped state within 60s (last state: ${state:-<unknown>}); Fly control plane may be unresponsive." >&2
+            exit 1
+          fi
+
+          # Poll until the machine returns to stopped (entrypoint finished).
+          deadline=$((SECONDS + 1800))
+          while [ "$SECONDS" -lt "$deadline" ]; do
+            state="$(get_state)"
+            case "$state" in
+              stopped|destroyed)
+                break
+                ;;
+              failed|crashed|error|replacing)
+                echo "Fly machine entered failure state: $state" >&2
+                exit 1
+                ;;
+            esac
+            sleep 10
+          done
+          if [ "$state" != "stopped" ] && [ "$state" != "destroyed" ]; then
+            echo "Machine did not return to stopped state within timeout (last state: $state)" >&2
+            exit 1
+          fi
+
+      - name: Restore machine to default mode
+        if: always() && steps.resolve.outputs.machine_id != '' && steps.pr.outputs.skip != 'true'
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+          FLY_APP_NAME: ${{ secrets.FLY_APP_NAME }}
+          FLY_MACHINE_ID: ${{ steps.resolve.outputs.machine_id }}
+        run: |
+          set -euo pipefail
+          # Don't swallow restore failures. If this update fails the machine is
+          # left in pr-reviewer mode and will misbehave on the next hourly run;
+          # surfacing the error gives an explicit signal to fix it manually.
+          if ! flyctl machine update "$FLY_MACHINE_ID" --app "$FLY_APP_NAME" --yes --skip-start --restart no \
+            --env "RUN_MODE=hourly" \
+            --env "BP_REVIEWER_ONLY_PR=" \
+            --env "BP_REVIEWER_ONLY_SHA="; then
+            echo "::warning::Failed to restore reviewer machine to default mode; manual intervention may be required (set RUN_MODE=hourly and clear BP_REVIEWER_ONLY_*)." >&2
+            exit 1
+          fi
+
+      - name: Read automerge result from logs
+        id: result
+        if: ${{ steps.pr.outputs.skip != 'true' }}
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+          FLY_APP_NAME: ${{ secrets.FLY_APP_NAME }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+          HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
+        run: |
+          set -euo pipefail
+          flyctl logs --app "$FLY_APP_NAME" --no-tail > all-logs.txt 2>&1 || true
+          # The success-path JSON serializes as `{"request":...,"decision":...,...}`
+          # because executePrReview returns `{ request, ...aggregate, summary }`,
+          # so anchoring on `{"decision":` would only match the catch-block
+          # failure object and silently drop every PASS result.
+          # Scope to this run via the prNumber and headSha downstream filters
+          # (those substrings are emitted in the request block).
+          marker_line="$(grep -E 'PR_REVIEW_RESULT:[[:space:]]*\{' all-logs.txt \
+            | grep "\"prNumber\":${PR_NUMBER}" \
+            | grep "\"headSha\":\"${HEAD_SHA}\"" \
+            | tail -1 || true)"
+          if [ -z "$marker_line" ]; then
+            echo "No PR_REVIEW_RESULT marker found in logs for PR #${PR_NUMBER} SHA ${HEAD_SHA} (pr-reviewer run may have crashed or not emitted a result)." >&2
+            tail -100 all-logs.txt >&2 || true
+            exit 1
+          fi
+          review_json="$(printf '%s\n' "$marker_line" | sed -E 's/^.*PR_REVIEW_RESULT:[[:space:]]*//')"
+          printf '%s\n' "$review_json" > review-result.json
+          decision="$(node -e "const fs=require('fs'); const d=JSON.parse(fs.readFileSync('review-result.json','utf8')); process.stdout.write(String(d.decision||''));")"
+          echo "decision=$decision" >> "$GITHUB_OUTPUT"
+
+      - name: Verify automerge outcome
+        if: ${{ steps.pr.outputs.skip != 'true' }}
+        env:
+          DECISION: ${{ steps.result.outputs.decision }}
+        run: |
+          if [ "$DECISION" != "PASS" ]; then
+            echo "pr-reviewer did not emit PASS (got: ${DECISION:-<empty>}); automerge blocked." >&2
+            exit 1
+          fi
