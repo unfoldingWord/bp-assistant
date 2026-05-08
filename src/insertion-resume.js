@@ -92,10 +92,15 @@ async function resumeInsertion(sessionKey, triggerMessage) {
   let success = 0;
   let fail = 0;
 
+  // For multi-chapter deferred runs, notify user as each chapter merges rather than waiting for all
+  const notify = completedChapters.length > 1
+    ? async (text) => replyTo(triggerMessage, text)
+    : null;
+
   if (pipelineType === 'generate') {
-    ({ success, fail } = await runGenerateInsertPhase(completedChapters, username, book));
+    ({ success, fail } = await runGenerateInsertPhase(completedChapters, username, book, notify));
   } else if (pipelineType === 'notes') {
-    ({ success, fail } = await runNotesInsertPhase(completedChapters, username, book));
+    ({ success, fail } = await runNotesInsertPhase(completedChapters, username, book, notify));
   }
 
   // Clear pending state
@@ -146,8 +151,9 @@ async function resumeInsertion(sessionKey, triggerMessage) {
 /**
  * Run repo-insert + repo-verify for ULT and UST per chapter.
  * Pushes to master via the repo-insert skill's merge-to-master workflow.
+ * @param {function} [notify] - optional async callback(text) to send per-chapter Zulip message
  */
-async function runGenerateInsertPhase(completedChapters, username, book) {
+async function runGenerateInsertPhase(completedChapters, username, book, notify) {
   let success = 0;
   let fail = 0;
 
@@ -229,8 +235,14 @@ async function runGenerateInsertPhase(completedChapters, username, book) {
       if (ultVerify.success && ustVerify.success && (verifyUlt || verifyUst)) await status(`Repo verify OK for ${book} ${ch.ch}`);
     }
 
-    if (chapterFailed) fail++;
-    else success++;
+    if (chapterFailed) {
+      fail++;
+    } else {
+      success++;
+      if (notify && completedChapters.length > 1) {
+        await notify(`**${book} ${ch.ch}** content merged to master on en_ult and en_ust`);
+      }
+    }
   }
 
   return { success, fail };
@@ -239,8 +251,9 @@ async function runGenerateInsertPhase(completedChapters, username, book) {
 /**
  * Run repo-insert + repo-verify for TN per chapter.
  * Pushes to master via the repo-insert skill's merge-to-master workflow.
+ * @param {function} [notify] - optional async callback(text) to send per-chapter Zulip message
  */
-async function runNotesInsertPhase(completedChapters, username, book) {
+async function runNotesInsertPhase(completedChapters, username, book, notify) {
   let success = 0;
   let fail = 0;
 
@@ -287,8 +300,14 @@ async function runNotesInsertPhase(completedChapters, username, book) {
       }
     }
 
-    if (chapterFailed) fail++;
-    else success++;
+    if (chapterFailed) {
+      fail++;
+    } else {
+      success++;
+      if (notify && completedChapters.length > 1) {
+        await notify(`**${book} ${ch.ch}** notes merged to master on en_tn`);
+      }
+    }
   }
 
   return { success, fail };
