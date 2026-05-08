@@ -206,8 +206,18 @@ function extractDiagnosisJson(raw) {
   if (!raw || typeof raw !== 'string') {
     throw new Error('Diagnosis agent returned no text');
   }
-  const fenceMatch = raw.match(/```(?:json)?\s*([\s\S]*?)\s*```/i);
-  const candidate = fenceMatch ? fenceMatch[1].trim() : raw.trim();
+  // Strip outermost code fence using greedy matching (first open, last close).
+  // A non-greedy regex would stop at the first ``` it encounters, truncating
+  // valid JSON when the body field contains nested markdown code fences.
+  let candidate = raw.trim();
+  const openFenceMatch = candidate.match(/^```(?:json)?\s*\n/);
+  if (openFenceMatch) {
+    const afterOpen = openFenceMatch[0].length;
+    const lastFenceIdx = candidate.lastIndexOf('\n```');
+    if (lastFenceIdx > afterOpen) {
+      candidate = candidate.slice(afterOpen, lastFenceIdx).trim();
+    }
+  }
   const parsed = tryParseDiagnosisJson(candidate);
   if (parsed === null) {
     throw new Error(`Diagnosis agent returned invalid JSON: ${candidate.slice(0, 1000)}`);
