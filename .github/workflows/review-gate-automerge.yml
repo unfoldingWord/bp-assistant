@@ -165,19 +165,50 @@ jobs:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
           FLY_APP_NAME: ${{ secrets.FLY_APP_NAME }}
           FLY_MACHINE_ID: ${{ steps.resolve.outputs.machine_id }}
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+          HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
+          REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
+
+          # Second drift guard immediately before start. The first check ran as a
+          # separate step; a commit pushed in the gap between that step and here
+          # would otherwise cause the bot to process a stale SHA.
+          current_sha="$(gh api "repos/${REPO}/pulls/${PR_NUMBER}" --jq '.head.sha')"
+          if [ "$current_sha" != "$HEAD_SHA" ]; then
+            echo "PR head advanced past approved SHA (approved=${HEAD_SHA}, current=${current_sha}); aborting." >&2
+            exit 1
+          fi
+
           flyctl machine start "$FLY_MACHINE_ID" --app "$FLY_APP_NAME"
-          # Brief pause so the Fly control plane transitions the machine out of
-          # stopped before the poll loop's first iteration can observe it.
-          sleep 5
-          deadline=$((SECONDS + 1800))
-          state=""
-          while [ "$SECONDS" -lt "$deadline" ]; do
-            state="$(flyctl machines list --app "$FLY_APP_NAME" --json 2>/dev/null \
+
+          # Poll until the machine leaves stopped — confirms the Fly control plane
+          # accepted the start. A fixed sleep is unreliable when the plane is under
+          # load; require an actual state transition before watching for completion.
+          get_state() {
+            flyctl machines list --app "$FLY_APP_NAME" --json 2>/dev/null \
               | node -e "let s=''; process.stdin.on('data',c=>s+=c); process.stdin.on('end',()=>{ try { const j=JSON.parse(s); const m=Array.isArray(j)?j.find(x=>x&&x.id===process.argv[1]):null; if (m) process.stdout.write(String(m.state||'')); } catch {} });" \
                 "$FLY_MACHINE_ID" \
-              || echo "")"
+              || echo ""
+          }
+
+          launch_deadline=$((SECONDS + 60))
+          state=""
+          while [ "$SECONDS" -lt "$launch_deadline" ]; do
+            state="$(get_state)"
+            [ "$state" != "stopped" ] && break
+            sleep 2
+          done
+          if [ "$state" = "stopped" ]; then
+            echo "Machine did not leave stopped state within 60s; Fly control plane may be unresponsive." >&2
+            exit 1
+          fi
+
+          # Poll until the machine returns to stopped (entrypoint finished).
+          deadline=$((SECONDS + 1800))
+          while [ "$SECONDS" -lt "$deadline" ]; do
+            state="$(get_state)"
             case "$state" in
               stopped|destroyed)
                 break
@@ -213,12 +244,19 @@ jobs:
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
           FLY_APP_NAME: ${{ secrets.FLY_APP_NAME }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+          HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
         run: |
           set -euo pipefail
           flyctl logs --app "$FLY_APP_NAME" --no-tail > all-logs.txt 2>&1 || true
-          marker_line="$(grep -E 'PR_REVIEW_RESULT:\s*\{"decision":' all-logs.txt | tail -1 || true)"
+          # Scope the grep to the current PR number and head SHA so a stale result
+          # from a prior run cannot be mistaken for this run's outcome.
+          marker_line="$(grep -E 'PR_REVIEW_RESULT:\s*\{"decision":' all-logs.txt \
+            | grep "\"prNumber\":${PR_NUMBER}" \
+            | grep "\"headSha\":\"${HEAD_SHA}\"" \
+            | tail -1 || true)"
           if [ -z "$marker_line" ]; then
-            echo "No PR_REVIEW_RESULT marker found in logs (pr-reviewer run may have crashed or not emitted a result)." >&2
+            echo "No PR_REVIEW_RESULT marker found in logs for PR #${PR_NUMBER} SHA ${HEAD_SHA} (pr-reviewer run may have crashed or not emitted a result)." >&2
             tail -100 all-logs.txt >&2 || true
             exit 1
           fi
