@@ -139,7 +139,7 @@ jobs:
           # run-pr-review.js emits a single-line marker so we don't need to
           # reassemble multi-line pretty JSON across log entries.
           flyctl logs --app "$FLY_APP_NAME" --no-tail > all-logs.txt 2>&1 || true
-          marker_line="$(grep -E 'PR_REVIEW_RESULT:' all-logs.txt | tail -1 || true)"
+          marker_line="$(grep -E 'PR_REVIEW_RESULT:\s*\{' all-logs.txt | tail -1 || true)"
           if [ -z "$marker_line" ]; then
             echo "No PR_REVIEW_RESULT marker found in logs (run may have crashed before emitting)." >&2
             tail -100 all-logs.txt >&2 || true

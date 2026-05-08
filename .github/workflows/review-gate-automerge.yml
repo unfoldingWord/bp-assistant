@@ -15,7 +15,7 @@ permissions:
 
 jobs:
   automerge:
-    if: ${{ github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.pull_requests[0] }}
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
     concurrency:
       group: bp-assistant-auto-issue-handler-fly-machine
@@ -25,12 +25,22 @@ jobs:
         id: pr
         with:
           script: |
-            const pr = context.payload.workflow_run.pull_requests[0];
+            const prs = context.payload.workflow_run.pull_requests;
+            if (!prs || prs.length === 0) {
+              // GitHub omits pull_requests for fork PRs. Automerge is intentionally
+              // skipped for forks (secrets unavailable; unsafe to auto-merge external code).
+              core.warning('No pull_requests in workflow_run payload — likely a fork PR. Automerge is skipped for fork PRs.');
+              core.setOutput('skip', 'true');
+              return;
+            }
+            const pr = prs[0];
+            core.setOutput('skip', 'false');
             core.setOutput('number', String(pr.number));
             core.setOutput('head_sha', context.payload.workflow_run.head_sha);
             core.setOutput('ref', `${context.repo.owner}/${context.repo.repo}#${pr.number}`);
 
       - uses: actions/github-script@v7
+        if: ${{ steps.pr.outputs.skip != 'true' }}
         env:
           HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
           PR_NUMBER: ${{ steps.pr.outputs.number }}
@@ -94,9 +104,11 @@ jobs:
             core.setFailed('Timed out waiting for PR checks/statuses to finish.');
 
       - uses: superfly/flyctl-actions/setup-flyctl@master
+        if: ${{ steps.pr.outputs.skip != 'true' }}
 
       - name: Resolve reviewer machine ID
         id: resolve
+        if: ${{ steps.pr.outputs.skip != 'true' }}
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
           FLY_APP_NAME: ${{ secrets.FLY_APP_NAME }}
@@ -115,6 +127,7 @@ jobs:
           echo "machine_id=$machine_id" >> "$GITHUB_OUTPUT"
 
       - name: Verify PR head still matches approved SHA
+        if: ${{ steps.pr.outputs.skip != 'true' }}
         uses: actions/github-script@v7
         env:
           HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
@@ -132,6 +145,7 @@ jobs:
             }
 
       - name: Configure machine for PR auto-reviewer
+        if: ${{ steps.pr.outputs.skip != 'true' }}
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
           FLY_APP_NAME: ${{ secrets.FLY_APP_NAME }}
@@ -146,6 +160,7 @@ jobs:
             --env "BP_REVIEWER_ONLY_SHA=${HEAD_SHA}"
 
       - name: Start machine and wait for completion
+        if: ${{ steps.pr.outputs.skip != 'true' }}
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
           FLY_APP_NAME: ${{ secrets.FLY_APP_NAME }}
@@ -153,6 +168,9 @@ jobs:
         run: |
           set -euo pipefail
           flyctl machine start "$FLY_MACHINE_ID" --app "$FLY_APP_NAME"
+          # Brief pause so the Fly control plane transitions the machine out of
+          # stopped before the poll loop's first iteration can observe it.
+          sleep 5
           deadline=$((SECONDS + 1800))
           state=""
           while [ "$SECONDS" -lt "$deadline" ]; do
@@ -177,7 +195,7 @@ jobs:
           fi
 
       - name: Restore machine to default mode
-        if: always() && steps.resolve.outputs.machine_id != ''
+        if: always() && steps.resolve.outputs.machine_id != '' && steps.pr.outputs.skip != 'true'
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
           FLY_APP_NAME: ${{ secrets.FLY_APP_NAME }}
@@ -188,3 +206,33 @@ jobs:
             --env "RUN_MODE=hourly" \
             --env "BP_REVIEWER_ONLY_PR=" \
             --env "BP_REVIEWER_ONLY_SHA=" || true
+
+      - name: Read automerge result from logs
+        id: result
+        if: ${{ steps.pr.outputs.skip != 'true' }}
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+          FLY_APP_NAME: ${{ secrets.FLY_APP_NAME }}
+        run: |
+          set -euo pipefail
+          flyctl logs --app "$FLY_APP_NAME" --no-tail > all-logs.txt 2>&1 || true
+          marker_line="$(grep -E 'PR_REVIEW_RESULT:\s*\{' all-logs.txt | tail -1 || true)"
+          if [ -z "$marker_line" ]; then
+            echo "No PR_REVIEW_RESULT marker found in logs (pr-reviewer run may have crashed or not emitted a result)." >&2
+            tail -100 all-logs.txt >&2 || true
+            exit 1
+          fi
+          review_json="$(printf '%s\n' "$marker_line" | sed -E 's/^.*PR_REVIEW_RESULT:[[:space:]]*//')"
+          printf '%s\n' "$review_json" > review-result.json
+          decision="$(node -e "const fs=require('fs'); const d=JSON.parse(fs.readFileSync('review-result.json','utf8')); process.stdout.write(String(d.decision||''));")"
+          echo "decision=$decision" >> "$GITHUB_OUTPUT"
+
+      - name: Verify automerge outcome
+        if: ${{ steps.pr.outputs.skip != 'true' }}
+        env:
+          DECISION: ${{ steps.result.outputs.decision }}
+        run: |
+          if [ "$DECISION" != "PASS" ]; then
+            echo "pr-reviewer did not emit PASS (got: ${DECISION:-<empty>}); automerge blocked." >&2
+            exit 1
+          fi
