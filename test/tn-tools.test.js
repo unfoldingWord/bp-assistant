@@ -865,6 +865,58 @@ test('fillOrigQuotes resolves Fly ZEC 3 reordered and punctuation-bound quotes t
   assert.equal(prepared.items.find((item) => item.id === 'hjj2').orig_quote, 'נְאֻם֙ יְהוָ֣ה צְבָא֔וֹת');
 });
 
+test('fillOrigQuotes chooses the Yahweh occurrence closest to Jerusalem when duplicate Hebrew tokens exist', () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tn-tools-duplicate-yahweh-'));
+  const relRoot = path.join('tmp', path.basename(tempDir));
+  const absRoot = path.join('/srv/bot/workspace', relRoot);
+  fs.mkdirSync(absRoot, { recursive: true });
+
+  const prepRel = path.join(relRoot, 'prepared_notes.json');
+  const alignRel = path.join(relRoot, 'alignment.json');
+  const hebRel = path.join(relRoot, 'hebrew.usfm');
+
+  fs.writeFileSync(path.join('/srv/bot/workspace', prepRel), JSON.stringify({
+    book: 'ISA',
+    items: [
+      {
+        id: 'yah1',
+        reference: '2:3',
+        sref: 'writing-quotations',
+        gl_quote: 'the word of Yahweh from Jerusalem',
+        issue_span_gl_quote: 'the word of Yahweh from Jerusalem',
+        orig_quote: '',
+        explanation: '',
+      },
+    ],
+  }, null, 2));
+
+  fs.writeFileSync(path.join('/srv/bot/workspace', alignRel), JSON.stringify({
+    '2:3': [
+      { eng: 'the', heb: 'הַ' },
+      { eng: 'word', heb: 'דָּבָר' },
+      { eng: 'of', heb: 'שֶׁל' },
+      { eng: 'Yahweh', heb: 'יְהוָ֖ה' },
+      { eng: 'from', heb: 'מִ' },
+      { eng: 'Jerusalem', heb: 'יְרוּשָׁלָֽם' },
+      { eng: 'and', heb: 'וְ' },
+      { eng: 'Yahweh', heb: 'יְהוָ֗ה' },
+    ],
+  }, null, 2));
+
+  fs.writeFileSync(path.join('/srv/bot/workspace', hebRel), [
+    '\\id ISA',
+    '\\c 2',
+    '\\v 3 \\w יְהוָ֗ה|x\\w* \\w שֶׁל|x\\w* \\w יְהוָ֖ה|x\\w* \\w מִ|x\\w* \\w יְרוּשָׁלָֽם|x\\w*',
+    '',
+  ].join('\n'));
+
+  const summary = fillOrigQuotes({ preparedJson: prepRel, alignmentJson: alignRel, hebrewUsfm: hebRel });
+  const prepared = JSON.parse(fs.readFileSync(path.join('/srv/bot/workspace', prepRel), 'utf8'));
+
+  assert.match(summary, /Resolved: 1 of 1 items/);
+  assert.equal(prepared.items[0].orig_quote, 'יְהוָ֖ה מִ יְרוּשָׁלָֽם');
+});
+
 test('fillOrigQuotes falls back to alignment-derived Hebrew when exact-source extraction fails', () => {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tn-tools-zec3-fallback-'));
   const relRoot = path.join('tmp', path.basename(tempDir));
