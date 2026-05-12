@@ -2071,7 +2071,7 @@ function fillOrigQuotes({ preparedJson, alignmentJson, hebrewUsfm, masterUltUsfm
     if (!rawVerse || !hebWords.length) return null;
     const { text: strippedVerse, offsetMap } = buildStripped(rawVerse);
     const targetWords = dedupeConsecutiveHebrewWords(hebWords, normalizeHeb);
-    const selected = chooseClosestHebrewTokenLocations(rawVerse, strippedVerse, offsetMap, targetWords, false);
+    const selected = chooseClosestHebrewTokenLocations(rawVerse, strippedVerse, offsetMap, targetWords, true);
     if (!selected || !selected.length) return null;
     return assembleHebrewQuoteFromLocations(rawVerse, strippedVerse, offsetMap, selected);
   }

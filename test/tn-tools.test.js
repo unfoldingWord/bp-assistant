@@ -906,7 +906,7 @@ test('fillOrigQuotes chooses the Yahweh occurrence closest to Jerusalem when dup
   fs.writeFileSync(path.join('/srv/bot/workspace', hebRel), [
     '\\id ISA',
     '\\c 2',
-    '\\v 3 \\w יְהוָ֗ה|x\\w* \\w שֶׁל|x\\w* \\w יְהוָ֖ה|x\\w* \\w מִ|x\\w* \\w יְרוּשָׁלָֽם|x\\w*',
+    '\\v 3 \\w הַ|x\\w* \\w דָּבָר|x\\w* \\w שֶׁל|x\\w* \\w יְהוָ֖ה|x\\w* \\w מִ|x\\w* \\w יְרוּשָׁלָֽם|x\\w* \\w וְ|x\\w* \\w יְהוָ֗ה|x\\w*',
     '',
   ].join('\n'));
 
@@ -1010,8 +1010,8 @@ test('fillOrigQuotes falls back to plain text when alignment token is missing fr
   const summary = fillOrigQuotes({ preparedJson: prepRel, alignmentJson: alignRel, hebrewUsfm: hebRel });
   const prepared = JSON.parse(fs.readFileSync(path.join('/srv/bot/workspace', prepRel), 'utf8'));
 
-  assert.match(summary, /Unresolved: 1 items/);
-  assert.equal(prepared.items[0].orig_quote, '');
+  assert.match(summary, /Resolved: 1 of 1 items/);
+  assert.equal(prepared.items[0].orig_quote, 'תֵּלֵךְ֙ בִּ⁠דְרָכַ֤⁠י נוֹנֶקְסִיסְטֶנְט');
 });
 
 test('fillOrigQuotes falls back to alignment-derived Hebrew when exact-source extraction fails', () => {
