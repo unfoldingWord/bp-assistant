@@ -1934,56 +1934,50 @@ function fillOrigQuotes({ preparedJson, alignmentJson, hebrewUsfm, masterUltUsfm
     return locations;
   }
 
-  function chooseClosestHebrewTokenLocations(rawVerse, strippedVerse, offsetMap, targetWords) {
+  function chooseClosestHebrewTokenLocations(rawVerse, strippedVerse, offsetMap, targetWords, allowPartial = false) {
     const groups = [];
     for (const heb of targetWords) {
-      const token = stripForSearch(heb);
-      if (!token) continue;
-      const locations = findHebrewTokenLocations(rawVerse, strippedVerse, offsetMap, token);
-      if (!locations.length) continue;
+      const locations = findHebrewTokenLocations(rawVerse, strippedVerse, offsetMap, heb);
+      if (!locations.length) {
+        if (!allowPartial) return null;
+        continue;
+      }
       groups.push(locations);
     }
 
     if (!groups.length) return null;
 
-    let candidates = groups[0].map((loc) => ({
-      locations: [loc],
-      start: loc.start,
-      end: loc.end,
-    }));
-
-    for (let i = 1; i < groups.length; i++) {
-      const nextCandidates = [];
-      for (const candidate of candidates) {
-        const previous = candidate.locations[candidate.locations.length - 1];
-        for (const loc of groups[i]) {
-          if (loc.start <= previous.start) continue;
-          nextCandidates.push({
-            locations: [...candidate.locations, loc],
-            start: candidate.start,
-            end: loc.end,
-          });
-        }
+    // Find all valid assignments (each token gets one location, no reuse)
+    function findAllAssignments(tokenIndex, selected) {
+      if (tokenIndex === groups.length) {
+        return [selected];
       }
-      if (!nextCandidates.length) return null;
-      candidates = nextCandidates;
+      const results = [];
+      for (const loc of groups[tokenIndex]) {
+        results.push(...findAllAssignments(tokenIndex + 1, [...selected, loc]));
+      }
+      return results;
     }
 
-    function gapSum(locations) {
-      return locations.slice(1).reduce((sum, loc, idx) => sum + Math.max(0, loc.start - locations[idx].end - 1), 0);
+    const allAssignments = findAllAssignments(0, []);
+    if (!allAssignments.length) return null;
+
+    // Sort each assignment by position and score it
+    function scoreAssignment(locations) {
+      const sorted = locations.slice().sort((a, b) => a.start - b.start);
+      const width = sorted[sorted.length - 1].end - sorted[0].start;
+      const gaps = sorted.slice(1).reduce((sum, loc, idx) => sum + Math.max(0, loc.start - sorted[idx].end - 1), 0);
+      return { sorted, width, gaps, start: sorted[0].start };
     }
 
-    candidates.sort((a, b) => {
-      const widthA = a.end - a.start;
-      const widthB = b.end - b.start;
-      if (widthA !== widthB) return widthA - widthB;
-      const gapA = gapSum(a.locations);
-      const gapB = gapSum(b.locations);
-      if (gapA !== gapB) return gapA - gapB;
+    const scored = allAssignments.map(scoreAssignment);
+    scored.sort((a, b) => {
+      if (a.width !== b.width) return a.width - b.width;
+      if (a.gaps !== b.gaps) return a.gaps - b.gaps;
       return a.start - b.start;
     });
 
-    return candidates[0].locations;
+    return scored[0].sorted;
   }
 
   function assembleHebrewQuoteFromLocations(rawVerse, strippedVerse, offsetMap, locations) {
@@ -2051,7 +2045,7 @@ function fillOrigQuotes({ preparedJson, alignmentJson, hebrewUsfm, masterUltUsfm
     if (!rawVerse || !hebWords.length) return null;
     const { text: strippedVerse, offsetMap } = buildStripped(rawVerse);
     const targetWords = dedupeConsecutiveHebrewWords(hebWords, normalizeHeb);
-    const selected = chooseClosestHebrewTokenLocations(rawVerse, strippedVerse, offsetMap, targetWords);
+    const selected = chooseClosestHebrewTokenLocations(rawVerse, strippedVerse, offsetMap, targetWords, false);
     if (!selected || !selected.length) return null;
     return assembleHebrewQuoteFromLocations(rawVerse, strippedVerse, offsetMap, selected);
   }
@@ -2063,7 +2057,7 @@ function fillOrigQuotes({ preparedJson, alignmentJson, hebrewUsfm, masterUltUsfm
     if (!rawVerse) return targetWords.join(' ');
 
     const { text: strippedVerse, offsetMap } = buildStripped(rawVerse);
-    const selected = chooseClosestHebrewTokenLocations(rawVerse, strippedVerse, offsetMap, targetWords);
+    const selected = chooseClosestHebrewTokenLocations(rawVerse, strippedVerse, offsetMap, targetWords, false);
     if (!selected || !selected.length) return targetWords.join(' ');
 
     return assembleHebrewQuoteFromLocations(rawVerse, strippedVerse, offsetMap, selected) || targetWords.join(' ');
