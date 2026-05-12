@@ -1947,53 +1947,63 @@ function fillOrigQuotes({ preparedJson, alignmentJson, hebrewUsfm, masterUltUsfm
 
     if (!groups.length) return null;
 
-    // Find all valid assignments (each token gets one location, no reuse)
-    function findAllAssignments(tokenIndex, selected) {
-      if (tokenIndex === groups.length) {
-        return [selected];
-      }
-      const results = [];
-      const usedLocations = new Set(selected.map(loc => `${loc.start},${loc.end}`));
-      for (const loc of groups[tokenIndex]) {
-        const locKey = `${loc.start},${loc.end}`;
-        if (!usedLocations.has(locKey)) {
-          results.push(...findAllAssignments(tokenIndex + 1, [...selected, loc]));
-        }
-      }
-      return results;
-    }
-
-    let allAssignments = findAllAssignments(0, []);
-    if (!allAssignments.length) return null;
-
-    // Prune non-ascending assignments to avoid exponential blowup
-    allAssignments = allAssignments.filter(assignment => {
-      for (let i = 1; i < assignment.length; i++) {
-        if (assignment[i].start <= assignment[i - 1].end) {
-          return false;
-        }
-      }
-      return true;
-    });
-
-    if (!allAssignments.length) return null;
-
-    // Sort each assignment by position and score it
-    function scoreAssignment(locations) {
+    function scoreLocations(locations) {
       const sorted = locations.slice().sort((a, b) => a.start - b.start);
       const width = sorted[sorted.length - 1].end - sorted[0].start;
       const gaps = sorted.slice(1).reduce((sum, loc, idx) => sum + Math.max(0, loc.start - sorted[idx].end - 1), 0);
       return { sorted, width, gaps, start: sorted[0].start };
     }
 
-    const scored = allAssignments.map(scoreAssignment);
-    scored.sort((a, b) => {
-      if (a.width !== b.width) return a.width - b.width;
-      if (a.gaps !== b.gaps) return a.gaps - b.gaps;
-      return a.start - b.start;
-    });
+    function locationsOverlap(locations) {
+      const sorted = locations.slice().sort((a, b) => a.start - b.start);
+      for (let i = 1; i < sorted.length; i++) {
+        if (sorted[i].start <= sorted[i - 1].end) return true;
+      }
+      return false;
+    }
 
-    return scored[0].sorted;
+    const orderedGroups = groups
+      .map((locations) => ({ locations, count: locations.length }))
+      .sort((a, b) => a.count - b.count)
+      .map((entry) => entry.locations);
+
+    const best = { result: null };
+
+    function search(tokenIndex, selected, usedKeys) {
+      if (tokenIndex === orderedGroups.length) {
+        const scored = scoreLocations(selected);
+        if (!best.result
+          || scored.width < best.result.width
+          || (scored.width === best.result.width && scored.gaps < best.result.gaps)
+          || (scored.width === best.result.width && scored.gaps === best.result.gaps && scored.start < best.result.start)
+        ) {
+          best.result = scored;
+        }
+        return;
+      }
+
+      // Explore more constrained groups first to reduce branching
+      const group = orderedGroups[tokenIndex];
+      for (const loc of group) {
+        const locKey = `${loc.start},${loc.end}`;
+        if (usedKeys.has(locKey)) continue;
+
+        const nextSelected = [...selected, loc];
+        if (locationsOverlap(nextSelected)) continue;
+
+        if (best.result) {
+          const scored = scoreLocations(nextSelected);
+          if (scored.width > best.result.width) continue;
+        }
+
+        usedKeys.add(locKey);
+        search(tokenIndex + 1, nextSelected, usedKeys);
+        usedKeys.delete(locKey);
+      }
+    }
+
+    search(0, [], new Set());
+    return best.result ? best.result.sorted : null;
   }
 
   function assembleHebrewQuoteFromLocations(rawVerse, strippedVerse, offsetMap, locations) {
