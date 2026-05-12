@@ -8,7 +8,7 @@ const {
   fetchGlossary, fetchIssuesResolved, fetchTemplates,
 } = require('./fetch-tools');
 const { splitTsv, mergeTsvs, fixTrailingNewlines } = require('./tsv-tools');
-const { extractUltEnglish, filterPsalms, curlyQuotes, checkUstPassives, createAlignedUsfm, readUsfmChapter, mergeAlignedUsfm, validateAlignmentJson, validateUltBrackets, checkUltVoiceMismatch } = require('./usfm-tools');
+const { extractUltEnglish, filterPsalms, curlyQuotes, checkUstPassives, createAlignedUsfm, repairAlignmentXContent, readUsfmChapter, mergeAlignedUsfm, validateAlignmentJson, validateUltBrackets, checkUltVoiceMismatch } = require('./usfm-tools');
 const { buildStrongsIndex, buildTnIndex, buildUstIndex } = require('./index-tools');
 const { checkTwHeadwords, compareUltUst, detectAbstractNouns } = require('./issue-tools');
 const { extractAlignmentData, fixHebrewQuotes, flagNarrowQuotes, generateIds, resolveGlQuotes, verifyAtFit, assembleNotes, prepareNotes, prepareAndValidate, fixUnicodeQuotes, verifyBoldMatches, fillTsvIds, fillOrigQuotes, prepareATContext, readPreparedNotes } = require('./tn-tools');
@@ -242,6 +242,18 @@ function createWorkspaceTools(createSdkMcpServer, tool, z) {
         },
         async (args) => ({
           content: [{ type: 'text', text: createAlignedUsfm(args) }],
+        })
+      ),
+
+      tool(
+        'repair_alignment_x_content',
+        'Repair x-content byte order in aligned USFM to match UHB verbatim. The AI alignment pipeline may NFC-normalize Hebrew combining marks (e.g. reordering dagesh U+05BC and vowel points), while the UHB stores them in traditional Tanakh order. This tool reads UHB tokens verbatim and patches any x-content values that differ only in combining-mark order. Run after create_aligned_usfm to ensure byte-identical x-content for downstream tools.',
+        {
+          alignedUsfm: z.string().describe('Aligned USFM file path relative to workspace'),
+          hebrewUsfm: z.string().describe('Hebrew UHB source USFM file path relative to workspace'),
+        },
+        async (args) => ({
+          content: [{ type: 'text', text: repairAlignmentXContent(args) }],
         })
       ),
 
