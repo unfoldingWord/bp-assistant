@@ -1934,6 +1934,78 @@ function fillOrigQuotes({ preparedJson, alignmentJson, hebrewUsfm, masterUltUsfm
     return locations;
   }
 
+  function chooseClosestHebrewTokenLocations(rawVerse, strippedVerse, offsetMap, targetWords, allowPartial = false) {
+    const groups = [];
+    for (const heb of targetWords) {
+      const locations = findHebrewTokenLocations(rawVerse, strippedVerse, offsetMap, heb);
+      if (!locations.length) {
+        if (!allowPartial) return null;
+        continue;
+      }
+      groups.push(locations);
+    }
+
+    if (!groups.length) return null;
+
+    function scoreLocations(locations) {
+      const sorted = locations.slice().sort((a, b) => a.start - b.start);
+      const width = sorted[sorted.length - 1].end - sorted[0].start;
+      const gaps = sorted.slice(1).reduce((sum, loc, idx) => sum + Math.max(0, loc.start - sorted[idx].end - 1), 0);
+      return { sorted, width, gaps, start: sorted[0].start };
+    }
+
+    function locationsOverlap(locations) {
+      const sorted = locations.slice().sort((a, b) => a.start - b.start);
+      for (let i = 1; i < sorted.length; i++) {
+        if (sorted[i].start <= sorted[i - 1].end) return true;
+      }
+      return false;
+    }
+
+    const orderedGroups = groups
+      .map((locations) => ({ locations, count: locations.length }))
+      .sort((a, b) => a.count - b.count)
+      .map((entry) => entry.locations);
+
+    const best = { result: null };
+
+    function search(tokenIndex, selected, usedKeys) {
+      if (tokenIndex === orderedGroups.length) {
+        const scored = scoreLocations(selected);
+        if (!best.result
+          || scored.width < best.result.width
+          || (scored.width === best.result.width && scored.gaps < best.result.gaps)
+          || (scored.width === best.result.width && scored.gaps === best.result.gaps && scored.start < best.result.start)
+        ) {
+          best.result = scored;
+        }
+        return;
+      }
+
+      // Explore more constrained groups first to reduce branching
+      const group = orderedGroups[tokenIndex];
+      for (const loc of group) {
+        const locKey = `${loc.start},${loc.end}`;
+        if (usedKeys.has(locKey)) continue;
+
+        const nextSelected = [...selected, loc];
+        if (locationsOverlap(nextSelected)) continue;
+
+        if (best.result) {
+          const scored = scoreLocations(nextSelected);
+          if (scored.width > best.result.width) continue;
+        }
+
+        usedKeys.add(locKey);
+        search(tokenIndex + 1, nextSelected, usedKeys);
+        usedKeys.delete(locKey);
+      }
+    }
+
+    search(0, [], new Set());
+    return best.result ? best.result.sorted : null;
+  }
+
   function assembleHebrewQuoteFromLocations(rawVerse, strippedVerse, offsetMap, locations) {
     if (!locations.length) return '';
 
@@ -1998,28 +2070,9 @@ function fillOrigQuotes({ preparedJson, alignmentJson, hebrewUsfm, masterUltUsfm
     const rawVerse = verseMap[ref];
     if (!rawVerse || !hebWords.length) return null;
     const { text: strippedVerse, offsetMap } = buildStripped(rawVerse);
-    const occurrencesByToken = new Map();
     const targetWords = dedupeConsecutiveHebrewWords(hebWords, normalizeHeb);
-
-    const recordOccurrences = (token) => {
-      if (!token || occurrencesByToken.has(token)) return;
-      occurrencesByToken.set(token, findHebrewTokenLocations(rawVerse, strippedVerse, offsetMap, token));
-    };
-
-    const selected = [];
-    for (const heb of targetWords) {
-      const token = stripForSearch(heb);
-      if (!token) continue;
-      recordOccurrences(token);
-      const locations = occurrencesByToken.get(token) || [];
-      const location = locations.shift();
-      if (!location) continue;
-      selected.push(location);
-    }
-
-    if (!selected.length) return null;
-    selected.sort((left, right) => left.start - right.start);
-
+    const selected = chooseClosestHebrewTokenLocations(rawVerse, strippedVerse, offsetMap, targetWords, true);
+    if (!selected || !selected.length) return null;
     return assembleHebrewQuoteFromLocations(rawVerse, strippedVerse, offsetMap, selected);
   }
 
@@ -2030,19 +2083,10 @@ function fillOrigQuotes({ preparedJson, alignmentJson, hebrewUsfm, masterUltUsfm
     if (!rawVerse) return targetWords.join(' ');
 
     const { text: strippedVerse, offsetMap } = buildStripped(rawVerse);
-    const locations = [];
-    for (const heb of targetWords) {
-      const tokenLocations = findHebrewTokenLocations(rawVerse, strippedVerse, offsetMap, heb);
-      if (!tokenLocations.length) {
-        return targetWords.join(' ');
-      }
-      locations.push(tokenLocations[0]);
-    }
+    const selected = chooseClosestHebrewTokenLocations(rawVerse, strippedVerse, offsetMap, targetWords, false);
+    if (!selected || !selected.length) return targetWords.join(' ');
 
-    if (!locations.length) return targetWords.join(' ');
-    locations.sort((left, right) => left.start - right.start);
-
-    return assembleHebrewQuoteFromLocations(rawVerse, strippedVerse, offsetMap, locations) || targetWords.join(' ');
+    return assembleHebrewQuoteFromLocations(rawVerse, strippedVerse, offsetMap, selected) || targetWords.join(' ');
   }
 
   // Extract [heb:...] hint from explanation and try direct UHB match
