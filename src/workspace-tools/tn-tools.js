@@ -1953,13 +1953,29 @@ function fillOrigQuotes({ preparedJson, alignmentJson, hebrewUsfm, masterUltUsfm
         return [selected];
       }
       const results = [];
+      const usedLocations = new Set(selected.map(loc => `${loc.start},${loc.end}`));
       for (const loc of groups[tokenIndex]) {
-        results.push(...findAllAssignments(tokenIndex + 1, [...selected, loc]));
+        const locKey = `${loc.start},${loc.end}`;
+        if (!usedLocations.has(locKey)) {
+          results.push(...findAllAssignments(tokenIndex + 1, [...selected, loc]));
+        }
       }
       return results;
     }
 
-    const allAssignments = findAllAssignments(0, []);
+    let allAssignments = findAllAssignments(0, []);
+    if (!allAssignments.length) return null;
+
+    // Prune non-ascending assignments to avoid exponential blowup
+    allAssignments = allAssignments.filter(assignment => {
+      for (let i = 1; i < assignment.length; i++) {
+        if (assignment[i].start <= assignment[i - 1].end) {
+          return false;
+        }
+      }
+      return true;
+    });
+
     if (!allAssignments.length) return null;
 
     // Sort each assignment by position and score it

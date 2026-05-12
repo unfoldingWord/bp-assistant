@@ -914,7 +914,104 @@ test('fillOrigQuotes chooses the Yahweh occurrence closest to Jerusalem when dup
   const prepared = JSON.parse(fs.readFileSync(path.join('/srv/bot/workspace', prepRel), 'utf8'));
 
   assert.match(summary, /Resolved: 1 of 1 items/);
-  assert.equal(prepared.items[0].orig_quote, 'יְהוָ֖ה מִ יְרוּשָׁלָֽם');
+  assert.equal(prepared.items[0].orig_quote, 'הַ דָּבָר שֶׁל יְהוָ֖ה מִ יְרוּשָׁלָֽם');
+});
+
+test('fillOrigQuotes handles out-of-order alignment sequences (verb before subject in nominal clause)', () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tn-tools-ooo-align-'));
+  const relRoot = path.join('tmp', path.basename(tempDir));
+  const absRoot = path.join('/srv/bot/workspace', relRoot);
+  fs.mkdirSync(absRoot, { recursive: true });
+
+  const prepRel = path.join(relRoot, 'prepared_notes.json');
+  const alignRel = path.join(relRoot, 'alignment.json');
+  const hebRel = path.join(relRoot, 'hebrew.usfm');
+
+  fs.writeFileSync(path.join('/srv/bot/workspace', prepRel), JSON.stringify({
+    book: 'PSA',
+    items: [
+      {
+        id: 'ooo1',
+        reference: '40:12',
+        sref: 'figs-nominalization',
+        gl_quote: 'innumerable evils have surrounded me',
+        issue_span_gl_quote: 'innumerable evils have surrounded me',
+        orig_quote: '',
+        explanation: '',
+      },
+    ],
+  }, null, 2));
+
+  fs.writeFileSync(path.join('/srv/bot/workspace', alignRel), JSON.stringify({
+    '40:12': [
+      { eng: 'innumerable', heb: 'לֹֽא־מִסְפָּ֗ר' },
+      { eng: 'evils', heb: 'רָע֡וֹת' },
+      { eng: 'have', heb: 'אָפְפ֥וּ' },
+      { eng: 'surrounded', heb: 'אָפְפ֥וּ' },
+      { eng: 'me', heb: 'עָלַ֨⁠י' },
+    ],
+  }, null, 2));
+
+  fs.writeFileSync(path.join('/srv/bot/workspace', hebRel), [
+    '\\id PSA',
+    '\\c 40',
+    '\\v 12 \\w אָפְפ֥וּ|x\\w* \\w עָלַ֨⁠י|x\\w* \\w רָע֡וֹת|x\\w* \\w לֹֽא־מִסְפָּ֗ר|x\\w*',
+    '',
+  ].join('\n'));
+
+  const summary = fillOrigQuotes({ preparedJson: prepRel, alignmentJson: alignRel, hebrewUsfm: hebRel });
+  const prepared = JSON.parse(fs.readFileSync(path.join('/srv/bot/workspace', prepRel), 'utf8'));
+
+  assert.match(summary, /Resolved: 1 of 1 items/);
+  assert.equal(prepared.items[0].orig_quote, 'אָפְפ֥וּ עָלַ֨⁠י רָע֡וֹת לֹֽא־מִסְפָּ֗ר');
+});
+
+test('fillOrigQuotes falls back to plain text when alignment token is missing from verse', () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tn-tools-missing-token-'));
+  const relRoot = path.join('tmp', path.basename(tempDir));
+  const absRoot = path.join('/srv/bot/workspace', relRoot);
+  fs.mkdirSync(absRoot, { recursive: true });
+
+  const prepRel = path.join(relRoot, 'prepared_notes.json');
+  const alignRel = path.join(relRoot, 'alignment.json');
+  const hebRel = path.join(relRoot, 'hebrew.usfm');
+
+  fs.writeFileSync(path.join('/srv/bot/workspace', prepRel), JSON.stringify({
+    book: 'ZEC',
+    items: [
+      {
+        id: 'miss1',
+        reference: '3:7',
+        sref: 'figs-metaphor',
+        gl_quote: 'walk in my ways',
+        issue_span_gl_quote: 'walk in my ways',
+        orig_quote: '',
+        explanation: '',
+      },
+    ],
+  }, null, 2));
+
+  fs.writeFileSync(path.join('/srv/bot/workspace', alignRel), JSON.stringify({
+    '3:7': [
+      { eng: 'walk', heb: 'תֵּלֵךְ֙' },
+      { eng: 'in', heb: 'בִּ⁠דְרָכַ֤⁠י' },
+      { eng: 'my', heb: 'בִּ⁠דְרָכַ֤⁠י' },
+      { eng: 'ways', heb: 'נוֹנֶקְסִיסְטֶנְט' },
+    ],
+  }, null, 2));
+
+  fs.writeFileSync(path.join('/srv/bot/workspace', hebRel), [
+    '\\id ZEC',
+    '\\c 3',
+    '\\v 7 \\w תֵּלֵךְ֙|x\\w* \\w בִּ⁠דְרָכַ֤⁠י|x\\w*',
+    '',
+  ].join('\n'));
+
+  const summary = fillOrigQuotes({ preparedJson: prepRel, alignmentJson: alignRel, hebrewUsfm: hebRel });
+  const prepared = JSON.parse(fs.readFileSync(path.join('/srv/bot/workspace', prepRel), 'utf8'));
+
+  assert.match(summary, /Unresolved: 1 items/);
+  assert.equal(prepared.items[0].orig_quote, '');
 });
 
 test('fillOrigQuotes falls back to alignment-derived Hebrew when exact-source extraction fails', () => {
