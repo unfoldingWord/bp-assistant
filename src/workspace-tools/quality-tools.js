@@ -241,6 +241,83 @@ function parseHebrewVerseWords(hebrewUsfmPath) {
   return verseWords;
 }
 
+const HEBREW_RTL_RE = /[֐-׿؀-ۿיִ-﷿ﹰ-﻿]/;
+const HEBREW_CANT_RE = /[֑-֯⁠־]/g;
+
+/**
+ * Normalize a candidate Hebrew quote against the canonical verse word list
+ * loaded from the UHB. Inserts ` & ` joiners at discontinuity gaps so the
+ * returned string matches translation-note conventions.
+ *
+ * Returns { quote, status, warnings } where:
+ *   quote    — normalized Hebrew (NFC, with ` & ` joiners where needed)
+ *   status   — 'ok' | 'no_rtl' | 'no_words_match' | 'partial_match'
+ *   warnings — [{ code, detail }] zero or more soft issues
+ *
+ * Matching is cantillation/taamim-insensitive. First occurrence wins when
+ * a verse repeats a word (refinement candidate if mis-matches show up).
+ */
+function normalizeHebrewQuote(rawQuote, verseWords) {
+  const warnings = [];
+  if (!rawQuote || typeof rawQuote !== 'string') {
+    return { quote: '', status: 'no_rtl', warnings };
+  }
+  if (!HEBREW_RTL_RE.test(rawQuote)) {
+    return { quote: rawQuote, status: 'no_rtl', warnings };
+  }
+
+  const tokens = rawQuote
+    .split(/\s+&\s+|\s+/)
+    .map(s => s.trim())
+    .filter(Boolean);
+  if (tokens.length === 0) {
+    return { quote: rawQuote, status: 'no_words_match', warnings };
+  }
+
+  const matched = [];
+  let matchCount = 0;
+  for (const tok of tokens) {
+    const tokStripped = tok.replace(HEBREW_CANT_RE, '');
+    let pos = -1;
+    for (let i = 0; i < verseWords.length; i++) {
+      const w = verseWords[i];
+      if (w === tok || w.replace(HEBREW_CANT_RE, '') === tokStripped) {
+        pos = i;
+        break;
+      }
+    }
+    if (pos < 0) {
+      warnings.push({ code: 'hebrew_word_not_in_verse', detail: tok });
+    } else {
+      matchCount++;
+    }
+    matched.push({ token: tok, position: pos });
+  }
+
+  if (matchCount === 0) {
+    return { quote: rawQuote, status: 'no_words_match', warnings };
+  }
+
+  const parts = [];
+  for (let i = 0; i < matched.length; i++) {
+    const cur = matched[i];
+    if (i === 0) {
+      parts.push(cur.token);
+      continue;
+    }
+    const prev = matched[i - 1];
+    const gap = (prev.position >= 0 && cur.position >= 0)
+      ? (cur.position - prev.position)
+      : 1;
+    parts.push(gap > 1 ? ' & ' : ' ');
+    parts.push(cur.token);
+  }
+
+  const normalized = parts.join('').normalize('NFC');
+  const status = matchCount < tokens.length ? 'partial_match' : 'ok';
+  return { quote: normalized, status, warnings };
+}
+
 /**
  * Fetch upstream TN IDs for a given book from Door43.
  * Returns a Set of IDs on success, or null on failure.
@@ -870,4 +947,9 @@ async function checkTnQuality({ tsvPath, preparedJson, ultUsfm, ustUsfm, book, h
   return `Quality check: ${summary.total_notes} notes, ${summary.errors} errors, ${summary.warnings} warnings, ${summary.clean} clean\n${outPath}`;
 }
 
-module.exports = { validateTnTsv, checkTnQuality };
+module.exports = {
+  validateTnTsv,
+  checkTnQuality,
+  parseHebrewVerseWords,
+  normalizeHebrewQuote,
+};

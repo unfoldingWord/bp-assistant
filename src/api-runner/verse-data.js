@@ -368,4 +368,10 @@ module.exports = {
   VERSE_DATA_TOOL_SCHEMAS,
   executeVerseDataTool,
   isVerseDataTool,
+  getTemplate,
+  getVerseData,
+  getExistingNotes,
+  loadCache,
+  cache,
+  BOOK_NUMBERS,
 };
