@@ -60,11 +60,13 @@ const THINKING_LEVELS = {
 function resolveThinkingBudget(thinking, resolvedModel) {
   if (thinking === false || thinking === 'off' || thinking === 'none') return null;
   if (typeof thinking === 'number') {
-    if (thinking >= 1024) return thinking;
-    throw new Error(`Invalid thinking budget: ${thinking} (must be >= 1024 tokens)`);
+    if (thinking < 1024 || thinking > THINKING_MAX) {
+      throw new Error(`Invalid thinking budget: ${thinking} (must be between 1024 and ${THINKING_MAX} tokens)`);
+    }
+    return thinking;
   }
   if (typeof thinking === 'string') {
-    if (THINKING_LEVELS[thinking]) return THINKING_LEVELS[thinking];
+    if (thinking in THINKING_LEVELS) return THINKING_LEVELS[thinking];
     throw new Error(`Unrecognized thinking level: '${thinking}' (expected one of: ${Object.keys(THINKING_LEVELS).join(', ')}, 'off')`);
   }
   // Auto-default (thinking == null/undefined): Opus → HIGH, Sonnet → MEDIUM, Haiku/others → none.
