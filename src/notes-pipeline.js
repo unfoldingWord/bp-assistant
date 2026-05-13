@@ -1852,7 +1852,8 @@ async function notesPipeline(route, message) {
       ops: 1,
     });
 
-    // tn-quality-check runs as a separate Sonnet invocation for independent review
+    // tn-quality-check runs as a separate Opus invocation for independent review
+    // (auto-defaults to THINKING_HIGH via claude-runner's thinking-budget logic)
     const qualityTag = hasVerseRange ? `${tag}-vv${verseStart}-${verseEnd}` : tag;
     const defaultNotesPath = hasVerseRange ? notesShardRel : notesChapterRel;
     skills.push({
@@ -1863,7 +1864,7 @@ async function notesPipeline(route, message) {
       mcpTools: 'quality',
       maxTurns: 100,
       ops: 1,
-      model: 'sonnet',
+      model: 'opus',
     });
 
     // --- Run skills sequentially ---

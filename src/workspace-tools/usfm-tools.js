@@ -986,12 +986,131 @@ function checkUltVoiceMismatch({ alignedUsfm }) {
   return lines3.join('\n');
 }
 
+/**
+ * Repair x-content byte order in aligned USFM to match UHB verbatim.
+ *
+ * The AI alignment pipeline may NFC-normalize Hebrew combining marks when writing
+ * x-content (e.g. reordering DAGESH U+05BC before HIRIQ U+05B4 into HIRIQ-then-DAGESH),
+ * while the UHB stores them in traditional Tanakh order (consonant → dagesh → vowel).
+ * Same glyph, different bytes — downstream tools that compare x-content against UHB
+ * \w tokens with strict equality silently miss the mismatch.
+ *
+ * This function reads UHB token texts verbatim (bypassing any library that might
+ * normalize) and patches any x-content value that differs from its UHB source
+ * only in combining-mark order (i.e. same NFC glyph, different bytes).
+ *
+ * @param {object} opts
+ * @param {string} opts.alignedUsfm - Path to aligned USFM file (relative to workspace)
+ * @param {string} opts.hebrewUsfm  - Path to Hebrew UHB source USFM (relative to workspace)
+ * @returns {string} Summary of changes made
+ */
+function repairAlignmentXContent({ alignedUsfm, hebrewUsfm }) {
+  const alignedPath = path.resolve(CSKILLBP_DIR, alignedUsfm);
+  const hebrewPath = path.resolve(CSKILLBP_DIR, hebrewUsfm);
+
+  if (!fs.existsSync(alignedPath)) return `Error: aligned USFM not found: ${alignedUsfm}`;
+  if (!fs.existsSync(hebrewPath)) return `Error: Hebrew USFM not found: ${hebrewUsfm}`;
+
+  // Build per-verse map of verbatim UHB word texts.
+  // Use a plain regex — never pass through usfm-js or any library that might normalize.
+  const hebrewContent = fs.readFileSync(hebrewPath, 'utf8');
+  const uhbByVerse = {};  // "ch:vs" -> { NFC(word): [verbatim1, verbatim2, ...] }
+  let uhbCh = 0, uhbVs = 0;
+  const UHB_W_RE = /\\w\s+([^|]+)\|/g;
+
+  for (const line of hebrewContent.split('\n')) {
+    const cm = line.match(/^\\c\s+(\d+)/);
+    if (cm) { uhbCh = parseInt(cm[1], 10); uhbVs = 0; continue; }
+    const vm = line.match(/^\\v\s+(\d+)/);
+    if (vm) { uhbVs = parseInt(vm[1], 10); continue; }
+    if (!uhbCh || !uhbVs) continue;
+
+    const key = `${uhbCh}:${uhbVs}`;
+    if (!uhbByVerse[key]) uhbByVerse[key] = {};
+    const map = uhbByVerse[key];
+
+    UHB_W_RE.lastIndex = 0;
+    let m;
+    while ((m = UHB_W_RE.exec(line)) !== null) {
+      const word = m[1].trimEnd();  // preserve internal characters, strip trailing whitespace
+      const nfc = word.normalize('NFC');
+      if (!map[nfc]) map[nfc] = [];
+      map[nfc].push(word);
+    }
+  }
+
+  // Patch x-content values in the aligned USFM.
+  const alignedLines = fs.readFileSync(alignedPath, 'utf8').split('\n');
+  let repaired = 0;
+  let aCh = 0, aVs = 0;
+  const ZALN_RE = /\\zaln-s\s*\|([^*]*?)\\\*/g;
+
+  for (let i = 0; i < alignedLines.length; i++) {
+    const line = alignedLines[i];
+
+    // Always update chapter/verse state before the early-continue
+    const cm = line.match(/^\\c\s+(\d+)/);
+    if (cm) { aCh = parseInt(cm[1], 10); aVs = 0; }
+    const vm2 = line.match(/\\v\s+(\d+)/);
+    if (vm2) { aVs = parseInt(vm2[1], 10); }
+
+    if (!line.includes('\\zaln-s')) continue;
+
+    const verseKey = `${aCh}:${aVs}`;
+    const verseTokens = uhbByVerse[verseKey];
+    if (!verseTokens) continue;
+
+    ZALN_RE.lastIndex = 0;
+    let newLine = line;
+    let offset = 0;
+    let zm;
+
+    while ((zm = ZALN_RE.exec(line)) !== null) {
+      const attrStr = zm[1];
+      const contentM = attrStr.match(/x-content="([^"]*)"/);
+      if (!contentM) continue;
+
+      const xContent = contentM[1];
+      // Only process Hebrew-range text
+      if (!xContent || !/[֐-׿]/.test(xContent)) continue;
+
+      // Look up UHB verbatim words by NFC-normalized form
+      const nfc = xContent.normalize('NFC');
+      const candidates = verseTokens[nfc];
+      if (!candidates || !candidates.length) continue;
+
+      // Use x-occurrence (1-based) to select the right candidate
+      const occM = attrStr.match(/x-occurrence="(\d+)"/);
+      const occ = occM ? parseInt(occM[1], 10) : 1;
+      const uhbWord = candidates[Math.min(occ - 1, candidates.length - 1)];
+
+      if (!uhbWord || uhbWord === xContent) continue;
+
+      // Same NFC glyph, different byte order — patch to UHB verbatim bytes
+      const posInNewLine = zm.index + offset;
+      const newMatch = zm[0].replace(`x-content="${xContent}"`, `x-content="${uhbWord}"`);
+      newLine = newLine.slice(0, posInNewLine) + newMatch + newLine.slice(posInNewLine + zm[0].length);
+      offset += newMatch.length - zm[0].length;
+      repaired++;
+    }
+
+    if (newLine !== line) alignedLines[i] = newLine;
+  }
+
+  if (repaired > 0) {
+    fs.writeFileSync(alignedPath, alignedLines.join('\n'));
+    return `Repaired ${repaired} x-content byte-order mismatch(es) in ${path.basename(alignedUsfm)} — x-content now byte-identical to UHB`;
+  }
+  return `No x-content byte-order mismatches found in ${path.basename(alignedUsfm)}`;
+}
+
 module.exports = {
   extractUltEnglish,
   filterPsalms,
   curlyQuotes,
   checkUstPassives,
   createAlignedUsfm,
+  repairAlignmentXContent,
   readUsfmChapter,
   mergeAlignedUsfm,
   validateAlignmentJson,

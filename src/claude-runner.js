@@ -42,6 +42,41 @@ async function createFreshWorkspaceToolsServer(toolSet) {
 const DEFAULT_TIMEOUT_MS = 10 * 60 * 1000;
 const DEFAULT_MAX_TURNS = 200;
 
+// Extended-thinking budgets (token counts for Claude Agent SDK thinking option).
+// Mirrors Claude Code's keyword tiers: think / megathink / ultrathink, plus an
+// extra "high" tier we use as the default for Opus calls.
+const THINKING_LOW = 4000;
+const THINKING_MEDIUM = 10000;
+const THINKING_HIGH = 20000;
+const THINKING_MAX = 31999;
+
+const THINKING_LEVELS = {
+  low: THINKING_LOW,
+  medium: THINKING_MEDIUM,
+  high: THINKING_HIGH,
+  max: THINKING_MAX,
+};
+
+function resolveThinkingBudget(thinking, resolvedModel) {
+  if (thinking === false || thinking === 'off' || thinking === 'none') return null;
+  if (typeof thinking === 'number') {
+    if (thinking < 1024 || thinking > THINKING_MAX) {
+      throw new Error(`Invalid thinking budget: ${thinking} (must be between 1024 and ${THINKING_MAX} tokens)`);
+    }
+    return thinking;
+  }
+  if (typeof thinking === 'string') {
+    if (thinking in THINKING_LEVELS) return THINKING_LEVELS[thinking];
+    throw new Error(`Unrecognized thinking level: '${thinking}' (expected one of: ${Object.keys(THINKING_LEVELS).join(', ')}, 'off')`);
+  }
+  // Auto-default (thinking == null/undefined): Opus → HIGH, Sonnet → MEDIUM, Haiku/others → none.
+  if (typeof resolvedModel === 'string') {
+    if (/opus/i.test(resolvedModel)) return THINKING_HIGH;
+    if (/sonnet/i.test(resolvedModel)) return THINKING_MEDIUM;
+  }
+  return null;
+}
+
 const DEFAULT_ALLOWED_TOOLS = [
   'Read', 'Write', 'Edit', 'Glob', 'Grep',
   'Task', 'Skill', 'SendMessage',
@@ -86,6 +121,7 @@ function buildOptions({
   appendSystemPrompt,
   abortController,
   mcpServers,
+  thinking,
 }) {
   const options = {
     cwd: cwd || process.cwd(),
@@ -117,6 +153,10 @@ function buildOptions({
     options.resume = resume;
   }
   options.model = model || 'opus';
+  const thinkingBudget = resolveThinkingBudget(thinking, options.model);
+  if (thinkingBudget) {
+    options.thinking = { type: 'enabled', budget_tokens: thinkingBudget };
+  }
   if (betas) {
     options.betas = betas;
   }
@@ -144,6 +184,7 @@ async function runClaudeOnce({
   mcpToolSet,
   onProgress,
   guardrails,
+  thinking,
 }) {
   await ensureFreshToken();
   const query = await getQuery();
@@ -204,6 +245,7 @@ async function runClaudeOnce({
     appendSystemPrompt,
     abortController,
     mcpServers: { 'workspace-tools': wsTools },
+    thinking,
   });
 
   console.log(`[claude-runner q=${queryId}] Starting query in ${cwd}`);
@@ -524,6 +566,7 @@ async function runClaudeStream({
   maxTurns,
   timeoutMs,
   appendSystemPrompt,
+  thinking,
 }) {
   await ensureFreshToken();
   const query = await getQuery();
@@ -549,6 +592,7 @@ async function runClaudeStream({
     appendSystemPrompt,
     abortController,
     mcpServers: { 'workspace-tools': wsTools },
+    thinking,
   });
 
   console.log(`[claude-runner] Starting stream in ${cwd}${resume ? ` (resume: ${resume.slice(0, 8)}…)` : ''}`);
@@ -570,4 +614,9 @@ module.exports = {
   DEFAULT_RESTRICTED_TOOLS,
   ClaudeTransientOutageError,
   isTransientOutageError,
+  THINKING_LOW,
+  THINKING_MEDIUM,
+  THINKING_HIGH,
+  THINKING_MAX,
+  resolveThinkingBudget,
 };

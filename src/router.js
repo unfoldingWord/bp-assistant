@@ -6,7 +6,7 @@ const { getTotalVerses, getChapterCount } = require('./verse-counts');
 const { classifyIntent } = require('./intent-classifier');
 const { preflightCheck, estimateTokens } = require('./usage-tracker');
 const { getPendingMerge, clearPendingMerge, getAllPendingMerges } = require('./pending-merges');
-const { getCheckpoint, setCheckpoint, clearCheckpoint } = require('./pipeline-checkpoints');
+const { getCheckpoint, setCheckpoint, clearCheckpoint, buildCheckpointKey } = require('./pipeline-checkpoints');
 const { listCheckpoints } = require('./pipeline-checkpoints');
 const { resumeInsertion } = require('./insertion-resume');
 const { normalizeBookName, isValidBook } = require('./pipeline-utils');
@@ -1318,6 +1318,155 @@ function hasActiveSession(channel, topic, senderId) {
   return hasActiveStreamSession(channel, topic, senderId);
 }
 
+// ---------------------------------------------------------------------------
+// triggerPipelineFromApi — HTTP-initiated pipeline launch
+//
+// Mirrors firePipeline's responsibilities (dedup, activePipelines bookkeeping,
+// fire-and-forget runPipeline) but takes structured input and returns a
+// structured result instead of sending Zulip messages on conflict. Used by
+// the public `/api/pipeline/start` endpoint.
+// ---------------------------------------------------------------------------
+
+const API_PIPELINE_ROUTE_NAMES = {
+  generate: 'generate-content',
+  notes: 'write-notes',
+  tqs: 'write-tqs',
+};
+
+function getApiStream() {
+  return process.env.BT_API_ZULIP_STREAM || 'bp-api';
+}
+
+function buildApiSyntheticRoute(pipelineType, scope) {
+  const routeName = API_PIPELINE_ROUTE_NAMES[pipelineType];
+  if (!routeName) return null;
+  const baseRoute = config.routes.find((r) => r.name === routeName);
+  if (!baseRoute) return null;
+
+  const { book, startChapter, endChapter, verseStart, verseEnd } = scope;
+  const rangeLabel = verseStart != null && verseEnd != null && startChapter === endChapter
+    ? `${book} ${startChapter}:${verseStart}-${verseEnd}`
+    : startChapter === endChapter
+      ? `${book} ${startChapter}`
+      : `${book} ${startChapter}-${endChapter}`;
+
+  return {
+    ...baseRoute,
+    _synthetic: true,
+    _book: book,
+    _startChapter: startChapter,
+    _endChapter: endChapter,
+    _verseStart: verseStart ?? null,
+    _verseEnd: verseEnd ?? null,
+    _scopeText: rangeLabel.replace(/^\S+\s+/, ''),
+    _apiOrigin: true,
+    confirmMessage: null,
+  };
+}
+
+function buildApiSyntheticMessage({ pipelineType, scope, apiSessionKey, username }) {
+  const { book, startChapter, endChapter } = scope;
+  const chapterPart = startChapter === endChapter ? String(startChapter) : `${startChapter}-${endChapter}`;
+  const commandWord = pipelineType === 'generate' ? 'generate'
+    : pipelineType === 'notes' ? 'write notes'
+    : 'write tqs';
+  return {
+    id: -1,
+    type: 'stream',
+    display_recipient: getApiStream(),
+    subject: apiSessionKey,
+    sender_id: -1,
+    sender_full_name: username,
+    sender_email: `${username}@api.bp-assistant`,
+    content: `${commandWord} ${book} ${chapterPart}`,
+    _apiOrigin: true,
+  };
+}
+
+function buildApiJobId({ apiSessionKey, pipelineType, scope }) {
+  const derivedSessionKey = `stream-${getApiStream()}-${apiSessionKey}`;
+  return buildCheckpointKey({ sessionKey: derivedSessionKey, pipelineType, scope });
+}
+
+/**
+ * Launch a pipeline from an HTTP/API caller.
+ *
+ * @param {object} input
+ * @param {'generate'|'notes'|'tqs'} input.pipelineType
+ * @param {string} input.book - 3-letter USFM code (already uppercased)
+ * @param {number} input.startChapter
+ * @param {number} input.endChapter
+ * @param {number|null} [input.verseStart]
+ * @param {number|null} [input.verseEnd]
+ * @param {string} input.username - DCS handle for commit attribution
+ * @param {string} input.apiSessionKey - caller-supplied; idempotency + scoping
+ * @returns {{ status: 'running'|'already_running'|'conflict'|'invalid', jobId?, scope?, conflictingJobId?, message? }}
+ */
+function triggerPipelineFromApi(input) {
+  const {
+    pipelineType,
+    book,
+    startChapter,
+    endChapter,
+    verseStart = null,
+    verseEnd = null,
+    username,
+    apiSessionKey,
+  } = input;
+
+  const scope = { book, startChapter, endChapter, verseStart, verseEnd };
+  const route = buildApiSyntheticRoute(pipelineType, scope);
+  if (!route) {
+    return { status: 'invalid', message: `Unknown pipelineType: ${pipelineType}` };
+  }
+  const message = buildApiSyntheticMessage({ pipelineType, scope, apiSessionKey, username });
+  const derivedSessionKey = `stream-${getApiStream()}-${apiSessionKey}`;
+  const jobId = buildCheckpointKey({ sessionKey: derivedSessionKey, pipelineType, scope });
+
+  // Conflict check 1: same (sessionKey, pipelineType, scope) already running?
+  const activeCp = getActiveCheckpoint(route, derivedSessionKey, []);
+  if (activeCp && !isStaleRunningCheckpoint(activeCp) && activeCp.state === 'running') {
+    return { status: 'already_running', jobId, scope };
+  }
+  // Stale running → flip to failed so it becomes resumable (mirrors firePipeline).
+  if (isStaleRunningCheckpoint(activeCp)) {
+    setCheckpoint({
+      sessionKey: activeCp.sessionKey,
+      pipelineType: activeCp.pipelineType,
+      scope: activeCp.scope,
+    }, { state: 'failed', current: { ...activeCp.current, status: 'failed', errorKind: 'interrupted' } });
+  }
+
+  // Conflict check 2: another caller is running the same (book, chapter) under a different sessionKey?
+  const keys = getPipelineKeys(route, message);
+  if (keys) {
+    const conflicts = keys.filter((k) => activePipelines.has(k));
+    if (conflicts.length > 0) {
+      return {
+        status: 'conflict',
+        jobId,
+        scope,
+        message: `Another run holds ${conflicts[0]}`,
+      };
+    }
+    for (const k of keys) activePipelines.add(k);
+  }
+
+  // Fire and forget.
+  runPipeline(route, message)
+    .catch(async (err) => {
+      console.error(`[router/api] Pipeline "${route.name}" failed: ${err.message}`);
+      await publishRouterFailure(route, message, err);
+    })
+    .finally(() => {
+      if (keys) {
+        for (const k of keys) activePipelines.delete(k);
+      }
+    });
+
+  return { status: 'running', jobId, scope };
+}
+
 module.exports = {
   routeMessage,
   hasPendingAction,
@@ -1327,4 +1476,7 @@ module.exports = {
   buildWriteTqsConfirmText,
   buildSyntheticRoute,
   parseIntentScope,
+  triggerPipelineFromApi,
+  buildApiJobId,
+  API_PIPELINE_ROUTE_NAMES,
 };
