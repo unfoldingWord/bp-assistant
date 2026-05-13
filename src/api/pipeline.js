@@ -24,6 +24,28 @@ const RATE_LIMIT_WINDOW_MS = 60_000;
 
 const PIPELINE_TYPES = Object.keys(API_PIPELINE_ROUTE_NAMES);
 
+const OptionsSchema = z.object({
+  // Common — currently a no-op on the wire (model is fixed per pipeline today),
+  // but accepted for forward compatibility with the contract doc.
+  model: z.enum(['sonnet', 'opus']).optional(),
+  // Common — re-run after a previous failed/paused run, clears checkpoint & prior outputs.
+  fresh: z.boolean().optional(),
+  // generate-only:
+  // Restrict to a subset of content types. Default is both. Single-element array
+  // routes to a per-type skill (ULT-gen / UST-gen) inside the pipeline.
+  contentTypes: z.array(z.enum(['ult', 'ust'])).min(1).max(2).optional(),
+  // Skip alignment + repo-insert. Mutually exclusive with alignOnly and textOnly.
+  noAlign: z.boolean().optional(),
+  // Reuse existing generated files; only align + repo-insert. Mutually exclusive
+  // with noAlign and textOnly.
+  alignOnly: z.boolean().optional(),
+  // Push unaligned USFM files (no alignment). Mutually exclusive with noAlign and alignOnly.
+  textOnly: z.boolean().optional(),
+  // notes-only:
+  noIntro: z.boolean().optional(),
+  pauseBeforeATs: z.boolean().optional(),
+}).strict();
+
 const StartBodySchema = z.object({
   pipelineType: z.enum(PIPELINE_TYPES),
   book: z.string().regex(/^[A-Za-z0-9]{3}$/),
@@ -35,9 +57,42 @@ const StartBodySchema = z.object({
   sessionKey: z.string().min(1).max(120).regex(/^[A-Za-z0-9_\-./]+$/)
     .refine((v) => !/__/.test(v), { message: 'sessionKey must not contain "__"' })
     .refine((v) => !v.replace(/[^a-zA-Z0-9_]/g, '_').includes('__'), { message: 'sessionKey collapses to "__" after sanitization' }),
-  options: z.object({
-    model: z.enum(['sonnet', 'opus']).optional(),
-  }).optional(),
+  options: OptionsSchema.optional(),
+}).superRefine((body, ctx) => {
+  const o = body.options || {};
+  // Mutually-exclusive align mode flags.
+  const alignFlags = ['noAlign', 'alignOnly', 'textOnly'].filter((k) => o[k]);
+  if (alignFlags.length > 1) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['options'],
+      message: `options.${alignFlags.join(' / options.')} are mutually exclusive`,
+    });
+  }
+  // generate-only flags must not appear on notes/tqs.
+  if (body.pipelineType !== 'generate') {
+    for (const k of ['contentTypes', 'noAlign', 'alignOnly', 'textOnly']) {
+      if (o[k] !== undefined) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['options', k],
+          message: `options.${k} only valid for pipelineType "generate"`,
+        });
+      }
+    }
+  }
+  // notes-only flags must not appear on generate/tqs.
+  if (body.pipelineType !== 'notes') {
+    for (const k of ['noIntro', 'pauseBeforeATs']) {
+      if (o[k] !== undefined) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['options', k],
+          message: `options.${k} only valid for pipelineType "notes"`,
+        });
+      }
+    }
+  }
 });
 
 const rateLimits = new Map();
@@ -226,6 +281,7 @@ async function handleStartRequest(req, res) {
       verseEnd: body.verseEnd ?? null,
       username: body.username,
       apiSessionKey: body.sessionKey,
+      options: body.options || {},
     });
 
     const lat = Date.now() - startedAt;

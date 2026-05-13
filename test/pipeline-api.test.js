@@ -188,3 +188,117 @@ test('PIPELINE_OUTPUT_TYPES — all referenced types exist in REPO_MAP', () => {
     }
   }
 });
+
+// ---------------------------------------------------------------------------
+// Options → synthetic content flags
+// ---------------------------------------------------------------------------
+
+const { buildApiContentFlags } = require('../src/router');
+
+test('buildApiContentFlags — generate, no options → no flags', () => {
+  assert.deepEqual(buildApiContentFlags('generate', {}), []);
+  assert.deepEqual(buildApiContentFlags('generate', undefined), []);
+});
+
+test('buildApiContentFlags — generate, ULT-only contentTypes → "ULT" flag', () => {
+  assert.deepEqual(buildApiContentFlags('generate', { contentTypes: ['ult'] }), ['ULT']);
+  assert.deepEqual(buildApiContentFlags('generate', { contentTypes: ['ust'] }), ['UST']);
+});
+
+test('buildApiContentFlags — generate, both contentTypes → no restriction flag', () => {
+  assert.deepEqual(buildApiContentFlags('generate', { contentTypes: ['ult', 'ust'] }), []);
+});
+
+test('buildApiContentFlags — generate, noAlign → --no-align', () => {
+  assert.deepEqual(buildApiContentFlags('generate', { noAlign: true }), ['--no-align']);
+});
+
+test('buildApiContentFlags — generate, alignOnly → --align-only', () => {
+  assert.deepEqual(buildApiContentFlags('generate', { alignOnly: true }), ['--align-only']);
+});
+
+test('buildApiContentFlags — generate, textOnly → --text-only', () => {
+  assert.deepEqual(buildApiContentFlags('generate', { textOnly: true }), ['--text-only']);
+});
+
+test('buildApiContentFlags — generate, combined ULT + no-align + fresh', () => {
+  const f = buildApiContentFlags('generate', { contentTypes: ['ult'], noAlign: true, fresh: true });
+  assert.deepEqual(f, ['ULT', '--no-align', '--fresh']);
+});
+
+test('buildApiContentFlags — notes, noIntro + pauseBeforeATs', () => {
+  assert.deepEqual(
+    buildApiContentFlags('notes', { noIntro: true, pauseBeforeATs: true }),
+    ['--no-intro', '--pause-before-ats'],
+  );
+});
+
+test('buildApiContentFlags — notes ignores generate-only flags', () => {
+  // Schema-level validation rejects these for notes, but the builder must also
+  // be tolerant: silently drop generate-only flags rather than emit them.
+  assert.deepEqual(buildApiContentFlags('notes', { contentTypes: ['ult'], noAlign: true }), []);
+});
+
+test('buildApiContentFlags — tqs, fresh', () => {
+  assert.deepEqual(buildApiContentFlags('tqs', { fresh: true }), ['--fresh']);
+});
+
+// ---------------------------------------------------------------------------
+// StartBodySchema — option validation
+// ---------------------------------------------------------------------------
+
+test('StartBodySchema — accepts options.contentTypes for generate', () => {
+  const r = StartBodySchema.safeParse({
+    pipelineType: 'generate', book: 'PSA', startChapter: 1,
+    username: 'u', sessionKey: 'k',
+    options: { contentTypes: ['ult'] },
+  });
+  assert.equal(r.success, true);
+});
+
+test('StartBodySchema — rejects generate-only options on notes', () => {
+  const r = StartBodySchema.safeParse({
+    pipelineType: 'notes', book: 'PSA', startChapter: 1,
+    username: 'u', sessionKey: 'k',
+    options: { contentTypes: ['ult'] },
+  });
+  assert.equal(r.success, false);
+});
+
+test('StartBodySchema — rejects notes-only options on generate', () => {
+  const r = StartBodySchema.safeParse({
+    pipelineType: 'generate', book: 'PSA', startChapter: 1,
+    username: 'u', sessionKey: 'k',
+    options: { noIntro: true },
+  });
+  assert.equal(r.success, false);
+});
+
+test('StartBodySchema — rejects mutually-exclusive align flags', () => {
+  const r = StartBodySchema.safeParse({
+    pipelineType: 'generate', book: 'PSA', startChapter: 1,
+    username: 'u', sessionKey: 'k',
+    options: { noAlign: true, alignOnly: true },
+  });
+  assert.equal(r.success, false);
+});
+
+test('StartBodySchema — rejects unknown options keys (strict)', () => {
+  const r = StartBodySchema.safeParse({
+    pipelineType: 'generate', book: 'PSA', startChapter: 1,
+    username: 'u', sessionKey: 'k',
+    options: { mysteryFlag: true },
+  });
+  assert.equal(r.success, false);
+});
+
+test('StartBodySchema — accepts fresh on any pipeline type', () => {
+  for (const pt of ['generate', 'notes', 'tqs']) {
+    const r = StartBodySchema.safeParse({
+      pipelineType: pt, book: 'PSA', startChapter: 1,
+      username: 'u', sessionKey: 'k',
+      options: { fresh: true },
+    });
+    assert.equal(r.success, true, `${pt} should accept fresh`);
+  }
+});
