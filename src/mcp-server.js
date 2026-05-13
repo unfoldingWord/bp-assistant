@@ -13,6 +13,7 @@ const { readSecret } = require('./secrets');
 const { readAdminStatus } = require('./admin-status');
 const { listCheckpoints } = require('./pipeline-checkpoints');
 const { handleTnQuickRequest } = require('./api/tn-quick');
+const { handleStartRequest, handleStatusRequest } = require('./api/pipeline');
 const { loadCache: loadVerseDataCache } = require('./api-runner/verse-data');
 
 const ADMIN_PORT = Number(process.env.PORT || 8080);
@@ -710,6 +711,22 @@ function createHttpServer() {
 
     if (req.method === 'POST' && urlPath === '/api/tn-quick') {
       await handleTnQuickRequest(req, res);
+      return;
+    }
+
+    if (req.method === 'POST' && urlPath === '/api/pipeline/start') {
+      await handleStartRequest(req, res);
+      return;
+    }
+
+    if (req.method === 'GET' && urlPath.startsWith('/api/pipeline/')) {
+      const jobId = decodeURIComponent(urlPath.slice('/api/pipeline/'.length));
+      if (!jobId) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'missing_job_id' }));
+        return;
+      }
+      await handleStatusRequest(req, res, jobId);
       return;
     }
 

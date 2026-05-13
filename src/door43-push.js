@@ -876,7 +876,8 @@ async function door43Push(opts) {
     }
 
     // Step 4: Commit and push
-    const commitMsg = `${type.toUpperCase()}: ${book} ${chapter} [${username}]`;
+    const pipelineForTrailer = type === 'tn' ? 'notes' : type === 'tq' ? 'tqs' : 'generate';
+    const commitMsg = `${type.toUpperCase()}: ${book} ${chapter} [${username}]\n\nX-AI-Pipeline: bp-assistant/${pipelineForTrailer}`;
     const pushResult = await commitAndPush(repoDir, branch, repoFilename, commitMsg, { force: !!branchOnly });
 
     if (pushResult.noChanges) {
