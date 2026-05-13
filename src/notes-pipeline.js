@@ -1863,7 +1863,7 @@ async function notesPipeline(route, message) {
       mcpTools: 'quality',
       maxTurns: 100,
       ops: 1,
-      model: 'sonnet',
+      model: 'opus',
     });
 
     // --- Run skills sequentially ---
