@@ -22,7 +22,24 @@ async function getClient() {
   return client;
 }
 
+// Stream name used by triggerPipelineFromApi as a synthetic display_recipient.
+// Pipelines for API-triggered runs surface their status via publishAdminStatus
+// to the existing /admin page; we suppress duplicate Zulip writes here so the
+// bot doesn't spam errors trying to post to a stream that doesn't exist.
+// Override via BT_API_SUPPRESS_STREAM (set to '' to disable suppression and
+// route API-run status to a real Zulip stream named in BT_API_ZULIP_STREAM).
+const API_SUPPRESS_STREAM = process.env.BT_API_SUPPRESS_STREAM ?? 'bp-api';
+
+function isApiSuppressedSender(userId) {
+  // Synthetic API messages set sender_id to -1; DMs back to that id would be no-ops.
+  return userId === -1 || userId === '-1';
+}
+
 async function sendMessage(stream, topic, content) {
+  if (API_SUPPRESS_STREAM && stream === API_SUPPRESS_STREAM) {
+    console.log(`[zulip-api-suppress] ${stream}/${topic}: ${String(content).slice(0, 200)}`);
+    return { result: 'success', id: -1, suppressed: true };
+  }
   const z = await getClient();
   return z.messages.send({
     type: 'stream',
@@ -33,6 +50,10 @@ async function sendMessage(stream, topic, content) {
 }
 
 async function sendDM(userId, content) {
+  if (isApiSuppressedSender(userId)) {
+    console.log(`[zulip-api-suppress] DM to ${userId}: ${String(content).slice(0, 200)}`);
+    return { result: 'success', id: -1, suppressed: true };
+  }
   const z = await getClient();
   return z.messages.send({
     type: 'direct',
@@ -48,6 +69,9 @@ async function getStreamId(streamName) {
 }
 
 async function addReaction(messageId, emojiName) {
+  if (messageId === -1 || messageId === '-1' || messageId == null) {
+    return { result: 'success', suppressed: true };
+  }
   const z = await getClient();
   return z.callEndpoint(`/messages/${messageId}/reactions`, 'POST', {
     emoji_name: emojiName,
@@ -55,6 +79,9 @@ async function addReaction(messageId, emojiName) {
 }
 
 async function removeReaction(messageId, emojiName) {
+  if (messageId === -1 || messageId === '-1' || messageId == null) {
+    return { result: 'success', suppressed: true };
+  }
   const z = await getClient();
   return z.callEndpoint(`/messages/${messageId}/reactions`, 'DELETE', {
     emoji_name: emojiName,

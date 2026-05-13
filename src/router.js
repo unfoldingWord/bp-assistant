@@ -1371,6 +1371,7 @@ function buildApiSyntheticMessage({ pipelineType, scope, apiSessionKey, username
     : pipelineType === 'notes' ? 'write notes'
     : 'write tqs';
   return {
+    id: -1,
     type: 'stream',
     display_recipient: getApiStream(),
     subject: apiSessionKey,
