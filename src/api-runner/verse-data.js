@@ -4,6 +4,7 @@
 const http = require('http');
 const https = require('https');
 const fs = require('fs');
+const path = require('path');
 
 const DOOR43_BASE = 'https://git.door43.org/unfoldingWord';
 
@@ -178,18 +179,32 @@ function stripMarkup(verseUsfm) {
 function loadCache() {
   if (cache.validIssues && cache.templates) return;
 
-  // Try Docker path first, then host path
-  const paths = ['/workspace/data', '/srv/bot/workspace/data'];
-  let dataDir;
-  for (const p of paths) {
-    if (fs.existsSync(p)) { dataDir = p; break; }
-  }
-  if (!dataDir) {
-    throw new Error('Cannot find workspace/data directory for translation-issues.csv and templates.csv');
+  const workspaceDir = process.env.CSKILLBP_DIR || '';
+  const dataDirCandidates = [
+    workspaceDir ? path.join(workspaceDir, 'data') : null,
+    '/data/workspace/data',
+    '/srv/bot/workspace/data',
+    '/workspace/data',
+    '/srv/bot/app/data',
+  ].filter(Boolean);
+
+  let issuesPath = null;
+  let templatesPath = null;
+  for (const dataDir of dataDirCandidates) {
+    const ic = path.join(dataDir, 'translation-issues.csv');
+    const tc = path.join(dataDir, 'templates.csv');
+    if (fs.existsSync(ic) && fs.existsSync(tc)) {
+      issuesPath = ic;
+      templatesPath = tc;
+      break;
+    }
   }
 
-  const issuesPath = `${dataDir}/translation-issues.csv`;
-  const templatesPath = `${dataDir}/templates.csv`;
+  if (!issuesPath || !templatesPath) {
+    throw new Error(
+      `Cannot find workspace/data directory for translation-issues.csv and templates.csv. Tried: ${dataDirCandidates.join(', ')}`
+    );
+  }
 
   const issuesText = fs.readFileSync(issuesPath, 'utf8');
   const issueRows = parseCSV(issuesText);
