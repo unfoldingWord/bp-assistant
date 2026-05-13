@@ -4,11 +4,9 @@
 
 const path = require('path');
 const crypto = require('crypto');
-const Anthropic = require('@anthropic-ai/sdk');
 const { z } = require('zod');
 const { readSecret } = require('../secrets');
-const { getAnthropicApiKey } = require('../anthropic-env');
-const { resolveProviderModel } = require('../api-runner/provider-config');
+const { ensureFreshToken } = require('../auth-refresh');
 const {
   getTemplate,
   loadCache,
@@ -19,6 +17,15 @@ const {
   normalizeHebrewQuote,
 } = require('../workspace-tools/quality-tools');
 
+let _agentSdkQuery = null;
+async function getAgentSdkQuery() {
+  if (!_agentSdkQuery) {
+    const sdk = await import('@anthropic-ai/claude-agent-sdk');
+    _agentSdkQuery = sdk.query;
+  }
+  return _agentSdkQuery;
+}
+
 const HEBREW_DIR_REL = 'data/hebrew_bible';
 const MAX_BODY_BYTES = 32 * 1024;
 const RATE_LIMIT_RPM = 60;
@@ -28,7 +35,7 @@ const RATE_LIMIT_WINDOW_MS = 60_000;
 // Keep in sync when style guidance there changes.
 const TN_QUICK_STYLE = `You draft a single English translation note for an English support phrase highlighted in the ULT.
 
-Output: call the submit_note tool exactly once with the final note text. No preamble outside the tool call.
+Output: emit ONLY the final note text. No preamble, no explanation, no JSON wrapper, no quotation marks around the whole thing. Just the note text on its own.
 
 ## Style Rules
 
@@ -212,39 +219,40 @@ function buildUserMessage({ body, templateInfo, hebrewQuote }) {
     'UST context (±5 verses):',
     ustCtx,
     '',
-    'Draft ONE translation note for the ULT support phrase above. Call submit_note exactly once with the final note text.',
+    'Draft ONE translation note for the ULT support phrase above. Output ONLY the note text.',
   ].join('\n');
 }
 
-async function callModel({ system, userMessage, modelTier, apiKey }) {
-  const AnthropicCtor = Anthropic.default || Anthropic.Anthropic || Anthropic;
-  const client = new AnthropicCtor({ apiKey });
-  const modelId = resolveProviderModel('claude', modelTier);
-
-  const response = await client.messages.create({
-    model: modelId,
-    max_tokens: 800,
-    system,
-    messages: [{ role: 'user', content: userMessage }],
-    tools: [{
-      name: 'submit_note',
-      description: 'Submit the final drafted translation note.',
-      input_schema: {
-        type: 'object',
-        properties: {
-          note: { type: 'string', description: 'The drafted note text.' },
-        },
-        required: ['note'],
-      },
-    }],
-    tool_choice: { type: 'tool', name: 'submit_note' },
+async function callModel({ system, userMessage, modelTier }) {
+  const query = await getAgentSdkQuery();
+  const conversation = query({
+    prompt: userMessage,
+    options: {
+      model: modelTier,
+      systemPrompt: system,
+      allowedTools: [],
+      maxTurns: 1,
+      permissionMode: 'auto',
+      settingSources: [],
+      persistSession: false,
+    },
   });
 
-  const toolUse = (response.content || []).find((b) => b.type === 'tool_use');
-  if (!toolUse || !toolUse.input || typeof toolUse.input.note !== 'string') {
-    throw new Error('model did not return submit_note tool call');
+  let text = '';
+  for await (const msg of conversation) {
+    if (msg.type === 'assistant' && msg.message && Array.isArray(msg.message.content)) {
+      for (const block of msg.message.content) {
+        if (block && block.type === 'text' && typeof block.text === 'string') {
+          text += block.text;
+        }
+      }
+    }
   }
-  return toolUse.input.note;
+  const trimmed = text.trim();
+  if (!trimmed) {
+    throw new Error('model returned empty response');
+  }
+  return trimmed;
 }
 
 async function handleTnQuickRequest(req, res) {
@@ -341,9 +349,14 @@ async function handleTnQuickRequest(req, res) {
     }
     const warnings = heb.warnings.map((w) => `${w.code}: ${w.detail}`);
 
-    const apiKey = getAnthropicApiKey();
-    if (!apiKey) {
-      reply(res, 503, { error: 'anthropic_api_key_missing' });
+    try {
+      await ensureFreshToken();
+    } catch (err) {
+      reply(res, 503, { error: 'oauth_token_unavailable', message: err.message });
+      return;
+    }
+    if (!process.env.CLAUDE_CODE_OAUTH_TOKEN) {
+      reply(res, 503, { error: 'oauth_token_unavailable' });
       return;
     }
 
@@ -360,7 +373,6 @@ async function handleTnQuickRequest(req, res) {
         system,
         userMessage,
         modelTier: body.model,
-        apiKey,
       });
     } catch (err) {
       console.error(`[tn-quick] model error: ${err.message}`);
