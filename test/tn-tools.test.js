@@ -19,6 +19,10 @@ const {
   _maybeBuildProgrammaticNote,
   _normalizeAssembledNoteText,
   substituteAT,
+  applyHintsToPreparedNotes,
+  normalizeQuote,
+  normalizeSupportReference,
+  quoteFuzzyMatch,
 } = require('../src/workspace-tools/tn-tools');
 
 test('parseExplanationDirectives separates t: and i: instructions deterministically', () => {
@@ -1282,4 +1286,220 @@ test('verifyBoldMatches does not scan beyond the opening to add bold', () => {
 
   assert.match(summary, /restored 0 missing bold/);
   assert.doesNotMatch(content, /\*\*stood on his right\*\*/);
+});
+
+// ---------------------------------------------------------------------------
+// Hint helpers: normalizeQuote / normalizeSupportReference / quoteFuzzyMatch
+// ---------------------------------------------------------------------------
+
+test('normalizeSupportReference — strips RC prefix and trims', () => {
+  assert.equal(normalizeSupportReference('rc://*/ta/man/translate/figs-metaphor'), 'figs-metaphor');
+  assert.equal(normalizeSupportReference('  rc://en/ta/man/translate/figs-idiom  '), 'figs-idiom');
+  assert.equal(normalizeSupportReference('figs-explicit'), 'figs-explicit');
+  assert.equal(normalizeSupportReference(''), '');
+  assert.equal(normalizeSupportReference(null), '');
+});
+
+test('normalizeQuote — strips cantillation, word-joiner, collapses whitespace', () => {
+  // Cantillation marks dropped (Hebrew accents in the 0591–05AF range).
+  const withMarks = 'מֵרֵעֵ֑הוּ';
+  const stripped = 'מֵרֵעֵהוּ';
+  assert.equal(normalizeQuote(withMarks), normalizeQuote(stripped));
+  // Word-joiner (U+2060) dropped.
+  assert.equal(normalizeQuote('a⁠b'), 'ab');
+  // Whitespace collapsed and case-folded.
+  assert.equal(normalizeQuote('  Hello   World  '), 'hello world');
+  assert.equal(normalizeQuote(''), '');
+  assert.equal(normalizeQuote(null), '');
+});
+
+test('quoteFuzzyMatch — exact match after normalization', () => {
+  assert.equal(quoteFuzzyMatch('מֵרֵעֵ֑הוּ', 'מֵרֵעֵהוּ'), true);
+  assert.equal(quoteFuzzyMatch('Hello', 'hello'), true);
+});
+
+test('quoteFuzzyMatch — substring containment matches', () => {
+  assert.equal(quoteFuzzyMatch('hello world', 'hello'), true);
+  assert.equal(quoteFuzzyMatch('hello', 'hello world'), true);
+});
+
+test('quoteFuzzyMatch — token overlap at/above 0.6 threshold matches; below does not', () => {
+  // 3/5 = 0.6 (boundary, inclusive) → match.
+  assert.equal(quoteFuzzyMatch('the quick brown fox', 'quick brown the dog'), true);
+  // All 4 tokens shared, just reordered (4/4 = 1.0) → match.
+  assert.equal(quoteFuzzyMatch('a b c d', 'd c b a'), true);
+  // Only 1 of 7 tokens shared (1/7 ≈ 0.14) → no match.
+  assert.equal(quoteFuzzyMatch('alpha beta gamma delta', 'gamma epsilon zeta'), false);
+});
+
+test('quoteFuzzyMatch — unrelated quotes do not match', () => {
+  assert.equal(quoteFuzzyMatch('hello world', 'goodbye moon'), false);
+  assert.equal(quoteFuzzyMatch('מֵרֵעֵהוּ', 'וְ⁠נִכְרַ֖תָּ'), false);
+});
+
+test('quoteFuzzyMatch — empty both sides matches; empty one side does not', () => {
+  assert.equal(quoteFuzzyMatch('', ''), true);
+  assert.equal(quoteFuzzyMatch('a', ''), false);
+  assert.equal(quoteFuzzyMatch('', 'a'), false);
+});
+
+// ---------------------------------------------------------------------------
+// applyHintsToPreparedNotes
+// ---------------------------------------------------------------------------
+
+function writePrepared(workspaceRel, prepared) {
+  const abs = path.join('/srv/bot/workspace', workspaceRel);
+  fs.mkdirSync(path.dirname(abs), { recursive: true });
+  fs.writeFileSync(abs, JSON.stringify(prepared, null, 2));
+}
+
+function readPrepared(workspaceRel) {
+  return JSON.parse(fs.readFileSync(path.join('/srv/bot/workspace', workspaceRel), 'utf8'));
+}
+
+function tempPreparedPath() {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tn-hints-'));
+  return path.join('tmp', path.basename(tempDir), 'prepared_notes.json');
+}
+
+test('applyHintsToPreparedNotes — no hints → no-op', () => {
+  const prepRel = tempPreparedPath();
+  writePrepared(prepRel, { book: 'ZEC', chapter: '7', items: [
+    { id: 'aaaa', reference: '7:1', sref: 'figs-metaphor', orig_quote: 'foo' },
+  ]});
+  const r = applyHintsToPreparedNotes({ preparedJson: prepRel, hints: [], chapter: 7 });
+  assert.equal(r.hintsApplied, 0);
+  assert.equal(r.itemsSuppressed, 0);
+  assert.equal(r.hintsDropped, 0);
+  const data = readPrepared(prepRel);
+  assert.equal(data.items.length, 1);
+});
+
+test('applyHintsToPreparedNotes — injects hint as new item with id=rowId, fromHint=true', () => {
+  const prepRel = tempPreparedPath();
+  writePrepared(prepRel, { book: 'ZEC', chapter: '7', items: [
+    { id: 'aaaa', reference: '7:1', sref: 'figs-other', orig_quote: 'unrelated', ult_verse: 'Verse 1 text' },
+  ]});
+  const r = applyHintsToPreparedNotes({
+    preparedJson: prepRel,
+    hints: [{
+      rowId: 'ab12', verse: 1,
+      quote: 'מֵרֵעֵהוּ',
+      supportReference: 'rc://*/ta/man/translate/figs-metaphor',
+      seed: 'expand me',
+    }],
+    chapter: 7,
+  });
+  assert.equal(r.hintsApplied, 1);
+  assert.equal(r.itemsSuppressed, 0);
+  const data = readPrepared(prepRel);
+  assert.equal(data.items.length, 2);
+  const injected = data.items.find((it) => it.id === 'ab12');
+  assert.ok(injected, 'hint item missing');
+  assert.equal(injected.fromHint, true);
+  assert.equal(injected.seed, 'expand me');
+  assert.equal(injected.hintRowId, 'ab12');
+  assert.equal(injected.note_type, 'hint');
+  assert.equal(injected.sref, 'figs-metaphor');  // RC prefix stripped
+  assert.equal(injected.reference, '7:1');
+  assert.equal(injected.orig_quote, 'מֵרֵעֵהוּ');
+});
+
+test('applyHintsToPreparedNotes — suppresses matching item on (verse, sref, fuzzy-quote)', () => {
+  const prepRel = tempPreparedPath();
+  writePrepared(prepRel, { book: 'ZEC', chapter: '7', items: [
+    { id: 'aaaa', reference: '7:7', sref: 'figs-metaphor', orig_quote: 'מֵרֵעֵ֑הוּ' },
+    { id: 'bbbb', reference: '7:7', sref: 'figs-idiom',    orig_quote: 'מֵרֵעֵהוּ' },
+    { id: 'cccc', reference: '7:8', sref: 'figs-metaphor', orig_quote: 'מֵרֵעֵהוּ' },
+  ]});
+  const r = applyHintsToPreparedNotes({
+    preparedJson: prepRel,
+    hints: [{
+      rowId: 'ab12', verse: 7,
+      quote: 'מֵרֵעֵהוּ',  // matches aaaa after cantillation strip
+      supportReference: 'figs-metaphor',
+      seed: null,
+    }],
+    chapter: 7,
+  });
+  assert.equal(r.hintsApplied, 1);
+  assert.equal(r.itemsSuppressed, 1);
+  const data = readPrepared(prepRel);
+  // aaaa suppressed, bbbb (different sref) kept, cccc (different verse) kept, hint injected
+  const ids = data.items.map((it) => it.id).sort();
+  assert.deepEqual(ids, ['ab12', 'bbbb', 'cccc']);
+});
+
+test('applyHintsToPreparedNotes — empty hint.quote suppresses on (verse, sref) only', () => {
+  const prepRel = tempPreparedPath();
+  writePrepared(prepRel, { book: 'ZEC', chapter: '7', items: [
+    { id: 'aaaa', reference: '7:7', sref: 'figs-metaphor', orig_quote: 'whatever' },
+    { id: 'bbbb', reference: '7:8', sref: 'figs-metaphor', orig_quote: 'whatever' },
+  ]});
+  const r = applyHintsToPreparedNotes({
+    preparedJson: prepRel,
+    hints: [{ rowId: 'ab12', verse: 7, quote: '', supportReference: 'figs-metaphor', seed: null }],
+    chapter: 7,
+  });
+  assert.equal(r.itemsSuppressed, 1);
+  const data = readPrepared(prepRel);
+  assert.ok(!data.items.find((it) => it.id === 'aaaa'), 'aaaa should be suppressed');
+  assert.ok(data.items.find((it) => it.id === 'bbbb'), 'bbbb should survive');
+});
+
+test('applyHintsToPreparedNotes — drops hint whose verse is outside chapter scope', () => {
+  const prepRel = tempPreparedPath();
+  writePrepared(prepRel, { book: 'ZEC', chapter: '7', items: [
+    { id: 'aaaa', reference: '7:1', sref: 'figs-other', orig_quote: 'a' },
+    { id: 'bbbb', reference: '7:2', sref: 'figs-other', orig_quote: 'b' },
+  ]});
+  const r = applyHintsToPreparedNotes({
+    preparedJson: prepRel,
+    hints: [{ rowId: 'ab12', verse: 99, quote: 'x', supportReference: 'figs-metaphor', seed: null }],
+    chapter: 7,
+  });
+  assert.equal(r.hintsApplied, 0);
+  assert.equal(r.hintsDropped, 1);
+  assert.match(r.droppedReasons[0], /verse 99 outside/);
+});
+
+test('applyHintsToPreparedNotes — re-rolls non-hint item id on rowId collision', () => {
+  const prepRel = tempPreparedPath();
+  writePrepared(prepRel, { book: 'ZEC', chapter: '7', items: [
+    { id: 'ab12', reference: '7:1', sref: 'figs-other', orig_quote: 'unrelated' },
+  ]});
+  const r = applyHintsToPreparedNotes({
+    preparedJson: prepRel,
+    hints: [{ rowId: 'ab12', verse: 1, quote: 'newquote', supportReference: 'figs-metaphor', seed: null }],
+    chapter: 7,
+  });
+  assert.equal(r.hintsApplied, 1);
+  const data = readPrepared(prepRel);
+  // Hint owns 'ab12'; old item's id was re-rolled to something else.
+  const hint = data.items.find((it) => it.fromHint);
+  const other = data.items.find((it) => !it.fromHint);
+  assert.equal(hint.id, 'ab12');
+  assert.notEqual(other.id, 'ab12');
+  assert.match(other.id, /^[a-z][a-z0-9]{3}$/);
+});
+
+test('applyHintsToPreparedNotes — multiple hints all applied', () => {
+  const prepRel = tempPreparedPath();
+  writePrepared(prepRel, { book: 'ZEC', chapter: '7', items: [
+    { id: 'aaaa', reference: '7:7', sref: 'figs-metaphor', orig_quote: 'q1' },
+    { id: 'bbbb', reference: '7:9', sref: 'figs-idiom',    orig_quote: 'q2' },
+  ]});
+  const r = applyHintsToPreparedNotes({
+    preparedJson: prepRel,
+    hints: [
+      { rowId: 'ab12', verse: 7, quote: 'q1', supportReference: 'figs-metaphor', seed: 's1' },
+      { rowId: 'cd34', verse: 9, quote: 'q2', supportReference: 'figs-idiom',    seed: null },
+    ],
+    chapter: 7,
+  });
+  assert.equal(r.hintsApplied, 2);
+  assert.equal(r.itemsSuppressed, 2);
+  const data = readPrepared(prepRel);
+  const ids = data.items.map((it) => it.id).sort();
+  assert.deepEqual(ids, ['ab12', 'cd34']);
 });
