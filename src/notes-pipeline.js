@@ -14,7 +14,7 @@ const { sendMessage, sendDM, addReaction, removeReaction } = require('./zulip-cl
 const { runClaude, DEFAULT_RESTRICTED_TOOLS, isTransientOutageError } = require('./claude-runner');
 const { getDoor43Username, emailToFallbackUsername, buildBranchName, resolveOutputFile, discoverFreshOutput, checkPrerequisites, calcSkillTimeout, normalizeBookName, resolveConflictMention, parsePartialTsv, truncatePartialTsv, parseChunkRange, CSKILLBP_DIR } = require('./pipeline-utils');
 const { splitTsv, fixTrailingNewlines } = require('./workspace-tools/tsv-tools');
-const { fillTsvIds, generateIds, prepareNotes, fillOrigQuotes, resolveGlQuotes, flagNarrowQuotes, extractAlignmentData, prepareATContext, substituteAT, fixUnicodeQuotes, verifyBoldMatches, syncCanonicalHebrewQuotes, _stripAlternateTranslation: stripAlternateTranslation } = require('./workspace-tools/tn-tools');
+const { fillTsvIds, generateIds, prepareNotes, fillOrigQuotes, resolveGlQuotes, flagNarrowQuotes, extractAlignmentData, prepareATContext, substituteAT, fixUnicodeQuotes, verifyBoldMatches, syncCanonicalHebrewQuotes, applyHintsToPreparedNotes, _stripAlternateTranslation: stripAlternateTranslation } = require('./workspace-tools/tn-tools');
 const { checkTnQuality } = require('./workspace-tools/quality-tools');
 const { normalizeIssuesFile, buildParallelismIntroHintArgs } = require('./issue-normalizer');
 const { curlyQuotes } = require('./workspace-tools/usfm-tools');
@@ -244,6 +244,9 @@ function runSeeHowDetection({ pipeDir }) {
   const bySref = {};
   for (const item of items) {
     if (!item.sref) continue;
+    // Hint-driven items carry their own framing (seed prose); skip see-how
+    // detection so we don't overwrite the seed with a programmatic back-ref.
+    if (item.fromHint) continue;
     if (!bySref[item.sref]) bySref[item.sref] = [];
     bySref[item.sref].push(item);
   }
@@ -1107,6 +1110,10 @@ function buildParsedNotesRequest(route, content) {
       withIntro: !hasNoIntroFlag(content) || hasWithIntroFlag(content),
       fresh: hasFreshFlag(content),
       pauseBeforeATs: hasPauseBeforeATsFlag(content),
+      // Editor-marked hints; only present on API-origin synthetic routes.
+      // Zulip-triggered runs fall through to parseWriteNotesCommand and
+      // never carry hints.
+      hints: Array.isArray(route._hints) && route._hints.length > 0 ? route._hints : null,
     };
   }
   return parseWriteNotesCommand(content);
@@ -1569,6 +1576,8 @@ async function notesPipeline(route, message) {
   }
 
   const { book, startChapter, endChapter, verseStart, verseEnd, withIntro, fresh, pauseBeforeATs } = parsed;
+  // Editor-marked TN hints (API-origin only; null on Zulip path).
+  const hints = parsed.hints || null;
   const sessionKey = stream ? `stream-${stream}-${topic}` : `dm-${message.sender_id}`;
   const debugRunId = `notes-${message.id || Date.now()}`;
   const checkpointRef = {
@@ -1975,6 +1984,35 @@ async function notesPipeline(route, message) {
             }
           } catch (seeHowErr) {
             console.warn(`[notes] See-how detection failed (non-fatal): ${seeHowErr.message}`);
+          }
+
+          // Apply editor-marked TN hints (API-origin only). Suppresses
+          // prepared items that match a hint on (verse, supportRef,
+          // fuzzy-quote) and injects each hint as a synthetic prepared
+          // item carrying its seed prose. hint.rowId is preserved as the
+          // item's id → TSV column-1 ID → bible-editor's UPDATE key.
+          if (Array.isArray(hints) && hints.length > 0) {
+            try {
+              const ctx = readContext(pipeDir);
+              const hintResult = applyHintsToPreparedNotes({
+                preparedJson: ctx.runtime.preparedNotes,
+                hints,
+                chapter: ch,
+              });
+              await status(
+                `**${ref}**: hints — ${hintResult.hintsApplied} applied, ` +
+                `${hintResult.itemsSuppressed} items suppressed, ` +
+                `${hintResult.hintsDropped} dropped`,
+              );
+              console.log(
+                `[notes] Hints ${ref}: applied=${hintResult.hintsApplied}, ` +
+                `suppressed=${hintResult.itemsSuppressed}, dropped=${hintResult.hintsDropped}` +
+                (hintResult.droppedReasons.length ? ` (${hintResult.droppedReasons.join('; ')})` : ''),
+              );
+            } catch (hintErr) {
+              console.error(`[notes] applyHintsToPreparedNotes failed (non-fatal): ${hintErr.message}`);
+              await status(`**${ref}**: hint application failed — ${hintErr.message}. Continuing without hints.`);
+            }
           }
         } catch (err) {
           console.error(`[notes] Mechanical prep failed for ${ref}: ${err.message}`);

@@ -302,3 +302,113 @@ test('StartBodySchema — accepts fresh on any pipeline type', () => {
     assert.equal(r.success, true, `${pt} should accept fresh`);
   }
 });
+
+// ---------------------------------------------------------------------------
+// StartBodySchema — hints
+// ---------------------------------------------------------------------------
+
+const VALID_HINT = {
+  rowId: 'ab12',
+  verse: 7,
+  quote: 'מֵרֵעֵהוּ',
+  supportReference: 'rc://*/ta/man/translate/figs-metaphor',
+  seed: 'Could be either view.',
+};
+
+test('StartBodySchema — accepts options.hints on notes pipeline', () => {
+  const r = StartBodySchema.safeParse({
+    pipelineType: 'notes', book: 'ZEC', startChapter: 7,
+    username: 'u', sessionKey: 'k',
+    options: { hints: [VALID_HINT] },
+  });
+  assert.equal(r.success, true);
+});
+
+test('StartBodySchema — accepts hints with null seed and null supportReference', () => {
+  const r = StartBodySchema.safeParse({
+    pipelineType: 'notes', book: 'ZEC', startChapter: 7,
+    username: 'u', sessionKey: 'k',
+    options: { hints: [{ ...VALID_HINT, seed: null, supportReference: null }] },
+  });
+  assert.equal(r.success, true);
+});
+
+test('StartBodySchema — accepts empty hint.quote', () => {
+  const r = StartBodySchema.safeParse({
+    pipelineType: 'notes', book: 'ZEC', startChapter: 7,
+    username: 'u', sessionKey: 'k',
+    options: { hints: [{ ...VALID_HINT, quote: '' }] },
+  });
+  assert.equal(r.success, true);
+});
+
+test('StartBodySchema — rejects hints on generate and tqs pipelines', () => {
+  for (const pt of ['generate', 'tqs']) {
+    const r = StartBodySchema.safeParse({
+      pipelineType: pt, book: 'ZEC', startChapter: 7,
+      username: 'u', sessionKey: 'k',
+      options: { hints: [VALID_HINT] },
+    });
+    assert.equal(r.success, false, `${pt} should reject hints`);
+  }
+});
+
+test('StartBodySchema — rejects malformed rowId', () => {
+  for (const bad of ['AB12', '12ab', 'abcde', 'ab1', '', 'ab-1']) {
+    const r = StartBodySchema.safeParse({
+      pipelineType: 'notes', book: 'ZEC', startChapter: 7,
+      username: 'u', sessionKey: 'k',
+      options: { hints: [{ ...VALID_HINT, rowId: bad }] },
+    });
+    assert.equal(r.success, false, `rowId="${bad}" should fail`);
+  }
+});
+
+test('StartBodySchema — rejects duplicate rowIds within a single request', () => {
+  const r = StartBodySchema.safeParse({
+    pipelineType: 'notes', book: 'ZEC', startChapter: 7,
+    username: 'u', sessionKey: 'k',
+    options: { hints: [VALID_HINT, { ...VALID_HINT, verse: 9 }] },
+  });
+  assert.equal(r.success, false);
+});
+
+test('StartBodySchema — rejects hints on multi-chapter scope', () => {
+  const r = StartBodySchema.safeParse({
+    pipelineType: 'notes', book: 'ZEC', startChapter: 7, endChapter: 9,
+    username: 'u', sessionKey: 'k',
+    options: { hints: [VALID_HINT] },
+  });
+  assert.equal(r.success, false);
+});
+
+test('StartBodySchema — accepts hints when endChapter omitted (defaults to startChapter)', () => {
+  const r = StartBodySchema.safeParse({
+    pipelineType: 'notes', book: 'ZEC', startChapter: 7,
+    username: 'u', sessionKey: 'k',
+    options: { hints: [VALID_HINT] },
+  });
+  assert.equal(r.success, true);
+});
+
+test('StartBodySchema — rejects more than 50 hints', () => {
+  const many = Array.from({ length: 51 }, (_, i) => ({
+    ...VALID_HINT,
+    rowId: 'a' + String(i).padStart(3, '0'),
+  }));
+  const r = StartBodySchema.safeParse({
+    pipelineType: 'notes', book: 'ZEC', startChapter: 7,
+    username: 'u', sessionKey: 'k',
+    options: { hints: many },
+  });
+  assert.equal(r.success, false);
+});
+
+test('StartBodySchema — rejects unknown keys on hint object (strict)', () => {
+  const r = StartBodySchema.safeParse({
+    pipelineType: 'notes', book: 'ZEC', startChapter: 7,
+    username: 'u', sessionKey: 'k',
+    options: { hints: [{ ...VALID_HINT, mysteryField: 'oops' }] },
+  });
+  assert.equal(r.success, false);
+});

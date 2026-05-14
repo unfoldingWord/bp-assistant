@@ -1337,7 +1337,7 @@ function getApiStream() {
   return process.env.BT_API_ZULIP_STREAM || 'bp-api';
 }
 
-function buildApiSyntheticRoute(pipelineType, scope) {
+function buildApiSyntheticRoute(pipelineType, scope, options) {
   const routeName = API_PIPELINE_ROUTE_NAMES[pipelineType];
   if (!routeName) return null;
   const baseRoute = config.routes.find((r) => r.name === routeName);
@@ -1350,6 +1350,14 @@ function buildApiSyntheticRoute(pipelineType, scope) {
       ? `${book} ${startChapter}`
       : `${book} ${startChapter}-${endChapter}`;
 
+  // hints can't ride the message.content flag string (it's a stringly-typed
+  // CLI grammar; an array of objects doesn't fit). Attach them structurally
+  // to the route — buildParsedNotesRequest will pick them up for synthetic
+  // (API-origin) routes. Zulip-triggered runs never go through here.
+  const hints = options && Array.isArray(options.hints) && options.hints.length > 0
+    ? options.hints
+    : null;
+
   return {
     ...baseRoute,
     _synthetic: true,
@@ -1358,6 +1366,7 @@ function buildApiSyntheticRoute(pipelineType, scope) {
     _endChapter: endChapter,
     _verseStart: verseStart ?? null,
     _verseEnd: verseEnd ?? null,
+    _hints: hints,
     _scopeText: rangeLabel.replace(/^\S+\s+/, ''),
     _apiOrigin: true,
     confirmMessage: null,
@@ -1438,7 +1447,7 @@ function triggerPipelineFromApi(input) {
   } = input;
 
   const scope = { book, startChapter, endChapter, verseStart, verseEnd };
-  const route = buildApiSyntheticRoute(pipelineType, scope);
+  const route = buildApiSyntheticRoute(pipelineType, scope, options);
   if (!route) {
     return { status: 'invalid', message: `Unknown pipelineType: ${pipelineType}` };
   }
