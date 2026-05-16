@@ -2049,65 +2049,6 @@ function verifyBoldMatches({ tsvFile, ultUsfm, preparedJson, output }) {
   return result.join('\n');
 }
 
-
-/**
- * Save original GLquotes for the checking against later ATs
- * Writes a file to data/workspace/output/notes
- * File includes ID and original GL quote (before any normalization or scope extraction)
- */
-function writeGlquoteFiles({ items, bookCode }) {
-  const fs = require('fs');
-  const path = require('path');
-
-  const book3 = bookCode.toLowerCase();
-
-  const baseOut = path.resolve(
-    CSKILLBP_DIR,
-    'data/workspace/output/notes',
-    book3
-  );
-
-  fs.mkdirSync(baseOut, { recursive: true });
-
-  const chapterBuckets = {};
-
-  for (const item of items || []) {
-    const ref = item.reference || '';
-    const chapterMatch = ref.match(/:(\d+)/);
-    const chapter = chapterMatch ? chapterMatch[1] : 'unknown';
-
-    const quote = item.orig_quote || item.gl_quote || item.issue_span_gl_quote || '';
-
-    if (!chapterBuckets[chapter]) {
-      chapterBuckets[chapter] = [];
-    }
-
-    chapterBuckets[chapter].push({
-      id: item.id,
-      quote
-    });
-  }
-
-  for (const [chapter, rows] of Object.entries(chapterBuckets)) {
-    const filePath = path.join(
-      baseOut,
-      `glquote_${book3}-${chapter}.tsv`
-    );
-
-    const tsv = rows
-      .map(r => `${r.id}\t${r.quote}`)
-      .join('\n');
-
-    fs.writeFileSync(filePath, tsv, 'utf8');
-  }
-
-  return {
-    chaptersWritten: Object.keys(chapterBuckets).length,
-    totalRows: items.length
-  };
-}
-
-
 /**
  * Fill empty orig_quote fields in prepared_notes.json using alignment data.
  * Deterministically matches English gl_quote words to Hebrew via alignment,
@@ -2632,10 +2573,6 @@ function fillOrigQuotes({ preparedJson, alignmentJson, hebrewUsfm, masterUltUsfm
   }
 
   fs.writeFileSync(prepPath, JSON.stringify(data, null, 2));
-  writeGlquoteFiles({
-    items: data.items,
-    bookCode
-  });
 
   const hintNote = resolvedViaHint ? `, ${resolvedViaHint} via Hebrew hint` : '';
   const masterNote = resolvedViaMaster ? `, ${resolvedViaMaster} via master ULT` : '';
