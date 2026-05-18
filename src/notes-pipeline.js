@@ -587,6 +587,9 @@ async function runATGeneration({ notesPath, pipeDir, status }) {
   function normalizeATCapitalization(atText, exactUltSpan) {
     if (!atText || !exactUltSpan) return atText;
 
+    const trimmed = atText.trim();
+    if (!trimmed) return atText;
+
     const spanFirst = exactUltSpan.trim()[0];
     const atFirst = atText.trim()[0];
 
@@ -699,6 +702,12 @@ async function runATGeneration({ notesPath, pipeDir, status }) {
       });
       let retryAt = extractResultText(retryResult);
       retryAt = retryAt.replace(/^\[|\]$/g, '').replace(/^Alternate translation:\s*/i, '').trim();
+      
+      // Normalize capitalization to ULT span
+      retryAt = normalizeATCapitalization(
+        retryAt,
+        packet.exact_ult_span
+      );
 
       if (!retryAt) {
         // First attempt's AT survives; tag for human review. Log retry failure reason
