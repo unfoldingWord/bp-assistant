@@ -940,6 +940,70 @@ async function generateIds({ book, count }) {
   return ids.join('\n');
 }
 
+function expandAlignedQuoteEdges(entries, quote, normalizeHeb) {
+  if (!quote || !entries?.length) return quote;
+
+  const quoteWords = quote.trim().split(/\s+/);
+  const normalizedQuote = quoteWords.map((word) =>
+    normalizeComparableQuoteText(word)
+  );
+
+  // Find the quote sequence inside the alignment stream
+  for (let start = 0; start < entries.length; start++) {
+    let matched = true;
+
+    for (let offset = 0; offset < normalizedQuote.length; offset++) {
+      const entry = entries[start + offset];
+
+      if (!entry) {
+        matched = false;
+        break;
+      }
+
+      const normalizedEntry = normalizeComparableQuoteText(entry.eng);
+
+      if (normalizedEntry !== normalizedQuote[offset]) {
+        matched = false;
+        break;
+      }
+    }
+
+    if (!matched) continue;
+
+    let end = start + normalizedQuote.length - 1;
+
+    // Get the boundary Hebrew words
+    const firstHeb = normalizeHeb(entries[start].heb);
+    const lastHeb = normalizeHeb(entries[end].heb);
+
+    // Expand backward to include ALL immediately preceding
+    // English words aligned to the first Hebrew word
+    while (
+      start > 0 &&
+      normalizeHeb(entries[start - 1].heb) === firstHeb
+    ) {
+      start--;
+    }
+
+    // Expand forward to include ALL immediately following
+    // English words aligned to the last Hebrew word
+    while (
+      end < entries.length - 1 &&
+      normalizeHeb(entries[end + 1].heb) === lastHeb
+    ) {
+      end++;
+    }
+
+    return entries
+      .slice(start, end + 1)
+      .map((entry) => entry.eng)
+      .join(' ')
+      .replace(/\s+([.,;:!?])/g, '$1');
+  }
+
+  return quote;
+}
+
 function resolveGlQuotes({ preparedJson, alignmentJson, dryRun }) {
   const data = JSON.parse(fs.readFileSync(path.resolve(CSKILLBP_DIR, preparedJson), 'utf8'));
   const alignData = JSON.parse(fs.readFileSync(path.resolve(CSKILLBP_DIR, alignmentJson), 'utf8'));
@@ -965,19 +1029,25 @@ function resolveGlQuotes({ preparedJson, alignmentJson, dryRun }) {
     const exactSpan = chooseRefinedAlignedSpan(candidates, currentScoped);
     if (!exactSpan) continue;
 
+    const expandedSpan = expandAlignedQuoteEdges(
+      entries,
+      exactSpan,
+      normalizeHeb
+    );
+
     if (!dryRun) {
-      item.exact_ult_span = exactSpan;
-      if (item.writer_packet) item.writer_packet.exact_ult_span = exactSpan;
+      item.exact_ult_span = expandedSpan;
+      if (item.writer_packet) item.writer_packet.exact_ult_span = expandedSpan;
     }
 
-    if (exactSpan !== currentScoped) {
-      log.push(`${item.reference}: "${currentScoped}" -> "${exactSpan}"`);
+    if (expandedSpan !== currentScoped) {
+      log.push(`${item.reference}: "${currentScoped}" -> "${expandedSpan}"`);
       if (!dryRun) {
-        item.issue_span_gl_quote = exactSpan;
-        item.gl_quote = exactSpan;
+        item.issue_span_gl_quote = expandedSpan;
+        item.gl_quote = expandedSpan;
         if (item.writer_packet) {
-          item.writer_packet.issue_span_gl_quote = exactSpan;
-          item.writer_packet.gl_quote = exactSpan;
+          item.writer_packet.issue_span_gl_quote = expandedSpan;
+          item.writer_packet.gl_quote = expandedSpan;
         }
         item.prompt = buildWriterPrompt(item);
       }
