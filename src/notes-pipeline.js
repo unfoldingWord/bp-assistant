@@ -603,8 +603,6 @@ async function runATGeneration({ notesPath, pipeDir, status }) {
       return atText;
     }
 
-    const trimmed = atText.trim();
-
     return atFirst.toUpperCase() + trimmed.slice(1);
   }
 
