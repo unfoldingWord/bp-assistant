@@ -18,11 +18,54 @@ const {
   detectLandedOutputs,
 } = require('./pipeline-output');
 
-const MAX_BODY_BYTES = 4 * 1024;          // start payloads are tiny
+// Bumped from 4KB to fit up to 50 hints with full prose seeds. The
+// per-field caps on HintSchema below bound the worst case well under this.
+const MAX_BODY_BYTES = 32 * 1024;
 const RATE_LIMIT_RPM = 60;
 const RATE_LIMIT_WINDOW_MS = 60_000;
 
 const PIPELINE_TYPES = Object.keys(API_PIPELINE_ROUTE_NAMES);
+
+// Canonical TN row-id format: lowercase letter + 3 alphanumerics. Same shape
+// as INTRO_ID_RE in src/lib/insert-tn-rows.js — hint rowIds are preserved
+// verbatim as TSV column-1 IDs, so they must conform to the TSV ID grammar.
+const HINT_ROW_ID_RE = /^[a-z][a-z0-9]{3}$/;
+
+const HintSchema = z.object({
+  rowId: z.string().regex(HINT_ROW_ID_RE),
+  verse: z.number().int().min(1).max(200),
+  quote: z.string().max(500),                   // source-language; may be ''
+  supportReference: z.string().max(200).nullable(),
+  seed: z.string().max(4000).nullable(),
+}).strict();
+
+const OptionsSchema = z.object({
+  // Common — currently a no-op on the wire (model is fixed per pipeline today),
+  // but accepted for forward compatibility with the contract doc.
+  model: z.enum(['sonnet', 'opus']).optional(),
+  // Common — re-run after a previous failed/paused run, clears checkpoint & prior outputs.
+  fresh: z.boolean().optional(),
+  // generate-only:
+  // Restrict to a subset of content types. Default is both. Single-element array
+  // routes to a per-type skill (ULT-gen / UST-gen) inside the pipeline.
+  contentTypes: z.array(z.enum(['ult', 'ust'])).min(1).max(2).optional(),
+  // Skip alignment + repo-insert. Mutually exclusive with alignOnly and textOnly.
+  noAlign: z.boolean().optional(),
+  // Reuse existing generated files; only align + repo-insert. Mutually exclusive
+  // with noAlign and textOnly.
+  alignOnly: z.boolean().optional(),
+  // Push unaligned USFM files (no alignment). Mutually exclusive with noAlign and alignOnly.
+  textOnly: z.boolean().optional(),
+  // notes-only:
+  noIntro: z.boolean().optional(),
+  pauseBeforeATs: z.boolean().optional(),
+  // Editor-marked TN row "hints" — each entry seeds one specific note the
+  // pipeline must produce, and suppresses competing notes for the same
+  // (verse, supportReference, fuzzy-quote). hint.rowId is preserved as the
+  // TSV ID column for the expanded row, so bible-editor can UPDATE the
+  // existing stub row in place by ID.
+  hints: z.array(HintSchema).max(50).optional(),
+}).strict();
 
 const StartBodySchema = z.object({
   pipelineType: z.enum(PIPELINE_TYPES),
@@ -35,9 +78,73 @@ const StartBodySchema = z.object({
   sessionKey: z.string().min(1).max(120).regex(/^[A-Za-z0-9_\-./]+$/)
     .refine((v) => !/__/.test(v), { message: 'sessionKey must not contain "__"' })
     .refine((v) => !v.replace(/[^a-zA-Z0-9_]/g, '_').includes('__'), { message: 'sessionKey collapses to "__" after sanitization' }),
-  options: z.object({
-    model: z.enum(['sonnet', 'opus']).optional(),
-  }).optional(),
+  options: OptionsSchema.optional(),
+}).superRefine((body, ctx) => {
+  const o = body.options || {};
+  // Mutually-exclusive align mode flags.
+  const alignFlags = ['noAlign', 'alignOnly', 'textOnly'].filter((k) => o[k]);
+  if (alignFlags.length > 1) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['options'],
+      message: `options.${alignFlags.join(' / options.')} are mutually exclusive`,
+    });
+  }
+  // generate-only flags must not appear on notes/tqs.
+  if (body.pipelineType !== 'generate') {
+    for (const k of ['contentTypes', 'noAlign', 'alignOnly', 'textOnly']) {
+      if (o[k] !== undefined) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['options', k],
+          message: `options.${k} only valid for pipelineType "generate"`,
+        });
+      }
+    }
+  }
+  // notes-only flags must not appear on generate/tqs.
+  if (body.pipelineType !== 'notes') {
+    for (const k of ['noIntro', 'pauseBeforeATs', 'hints']) {
+      if (o[k] !== undefined) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['options', k],
+          message: `options.${k} only valid for pipelineType "notes"`,
+        });
+      }
+    }
+  }
+  // hints — reject duplicate rowIds within a single request. The rowId is
+  // the stable TN row identifier and gets preserved as the TSV ID column;
+  // duplicates would produce ambiguous matches on bible-editor's apply side.
+  if (Array.isArray(o.hints) && o.hints.length > 1) {
+    const seen = new Set();
+    for (let i = 0; i < o.hints.length; i++) {
+      const id = o.hints[i] && o.hints[i].rowId;
+      if (id && seen.has(id)) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['options', 'hints', i, 'rowId'],
+          message: `duplicate hint rowId "${id}"`,
+        });
+      }
+      if (id) seen.add(id);
+    }
+  }
+  // hints carry verse but not chapter, so multi-chapter scopes would
+  // produce ambiguous routing (verse 7 could mean ch.7v7 or ch.8v7 …).
+  // Until bible-editor's wire-shape includes chapter-per-hint, require a
+  // single-chapter scope when hints are present.
+  if (Array.isArray(o.hints) && o.hints.length > 0) {
+    const endCh = body.endChapter ?? body.startChapter;
+    if (endCh !== body.startChapter) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['options', 'hints'],
+        message: 'options.hints requires a single-chapter scope (startChapter must equal endChapter)',
+      });
+    }
+  }
 });
 
 const rateLimits = new Map();
@@ -226,6 +333,7 @@ async function handleStartRequest(req, res) {
       verseEnd: body.verseEnd ?? null,
       username: body.username,
       apiSessionKey: body.sessionKey,
+      options: body.options || {},
     });
 
     const lat = Date.now() - startedAt;
@@ -326,5 +434,7 @@ module.exports = {
   // exposed for testing
   parseJobId,
   StartBodySchema,
+  HintSchema,
+  HINT_ROW_ID_RE,
   buildApiJobId,
 };

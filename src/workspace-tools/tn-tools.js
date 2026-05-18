@@ -1324,6 +1324,239 @@ function stripHebrewQuoteMarks(value) {
   return String(value || '').replace(HEBREW_QUOTE_STRIP_RE, '');
 }
 
+// -- Hint helpers --------------------------------------------------------
+//
+// Used by applyHintsToPreparedNotes (and exposed for tests) to compare
+// human-supplied hint metadata against AI-prepared note items so we can
+// suppress duplicate notes and inject the hint as a synthetic prepared item.
+
+const SUPPORT_REF_RC_PREFIX_RE = /^rc:\/\/[^/]+\/ta\/man\/translate\//;
+// Word-joiner (U+2060), soft hyphen (U+00AD), Hebrew maqaf-like word
+// dividers (U+05BE) and the existing cantillation set above are stripped
+// from quotes so fuzzy match isn't confused by invisible joiners that the
+// human and AI tooling handle differently.
+const QUOTE_INVISIBLE_RE = /[\u2060\u00AD]/g;
+
+function normalizeSupportReference(s) {
+  return String(s || '').trim().replace(SUPPORT_REF_RC_PREFIX_RE, '');
+}
+
+function normalizeQuote(s) {
+  return stripHebrewQuoteMarks(String(s || ''))
+    .normalize('NFC')
+    .replace(QUOTE_INVISIBLE_RE, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .toLowerCase();
+}
+
+function quoteFuzzyMatch(a, b) {
+  const na = normalizeQuote(a);
+  const nb = normalizeQuote(b);
+  if (!na && !nb) return true;
+  if (!na || !nb) return false;
+  if (na === nb) return true;
+  if (na.includes(nb) || nb.includes(na)) return true;
+  const ta = new Set(na.split(' ').filter(Boolean));
+  const tb = new Set(nb.split(' ').filter(Boolean));
+  if (!ta.size || !tb.size) return false;
+  let inter = 0;
+  for (const t of ta) if (tb.has(t)) inter++;
+  const union = ta.size + tb.size - inter;
+  return union > 0 && (inter / union) >= 0.6;
+}
+
+function verseFromReference(ref) {
+  if (!ref) return null;
+  const m = String(ref).match(/^(\d+):(\d+)/);
+  return m ? parseInt(m[2], 10) : null;
+}
+
+function rerollId(takenIds) {
+  const letters = 'abcdefghijklmnopqrstuvwxyz';
+  const chars = 'abcdefghijklmnopqrstuvwxyz0123456789';
+  for (let attempt = 0; attempt < 100; attempt++) {
+    let id = letters[Math.floor(Math.random() * 26)];
+    for (let j = 0; j < 3; j++) id += chars[Math.floor(Math.random() * 36)];
+    if (!takenIds.has(id)) return id;
+  }
+  // Deterministic fallback; extremely unlikely to be reached.
+  return 'x' + crypto.createHash('md5').update(`${Date.now()}-${takenIds.size}`).digest('hex').slice(0, 3);
+}
+
+/**
+ * Apply editor-marked TN row hints to a prepared-notes JSON file.
+ *
+ * For each hint:
+ *   1. Suppress prepared items that target the same (verse, supportReference,
+ *      fuzzy-quote) \u2014 the translator has already chosen the issue framing,
+ *      so a competing AI note would conflict.
+ *   2. Inject the hint as a new prepared item carrying:
+ *        - id = hint.rowId (preserved across the pipeline \u2192 TSV ID column,
+ *          so bible-editor can UPDATE its stub row by ID match).
+ *        - seed = hint.seed (skill expands into a complete note when present).
+ *        - fromHint = true (marker so see-how detection and other passes
+ *          can opt out of mutating hint-driven items).
+ *
+ * Re-rolls IDs on any non-suppressed prepared item that happens to share an
+ * id with a hint's rowId \u2014 the hint id is authoritative.
+ *
+ * Skips hints whose verse is outside the chapter's existing item range and
+ * doesn't appear in the chapter's ult verses (defensive: a stray verse
+ * number shouldn't produce an orphan row).
+ *
+ * @param {object} args
+ * @param {string} args.preparedJson - workspace-relative path to prepared_notes.json
+ * @param {Array}  args.hints        - validated hint objects from options.hints
+ * @param {number} args.chapter      - chapter number (used to build references)
+ * @returns {{ hintsApplied: number, itemsSuppressed: number, hintsDropped: number,
+ *             droppedReasons: string[] }}
+ */
+function applyHintsToPreparedNotes({ preparedJson, hints, chapter }) {
+  if (!Array.isArray(hints) || hints.length === 0) {
+    return { hintsApplied: 0, itemsSuppressed: 0, hintsDropped: 0, droppedReasons: [] };
+  }
+  const absPath = path.resolve(CSKILLBP_DIR, preparedJson);
+  const data = JSON.parse(fs.readFileSync(absPath, 'utf8'));
+  const items = Array.isArray(data.items) ? data.items : [];
+  const ch = Number(chapter);
+
+  // Collect existing verses with prepared items \u2014 used to drop hints
+  // pointing at verses that aren't part of this chapter's scope.
+  const versesInChapter = new Set();
+  for (const item of items) {
+    const v = verseFromReference(item.reference);
+    if (v != null) versesInChapter.add(v);
+  }
+
+  let suppressed = 0;
+  let applied = 0;
+  let dropped = 0;
+  const droppedReasons = [];
+
+  // Process hints in input order so a deterministic suppression log results.
+  for (const hint of hints) {
+    const verse = Number(hint.verse);
+    if (!Number.isFinite(verse)) {
+      dropped++;
+      droppedReasons.push(`${hint.rowId}: non-numeric verse`);
+      continue;
+    }
+    // Drop hints outside the chapter unless the verse is plausibly inside
+    // (i.e., another item already targets the same verse). The chapter
+    // scope isn't fully known here \u2014 versesInChapter is the best proxy.
+    // Tolerate verses with no existing items only if there are NO items
+    // (empty issues TSV \u2014 the hint becomes the sole note).
+    if (versesInChapter.size > 0 && !versesInChapter.has(verse)) {
+      dropped++;
+      droppedReasons.push(`${hint.rowId}: verse ${verse} outside chapter scope`);
+      continue;
+    }
+
+    const hintSref = normalizeSupportReference(hint.supportReference);
+
+    // Suppression pass: drop any prepared item whose (verse, supportRef,
+    // fuzzy-quote) matches the hint. Skip items already marked fromHint
+    // (defensive: shouldn't happen on a single applyHints call, but a
+    // future re-entrancy bug shouldn't silently delete hint rows).
+    for (let i = items.length - 1; i >= 0; i--) {
+      const item = items[i];
+      if (item && item.fromHint) continue;
+      if (verseFromReference(item.reference) !== verse) continue;
+      if (normalizeSupportReference(item.sref) !== hintSref) continue;
+      const hintQuote = String(hint.quote || '');
+      const itemQuote = String(item.orig_quote || '');
+      // Empty hint quote \u2192 match on (verse, sref) only.
+      const quoteMatches = hintQuote ? quoteFuzzyMatch(itemQuote, hintQuote) : true;
+      if (!quoteMatches) continue;
+      items.splice(i, 1);
+      suppressed++;
+    }
+
+    // ID-collision check: a non-suppressed item happens to share the
+    // hint's rowId. The hint is authoritative \u2014 re-roll the other item's id.
+    const takenIds = new Set(items.map((it) => it.id).filter(Boolean));
+    if (takenIds.has(hint.rowId)) {
+      // Pretend this id is already taken when re-rolling, plus reserve all
+      // remaining hint rowIds so we don't burn one of those on a re-roll.
+      const reservedForLaterHints = new Set(
+        hints.slice(hints.indexOf(hint) + 1).map((h) => h.rowId),
+      );
+      const reroll = new Set([...takenIds, ...reservedForLaterHints, hint.rowId]);
+      const conflictIdx = items.findIndex((it) => it.id === hint.rowId);
+      if (conflictIdx >= 0) {
+        items[conflictIdx].id = rerollId(reroll);
+      }
+    }
+
+    // Inject a synthetic prepared item carrying the hint. It's intentionally
+    // sparse: tn-writer reads `seed` (added below) and uses the hint's
+    // orig_quote / sref directly; the heavyweight selector/template fields
+    // that prepareNotes computes for issue-driven items aren't applicable
+    // here because the human has already chosen the framing.
+    const refStr = `${ch}:${verse}`;
+    const ultVerseText = (() => {
+      const sib = items.find((it) => verseFromReference(it.reference) === verse && it.ult_verse);
+      return sib ? sib.ult_verse : '';
+    })();
+    const ustVerseText = (() => {
+      const sib = items.find((it) => verseFromReference(it.reference) === verse && it.ust_verse);
+      return sib ? sib.ust_verse : '';
+    })();
+    items.push({
+      index: items.length,
+      reference: refStr,
+      sref: hintSref,
+      gl_quote: '',
+      issue_span_gl_quote: '',
+      scope_mode: 'focused_span',
+      needs_at: false,
+      at_provided: '',
+      explanation: hint.seed || '',
+      id: hint.rowId,
+      orig_quote: String(hint.quote || ''),
+      ult_verse: ultVerseText,
+      ust_verse: ustVerseText,
+      book: data.book || '',
+      note_type: 'hint',
+      hebrew_front_words: [],
+      tcm_mode: false,
+      chosen_template_id: '',
+      chosen_template_has_at_slot: false,
+      template_text: '',
+      template_type: 'generic',
+      template_locked: false,
+      must_include: [],
+      clean_explanation: hint.seed || '',
+      at_policy: 'not_needed',
+      at_required: false,
+      at_decision_reason: 'hint',
+      template_selector_status: 'fallback_deterministic',
+      template_selector_fallback_reason: 'hint',
+      quote_scope_selector_status: 'fallback_deterministic',
+      quote_scope_selector_fallback_reason: 'hint',
+      selector_status: 'fallback_deterministic',
+      selector_fallback_reason: 'hint',
+      style_rules: [],
+      rule_overrides: [],
+      writer_packet: null,
+      prompt: '',
+      system_prompt_key: 'given_at_agent',
+      programmatic_note: '',
+      candidate_templates: [],
+      // Hint-specific fields:
+      seed: hint.seed || null,
+      hintRowId: hint.rowId,
+      fromHint: true,
+    });
+    applied++;
+  }
+
+  data.items = items;
+  fs.writeFileSync(absPath, JSON.stringify(data, null, 2));
+  return { hintsApplied: applied, itemsSuppressed: suppressed, hintsDropped: dropped, droppedReasons };
+}
+
 function buildStrippedHebrewText(raw) {
   const stripped = [];
   const offsetMap = [];
@@ -1886,65 +2119,6 @@ function verifyBoldMatches({ tsvFile, ultUsfm, preparedJson, output }) {
   return result.join('\n');
 }
 
-
-/**
- * Save original GLquotes for the checking against later ATs
- * Writes a file to data/workspace/output/notes
- * File includes ID and original GL quote (before any normalization or scope extraction)
- */
-function writeGlquoteFiles({ items, bookCode }) {
-  const fs = require('fs');
-  const path = require('path');
-
-  const book3 = bookCode.toLowerCase();
-
-  const baseOut = path.resolve(
-    CSKILLBP_DIR,
-    'data/workspace/output/notes',
-    book3
-  );
-
-  fs.mkdirSync(baseOut, { recursive: true });
-
-  const chapterBuckets = {};
-
-  for (const item of items || []) {
-    const ref = item.reference || '';
-    const chapterMatch = ref.match(/:(\d+)/);
-    const chapter = chapterMatch ? chapterMatch[1] : 'unknown';
-
-    const quote = item.orig_quote || item.gl_quote || item.issue_span_gl_quote || '';
-
-    if (!chapterBuckets[chapter]) {
-      chapterBuckets[chapter] = [];
-    }
-
-    chapterBuckets[chapter].push({
-      id: item.id,
-      quote
-    });
-  }
-
-  for (const [chapter, rows] of Object.entries(chapterBuckets)) {
-    const filePath = path.join(
-      baseOut,
-      `glquote_${book3}-${chapter}.tsv`
-    );
-
-    const tsv = rows
-      .map(r => `${r.id}\t${r.quote}`)
-      .join('\n');
-
-    fs.writeFileSync(filePath, tsv, 'utf8');
-  }
-
-  return {
-    chaptersWritten: Object.keys(chapterBuckets).length,
-    totalRows: items.length
-  };
-}
-
-
 /**
  * Fill empty orig_quote fields in prepared_notes.json using alignment data.
  * Deterministically matches English gl_quote words to Hebrew via alignment,
@@ -2469,10 +2643,6 @@ function fillOrigQuotes({ preparedJson, alignmentJson, hebrewUsfm, masterUltUsfm
   }
 
   fs.writeFileSync(prepPath, JSON.stringify(data, null, 2));
-  writeGlquoteFiles({
-    items: data.items,
-    bookCode
-  });
 
   const hintNote = resolvedViaHint ? `, ${resolvedViaHint} via Hebrew hint` : '';
   const masterNote = resolvedViaMaster ? `, ${resolvedViaMaster} via master ULT` : '';
@@ -2821,6 +2991,11 @@ module.exports = {
   readPreparedNotes,
   substituteAT,
   resolveAtRequirement,
+  // Hint expansion (used by notes-pipeline mechanical prep + tests):
+  applyHintsToPreparedNotes,
+  normalizeQuote,
+  normalizeSupportReference,
+  quoteFuzzyMatch,
   _parseExplanationDirectives: parseExplanationDirectives,
   _resolveTemplateSelection: resolveTemplateSelection,
   _deriveStyleProfile: deriveStyleProfile,

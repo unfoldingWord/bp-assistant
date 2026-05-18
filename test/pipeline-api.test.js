@@ -188,3 +188,227 @@ test('PIPELINE_OUTPUT_TYPES — all referenced types exist in REPO_MAP', () => {
     }
   }
 });
+
+// ---------------------------------------------------------------------------
+// Options → synthetic content flags
+// ---------------------------------------------------------------------------
+
+const { buildApiContentFlags } = require('../src/router');
+
+test('buildApiContentFlags — generate, no options → no flags', () => {
+  assert.deepEqual(buildApiContentFlags('generate', {}), []);
+  assert.deepEqual(buildApiContentFlags('generate', undefined), []);
+});
+
+test('buildApiContentFlags — generate, ULT-only contentTypes → "ULT" flag', () => {
+  assert.deepEqual(buildApiContentFlags('generate', { contentTypes: ['ult'] }), ['ULT']);
+  assert.deepEqual(buildApiContentFlags('generate', { contentTypes: ['ust'] }), ['UST']);
+});
+
+test('buildApiContentFlags — generate, both contentTypes → no restriction flag', () => {
+  assert.deepEqual(buildApiContentFlags('generate', { contentTypes: ['ult', 'ust'] }), []);
+});
+
+test('buildApiContentFlags — generate, noAlign → --no-align', () => {
+  assert.deepEqual(buildApiContentFlags('generate', { noAlign: true }), ['--no-align']);
+});
+
+test('buildApiContentFlags — generate, alignOnly → --align-only', () => {
+  assert.deepEqual(buildApiContentFlags('generate', { alignOnly: true }), ['--align-only']);
+});
+
+test('buildApiContentFlags — generate, textOnly → --text-only', () => {
+  assert.deepEqual(buildApiContentFlags('generate', { textOnly: true }), ['--text-only']);
+});
+
+test('buildApiContentFlags — generate, combined ULT + no-align + fresh', () => {
+  const f = buildApiContentFlags('generate', { contentTypes: ['ult'], noAlign: true, fresh: true });
+  assert.deepEqual(f, ['ULT', '--no-align', '--fresh']);
+});
+
+test('buildApiContentFlags — notes, noIntro + pauseBeforeATs', () => {
+  assert.deepEqual(
+    buildApiContentFlags('notes', { noIntro: true, pauseBeforeATs: true }),
+    ['--no-intro', '--pause-before-ats'],
+  );
+});
+
+test('buildApiContentFlags — notes ignores generate-only flags', () => {
+  // Schema-level validation rejects these for notes, but the builder must also
+  // be tolerant: silently drop generate-only flags rather than emit them.
+  assert.deepEqual(buildApiContentFlags('notes', { contentTypes: ['ult'], noAlign: true }), []);
+});
+
+test('buildApiContentFlags — tqs, fresh', () => {
+  assert.deepEqual(buildApiContentFlags('tqs', { fresh: true }), ['--fresh']);
+});
+
+// ---------------------------------------------------------------------------
+// StartBodySchema — option validation
+// ---------------------------------------------------------------------------
+
+test('StartBodySchema — accepts options.contentTypes for generate', () => {
+  const r = StartBodySchema.safeParse({
+    pipelineType: 'generate', book: 'PSA', startChapter: 1,
+    username: 'u', sessionKey: 'k',
+    options: { contentTypes: ['ult'] },
+  });
+  assert.equal(r.success, true);
+});
+
+test('StartBodySchema — rejects generate-only options on notes', () => {
+  const r = StartBodySchema.safeParse({
+    pipelineType: 'notes', book: 'PSA', startChapter: 1,
+    username: 'u', sessionKey: 'k',
+    options: { contentTypes: ['ult'] },
+  });
+  assert.equal(r.success, false);
+});
+
+test('StartBodySchema — rejects notes-only options on generate', () => {
+  const r = StartBodySchema.safeParse({
+    pipelineType: 'generate', book: 'PSA', startChapter: 1,
+    username: 'u', sessionKey: 'k',
+    options: { noIntro: true },
+  });
+  assert.equal(r.success, false);
+});
+
+test('StartBodySchema — rejects mutually-exclusive align flags', () => {
+  const r = StartBodySchema.safeParse({
+    pipelineType: 'generate', book: 'PSA', startChapter: 1,
+    username: 'u', sessionKey: 'k',
+    options: { noAlign: true, alignOnly: true },
+  });
+  assert.equal(r.success, false);
+});
+
+test('StartBodySchema — rejects unknown options keys (strict)', () => {
+  const r = StartBodySchema.safeParse({
+    pipelineType: 'generate', book: 'PSA', startChapter: 1,
+    username: 'u', sessionKey: 'k',
+    options: { mysteryFlag: true },
+  });
+  assert.equal(r.success, false);
+});
+
+test('StartBodySchema — accepts fresh on any pipeline type', () => {
+  for (const pt of ['generate', 'notes', 'tqs']) {
+    const r = StartBodySchema.safeParse({
+      pipelineType: pt, book: 'PSA', startChapter: 1,
+      username: 'u', sessionKey: 'k',
+      options: { fresh: true },
+    });
+    assert.equal(r.success, true, `${pt} should accept fresh`);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// StartBodySchema — hints
+// ---------------------------------------------------------------------------
+
+const VALID_HINT = {
+  rowId: 'ab12',
+  verse: 7,
+  quote: 'מֵרֵעֵהוּ',
+  supportReference: 'rc://*/ta/man/translate/figs-metaphor',
+  seed: 'Could be either view.',
+};
+
+test('StartBodySchema — accepts options.hints on notes pipeline', () => {
+  const r = StartBodySchema.safeParse({
+    pipelineType: 'notes', book: 'ZEC', startChapter: 7,
+    username: 'u', sessionKey: 'k',
+    options: { hints: [VALID_HINT] },
+  });
+  assert.equal(r.success, true);
+});
+
+test('StartBodySchema — accepts hints with null seed and null supportReference', () => {
+  const r = StartBodySchema.safeParse({
+    pipelineType: 'notes', book: 'ZEC', startChapter: 7,
+    username: 'u', sessionKey: 'k',
+    options: { hints: [{ ...VALID_HINT, seed: null, supportReference: null }] },
+  });
+  assert.equal(r.success, true);
+});
+
+test('StartBodySchema — accepts empty hint.quote', () => {
+  const r = StartBodySchema.safeParse({
+    pipelineType: 'notes', book: 'ZEC', startChapter: 7,
+    username: 'u', sessionKey: 'k',
+    options: { hints: [{ ...VALID_HINT, quote: '' }] },
+  });
+  assert.equal(r.success, true);
+});
+
+test('StartBodySchema — rejects hints on generate and tqs pipelines', () => {
+  for (const pt of ['generate', 'tqs']) {
+    const r = StartBodySchema.safeParse({
+      pipelineType: pt, book: 'ZEC', startChapter: 7,
+      username: 'u', sessionKey: 'k',
+      options: { hints: [VALID_HINT] },
+    });
+    assert.equal(r.success, false, `${pt} should reject hints`);
+  }
+});
+
+test('StartBodySchema — rejects malformed rowId', () => {
+  for (const bad of ['AB12', '12ab', 'abcde', 'ab1', '', 'ab-1']) {
+    const r = StartBodySchema.safeParse({
+      pipelineType: 'notes', book: 'ZEC', startChapter: 7,
+      username: 'u', sessionKey: 'k',
+      options: { hints: [{ ...VALID_HINT, rowId: bad }] },
+    });
+    assert.equal(r.success, false, `rowId="${bad}" should fail`);
+  }
+});
+
+test('StartBodySchema — rejects duplicate rowIds within a single request', () => {
+  const r = StartBodySchema.safeParse({
+    pipelineType: 'notes', book: 'ZEC', startChapter: 7,
+    username: 'u', sessionKey: 'k',
+    options: { hints: [VALID_HINT, { ...VALID_HINT, verse: 9 }] },
+  });
+  assert.equal(r.success, false);
+});
+
+test('StartBodySchema — rejects hints on multi-chapter scope', () => {
+  const r = StartBodySchema.safeParse({
+    pipelineType: 'notes', book: 'ZEC', startChapter: 7, endChapter: 9,
+    username: 'u', sessionKey: 'k',
+    options: { hints: [VALID_HINT] },
+  });
+  assert.equal(r.success, false);
+});
+
+test('StartBodySchema — accepts hints when endChapter omitted (defaults to startChapter)', () => {
+  const r = StartBodySchema.safeParse({
+    pipelineType: 'notes', book: 'ZEC', startChapter: 7,
+    username: 'u', sessionKey: 'k',
+    options: { hints: [VALID_HINT] },
+  });
+  assert.equal(r.success, true);
+});
+
+test('StartBodySchema — rejects more than 50 hints', () => {
+  const many = Array.from({ length: 51 }, (_, i) => ({
+    ...VALID_HINT,
+    rowId: 'a' + String(i).padStart(3, '0'),
+  }));
+  const r = StartBodySchema.safeParse({
+    pipelineType: 'notes', book: 'ZEC', startChapter: 7,
+    username: 'u', sessionKey: 'k',
+    options: { hints: many },
+  });
+  assert.equal(r.success, false);
+});
+
+test('StartBodySchema — rejects unknown keys on hint object (strict)', () => {
+  const r = StartBodySchema.safeParse({
+    pipelineType: 'notes', book: 'ZEC', startChapter: 7,
+    username: 'u', sessionKey: 'k',
+    options: { hints: [{ ...VALID_HINT, mysteryField: 'oops' }] },
+  });
+  assert.equal(r.success, false);
+});

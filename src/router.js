@@ -1337,7 +1337,7 @@ function getApiStream() {
   return process.env.BT_API_ZULIP_STREAM || 'bp-api';
 }
 
-function buildApiSyntheticRoute(pipelineType, scope) {
+function buildApiSyntheticRoute(pipelineType, scope, options) {
   const routeName = API_PIPELINE_ROUTE_NAMES[pipelineType];
   if (!routeName) return null;
   const baseRoute = config.routes.find((r) => r.name === routeName);
@@ -1350,6 +1350,14 @@ function buildApiSyntheticRoute(pipelineType, scope) {
       ? `${book} ${startChapter}`
       : `${book} ${startChapter}-${endChapter}`;
 
+  // hints can't ride the message.content flag string (it's a stringly-typed
+  // CLI grammar; an array of objects doesn't fit). Attach them structurally
+  // to the route — buildParsedNotesRequest will pick them up for synthetic
+  // (API-origin) routes. Zulip-triggered runs never go through here.
+  const hints = options && Array.isArray(options.hints) && options.hints.length > 0
+    ? options.hints
+    : null;
+
   return {
     ...baseRoute,
     _synthetic: true,
@@ -1358,18 +1366,40 @@ function buildApiSyntheticRoute(pipelineType, scope) {
     _endChapter: endChapter,
     _verseStart: verseStart ?? null,
     _verseEnd: verseEnd ?? null,
+    _hints: hints,
     _scopeText: rangeLabel.replace(/^\S+\s+/, ''),
     _apiOrigin: true,
     confirmMessage: null,
   };
 }
 
-function buildApiSyntheticMessage({ pipelineType, scope, apiSessionKey, username }) {
+function buildApiContentFlags(pipelineType, options) {
+  const o = options || {};
+  const flags = [];
+  if (pipelineType === 'generate') {
+    if (Array.isArray(o.contentTypes) && o.contentTypes.length === 1) {
+      flags.push(o.contentTypes[0].toUpperCase()); // 'ULT' | 'UST' restricts to one
+    }
+    if (o.noAlign) flags.push('--no-align');
+    if (o.alignOnly) flags.push('--align-only');
+    if (o.textOnly) flags.push('--text-only');
+  }
+  if (pipelineType === 'notes') {
+    if (o.noIntro) flags.push('--no-intro');
+    if (o.pauseBeforeATs) flags.push('--pause-before-ats');
+  }
+  if (o.fresh) flags.push('--fresh');
+  return flags;
+}
+
+function buildApiSyntheticMessage({ pipelineType, scope, apiSessionKey, username, options }) {
   const { book, startChapter, endChapter } = scope;
   const chapterPart = startChapter === endChapter ? String(startChapter) : `${startChapter}-${endChapter}`;
   const commandWord = pipelineType === 'generate' ? 'generate'
     : pipelineType === 'notes' ? 'write notes'
     : 'write tqs';
+  const flags = buildApiContentFlags(pipelineType, options);
+  const content = [commandWord, book, chapterPart, ...flags].join(' ');
   return {
     id: -1,
     type: 'stream',
@@ -1378,7 +1408,7 @@ function buildApiSyntheticMessage({ pipelineType, scope, apiSessionKey, username
     sender_id: -1,
     sender_full_name: username,
     sender_email: `${username}@api.bp-assistant`,
-    content: `${commandWord} ${book} ${chapterPart}`,
+    content,
     _apiOrigin: true,
   };
 }
@@ -1400,6 +1430,7 @@ function buildApiJobId({ apiSessionKey, pipelineType, scope }) {
  * @param {number|null} [input.verseEnd]
  * @param {string} input.username - DCS handle for commit attribution
  * @param {string} input.apiSessionKey - caller-supplied; idempotency + scoping
+ * @param {object} [input.options] - per-pipeline flag toggles (contentTypes, noAlign, alignOnly, textOnly, fresh, noIntro, pauseBeforeATs)
  * @returns {{ status: 'running'|'already_running'|'conflict'|'invalid', jobId?, scope?, conflictingJobId?, message? }}
  */
 function triggerPipelineFromApi(input) {
@@ -1412,14 +1443,15 @@ function triggerPipelineFromApi(input) {
     verseEnd = null,
     username,
     apiSessionKey,
+    options = {},
   } = input;
 
   const scope = { book, startChapter, endChapter, verseStart, verseEnd };
-  const route = buildApiSyntheticRoute(pipelineType, scope);
+  const route = buildApiSyntheticRoute(pipelineType, scope, options);
   if (!route) {
     return { status: 'invalid', message: `Unknown pipelineType: ${pipelineType}` };
   }
-  const message = buildApiSyntheticMessage({ pipelineType, scope, apiSessionKey, username });
+  const message = buildApiSyntheticMessage({ pipelineType, scope, apiSessionKey, username, options });
   const derivedSessionKey = `stream-${getApiStream()}-${apiSessionKey}`;
   const jobId = buildCheckpointKey({ sessionKey: derivedSessionKey, pipelineType, scope });
 
@@ -1478,5 +1510,6 @@ module.exports = {
   parseIntentScope,
   triggerPipelineFromApi,
   buildApiJobId,
+  buildApiContentFlags,
   API_PIPELINE_ROUTE_NAMES,
 };
