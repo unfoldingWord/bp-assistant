@@ -583,6 +583,28 @@ async function runATGeneration({ notesPath, pipeDir, status }) {
     return '';
   }
 
+  // Cap AT if ULT span is capped
+  function normalizeATCapitalization(atText, exactUltSpan) {
+    if (!atText || !exactUltSpan) return atText;
+
+    const spanFirst = exactUltSpan.trim()[0];
+    const atFirst = atText.trim()[0];
+
+    // Only enforce capitalization if the span starts uppercase
+    if (!/[A-Z]/.test(spanFirst)) {
+      return atText;
+    }
+
+    // AT already starts uppercase
+    if (/[A-Z]/.test(atFirst)) {
+      return atText;
+    }
+
+    const trimmed = atText.trim();
+
+    return atFirst.toUpperCase() + trimmed.slice(1);
+  }
+
   // Process items with concurrency limiter
   async function generateOneAT(packet) {
     const userPrompt = [
@@ -614,6 +636,12 @@ async function runATGeneration({ notesPath, pipeDir, status }) {
       let atText = extractResultText(atResult);
       // Strip any accidental brackets or "Alternate translation:" prefix
       atText = atText.replace(/^\[|\]$/g, '').replace(/^Alternate translation:\s*/i, '').trim();
+
+      // Normalize capitalization to ULT span
+      atText = normalizeATCapitalization(
+        atText,
+        packet.exact_ult_span
+      );
 
       if (!atText) {
         return { id: packet.id, success: false, reason: classifyEmpty(atResult, 'generate') };
