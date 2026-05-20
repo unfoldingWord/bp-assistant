@@ -16,6 +16,7 @@ const WORKSPACE = process.env.CSKILLBP_DIR || path.resolve(__dirname, '..', '..'
 const DATA_DIR = path.join(WORKSPACE, 'data');
 const CACHE_DIR = path.join(DATA_DIR, 'cache');
 const MANIFEST_PATH = path.join(CACHE_DIR, 'published_manifest.json');
+const FETCH_STATUS_PATH = path.join(DATA_DIR, '.fetch-status.json');
 
 // usfm-js is an app dependency (installed via npm, baked into Docker image)
 let usfm;
@@ -42,7 +43,7 @@ const GOOGLE = {
       biblical_phrases: 1459152614,
     },
   },
-  templates: { sheetId: '1ot6A7RxcsxM_Wv94sauoTAaRPO5Q-gynFqMHeldnM64', gid: 0 },
+  templates: { sheetId: '1ot6A7RxcsxM_Wv94sauoTAaRPO5Q-gynFqMHeldnM64', gid: 1419396008 },
   issuesResolved: { docId: '1C0C7Qsm78fM0tuLyVZEAs-IWtClNo9nqbsAZkAFeFio' },
 };
 
@@ -204,10 +205,15 @@ async function fetchDoor43Data(books, force, manifest, log) {
 
 // ── Step 4: Fetch Google Sheets/Docs ───────────────────────────────────────
 
-async function fetchGoogleData(force, log) {
+async function fetchGoogleData(force, log, fetchErrors) {
   log('Fetching Google Sheets/Docs...');
   var glossaryDir = path.join(DATA_DIR, 'glossary');
   ensureDir(glossaryDir);
+
+  function recordFailure(file, err) {
+    fetchErrors.push({ file: file, message: err.message, attemptedAt: new Date().toISOString() });
+    log('Warning: ' + file + ': ' + err.message);
+  }
 
   var tabEntries = Object.entries(GOOGLE.glossary.tabs);
   for (var gi = 0; gi < tabEntries.length; gi++) {
@@ -218,7 +224,7 @@ async function fetchGoogleData(force, log) {
       var url = 'https://docs.google.com/spreadsheets/d/' + GOOGLE.glossary.sheetId + '/export?format=csv&gid=' + gid;
       fs.writeFileSync(dest, '# Fetched: ' + today() + '\n' + stripBom(await httpFetch(url)));
       log('  ' + name + '.csv');
-    } catch (err) { log('Warning: ' + name + '.csv: ' + err.message); }
+    } catch (err) { recordFailure(name + '.csv', err); }
   }
 
   var templatesDest = path.join(DATA_DIR, 'templates.csv');
@@ -227,7 +233,7 @@ async function fetchGoogleData(force, log) {
       var tUrl = 'https://docs.google.com/spreadsheets/d/' + GOOGLE.templates.sheetId + '/export?format=csv&gid=' + GOOGLE.templates.gid;
       fs.writeFileSync(templatesDest, '# Fetched: ' + today() + '\n' + stripBom(await httpFetch(tUrl)));
       log('  templates.csv');
-    } catch (err) { log('Warning: templates.csv: ' + err.message); }
+    } catch (err) { recordFailure('templates.csv', err); }
   }
 
   var issuesDest = path.join(DATA_DIR, 'issues_resolved.txt');
@@ -236,8 +242,26 @@ async function fetchGoogleData(force, log) {
       var iUrl = 'https://docs.google.com/document/d/' + GOOGLE.issuesResolved.docId + '/export?format=txt';
       fs.writeFileSync(issuesDest, '# Fetched: ' + today() + '\n' + stripBom(await httpFetch(iUrl)));
       log('  issues_resolved.txt');
-    } catch (err) { log('Warning: issues_resolved.txt: ' + err.message); }
+    } catch (err) { recordFailure('issues_resolved.txt', err); }
   }
+}
+
+function readFetchStatus() {
+  if (!fs.existsSync(FETCH_STATUS_PATH)) return { lastRun: null, lastSuccess: null, errors: [] };
+  try { return JSON.parse(fs.readFileSync(FETCH_STATUS_PATH, 'utf-8')); }
+  catch (e) { return { lastRun: null, lastSuccess: null, errors: [] }; }
+}
+
+function writeFetchStatus(fetchErrors) {
+  ensureDir(DATA_DIR);
+  var prev = readFetchStatus();
+  var now = new Date().toISOString();
+  var status = {
+    lastRun: now,
+    lastSuccess: fetchErrors.length === 0 ? now : (prev.lastSuccess || null),
+    errors: fetchErrors,
+  };
+  fs.writeFileSync(FETCH_STATUS_PATH, JSON.stringify(status, null, 2));
 }
 
 // ── Step 5: Extract unaligned English via usfm-js ──────────────────────────
@@ -671,8 +695,10 @@ async function curatePublishedData(opts) {
     newBooks = await fetchDoor43Data(releaseInfo.books, force, manifest, log);
   }
 
+  var fetchErrors = [];
   if (runStep('fetch-google')) {
-    await fetchGoogleData(force, log);
+    await fetchGoogleData(force, log, fetchErrors);
+    writeFetchStatus(fetchErrors);
   }
 
   var ultAlignments = new Map();
@@ -697,7 +723,7 @@ async function curatePublishedData(opts) {
   });
 
   log('Done.');
-  return { success: true, messages: messages, release: releaseInfo.tag, books: releaseInfo.books, newBooks: newBooks };
+  return { success: true, messages: messages, release: releaseInfo.tag, books: releaseInfo.books, newBooks: newBooks, fetchErrors: fetchErrors };
 }
 
-module.exports = { curatePublishedData };
+module.exports = { curatePublishedData, readFetchStatus, FETCH_STATUS_PATH };
