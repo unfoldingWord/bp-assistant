@@ -15,6 +15,7 @@ const { listCheckpoints } = require('./pipeline-checkpoints');
 const { handleTnQuickRequest } = require('./api/tn-quick');
 const { handleStartRequest, handleStatusRequest } = require('./api/pipeline');
 const { loadCache: loadVerseDataCache } = require('./api-runner/verse-data');
+const { readFetchStatus } = require('./curate-data');
 
 const ADMIN_PORT = Number(process.env.PORT || 8080);
 const MCP_PORT = Number(process.env.MCP_PORT || 3001);
@@ -28,6 +29,9 @@ const PROCESS_STARTED_AT_MS = Number(process.env.PROCESS_STARTED_AT_MS || Date.n
 // generation steps, which can spend more than an hour inside one model call.
 const CHECKPOINT_FRESHNESS_MINUTES = Number(process.env.PIPELINE_HEALTH_FRESHNESS_MINUTES || 12 * 60);
 const CHECKPOINT_FRESHNESS_MS = CHECKPOINT_FRESHNESS_MINUTES * 60 * 1000;
+
+// Weekly refresh runs Thursdays. 10-day staleness allows for one missed run.
+const FETCH_STALE_MS = 10 * 24 * 60 * 60 * 1000;
 
 function getActivePipelines() {
   const now = Date.now();
@@ -705,6 +709,21 @@ function createHttpServer() {
         active: pipelines.length,
         processStartedAt: new Date(PROCESS_STARTED_AT_MS).toISOString(),
         pipelines,
+      }));
+      return;
+    }
+
+    if (req.method === 'GET' && urlPath === '/health/data-freshness') {
+      const status = readFetchStatus();
+      const lastRunMs = status.lastRun ? Date.parse(status.lastRun) : NaN;
+      const stale = !Number.isFinite(lastRunMs) || (Date.now() - lastRunMs) > FETCH_STALE_MS;
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        lastRun: status.lastRun,
+        lastSuccess: status.lastSuccess,
+        stale,
+        errorCount: (status.errors || []).length,
+        errors: status.errors || [],
       }));
       return;
     }

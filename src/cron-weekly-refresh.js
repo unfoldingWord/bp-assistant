@@ -10,6 +10,13 @@ function startWeeklyRefresh() {
     try {
       const result = await curatePublishedData({ step: 'fetch-google', force: true });
       console.log('[weekly-refresh] Done:', result.messages.join(' | '));
+      const errors = result.fetchErrors || [];
+      if (errors.length) {
+        const summary = errors.map(e => `${e.file}: ${e.message}`).join('; ');
+        console.error(`[weekly-refresh] FAILED: ${errors.length} file(s) — ${summary}`);
+      } else {
+        console.log('[weekly-refresh] OK: all sources refreshed');
+      }
     } catch (err) {
       console.error('[weekly-refresh] Failed:', err.message);
     }
