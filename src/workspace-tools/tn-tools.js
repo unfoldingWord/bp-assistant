@@ -970,29 +970,32 @@ function expandAlignedQuoteEdges(entries, quote, normalizeHeb) {
 
     if (!matched) continue;
 
-    let end = start + normalizedQuote.length - 1;
+  let end = start + normalizedQuote.length - 1;
 
-    // Get the boundary Hebrew words
-    const firstHeb = normalizeHeb(entries[start].heb);
-    const lastHeb = normalizeHeb(entries[end].heb);
+  // Collect ALL Hebrew words represented in the matched span
+  const matchedHebs = new Set();
 
-    // Expand backward to include ALL immediately preceding
-    // English words aligned to the first Hebrew word
-    while (
-      start > 0 &&
-      normalizeHeb(entries[start - 1].heb) === firstHeb
-    ) {
-      start--;
-    }
+  for (let i = start; i <= end; i++) {
+    matchedHebs.add(normalizeHeb(entries[i].heb));
+  }
 
-    // Expand forward to include ALL immediately following
-    // English words aligned to the last Hebrew word
-    while (
-      end < entries.length - 1 &&
-      normalizeHeb(entries[end + 1].heb) === lastHeb
-    ) {
-      end++;
-    }
+  // Expand backward to include contiguous English words
+  // aligned to ANY Hebrew word in the matched span
+  while (
+    start > 0 &&
+    matchedHebs.has(normalizeHeb(entries[start - 1].heb))
+  ) {
+    start--;
+  }
+
+  // Expand forward to include contiguous English words
+  // aligned to ANY Hebrew word in the matched span
+  while (
+    end < entries.length - 1 &&
+    matchedHebs.has(normalizeHeb(entries[end + 1].heb))
+  ) {
+    end++;
+  }
 
     return entries
       .slice(start, end + 1)
