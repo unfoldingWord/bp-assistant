@@ -267,15 +267,52 @@ function buildAlignedSpan(entries, start, length, normalizeHeb = (value) => valu
   return normalizeWhitespace(words.join(' '));
 }
 
-function dedupeConsecutiveHebrewWords(hebWords, normalizeHeb = (value) => value) {
-  const deduped = [];
-  for (const heb of (hebWords || [])) {
-    if (!heb) continue;
-    if (!deduped.length || normalizeHeb(deduped[deduped.length - 1]) !== normalizeHeb(heb)) {
-      deduped.push(heb);
+function dedupeHebrewOccurrences(entries, normalizeHeb = (v) => v) {
+  const seen = new Set();
+  const out = [];
+
+  for (const entry of (entries || [])) {
+    if (!entry?.heb) continue;
+
+    // If occurrence is missing → only apply consecutive dedupe, not global dedupe
+    if (entry.occurrence == null) {
+      const last = out[out.length - 1];
+
+      // only skip if truly consecutive duplicate (same normalized heb)
+      if (
+        last &&
+        last.occurrence == null &&
+        normalizeHeb(last.heb) === normalizeHeb(entry.heb)
+      ) {
+        continue;
+      }
+
+      out.push(entry);
+      continue;
     }
+
+    const key = `${entry.heb}|${entry.occurrence}`;
+
+    if (seen.has(key)) continue;
+
+    seen.add(key);
+    out.push(entry);
   }
-  return deduped;
+
+  return out;
+}
+
+function dedupeConsecutiveHebrewWords(hebWords, normalizeHeb = (v) => v) {
+  const out = [];
+  for (const w of hebWords || []) {
+    if (!w) continue;
+
+    const n = normalizeHeb(w);
+    const last = out.length ? normalizeHeb(out[out.length - 1]) : null;
+
+    if (n !== last) out.push(w);
+  }
+  return out;
 }
 
 function normalizeHebrewGapForJoin(rawGap) {
@@ -800,6 +837,7 @@ function extractAlignmentData({ alignedUsfm, output }) {
   const result = {};
   let chapter = 0, verse = '0';
   const milestones = [];
+  let occurrenceMap = {};
 
   for (const line of content.split('\n')) {
     const trimmed = line.trim();
@@ -812,7 +850,7 @@ function extractAlignmentData({ alignedUsfm, output }) {
     // Verse marker can appear mid-line after a poetry marker (e.g. \q1 \v 1 \zaln-s...)
     // Update verse but do NOT continue — alignment data on the same line must still be processed
     const vm = trimmed.match(/\\v\s+(\d+[-\d]*|front)/);
-    if (vm) { verse = vm[1].split('-')[0]; milestones.length = 0; }
+    if (vm) { verse = vm[1].split('-')[0]; milestones.length = 0; occurrenceMap = {}; }
 
     const ZALN_S = /\\zaln-s\s+\|([^\\]*?)\\?\*/g;
     const ZALN_E = /\\zaln-e\\?\*/g;
@@ -834,11 +872,25 @@ function extractAlignmentData({ alignedUsfm, output }) {
       if (tok.type === 's') {
         const sM = tok.attrs.match(/x-strong="([^"]*)"/);
         const cM = tok.attrs.match(/x-content="([^"]*)"/);
-        milestones.push({ heb: cM ? cM[1] : '', strong: sM ? sM[1] : '', heb_pos: milestones.length });
+        const heb = cM ? cM[1] : '';
+        occurrenceMap[heb] = (occurrenceMap[heb] || 0) + 1;
+        milestones.push({
+          heb,
+          strong: sM ? sM[1] : '',
+          heb_pos: milestones.length,
+          occurrence: occurrenceMap[heb]
+        });
       } else if (tok.type === 'e') { milestones.pop(); }
       else if (tok.type === 'w' && milestones.length > 0) {
         const top = milestones[milestones.length - 1];
-        result[key].push({ eng: tok.word, heb: top.heb, heb_pos: top.heb_pos, strong: top.strong });
+      
+        result[key].push({
+          eng: tok.word,
+          heb: top.heb,
+          heb_pos: top.heb_pos,
+          strong: top.strong,
+          occurrence: top.occurrence
+        });
       }
     }
   }
@@ -2375,24 +2427,55 @@ function fillOrigQuotes({ preparedJson, alignmentJson, hebrewUsfm, masterUltUsfm
   function extractHebrewQuote(ref, hebWords) {
     const rawVerse = verseMap[ref];
     if (!rawVerse || !hebWords.length) return null;
+
     const { text: strippedVerse, offsetMap } = buildStripped(rawVerse);
-    const targetWords = dedupeConsecutiveHebrewWords(hebWords, normalizeHeb);
-    const selected = chooseClosestHebrewTokenLocations(rawVerse, strippedVerse, offsetMap, targetWords, true);
+
+    // Only remove consecutive duplicates (safe, local)
+    const targetWords = dedupeConsecutiveHebrewWords(
+      hebWords.map(h => normalizeHeb(h)),
+      normalizeHeb
+    );
+
+    const selected = chooseClosestHebrewTokenLocations(
+      rawVerse,
+      strippedVerse,
+      offsetMap,
+      targetWords,
+      true
+    );
+
     if (!selected || !selected.length) return null;
-    return assembleHebrewQuoteFromLocations(rawVerse, strippedVerse, offsetMap, selected);
+
+    return assembleHebrewQuoteFromLocations(
+      rawVerse,
+      strippedVerse,
+      offsetMap,
+      selected
+    );
   }
 
   function buildHebrewFallbackQuote(ref, hebWords) {
     const rawVerse = verseMap[ref];
+
     const targetWords = dedupeConsecutiveHebrewWords(hebWords, normalizeHeb);
+
     if (!targetWords.length) return '';
     if (!rawVerse) return targetWords.join(' ');
 
     const { text: strippedVerse, offsetMap } = buildStripped(rawVerse);
-    const selected = chooseClosestHebrewTokenLocations(rawVerse, strippedVerse, offsetMap, targetWords, false);
+
+    const selected = chooseClosestHebrewTokenLocations(
+      rawVerse,
+      strippedVerse,
+      offsetMap,
+      targetWords,
+      false
+    );
+
     if (!selected || !selected.length) return targetWords.join(' ');
 
-    return assembleHebrewQuoteFromLocations(rawVerse, strippedVerse, offsetMap, selected) || targetWords.join(' ');
+    return assembleHebrewQuoteFromLocations(rawVerse, strippedVerse, offsetMap, selected)
+      || targetWords.join(' ');
   }
 
   // Extract [heb:...] hint from explanation and try direct UHB match
@@ -2433,10 +2516,17 @@ function fillOrigQuotes({ preparedJson, alignmentJson, hebrewUsfm, masterUltUsfm
     const matches = [];
 
     function collectHebrew(indices) {
-      return dedupeConsecutiveHebrewWords(indices
-        .map((idx) => entries[idx]?.heb)
+      const entriesList = indices
+        .map(idx => entries[idx])
         .filter(Boolean)
-      , normalizeHeb);
+        .map(e => ({
+          heb: e.heb,
+          occurrence: e.occurrence ?? null
+        }));
+
+      const deduped = dedupeHebrewOccurrences(entriesList, normalizeHeb);
+
+      return deduped.map(e => e.heb);
     }
 
     for (const seg of segments) {
