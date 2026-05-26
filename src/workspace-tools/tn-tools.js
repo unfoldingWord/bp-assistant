@@ -274,13 +274,24 @@ function dedupeHebrewOccurrences(entries, normalizeHeb = (v) => v) {
   for (const entry of (entries || [])) {
     if (!entry?.heb) continue;
 
-    // If occurrence is missing → DO NOT dedupe globally
+    // If occurrence is missing → only apply consecutive dedupe, not global dedupe
     if (entry.occurrence == null) {
+      const last = out[out.length - 1];
+
+      // only skip if truly consecutive duplicate (same normalized heb)
+      if (
+        last &&
+        last.occurrence == null &&
+        normalizeHeb(last.heb) === normalizeHeb(entry.heb)
+      ) {
+        continue;
+      }
+
       out.push(entry);
       continue;
     }
 
-    const key = `${normalizeHeb(entry.heb)}|${entry.occurrence}`;
+    const key = `${entry.heb}|${entry.occurrence}`;
 
     if (seen.has(key)) continue;
 
