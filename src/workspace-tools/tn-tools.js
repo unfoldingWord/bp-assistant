@@ -267,30 +267,27 @@ function buildAlignedSpan(entries, start, length, normalizeHeb = (value) => valu
   return normalizeWhitespace(words.join(' '));
 }
 
-function dedupeConsecutiveHebrewWords(hebWords, normalizeHeb = (value) => value) {
-  const deduped = [];
-  for (const heb of (hebWords || [])) {
-    if (!heb) continue;
-    if (!deduped.length || normalizeHeb(deduped[deduped.length - 1]) !== normalizeHeb(heb)) {
-      deduped.push(heb);
-    }
-  }
-  return deduped;
-}
-
-function dedupeHebrewOccurrences(entries, normalizeHeb = (value) => value) {
+function dedupeHebrewEntries(entries, normalizeHeb = v => v) {
   const deduped = [];
   const seen = new Set();
+
+  let lastKey = null;
 
   for (const entry of (entries || [])) {
     if (!entry?.heb) continue;
 
-    const key = `${normalizeHeb(entry.heb)}|${entry.occurrence}`;
+    const normHeb = normalizeHeb(entry.heb);
+    const key = `${normHeb}|${entry.occurrence}`;
 
+    // 1. Hard dedupe: same heb + occurrence anywhere
     if (seen.has(key)) continue;
-
     seen.add(key);
-    deduped.push(entry);
+
+    // 2. Consecutive noise collapse (same heb repetition in a row)
+    if (lastKey === normHeb) continue;
+    lastKey = normHeb;
+
+    deduped.push(entry.heb);
   }
 
   return deduped;
@@ -2408,26 +2405,49 @@ function fillOrigQuotes({ preparedJson, alignmentJson, hebrewUsfm, masterUltUsfm
   function extractHebrewQuote(ref, hebWords) {
     const rawVerse = verseMap[ref];
     if (!rawVerse || !hebWords.length) return null;
+
     const { text: strippedVerse, offsetMap } = buildStripped(rawVerse);
-    const step1 = dedupeConsecutiveHebrewWords(hebWords, normalizeHeb);
-    const targetWords = dedupeHebrewOccurrences(step1, normalizeHeb);
-    const selected = chooseClosestHebrewTokenLocations(rawVerse, strippedVerse, offsetMap, targetWords, true);
+
+    const targetWords = dedupeHebrewEntries(
+      hebWords.map(h => ({ heb: h, occurrence: 0 })) // fallback-safe shim
+    );
+
+    const selected = chooseClosestHebrewTokenLocations(
+      rawVerse,
+      strippedVerse,
+      offsetMap,
+      targetWords,
+      true
+    );
+
     if (!selected || !selected.length) return null;
     return assembleHebrewQuoteFromLocations(rawVerse, strippedVerse, offsetMap, selected);
   }
 
   function buildHebrewFallbackQuote(ref, hebWords) {
     const rawVerse = verseMap[ref];
-    const step1 = dedupeConsecutiveHebrewWords(hebWords, normalizeHeb);
-    const targetWords = dedupeHebrewOccurrences(step1, normalizeHeb);
+
+    const targetWords = dedupeHebrewEntries(
+      hebWords.map(h => ({ heb: h, occurrence: 0 }))
+    );
+
     if (!targetWords.length) return '';
     if (!rawVerse) return targetWords.join(' ');
 
     const { text: strippedVerse, offsetMap } = buildStripped(rawVerse);
-    const selected = chooseClosestHebrewTokenLocations(rawVerse, strippedVerse, offsetMap, targetWords, false);
+
+    const selected = chooseClosestHebrewTokenLocations(
+      rawVerse,
+      strippedVerse,
+      offsetMap,
+      targetWords,
+      false
+    );
+
     if (!selected || !selected.length) return targetWords.join(' ');
 
-    return assembleHebrewQuoteFromLocations(rawVerse, strippedVerse, offsetMap, selected) || targetWords.join(' ');
+    return assembleHebrewQuoteFromLocations(rawVerse, strippedVerse, offsetMap, selected)
+      || targetWords.join(' ');
   }
 
   // Extract [heb:...] hint from explanation and try direct UHB match
@@ -2468,13 +2488,11 @@ function fillOrigQuotes({ preparedJson, alignmentJson, hebrewUsfm, masterUltUsfm
     const matches = [];
 
     function collectHebrew(indices) {
-      const step1 = indices
-        .map((idx) => entries[idx])
+      const entriesList = indices
+        .map(idx => entries[idx])
         .filter(Boolean);
 
-      const step2 = dedupeHebrewByOccurrence(step1, normalizeHeb);
-
-      return step2.map(e => e.heb);
+      return dedupeHebrewEntries(entriesList, normalizeHeb);
     }
 
     for (const seg of segments) {
