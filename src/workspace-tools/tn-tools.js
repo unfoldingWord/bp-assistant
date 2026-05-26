@@ -271,11 +271,16 @@ function dedupeHebrewOccurrences(entries, normalizeHeb = (v) => v) {
   const seen = new Set();
   const out = [];
 
-  for (const entry of entries || []) {
+  for (const entry of (entries || [])) {
     if (!entry?.heb) continue;
 
-    const key =
-      `${normalizeHeb(entry.heb)}|${entry.occurrence ?? -1}`;
+    // If occurrence is missing → DO NOT dedupe globally
+    if (entry.occurrence == null) {
+      out.push(entry);
+      continue;
+    }
+
+    const key = `${normalizeHeb(entry.heb)}|${entry.occurrence}`;
 
     if (seen.has(key)) continue;
 
@@ -2414,17 +2419,11 @@ function fillOrigQuotes({ preparedJson, alignmentJson, hebrewUsfm, masterUltUsfm
 
     const { text: strippedVerse, offsetMap } = buildStripped(rawVerse);
 
-    const step1 = dedupeConsecutiveHebrewWords(hebWords, normalizeHeb);
-
-    // IMPORTANT: reconstruct objects BEFORE occurrence dedupe
-    const step2 = step1.map(hw => ({
-      heb: hw,
-      occurrence: undefined, // or -1 if unknown here
-    }));
-
-    const step3 = dedupeHebrewOccurrences(step2, normalizeHeb);
-
-    const targetWords = step3.map(e => e.heb);
+    // Only remove consecutive duplicates (safe, local)
+    const targetWords = dedupeConsecutiveHebrewWords(
+      hebWords.map(h => normalizeHeb(h)),
+      normalizeHeb
+    );
 
     const selected = chooseClosestHebrewTokenLocations(
       rawVerse,
@@ -2435,23 +2434,19 @@ function fillOrigQuotes({ preparedJson, alignmentJson, hebrewUsfm, masterUltUsfm
     );
 
     if (!selected || !selected.length) return null;
-    return assembleHebrewQuoteFromLocations(rawVerse, strippedVerse, offsetMap, selected);
+
+    return assembleHebrewQuoteFromLocations(
+      rawVerse,
+      strippedVerse,
+      offsetMap,
+      selected
+    );
   }
 
   function buildHebrewFallbackQuote(ref, hebWords) {
     const rawVerse = verseMap[ref];
 
-    const step1 = dedupeConsecutiveHebrewWords(hebWords, normalizeHeb);
-
-    // IMPORTANT: reconstruct objects BEFORE occurrence dedupe
-    const step2 = step1.map(hw => ({
-      heb: hw,
-      occurrence: undefined, // or -1 if unknown here
-    }));
-
-    const step3 = dedupeHebrewOccurrences(step2, normalizeHeb);
-
-    const targetWords = step3.map(e => e.heb);
+    const targetWords = dedupeConsecutiveHebrewWords(hebWords, normalizeHeb);
 
     if (!targetWords.length) return '';
     if (!rawVerse) return targetWords.join(' ');
@@ -2512,9 +2507,13 @@ function fillOrigQuotes({ preparedJson, alignmentJson, hebrewUsfm, masterUltUsfm
     function collectHebrew(indices) {
       const entriesList = indices
         .map(idx => entries[idx])
-        .filter(Boolean);
+        .filter(Boolean)
+        .map(e => ({
+          heb: e.heb,
+          occurrence: e.occurrence ?? null
+        }));
 
-      const deduped = dedupeHebrewEntries(entriesList, normalizeHeb);
+      const deduped = dedupeHebrewOccurrences(entriesList, normalizeHeb);
 
       return deduped.map(e => e.heb);
     }
