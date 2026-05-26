@@ -267,30 +267,36 @@ function buildAlignedSpan(entries, start, length, normalizeHeb = (value) => valu
   return normalizeWhitespace(words.join(' '));
 }
 
-function dedupeHebrewEntries(entries, normalizeHeb = v => v) {
-  const deduped = [];
+function dedupeHebrewOccurrences(entries, normalizeHeb = (v) => v) {
   const seen = new Set();
+  const out = [];
 
-  let lastKey = null;
-
-  for (const entry of (entries || [])) {
+  for (const entry of entries || []) {
     if (!entry?.heb) continue;
 
-    const normHeb = normalizeHeb(entry.heb);
-    const key = `${normHeb}|${entry.occurrence}`;
+    const key =
+      `${normalizeHeb(entry.heb)}|${entry.occurrence ?? -1}`;
 
-    // 1. Hard dedupe: same heb + occurrence anywhere
     if (seen.has(key)) continue;
+
     seen.add(key);
-
-    // 2. Consecutive noise collapse (same heb repetition in a row)
-    if (lastKey === normHeb) continue;
-    lastKey = normHeb;
-
-    deduped.push(entry.heb);
+    out.push(entry);
   }
 
-  return deduped;
+  return out;
+}
+
+function dedupeConsecutiveHebrewWords(hebWords, normalizeHeb = (v) => v) {
+  const out = [];
+  for (const w of hebWords || []) {
+    if (!w) continue;
+
+    const n = normalizeHeb(w);
+    const last = out.length ? normalizeHeb(out[out.length - 1]) : null;
+
+    if (n !== last) out.push(w);
+  }
+  return out;
 }
 
 function normalizeHebrewGapForJoin(rawGap) {
@@ -2408,9 +2414,17 @@ function fillOrigQuotes({ preparedJson, alignmentJson, hebrewUsfm, masterUltUsfm
 
     const { text: strippedVerse, offsetMap } = buildStripped(rawVerse);
 
-    const targetWords = dedupeHebrewEntries(
-      hebWords.map(h => ({ heb: h, occurrence: 0 })) // fallback-safe shim
-    );
+    const step1 = dedupeConsecutiveHebrewWords(hebWords, normalizeHeb);
+
+    // IMPORTANT: reconstruct objects BEFORE occurrence dedupe
+    const step2 = step1.map(hw => ({
+      heb: hw,
+      occurrence: undefined, // or -1 if unknown here
+    }));
+
+    const step3 = dedupeHebrewOccurrences(step2, normalizeHeb);
+
+    const targetWords = step3.map(e => e.heb);
 
     const selected = chooseClosestHebrewTokenLocations(
       rawVerse,
@@ -2427,9 +2441,17 @@ function fillOrigQuotes({ preparedJson, alignmentJson, hebrewUsfm, masterUltUsfm
   function buildHebrewFallbackQuote(ref, hebWords) {
     const rawVerse = verseMap[ref];
 
-    const targetWords = dedupeHebrewEntries(
-      hebWords.map(h => ({ heb: h, occurrence: 0 }))
-    );
+    const step1 = dedupeConsecutiveHebrewWords(hebWords, normalizeHeb);
+
+    // IMPORTANT: reconstruct objects BEFORE occurrence dedupe
+    const step2 = step1.map(hw => ({
+      heb: hw,
+      occurrence: undefined, // or -1 if unknown here
+    }));
+
+    const step3 = dedupeHebrewOccurrences(step2, normalizeHeb);
+
+    const targetWords = step3.map(e => e.heb);
 
     if (!targetWords.length) return '';
     if (!rawVerse) return targetWords.join(' ');
@@ -2492,7 +2514,9 @@ function fillOrigQuotes({ preparedJson, alignmentJson, hebrewUsfm, masterUltUsfm
         .map(idx => entries[idx])
         .filter(Boolean);
 
-      return dedupeHebrewEntries(entriesList, normalizeHeb);
+      const deduped = dedupeHebrewEntries(entriesList, normalizeHeb);
+
+      return deduped.map(e => e.heb);
     }
 
     for (const seg of segments) {
