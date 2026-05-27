@@ -837,7 +837,6 @@ function extractAlignmentData({ alignedUsfm, output }) {
   const result = {};
   let chapter = 0, verse = '0';
   const milestones = [];
-  let occurrenceMap = {};
 
   for (const line of content.split('\n')) {
     const trimmed = line.trim();
@@ -850,11 +849,12 @@ function extractAlignmentData({ alignedUsfm, output }) {
     // Verse marker can appear mid-line after a poetry marker (e.g. \q1 \v 1 \zaln-s...)
     // Update verse but do NOT continue — alignment data on the same line must still be processed
     const vm = trimmed.match(/\\v\s+(\d+[-\d]*|front)/);
-    if (vm) { verse = vm[1].split('-')[0]; milestones.length = 0; occurrenceMap = {}; }
+    if (vm) { verse = vm[1].split('-')[0]; milestones.length = 0; }
 
     const ZALN_S = /\\zaln-s\s+\|([^\\]*?)\\?\*/g;
     const ZALN_E = /\\zaln-e\\?\*/g;
     const WORD = /\\w\s+([^|\\]+)\|[^\\]*\\w\*/g;
+    const OCCURRENCE = /occurrence="(\d+)"/;
     const key = `${chapter}:${verse}`;
     if (!result[key]) result[key] = [];
 
@@ -871,14 +871,14 @@ function extractAlignmentData({ alignedUsfm, output }) {
     for (const tok of tokens) {
       if (tok.type === 's') {
         const sM = tok.attrs.match(/x-strong="([^"]*)"/);
+        const oM = tok.attrs.match(/x-morph="[^\n"]+" x-occurrence="(\d+)"/);
         const cM = tok.attrs.match(/x-content="([^"]*)"/);
         const heb = cM ? cM[1] : '';
-        occurrenceMap[heb] = (occurrenceMap[heb] || 0) + 1;
         milestones.push({
           heb,
           strong: sM ? sM[1] : '',
           heb_pos: milestones.length,
-          occurrence: occurrenceMap[heb]
+          occurrence: oM ? parseInt(oM[1], 10) : null
         });
       } else if (tok.type === 'e') { milestones.pop(); }
       else if (tok.type === 'w' && milestones.length > 0) {
