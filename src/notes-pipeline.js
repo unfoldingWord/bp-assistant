@@ -121,6 +121,33 @@ function hasPauseBeforeATsFlag(content) {
     || /\bpause[\s-]+before[\s-]+alternate[\s-]+translations\b/i.test(text);
 }
 
+// Run a Python script as a child process and capture its output.
+const { spawn } = require("child_process");
+
+function runPython(scriptPath, args = []) {
+  return new Promise((resolve, reject) => {
+    const py = spawn("python3", [scriptPath, ...args]);
+
+    let stdout = "";
+    let stderr = "";
+
+    py.stdout.on("data", (data) => {
+      stdout += data.toString();
+    });
+
+    py.stderr.on("data", (data) => {
+      stderr += data.toString();
+    });
+
+    py.on("close", (code) => {
+      if (code !== 0) {
+        return reject(new Error(stderr || `Python exited with code ${code}`));
+      }
+      resolve(stdout);
+    });
+  });
+}
+
 /**
  * Run all mechanical prep steps in Node.js before invoking tn-writer.
  * This replaces ~100 Claude MCP tool calls with direct function calls:
@@ -2010,6 +2037,24 @@ async function notesPipeline(route, message) {
             `**${ref}**: Mechanical prep complete — extract=${prep.extractSummary}; ${prep.prepSummary}; ${prep.fillSummary}; ${prep.glSummary}; ${prep.flagSummary}; ids=${prep.idSummary}`
           );
           console.log(`[notes] Mechanical prep ${ref}: extract=${prep.extractSummary}, prep=${prep.prepSummary}, fill=${prep.fillSummary}, gl=${prep.glSummary}, flag=${prep.flagSummary}, ids=${prep.idSummary}`);
+
+          // Run Stephen's gl_quote and orig_quote script
+          try {
+            const pythonResult = await runPython(
+              "fill_quotes.py", [
+                ctx.sources.ult,
+                ctx.sources.hebrew,
+                ctx.runtime.preparedNotes,
+              ]
+            );
+
+            await status(`**${ref}**: Python processing complete`);
+            console.log("[notes] Python result:", pythonResult);
+
+          } catch (err) {
+            console.warn(`[notes] Python step failed (non-fatal): ${err.message}`);
+          }
+
 
           // Run see-how detection after mechanical prep
           try {
