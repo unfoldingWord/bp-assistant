@@ -1,11 +1,11 @@
 import re
 import csv
-import requests
 from collections import defaultdict
-import os
 import shutil
 import json
 import sys
+import os
+import tempfile
 
 def build_tsv_notes(json_file):
     # Load JSON
@@ -139,14 +139,6 @@ def create_tsv_ult(ult_usfm):
         "rows": cleaned_data
     }
 
-# Function to get the content of the file
-def get_file_content(url):
-    response = requests.get(url)
-    if response.status_code == 200:
-        return response.text
-    else:
-        return ''
-
 def parse_verse_ref(verse_ref):
     # Function to split verse_ref into chapter and verse and return as tuple for sorting
     chapter, verse = verse_ref.split(':')
@@ -215,7 +207,6 @@ def combine_entries(ult_dict):
     combined_entries = []
 
     # Group entries by (verse_ref, gloss, chunk_number)
-    from collections import defaultdict
     grouped_entries = defaultdict(list)
 
     for entry in indexed_entries:
@@ -806,13 +797,28 @@ def update_json_from_tsv(json_file, origl_and_snippet):
                     item["writer_packet"]["gl_quote"] = english_phrase
                     item["writer_packet"]["issue_span_gl_quote"] = english_phrase
 
-    # Backup old file first
-    backup_file = json_file + ".bak"
-    shutil.move(json_file, backup_file)
+    def safe_write_json(json_file, data):
+        # 1. Write to temp file in same directory
+        dir_name = os.path.dirname(json_file)
 
-    # Save updated JSON with original name
-    with open(json_file, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            delete=False,
+            dir=dir_name
+        ) as tmp:
+            json.dump(data, tmp, ensure_ascii=False, indent=2)
+            temp_path = tmp.name
+
+        # 2. Backup old file (only AFTER successful write)
+        if os.path.exists(json_file):
+            backup_file = json_file + ".bak"
+            shutil.move(json_file, backup_file)
+
+        # 3. Atomic replace
+        shutil.move(temp_path, json_file)
+
+    safe_write_json(json_file, data)
 
 def fill_quotes(ult_usfm, uhb_usfm, prep_notes):
 
