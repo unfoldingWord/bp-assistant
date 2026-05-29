@@ -2044,6 +2044,7 @@ async function notesPipeline(route, message) {
           console.log(`[notes] Mechanical prep ${ref}: extract=${prep.extractSummary}, prep=${prep.prepSummary}, fill=${prep.fillSummary}, gl=${prep.glSummary}, flag=${prep.flagSummary}, ids=${prep.idSummary}`);
 
           // Run Stephen's gl_quote and orig_quote script
+          const ctx = readContext(pipeDir);
           try {
             const pythonResult = await runPythonWithTimeout(
               [
