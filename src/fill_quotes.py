@@ -851,3 +851,4 @@ if __name__ == "__main__":
     prep_notes = sys.argv[3]
 
     fill_quotes(ult_usfm, uhb_usfm, prep_notes)
+    

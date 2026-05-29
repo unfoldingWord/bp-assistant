@@ -10,6 +10,7 @@
 const fs = require('fs');
 const path = require('path');
 const config = require('./config');
+const { spawn } = require("child_process");
 const { sendMessage, sendDM, addReaction, removeReaction } = require('./zulip-client');
 const { runClaude, DEFAULT_RESTRICTED_TOOLS, isTransientOutageError } = require('./claude-runner');
 const { getDoor43Username, emailToFallbackUsername, buildBranchName, resolveOutputFile, discoverFreshOutput, checkPrerequisites, calcSkillTimeout, normalizeBookName, resolveConflictMention, parsePartialTsv, truncatePartialTsv, parseChunkRange, CSKILLBP_DIR } = require('./pipeline-utils');
@@ -2047,11 +2048,13 @@ async function notesPipeline(route, message) {
           // Run Stephen's gl_quote and orig_quote script
           try {
             const pythonResult = await runPythonWithTimeout(
-              "src/fill_quotes.py", [
+              [
+                "src/fill_quotes.py",
                 ctx.sources.ult,
                 ctx.sources.hebrew,
                 ctx.runtime.preparedNotes,
-              ], 120000);
+              ],
+              120000);
 
             await status(`**${ref}**: Python processing complete`);
             console.log("[notes] Python result:", pythonResult);
