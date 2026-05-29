@@ -123,8 +123,6 @@ function hasPauseBeforeATsFlag(content) {
 }
 
 // Run a Python script as a child process and capture its output.
-import { spawn } from "child_process";
-
 function runPythonWithTimeout(args, timeoutMs = 120000) {
   return new Promise((resolve, reject) => {
     const proc = spawn("python3", args);
