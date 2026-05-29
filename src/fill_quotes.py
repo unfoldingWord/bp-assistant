@@ -428,7 +428,7 @@ def find_sequence(ult_dict_combined, notes_dict, unique_numbers):
             numbers = sorted(set(numbers))
             chunk_numbers = sorted(set(chunk_numbers))
 
-            snippet_data.append([verse_ref, phrase, numbers, chunk_numbers])
+            snippet_data.append([verse_ref, phrase, numbers, chunk_numbers, id])
 
             continue
 
