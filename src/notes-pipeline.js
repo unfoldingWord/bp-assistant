@@ -2041,7 +2041,7 @@ async function notesPipeline(route, message) {
           // Run Stephen's gl_quote and orig_quote script
           try {
             const pythonResult = await runPython(
-              "fill_quotes.py", [
+              "src/fill_quotes.py", [
                 ctx.sources.ult,
                 ctx.sources.hebrew,
                 ctx.runtime.preparedNotes,

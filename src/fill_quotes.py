@@ -7,7 +7,6 @@ import shutil
 import json
 import sys
 
-
 def build_tsv_notes(json_file):
     # Load JSON
     with open(json_file, "r", encoding="utf-8") as f:
@@ -131,20 +130,14 @@ def create_tsv_ult(ult_usfm):
             cleaned_data.append(line)
         return cleaned_data
 
-    def write_tsv(file_name, headers, data):
-        with open(file_name, mode='w', newline='', encoding='utf-8') as file:
-            file.write('\t'.join(headers) + '\n')
-            for line in data:
-                file.write(line + '\n')
-        print(f'Data written to {file_name}')
-
-
     file_content = read_usfm_data(ult_usfm)
     verse_data = create_ult(file_content)
     cleaned_data = cleanup_lines(verse_data)
     headers = ['Reference', 'Verse']
-    file_name = f'Hosea_2.tsv'
-    write_tsv(file_name, headers, cleaned_data)
+    return {
+        "headers": headers,
+        "rows": cleaned_data
+    }
 
 # Function to get the content of the file
 def get_file_content(url):
@@ -158,19 +151,6 @@ def parse_verse_ref(verse_ref):
     # Function to split verse_ref into chapter and verse and return as tuple for sorting
     chapter, verse = verse_ref.split(':')
     return int(chapter), int(verse)
-
-def setup_output(file_name):
-    # Construct the output path
-    output_path = f'output/'
-
-    # Ensure the directory exists
-    os.makedirs(output_path, exist_ok=True)
-
-    if '.tsv' not in file_name:
-        file_name += '.tsv'
-
-    # Path to the file you want to write
-    return f'{output_path}/{file_name}'
 
 def get_hbo(file_name):
 
@@ -707,30 +687,31 @@ def write_origl_and_snippet(snippet_data, ult_dict_combined, unique_numbers):
         processed_data.append([verse_ref, phrase, hebrew_phrase, english_phrase, id])
     return processed_data
 
-def write_output(file, headers, data, fieldnames=None):
+def add_punctuation(origl_and_snippet, tsv_ult):
+    data = tsv_ult["rows"]
+    data_str = '\n'.join([''.join(row) for row in data])
 
-    output_file = setup_output(file)
+    verse_map = {}
 
-    # Write results to a TSV file
-    with open(output_file, mode='w', newline='', encoding='utf-8') as file:
-        if fieldnames:
-            writer = csv.DictWriter(file, delimiter='\t', fieldnames=fieldnames)
-            writer.writeheader()
-        else:
-            writer = csv.writer(file, delimiter='\t')
-            writer.writerow(headers)  # Column headers
-        for line in data:
-            writer.writerow(line)
+    for line in data_str.splitlines():
+        if not line.strip():
+            continue
 
-    print(f"Data has been written to {output_file}")
+        parts = line.split("\t", 1)
 
-def add_punctuation(origl_and_snippet):
-    book_file = f'Hosea_2.tsv'
-    data, headers = read_ai_notes(book_file)
-    data_str = ' '.join([' '.join(row) for row in data])
+        verse = parts[0].strip()
+        text = parts[1].strip() if len(parts) > 1 else ""
+
+        verse_map[verse] = text
 
     for row in origl_and_snippet:
         verse_ref = row[0]
+
+        if verse_ref not in verse_map:
+            continue
+
+        verse_text = verse_map[verse_ref]
+
         phrase = row[1]
         hebrew_words = row[2]
         english_words = row[3]
@@ -745,14 +726,14 @@ def add_punctuation(origl_and_snippet):
             full_search_phrase = prepend_phrase + search_phrase + append_phrase
 
             # Find all matches of the search phrase in the data string
-            matches = re.findall(full_search_phrase, data_str)
+            matches = re.findall(full_search_phrase, verse_text)
             if matches:
 
                 # Update english_words with the first match found
                 row[3] = matches[0]
     return origl_and_snippet
 
-def update_json_from_tsv(json_file, tsv_file):
+def update_json_from_tsv(json_file, origl_and_snippet):
     """
     Update JSON entries using TSV data.
 
@@ -770,19 +751,16 @@ def update_json_from_tsv(json_file, tsv_file):
     with open(json_file, "r", encoding="utf-8") as f:
         data = json.load(f)
 
-    # Load TSV rows into lookup dict
     updates = {}
 
-    with open(tsv_file, "r", encoding="utf-8") as f:
-        reader = csv.DictReader(f, delimiter="\t")
+    for row in origl_and_snippet:
 
-        for row in reader:
-            key = (row["Reference"], row["ID"])
+        key = (row[0], row[4])  # Reference + ID
 
-            updates[key] = {
-                "hebrew_phrase": row["Hebrew phrase"],
-                "english_phrase": row["English phrase"]
-            }
+        updates[key] = {
+            "hebrew_phrase": row[2],
+            "english_phrase": row[3]
+        }
 
     # Update JSON entries
     for item in data["items"]:
@@ -840,7 +818,7 @@ def fill_quotes(ult_usfm, uhb_usfm, prep_notes):
 
     ai_notes = build_tsv_notes(prep_notes)
 
-    create_tsv_ult(ult_usfm)
+    tsv_ult = create_tsv_ult(ult_usfm)
 
     combined_text = get_hbo(uhb_usfm)
     unique_numbers = find_unique_numbers(combined_text)
@@ -853,9 +831,9 @@ def fill_quotes(ult_usfm, uhb_usfm, prep_notes):
 
     origl_and_snippet = write_origl_and_snippet(processed_snippet_data, ult_dict_combined, unique_numbers)
 
-    origl_and_snippet = add_punctuation(origl_and_snippet)
+    origl_and_snippet = add_punctuation(origl_and_snippet, tsv_ult)
 
-    update_json_from_tsv(prep_notes, 'output/4_origl_and_snippet.tsv')
+    update_json_from_tsv(prep_notes, origl_and_snippet)
 
 
 if __name__ == "__main__":
