@@ -122,28 +122,34 @@ function hasPauseBeforeATsFlag(content) {
 }
 
 // Run a Python script as a child process and capture its output.
-const { spawn } = require("child_process");
+import { spawn } from "child_process";
 
-function runPython(scriptPath, args = []) {
+function runPythonWithTimeout(args, timeoutMs = 120000) {
   return new Promise((resolve, reject) => {
-    const py = spawn("python3", [scriptPath, ...args]);
+    const proc = spawn("python3", args);
+
+    let killed = false;
+
+    const timer = setTimeout(() => {
+      killed = true;
+      proc.kill("SIGKILL");
+      reject(new Error("Python timeout exceeded"));
+    }, timeoutMs);
 
     let stdout = "";
     let stderr = "";
 
-    py.stdout.on("data", (data) => {
-      stdout += data.toString();
-    });
+    proc.stdout.on("data", (d) => stdout += d.toString());
+    proc.stderr.on("data", (d) => stderr += d.toString());
 
-    py.stderr.on("data", (data) => {
-      stderr += data.toString();
-    });
+    proc.on("close", (code) => {
+      clearTimeout(timer);
 
-    py.on("close", (code) => {
-      if (code !== 0) {
-        return reject(new Error(stderr || `Python exited with code ${code}`));
+      if (!killed && code === 0) {
+        resolve({ stdout, stderr });
+      } else {
+        reject(new Error(stderr || `Python exited with code ${code}`));
       }
-      resolve(stdout);
     });
   });
 }
@@ -2040,13 +2046,12 @@ async function notesPipeline(route, message) {
 
           // Run Stephen's gl_quote and orig_quote script
           try {
-            const pythonResult = await runPython(
+            const pythonResult = await runPythonWithTimeout(
               "src/fill_quotes.py", [
                 ctx.sources.ult,
                 ctx.sources.hebrew,
                 ctx.runtime.preparedNotes,
-              ]
-            );
+              ], 120000);
 
             await status(`**${ref}**: Python processing complete`);
             console.log("[notes] Python result:", pythonResult);

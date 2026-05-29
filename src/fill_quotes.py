@@ -124,7 +124,7 @@ def create_tsv_ult(ult_usfm):
             line = re.sub(r'  +', r' ', line)
             line = re.sub(r'(\.),[ .,]*([\n])', r'\1\2', line)
             line = re.sub(r'(\.),[ .,]*([\w])', r'\1 \2', line)
-            line = re.sub(r'\.\.+', r'\.', line)
+            line = re.sub(r'\.\.+', r'.', line)
             line = re.sub(r'(\d,) (\d)', r'\1\2', line)
             line = line.strip()
             cleaned_data.append(line)
@@ -784,7 +784,7 @@ def update_json_from_tsv(json_file, origl_and_snippet):
         if hebrew_phrase == '':
             if english_phrase == '':
                 continue
-            if item["orig_quote"] != '':
+            if item.get('orig_quote', '') != '':
                 continue
             else:
                 item["orig_quote"] = english_phrase
