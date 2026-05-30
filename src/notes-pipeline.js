@@ -10,6 +10,7 @@
 const fs = require('fs');
 const path = require('path');
 const config = require('./config');
+const { spawn } = require("child_process");
 const { sendMessage, sendDM, addReaction, removeReaction } = require('./zulip-client');
 const { runClaude, DEFAULT_RESTRICTED_TOOLS, isTransientOutageError } = require('./claude-runner');
 const { getDoor43Username, emailToFallbackUsername, buildBranchName, resolveOutputFile, discoverFreshOutput, checkPrerequisites, calcSkillTimeout, normalizeBookName, resolveConflictMention, parsePartialTsv, truncatePartialTsv, parseChunkRange, CSKILLBP_DIR } = require('./pipeline-utils');
@@ -119,6 +120,58 @@ function hasPauseBeforeATsFlag(content) {
     || /--pause-ats\b/i.test(text)
     || /\bpause[\s-]+before[\s-]+ats\b/i.test(text)
     || /\bpause[\s-]+before[\s-]+alternate[\s-]+translations\b/i.test(text);
+}
+
+// Run a Python script as a child process and capture its output.
+function runPythonWithTimeout(args, timeoutMs = 120000) {
+  return new Promise((resolve, reject) => {
+    const proc = spawn("python3", args);
+
+    let stdout = "";
+    let stderr = "";
+    let settled = false;
+
+    const timer = setTimeout(() => {
+      if (settled) return;
+
+      settled = true;
+      proc.kill("SIGKILL");
+      reject(new Error(`Python timed out after ${timeoutMs} ms`));
+    }, timeoutMs);
+
+    proc.stdout.on("data", (d) => {
+      stdout += d.toString();
+    });
+
+    proc.stderr.on("data", (d) => {
+      stderr += d.toString();
+    });
+
+    proc.on("error", (err) => {
+      if (settled) return;
+
+      settled = true;
+      clearTimeout(timer);
+      reject(err);
+    });
+
+    proc.on("close", (code) => {
+      if (settled) return;
+
+      settled = true;
+      clearTimeout(timer);
+
+      if (code === 0) {
+        resolve({ stdout, stderr });
+      } else {
+        reject(
+          new Error(
+            stderr || `Python exited with code ${code}`
+          )
+        );
+      }
+    });
+  });
 }
 
 /**
@@ -2010,6 +2063,27 @@ async function notesPipeline(route, message) {
             `**${ref}**: Mechanical prep complete — extract=${prep.extractSummary}; ${prep.prepSummary}; ${prep.fillSummary}; ${prep.glSummary}; ${prep.flagSummary}; ids=${prep.idSummary}`
           );
           console.log(`[notes] Mechanical prep ${ref}: extract=${prep.extractSummary}, prep=${prep.prepSummary}, fill=${prep.fillSummary}, gl=${prep.glSummary}, flag=${prep.flagSummary}, ids=${prep.idSummary}`);
+
+          // Run Stephen's gl_quote and orig_quote script
+          const ctx = readContext(pipeDir);
+          const fillQuotesScript = path.join(__dirname, "fill_quotes.py");
+          try {
+            const pythonResult = await runPythonWithTimeout(
+              [
+                fillQuotesScript,
+                ctx.sources.ult,
+                ctx.sources.hebrew,
+                ctx.runtime.preparedNotes,
+              ],
+              120000);
+
+            await status(`**${ref}**: Python processing complete`);
+            console.log("[notes] Python result:", pythonResult);
+
+          } catch (err) {
+            console.warn(`[notes] Python step failed (non-fatal): ${err.message}`);
+          }
+
 
           // Run see-how detection after mechanical prep
           try {
