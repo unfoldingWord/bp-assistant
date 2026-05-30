@@ -127,27 +127,48 @@ function runPythonWithTimeout(args, timeoutMs = 120000) {
   return new Promise((resolve, reject) => {
     const proc = spawn("python3", args);
 
-    let killed = false;
-
-    const timer = setTimeout(() => {
-      killed = true;
-      proc.kill("SIGKILL");
-      reject(new Error("Python timeout exceeded"));
-    }, timeoutMs);
-
     let stdout = "";
     let stderr = "";
+    let settled = false;
 
-    proc.stdout.on("data", (d) => stdout += d.toString());
-    proc.stderr.on("data", (d) => stderr += d.toString());
+    const timer = setTimeout(() => {
+      if (settled) return;
+
+      settled = true;
+      proc.kill("SIGKILL");
+      reject(new Error(`Python timed out after ${timeoutMs} ms`));
+    }, timeoutMs);
+
+    proc.stdout.on("data", (d) => {
+      stdout += d.toString();
+    });
+
+    proc.stderr.on("data", (d) => {
+      stderr += d.toString();
+    });
+
+    proc.on("error", (err) => {
+      if (settled) return;
+
+      settled = true;
+      clearTimeout(timer);
+      reject(err);
+    });
 
     proc.on("close", (code) => {
+      if (settled) return;
+
+      settled = true;
       clearTimeout(timer);
 
-      if (!killed && code === 0) {
+      if (code === 0) {
         resolve({ stdout, stderr });
       } else {
-        reject(new Error(stderr || `Python exited with code ${code}`));
+        reject(
+          new Error(
+            stderr || `Python exited with code ${code}`
+          )
+        );
       }
     });
   });
