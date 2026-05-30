@@ -2067,9 +2067,11 @@ async function notesPipeline(route, message) {
           // Run Stephen's gl_quote and orig_quote script
           const ctx = readContext(pipeDir);
           const fillQuotesScript = path.join(__dirname, "fill_quotes.py");
-          const ultPath = 'data/workspace/' + ctx.sources.ult;
-          const uhbPath = 'data/workspace/' + ctx.sources.hebrew;
-          const prepPath = 'data/workspace/' + ctx.runtime.preparedNotes;
+          const workspaceRoot = path.resolve('data/workspace');
+
+          const ultPath = path.resolve(workspaceRoot, ctx.sources.ult);
+          const uhbPath = path.resolve(workspaceRoot, ctx.sources.hebrew);
+          const prepPath = path.resolve(workspaceRoot, ctx.runtime.preparedNotes);
           console.log(`[notes] ultPath: ${ultPath}, uhbPath: ${uhbPath}, prepPath: ${prepPath}`);
           try {
             const pythonResult = await runPythonWithTimeout(
