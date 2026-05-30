@@ -150,15 +150,6 @@ def get_hbo(file_name):
 
     return data
 
-def read_ai_notes(file_path):
-    data = []
-    with open(file_path, 'r', encoding='utf-8') as tsvfile:
-        reader = csv.reader(tsvfile, delimiter='\t')
-        headers = next(reader)  # Assuming the first row is headers
-        for row in reader:
-            data.append(row)
-    return data, headers
-
 def find_unique_numbers(combined_text):
     # Initialize variables
     chapter = None
@@ -263,7 +254,7 @@ def construct_ult_dict(file_name, unique_numbers):
     verse = None
 
     # Split the combined text by "\\v" to get verse chunks
-    chunks = combined_text.split('\\v')
+    chunks = combined_text.split('\\v ')
 
     for chunk in chunks:
 
@@ -851,4 +842,3 @@ if __name__ == "__main__":
     prep_notes = sys.argv[3]
 
     fill_quotes(ult_usfm, uhb_usfm, prep_notes)
-    

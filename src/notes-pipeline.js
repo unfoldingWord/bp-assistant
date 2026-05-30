@@ -2045,7 +2045,6 @@ async function notesPipeline(route, message) {
 
           // Run Stephen's gl_quote and orig_quote script
           const ctx = readContext(pipeDir);
-          const path = require("path");
           const fillQuotesScript = path.join(__dirname, "fill_quotes.py");
           try {
             const pythonResult = await runPythonWithTimeout(
