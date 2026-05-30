@@ -2064,22 +2064,14 @@ async function notesPipeline(route, message) {
           );
           console.log(`[notes] Mechanical prep ${ref}: extract=${prep.extractSummary}, prep=${prep.prepSummary}, fill=${prep.fillSummary}, gl=${prep.glSummary}, flag=${prep.flagSummary}, ids=${prep.idSummary}`);
 
-          // Run see-how detection after mechanical prep
-          try {
-            const seeHowSummary = runSeeHowDetection({ pipeDir });
-            if (seeHowSummary !== '0 see-how back-refs, 0 same-verse combinations') {
-              await status(`**${ref}**: See-how detection — ${seeHowSummary}`);
-            }
-          } catch (seeHowErr) {
-            console.warn(`[notes] See-how detection failed (non-fatal): ${seeHowErr.message}`);
-          }
-
           // Run Stephen's gl_quote and orig_quote script
           const ctx = readContext(pipeDir);
           const fillQuotesScript = path.join(__dirname, "fill_quotes.py");
-          const ultPath = ctx.sources.ult;
-          const uhbPath = ctx.sources.hebrew;
-          const prepPath = ctx.runtime.preparedNotes;
+          const workspaceRoot = path.resolve('data/workspace');
+
+          const ultPath = path.resolve(workspaceRoot, ctx.sources.ult);
+          const uhbPath = path.resolve(workspaceRoot, ctx.sources.hebrew);
+          const prepPath = path.resolve(workspaceRoot, ctx.runtime.preparedNotes);
           console.log(`[notes] ultPath: ${ultPath}, uhbPath: ${uhbPath}, prepPath: ${prepPath}`);
           try {
             const pythonResult = await runPythonWithTimeout(
@@ -2096,6 +2088,16 @@ async function notesPipeline(route, message) {
 
           } catch (err) {
             console.warn(`[notes] Python step failed (non-fatal): ${err.message}`);
+          }
+
+          // Run see-how detection after mechanical prep
+          try {
+            const seeHowSummary = runSeeHowDetection({ pipeDir });
+            if (seeHowSummary !== '0 see-how back-refs, 0 same-verse combinations') {
+              await status(`**${ref}**: See-how detection — ${seeHowSummary}`);
+            }
+          } catch (seeHowErr) {
+            console.warn(`[notes] See-how detection failed (non-fatal): ${seeHowErr.message}`);
           }
 
           // Apply editor-marked TN hints (API-origin only). Suppresses
