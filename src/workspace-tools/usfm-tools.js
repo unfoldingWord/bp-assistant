@@ -1016,7 +1016,7 @@ function repairAlignmentXContent({ alignedUsfm, hebrewUsfm }) {
   const hebrewContent = fs.readFileSync(hebrewPath, 'utf8');
   const uhbByVerse = {};  // "ch:vs" -> { NFC(word): [verbatim1, verbatim2, ...] }
   let uhbCh = 0, uhbVs = 0;
-  const UHB_W_RE = /\\w\s+([^|]+)\|/g;
+  const UHB_W_RE = /\\w\s+([^\\]*)\\*/g;
 
   for (const line of hebrewContent.split('\n')) {
     const cm = line.match(/^\\c\s+(\d+)/);
@@ -1032,10 +1032,22 @@ function repairAlignmentXContent({ alignedUsfm, hebrewUsfm }) {
     UHB_W_RE.lastIndex = 0;
     let m;
     while ((m = UHB_W_RE.exec(line)) !== null) {
-      const word = m[1].trimEnd();  // preserve internal characters, strip trailing whitespace
+      const attrStr = m[1];
+
+      const wordM = attrStr.match(/^([^|]+)/);
+      const word = wordM ? wordM[1].trimEnd() : '';
+
+      const lemmaM = attrStr.match(/lemma="([^"]*)"/);
+      const lemma = lemmaM ? lemmaM[1] : null;
+
       const nfc = word.normalize('NFC');
+
       if (!map[nfc]) map[nfc] = [];
-      map[nfc].push(word);
+
+      map[nfc].push({
+        word,
+        lemma
+      });
     }
   }
 
@@ -1082,14 +1094,38 @@ function repairAlignmentXContent({ alignedUsfm, hebrewUsfm }) {
       // Use x-occurrence (1-based) to select the right candidate
       const occM = attrStr.match(/x-occurrence="(\d+)"/);
       const occ = occM ? parseInt(occM[1], 10) : 1;
-      const uhbWord = candidates[Math.min(occ - 1, candidates.length - 1)];
+      const uhbEntry = candidates[Math.min(occ - 1, candidates.length - 1)];
+      const uhbWord = uhbEntry?.word;
+      const uhbLemma = uhbEntry?.lemma;
 
       if (!uhbWord || uhbWord === xContent) continue;
 
       // Same NFC glyph, different byte order — patch to UHB verbatim bytes
       const posInNewLine = zm.index + offset;
-      const newMatch = zm[0].replace(`x-content="${xContent}"`, `x-content="${uhbWord}"`);
-      newLine = newLine.slice(0, posInNewLine) + newMatch + newLine.slice(posInNewLine + zm[0].length);
+
+      // start from original matched token
+      let newMatch = zm[0];
+
+      // 1. Replace x-content
+      newMatch = newMatch.replace(
+        `x-content="${xContent}"`,
+        `x-content="${uhbWord}"`
+      );
+
+      // 2. Replace x-lemma (if available)
+      if (uhbLemma) {
+        newMatch = newMatch.replace(
+          /x-lemma="[^"]*"/,
+          `x-lemma="${uhbLemma}"`
+        );
+      }
+
+      // splice back into line
+      newLine =
+        newLine.slice(0, posInNewLine) +
+        newMatch +
+        newLine.slice(posInNewLine + zm[0].length);
+
       offset += newMatch.length - zm[0].length;
       repaired++;
     }
