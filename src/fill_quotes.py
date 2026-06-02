@@ -728,6 +728,7 @@ def update_json_from_tsv(json_file, origl_and_snippet):
         - all orig_quote fields
         - all gl_quote fields
         - all issue_span_gl_quote fields
+        - all exact_ult_span fields
     """
 
     # Load JSON
@@ -766,12 +767,14 @@ def update_json_from_tsv(json_file, origl_and_snippet):
             item["orig_quote"] = hebrew_phrase
             item["gl_quote"] = english_phrase
             item["issue_span_gl_quote"] = english_phrase
+            item["exact_ult_span"] = english_phrase
 
             # Nested writer_packet replacements
             if "writer_packet" in item:
                 item["writer_packet"]["orig_quote"] = hebrew_phrase
                 item["writer_packet"]["gl_quote"] = english_phrase
                 item["writer_packet"]["issue_span_gl_quote"] = english_phrase
+                item["writer_packet"]["exact_ult_span"] = english_phrase
         
         if hebrew_phrase == '':
             if english_phrase == '':
@@ -782,12 +785,14 @@ def update_json_from_tsv(json_file, origl_and_snippet):
                 item["orig_quote"] = english_phrase
                 item["gl_quote"] = english_phrase
                 item["issue_span_gl_quote"] = english_phrase
+                item["exact_ult_span"] = english_phrase
 
                 # Nested writer_packet replacements
                 if "writer_packet" in item:
                     item["writer_packet"]["orig_quote"] = english_phrase
                     item["writer_packet"]["gl_quote"] = english_phrase
                     item["writer_packet"]["issue_span_gl_quote"] = english_phrase
+                    item["writer_packet"]["exact_ult_span"] = english_phrase
 
     def safe_write_json(json_file, data):
         # 1. Write to temp file in same directory
