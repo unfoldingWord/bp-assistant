@@ -276,15 +276,25 @@ function createAlignedUsfm({ hebrew, mapping, source, output, chapter, verse, us
       maxBuffer: 10 * 1024 * 1024,
       timeout: 30000,
     });
-    if (output) {
-      console.log(`Aligned USFM written to ${output}`);
-      const repairResult = repairAlignmentXContent({
+
+    if (!output) {
+      return result;
+    }
+
+    console.log(`Aligned USFM written to ${output}`);
+
+    let repairResult;
+    try {
+      repairResult = repairAlignmentXContent({
         alignedUsfm: output,
         hebrewUsfm: hebrew,
       });
-      return `Aligned USFM written to ${output}.\nX-content and lemma byte repair completed:\n${repairResult}`;
+    } catch (repairErr) {
+      return `Aligned USFM written to ${output}.\nRepair step failed: ${repairErr.message}`;
     }
-    return result;
+
+    return `Aligned USFM written to ${output}.\nX-content and lemma byte repair completed:\n${repairResult}`;
+
   } catch (err) {
     const stderr = err.stderr ? err.stderr.toString() : '';
     const msg = stderr || err.message;
