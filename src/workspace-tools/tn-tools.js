@@ -452,8 +452,14 @@ function parseExplanationDirectives(explanation) {
     remaining.push(trimmed);
   }
 
+  let cleanExplanation = normalizeWhitespace(remaining.join(' '));
+
+  if (cleanExplanation.includes('reason after result')) {
+    cleanExplanation = 'Reverse: reason after result';
+  }
+
   return {
-    clean_explanation: normalizeWhitespace(remaining.join(' ')),
+    clean_explanation: cleanExplanation,
     must_include: mustInclude,
     template_hints: templateHints,
   };
