@@ -750,6 +750,7 @@ def update_json_from_tsv(json_file, origl_and_snippet):
     for item in data["items"]:
 
         key = (item.get("reference", ""), item.get("id", ""))
+        sref = item.get("sref", "")
 
         if key not in updates:
             continue
@@ -758,9 +759,15 @@ def update_json_from_tsv(json_file, origl_and_snippet):
 
         hebrew_phrase = update["hebrew_phrase"]
         english_phrase = update["english_phrase"]
-        english_phrase = re.sub(r'[“”‘’]', '"', english_phrase)
-        english_phrase = re.sub(r'[.,:;!?]$', '', english_phrase)
-        english_phrase = re.sub(r'…', '&', english_phrase)
+        english_phrase = re.sub(r'[“”]', '"', english_phrase)
+        english_phrase = re.sub(r'[‘’]', "'", english_phrase)
+        if english_phrase.count('"') == 1 and (english_phrase.startswith('"') or english_phrase.endswith('"')):
+            english_phrase = english_phrase.replace('"', '')
+        english_phrase = re.sub(r'(^")(.+)("$)', r'\2', english_phrase)
+        english_phrase = re.sub(r'[.,:;!]$', '', english_phrase)
+        if sref != 'figs-rquestion':
+            english_phrase = re.sub(r'\?$', '', english_phrase)
+        english_phrase = english_phrase.replace('…', '&')
 
         # Top-level replacements
         if hebrew_phrase != '':
