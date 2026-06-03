@@ -750,6 +750,7 @@ def update_json_from_tsv(json_file, origl_and_snippet):
     for item in data["items"]:
 
         key = (item.get("reference", ""), item.get("id", ""))
+        sref = item.get("sref", "")
 
         if key not in updates:
             continue
@@ -764,7 +765,7 @@ def update_json_from_tsv(json_file, origl_and_snippet):
             english_phrase = english_phrase.replace('"', '')
         english_phrase = re.sub(r'(^")(.+)("$)', r'\2', english_phrase)
         english_phrase = re.sub(r'[.,:;!]$', '', english_phrase)
-        if item["sref"] != 'figs-rquestion':
+        if sref != 'figs-rquestion':
             english_phrase = re.sub(r'\?$', '', english_phrase)
         english_phrase = english_phrase.replace('…', '&')
 
