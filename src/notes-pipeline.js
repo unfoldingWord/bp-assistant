@@ -1570,7 +1570,6 @@ async function notesPipeline(route, message) {
 
   const { book, startChapter, endChapter, verseStart, verseEnd, withIntro, fresh, pauseBeforeATs } = parsed;
   const sessionKey = stream ? `stream-${stream}-${topic}` : `dm-${message.sender_id}`;
-  const debugRunId = `notes-${message.id || Date.now()}`;
   const checkpointRef = {
     sessionKey,
     pipelineType: 'notes',
@@ -1631,9 +1630,6 @@ async function notesPipeline(route, message) {
     existingCheckpoint?.resume?.chapter != null &&
     (existingCheckpoint?.state === 'paused_for_outage' || existingCheckpoint?.state === 'paused_for_usage_limit' || existingCheckpoint?.state === 'failed' || existingCheckpoint?.state === 'running')
   );
-  // #region agent log
-  fetch('http://localhost:7282/ingest/190f0e90-444d-4921-920d-f208e86f8cb3',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'7de6a4'},body:JSON.stringify({sessionId:'7de6a4',runId:debugRunId,hypothesisId:'H4',location:'notes-pipeline.js:resume-gate',message:'checkpoint and resume decision',data:{scope:{book,startChapter,endChapter,verseStart:verseStart??null,verseEnd:verseEnd??null},fresh,checkpointState:existingCheckpoint?.state||null,resume:existingCheckpoint?.resume||null,canResumeFromCheckpoint},timestamp:Date.now()})}).catch(()=>{});
-  // #endregion
   if (!fresh && canResumeFromCheckpoint && resumeChapter >= startChapter) {
     // The resume chapter was counted as failed in the previous run; undo that
     // so it isn't double-counted if it succeeds this time.
@@ -2080,9 +2076,6 @@ async function notesPipeline(route, message) {
       const toolConfig = getSkillToolConfig(skill.name);
       await status(`Running **${skill.name}** for ${ref} (timeout: ${Math.round(timeoutMs / 60000)}min)...`);
       console.log(`[notes] Running ${skill.name}: ${skill.prompt} (timeout: ${Math.round(timeoutMs / 60000)}min)`);
-      // #region agent log
-      fetch('http://localhost:7282/ingest/190f0e90-444d-4921-920d-f208e86f8cb3',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'7de6a4'},body:JSON.stringify({sessionId:'7de6a4',runId:debugRunId,hypothesisId:'H1',location:'notes-pipeline.js:skill-start',message:'skill start',data:{ref,skill:skill.name,expectedOutput:skill.expectedOutput||null,prompt:skill.prompt,skillStart,timeoutMs},timestamp:Date.now()})}).catch(()=>{});
-      // #endregion
       setCheckpoint(checkpointRef, {
         state: 'running',
         totalSuccess,
@@ -2203,9 +2196,6 @@ async function notesPipeline(route, message) {
         }
       }
       } // end !usedParallel
-      // #region agent log
-      fetch('http://localhost:7282/ingest/190f0e90-444d-4921-920d-f208e86f8cb3',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'7de6a4'},body:JSON.stringify({sessionId:'7de6a4',runId:debugRunId,hypothesisId:'H4',location:'notes-pipeline.js:skill-result',message:'skill result/error',data:{ref,skill:skill.name,hadError:!!skillError,error:skillError?String(skillError.message||skillError):null,resultSubtype:result?.subtype||null,resultError:result?.error||null},timestamp:Date.now()})}).catch(()=>{});
-      // #endregion
 
       const duration = ((Date.now() - skillStart) / 1000).toFixed(1);
       const sdkSuccess = result?.subtype === 'success';
@@ -2294,9 +2284,6 @@ async function notesPipeline(route, message) {
         const discoverPat = new RegExp(`^${book}-0*${ch}(-.*)?${outExt}$`);
         const resolved = discoverFreshOutput(outDir, book, discoverPat, skillStart)
           || resolveOutputFile(skill.expectedOutput, book);
-        // #region agent log
-        fetch('http://localhost:7282/ingest/190f0e90-444d-4921-920d-f208e86f8cb3',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'7de6a4'},body:JSON.stringify({sessionId:'7de6a4',runId:debugRunId,hypothesisId:'H1',location:'notes-pipeline.js:resolve-output',message:'resolved expected output',data:{ref,skill:skill.name,expectedOutput:skill.expectedOutput,resolved:resolved||null},timestamp:Date.now()})}).catch(()=>{});
-        // #endregion
         if (!resolved) {
           failedSkill = skill.name;
           await status(`**${skill.name}** failed for ${ref} \u2014 expected output not found: ${skill.expectedOutput} (${duration}s)`);
@@ -2317,9 +2304,6 @@ async function notesPipeline(route, message) {
         } catch (_) {
           mtimeMs = 0;
         }
-        // #region agent log
-        fetch('http://localhost:7282/ingest/190f0e90-444d-4921-920d-f208e86f8cb3',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'7de6a4'},body:JSON.stringify({sessionId:'7de6a4',runId:debugRunId,hypothesisId:'H2',location:'notes-pipeline.js:freshness-check',message:'mtime freshness evaluation',data:{ref,skill:skill.name,resolved,skillStart,mtimeMs,isStale:mtimeMs<(skillStart-2000)},timestamp:Date.now()})}).catch(()=>{});
-        // #endregion
         if (mtimeMs < skillStart - 2000) {
           if (skill.name === 'post-edit-review') {
             // post-edit-review can legitimately keep an unchanged issues TSV.
