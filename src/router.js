@@ -104,23 +104,31 @@ const activePipelines = new Set();
 const MIN_TIMEOUT_MS = 10 * 60 * 1000; // 10 min floor
 const MS_PER_VERSE_OP = 5 * 60 * 1000; // 5 min per verse per operation
 
+function stripMentions(content) {
+  // Strip @**Name** or @**Name|id** from both leading and trailing positions
+  // so "yes @**BPbot**" and "@**BPbot** yes" both reduce to "yes"
+  return content.trim().toLowerCase()
+    .replace(/^@\*\*[^*]+\*\*\s*/, '')
+    .replace(/\s*@\*\*[^*]+\*\*$/, '');
+}
+
 function isYes(content) {
-  const t = content.trim().toLowerCase().replace(/^@\*\*[^*]+\*\*\s*/, '');
+  const t = stripMentions(content);
   return /^(y|yes|yep|yeah|yea|correct|sure|do it|go|go ahead|ok|okay)[\s.!]*$/.test(t);
 }
 
 function isNo(content) {
-  const t = content.trim().toLowerCase().replace(/^@\*\*[^*]+\*\*\s*/, '');
+  const t = stripMentions(content);
   return /^(n|no|nope|nah|cancel|wrong|never ?mind)[\s.!]*$/.test(t);
 }
 
 function isMerged(content) {
-  const t = content.trim().toLowerCase().replace(/^@\*\*[^*]+\*\*\s*/, '');
+  const t = stripMentions(content);
   return /^(merged|done|i merged|it'?s merged|branches? merged|go ahead)[\s.!]*$/.test(t);
 }
 
 function isCancelMerge(content) {
-  const t = content.trim().toLowerCase().replace(/^@\*\*[^*]+\*\*\s*/, '');
+  const t = stripMentions(content);
   return /^(cancel|discard|nevermind|never ?mind|forget it|start over)[\s.!]*$/.test(t);
 }
 
@@ -1206,6 +1214,16 @@ async function routeMessage(message) {
     if (session && session.sessionId) {
       console.log(`[router] Active session found — resuming for ${sessionKey}`);
       firePipeline(config.dmDefaultPipeline, message);
+      return;
+    }
+
+    // Guard: bare yes/no with no pending confirmation means the user is likely replying
+    // to a confirmation prompt that's no longer in memory (e.g. after a bot restart).
+    // Don't pass this to Haiku — it can't do anything useful with a lone "yes".
+    if (isYes(message.content) || isNo(message.content)) {
+      console.log(`[router] Bare yes/no with no pending confirmation from ${message.sender_full_name} in ${sessionKey}`);
+      await sendMessage(message.display_recipient, message.subject,
+        `@**${message.sender_full_name}** I don't have anything waiting for confirmation right now. Please re-send your original request and I'll ask again.`);
       return;
     }
 
