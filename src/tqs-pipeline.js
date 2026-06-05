@@ -259,6 +259,7 @@ async function tqsPipeline(route, message) {
     try {
       result = await runClaude({
         skill: 'tq-writer',
+        label: `${ref} tq-writer`,
         model: 'sonnet',
         cwd: CSKILLBP_DIR,
         prompt: `Write translation questions for ${book} chapter ${chapter}.`,

@@ -257,6 +257,7 @@ async function runDiagnosisAgent({ contextSummary, runClaudeImpl }) {
   const runner = runClaudeImpl || runClaude;
   const result = await runner({
     prompt: contextSummary,
+    label: 'self-diagnosis',
     cwd: process.cwd(),
     model: 'sonnet',
     allowedTools: ['Read', 'Grep'],

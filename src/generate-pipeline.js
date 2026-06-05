@@ -610,6 +610,7 @@ async function generatePipeline(route, message) {
         } else if (runInitialSkill) {
           claudeResult = await runClaude({
             prompt: initialPrompt,
+            label: `${skillRef} ${skill}`,
             cwd: CSKILLBP_DIR,
             model,
             betas,
@@ -780,6 +781,7 @@ async function generatePipeline(route, message) {
                 missing: initialPipelineStatus.missing,
                 observed: observedArtifacts,
               }),
+              label: `${book} ${ch} ${skill} (cont)`,
               cwd: CSKILLBP_DIR,
               model,
               betas,
@@ -1061,6 +1063,7 @@ async function generatePipeline(route, message) {
       const alignTypeFlags = [contentTypes.includes('ult') && '--ult', contentTypes.includes('ust') && '--ust'].filter(Boolean).join(' ');
       const alignResult = await runClaude({
         prompt: `${alignRef} ${alignTypeFlags}${genCtxFlag}`,
+        label: `${alignRef} align-all-parallel`,
         cwd: CSKILLBP_DIR,
         model: model || 'sonnet',  // mechanical alignment — Sonnet suffices at lower cost
         betas,
@@ -1180,6 +1183,7 @@ async function generatePipeline(route, message) {
         await status(`Retrying **align-all-parallel** for ${book} ${ch} after degraded alignment check...`);
         const retryResult = await runClaude({
           prompt: `${alignRef} ${alignTypeFlags}${genCtxFlag}`,
+          label: `${alignRef} align-all-parallel (retry)`,
           cwd: CSKILLBP_DIR,
           model: model || 'sonnet',
           betas,

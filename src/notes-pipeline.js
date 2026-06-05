@@ -470,6 +470,7 @@ async function runPerNoteGeneration({ pipeDir, outputPath, status, book }) {
     try {
       const result = await runClaude({
         prompt,
+        label: `${item.reference || book} note`,
         cwd: CSKILLBP_DIR,
         model: 'sonnet',
         maxTurns: 2,
@@ -679,6 +680,7 @@ async function runATGeneration({ notesPath, pipeDir, status }) {
       // Step 1: Generate AT with Sonnet via SDK
       const atResult = await runClaude({
         prompt: userPrompt,
+        label: `${packet.reference || 'AT'} AT-gen`,
         cwd: CSKILLBP_DIR,
         model: 'sonnet',
         maxTurns: 2,
@@ -716,6 +718,7 @@ async function runATGeneration({ notesPath, pipeDir, status }) {
 
       const valResult = await runClaude({
         prompt: validatorPrompt,
+        label: `${packet.reference || 'AT'} AT-val`,
         cwd: CSKILLBP_DIR,
         model: 'haiku',
         maxTurns: 2,
@@ -743,6 +746,7 @@ async function runATGeneration({ notesPath, pipeDir, status }) {
 
       const retryResult = await runClaude({
         prompt: retryPrompt,
+        label: `${packet.reference || 'AT'} AT-retry`,
         cwd: CSKILLBP_DIR,
         model: 'sonnet',
         maxTurns: 2,
@@ -1518,6 +1522,7 @@ async function runParallelTnWriter({
       const toolConfig = getSkillToolConfig('tn-writer');
       return runClaude({
         prompt,
+        label: `${book} ${ch} tn-writer shard ${i}${vRange ? ` v${vRange}` : ''}`,
         cwd: CSKILLBP_DIR,
         model: model || undefined,
         skill: 'tn-writer',
@@ -2329,6 +2334,7 @@ async function notesPipeline(route, message) {
           console.log(`[notes] Starting skill ${skill.name} for ${ref}`);
           result = await runClaude({
             prompt: skill.prompt,
+            label: `${ref} ${skill.name}`,
             cwd: CSKILLBP_DIR,
             model: model || skill.model, // TEST_FAST haiku overrides per-skill model
             skill: skill.name,
@@ -2678,6 +2684,7 @@ async function notesPipeline(route, message) {
             `Do not create scratch scripts and do not perform open-ended manual JSON surgery loops.`;
           await runClaude({
             prompt: rescuePrompt,
+            label: `${ref} tn-quality-check (rescue)`,
             cwd: CSKILLBP_DIR,
             model: model || 'sonnet',
             skill: 'tn-quality-check',
