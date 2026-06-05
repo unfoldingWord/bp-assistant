@@ -370,7 +370,6 @@ def find_sequence(ult_dict_combined, notes_dict, unique_numbers):
 
     # Step 2: Find sequences
     for row in data["rows"]:
-
         if not row.get("Snippet"):
             continue
 
@@ -383,7 +382,6 @@ def find_sequence(ult_dict_combined, notes_dict, unique_numbers):
         # HEBREW QUOTE PATH
         # ------------------------------------------------------------------
         if is_hebrew(quote):
-
             numbers = []
             chunk_numbers = []
 
@@ -429,10 +427,11 @@ def find_sequence(ult_dict_combined, notes_dict, unique_numbers):
         # ------------------------------------------------------------------
         lower_phrase = phrase.lower()
         mod_phrase = re.sub(r'[.,]’', r'', lower_phrase)
-        mod_phrase = re.sub('-', ' ', mod_phrase)
+        mod_phrase = re.sub(r'[-—]', ' ', mod_phrase)
         mod_phrase = re.sub(r'(\d),(\d)', r'\1 \2', mod_phrase)
         mod_phrase = re.sub(r'[{}.,:;”‘“!?—*]', r'', mod_phrase)
         mod_phrase = re.sub('s’', 's', mod_phrase)
+        mod_phrase = re.sub(r'  +', ' ', mod_phrase)
         mod_phrase = re.escape(mod_phrase)
         mod_phrase = re.sub(r'[\\ ]*…[\\ ]*', ' )(.+?)(', mod_phrase)
         mod_phrase = re.sub(r'\\\&', ')(.+?)(', mod_phrase)
@@ -473,8 +472,8 @@ def find_sequence(ult_dict_combined, notes_dict, unique_numbers):
                 forward_text = None
                 reversed_text = None
                 forward_search_phrase = re.sub(r'(\\d\+) ', r'\1.*?', search_phrase)
-                forward_matches = list(re.finditer(forward_search_phrase, gloss_text))[:1]
-                for forward_match in forward_matches:
+                forward_match = re.search(forward_search_phrase, gloss_text)
+                if forward_match:
                     forward_text = forward_match.group(0)
 
                 mod_search_phrase = re.sub(r'[\)\(]', '', search_phrase)
@@ -485,9 +484,10 @@ def find_sequence(ult_dict_combined, notes_dict, unique_numbers):
 
                 reverse_gloss_text = ' '.join(gloss_text.split()[::-1])
 
-                reverse_matches = list(re.finditer(reverse_search_phrase, reverse_gloss_text))[:1]
-                for reverse_match in reverse_matches:
 
+                reverse_match = re.search(reverse_search_phrase, reverse_gloss_text)
+
+                if reverse_match:
                     reversed_text = reverse_match.group(0)
                     reversed_text = ' '.join(reversed_text.split()[::-1])
 
