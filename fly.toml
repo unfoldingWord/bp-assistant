@@ -30,9 +30,9 @@ kill_timeout = 30
   processes = ["app"]
 
 [[vm]]
-  memory = "2gb"
+  memory = "4gb"
   cpu_kind = "shared"
-  cpus = 1
+  cpus = 2
 
 [[mounts]]
   source = "workspace_vol"
