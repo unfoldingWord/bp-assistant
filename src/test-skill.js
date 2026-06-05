@@ -65,6 +65,7 @@ async function runSDK(opts) {
 
   const options = {
     prompt: opts.prompt,
+    label: `test ${opts.skill}`,
     cwd: CSKILLBP_DIR,
     model: opts.model,
     skill: opts.skill,
