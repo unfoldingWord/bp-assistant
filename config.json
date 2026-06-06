@@ -127,6 +127,8 @@
     "tnWriterParallelMinVerses": 35,
     "tnWriterMaxTurns": 400,
     "tnWriterMaxToolCalls": 400,
-    "rescueMaxPasses": 1
+    "rescueMaxPasses": 1,
+    "qualityCheckMaxConsecutiveToolErrors": 6,
+    "qualityCheckMaxRepeatedToolErrorSignature": 5
   }
 }

@@ -443,6 +443,14 @@ function isTransientOutageError(err) {
   return false;
 }
 
+// True for any guardrail-stop the runner throws/returns (repeated tool errors,
+// max tool calls, or token budget). Callers use this to distinguish a "ran out
+// of budget / looping" stop from a genuine crash or transient outage.
+function isGuardrailStop(err) {
+  const msg = typeof err === 'string' ? err : (err && err.message) || String(err || '');
+  return /Guardrail stop:/i.test(msg);
+}
+
 function backoffDelayMs(attempt) {
   const exp = Math.min(RETRY_MAX_DELAY_MS, RETRY_BASE_DELAY_MS * Math.pow(2, Math.max(0, attempt - 1)));
   const jitter = Math.floor(Math.random() * 2000);
@@ -627,6 +635,7 @@ module.exports = {
   DEFAULT_RESTRICTED_TOOLS,
   ClaudeTransientOutageError,
   isTransientOutageError,
+  isGuardrailStop,
   THINKING_LOW,
   THINKING_MEDIUM,
   THINKING_HIGH,

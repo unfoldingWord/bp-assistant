@@ -3,7 +3,7 @@
 const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
-const { runClaude } = require('./claude-runner');
+const { runClaude, isGuardrailStop } = require('./claude-runner');
 const { publishAdminStatus, readAdminStatus } = require('./admin-status');
 const { readSecret } = require('./secrets');
 const {
@@ -119,7 +119,7 @@ A concrete, minimal change. If the cause is unclear, list the next debugging ste
 
 The fingerprint marker will be appended automatically — do not include it.`;
 
-function buildContextSummary(event, contextEvents, checkpoint, errorText) {
+function buildContextSummary(event, contextEvents, checkpoint, errorText, workdir) {
   const lines = [];
   lines.push('## Failure event');
   lines.push(`- timestamp: ${event.timestamp}`);
@@ -145,6 +145,25 @@ function buildContextSummary(event, contextEvents, checkpoint, errorText) {
     lines.push(JSON.stringify(checkpoint, null, 2));
     lines.push('```');
     lines.push('');
+  }
+  {
+    const wd = workdir || process.env.CSKILLBP_DIR || '';
+    const outputs = (checkpoint && checkpoint.skillOutputs) || {};
+    let notesRel = null;
+    for (const ch of Object.keys(outputs)) {
+      const bySkill = outputs[ch] || {};
+      if (bySkill['tn-writer']) { notesRel = bySkill['tn-writer']; break; }
+    }
+    if (wd || notesRel) {
+      lines.push('## Working directory');
+      if (wd) lines.push(`- Pipeline working dir (CSKILLBP_DIR): ${wd}`);
+      if (notesRel) {
+        lines.push(`- Notes TSV (relative): ${notesRel}`);
+        if (wd) lines.push(`- Notes TSV (absolute): ${path.resolve(wd, notesRel)}`);
+      }
+      lines.push('- Read files by absolute path; do not run `find` to locate them.');
+      lines.push('');
+    }
   }
   if (errorText) {
     lines.push('## Error text from failure site');
@@ -264,9 +283,9 @@ async function runDiagnosisAgent({ contextSummary, runClaudeImpl }) {
     mcpToolSet: 'workspace',
     disableLocalSettings: true,
     appendSystemPrompt: SYSTEM_PROMPT,
-    maxTurns: 30,
-    timeoutMs: 3 * 60 * 1000,
-    guardrails: { maxToolCalls: 25, tokenBudget: 200000 },
+    maxTurns: 40,
+    timeoutMs: 5 * 60 * 1000,
+    guardrails: { maxToolCalls: 40, tokenBudget: 200000 },
   });
   return {
     subtype: result?.subtype || 'unknown',
@@ -344,6 +363,45 @@ function buildFallbackDiagnosis(event, rawText, parseError, contextSummary) {
   };
 }
 
+// Templated diagnosis for a recognized runner guardrail stop (looping tool errors
+// or budget exhaustion). No LLM investigation is run — the signature is well
+// understood — so we file a concise, actionable issue directly.
+function buildGuardrailStopDiagnosis(event, contextSummary) {
+  const targetRepo = classifyRepo(event);
+  const scopeLabel = event.scope || event.pipelineType || 'event';
+  const title = `Pipeline guardrail stop: ${event.pipelineType || 'unknown'} ${scopeLabel}`.slice(0, 120);
+  const body = [
+    '## Summary',
+    'A pipeline step was stopped by a runner guardrail (repeated tool errors, max tool calls,',
+    'or token budget). This is a known signature, so no agent investigation was run — it was',
+    'filed directly. The usual cause is a skill looping on `Edit` "string to replace not found"',
+    'against a TSV/JSON source; see the structured by-id tools (update_note_text /',
+    'update_prepared_quote / remove_note) and the per-skill repeated-error guardrails.',
+    '',
+    '## Failure event',
+    `- pipelineType: ${event.pipelineType || '(unknown)'}`,
+    `- scope: ${event.scope || '(none)'}`,
+    `- phase: ${event.phase || '(none)'}`,
+    `- severity: ${event.severity || '(unknown)'}`,
+    `- message: ${event.message || '(none)'}`,
+    '',
+    '## Diagnosis context',
+    '<details><summary>Click to expand</summary>',
+    '',
+    '```',
+    String(contextSummary || '').slice(0, 8000),
+    '```',
+    '</details>',
+  ].join('\n');
+  return {
+    repo: targetRepo,
+    title,
+    body,
+    labels: ['bug', 'pipeline-failure', 'guardrail-stop'],
+    classification: 'guardrail-stop',
+  };
+}
+
 async function dispatchSelfDiagnosis({
   event,
   checkpoint = null,
@@ -392,49 +450,60 @@ async function dispatchSelfDiagnosis({
     const recent = readEvents({ scope: event.scope || undefined, limit: 20 });
     const recentEvents = Array.isArray(recent) ? [...recent].reverse() : [];
 
-    const contextSummary = buildContextSummary(event, recentEvents, checkpoint, errorText);
-    const agentResult = await runDiagnosisAgent({ contextSummary, runClaudeImpl });
-    const rawText = agentResult.rawText;
-    const cleanSubtype = agentResult.subtype || 'unknown';
-    const nonSuccess = cleanSubtype !== 'success';
-    if (nonSuccess) {
-      const flavor = rawText ? 'agent_non_success_with_text' : 'agent_non_success_no_text';
-      try {
-        await publishAdminStatus({
-          source: 'self-diagnosis',
-          pipelineType: event.pipelineType || 'system',
-          scope: event.scope || null,
-          phase: 'self-diagnosis',
-          severity: 'warn',
-          message: `Diagnosis agent non-success (${flavor}): subtype=${cleanSubtype}`,
-        });
-      } catch (_) { /* non-fatal */ }
-    }
+    const workdir = process.env.CSKILLBP_DIR || process.cwd();
+    const contextSummary = buildContextSummary(event, recentEvents, checkpoint, errorText, workdir);
 
     let diagnosis;
     let usedFallback = false;
     let parseError = null;
-    try {
-      diagnosis = extractDiagnosisJson(rawText);
-    } catch (err) {
-      parseError = err;
-      const rawPath = persistRawDiagnosisOutput(fingerprint, rawText);
-      if (rawPath) {
-        console.error(`[self-diagnosis] Persisted unparseable raw output to ${rawPath}`);
+    let shortCircuited = false;
+
+    if (isGuardrailStop(errorText) || isGuardrailStop(event.message)) {
+      // Known signature — skip the LLM investigation and file a templated issue.
+      console.log('[self-diagnosis] Guardrail-stop signature recognized; filing templated issue without running the agent.');
+      diagnosis = buildGuardrailStopDiagnosis(event, contextSummary);
+      shortCircuited = true;
+    } else {
+      const agentResult = await runDiagnosisAgent({ contextSummary, runClaudeImpl });
+      const rawText = agentResult.rawText;
+      const cleanSubtype = agentResult.subtype || 'unknown';
+      const nonSuccess = cleanSubtype !== 'success';
+      if (nonSuccess) {
+        const flavor = rawText ? 'agent_non_success_with_text' : 'agent_non_success_no_text';
+        try {
+          await publishAdminStatus({
+            source: 'self-diagnosis',
+            pipelineType: event.pipelineType || 'system',
+            scope: event.scope || null,
+            phase: 'self-diagnosis',
+            severity: 'warn',
+            message: `Diagnosis agent non-success (${flavor}): subtype=${cleanSubtype}`,
+          });
+        } catch (_) { /* non-fatal */ }
       }
-      if (!looksLikeDiagnosisAttempt(rawText)) {
-        if (nonSuccess) {
-          throw new Error(
-            `Diagnosis agent did not complete cleanly: subtype=${cleanSubtype}; ` +
-            `error=${String(agentResult.error || '').slice(0, 200)}; ` +
-            `result_head=${String(agentResult.resultHead || '').slice(0, 200)}`
-          );
+
+      try {
+        diagnosis = extractDiagnosisJson(rawText);
+      } catch (err) {
+        parseError = err;
+        const rawPath = persistRawDiagnosisOutput(fingerprint, rawText);
+        if (rawPath) {
+          console.error(`[self-diagnosis] Persisted unparseable raw output to ${rawPath}`);
         }
-        throw err;
+        if (!looksLikeDiagnosisAttempt(rawText)) {
+          if (nonSuccess) {
+            throw new Error(
+              `Diagnosis agent did not complete cleanly: subtype=${cleanSubtype}; ` +
+              `error=${String(agentResult.error || '').slice(0, 200)}; ` +
+              `result_head=${String(agentResult.resultHead || '').slice(0, 200)}`
+            );
+          }
+          throw err;
+        }
+        console.error(`[self-diagnosis] JSON parse failed (${err.message.slice(0, 200)}); filing fallback issue with raw output`);
+        diagnosis = buildFallbackDiagnosis(event, rawText, err, contextSummary);
+        usedFallback = true;
       }
-      console.error(`[self-diagnosis] JSON parse failed (${err.message.slice(0, 200)}); filing fallback issue with raw output`);
-      diagnosis = buildFallbackDiagnosis(event, rawText, err, contextSummary);
-      usedFallback = true;
     }
 
     const finalRepo = VALID_REPOS.has(diagnosis.repo) ? diagnosis.repo : targetRepo;
@@ -456,7 +525,7 @@ async function dispatchSelfDiagnosis({
       });
     } catch (_) { /* non-fatal */ }
 
-    const action = usedFallback ? 'created-fallback' : 'created';
+    const action = shortCircuited ? 'created-guardrail' : (usedFallback ? 'created-fallback' : 'created');
     console.log(`[self-diagnosis] Done (action=${action} issue=${finalRepo}#${created.number}${usedFallback ? ' parse-error=' + (parseError && parseError.message ? parseError.message.slice(0, 120) : 'unknown') : ''})`);
     return { ok: true, action, issue: created, fingerprint, classification: diagnosis.classification };
   } catch (err) {
@@ -486,6 +555,7 @@ module.exports = {
   repairAgentJson,
   looksLikeDiagnosisAttempt,
   buildFallbackDiagnosis,
+  buildGuardrailStopDiagnosis,
   buildContextSummary,
   appendFingerprintMarker,
   FINGERPRINT_PREFIX,

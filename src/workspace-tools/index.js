@@ -11,7 +11,7 @@ const { splitTsv, mergeTsvs, fixTrailingNewlines } = require('./tsv-tools');
 const { extractUltEnglish, filterPsalms, curlyQuotes, checkUstPassives, createAlignedUsfm, repairAlignmentXContent, readUsfmChapter, mergeAlignedUsfm, validateAlignmentJson, validateUltBrackets, checkUltVoiceMismatch } = require('./usfm-tools');
 const { buildStrongsIndex, buildTnIndex, buildUstIndex } = require('./index-tools');
 const { checkTwHeadwords, compareUltUst, detectAbstractNouns } = require('./issue-tools');
-const { extractAlignmentData, fixHebrewQuotes, flagNarrowQuotes, generateIds, resolveGlQuotes, verifyAtFit, assembleNotes, prepareNotes, prepareAndValidate, fixUnicodeQuotes, verifyBoldMatches, fillTsvIds, fillOrigQuotes, prepareATContext, readPreparedNotes } = require('./tn-tools');
+const { extractAlignmentData, fixHebrewQuotes, flagNarrowQuotes, generateIds, resolveGlQuotes, verifyAtFit, assembleNotes, updateNoteText, updatePreparedQuote, removeNote, prepareNotes, prepareAndValidate, fixUnicodeQuotes, verifyBoldMatches, fillTsvIds, fillOrigQuotes, prepareATContext, readPreparedNotes } = require('./tn-tools');
 const { validateTnTsv, checkTnQuality } = require('./quality-tools');
 const { giteaPr, prepareCompare, prepareTq, verifyTq, appendQuickref } = require('./misc-tools');
 
@@ -540,6 +540,23 @@ function createQualityTools(createSdkMcpServer, tool, z) {
       tool('curly_quotes', 'Convert straight quotes to curly quotes', {
         input: z.string(), output: z.string().optional(), inPlace: z.boolean().optional(),
       }, async (args) => ({ content: [{ type: 'text', text: curlyQuotes(args) }] })),
+      tool('update_note_text', 'Set the note text for one generated note by id (in generated_notes.json). Use this instead of hand-editing the JSON. After updating, re-run assemble_notes + curly_quotes.', {
+        generatedJson: z.string().describe('Path to generated_notes.json (runtime.generatedNotes)'),
+        id: z.string().describe('The note id to update'),
+        note: z.string().describe('The full replacement note text'),
+      }, async (args) => ({ content: [{ type: 'text', text: updateNoteText(args) }] })),
+      tool('update_prepared_quote', 'Set quote fields for one prepared note by id (in prepared_notes.json). Only the provided fields are changed. After updating, re-run assemble_notes + curly_quotes.', {
+        preparedJson: z.string().describe('Path to prepared_notes.json (runtime.preparedNotes)'),
+        id: z.string().describe('The prepared item id to update'),
+        glQuote: z.string().optional().describe('New gl_quote'),
+        glQuoteRoundtripped: z.string().optional().describe('New gl_quote_roundtripped'),
+        origQuote: z.string().optional().describe('New orig_quote'),
+      }, async (args) => ({ content: [{ type: 'text', text: updatePreparedQuote(args) }] })),
+      tool('remove_note', 'Remove one note by id from generated_notes.json and/or directly from an assembled TSV row. Use for antithetical-parallelism or redundant notes.', {
+        id: z.string().describe('The note id to remove'),
+        generatedJson: z.string().optional().describe('Path to generated_notes.json (runtime.generatedNotes)'),
+        tsvFile: z.string().optional().describe('Path to the assembled TN TSV (removes the row whose ID column matches)'),
+      }, async (args) => ({ content: [{ type: 'text', text: removeNote(args) }] })),
     ],
   });
 }
