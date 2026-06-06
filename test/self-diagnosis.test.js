@@ -18,6 +18,8 @@ const {
   repairAgentJson,
   looksLikeDiagnosisAttempt,
   appendFingerprintMarker,
+  buildContextSummary,
+  buildGuardrailStopDiagnosis,
   FINGERPRINT_PREFIX,
 } = require('../src/self-diagnosis');
 
@@ -383,4 +385,51 @@ test('dispatchSelfDiagnosis fails with subtype details when diagnosis subtype is
   assert.equal(result.ok, false);
   assert.equal(calls.createCount, 0);
   assert.match(result.reason, /subtype=error/);
+});
+
+test('dispatchSelfDiagnosis short-circuits a guardrail-stop without invoking the agent', async () => {
+  const event = makePsa1Event({
+    pipelineType: 'notes',
+    scope: 'ZEC 6',
+    message: 'Chapter ZEC 6 failed at **tn-quality-check** after 3212.7s',
+  });
+  const calls = {};
+  const fetchImpl = createGithubFetchStub({ captureCalls: calls });
+  let claudeWasCalled = false;
+  const runClaudeImpl = async () => { claudeWasCalled = true; return { subtype: 'success', result: VALID_AGENT_OUTPUT }; };
+
+  const result = await dispatchSelfDiagnosis({
+    event,
+    errorText: 'Skill that failed: tn-quality-check\nGuardrail stop: repeated tool errors (string_not_found, consecutive=17, repeats=25)',
+    checkpoint: { state: 'failed', skillOutputs: { '6': { 'tn-writer': 'output/notes/ZEC/ZEC-06.tsv' } } },
+    runClaudeImpl,
+    fetchImpl,
+    readSecretImpl: () => 'fake-token',
+    readAdminStatusImpl: () => [event],
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.action, 'created-guardrail');
+  assert.equal(claudeWasCalled, false, 'a known guardrail stop must not invoke the diagnosis agent');
+  assert.equal(calls.createCount, 1);
+  assert.ok(calls.lastCreateBody.labels.includes('guardrail-stop'));
+  assert.match(calls.lastCreateBody.body, /pipeline-failure-fingerprint:/);
+});
+
+test('buildContextSummary surfaces the absolute notes path so the agent does not hunt', () => {
+  const event = makePsa1Event({ pipelineType: 'notes', scope: 'ZEC 6' });
+  const checkpoint = { state: 'failed', skillOutputs: { '6': { 'tn-writer': 'output/notes/ZEC/ZEC-06.tsv' } } };
+  const summary = buildContextSummary(event, [], checkpoint, 'err', '/data/workspace');
+  assert.match(summary, /Working directory/);
+  assert.match(summary, /CSKILLBP_DIR\): \/data\/workspace/);
+  assert.match(summary, /\/data\/workspace\/output\/notes\/ZEC\/ZEC-06\.tsv/);
+});
+
+test('buildGuardrailStopDiagnosis returns a templated issue tagged guardrail-stop', () => {
+  const event = makePsa1Event({ pipelineType: 'notes', scope: 'ZEC 6' });
+  const d = buildGuardrailStopDiagnosis(event, 'some context');
+  assert.ok(d.title.length <= 120);
+  assert.ok(d.labels.includes('guardrail-stop'));
+  assert.equal(d.classification, 'guardrail-stop');
+  assert.match(d.body, /guardrail/i);
 });

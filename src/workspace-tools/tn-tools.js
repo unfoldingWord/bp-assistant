@@ -1379,6 +1379,82 @@ function assembleNotes({ preparedJson, generatedJson, output }) {
   return res.join('\n');
 }
 
+// ---------------------------------------------------------------------------
+// Structured by-id edits for the quality-check skill.
+//
+// The quality skill previously fixed issues by freehand `Edit` on the upstream
+// JSON sources (generated_notes.json is a { id: noteText } map; prepared_notes.json
+// is { items: [ { id, gl_quote, gl_quote_roundtripped, orig_quote, ... } ] }).
+// Whitespace/escaping/already-edited mismatches produced "string to replace not
+// found" errors that looped until the runner guardrail tripped. These tools locate
+// items deterministically by id, so that whole error class disappears. A missing id
+// returns a plain message (not a tool error), so it never increments the runner's
+// repeated-tool-error guard \u2014 the skill should tag the row unresolved and move on.
+// ---------------------------------------------------------------------------
+
+function updateNoteText({ generatedJson, id, note }) {
+  if (!generatedJson) return 'ERROR: generatedJson is required';
+  if (!id) return 'ERROR: id is required';
+  const p = path.resolve(CSKILLBP_DIR, generatedJson);
+  const gen = JSON.parse(fs.readFileSync(p, 'utf8'));
+  if (!Object.prototype.hasOwnProperty.call(gen, id)) {
+    return `ERROR: id "${id}" not found in ${generatedJson} \u2014 no change made. Verify the id against the findings, or tag the row unresolved and move on.`;
+  }
+  gen[id] = String(note == null ? '' : note);
+  fs.writeFileSync(p, JSON.stringify(gen, null, 2) + '\n');
+  return `Updated note text for id "${id}" in ${generatedJson}. Re-run assemble_notes + curly_quotes to apply.`;
+}
+
+function updatePreparedQuote({ preparedJson, id, glQuote, glQuoteRoundtripped, origQuote }) {
+  if (!preparedJson) return 'ERROR: preparedJson is required';
+  if (!id) return 'ERROR: id is required';
+  const p = path.resolve(CSKILLBP_DIR, preparedJson);
+  const prep = JSON.parse(fs.readFileSync(p, 'utf8'));
+  const items = Array.isArray(prep.items) ? prep.items : [];
+  const item = items.find((it) => it && it.id === id);
+  if (!item) {
+    return `ERROR: id "${id}" not found in ${preparedJson} items \u2014 no change made. Verify the id, or tag the row unresolved and move on.`;
+  }
+  const changed = [];
+  if (glQuote !== undefined) { item.gl_quote = glQuote; changed.push('gl_quote'); }
+  if (glQuoteRoundtripped !== undefined) { item.gl_quote_roundtripped = glQuoteRoundtripped; changed.push('gl_quote_roundtripped'); }
+  if (origQuote !== undefined) { item.orig_quote = origQuote; changed.push('orig_quote'); }
+  if (!changed.length) return `No quote fields provided for id "${id}"; nothing changed.`;
+  fs.writeFileSync(p, JSON.stringify(prep, null, 2) + '\n');
+  return `Updated ${changed.join(', ')} for id "${id}" in ${preparedJson}. Re-run assemble_notes + curly_quotes to apply.`;
+}
+
+function removeNote({ id, generatedJson, tsvFile }) {
+  if (!id) return 'ERROR: id is required';
+  const msgs = [];
+  if (generatedJson) {
+    const p = path.resolve(CSKILLBP_DIR, generatedJson);
+    const gen = JSON.parse(fs.readFileSync(p, 'utf8'));
+    if (Object.prototype.hasOwnProperty.call(gen, id)) {
+      delete gen[id];
+      fs.writeFileSync(p, JSON.stringify(gen, null, 2) + '\n');
+      msgs.push(`removed id "${id}" from ${generatedJson}`);
+    } else {
+      msgs.push(`id "${id}" not present in ${generatedJson}`);
+    }
+  }
+  if (tsvFile) {
+    const tp = path.resolve(CSKILLBP_DIR, tsvFile);
+    const lines = fs.readFileSync(tp, 'utf8').split('\n');
+    let removed = 0;
+    const kept = lines.filter((line, idx) => {
+      if (idx === 0 || line.trim() === '') return true; // keep header and blank lines
+      const cols = line.split('\t');
+      if (cols[1] === id) { removed++; return false; }
+      return true;
+    });
+    fs.writeFileSync(tp, kept.join('\n'));
+    msgs.push(`removed ${removed} row(s) with id "${id}" from ${tsvFile}`);
+  }
+  if (!msgs.length) return 'ERROR: provide generatedJson and/or tsvFile';
+  return `remove_note: ${msgs.join('; ')}.`;
+}
+
 const HEBREW_QUOTE_STRIP_RE = /[\u0591-\u05AF\u2060\u05BD\u05C3]/g;
 
 function stripHebrewQuoteMarks(value) {
@@ -3078,6 +3154,9 @@ module.exports = {
   resolveGlQuotes,
   verifyAtFit,
   assembleNotes,
+  updateNoteText,
+  updatePreparedQuote,
+  removeNote,
   prepareNotes,
   prepareAndValidate,
   syncCanonicalHebrewQuotes,

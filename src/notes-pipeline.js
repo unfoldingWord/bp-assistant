@@ -12,7 +12,7 @@ const path = require('path');
 const config = require('./config');
 const { spawn } = require("child_process");
 const { sendMessage, sendDM, addReaction, removeReaction } = require('./zulip-client');
-const { runClaude, DEFAULT_RESTRICTED_TOOLS, isTransientOutageError } = require('./claude-runner');
+const { runClaude, DEFAULT_RESTRICTED_TOOLS, isTransientOutageError, isGuardrailStop } = require('./claude-runner');
 const { getDoor43Username, emailToFallbackUsername, buildBranchName, resolveOutputFile, discoverFreshOutput, checkPrerequisites, calcSkillTimeout, normalizeBookName, resolveConflictMention, parsePartialTsv, truncatePartialTsv, parseChunkRange, CSKILLBP_DIR } = require('./pipeline-utils');
 const { splitTsv, fixTrailingNewlines } = require('./workspace-tools/tsv-tools');
 const { fillTsvIds, generateIds, prepareNotes, fillOrigQuotes, resolveGlQuotes, flagNarrowQuotes, extractAlignmentData, prepareATContext, substituteAT, fixUnicodeQuotes, verifyBoldMatches, syncCanonicalHebrewQuotes, applyHintsToPreparedNotes, _stripAlternateTranslation: stripAlternateTranslation } = require('./workspace-tools/tn-tools');
@@ -49,7 +49,12 @@ const TN_QUALITY_CHECK_HINT =
   'Do not guess alternate file paths or probe missing runtime files outside context.json. ' +
   'Do the full semantic review (Steps 3a-3j), fix issues found, then re-run check_tn_quality ' +
   'at most once to verify fixes. If issues still persist after that one re-check, report them ' +
-  'as unresolved and stop. Do not loop further.';
+  'as unresolved and stop. Do not loop further. ' +
+  'To apply fixes, use the structured tools update_note_text / update_prepared_quote / remove_note ' +
+  '(they locate items by id) — never hand-Edit generated_notes.json or prepared_notes.json. ' +
+  'If any Edit returns "string to replace not found", do NOT retry that edit: re-Read the file once ' +
+  'or switch to the structured tool; if the target still cannot be matched, tag that row as ' +
+  'unresolved and move on.';
 
 const TN_WRITER_HINT =
   'The pipeline has already run all mechanical preparation (prepare_notes, fill_orig_quotes, resolve_gl_quotes, flag_narrow_quotes). ' +
@@ -1243,6 +1248,11 @@ const TN_WRITER_MAX_TURNS = Number((config.notesGuardrails || {}).tnWriterMaxTur
 const TN_WRITER_MAX_TOOL_CALLS = Number((config.notesGuardrails || {}).tnWriterMaxToolCalls || 1000);
 const RESCUE_MAX_PASSES = Number((config.notesGuardrails || {}).rescueMaxPasses || 1);
 const USE_PER_NOTE_GENERATION = Boolean((config.notesGuardrails || {}).usePerNoteGeneration);
+// Tight repeated-error limits for the INITIAL tn-quality-check pass so it bails in minutes
+// (not ~53min) when it loops on edits; Fix 1 then degrades gracefully. The bounded rescue pass
+// keeps its own tighter 2/3 override.
+const TN_QC_MAX_CONSEC = Number((config.notesGuardrails || {}).qualityCheckMaxConsecutiveToolErrors || 6);
+const TN_QC_MAX_REPEAT = Number((config.notesGuardrails || {}).qualityCheckMaxRepeatedToolErrorSignature || 5);
 const TN_WRITER_RESTRICTED_TOOLS = DEFAULT_RESTRICTED_TOOLS.filter((tool) => !TN_WRITER_TOOL_BLOCKLIST.includes(tool));
 
 function buildAtValidatorSystemPrompt() {
@@ -1298,12 +1308,21 @@ function parseContextPathFlag(ctxFlag) {
 }
 
 function applySkillSpecificGuardrails(skill, guardrails) {
-  if (skill !== 'tn-writer') return guardrails;
-  return {
-    ...guardrails,
-    maxTurns: Math.min(Number(guardrails?.maxTurns || TN_WRITER_MAX_TURNS), TN_WRITER_MAX_TURNS),
-    maxToolCalls: Math.min(Number(guardrails?.maxToolCalls || TN_WRITER_MAX_TOOL_CALLS), TN_WRITER_MAX_TOOL_CALLS),
-  };
+  if (skill === 'tn-writer') {
+    return {
+      ...guardrails,
+      maxTurns: Math.min(Number(guardrails?.maxTurns || TN_WRITER_MAX_TURNS), TN_WRITER_MAX_TURNS),
+      maxToolCalls: Math.min(Number(guardrails?.maxToolCalls || TN_WRITER_MAX_TOOL_CALLS), TN_WRITER_MAX_TOOL_CALLS),
+    };
+  }
+  if (skill === 'tn-quality-check') {
+    return {
+      ...guardrails,
+      maxConsecutiveToolErrors: Math.min(Number(guardrails?.maxConsecutiveToolErrors || TN_QC_MAX_CONSEC), TN_QC_MAX_CONSEC),
+      maxRepeatedToolErrorSignature: Math.min(Number(guardrails?.maxRepeatedToolErrorSignature || TN_QC_MAX_REPEAT), TN_QC_MAX_REPEAT),
+    };
+  }
+  return guardrails;
 }
 
 function getSkillToolConfig(skill) {
@@ -2379,6 +2398,24 @@ async function notesPipeline(route, message) {
       if (skillError) {
         failedSkill = skill.name;
         const errText = skillError.message || String(skillError);
+        // A guardrail stop on the quality check (looping edits / budget exhaustion) must not
+        // discard the already-written, mechanically-validated notes. Treat it as "quality
+        // incomplete but non-fatal": fall through to the graceful-degradation path (bounded
+        // rescue + tag unresolved findings + canonical quote-sync + door43-push) instead of
+        // failing the chapter. Scope strictly to tn-quality-check — a guardrail stop on
+        // tn-writer means the notes are incomplete and must still hard-fail.
+        if (skill.name === 'tn-quality-check' && isGuardrailStop(errText)) {
+          failedSkill = null;
+          await status(`**${skill.name}** for ${ref} stopped by guardrail (${errText}); proceeding with notes as written and tagging any unresolved findings.`);
+          try {
+            const qResolved = resolveOutputFile(skill.expectedOutput, book);
+            if (qResolved && fs.existsSync(path.resolve(CSKILLBP_DIR, qResolved))) {
+              if (!skillOutputs[ch]) skillOutputs[ch] = {};
+              skillOutputs[ch]['tn-quality-check'] = qResolved;
+            }
+          } catch (_) { /* no partial findings on disk — push notes as-is */ }
+          break;
+        }
         if (isTransientOutageError(skillError)) {
           abortForOutage = true;
           setCheckpoint(checkpointRef, {
