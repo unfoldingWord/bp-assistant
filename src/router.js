@@ -140,6 +140,16 @@ function parseMergeCommand(content) {
   return book ? { book, chapter: parseInt(m[2]) } : null;
 }
 
+// Scope-addressed counterpart to parseMergeCommand: discard one specific
+// deferred run when several share a topic (e.g. the API control thread).
+function parseCancelCommand(content) {
+  const t = content.trim().replace(/^@\*\*[^*]+\*\*\s*/, '');
+  const m = t.match(/^(?:cancel|discard)\s+(\w+)\s+(\d+)[\s.!]*$/i);
+  if (!m) return null;
+  const book = normalizeBookName(m[1]);
+  return book ? { book, chapter: parseInt(m[2]) } : null;
+}
+
 function buildConfirmMessage(template, captures) {
   if (!template) return null;
   return template.replace(/\$(\d+)/g, (_, idx) => {
@@ -858,7 +868,8 @@ const HELP_TEXT = `I can help with:\n` +
   `- **note HAB 3 lots of parallelism** -- file an observation for a book/chapter\n` +
   `- **report: ...** / **issue: ...** / **bug: ...** -- file bot feedback or a bug report\n` +
   `- **resume** -- resume a paused/failed run in this topic\n` +
-  `- **merged** or **merged PSA 82** -- continue insertion after you merge pending branches\n` +
+  `- **merged** or **merge PSA 82** -- continue insertion after you merge pending branches\n` +
+  `- **cancel** or **cancel PSA 82** -- discard a pending insertion (use the scoped form when several are waiting)\n` +
   `- **api generate PSA 79** / **api write notes PSA 82** -- use the API runner`;
 
 async function routeMessage(message) {
@@ -1001,6 +1012,27 @@ async function routeMessage(message) {
     }
   }
 
+  // Handle explicit "cancel PSA 88" command — discard one specific deferred run
+  // (the scope-addressed counterpart to "merge PSA 88"). Works from any topic.
+  if (isStream) {
+    const cancelCmd = parseCancelCommand(message.content);
+    if (cancelCmd) {
+      const match = getAllPendingMerges().find(pm =>
+        pm.book === cancelCmd.book && pm.startChapter <= cancelCmd.chapter && pm.endChapter >= cancelCmd.chapter);
+      if (match) {
+        clearPendingMerge(match.key || match.sessionKey);
+        console.log(`[router] Explicit cancel command for ${cancelCmd.book} ${cancelCmd.chapter} — discarded ${match.key || match.sessionKey}`);
+        await sendMessage(message.display_recipient, message.subject,
+          `Discarded the pending insertion for **${cancelCmd.book} ${cancelCmd.chapter}**. ` +
+          `Generated files are still in the output folder if you need them later.`);
+      } else {
+        await sendMessage(message.display_recipient, message.subject,
+          `No pending insertion found for ${cancelCmd.book} ${cancelCmd.chapter}.`);
+      }
+      return;
+    }
+  }
+
   // Check for pending merge (deferred repo-insert waiting for user to merge branches).
   // A single topic can hold several deferred runs at once (notably the API control
   // thread, which all API runs share), so resolve by session scan: bare "merged" /
@@ -1013,7 +1045,8 @@ async function routeMessage(message) {
         ? `${pm.book} ${pm.startChapter}`
         : `${pm.book} ${pm.startChapter}–${pm.endChapter}`;
       const listPending = () => sessionPending.map(pm => `**${labelOf(pm)}** (${pm.pipelineType})`).join(', ');
-      const example = `**merge ${sessionPending[0].book} ${sessionPending[0].startChapter}**`;
+      const mergeExample = `**merge ${sessionPending[0].book} ${sessionPending[0].startChapter}**`;
+      const cancelExample = `**cancel ${sessionPending[0].book} ${sessionPending[0].startChapter}**`;
 
       if (isMerged(message.content)) {
         if (sessionPending.length === 1) {
@@ -1025,7 +1058,7 @@ async function routeMessage(message) {
         } else {
           await sendMessage(message.display_recipient, message.subject,
             `More than one run is waiting to merge here: ${listPending()}. ` +
-            `Say **merge <BOOK> <chapter>** to pick one (e.g. ${example}).`);
+            `Say **merge <BOOK> <chapter>** to pick one (e.g. ${mergeExample}).`);
         }
         return;
       }
@@ -1039,7 +1072,7 @@ async function routeMessage(message) {
         } else {
           await sendMessage(message.display_recipient, message.subject,
             `More than one run is waiting here: ${listPending()}. ` +
-            `Resume a specific one with **merge <BOOK> <chapter>** (e.g. ${example}).`);
+            `Discard a specific one with **cancel <BOOK> <chapter>** (e.g. ${cancelExample}).`);
         }
         return;
       }
@@ -1535,7 +1568,7 @@ function triggerPipelineFromApi(input) {
   const message = buildApiSyntheticMessage({ pipelineType, scope, username, options });
   const { stream: controlStream, topic: controlTopic } = getApiControlThread();
   const derivedSessionKey = `stream-${controlStream}-${controlTopic}`;
-  const jobId = buildCheckpointKey({ sessionKey: derivedSessionKey, pipelineType, scope });
+  const jobId = buildApiJobId({ pipelineType, scope });
 
   // Conflict check 1: same (sessionKey, pipelineType, scope) already running?
   const activeCp = getActiveCheckpoint(route, derivedSessionKey, []);

@@ -1371,7 +1371,14 @@ async function generatePipeline(route, message) {
       ).join(', ');
       const fileList = [...new Set(dedupedConflicts.map(c => `\`${c.file}\``))].join(', ');
 
-      const pendingScope = { book, startChapter: start, endChapter: end, verseStart: verseStart ?? null, verseEnd: verseEnd ?? null };
+      // Key/label off the chapters actually completed (deferred), not the
+      // requested range — early chapters can fail generation and be skipped,
+      // so completedChapters[0].ch may be > start. Matches notes-pipeline and
+      // keeps the displayed range, the "merge BOOK ch" hint, and the stored
+      // scope consistent.
+      const deferredStart = completedChapters[0].ch;
+      const deferredEnd = completedChapters[completedChapters.length - 1].ch;
+      const pendingScope = { book, startChapter: deferredStart, endChapter: deferredEnd, verseStart: verseStart ?? null, verseEnd: verseEnd ?? null };
       const pendingKey = buildCheckpointKey({ sessionKey, pipelineType: 'generate', scope: pendingScope });
       setPendingMerge(pendingKey, {
         key: pendingKey,
@@ -1379,8 +1386,8 @@ async function generatePipeline(route, message) {
         pipelineType: 'generate',
         username,
         book,
-        startChapter: start,
-        endChapter: end,
+        startChapter: deferredStart,
+        endChapter: deferredEnd,
         scope: pendingScope,
         completedChapters,
         blockingBranches: dedupedConflicts.map(c => ({ repo: c.repo, branchPattern: c.branch })),
