@@ -1351,8 +1351,38 @@ const API_PIPELINE_ROUTE_NAMES = {
   tqs: 'write-tqs',
 };
 
-function getApiStream() {
-  return process.env.BT_API_ZULIP_STREAM || 'bp-api';
+// API-triggered runs (POST /api/pipeline/start) have no originating Zulip
+// thread, so we adopt a fixed control thread as their lifecycle +
+// human-in-the-loop channel: the bot's watched channel (config.channel) plus a
+// configurable topic. The stream is hard-locked to config.channel — the
+// merge-conflict "merged" reply must land on the watched channel to be heard
+// at all (see index.js handleEvents). Only the topic is configurable.
+function getApiControlThread() {
+  return {
+    stream: config.channel,
+    topic: process.env.BT_API_CONTROL_TOPIC
+      || (config.apiControlThread && config.apiControlThread.topic)
+      || 'Bot testing',
+  };
+}
+
+// Compact, human-readable label for an API run, e.g. "ZEC 7 notes".
+function buildApiRunLabel({ pipelineType, scope }) {
+  const { book, startChapter, endChapter, verseStart, verseEnd } = scope;
+  const chPart = verseStart != null && verseEnd != null && startChapter === endChapter
+    ? `${startChapter}:${verseStart}-${verseEnd}`
+    : startChapter === endChapter
+      ? `${startChapter}`
+      : `${startChapter}-${endChapter}`;
+  const typeLabel = pipelineType === 'generate' ? 'content'
+    : pipelineType === 'notes' ? 'notes'
+      : 'tqs';
+  return `${book} ${chPart} ${typeLabel}`;
+}
+
+// Stamp for lifecycle posts, e.g. "ZEC 7 notes · triggered by @username · job `…`".
+function buildApiRunStamp({ pipelineType, scope, username, jobId }) {
+  return `${buildApiRunLabel({ pipelineType, scope })} · triggered by @${username} · job \`${jobId}\``;
 }
 
 function buildApiSyntheticRoute(pipelineType, scope, options) {
@@ -1418,21 +1448,30 @@ function buildApiSyntheticMessage({ pipelineType, scope, apiSessionKey, username
     : 'write tqs';
   const flags = buildApiContentFlags(pipelineType, options);
   const content = [commandWord, book, chapterPart, ...flags].join(' ');
+  // Adopt the API control thread as this run's originating stream/topic. The
+  // pipelines derive sessionKey, checkpoints, pending-merge keys and all Zulip
+  // posts from message.display_recipient/subject, so this single substitution
+  // makes API runs visible and their merge-conflict prompts answerable in the
+  // control thread with no per-pipeline changes. apiSessionKey is retained for
+  // the API response/dedup, but no longer participates in the sessionKey.
+  const { stream: controlStream, topic: controlTopic } = getApiControlThread();
   return {
     id: -1,
     type: 'stream',
-    display_recipient: getApiStream(),
-    subject: apiSessionKey,
+    display_recipient: controlStream,
+    subject: controlTopic,
     sender_id: -1,
     sender_full_name: username,
     sender_email: `${username}@api.bp-assistant`,
     content,
     _apiOrigin: true,
+    _apiSessionKey: apiSessionKey,
   };
 }
 
-function buildApiJobId({ apiSessionKey, pipelineType, scope }) {
-  const derivedSessionKey = `stream-${getApiStream()}-${apiSessionKey}`;
+function buildApiJobId({ pipelineType, scope }) {
+  const { stream, topic } = getApiControlThread();
+  const derivedSessionKey = `stream-${stream}-${topic}`;
   return buildCheckpointKey({ sessionKey: derivedSessionKey, pipelineType, scope });
 }
 
@@ -1470,7 +1509,8 @@ function triggerPipelineFromApi(input) {
     return { status: 'invalid', message: `Unknown pipelineType: ${pipelineType}` };
   }
   const message = buildApiSyntheticMessage({ pipelineType, scope, apiSessionKey, username, options });
-  const derivedSessionKey = `stream-${getApiStream()}-${apiSessionKey}`;
+  const { stream: controlStream, topic: controlTopic } = getApiControlThread();
+  const derivedSessionKey = `stream-${controlStream}-${controlTopic}`;
   const jobId = buildCheckpointKey({ sessionKey: derivedSessionKey, pipelineType, scope });
 
   // Conflict check 1: same (sessionKey, pipelineType, scope) already running?
@@ -1502,11 +1542,26 @@ function triggerPipelineFromApi(input) {
     for (const k of keys) activePipelines.add(k);
   }
 
+  // Lifecycle: announce the run in the control thread (API runs have no
+  // originating message to react to). Finished / per-chapter / merge-conflict
+  // posts ride the pipeline's own reply()/sendMessage path to the same thread.
+  const stamp = buildApiRunStamp({ pipelineType, scope, username, jobId });
+  sendMessage(controlStream, controlTopic, `:rocket: Starting ${stamp}`).catch((err) =>
+    console.error(`[router/api] Failed to post start message: ${err.message}`));
+
   // Fire and forget.
   runPipeline(route, message)
     .catch(async (err) => {
       console.error(`[router/api] Pipeline "${route.name}" failed: ${err.message}`);
       await publishRouterFailure(route, message, err);
+      // The pipeline's own handled errors (outage, usage limit, conflict) post
+      // to the thread already; this covers an unhandled throw, which otherwise
+      // only reaches the admin status board.
+      try {
+        await sendMessage(controlStream, controlTopic, `:cross_mark: ${stamp} failed: ${err.message}`);
+      } catch (postErr) {
+        console.error(`[router/api] Failed to post error message: ${postErr.message}`);
+      }
     })
     .finally(() => {
       if (keys) {

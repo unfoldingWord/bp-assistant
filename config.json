@@ -2,6 +2,9 @@
   "adminUserId": null,
   "authorizedUserIds": [],
   "channel": "81 English Book Packages",
+  "apiControlThread": {
+    "topic": "Bot testing"
+  },
   "topics": [
     "Psalms BP",
     "AI Work",
