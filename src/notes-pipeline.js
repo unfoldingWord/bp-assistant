@@ -24,7 +24,7 @@ const { recordMetrics, getCumulativeTokens, recordRunSummary, getAdaptiveSkillGu
 const { door43Push, checkConflictingBranches, REPO_MAP, getRepoFilename } = require('./door43-push');
 const { setPendingMerge } = require('./pending-merges');
 const { mergeTsvs } = require('./workspace-tools/tsv-tools');
-const { getCheckpoint, setCheckpoint, clearCheckpoint } = require('./pipeline-checkpoints');
+const { getCheckpoint, setCheckpoint, clearCheckpoint, buildCheckpointKey } = require('./pipeline-checkpoints');
 const { buildNotesContext, updateContextArtifacts, readContext, writeContext } = require('./pipeline-context');
 const { checkUltEdits } = require('./check-ult-edits');
 const { getVerseCount } = require('./verse-counts');
@@ -2856,13 +2856,19 @@ async function notesPipeline(route, message) {
         : `\`${c.branch}\``
     ).join(', ');
 
-    setPendingMerge(sessionKey, {
+    const deferredStart = deferredChapters[0].ch;
+    const deferredEnd = deferredChapters[deferredChapters.length - 1].ch;
+    const pendingScope = { book, startChapter: deferredStart, endChapter: deferredEnd, verseStart: verseStart ?? null, verseEnd: verseEnd ?? null };
+    const pendingKey = buildCheckpointKey({ sessionKey, pipelineType: 'notes', scope: pendingScope });
+    setPendingMerge(pendingKey, {
+      key: pendingKey,
       sessionKey,
       pipelineType: 'notes',
       username,
       book,
-      startChapter: deferredChapters[0].ch,
-      endChapter: deferredChapters[deferredChapters.length - 1].ch,
+      startChapter: deferredStart,
+      endChapter: deferredEnd,
+      scope: pendingScope,
       completedChapters: deferredChapters,
       blockingBranches: deferredConflicts.map(c => ({ repo: repoName, branchPattern: c.branch })),
       originalMessage: message,
@@ -2884,7 +2890,8 @@ async function notesPipeline(route, message) {
     await addReaction(msgId, 'hourglass');
     // Use sendMessage directly to control the @-mention (reply() auto-prepends sender)
     const conflictMsg = `${mention} I have notes ready for **${deferredRange}**, but ${branchList} on ${repoName} ` +
-      `has edits to \`${targetFile}\`. Please merge your branch first, then say **merged** or **done** ` +
+      `has edits to \`${targetFile}\`. Please merge your branch first, then say **merged** ` +
+      `(or **merge ${book} ${deferredStart}** if more than one run is waiting here) ` +
       `so I can proceed with the insertion.`;
     if (stream) {
       await sendMessage(stream, topic, conflictMsg);

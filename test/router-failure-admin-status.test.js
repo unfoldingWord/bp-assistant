@@ -79,6 +79,7 @@ test('router publishes admin-status event when pipeline dispatch throws', async 
     getPendingMerge: () => null,
     clearPendingMerge: () => {},
     getAllPendingMerges: () => [],
+    getPendingMergesForSession: () => [],
   });
   installStub(checkpointsPath, {
     getCheckpoint: () => null,
