@@ -43,11 +43,11 @@ async function replyTo(msg, text) {
 
 /**
  * Resume insertion for a pending merge. Re-checks branches first.
- * @param {string} sessionKey
+ * @param {string} pendingKey - per-run pending-merge key (sessionKey + scope)
  * @param {object} triggerMessage - the Zulip message that triggered resume
  */
-async function resumeInsertion(sessionKey, triggerMessage) {
-  const pending = getPendingMerge(sessionKey);
+async function resumeInsertion(pendingKey, triggerMessage) {
+  const pending = getPendingMerge(pendingKey);
   if (!pending) {
     await replyTo(triggerMessage, 'No pending insertion found for this topic.');
     return;
@@ -76,7 +76,7 @@ async function resumeInsertion(sessionKey, triggerMessage) {
   if (uniqueBlocking.length > 0) {
     // Update retry count
     pending.retryCount = (pending.retryCount || 0) + 1;
-    setPendingMerge(sessionKey, pending);
+    setPendingMerge(pendingKey, pending);
 
     await replyTo(triggerMessage,
       `Branches still exist -- please merge them first:\n` +
@@ -87,7 +87,7 @@ async function resumeInsertion(sessionKey, triggerMessage) {
   }
 
   // Branches are clear -- run insertion (pushes to master now)
-  await status(`[insertion-resume] Branches clear for ${sessionKey}, running deferred insertion...`);
+  await status(`[insertion-resume] Branches clear for ${pendingKey}, running deferred insertion...`);
 
   let success = 0;
   let fail = 0;
@@ -104,7 +104,7 @@ async function resumeInsertion(sessionKey, triggerMessage) {
   }
 
   // Clear pending state
-  clearPendingMerge(sessionKey);
+  clearPendingMerge(pendingKey);
 
   // Update reaction on original message
   try {
@@ -145,7 +145,7 @@ async function resumeInsertion(sessionKey, triggerMessage) {
     }
   }
 
-  await status(`[insertion-resume] Deferred insertion complete for ${sessionKey}: ${success} ok, ${fail} failed.`);
+  await status(`[insertion-resume] Deferred insertion complete for ${pendingKey}: ${success} ok, ${fail} failed.`);
 }
 
 /**

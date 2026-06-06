@@ -18,7 +18,7 @@ const { ensureFreshToken, isAuthError } = require('./auth-refresh');
 const { recordMetrics, getCumulativeTokens, recordRunSummary } = require('./usage-tracker');
 const { door43Push, checkConflictingBranches, REPO_MAP, getRepoFilename } = require('./door43-push');
 const { setPendingMerge } = require('./pending-merges');
-const { getCheckpoint, setCheckpoint, clearCheckpoint } = require('./pipeline-checkpoints');
+const { getCheckpoint, setCheckpoint, clearCheckpoint, buildCheckpointKey } = require('./pipeline-checkpoints');
 const { buildGenerateContext, buildUstContext } = require('./pipeline-context');
 const { publishAdminStatus } = require('./admin-status');
 const { dispatchSelfDiagnosis } = require('./self-diagnosis');
@@ -1371,13 +1371,24 @@ async function generatePipeline(route, message) {
       ).join(', ');
       const fileList = [...new Set(dedupedConflicts.map(c => `\`${c.file}\``))].join(', ');
 
-      setPendingMerge(sessionKey, {
+      // Key/label off the chapters actually completed (deferred), not the
+      // requested range — early chapters can fail generation and be skipped,
+      // so completedChapters[0].ch may be > start. Matches notes-pipeline and
+      // keeps the displayed range, the "merge BOOK ch" hint, and the stored
+      // scope consistent.
+      const deferredStart = completedChapters[0].ch;
+      const deferredEnd = completedChapters[completedChapters.length - 1].ch;
+      const pendingScope = { book, startChapter: deferredStart, endChapter: deferredEnd, verseStart: verseStart ?? null, verseEnd: verseEnd ?? null };
+      const pendingKey = buildCheckpointKey({ sessionKey, pipelineType: 'generate', scope: pendingScope });
+      setPendingMerge(pendingKey, {
+        key: pendingKey,
         sessionKey,
         pipelineType: 'generate',
         username,
         book,
-        startChapter: start,
-        endChapter: end,
+        startChapter: deferredStart,
+        endChapter: deferredEnd,
+        scope: pendingScope,
         completedChapters,
         blockingBranches: dedupedConflicts.map(c => ({ repo: c.repo, branchPattern: c.branch })),
         originalMessage: message,
@@ -1398,7 +1409,8 @@ async function generatePipeline(route, message) {
       await addReaction(msgId, 'hourglass');
       // Use sendMessage directly to control the @-mention (reply() auto-prepends sender)
       const conflictMsg = `${mention} I have content ready for **${deferredRange}**, but ${branchList} ` +
-        `has edits to ${fileList}. Please merge your branch first, then say **merged** or **done** ` +
+        `has edits to ${fileList}. Please merge your branch first, then say **merged** ` +
+        `(or **merge ${book} ${completedChapters[0].ch}** if more than one run is waiting here) ` +
         `so I can proceed with the insertion.`;
       if (stream) {
         await sendMessage(stream, topic, conflictMsg);
