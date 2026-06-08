@@ -2804,6 +2804,7 @@ async function notesPipeline(route, message) {
     }
 
     let pushNoChanges = false;
+    let pushPrNumber;
     if (!chapterFailed) await status(`Running **door43-push** (TN) for ${ref}...`);
     const pushStartTime = new Date().toISOString();
     if (!chapterFailed) try {
@@ -2818,6 +2819,7 @@ async function notesPipeline(route, message) {
         chapterFailed = true;
       } else {
         pushNoChanges = pushResult.noChanges === true;
+        pushPrNumber = pushResult.prNumber;
         await status(`**door43-push** (TN) done for ${ref}: ${pushResult.details}`);
       }
     } catch (err) {
@@ -2833,7 +2835,7 @@ async function notesPipeline(route, message) {
     if (!chapterFailed && !pushNoChanges) {
       await status(`Verifying push for ${ref}...`);
       const stagingBranch = buildBranchName(book, ch);
-      const verify = await verifyRepoPush({ repo: 'en_tn', stagingBranch, since: pushStartTime });
+      const verify = await verifyRepoPush({ repo: 'en_tn', stagingBranch, since: pushStartTime, prNumber: pushPrNumber });
       if (!verify.success) {
         await status(`Repo verify FAILED for ${ref}: ${verify.details}`);
         console.warn(`[notes] Repo verify failed for ${ref}: ${verify.details}`);
