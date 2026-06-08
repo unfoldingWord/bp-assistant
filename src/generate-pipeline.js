@@ -1466,6 +1466,8 @@ async function generatePipeline(route, message) {
       const pushStartTime = new Date().toISOString();
       let ultNoChanges = false;
       let ustNoChanges = false;
+      let ultPrNumber;
+      let ustPrNumber;
 
       // door43-push ULT
       if (!chapterFailed && pushUlt) {
@@ -1483,6 +1485,7 @@ async function generatePipeline(route, message) {
             chapterFailed = true;
           } else {
             ultNoChanges = pushResultUlt.noChanges === true;
+            ultPrNumber = pushResultUlt.prNumber;
             await status(`**door43-push** (ULT) done for ${book} ${chData.ch}: ${pushResultUlt.details}`);
           }
         } catch (err) {
@@ -1508,6 +1511,7 @@ async function generatePipeline(route, message) {
             chapterFailed = true;
           } else {
             ustNoChanges = pushResultUst.noChanges === true;
+            ustPrNumber = pushResultUst.prNumber;
             await status(`**door43-push** (UST) done for ${book} ${chData.ch}: ${pushResultUst.details}`);
           }
         } catch (err) {
@@ -1529,8 +1533,8 @@ async function generatePipeline(route, message) {
         if (verifyUlt || verifyUst) {
           await status(`Verifying merges for ${book} ${chData.ch}...`);
         }
-        const ultVerify = verifyUlt ? await verifyRepoPush({ repo: 'en_ult', stagingBranch, since: pushStartTime }) : { success: true };
-        const ustVerify = verifyUst ? await verifyRepoPush({ repo: 'en_ust', stagingBranch, since: pushStartTime }) : { success: true };
+        const ultVerify = verifyUlt ? await verifyRepoPush({ repo: 'en_ult', stagingBranch, since: pushStartTime, prNumber: ultPrNumber }) : { success: true };
+        const ustVerify = verifyUst ? await verifyRepoPush({ repo: 'en_ust', stagingBranch, since: pushStartTime, prNumber: ustPrNumber }) : { success: true };
 
         if (verifyUlt && !ultVerify.success) {
           await status(`Repo verify FAILED (ULT) for ${book} ${chData.ch}: ${ultVerify.details}`);

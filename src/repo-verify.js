@@ -52,13 +52,19 @@ function apiGet(path, token) {
  * This avoids the false-positive where a never-pushed branch is absent
  * and mistakenly interpreted as "merged and deleted."
  *
+ * When a `prNumber` is supplied, a direct PR-by-number lookup is used first.
+ * This is resilient to Gitea's behavior of stripping `head.label`/`head.ref`
+ * from merged PR records once the source branch is deleted — which breaks
+ * both the head-filtered query and the field-based fallback scan below.
+ *
  * @param {object} opts
  * @param {string} opts.repo - Repo name (en_tn, en_ult, en_ust)
  * @param {string} opts.stagingBranch - The staging branch name that should have been merged+deleted
  * @param {string} [opts.since] - ISO timestamp; only accept PRs merged after this time
+ * @param {number} [opts.prNumber] - Numeric PR id from door43Push; enables direct PR lookup
  * @returns {{ success: boolean, details: string }}
  */
-async function verifyRepoPush({ repo, stagingBranch, since }) {
+async function verifyRepoPush({ repo, stagingBranch, since, prNumber }) {
   const token = readSecret('door43_token', 'DOOR43_TOKEN') || readSecret('gitea_token', 'GITEA_TOKEN');
 
   if (!token) {
@@ -86,6 +92,26 @@ async function verifyRepoPush({ repo, stagingBranch, since }) {
       success: false,
       details: `Token validation failed: ${err.message}`,
     };
+  }
+
+  // Direct PR-by-number lookup when door43Push provided one. This works even
+  // after Gitea strips head.label/head.ref from the PR record on branch deletion.
+  if (prNumber) {
+    try {
+      const prRes = await apiGet(`/repos/${ORG}/${repo}/pulls/${prNumber}`, token);
+      if (prRes.status === 200 && prRes.data && typeof prRes.data === 'object') {
+        const pr = prRes.data;
+        const isMerged = pr.merged === true || pr.merged_by != null;
+        if (isMerged && pr.merged_at && new Date(pr.merged_at) >= new Date(effectiveSince)) {
+          return {
+            success: true,
+            details: `PR #${prNumber} merged ${stagingBranch} into master on ${repo} (confirmed via direct PR lookup)`,
+          };
+        }
+      }
+    } catch (_) {
+      // Non-fatal: fall through to the head-filter + fallback scan logic below.
+    }
   }
 
   // Search for a merged PR from this staging branch
