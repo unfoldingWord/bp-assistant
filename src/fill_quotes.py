@@ -41,6 +41,10 @@ def build_tsv_notes(json_file):
         quote = re.sub(r'" ', '” ', quote)
         quote = re.sub(r'"$', '”', quote)
 
+        # Remove backslash codes if present
+        quote = re.sub(r'\\\w+', '', quote)
+        quote = re.sub(r'\\\*', '', quote)
+
         occurrence = ""
         note = ""
         snippet = quote
@@ -370,6 +374,7 @@ def find_sequence(ult_dict_combined, notes_dict, unique_numbers):
 
     # Step 2: Find sequences
     for row in data["rows"]:
+        print(row)
         if not row.get("Snippet"):
             continue
 
