@@ -374,7 +374,6 @@ def find_sequence(ult_dict_combined, notes_dict, unique_numbers):
 
     # Step 2: Find sequences
     for row in data["rows"]:
-        print(row)
         if not row.get("Snippet"):
             continue
 
