@@ -135,7 +135,8 @@ async function main() {
           const typeLabel = pm.pipelineType === 'generate' ? 'ULT/UST content' : 'translation notes';
           await sendMessage(msg.display_recipient, msg.subject,
             `Reminder: I have ${typeLabel} for **${rangeLabel}** ready to push, ` +
-            `but your branches need merging first. Say **merged** when done, or **cancel** to discard.`
+            `but your branches need merging first. Say **merge ${pm.book} ${pm.startChapter}** when done ` +
+            `(or **merged** if this is the only run waiting here), or **cancel** to discard.`
           );
         }
       }
@@ -153,7 +154,7 @@ async function main() {
   //     if (pendingMerges.length === 0) return;
   //     console.log(`[bot] Auto-rechecking ${pendingMerges.length} pending merge(s)...`);
   //     for (const pm of pendingMerges) {
-  //       await resumeInsertion(pm.sessionKey, pm.originalMessage);
+  //       await resumeInsertion(pm.key || pm.sessionKey, pm.originalMessage);
   //     }
   //   } catch (err) {
   //     console.error(`[bot] Auto-recheck failed: ${err.message}`);

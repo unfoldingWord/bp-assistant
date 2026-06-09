@@ -168,6 +168,7 @@ function buildOptions({
 
 async function runClaudeOnce({
   prompt,
+  label,
   cwd,
   resume,
   model,
@@ -199,6 +200,13 @@ async function runClaudeOnce({
   const queryStart = Date.now();
   const queryDeadline = queryStart + timeout;
   const queryId = Math.random().toString(36).slice(2, 8);
+  // Human-readable job tag for the logs (e.g. "NUM 23 UST-gen", "HOS 6 tn-writer").
+  // Threaded onto every line this query emits so concurrent pipeline runs stay
+  // attributable in the interleaved fly.io log stream. Falls back to just the
+  // query id when no label is supplied.
+  const idTag = label ? `${label} q=${queryId}` : `q=${queryId}`;
+  const runnerPrefix = `[claude-runner ${idTag}]`;
+  const claudePrefix = `[claude ${idTag}]`;
   let localTimeoutFired = false;
   const toolErrorSigs = new Map();
   let consecutiveToolErrors = 0;
@@ -210,7 +218,7 @@ async function runClaudeOnce({
     // Positive = event loop was busy and couldn't service the timer on schedule.
     const driftMs = elapsedMs - timeout;
     console.warn(
-      `[claude-runner q=${queryId}] Timeout fired — ` +
+      `${runnerPrefix} Timeout fired — ` +
       `configured=${timeout}ms elapsed=${elapsedMs}ms drift=${driftMs}ms ` +
       `turns=${turnCount} lastTool=${lastTool || 'none'} — aborting query`
     );
@@ -248,9 +256,9 @@ async function runClaudeOnce({
     thinking,
   });
 
-  console.log(`[claude-runner q=${queryId}] Starting query in ${cwd}`);
-  console.log(`[claude-runner q=${queryId}] Prompt: ${fullPrompt.slice(0, 200)}`);
-  console.log(`[claude-runner q=${queryId}] maxTurns: ${options.maxTurns}, timeout: ${timeout / 1000}s, deadline: ${new Date(queryDeadline).toISOString()}`);
+  console.log(`${runnerPrefix} Starting query in ${cwd}`);
+  console.log(`${runnerPrefix} Prompt: ${fullPrompt.slice(0, 200)}`);
+  console.log(`${runnerPrefix} maxTurns: ${options.maxTurns}, timeout: ${timeout / 1000}s, deadline: ${new Date(queryDeadline).toISOString()}`);
 
   const conversation = query({ prompt: fullPrompt, options });
 
@@ -261,11 +269,11 @@ async function runClaudeOnce({
       if (message.type === 'assistant' && message.message?.content) {
         for (const block of message.message.content) {
           if ('text' in block) {
-            console.log(`[claude] ${block.text.slice(0, 200)}`);
+            console.log(`${claudePrefix} ${block.text.slice(0, 200)}`);
           } else if ('name' in block) {
             turnCount++;
             lastTool = block.name;
-            console.log(`[claude] Tool: ${block.name}(${JSON.stringify(block.input || {}).slice(0, 150)})`);
+            console.log(`${claudePrefix} Tool: ${block.name}(${JSON.stringify(block.input || {}).slice(0, 150)})`);
           }
         }
       } else if (message.type === 'result') {
@@ -304,17 +312,17 @@ async function runClaudeOnce({
           consecutiveToolErrors = 0;
         }
         if (text.includes('command-stderr') || text.includes('Error')) {
-          console.error(`[claude-runner] SDK user message (error): ${text.slice(0, 500)}`);
+          console.error(`${runnerPrefix} SDK user message (error): ${text.slice(0, 500)}`);
         } else {
-          console.log(`[claude-runner] SDK user message: ${text.slice(0, 300)}`);
+          console.log(`${runnerPrefix} SDK user message: ${text.slice(0, 300)}`);
         }
       } else if (message.type === 'system') {
-        console.log(`[claude-runner] SDK system: ${message.subtype || 'unknown'} ${JSON.stringify(message).slice(0, 200)}`);
+        console.log(`${runnerPrefix} SDK system: ${message.subtype || 'unknown'} ${JSON.stringify(message).slice(0, 200)}`);
         if (message.subtype === 'init' && Array.isArray(message.tools)) {
-          console.log(`[claude-runner] SDK init tools: ${message.tools.join(', ')}`);
+          console.log(`${runnerPrefix} SDK init tools: ${message.tools.join(', ')}`);
         }
       } else {
-        console.log(`[claude-runner] SDK event: ${message.type}${message.subtype ? '/' + message.subtype : ''}`);
+        console.log(`${runnerPrefix} SDK event: ${message.type}${message.subtype ? '/' + message.subtype : ''}`);
       }
       if (guardrails && Number(guardrails.maxToolCalls || 0) > 0 && turnCount >= Number(guardrails.maxToolCalls)) {
         throw new Error(`Guardrail stop: max tool calls exceeded (${turnCount}/${guardrails.maxToolCalls})`);
@@ -325,7 +333,7 @@ async function runClaudeOnce({
       const elapsedMs = Date.now() - queryStart;
       const driftMs = elapsedMs - timeout;
       console.warn(
-        `[claude-runner q=${queryId}] Query aborted — ` +
+        `${runnerPrefix} Query aborted — ` +
         `elapsed=${elapsedMs}ms${localTimeoutFired ? ` drift=${driftMs}ms` : ''} ` +
         `turns=${turnCount} lastTool=${lastTool || 'none'} ` +
         `reason=${localTimeoutFired ? 'timeout_local_abort' : 'external_abort'}`
@@ -335,7 +343,7 @@ async function runClaudeOnce({
       const msg = (err.message || '').toLowerCase();
       const isRateLimit = msg.includes('rate limit') || msg.includes('429') || msg.includes('too many requests');
       if (isRateLimit) {
-        console.warn(`[claude-runner] Rate limit detected -- calibrating window budget`);
+        console.warn(`${runnerPrefix} Rate limit detected -- calibrating window budget`);
         try {
           const room = await getHeadroom();
           recordRateLimit({ windowUsed: room.used, source: 'claude-runner-error' });
@@ -350,15 +358,15 @@ async function runClaudeOnce({
   }
 
   if (result) {
-    console.log(`[claude-runner q=${queryId}] Finished — subtype: ${result.subtype}, turns: ${result.num_turns}, cost: $${result.total_cost_usd?.toFixed(4) || '?'}, duration: ${(result.duration_ms / 1000).toFixed(1)}s`);
+    console.log(`${runnerPrefix} Finished — subtype: ${result.subtype}, turns: ${result.num_turns}, cost: $${result.total_cost_usd?.toFixed(4) || '?'}, duration: ${(result.duration_ms / 1000).toFixed(1)}s`);
     if (result.subtype !== 'success' && result.result) {
-      console.error(`[claude-runner q=${queryId}] Result text: ${result.result.slice(0, 500)}`);
+      console.error(`${runnerPrefix} Result text: ${result.result.slice(0, 500)}`);
     }
     // Detect rate limit in result subtype or error message
     const resultMsg = (result.subtype || '') + ' ' + (result.error || '');
     const isRateLimit = /rate.?limit|429|too.many.requests/i.test(resultMsg);
     if (isRateLimit) {
-      console.warn(`[claude-runner q=${queryId}] Rate limit in result subtype -- calibrating window budget`);
+      console.warn(`${runnerPrefix} Rate limit in result subtype -- calibrating window budget`);
       try {
         const room = await getHeadroom();
         recordRateLimit({ windowUsed: room.used, source: 'claude-runner-result' });
@@ -374,7 +382,7 @@ async function runClaudeOnce({
   if (localTimeoutFired || abortController.signal.aborted) {
     const driftMs = elapsedMs - timeout;
     console.warn(
-      `[claude-runner q=${queryId}] Returning timeout outcome — ` +
+      `${runnerPrefix} Returning timeout outcome — ` +
       `reason=timeout_local_abort elapsed=${elapsedMs}ms configured=${timeout}ms drift=${driftMs}ms`
     );
     return {
@@ -389,7 +397,7 @@ async function runClaudeOnce({
       lastTool,
     };
   }
-  console.warn(`[claude-runner q=${queryId}] Query ended without a result message (elapsed=${elapsedMs}ms) — reason=no_result_message`);
+  console.warn(`${runnerPrefix} Query ended without a result message (elapsed=${elapsedMs}ms) — reason=no_result_message`);
   return {
     subtype: 'no_result',
     reason: 'no_result_message',
@@ -435,6 +443,14 @@ function isTransientOutageError(err) {
   return false;
 }
 
+// True for any guardrail-stop the runner throws/returns (repeated tool errors,
+// max tool calls, or token budget). Callers use this to distinguish a "ran out
+// of budget / looping" stop from a genuine crash or transient outage.
+function isGuardrailStop(err) {
+  const msg = typeof err === 'string' ? err : (err && err.message) || String(err || '');
+  return /Guardrail stop:/i.test(msg);
+}
+
 function backoffDelayMs(attempt) {
   const exp = Math.min(RETRY_MAX_DELAY_MS, RETRY_BASE_DELAY_MS * Math.pow(2, Math.max(0, attempt - 1)));
   const jitter = Math.floor(Math.random() * 2000);
@@ -463,6 +479,9 @@ async function runClaude(args) {
   let attempt = 0;
   let lastTransientMessage = '';
   let firstDowntimeNoticeSent = false;
+  // Job tag for the wrapper's own retry/backoff lines. Each runClaudeOnce()
+  // attempt mints its own q= id, so the wrapper carries only the label.
+  const labelPrefix = args?.label ? `[claude-runner ${args.label}]` : '[claude-runner]';
 
   while (true) {
     attempt++;
@@ -496,7 +515,7 @@ async function runClaude(args) {
           );
         }
         const delay = backoffDelayMs(attempt);
-        console.warn(`[claude-runner] Transient non-success result, retrying in ${Math.round(delay / 1000)}s (attempt ${attempt})`);
+        console.warn(`${labelPrefix} Transient non-success result, retrying in ${Math.round(delay / 1000)}s (attempt ${attempt})`);
         await sleep(delay);
         continue;
       }
@@ -525,7 +544,7 @@ async function runClaude(args) {
           );
         }
         const delay = backoffDelayMs(attempt);
-        console.warn(`[claude-runner] Transient SDK error, retrying in ${Math.round(delay / 1000)}s (attempt ${attempt}): ${msg.slice(0, 200)}`);
+        console.warn(`${labelPrefix} Transient SDK error, retrying in ${Math.round(delay / 1000)}s (attempt ${attempt}): ${msg.slice(0, 200)}`);
         await sleep(delay);
         continue;
       }
@@ -554,6 +573,7 @@ async function runClaude(args) {
  */
 async function runClaudeStream({
   prompt,
+  label,
   cwd,
   resume,
   model,
@@ -573,8 +593,9 @@ async function runClaudeStream({
   const wsTools = await createFreshWorkspaceToolsServer();
   const abortController = new AbortController();
   const timeout = timeoutMs || DEFAULT_TIMEOUT_MS;
+  const streamPrefix = label ? `[claude-runner ${label}]` : '[claude-runner]';
   const timer = setTimeout(() => {
-    console.warn(`[claude-runner] Timeout reached (${timeout / 1000}s) — aborting stream`);
+    console.warn(`${streamPrefix} Timeout reached (${timeout / 1000}s) — aborting stream`);
     abortController.abort();
   }, timeout);
 
@@ -595,7 +616,7 @@ async function runClaudeStream({
     thinking,
   });
 
-  console.log(`[claude-runner] Starting stream in ${cwd}${resume ? ` (resume: ${resume.slice(0, 8)}…)` : ''}`);
+  console.log(`${streamPrefix} Starting stream in ${cwd}${resume ? ` (resume: ${resume.slice(0, 8)}…)` : ''}`);
   const conversation = query({ prompt, options });
 
   function cleanup() {
@@ -614,6 +635,7 @@ module.exports = {
   DEFAULT_RESTRICTED_TOOLS,
   ClaudeTransientOutageError,
   isTransientOutageError,
+  isGuardrailStop,
   THINKING_LOW,
   THINKING_MEDIUM,
   THINKING_HIGH,

@@ -43,11 +43,11 @@ async function replyTo(msg, text) {
 
 /**
  * Resume insertion for a pending merge. Re-checks branches first.
- * @param {string} sessionKey
+ * @param {string} pendingKey - per-run pending-merge key (sessionKey + scope)
  * @param {object} triggerMessage - the Zulip message that triggered resume
  */
-async function resumeInsertion(sessionKey, triggerMessage) {
-  const pending = getPendingMerge(sessionKey);
+async function resumeInsertion(pendingKey, triggerMessage) {
+  const pending = getPendingMerge(pendingKey);
   if (!pending) {
     await replyTo(triggerMessage, 'No pending insertion found for this topic.');
     return;
@@ -76,7 +76,7 @@ async function resumeInsertion(sessionKey, triggerMessage) {
   if (uniqueBlocking.length > 0) {
     // Update retry count
     pending.retryCount = (pending.retryCount || 0) + 1;
-    setPendingMerge(sessionKey, pending);
+    setPendingMerge(pendingKey, pending);
 
     await replyTo(triggerMessage,
       `Branches still exist -- please merge them first:\n` +
@@ -87,7 +87,7 @@ async function resumeInsertion(sessionKey, triggerMessage) {
   }
 
   // Branches are clear -- run insertion (pushes to master now)
-  await status(`[insertion-resume] Branches clear for ${sessionKey}, running deferred insertion...`);
+  await status(`[insertion-resume] Branches clear for ${pendingKey}, running deferred insertion...`);
 
   let success = 0;
   let fail = 0;
@@ -104,7 +104,7 @@ async function resumeInsertion(sessionKey, triggerMessage) {
   }
 
   // Clear pending state
-  clearPendingMerge(sessionKey);
+  clearPendingMerge(pendingKey);
 
   // Update reaction on original message
   try {
@@ -145,7 +145,7 @@ async function resumeInsertion(sessionKey, triggerMessage) {
     }
   }
 
-  await status(`[insertion-resume] Deferred insertion complete for ${sessionKey}: ${success} ok, ${fail} failed.`);
+  await status(`[insertion-resume] Deferred insertion complete for ${pendingKey}: ${success} ok, ${fail} failed.`);
 }
 
 /**
@@ -161,6 +161,8 @@ async function runGenerateInsertPhase(completedChapters, username, book, notify)
     let chapterFailed = false;
     let ultNoChanges = false;
     let ustNoChanges = false;
+    let ultPrNumber;
+    let ustPrNumber;
     const pushStartTime = new Date().toISOString();
 
     // door43-push ULT
@@ -177,6 +179,7 @@ async function runGenerateInsertPhase(completedChapters, username, book, notify)
         chapterFailed = true;
       } else {
         ultNoChanges = pushResultUlt.noChanges === true;
+        ultPrNumber = pushResultUlt.prNumber;
         await status(`**door43-push** (ULT) done for ${book} ${ch.ch}: ${pushResultUlt.details}`);
       }
     } catch (err) {
@@ -200,6 +203,7 @@ async function runGenerateInsertPhase(completedChapters, username, book, notify)
           chapterFailed = true;
         } else {
           ustNoChanges = pushResultUst.noChanges === true;
+          ustPrNumber = pushResultUst.prNumber;
           await status(`**door43-push** (UST) done for ${book} ${ch.ch}: ${pushResultUst.details}`);
         }
       } catch (err) {
@@ -221,8 +225,8 @@ async function runGenerateInsertPhase(completedChapters, username, book, notify)
       if (verifyUlt || verifyUst) {
         await status(`Verifying merges for ${book} ${ch.ch}...`);
       }
-      const ultVerify = verifyUlt ? await verifyRepoPush({ repo: 'en_ult', stagingBranch, since: pushStartTime }) : { success: true };
-      const ustVerify = verifyUst ? await verifyRepoPush({ repo: 'en_ust', stagingBranch, since: pushStartTime }) : { success: true };
+      const ultVerify = verifyUlt ? await verifyRepoPush({ repo: 'en_ult', stagingBranch, since: pushStartTime, prNumber: ultPrNumber }) : { success: true };
+      const ustVerify = verifyUst ? await verifyRepoPush({ repo: 'en_ust', stagingBranch, since: pushStartTime, prNumber: ustPrNumber }) : { success: true };
 
       if (verifyUlt && !ultVerify.success) {
         await status(`Repo verify FAILED (ULT) for ${book} ${ch.ch}: ${ultVerify.details}`);
@@ -260,6 +264,7 @@ async function runNotesInsertPhase(completedChapters, username, book, notify) {
   for (const ch of completedChapters) {
     let chapterFailed = false;
     let pushNoChanges = false;
+    let pushPrNumber;
     const pushStartTime = new Date().toISOString();
 
     await status(`Running deferred **door43-push** (TN) for ${book} ${ch.ch}...`);
@@ -275,6 +280,7 @@ async function runNotesInsertPhase(completedChapters, username, book, notify) {
         chapterFailed = true;
       } else {
         pushNoChanges = pushResult.noChanges === true;
+        pushPrNumber = pushResult.prNumber;
         await status(`**door43-push** (TN) done for ${book} ${ch.ch}: ${pushResult.details}`);
       }
     } catch (err) {
@@ -290,7 +296,7 @@ async function runNotesInsertPhase(completedChapters, username, book, notify) {
       } else {
         const stagingBranch = buildBranchName(book, ch.ch);
         await status(`Verifying merge for ${book} ${ch.ch}...`);
-        const verify = await verifyRepoPush({ repo: 'en_tn', stagingBranch, since: pushStartTime });
+        const verify = await verifyRepoPush({ repo: 'en_tn', stagingBranch, since: pushStartTime, prNumber: pushPrNumber });
         if (!verify.success) {
           await status(`Repo verify FAILED for ${book} ${ch.ch}: ${verify.details}`);
           chapterFailed = true;

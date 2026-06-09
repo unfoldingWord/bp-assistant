@@ -12,7 +12,7 @@ const path = require('path');
 const config = require('./config');
 const { spawn } = require("child_process");
 const { sendMessage, sendDM, addReaction, removeReaction } = require('./zulip-client');
-const { runClaude, DEFAULT_RESTRICTED_TOOLS, isTransientOutageError } = require('./claude-runner');
+const { runClaude, DEFAULT_RESTRICTED_TOOLS, isTransientOutageError, isGuardrailStop } = require('./claude-runner');
 const { getDoor43Username, emailToFallbackUsername, buildBranchName, resolveOutputFile, discoverFreshOutput, checkPrerequisites, calcSkillTimeout, normalizeBookName, resolveConflictMention, parsePartialTsv, truncatePartialTsv, parseChunkRange, CSKILLBP_DIR } = require('./pipeline-utils');
 const { splitTsv, fixTrailingNewlines } = require('./workspace-tools/tsv-tools');
 const { fillTsvIds, generateIds, prepareNotes, fillOrigQuotes, resolveGlQuotes, flagNarrowQuotes, extractAlignmentData, prepareATContext, substituteAT, fixUnicodeQuotes, verifyBoldMatches, syncCanonicalHebrewQuotes, applyHintsToPreparedNotes, _stripAlternateTranslation: stripAlternateTranslation } = require('./workspace-tools/tn-tools');
@@ -24,7 +24,7 @@ const { recordMetrics, getCumulativeTokens, recordRunSummary, getAdaptiveSkillGu
 const { door43Push, checkConflictingBranches, REPO_MAP, getRepoFilename } = require('./door43-push');
 const { setPendingMerge } = require('./pending-merges');
 const { mergeTsvs } = require('./workspace-tools/tsv-tools');
-const { getCheckpoint, setCheckpoint, clearCheckpoint } = require('./pipeline-checkpoints');
+const { getCheckpoint, setCheckpoint, clearCheckpoint, buildCheckpointKey } = require('./pipeline-checkpoints');
 const { buildNotesContext, updateContextArtifacts, readContext, writeContext } = require('./pipeline-context');
 const { checkUltEdits } = require('./check-ult-edits');
 const { getVerseCount } = require('./verse-counts');
@@ -49,7 +49,12 @@ const TN_QUALITY_CHECK_HINT =
   'Do not guess alternate file paths or probe missing runtime files outside context.json. ' +
   'Do the full semantic review (Steps 3a-3j), fix issues found, then re-run check_tn_quality ' +
   'at most once to verify fixes. If issues still persist after that one re-check, report them ' +
-  'as unresolved and stop. Do not loop further.';
+  'as unresolved and stop. Do not loop further. ' +
+  'To apply fixes, use the structured tools update_note_text / update_prepared_quote / remove_note ' +
+  '(they locate items by id) — never hand-Edit generated_notes.json or prepared_notes.json. ' +
+  'If any Edit returns "string to replace not found", do NOT retry that edit: re-Read the file once ' +
+  'or switch to the structured tool; if the target still cannot be matched, tag that row as ' +
+  'unresolved and move on.';
 
 const TN_WRITER_HINT =
   'The pipeline has already run all mechanical preparation (prepare_notes, fill_orig_quotes, resolve_gl_quotes, flag_narrow_quotes). ' +
@@ -470,6 +475,7 @@ async function runPerNoteGeneration({ pipeDir, outputPath, status, book }) {
     try {
       const result = await runClaude({
         prompt,
+        label: `${item.reference || book} note`,
         cwd: CSKILLBP_DIR,
         model: 'sonnet',
         maxTurns: 2,
@@ -679,6 +685,7 @@ async function runATGeneration({ notesPath, pipeDir, status }) {
       // Step 1: Generate AT with Sonnet via SDK
       const atResult = await runClaude({
         prompt: userPrompt,
+        label: `${packet.reference || 'AT'} AT-gen`,
         cwd: CSKILLBP_DIR,
         model: 'sonnet',
         maxTurns: 2,
@@ -716,6 +723,7 @@ async function runATGeneration({ notesPath, pipeDir, status }) {
 
       const valResult = await runClaude({
         prompt: validatorPrompt,
+        label: `${packet.reference || 'AT'} AT-val`,
         cwd: CSKILLBP_DIR,
         model: 'haiku',
         maxTurns: 2,
@@ -743,6 +751,7 @@ async function runATGeneration({ notesPath, pipeDir, status }) {
 
       const retryResult = await runClaude({
         prompt: retryPrompt,
+        label: `${packet.reference || 'AT'} AT-retry`,
         cwd: CSKILLBP_DIR,
         model: 'sonnet',
         maxTurns: 2,
@@ -1239,6 +1248,11 @@ const TN_WRITER_MAX_TURNS = Number((config.notesGuardrails || {}).tnWriterMaxTur
 const TN_WRITER_MAX_TOOL_CALLS = Number((config.notesGuardrails || {}).tnWriterMaxToolCalls || 1000);
 const RESCUE_MAX_PASSES = Number((config.notesGuardrails || {}).rescueMaxPasses || 1);
 const USE_PER_NOTE_GENERATION = Boolean((config.notesGuardrails || {}).usePerNoteGeneration);
+// Tight repeated-error limits for the INITIAL tn-quality-check pass so it bails in minutes
+// (not ~53min) when it loops on edits; Fix 1 then degrades gracefully. The bounded rescue pass
+// keeps its own tighter 2/3 override.
+const TN_QC_MAX_CONSEC = Number((config.notesGuardrails || {}).qualityCheckMaxConsecutiveToolErrors || 6);
+const TN_QC_MAX_REPEAT = Number((config.notesGuardrails || {}).qualityCheckMaxRepeatedToolErrorSignature || 5);
 const TN_WRITER_RESTRICTED_TOOLS = DEFAULT_RESTRICTED_TOOLS.filter((tool) => !TN_WRITER_TOOL_BLOCKLIST.includes(tool));
 
 function buildAtValidatorSystemPrompt() {
@@ -1294,12 +1308,21 @@ function parseContextPathFlag(ctxFlag) {
 }
 
 function applySkillSpecificGuardrails(skill, guardrails) {
-  if (skill !== 'tn-writer') return guardrails;
-  return {
-    ...guardrails,
-    maxTurns: Math.min(Number(guardrails?.maxTurns || TN_WRITER_MAX_TURNS), TN_WRITER_MAX_TURNS),
-    maxToolCalls: Math.min(Number(guardrails?.maxToolCalls || TN_WRITER_MAX_TOOL_CALLS), TN_WRITER_MAX_TOOL_CALLS),
-  };
+  if (skill === 'tn-writer') {
+    return {
+      ...guardrails,
+      maxTurns: Math.min(Number(guardrails?.maxTurns || TN_WRITER_MAX_TURNS), TN_WRITER_MAX_TURNS),
+      maxToolCalls: Math.min(Number(guardrails?.maxToolCalls || TN_WRITER_MAX_TOOL_CALLS), TN_WRITER_MAX_TOOL_CALLS),
+    };
+  }
+  if (skill === 'tn-quality-check') {
+    return {
+      ...guardrails,
+      maxConsecutiveToolErrors: Math.min(Number(guardrails?.maxConsecutiveToolErrors || TN_QC_MAX_CONSEC), TN_QC_MAX_CONSEC),
+      maxRepeatedToolErrorSignature: Math.min(Number(guardrails?.maxRepeatedToolErrorSignature || TN_QC_MAX_REPEAT), TN_QC_MAX_REPEAT),
+    };
+  }
+  return guardrails;
 }
 
 function getSkillToolConfig(skill) {
@@ -1518,6 +1541,7 @@ async function runParallelTnWriter({
       const toolConfig = getSkillToolConfig('tn-writer');
       return runClaude({
         prompt,
+        label: `${book} ${ch} tn-writer shard ${i}${vRange ? ` v${vRange}` : ''}`,
         cwd: CSKILLBP_DIR,
         model: model || undefined,
         skill: 'tn-writer',
@@ -1667,7 +1691,6 @@ async function notesPipeline(route, message) {
   // Editor-marked TN hints (API-origin only; null on Zulip path).
   const hints = parsed.hints || null;
   const sessionKey = stream ? `stream-${stream}-${topic}` : `dm-${message.sender_id}`;
-  const debugRunId = `notes-${message.id || Date.now()}`;
   const checkpointRef = {
     sessionKey,
     pipelineType: 'notes',
@@ -1728,9 +1751,6 @@ async function notesPipeline(route, message) {
     existingCheckpoint?.resume?.chapter != null &&
     (existingCheckpoint?.state === 'paused_for_outage' || existingCheckpoint?.state === 'paused_for_usage_limit' || existingCheckpoint?.state === 'failed' || existingCheckpoint?.state === 'running')
   );
-  // #region agent log
-  fetch('http://localhost:7282/ingest/190f0e90-444d-4921-920d-f208e86f8cb3',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'7de6a4'},body:JSON.stringify({sessionId:'7de6a4',runId:debugRunId,hypothesisId:'H4',location:'notes-pipeline.js:resume-gate',message:'checkpoint and resume decision',data:{scope:{book,startChapter,endChapter,verseStart:verseStart??null,verseEnd:verseEnd??null},fresh,checkpointState:existingCheckpoint?.state||null,resume:existingCheckpoint?.resume||null,canResumeFromCheckpoint},timestamp:Date.now()})}).catch(()=>{});
-  // #endregion
   if (!fresh && canResumeFromCheckpoint && resumeChapter >= startChapter) {
     // The resume chapter was counted as failed in the previous run; undo that
     // so it isn't double-counted if it succeeds this time.
@@ -2230,9 +2250,6 @@ async function notesPipeline(route, message) {
       const toolConfig = getSkillToolConfig(skill.name);
       await status(`Running **${skill.name}** for ${ref} (timeout: ${Math.round(timeoutMs / 60000)}min)...`);
       console.log(`[notes] Running ${skill.name}: ${skill.prompt} (timeout: ${Math.round(timeoutMs / 60000)}min)`);
-      // #region agent log
-      fetch('http://localhost:7282/ingest/190f0e90-444d-4921-920d-f208e86f8cb3',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'7de6a4'},body:JSON.stringify({sessionId:'7de6a4',runId:debugRunId,hypothesisId:'H1',location:'notes-pipeline.js:skill-start',message:'skill start',data:{ref,skill:skill.name,expectedOutput:skill.expectedOutput||null,prompt:skill.prompt,skillStart,timeoutMs},timestamp:Date.now()})}).catch(()=>{});
-      // #endregion
       setCheckpoint(checkpointRef, {
         state: 'running',
         totalSuccess,
@@ -2329,6 +2346,7 @@ async function notesPipeline(route, message) {
           console.log(`[notes] Starting skill ${skill.name} for ${ref}`);
           result = await runClaude({
             prompt: skill.prompt,
+            label: `${ref} ${skill.name}`,
             cwd: CSKILLBP_DIR,
             model: model || skill.model, // TEST_FAST haiku overrides per-skill model
             skill: skill.name,
@@ -2353,9 +2371,6 @@ async function notesPipeline(route, message) {
         }
       }
       } // end !usedParallel
-      // #region agent log
-      fetch('http://localhost:7282/ingest/190f0e90-444d-4921-920d-f208e86f8cb3',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'7de6a4'},body:JSON.stringify({sessionId:'7de6a4',runId:debugRunId,hypothesisId:'H4',location:'notes-pipeline.js:skill-result',message:'skill result/error',data:{ref,skill:skill.name,hadError:!!skillError,error:skillError?String(skillError.message||skillError):null,resultSubtype:result?.subtype||null,resultError:result?.error||null},timestamp:Date.now()})}).catch(()=>{});
-      // #endregion
 
       const duration = ((Date.now() - skillStart) / 1000).toFixed(1);
       const sdkSuccess = result?.subtype === 'success';
@@ -2383,6 +2398,24 @@ async function notesPipeline(route, message) {
       if (skillError) {
         failedSkill = skill.name;
         const errText = skillError.message || String(skillError);
+        // A guardrail stop on the quality check (looping edits / budget exhaustion) must not
+        // discard the already-written, mechanically-validated notes. Treat it as "quality
+        // incomplete but non-fatal": fall through to the graceful-degradation path (bounded
+        // rescue + tag unresolved findings + canonical quote-sync + door43-push) instead of
+        // failing the chapter. Scope strictly to tn-quality-check — a guardrail stop on
+        // tn-writer means the notes are incomplete and must still hard-fail.
+        if (skill.name === 'tn-quality-check' && isGuardrailStop(errText)) {
+          failedSkill = null;
+          await status(`**${skill.name}** for ${ref} stopped by guardrail (${errText}); proceeding with notes as written and tagging any unresolved findings.`);
+          try {
+            const qResolved = resolveOutputFile(skill.expectedOutput, book);
+            if (qResolved && fs.existsSync(path.resolve(CSKILLBP_DIR, qResolved))) {
+              if (!skillOutputs[ch]) skillOutputs[ch] = {};
+              skillOutputs[ch]['tn-quality-check'] = qResolved;
+            }
+          } catch (_) { /* no partial findings on disk — push notes as-is */ }
+          break;
+        }
         if (isTransientOutageError(skillError)) {
           abortForOutage = true;
           setCheckpoint(checkpointRef, {
@@ -2444,9 +2477,6 @@ async function notesPipeline(route, message) {
         const discoverPat = new RegExp(`^${book}-0*${ch}(-.*)?${outExt}$`);
         const resolved = discoverFreshOutput(outDir, book, discoverPat, skillStart)
           || resolveOutputFile(skill.expectedOutput, book);
-        // #region agent log
-        fetch('http://localhost:7282/ingest/190f0e90-444d-4921-920d-f208e86f8cb3',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'7de6a4'},body:JSON.stringify({sessionId:'7de6a4',runId:debugRunId,hypothesisId:'H1',location:'notes-pipeline.js:resolve-output',message:'resolved expected output',data:{ref,skill:skill.name,expectedOutput:skill.expectedOutput,resolved:resolved||null},timestamp:Date.now()})}).catch(()=>{});
-        // #endregion
         if (!resolved) {
           failedSkill = skill.name;
           await status(`**${skill.name}** failed for ${ref} \u2014 expected output not found: ${skill.expectedOutput} (${duration}s)`);
@@ -2467,9 +2497,6 @@ async function notesPipeline(route, message) {
         } catch (_) {
           mtimeMs = 0;
         }
-        // #region agent log
-        fetch('http://localhost:7282/ingest/190f0e90-444d-4921-920d-f208e86f8cb3',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'7de6a4'},body:JSON.stringify({sessionId:'7de6a4',runId:debugRunId,hypothesisId:'H2',location:'notes-pipeline.js:freshness-check',message:'mtime freshness evaluation',data:{ref,skill:skill.name,resolved,skillStart,mtimeMs,isStale:mtimeMs<(skillStart-2000)},timestamp:Date.now()})}).catch(()=>{});
-        // #endregion
         if (mtimeMs < skillStart - 2000) {
           if (skill.name === 'post-edit-review') {
             // post-edit-review can legitimately keep an unchanged issues TSV.
@@ -2678,6 +2705,7 @@ async function notesPipeline(route, message) {
             `Do not create scratch scripts and do not perform open-ended manual JSON surgery loops.`;
           await runClaude({
             prompt: rescuePrompt,
+            label: `${ref} tn-quality-check (rescue)`,
             cwd: CSKILLBP_DIR,
             model: model || 'sonnet',
             skill: 'tn-quality-check',
@@ -2776,6 +2804,7 @@ async function notesPipeline(route, message) {
     }
 
     let pushNoChanges = false;
+    let pushPrNumber;
     if (!chapterFailed) await status(`Running **door43-push** (TN) for ${ref}...`);
     const pushStartTime = new Date().toISOString();
     if (!chapterFailed) try {
@@ -2790,6 +2819,7 @@ async function notesPipeline(route, message) {
         chapterFailed = true;
       } else {
         pushNoChanges = pushResult.noChanges === true;
+        pushPrNumber = pushResult.prNumber;
         await status(`**door43-push** (TN) done for ${ref}: ${pushResult.details}`);
       }
     } catch (err) {
@@ -2805,7 +2835,7 @@ async function notesPipeline(route, message) {
     if (!chapterFailed && !pushNoChanges) {
       await status(`Verifying push for ${ref}...`);
       const stagingBranch = buildBranchName(book, ch);
-      const verify = await verifyRepoPush({ repo: 'en_tn', stagingBranch, since: pushStartTime });
+      const verify = await verifyRepoPush({ repo: 'en_tn', stagingBranch, since: pushStartTime, prNumber: pushPrNumber });
       if (!verify.success) {
         await status(`Repo verify FAILED for ${ref}: ${verify.details}`);
         console.warn(`[notes] Repo verify failed for ${ref}: ${verify.details}`);
@@ -2865,13 +2895,19 @@ async function notesPipeline(route, message) {
         : `\`${c.branch}\``
     ).join(', ');
 
-    setPendingMerge(sessionKey, {
+    const deferredStart = deferredChapters[0].ch;
+    const deferredEnd = deferredChapters[deferredChapters.length - 1].ch;
+    const pendingScope = { book, startChapter: deferredStart, endChapter: deferredEnd, verseStart: verseStart ?? null, verseEnd: verseEnd ?? null };
+    const pendingKey = buildCheckpointKey({ sessionKey, pipelineType: 'notes', scope: pendingScope });
+    setPendingMerge(pendingKey, {
+      key: pendingKey,
       sessionKey,
       pipelineType: 'notes',
       username,
       book,
-      startChapter: deferredChapters[0].ch,
-      endChapter: deferredChapters[deferredChapters.length - 1].ch,
+      startChapter: deferredStart,
+      endChapter: deferredEnd,
+      scope: pendingScope,
       completedChapters: deferredChapters,
       blockingBranches: deferredConflicts.map(c => ({ repo: repoName, branchPattern: c.branch })),
       originalMessage: message,
@@ -2893,7 +2929,8 @@ async function notesPipeline(route, message) {
     await addReaction(msgId, 'hourglass');
     // Use sendMessage directly to control the @-mention (reply() auto-prepends sender)
     const conflictMsg = `${mention} I have notes ready for **${deferredRange}**, but ${branchList} on ${repoName} ` +
-      `has edits to \`${targetFile}\`. Please merge your branch first, then say **merged** or **done** ` +
+      `has edits to \`${targetFile}\`. Please merge your branch first, then say **merged** ` +
+      `(or **merge ${book} ${deferredStart}** if more than one run is waiting here) ` +
       `so I can proceed with the insertion.`;
     if (stream) {
       await sendMessage(stream, topic, conflictMsg);

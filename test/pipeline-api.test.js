@@ -26,8 +26,22 @@ test('buildApiJobId / parseJobId — round-trip for single chapter', () => {
   assert.ok(parsed, 'parseJobId returned null');
   assert.equal(parsed.pipelineType, 'notes');
   assert.deepEqual(parsed.scope, scope);
-  // sessionKey is the derived "stream-bp-api-<key>" form, sanitized.
-  assert.match(parsed.sessionKey, /bp_api/);
+  // sessionKey is the API control thread ("stream-<channel>-<topic>"),
+  // sanitized — NOT the caller's apiSessionKey. This is what the pipeline
+  // writes its checkpoint under, so /api/pipeline/:jobId status lookups match.
+  assert.match(parsed.sessionKey, /^stream_/);
+  assert.match(parsed.sessionKey, /Bot_testing/);
+  assert.doesNotMatch(parsed.sessionKey, /bible_editor/);
+});
+
+test('buildApiJobId — jobId is independent of apiSessionKey (control-thread identity)', () => {
+  // API runs adopt the shared control thread as their sessionKey, so two
+  // callers requesting the same scope get the same jobId/checkpoint. Dedup is
+  // by (control-thread, scope); idempotency on the work itself is preserved.
+  const scope = { book: 'ZEC', startChapter: 7, endChapter: 7, verseStart: null, verseEnd: null };
+  const a = buildApiJobId({ apiSessionKey: 'editor-AAA', pipelineType: 'notes', scope });
+  const b = buildApiJobId({ apiSessionKey: 'editor-BBB', pipelineType: 'notes', scope });
+  assert.equal(a, b);
 });
 
 test('parseJobId — round-trip with chapter range', () => {

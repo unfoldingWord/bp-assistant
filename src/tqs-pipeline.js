@@ -259,6 +259,7 @@ async function tqsPipeline(route, message) {
     try {
       result = await runClaude({
         skill: 'tq-writer',
+        label: `${ref} tq-writer`,
         model: 'sonnet',
         cwd: CSKILLBP_DIR,
         prompt: `Write translation questions for ${book} chapter ${chapter}.`,
@@ -427,7 +428,7 @@ async function tqsPipeline(route, message) {
       continue; // skip verifyRepoPush — nothing was pushed
     }
 
-    const verifyPush = await verifyRepoPush({ repo: 'en_tq', stagingBranch: branch, since: pushStartTime });
+    const verifyPush = await verifyRepoPush({ repo: 'en_tq', stagingBranch: branch, since: pushStartTime, prNumber: pushResult.prNumber });
     if (!verifyPush.success) {
       totalFail++;
       setCheckpoint(checkpointRef, {

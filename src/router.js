@@ -5,7 +5,7 @@ const { getSession, clearSession, hasActiveStreamSession } = require('./session-
 const { getTotalVerses, getChapterCount } = require('./verse-counts');
 const { classifyIntent } = require('./intent-classifier');
 const { preflightCheck, estimateTokens } = require('./usage-tracker');
-const { getPendingMerge, clearPendingMerge, getAllPendingMerges } = require('./pending-merges');
+const { clearPendingMerge, getAllPendingMerges, getPendingMergesForSession } = require('./pending-merges');
 const { getCheckpoint, setCheckpoint, clearCheckpoint, buildCheckpointKey } = require('./pipeline-checkpoints');
 const { listCheckpoints } = require('./pipeline-checkpoints');
 const { resumeInsertion } = require('./insertion-resume');
@@ -104,29 +104,47 @@ const activePipelines = new Set();
 const MIN_TIMEOUT_MS = 10 * 60 * 1000; // 10 min floor
 const MS_PER_VERSE_OP = 5 * 60 * 1000; // 5 min per verse per operation
 
+function stripMentions(content) {
+  // Strip @**Name** or @**Name|id** from both leading and trailing positions
+  // so "yes @**BPbot**" and "@**BPbot** yes" both reduce to "yes"
+  return content.trim().toLowerCase()
+    .replace(/^@\*\*[^*]+\*\*\s*/, '')
+    .replace(/\s*@\*\*[^*]+\*\*$/, '');
+}
+
 function isYes(content) {
-  const t = content.trim().toLowerCase().replace(/^@\*\*[^*]+\*\*\s*/, '');
+  const t = stripMentions(content);
   return /^(y|yes|yep|yeah|yea|correct|sure|do it|go|go ahead|ok|okay)[\s.!]*$/.test(t);
 }
 
 function isNo(content) {
-  const t = content.trim().toLowerCase().replace(/^@\*\*[^*]+\*\*\s*/, '');
+  const t = stripMentions(content);
   return /^(n|no|nope|nah|cancel|wrong|never ?mind)[\s.!]*$/.test(t);
 }
 
 function isMerged(content) {
-  const t = content.trim().toLowerCase().replace(/^@\*\*[^*]+\*\*\s*/, '');
+  const t = stripMentions(content);
   return /^(merged|done|i merged|it'?s merged|branches? merged|go ahead)[\s.!]*$/.test(t);
 }
 
 function isCancelMerge(content) {
-  const t = content.trim().toLowerCase().replace(/^@\*\*[^*]+\*\*\s*/, '');
+  const t = stripMentions(content);
   return /^(cancel|discard|nevermind|never ?mind|forget it|start over)[\s.!]*$/.test(t);
 }
 
 function parseMergeCommand(content) {
   const t = content.trim().replace(/^@\*\*[^*]+\*\*\s*/, '');
   const m = t.match(/^(?:merged?)\s+(\w+)\s+(\d+)[\s.!]*$/i);
+  if (!m) return null;
+  const book = normalizeBookName(m[1]);
+  return book ? { book, chapter: parseInt(m[2]) } : null;
+}
+
+// Scope-addressed counterpart to parseMergeCommand: discard one specific
+// deferred run when several share a topic (e.g. the API control thread).
+function parseCancelCommand(content) {
+  const t = content.trim().replace(/^@\*\*[^*]+\*\*\s*/, '');
+  const m = t.match(/^(?:cancel|discard)\s+(\w+)\s+(\d+)[\s.!]*$/i);
   if (!m) return null;
   const book = normalizeBookName(m[1]);
   return book ? { book, chapter: parseInt(m[2]) } : null;
@@ -850,7 +868,8 @@ const HELP_TEXT = `I can help with:\n` +
   `- **note HAB 3 lots of parallelism** -- file an observation for a book/chapter\n` +
   `- **report: ...** / **issue: ...** / **bug: ...** -- file bot feedback or a bug report\n` +
   `- **resume** -- resume a paused/failed run in this topic\n` +
-  `- **merged** or **merged PSA 82** -- continue insertion after you merge pending branches\n` +
+  `- **merged** or **merge PSA 82** -- continue insertion after you merge pending branches\n` +
+  `- **cancel** or **cancel PSA 82** -- discard a pending insertion (use the scoped form when several are waiting)\n` +
   `- **api generate PSA 79** / **api write notes PSA 82** -- use the API runner`;
 
 async function routeMessage(message) {
@@ -982,8 +1001,8 @@ async function routeMessage(message) {
         pm.book === mergeCmd.book && pm.startChapter <= mergeCmd.chapter && pm.endChapter >= mergeCmd.chapter);
       if (match) {
         try { await addReaction(message.id, 'working_on_it'); } catch (_) {}
-        console.log(`[router] Explicit merge command for ${mergeCmd.book} ${mergeCmd.chapter} — resuming ${match.sessionKey}`);
-        resumeInsertion(match.sessionKey, message).catch(err =>
+        console.log(`[router] Explicit merge command for ${mergeCmd.book} ${mergeCmd.chapter} — resuming ${match.key || match.sessionKey}`);
+        resumeInsertion(match.key || match.sessionKey, message).catch(err =>
           console.error(`[router] resumeInsertion failed: ${err.message}`));
       } else {
         await sendMessage(message.display_recipient, message.subject,
@@ -993,22 +1012,68 @@ async function routeMessage(message) {
     }
   }
 
-  // Check for pending merge (deferred repo-insert waiting for user to merge branches)
+  // Handle explicit "cancel PSA 88" command — discard one specific deferred run
+  // (the scope-addressed counterpart to "merge PSA 88"). Works from any topic.
   if (isStream) {
-    const pendingMerge = getPendingMerge(sessionKey);
-    if (pendingMerge) {
+    const cancelCmd = parseCancelCommand(message.content);
+    if (cancelCmd) {
+      const match = getAllPendingMerges().find(pm =>
+        pm.book === cancelCmd.book && pm.startChapter <= cancelCmd.chapter && pm.endChapter >= cancelCmd.chapter);
+      if (match) {
+        clearPendingMerge(match.key || match.sessionKey);
+        console.log(`[router] Explicit cancel command for ${cancelCmd.book} ${cancelCmd.chapter} — discarded ${match.key || match.sessionKey}`);
+        await sendMessage(message.display_recipient, message.subject,
+          `Discarded the pending insertion for **${cancelCmd.book} ${cancelCmd.chapter}**. ` +
+          `Generated files are still in the output folder if you need them later.`);
+      } else {
+        await sendMessage(message.display_recipient, message.subject,
+          `No pending insertion found for ${cancelCmd.book} ${cancelCmd.chapter}.`);
+      }
+      return;
+    }
+  }
+
+  // Check for pending merge (deferred repo-insert waiting for user to merge branches).
+  // A single topic can hold several deferred runs at once (notably the API control
+  // thread, which all API runs share), so resolve by session scan: bare "merged" /
+  // "cancel" act only when exactly one run is waiting; otherwise point the user at
+  // the unambiguous scope-addressed "merge <BOOK> <chapter>" command.
+  if (isStream) {
+    const sessionPending = getPendingMergesForSession(sessionKey);
+    if (sessionPending.length > 0) {
+      const labelOf = (pm) => pm.startChapter === pm.endChapter
+        ? `${pm.book} ${pm.startChapter}`
+        : `${pm.book} ${pm.startChapter}–${pm.endChapter}`;
+      const listPending = () => sessionPending.map(pm => `**${labelOf(pm)}** (${pm.pipelineType})`).join(', ');
+      const mergeExample = `**merge ${sessionPending[0].book} ${sessionPending[0].startChapter}**`;
+      const cancelExample = `**cancel ${sessionPending[0].book} ${sessionPending[0].startChapter}**`;
+
       if (isMerged(message.content)) {
-        try { await addReaction(message.id, 'working_on_it'); } catch (_) {}
-        console.log(`[router] User said merged -- resuming insertion for ${sessionKey}`);
-        resumeInsertion(sessionKey, message).catch(err =>
-          console.error(`[router] resumeInsertion failed: ${err.message}`));
+        if (sessionPending.length === 1) {
+          const pm = sessionPending[0];
+          try { await addReaction(message.id, 'working_on_it'); } catch (_) {}
+          console.log(`[router] User said merged -- resuming insertion for ${pm.key || pm.sessionKey}`);
+          resumeInsertion(pm.key || pm.sessionKey, message).catch(err =>
+            console.error(`[router] resumeInsertion failed: ${err.message}`));
+        } else {
+          await sendMessage(message.display_recipient, message.subject,
+            `More than one run is waiting to merge here: ${listPending()}. ` +
+            `Say **merge <BOOK> <chapter>** to pick one (e.g. ${mergeExample}).`);
+        }
         return;
       }
       if (isCancelMerge(message.content)) {
-        clearPendingMerge(sessionKey);
-        console.log(`[router] User cancelled pending merge for ${sessionKey}`);
-        await sendMessage(message.display_recipient, message.subject,
-          `Pending insertion discarded. Generated files are still in the output folder if you need them later.`);
+        if (sessionPending.length === 1) {
+          const pm = sessionPending[0];
+          clearPendingMerge(pm.key || pm.sessionKey);
+          console.log(`[router] User cancelled pending merge for ${pm.key || pm.sessionKey}`);
+          await sendMessage(message.display_recipient, message.subject,
+            `Pending insertion discarded. Generated files are still in the output folder if you need them later.`);
+        } else {
+          await sendMessage(message.display_recipient, message.subject,
+            `More than one run is waiting here: ${listPending()}. ` +
+            `Discard a specific one with **cancel <BOOK> <chapter>** (e.g. ${cancelExample}).`);
+        }
         return;
       }
       // New commands pass through to normal routing — pending merge doesn't block new work
@@ -1209,6 +1274,16 @@ async function routeMessage(message) {
       return;
     }
 
+    // Guard: bare yes/no with no pending confirmation means the user is likely replying
+    // to a confirmation prompt that's no longer in memory (e.g. after a bot restart).
+    // Don't pass this to Haiku — it can't do anything useful with a lone "yes".
+    if (isYes(message.content) || isNo(message.content)) {
+      console.log(`[router] Bare yes/no with no pending confirmation from ${message.sender_full_name} in ${sessionKey}`);
+      await sendMessage(message.display_recipient, message.subject,
+        `@**${message.sender_full_name}** I don't have anything waiting for confirmation right now. Please re-send your original request and I'll ask again.`);
+      return;
+    }
+
     // No active session -- try Haiku classification for new commands
     console.log(`[router] No regex match, no active session — trying haiku intent classification`);
     let haikuMatched = false;
@@ -1308,7 +1383,7 @@ async function routeMessage(message) {
  */
 function hasPendingAction(channel, topic) {
   const sessionKey = `stream-${channel}-${topic}`;
-  return pendingConfirmations.has(sessionKey) || !!getPendingMerge(sessionKey);
+  return pendingConfirmations.has(sessionKey) || getPendingMergesForSession(sessionKey).length > 0;
 }
 
 /**
@@ -1333,8 +1408,38 @@ const API_PIPELINE_ROUTE_NAMES = {
   tqs: 'write-tqs',
 };
 
-function getApiStream() {
-  return process.env.BT_API_ZULIP_STREAM || 'bp-api';
+// API-triggered runs (POST /api/pipeline/start) have no originating Zulip
+// thread, so we adopt a fixed control thread as their lifecycle +
+// human-in-the-loop channel: the bot's watched channel (config.channel) plus a
+// configurable topic. The stream is hard-locked to config.channel — the
+// merge-conflict "merged" reply must land on the watched channel to be heard
+// at all (see index.js handleEvents). Only the topic is configurable.
+function getApiControlThread() {
+  return {
+    stream: config.channel,
+    topic: process.env.BT_API_CONTROL_TOPIC
+      || (config.apiControlThread && config.apiControlThread.topic)
+      || 'Bot testing',
+  };
+}
+
+// Compact, human-readable label for an API run, e.g. "ZEC 7 notes".
+function buildApiRunLabel({ pipelineType, scope }) {
+  const { book, startChapter, endChapter, verseStart, verseEnd } = scope;
+  const chPart = verseStart != null && verseEnd != null && startChapter === endChapter
+    ? `${startChapter}:${verseStart}-${verseEnd}`
+    : startChapter === endChapter
+      ? `${startChapter}`
+      : `${startChapter}-${endChapter}`;
+  const typeLabel = pipelineType === 'generate' ? 'content'
+    : pipelineType === 'notes' ? 'notes'
+      : 'tqs';
+  return `${book} ${chPart} ${typeLabel}`;
+}
+
+// Stamp for lifecycle posts, e.g. "ZEC 7 notes · triggered by @username · job `…`".
+function buildApiRunStamp({ pipelineType, scope, username, jobId }) {
+  return `${buildApiRunLabel({ pipelineType, scope })} · triggered by @${username} · job \`${jobId}\``;
 }
 
 function buildApiSyntheticRoute(pipelineType, scope, options) {
@@ -1392,7 +1497,7 @@ function buildApiContentFlags(pipelineType, options) {
   return flags;
 }
 
-function buildApiSyntheticMessage({ pipelineType, scope, apiSessionKey, username, options }) {
+function buildApiSyntheticMessage({ pipelineType, scope, username, options }) {
   const { book, startChapter, endChapter } = scope;
   const chapterPart = startChapter === endChapter ? String(startChapter) : `${startChapter}-${endChapter}`;
   const commandWord = pipelineType === 'generate' ? 'generate'
@@ -1400,11 +1505,19 @@ function buildApiSyntheticMessage({ pipelineType, scope, apiSessionKey, username
     : 'write tqs';
   const flags = buildApiContentFlags(pipelineType, options);
   const content = [commandWord, book, chapterPart, ...flags].join(' ');
+  // Adopt the API control thread as this run's originating stream/topic. The
+  // pipelines derive sessionKey, checkpoints, pending-merge keys and all Zulip
+  // posts from message.display_recipient/subject, so this single substitution
+  // makes API runs visible and their merge-conflict prompts answerable in the
+  // control thread with no per-pipeline changes. The caller's apiSessionKey no
+  // longer participates in the sessionKey; pending-merge records are kept
+  // distinct per run by scope (see pending-merges.js).
+  const { stream: controlStream, topic: controlTopic } = getApiControlThread();
   return {
     id: -1,
     type: 'stream',
-    display_recipient: getApiStream(),
-    subject: apiSessionKey,
+    display_recipient: controlStream,
+    subject: controlTopic,
     sender_id: -1,
     sender_full_name: username,
     sender_email: `${username}@api.bp-assistant`,
@@ -1413,8 +1526,9 @@ function buildApiSyntheticMessage({ pipelineType, scope, apiSessionKey, username
   };
 }
 
-function buildApiJobId({ apiSessionKey, pipelineType, scope }) {
-  const derivedSessionKey = `stream-${getApiStream()}-${apiSessionKey}`;
+function buildApiJobId({ pipelineType, scope }) {
+  const { stream, topic } = getApiControlThread();
+  const derivedSessionKey = `stream-${stream}-${topic}`;
   return buildCheckpointKey({ sessionKey: derivedSessionKey, pipelineType, scope });
 }
 
@@ -1451,9 +1565,10 @@ function triggerPipelineFromApi(input) {
   if (!route) {
     return { status: 'invalid', message: `Unknown pipelineType: ${pipelineType}` };
   }
-  const message = buildApiSyntheticMessage({ pipelineType, scope, apiSessionKey, username, options });
-  const derivedSessionKey = `stream-${getApiStream()}-${apiSessionKey}`;
-  const jobId = buildCheckpointKey({ sessionKey: derivedSessionKey, pipelineType, scope });
+  const message = buildApiSyntheticMessage({ pipelineType, scope, username, options });
+  const { stream: controlStream, topic: controlTopic } = getApiControlThread();
+  const derivedSessionKey = `stream-${controlStream}-${controlTopic}`;
+  const jobId = buildApiJobId({ pipelineType, scope });
 
   // Conflict check 1: same (sessionKey, pipelineType, scope) already running?
   const activeCp = getActiveCheckpoint(route, derivedSessionKey, []);
@@ -1484,11 +1599,28 @@ function triggerPipelineFromApi(input) {
     for (const k of keys) activePipelines.add(k);
   }
 
+  // Lifecycle: announce the run in the control thread (API runs have no
+  // originating message to react to). Finished / per-chapter / merge-conflict
+  // posts ride the pipeline's own reply()/sendMessage path to the same thread.
+  const stamp = buildApiRunStamp({ pipelineType, scope, username, jobId });
+  sendMessage(controlStream, controlTopic, `:rocket: Starting ${stamp}`).catch((err) =>
+    console.error(`[router/api] Failed to post start message: ${err.message}`));
+  // Trace the caller's idempotency key → job, since it no longer rides the sessionKey.
+  console.log(`[router/api] firing ${pipelineType} ${book} ${startChapter}-${endChapter} apiSessionKey=${apiSessionKey} jobId=${jobId}`);
+
   // Fire and forget.
   runPipeline(route, message)
     .catch(async (err) => {
       console.error(`[router/api] Pipeline "${route.name}" failed: ${err.message}`);
       await publishRouterFailure(route, message, err);
+      // The pipeline's own handled errors (outage, usage limit, conflict) post
+      // to the thread already; this covers an unhandled throw, which otherwise
+      // only reaches the admin status board.
+      try {
+        await sendMessage(controlStream, controlTopic, `:cross_mark: ${stamp} failed: ${err.message}`);
+      } catch (postErr) {
+        console.error(`[router/api] Failed to post error message: ${postErr.message}`);
+      }
     })
     .finally(() => {
       if (keys) {
