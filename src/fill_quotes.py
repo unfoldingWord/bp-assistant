@@ -41,6 +41,10 @@ def build_tsv_notes(json_file):
         quote = re.sub(r'" ', '” ', quote)
         quote = re.sub(r'"$', '”', quote)
 
+        # Remove backslash codes if present
+        quote = re.sub(r'\\\w+', '', quote)
+        quote = re.sub(r'\\\*', '', quote)
+
         occurrence = ""
         note = ""
         snippet = quote
