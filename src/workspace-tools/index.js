@@ -14,6 +14,7 @@ const { checkTwHeadwords, compareUltUst, detectAbstractNouns } = require('./issu
 const { extractAlignmentData, fixHebrewQuotes, flagNarrowQuotes, generateIds, resolveGlQuotes, verifyAtFit, assembleNotes, updateNoteText, updatePreparedQuote, removeNote, prepareNotes, prepareAndValidate, fixUnicodeQuotes, verifyBoldMatches, fillTsvIds, fillOrigQuotes, prepareATContext, readPreparedNotes } = require('./tn-tools');
 const { validateTnTsv, checkTnQuality } = require('./quality-tools');
 const { giteaPr, prepareCompare, prepareTq, verifyTq, appendQuickref } = require('./misc-tools');
+const { validateUsfmStructure, validateAlignmentIntegrityGate, checkDuplicateIdsGate, preflightDataCheck, runRegressionChecks } = require('./validation-tools');
 
 function asTextToolResult(value) {
   if (typeof value === 'string') return { content: [{ type: 'text', text: value }] };
@@ -515,6 +516,33 @@ function createTnWriterTools(createSdkMcpServer, tool, z) {
         end: z.number().int().optional().describe('Last item index (inclusive). Default: start+19'),
         summaryOnly: z.boolean().optional().describe('Return only total count and item IDs — no bodies'),
       }, async (args) => ({ content: [{ type: 'text', text: readPreparedNotes(args) }] })),
+
+      // --- Validation gates (logic lives in bp-assistant-skills; see validation-tools.js) ---
+      tool('validate_usfm_structure', 'Structural gate for generated USFM: verse completeness (vs Hebrew source when given), duplicate/out-of-order verses, marker balance, empty verses, balanced {braces}. First line of result starts OK:/FAIL:.', {
+        usfm: z.string().describe('Generated USFM path (relative to workspace)'),
+        source: z.string().optional().describe('Reference USFM (e.g. Hebrew source) whose verse set must match'),
+        chapter: z.number().int().optional().describe('Validate only this chapter'),
+      }, async (args) => ({ content: [{ type: 'text', text: await validateUsfmStructure(args) }] })),
+      tool('validate_alignment_integrity', 'Field-level gate for aligned USFM: byte-exact x-content/x-lemma vs Hebrew source (flags visually-identical Unicode drift), occurrence numbering, Hebrew coverage (ULT mode). Run after create_aligned_usfm/repair. First line starts OK:/FAIL:.', {
+        aligned: z.string().describe('Aligned USFM path (relative to workspace)'),
+        hebrew: z.string().describe('Hebrew source USFM path (relative to workspace)'),
+        chapter: z.number().int().optional().describe('Validate only this chapter'),
+        ust: z.boolean().optional().describe('UST mode: unaligned Hebrew words are allowed'),
+      }, async (args) => ({ content: [{ type: 'text', text: await validateAlignmentIntegrityGate(args) }] })),
+      tool('check_duplicate_ids', 'ID gate for TN/TQ TSVs: format [a-z][a-z0-9]{3}, uniqueness within and across files, optional collision check vs a published book TSV. First line starts OK:/FAIL:.', {
+        files: z.array(z.string()).describe('TSV file paths to check together (relative to workspace)'),
+        against: z.array(z.string()).optional().describe('Published TSVs to check collisions against'),
+      }, async (args) => ({ content: [{ type: 'text', text: await checkDuplicateIdsGate(args) }] })),
+      tool('preflight_data_check', 'Loud check that required reference data exists before generation (issues_resolved, glossaries, Hebrew source, T4T, Strong\'s index). First line starts OK:/FAIL: — do not generate on FAIL.', {
+        book: z.string().describe('Book code (e.g. NAM)'),
+        stage: z.enum(['ult', 'ust', 'tn', 'all']).optional().describe('Which stage\'s requirements to check (default all)'),
+      }, async (args) => ({ content: [{ type: 'text', text: await preflightDataCheck(args) }] })),
+      tool('run_regression_checks', 'Re-test every mechanizable closed quality bug against a generated file (checks live in the skills repo). FAIL means a previously fixed mistake has returned. First line starts OK:/FAIL:.', {
+        stage: z.enum(['ULT', 'UST', 'TN', 'TQ', 'alignment']).describe('Content stage of the file'),
+        file: z.string().describe('Generated file path (relative to workspace)'),
+        book: z.string().optional().describe('Book code (enables book-scoped checks)'),
+        chapter: z.number().int().optional().describe('Chapter number (scopes chapter-pinned checks)'),
+      }, async (args) => ({ content: [{ type: 'text', text: await runRegressionChecks(args) }] })),
     ],
   });
 }
@@ -557,6 +585,13 @@ function createQualityTools(createSdkMcpServer, tool, z) {
         generatedJson: z.string().optional().describe('Path to generated_notes.json (runtime.generatedNotes)'),
         tsvFile: z.string().optional().describe('Path to the assembled TN TSV (removes the row whose ID column matches)'),
       }, async (args) => ({ content: [{ type: 'text', text: removeNote(args) }] })),
+      tool('check_duplicate_ids', 'ID gate for TN/TQ TSVs: format, uniqueness within/across files, optional collision vs published. First line starts OK:/FAIL:.', {
+        files: z.array(z.string()), against: z.array(z.string()).optional(),
+      }, async (args) => ({ content: [{ type: 'text', text: await checkDuplicateIdsGate(args) }] })),
+      tool('run_regression_checks', 'Re-test mechanizable closed quality bugs against a generated file. FAIL = a fixed mistake returned. First line starts OK:/FAIL:.', {
+        stage: z.enum(['ULT', 'UST', 'TN', 'TQ', 'alignment']), file: z.string(),
+        book: z.string().optional(), chapter: z.number().int().optional(),
+      }, async (args) => ({ content: [{ type: 'text', text: await runRegressionChecks(args) }] })),
     ],
   });
 }
