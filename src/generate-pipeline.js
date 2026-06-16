@@ -389,10 +389,15 @@ async function generatePipeline(route, message) {
 
   // Convenience wrapper for terminal failures outside Phase 1 (alignment
   // validation, door43-push, repo-verify): attaches the current checkpoint and
-  // a short error context. No-ops unless the event severity is 'error', so it
-  // is safe to call on any status event.
+  // a short error context. Callers invoke this ONLY at terminal failures, so it
+  // forces 'error' severity rather than trusting inferSeverity on the status
+  // text — e.g. a "source file missing" message infers as 'warn', which would
+  // otherwise silently suppress the diagnosis. This decouples the dispatch
+  // decision from the human-facing wording.
   function fireDiagnosisFor(event, errorText) {
-    fireDiagnosis(event, { checkpoint: getCheckpoint(checkpointRef), errorText });
+    if (!event) return;
+    const errorEvent = event.severity === 'error' ? event : { ...event, severity: 'error' };
+    fireDiagnosis(errorEvent, { checkpoint: getCheckpoint(checkpointRef), errorText });
   }
 
   // Helper: reply to the originating stream
@@ -1520,12 +1525,12 @@ async function generatePipeline(route, message) {
       const pushUlt = contentTypes.includes('ult') && chData.ultAligned;
       const pushUst = contentTypes.includes('ust') && chData.ustAligned;
       if (pushUlt && !fs.existsSync(path.resolve(CSKILLBP_DIR, chData.ultAligned))) {
-        const ultMissingEvent = await status(`**door43-push** SKIPPED (ULT) for ${book} ${chData.ch}: source file missing: ${chData.ultAligned}`);
+        const ultMissingEvent = await status(`**door43-push** failed (ULT) for ${book} ${chData.ch}: aligned source file missing: ${chData.ultAligned}`);
         fireDiagnosisFor(ultMissingEvent, `Phase: door43-push (ULT)\nChapter: ${book} ${chData.ch}\nAligned source file missing at push time: ${chData.ultAligned}`);
         chapterFailed = true;
       }
       if (!chapterFailed && pushUst && !fs.existsSync(path.resolve(CSKILLBP_DIR, chData.ustAligned))) {
-        const ustMissingEvent = await status(`**door43-push** SKIPPED (UST) for ${book} ${chData.ch}: source file missing: ${chData.ustAligned}`);
+        const ustMissingEvent = await status(`**door43-push** failed (UST) for ${book} ${chData.ch}: aligned source file missing: ${chData.ustAligned}`);
         fireDiagnosisFor(ustMissingEvent, `Phase: door43-push (UST)\nChapter: ${book} ${chData.ch}\nAligned source file missing at push time: ${chData.ustAligned}`);
         chapterFailed = true;
       }

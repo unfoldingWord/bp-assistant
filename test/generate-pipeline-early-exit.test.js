@@ -508,6 +508,41 @@ test('generatePipeline fires self-diagnosis when door43-push fails', async () =>
   }
 });
 
+test('generatePipeline fires self-diagnosis when an aligned source is missing at push time', async () => {
+  // Resume at door43-push with a checkpoint that references aligned files which
+  // no longer exist on disk. The pre-flight existence check must dispatch
+  // diagnosis — its status text ("source file missing") infers as 'warn', so
+  // this guards against the severity-gating regression caught in PR #123 review.
+  const harness = createHarness({
+    initialCheckpoint: {
+      state: 'failed',
+      success: 1,
+      completedChapters: [{
+        ch: 52,
+        ultAligned: 'output/AI-ULT/ISA/ISA-52-aligned.usfm',
+        ustAligned: 'output/AI-UST/ISA/ISA-52-aligned.usfm',
+      }],
+      resume: { chapter: 52, skill: 'door43-push' },
+    },
+    // Phase 1 is skipped on a door43-push resume, so runClaude must not be called.
+    runClaudeImpl: async () => { throw new Error('runClaude should not run when resuming at door43-push'); },
+  });
+
+  try {
+    await harness.generatePipeline(
+      { _synthetic: true, _book: 'ISA', _startChapter: 52, _endChapter: 52, skill: 'initial-pipeline', operations: 6 },
+      buildMessage('generate isa 52', { sender_id: 7 })
+    );
+
+    assert.equal(harness.runClaudeCalls.length, 0);
+    const missingDiag = harness.diagnosisCalls.find((c) => /source file missing/.test(c.errorText || ''));
+    assert.ok(missingDiag, 'expected a self-diagnosis dispatch for the missing aligned source');
+    assert.equal(missingDiag.event.severity, 'error');
+  } finally {
+    harness.cleanup();
+  }
+});
+
 test('generatePipeline reruns align-all-parallel when first post-align validation fails', async () => {
   let alignCalls = 0;
   const harness = createHarness({
