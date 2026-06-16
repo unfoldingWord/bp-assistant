@@ -22,7 +22,7 @@ const { getCheckpoint, setCheckpoint, clearCheckpoint, buildCheckpointKey } = re
 const { buildGenerateContext, buildUstContext } = require('./pipeline-context');
 const { publishAdminStatus } = require('./admin-status');
 const { dispatchSelfDiagnosis } = require('./self-diagnosis');
-const { validateAlignedUsfmCompleteness } = require('./workspace-tools/usfm-tools');
+const { validateAlignedUsfmCompleteness, mergeAlignedUsfm } = require('./workspace-tools/usfm-tools');
 
 const LOG_DIR = path.resolve(__dirname, '../logs');
 const REQUIRED_INITIAL_PIPELINE_FILES = [
@@ -300,6 +300,43 @@ function isFreshOutput(relPath, minMs) {
   } catch {
     return false;
   }
+}
+
+// When a chapter is aligned in batches (e.g. JER-29-v01-v16-aligned.usfm +
+// JER-29-v17-v32-aligned.usfm), the pipeline must push a single merged
+// full-chapter file — never an individual batch, which would truncate the
+// chapter on door43. If the freshest discovered aligned file is a batch,
+// merge all sibling batches (in verse order) into the canonical
+// <book>-<ch>-aligned.usfm and return that path. Otherwise return the input
+// unchanged. Only batch files (…-vNN-vMM-aligned.usfm) trigger a merge;
+// full-chapter and verse-range (…-vvN-M-aligned.usfm) files pass through.
+function resolveMergedChapterAligned(book, discoveredRel) {
+  if (!discoveredRel) return discoveredRel;
+  const name = path.basename(discoveredRel);
+  const batchRe = new RegExp(`^(${book}-\\d+)-v\\d+-v\\d+-aligned\\.usfm$`);
+  const m = name.match(batchRe);
+  if (!m) return discoveredRel; // already a full-chapter or verse-range file
+
+  const dirRel = path.dirname(discoveredRel);
+  const absDir = path.resolve(CSKILLBP_DIR, dirRel);
+  const chapterPrefix = m[1]; // e.g. "JER-29"
+  const siblingRe = new RegExp(`^${chapterPrefix}-v(\\d+)-v\\d+-aligned\\.usfm$`);
+  let batches;
+  try {
+    batches = fs.readdirSync(absDir)
+      .map((f) => { const sm = f.match(siblingRe); return sm ? { f, start: parseInt(sm[1], 10) } : null; })
+      .filter(Boolean)
+      .sort((a, b) => a.start - b.start);
+  } catch (_) {
+    return discoveredRel;
+  }
+  if (batches.length < 2) return discoveredRel; // nothing to merge
+
+  const parts = batches.map((b) => path.join(dirRel, b.f));
+  const outputRel = path.join(dirRel, `${chapterPrefix}-aligned.usfm`);
+  const result = mergeAlignedUsfm({ parts, output: outputRel });
+  console.log(`[generate] Merged ${batches.length} alignment batches → ${outputRel}: ${result}`);
+  return outputRel;
 }
 
 function summarizeAlignmentValidation({ book, chapter, ultCheck, ustCheck }) {
@@ -1164,6 +1201,14 @@ async function generatePipeline(route, message) {
           break;
         }
 
+        // If alignment was split into batches, merge them into a single
+        // full-chapter file before validating/pushing. Skipped for verse-range
+        // runs, whose source is intentionally a verse subset.
+        if (!hasVerseRange) {
+          if (needUlt) alignedUltRel = resolveMergedChapterAligned(book, alignedUltRel);
+          if (needUst) alignedUstRel = resolveMergedChapterAligned(book, alignedUstRel);
+        }
+
         const ultCheck = needUlt ? validateAlignedUsfmCompleteness({ alignedUsfm: alignedUltRel }) : null;
         const ustCheck = needUst ? validateAlignedUsfmCompleteness({ alignedUsfm: alignedUstRel }) : null;
         finalValidationSummary = summarizeAlignmentValidation({ book, chapter: ch, ultCheck, ustCheck });
@@ -1625,4 +1670,5 @@ module.exports = {
   buildParsedGenerateRequest,
   hasRequiredGeneratedOutputs,
   shouldUseFileResponseMode,
+  resolveMergedChapterAligned,
 };

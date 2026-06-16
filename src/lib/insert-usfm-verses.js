@@ -19,6 +19,23 @@ function parseVerseRange(spec) {
   return [v, v];
 }
 
+// Collect every verse number covered by the source content, expanding verse
+// bridges (\v 1-2 covers both 1 and 2). Only matches \v at the start of a line
+// (optionally after a paragraph/poetry marker) so it never picks up a stray
+// \v inside alignment attribute data.
+function collectCoveredVerses(lines) {
+  const covered = new Set();
+  const pat = /^(?:\\[pqmsd]\d?\s+)?\\v\s+(\d+)(?:-(\d+))?/;
+  for (const line of lines) {
+    const m = line.trim().match(pat);
+    if (!m) continue;
+    const lo = parseInt(m[1], 10);
+    const hi = m[2] ? parseInt(m[2], 10) : lo;
+    for (let v = lo; v <= hi; v++) covered.add(v);
+  }
+  return covered;
+}
+
 function stripSourceHeader(lines) {
   const result = [];
   let foundVerse = false;
@@ -79,8 +96,11 @@ function findVerseBoundaries(lines, startIdx, endIdx, verseStart, verseEnd) {
   let replaceStart = null;
   let replaceEnd = null;
   const nextVerse = verseEnd + 1;
-  const verseStartPat = new RegExp(`\\\\v\\s+${verseStart}(?:\\s|$)`);
-  const nextVersePat = new RegExp(`\\\\v\\s+${nextVerse}(?:\\s|$)`);
+  // Allow a '-' after the verse number so a bridge (e.g. \v 1-2) is matched
+  // when looking for verse 1 — otherwise a chapter that opens with a bridge
+  // can't be located and the whole push aborts with "Verse N not found".
+  const verseStartPat = new RegExp(`\\\\v\\s+${verseStart}(?:[-\\s]|$)`);
+  const nextVersePat = new RegExp(`\\\\v\\s+${nextVerse}(?:[-\\s]|$)`);
 
   for (let i = startIdx; i < endIdx; i++) {
     const line = lines[i];
@@ -168,6 +188,24 @@ function insertUsfmVerses({ bookFile, sourceFile, chapter, verses, backup = fals
     throw new Error(`Chapter ${chapter} not found in ${bookFile}`);
   }
 
+  // Guard against pushing a truncated chapter: the source must cover every
+  // verse in the requested range. A partial source (e.g. only the first batch
+  // of a split chapter) would otherwise silently overwrite and delete the
+  // verses it's missing. Bridges in the source count for each verse they span.
+  const covered = collectCoveredVerses(sourceVerses);
+  const missing = [];
+  for (let v = verseStart; v <= verseEnd; v++) {
+    if (!covered.has(v)) missing.push(v);
+  }
+  if (missing.length) {
+    const have = [...covered].sort((a, b) => a - b);
+    throw new Error(
+      `Source is missing verse(s) ${missing.join(', ')} for chapter ${chapter} `
+      + `(requested ${verseStart}-${verseEnd}, source covers ${have[0]}-${have[have.length - 1]}) `
+      + `— refusing to push a partial chapter`
+    );
+  }
+
   // Find verse boundaries
   const [vStart, vEnd] = findVerseBoundaries(bookLines, chStart, chEnd, verseStart, verseEnd);
   if (vStart === null) {
@@ -191,14 +229,6 @@ function insertUsfmVerses({ bookFile, sourceFile, chapter, verses, backup = fals
     log.push(`WARNING: Verse marker count changed! Before: ${preCount}, After: ${postCount}`);
   } else {
     log.push(`Verse marker count: ${postCount} (unchanged)`);
-  }
-
-  // Verify inserted verses are present
-  const insertedText = sourceVerses.join('\n');
-  for (let v = verseStart; v <= verseEnd; v++) {
-    if (!new RegExp(`\\\\v\\s+${v}\\s`).test(insertedText)) {
-      log.push(`WARNING: \\v ${v} not found in inserted content`);
-    }
   }
 
   // Backup
