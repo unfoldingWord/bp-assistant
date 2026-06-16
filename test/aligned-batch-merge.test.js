@@ -48,7 +48,7 @@ test('merges sibling batches into a single full-chapter file', () => {
   const merged = fs.readFileSync(path.join(TMP, resolved), 'utf8');
   // Full verse sequence, batch headers stripped from the second part.
   for (const v of ['1-2', '3', '4', '17', '18', '32']) {
-    assert.match(merged, new RegExp(`\\\\v ${v.replace('-', '-')}\\b`));
+    assert.match(merged, new RegExp(`\\\\v ${v}\\b`));
   }
   // Only one \c 29 (second batch's header was stripped).
   assert.equal((merged.match(/\\c 29/g) || []).length, 1);
@@ -70,6 +70,19 @@ test('a lone batch with no sibling is left as-is (push guard handles it)', () =>
   const rel = writeRel(`${DIR}/JER-32-v01-v16-aligned.usfm`, batch(32, ['1', '2']));
   const resolved = resolveMergedChapterAligned('JER', rel);
   assert.equal(resolved, rel); // fewer than 2 batches → nothing to merge
+});
+
+test('throws (instead of returning a non-existent path) when a merge fails', () => {
+  // Two "batches" exist, but one is a directory — the merge cannot read it, so
+  // resolveMergedChapterAligned must throw rather than return the canonical
+  // path to a file that was never written (which would mask the cause behind a
+  // misleading "missing file" alignment retry).
+  writeRel(`${DIR}/JER-33-v01-v16-aligned.usfm`, batch(33, ['1', '2']));
+  fs.mkdirSync(path.join(TMP, DIR, 'JER-33-v17-v32-aligned.usfm'), { recursive: true });
+
+  assert.throws(() => resolveMergedChapterAligned('JER', `${DIR}/JER-33-v01-v16-aligned.usfm`));
+  // The canonical merged file must NOT have been left behind as a valid result.
+  assert.equal(fs.existsSync(path.join(TMP, DIR, 'JER-33-aligned.usfm')), false);
 });
 
 test('null input returns null', () => {
