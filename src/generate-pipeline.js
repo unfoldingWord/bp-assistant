@@ -334,7 +334,16 @@ function resolveMergedChapterAligned(book, discoveredRel) {
 
   const parts = batches.map((b) => path.join(dirRel, b.f));
   const outputRel = path.join(dirRel, `${chapterPrefix}-aligned.usfm`);
+  // mergeAlignedUsfm signals failure by returning an "Error: …" string rather
+  // than throwing. Returning outputRel regardless would point validation at a
+  // file that was never written, masking the real cause behind a misleading
+  // "missing file" retry. Throw instead so the chapter fails with a clear
+  // diagnostic and no wasted re-alignment.
   const result = mergeAlignedUsfm({ parts, output: outputRel });
+  if (String(result).startsWith('Error:')
+      || !fs.existsSync(path.resolve(CSKILLBP_DIR, outputRel))) {
+    throw new Error(`Failed to merge alignment batches for ${chapterPrefix}: ${result}`);
+  }
   console.log(`[generate] Merged ${batches.length} alignment batches → ${outputRel}: ${result}`);
   return outputRel;
 }
