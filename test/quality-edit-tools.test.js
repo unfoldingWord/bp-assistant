@@ -59,6 +59,17 @@ test('updatePreparedQuote returns a clear message for a missing id', () => {
   assert.match(out, /ERROR: id "zz9z" not found/);
 });
 
+test('updatePreparedQuote sets sref and strips the rc:// prefix', () => {
+  const rel = writeJson('prep3.json', { items: [
+    { id: 'ab1c', gl_quote: 'q', sref: 'figs-paronomasia' },
+  ] });
+  const out = updatePreparedQuote({ preparedJson: rel, id: 'ab1c', sref: 'rc://*/ta/man/translate/writing-poetry' });
+  assert.match(out, /sref/);
+  const item = readJson('prep3.json').items.find((i) => i.id === 'ab1c');
+  assert.equal(item.sref, 'writing-poetry');
+  assert.equal(item.gl_quote, 'q'); // not provided → unchanged
+});
+
 test('removeNote drops the entry from generated JSON and the matching TSV row, preserving header', () => {
   const genRel = writeJson('gen3.json', { ab1c: 'note A', de2f: 'note B' });
   const tsvRel = 'notes3.tsv';
