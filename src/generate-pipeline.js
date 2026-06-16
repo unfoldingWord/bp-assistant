@@ -387,6 +387,14 @@ async function generatePipeline(route, message) {
     });
   }
 
+  // Convenience wrapper for terminal failures outside Phase 1 (alignment
+  // validation, door43-push, repo-verify): attaches the current checkpoint and
+  // a short error context. No-ops unless the event severity is 'error', so it
+  // is safe to call on any status event.
+  function fireDiagnosisFor(event, errorText) {
+    fireDiagnosis(event, { checkpoint: getCheckpoint(checkpointRef), errorText });
+  }
+
   // Helper: reply to the originating stream
   async function reply(text) {
     try {
@@ -1182,7 +1190,7 @@ async function generatePipeline(route, message) {
 
         if ((needUlt && !alignedUltRel) || (needUst && !alignedUstRel)) {
           const missing = [needUlt && !alignedUltRel && 'ULT', needUst && !alignedUstRel && 'UST'].filter(Boolean).join(', ');
-          await status(`**align-all-parallel** failed for ${book} ${ch} at ${new Date().toISOString()} — aligned ${missing} file(s) not found (${alignDuration}s)`);
+          const missingAlignEvent = await status(`**align-all-parallel** failed for ${book} ${ch} at ${new Date().toISOString()} — aligned ${missing} file(s) not found (${alignDuration}s)`);
           fail++;
           setCheckpoint(checkpointRef, {
             state: 'failed',
@@ -1192,11 +1200,12 @@ async function generatePipeline(route, message) {
             current: { chapter: ch, skill: 'align-all-parallel', status: 'failed', errorKind: 'missing_output', outputStatus: 'missing' },
             resume: { chapter: ch, skill: 'align-all-parallel' },
           });
+          fireDiagnosisFor(missingAlignEvent, `Phase: align-all-parallel\nChapter: ${book} ${ch}\nAligned ${missing} output file(s) not found after alignment completed.`);
           alignmentTerminalFailure = true;
           break;
         }
         if ((needUlt && !isFreshOutput(alignedUltRel, chapterStart)) || (needUst && !isFreshOutput(alignedUstRel, chapterStart))) {
-          await status(`**align-all-parallel** failed for ${book} ${ch} at ${new Date().toISOString()} — aligned output appears stale from an earlier run`);
+          const staleAlignEvent = await status(`**align-all-parallel** failed for ${book} ${ch} at ${new Date().toISOString()} — aligned output appears stale from an earlier run`);
           fail++;
           setCheckpoint(checkpointRef, {
             state: 'failed',
@@ -1206,6 +1215,7 @@ async function generatePipeline(route, message) {
             current: { chapter: ch, skill: 'align-all-parallel', status: 'failed', errorKind: 'stale_output', outputStatus: 'stale' },
             resume: { chapter: ch, skill: 'align-all-parallel' },
           });
+          fireDiagnosisFor(staleAlignEvent, `Phase: align-all-parallel\nChapter: ${book} ${ch}\nAligned output appears stale (mtime older than this run) — alignment may not have rewritten it.`);
           alignmentTerminalFailure = true;
           break;
         }
@@ -1264,7 +1274,7 @@ async function generatePipeline(route, message) {
       if (alignmentTerminalFailure) continue;
 
       if (!alignmentValidated) {
-        await status(`**align-all-parallel** failed for ${book} ${ch} at ${new Date().toISOString()} — degraded alignment (${finalValidationSummary})`);
+        const degradedEvent = await status(`**align-all-parallel** failed for ${book} ${ch} at ${new Date().toISOString()} — degraded alignment (${finalValidationSummary})`);
         fail++;
         setCheckpoint(checkpointRef, {
           state: 'failed',
@@ -1281,6 +1291,7 @@ async function generatePipeline(route, message) {
           },
           resume: { chapter: ch, skill: 'align-all-parallel' },
         });
+        fireDiagnosisFor(degradedEvent, `Phase: align-all-parallel\nChapter: ${book} ${ch}\nDegraded alignment after retries: ${finalValidationSummary}`);
         continue;
       }
 
@@ -1509,11 +1520,13 @@ async function generatePipeline(route, message) {
       const pushUlt = contentTypes.includes('ult') && chData.ultAligned;
       const pushUst = contentTypes.includes('ust') && chData.ustAligned;
       if (pushUlt && !fs.existsSync(path.resolve(CSKILLBP_DIR, chData.ultAligned))) {
-        await status(`**door43-push** SKIPPED (ULT) for ${book} ${chData.ch}: source file missing: ${chData.ultAligned}`);
+        const ultMissingEvent = await status(`**door43-push** SKIPPED (ULT) for ${book} ${chData.ch}: source file missing: ${chData.ultAligned}`);
+        fireDiagnosisFor(ultMissingEvent, `Phase: door43-push (ULT)\nChapter: ${book} ${chData.ch}\nAligned source file missing at push time: ${chData.ultAligned}`);
         chapterFailed = true;
       }
       if (!chapterFailed && pushUst && !fs.existsSync(path.resolve(CSKILLBP_DIR, chData.ustAligned))) {
-        await status(`**door43-push** SKIPPED (UST) for ${book} ${chData.ch}: source file missing: ${chData.ustAligned}`);
+        const ustMissingEvent = await status(`**door43-push** SKIPPED (UST) for ${book} ${chData.ch}: source file missing: ${chData.ustAligned}`);
+        fireDiagnosisFor(ustMissingEvent, `Phase: door43-push (UST)\nChapter: ${book} ${chData.ch}\nAligned source file missing at push time: ${chData.ustAligned}`);
         chapterFailed = true;
       }
 
@@ -1535,7 +1548,8 @@ async function generatePipeline(route, message) {
           });
           if (!pushResultUlt.success) {
             console.error(`[generate] door43-push ULT failed for ${book} ${chData.ch}: ${pushResultUlt.details}`);
-            await status(`**door43-push** (ULT) failed for ${book} ${chData.ch}: ${pushResultUlt.details}`);
+            const ultPushFailEvent = await status(`**door43-push** (ULT) failed for ${book} ${chData.ch}: ${pushResultUlt.details}`);
+            fireDiagnosisFor(ultPushFailEvent, `Phase: door43-push (ULT)\nChapter: ${book} ${chData.ch}\nSource: ${chData.ultAligned}\nPush failed: ${pushResultUlt.details}`);
             chapterFailed = true;
           } else {
             ultNoChanges = pushResultUlt.noChanges === true;
@@ -1544,7 +1558,8 @@ async function generatePipeline(route, message) {
           }
         } catch (err) {
           console.error(`[generate] door43-push ULT error for ${book} ${chData.ch}: ${err.message}`);
-          await status(`**door43-push** (ULT) failed for ${book} ${chData.ch}: ${err.message}`);
+          const ultPushErrEvent = await status(`**door43-push** (ULT) failed for ${book} ${chData.ch}: ${err.message}`);
+          fireDiagnosisFor(ultPushErrEvent, `Phase: door43-push (ULT)\nChapter: ${book} ${chData.ch}\nSource: ${chData.ultAligned}\nThrew: ${err.message}`);
           chapterFailed = true;
         }
       }
@@ -1561,7 +1576,8 @@ async function generatePipeline(route, message) {
           });
           if (!pushResultUst.success) {
             console.error(`[generate] door43-push UST failed for ${book} ${chData.ch}: ${pushResultUst.details}`);
-            await status(`**door43-push** (UST) failed for ${book} ${chData.ch}: ${pushResultUst.details}`);
+            const ustPushFailEvent = await status(`**door43-push** (UST) failed for ${book} ${chData.ch}: ${pushResultUst.details}`);
+            fireDiagnosisFor(ustPushFailEvent, `Phase: door43-push (UST)\nChapter: ${book} ${chData.ch}\nSource: ${chData.ustAligned}\nPush failed: ${pushResultUst.details}`);
             chapterFailed = true;
           } else {
             ustNoChanges = pushResultUst.noChanges === true;
@@ -1570,7 +1586,8 @@ async function generatePipeline(route, message) {
           }
         } catch (err) {
           console.error(`[generate] door43-push UST error for ${book} ${chData.ch}: ${err.message}`);
-          await status(`**door43-push** (UST) failed for ${book} ${chData.ch}: ${err.message}`);
+          const ustPushErrEvent = await status(`**door43-push** (UST) failed for ${book} ${chData.ch}: ${err.message}`);
+          fireDiagnosisFor(ustPushErrEvent, `Phase: door43-push (UST)\nChapter: ${book} ${chData.ch}\nSource: ${chData.ustAligned}\nThrew: ${err.message}`);
           chapterFailed = true;
         }
       }
@@ -1591,11 +1608,13 @@ async function generatePipeline(route, message) {
         const ustVerify = verifyUst ? await verifyRepoPush({ repo: 'en_ust', stagingBranch, since: pushStartTime, prNumber: ustPrNumber }) : { success: true };
 
         if (verifyUlt && !ultVerify.success) {
-          await status(`Repo verify FAILED (ULT) for ${book} ${chData.ch}: ${ultVerify.details}`);
+          const ultVerifyEvent = await status(`Repo verify FAILED (ULT) for ${book} ${chData.ch}: ${ultVerify.details}`);
+          fireDiagnosisFor(ultVerifyEvent, `Phase: repo-verify (ULT)\nChapter: ${book} ${chData.ch}\nPush reported success but post-merge verification failed: ${ultVerify.details}`);
           chapterFailed = true;
         }
         if (verifyUst && !ustVerify.success) {
-          await status(`Repo verify FAILED (UST) for ${book} ${chData.ch}: ${ustVerify.details}`);
+          const ustVerifyEvent = await status(`Repo verify FAILED (UST) for ${book} ${chData.ch}: ${ustVerify.details}`);
+          fireDiagnosisFor(ustVerifyEvent, `Phase: repo-verify (UST)\nChapter: ${book} ${chData.ch}\nPush reported success but post-merge verification failed: ${ustVerify.details}`);
           chapterFailed = true;
         }
         const verifiedTypes = [verifyUlt && 'ULT', verifyUst && 'UST'].filter(Boolean).join(' and ');
