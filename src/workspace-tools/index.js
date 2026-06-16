@@ -573,12 +573,13 @@ function createQualityTools(createSdkMcpServer, tool, z) {
         id: z.string().describe('The note id to update'),
         note: z.string().describe('The full replacement note text'),
       }, async (args) => ({ content: [{ type: 'text', text: updateNoteText(args) }] })),
-      tool('update_prepared_quote', 'Set quote fields for one prepared note by id (in prepared_notes.json). Only the provided fields are changed. After updating, re-run assemble_notes + curly_quotes.', {
+      tool('update_prepared_quote', 'Set quote or support-reference fields for one prepared note by id (in prepared_notes.json). Only the provided fields are changed. After updating, re-run assemble_notes + curly_quotes.', {
         preparedJson: z.string().describe('Path to prepared_notes.json (runtime.preparedNotes)'),
         id: z.string().describe('The prepared item id to update'),
         glQuote: z.string().optional().describe('New gl_quote'),
         glQuoteRoundtripped: z.string().optional().describe('New gl_quote_roundtripped'),
         origQuote: z.string().optional().describe('New orig_quote'),
+        sref: z.string().optional().describe('New support reference issue type — a valid slug from data/translation-issues.csv (e.g. writing-poetry). The rc:// prefix is stripped if present.'),
       }, async (args) => ({ content: [{ type: 'text', text: updatePreparedQuote(args) }] })),
       tool('remove_note', 'Remove one note by id from generated_notes.json and/or directly from an assembled TSV row. Use for antithetical-parallelism or redundant notes.', {
         id: z.string().describe('The note id to remove'),

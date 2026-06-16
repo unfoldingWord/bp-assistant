@@ -1405,7 +1405,7 @@ function updateNoteText({ generatedJson, id, note }) {
   return `Updated note text for id "${id}" in ${generatedJson}. Re-run assemble_notes + curly_quotes to apply.`;
 }
 
-function updatePreparedQuote({ preparedJson, id, glQuote, glQuoteRoundtripped, origQuote }) {
+function updatePreparedQuote({ preparedJson, id, glQuote, glQuoteRoundtripped, origQuote, sref }) {
   if (!preparedJson) return 'ERROR: preparedJson is required';
   if (!id) return 'ERROR: id is required';
   const p = path.resolve(CSKILLBP_DIR, preparedJson);
@@ -1419,7 +1419,8 @@ function updatePreparedQuote({ preparedJson, id, glQuote, glQuoteRoundtripped, o
   if (glQuote !== undefined) { item.gl_quote = glQuote; changed.push('gl_quote'); }
   if (glQuoteRoundtripped !== undefined) { item.gl_quote_roundtripped = glQuoteRoundtripped; changed.push('gl_quote_roundtripped'); }
   if (origQuote !== undefined) { item.orig_quote = origQuote; changed.push('orig_quote'); }
-  if (!changed.length) return `No quote fields provided for id "${id}"; nothing changed.`;
+  if (sref !== undefined) { item.sref = String(sref).replace(/^rc:\/\/\*\/ta\/man\/translate\//, ''); changed.push('sref'); }
+  if (!changed.length) return `No fields provided for id "${id}"; nothing changed.`;
   fs.writeFileSync(p, JSON.stringify(prep, null, 2) + '\n');
   return `Updated ${changed.join(', ')} for id "${id}" in ${preparedJson}. Re-run assemble_notes + curly_quotes to apply.`;
 }
