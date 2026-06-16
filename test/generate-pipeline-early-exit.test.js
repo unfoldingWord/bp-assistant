@@ -27,7 +27,7 @@ function buildMessage(content, overrides = {}) {
   };
 }
 
-function createHarness({ runClaudeImpl, initialCheckpoint = null }) {
+function createHarness({ runClaudeImpl, initialCheckpoint = null, door43PushImpl = null }) {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'generate-pipeline-'));
   const oldBaseDir = process.env.CSKILLBP_DIR;
   const oldStatusFile = process.env.ADMIN_STATUS_FILE;
@@ -62,6 +62,9 @@ function createHarness({ runClaudeImpl, initialCheckpoint = null }) {
   const pipelineUtilsPath = require.resolve('../src/pipeline-utils');
   const adminStatusPath = require.resolve('../src/admin-status');
   const selfDiagnosisPath = require.resolve('../src/self-diagnosis');
+  // usfm-tools captures CSKILLBP_DIR at module load; reload it per-harness so
+  // validateAlignedUsfmCompleteness/mergeAlignedUsfm read from this temp dir.
+  const usfmToolsPath = require.resolve('../src/workspace-tools/usfm-tools');
 
   const sent = {
     stream: [],
@@ -79,6 +82,7 @@ function createHarness({ runClaudeImpl, initialCheckpoint = null }) {
   delete require.cache[pipelineUtilsPath];
   delete require.cache[adminStatusPath];
   delete require.cache[selfDiagnosisPath];
+  delete require.cache[usfmToolsPath];
 
   installStub(configPath, {
     adminUserId: 1,
@@ -125,7 +129,7 @@ function createHarness({ runClaudeImpl, initialCheckpoint = null }) {
   installStub(door43PushPath, {
     REPO_MAP: {},
     checkConflictingBranches: async () => [],
-    door43Push: async () => ({ success: true, details: 'ok', noChanges: false }),
+    door43Push: door43PushImpl || (async () => ({ success: true, details: 'ok', noChanges: false })),
     getRepoFilename: () => 'dummy.usfm',
   });
   installStub(repoVerifyPath, {
@@ -190,6 +194,7 @@ function createHarness({ runClaudeImpl, initialCheckpoint = null }) {
       delete require.cache[pipelineContextPath];
       delete require.cache[adminStatusPath];
       delete require.cache[selfDiagnosisPath];
+      delete require.cache[usfmToolsPath];
       if (oldBaseDir == null) delete process.env.CSKILLBP_DIR;
       else process.env.CSKILLBP_DIR = oldBaseDir;
       if (oldStatusFile == null) delete process.env.ADMIN_STATUS_FILE;
@@ -451,6 +456,88 @@ test('generatePipeline retries alignment once and fails with degraded_alignment 
     assert.equal(alignCalls, 2);
     assert.ok(harness.checkpoints.some((patch) => patch.current?.errorKind === 'degraded_alignment'));
     assert.ok(harness.readStatusTexts().some((text) => text.includes('Retrying **align-all-parallel**')));
+    // Self-diagnosis now covers the alignment phase (previously Phase 1 only).
+    assert.equal(harness.diagnosisCalls.length, 1);
+    assert.equal(harness.diagnosisCalls[0].event.severity, 'error');
+    assert.equal(harness.diagnosisCalls[0].checkpoint.current.errorKind, 'degraded_alignment');
+    assert.match(harness.diagnosisCalls[0].errorText, /align-all-parallel/);
+  } finally {
+    harness.cleanup();
+  }
+});
+
+test('generatePipeline fires self-diagnosis when door43-push fails', async () => {
+  const harness = createHarness({
+    door43PushImpl: async ({ type }) => ({ success: false, details: `Verse 1 not found in chapter 52 (${type})` }),
+    runClaudeImpl: async ({ options, tempDir }) => {
+      if (options.skill === 'initial-pipeline') {
+        fs.mkdirSync(path.join(tempDir, 'output', 'AI-ULT', 'ISA'), { recursive: true });
+        fs.mkdirSync(path.join(tempDir, 'output', 'AI-UST', 'ISA'), { recursive: true });
+        fs.mkdirSync(path.join(tempDir, 'output', 'issues', 'ISA'), { recursive: true });
+        fs.writeFileSync(path.join(tempDir, 'output', 'AI-ULT', 'ISA', 'ISA-52.usfm'), '\\id ISA\n\\c 52\n\\v 1 ult\n');
+        fs.writeFileSync(path.join(tempDir, 'output', 'AI-UST', 'ISA', 'ISA-52.usfm'), '\\id ISA\n\\c 52\n\\v 1 ust\n');
+        fs.writeFileSync(path.join(tempDir, 'output', 'issues', 'ISA', 'ISA-52.tsv'), 'Reference\tID\nISA 52:1\ta1b2\n');
+        return { subtype: 'success', usage: {}, total_cost_usd: 0 };
+      }
+      if (options.skill === 'align-all-parallel') {
+        fs.mkdirSync(path.join(tempDir, 'output', 'AI-ULT', 'ISA'), { recursive: true });
+        fs.mkdirSync(path.join(tempDir, 'output', 'AI-UST', 'ISA'), { recursive: true });
+        const good = '\\id ISA\n\\c 52\n\\v 1 \\zaln-s |x-strong="H1" x-content="א"\\*\\w Joshua|x-occurrence="1" x-occurrences="1"\\w*\\zaln-e\\*\n';
+        fs.writeFileSync(path.join(tempDir, 'output', 'AI-ULT', 'ISA', 'ISA-52-aligned.usfm'), good);
+        fs.writeFileSync(path.join(tempDir, 'output', 'AI-UST', 'ISA', 'ISA-52-aligned.usfm'), good);
+        return { subtype: 'success', usage: {}, total_cost_usd: 0 };
+      }
+      return { subtype: 'success', usage: {}, total_cost_usd: 0 };
+    },
+  });
+
+  try {
+    await harness.generatePipeline(
+      { _synthetic: true, _book: 'ISA', _startChapter: 52, _endChapter: 52, skill: 'initial-pipeline', operations: 6 },
+      buildMessage('generate isa 52', { sender_id: 7 })
+    );
+
+    // door43-push failures used to only set a checkpoint; now they dispatch
+    // self-diagnosis like Phase-1 failures do.
+    const pushDiag = harness.diagnosisCalls.find((c) => /door43-push/.test(c.errorText || ''));
+    assert.ok(pushDiag, 'expected a door43-push self-diagnosis dispatch');
+    assert.equal(pushDiag.event.severity, 'error');
+    assert.match(pushDiag.errorText, /Verse 1 not found/);
+  } finally {
+    harness.cleanup();
+  }
+});
+
+test('generatePipeline fires self-diagnosis when an aligned source is missing at push time', async () => {
+  // Resume at door43-push with a checkpoint that references aligned files which
+  // no longer exist on disk. The pre-flight existence check must dispatch
+  // diagnosis — its status text ("source file missing") infers as 'warn', so
+  // this guards against the severity-gating regression caught in PR #123 review.
+  const harness = createHarness({
+    initialCheckpoint: {
+      state: 'failed',
+      success: 1,
+      completedChapters: [{
+        ch: 52,
+        ultAligned: 'output/AI-ULT/ISA/ISA-52-aligned.usfm',
+        ustAligned: 'output/AI-UST/ISA/ISA-52-aligned.usfm',
+      }],
+      resume: { chapter: 52, skill: 'door43-push' },
+    },
+    // Phase 1 is skipped on a door43-push resume, so runClaude must not be called.
+    runClaudeImpl: async () => { throw new Error('runClaude should not run when resuming at door43-push'); },
+  });
+
+  try {
+    await harness.generatePipeline(
+      { _synthetic: true, _book: 'ISA', _startChapter: 52, _endChapter: 52, skill: 'initial-pipeline', operations: 6 },
+      buildMessage('generate isa 52', { sender_id: 7 })
+    );
+
+    assert.equal(harness.runClaudeCalls.length, 0);
+    const missingDiag = harness.diagnosisCalls.find((c) => /source file missing/.test(c.errorText || ''));
+    assert.ok(missingDiag, 'expected a self-diagnosis dispatch for the missing aligned source');
+    assert.equal(missingDiag.event.severity, 'error');
   } finally {
     harness.cleanup();
   }
