@@ -1936,6 +1936,7 @@ async function notesPipeline(route, message) {
         expectedOutput: issuesPath,
         mcpTools: 'issue-id',
         ops: 3, // 2 analysts + challenger/merge
+        thinking: 'xhigh', // 3 issue-id agents inherit xhigh effort from this orchestrator session
       });
     }
 
@@ -1970,7 +1971,7 @@ async function notesPipeline(route, message) {
     });
 
     // tn-quality-check runs as a separate Opus invocation for independent review
-    // (auto-defaults to THINKING_HIGH via claude-runner's thinking-budget logic)
+    // (auto-defaults to high effort + adaptive thinking via claude-runner)
     const qualityTag = hasVerseRange ? `${tag}-vv${verseStart}-${verseEnd}` : tag;
     const defaultNotesPath = hasVerseRange ? notesShardRel : notesChapterRel;
     skills.push({
@@ -2349,6 +2350,7 @@ async function notesPipeline(route, message) {
             label: `${ref} ${skill.name}`,
             cwd: CSKILLBP_DIR,
             model: model || skill.model, // TEST_FAST haiku overrides per-skill model
+            thinking: skill.thinking, // per-stage effort (e.g. deep-issue-id: xhigh); undefined -> high default
             skill: skill.name,
             tools: toolConfig.tools,
             disallowedTools: toolConfig.disallowedTools,

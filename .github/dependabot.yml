@@ -1,0 +1,24 @@
+# Keeps the Claude Agent SDK / bundled claude-code CLI (and its peer deps)
+# current. Each release is what teaches the bot new models (e.g. Opus 4.8) and
+# reasoning controls (adaptive thinking, effort). PRs run through the existing
+# review-gate + automerge workflows — no unattended SDK upgrade reaches the live
+# bot without passing the gate.
+version: 2
+updates:
+  - package-ecosystem: "npm"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "chore(deps)"
+    groups:
+      # The agent SDK, the API SDK, MCP SDK, and zod are peer-coupled
+      # (agent-sdk pins @anthropic-ai/sdk >= X, zod ^4, mcp ^1.29). Bump them
+      # together so a coordinated upgrade lands as one reviewable PR rather than
+      # several that fail each other's peer-dependency checks.
+      claude-sdk:
+        patterns:
+          - "@anthropic-ai/*"
+          - "@modelcontextprotocol/*"
+          - "zod"
