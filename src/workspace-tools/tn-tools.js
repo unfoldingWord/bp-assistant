@@ -1134,11 +1134,9 @@ function verifyAtFit({ preparedJson, generatedJson }) {
     for (const atRaw of atMatches) {
       const at = atRaw.slice(1, -1);
       const ult = item.ult_verse || '';
-      const glq = (item.gl_quote || '').replace(/\{[^}]*\}/g, '').replace(/\s+/g, ' ').trim();
-      let idx = ult.indexOf(glq);
-      if (idx < 0) idx = ult.toLowerCase().indexOf(glq.toLowerCase());
-      if (idx >= 0) { results.push(`${item.reference} (${id}) [${item.sref}]\n  [${at}]\n  -> ${(ult.slice(0, idx) + at + ult.slice(idx + glq.length)).slice(0, 150)}`); }
-      else errors.push(`${item.reference} (${id}): gl_quote "${glq}" not found in ULT`);
+      const preview = substituteAT(ult, item.gl_quote || '', at);
+      if (preview !== null) { results.push(`${item.reference} (${id}) [${item.sref}]\n  [${at}]\n  -> ${preview.slice(0, 150)}`); }
+      else errors.push(`${item.reference} (${id}): gl_quote "${item.gl_quote || ''}" not found in ULT`);
     }
   }
   const lines = [`AT check: ${results.length} OK, ${errors.length} errors`];
@@ -1327,12 +1325,13 @@ function assembleNotes({ preparedJson, generatedJson, output }) {
     return [ch, vs];
   }
   function intraKey(item) {
-    const ult = (item.ult_verse || '').toLowerCase();
-    const glq = (item.gl_quote || '').replace(/\{[^}]*\}/g, '').replace(/\s+/g, ' ').trim().toLowerCase();
-    if (!ult || !glq) return [9998, 0];
-    let pos = ult.indexOf(glq);
-    if (pos < 0) pos = 9999;
-    return [pos, -glq.length];
+    const ult = item.ult_verse || '';
+    const glq = item.gl_quote || '';
+    if (!ult.trim() || !glq.trim()) return [9998, 0];
+    const pos = locateQuoteStart(ult, glq);
+    // pos = reading position of the quote; -length = longest-first so a
+    // containing quote sorts before the sub-quotes nested inside it.
+    return [pos < 0 ? 9999 : pos, -comparableQuoteLength(glq)];
   }
   const rows = [];
   const missing = [];
@@ -2917,6 +2916,124 @@ function prepareAndValidate({ inputTsv, ultUsfm, ustUsfm, alignedUsfm, output })
   return lines.join('\n\n');
 }
 
+// --- GL-quote <-> verse matching (shared) ----------------------------------
+// Locates a GL quote inside a verse, tolerant of supplied-word braces
+// ({word} keeps the inner word), curly quotes/dashes, collapsed whitespace,
+// and case. Shared by substituteAT (AT preview), verifyAtFit, and the
+// intra-verse note sort in assembleNotes so all three agree on where a quote
+// sits in its verse. (Previously each site re-derived this; the note sort and
+// the AT check used a naive match that stripped brace *content* and ignored
+// discontinuous separators, so supplied-word / discontinuous quotes failed to
+// match and sorted to the end of the verse.)
+function buildComparableIndex(text) {
+  const normalizedChars = [];
+  const offsets = [];
+  let pendingSpace = false;
+
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (ch === '{') {
+      const end = text.indexOf('}', i + 1);
+      if (end !== -1) {
+        for (let j = i + 1; j < end; j++) {
+          const inner = text[j];
+          if (/\s/.test(inner)) {
+            pendingSpace = normalizedChars.length > 0;
+            continue;
+          }
+          if (pendingSpace && normalizedChars.length > 0 && normalizedChars[normalizedChars.length - 1] !== ' ') {
+            normalizedChars.push(' ');
+            offsets.push(j);
+          }
+          pendingSpace = false;
+          normalizedChars.push(inner.toLowerCase());
+          offsets.push(j);
+        }
+        i = end;
+        continue;
+      }
+    }
+
+    let next = ch;
+    if (/[\u2018\u2019]/.test(ch)) next = '\'';
+    else if (/[\u201C\u201D]/.test(ch)) next = '"';
+    else if (/[\u2010-\u2015]/.test(ch)) next = '-';
+
+    if (/\s/.test(next)) {
+      pendingSpace = normalizedChars.length > 0;
+      continue;
+    }
+    if (pendingSpace && normalizedChars.length > 0 && normalizedChars[normalizedChars.length - 1] !== ' ') {
+      normalizedChars.push(' ');
+      offsets.push(i);
+    }
+    pendingSpace = false;
+    normalizedChars.push(next.toLowerCase());
+    offsets.push(i);
+  }
+
+  while (normalizedChars[0] === ' ') {
+    normalizedChars.shift();
+    offsets.shift();
+  }
+  while (normalizedChars[normalizedChars.length - 1] === ' ') {
+    normalizedChars.pop();
+    offsets.pop();
+  }
+
+  return { text: normalizedChars.join(''), offsets };
+}
+
+function findComparableSpan(haystack, needle, fromOriginalIndex = 0) {
+  const hay = buildComparableIndex(haystack);
+  const ndl = buildComparableIndex(needle).text;
+  if (!hay.text || !ndl) return null;
+
+  let fromNormalizedIndex = 0;
+  while (fromNormalizedIndex < hay.offsets.length && hay.offsets[fromNormalizedIndex] < fromOriginalIndex) {
+    fromNormalizedIndex++;
+  }
+  const idx = hay.text.indexOf(ndl, fromNormalizedIndex);
+  if (idx === -1) return null;
+  return {
+    start: hay.offsets[idx],
+    end: hay.offsets[idx + ndl.length - 1] + 1,
+  };
+}
+
+// Discontinuous GL quotes join segments with an ellipsis, "..." or " & ".
+function splitQuoteSegments(glQuote) {
+  const s = String(glQuote || '');
+  const sep = s.includes('\u2026') ? '\u2026' : s.includes('...') ? '...' : s.includes(' & ') ? ' & ' : null;
+  if (!sep) return [s];
+  return s.split(sep).map((p) => p.trim()).filter(Boolean);
+}
+
+// Normalized length of a GL quote (segments flattened to spaces). Used as the
+// longest-first tiebreak so a containing quote sorts before sub-quotes nested
+// inside it.
+function comparableQuoteLength(glQuote) {
+  return buildComparableIndex(splitQuoteSegments(glQuote).join(' ')).text.length;
+}
+
+// Start offset (in the verse's normalized index space) of the first segment of
+// glQuote within verse, or -1 if not found. Offsets are comparable across
+// quotes in the same verse, so they order notes by reading position.
+function locateQuoteStart(verse, glQuote) {
+  const hay = buildComparableIndex(verse);
+  if (!hay.text) return -1;
+  const segments = splitQuoteSegments(glQuote);
+  const head = buildComparableIndex(segments[0] || '').text;
+  if (head) {
+    const idx = hay.text.indexOf(head);
+    if (idx !== -1) return idx;
+  }
+  // Fall back to the whole quote flattened (separators -> space) in case the
+  // first segment alone is not locatable but the joined form is.
+  const whole = buildComparableIndex(segments.join(' ')).text;
+  return whole ? hay.text.indexOf(whole) : -1;
+}
+
 // --- AT Generation Support ---
 
 /**
@@ -2927,82 +3044,6 @@ function prepareAndValidate({ inputTsv, ultUsfm, ustUsfm, alignedUsfm, output })
  */
 function substituteAT(verse, glQuote, atText) {
   if (!verse || !glQuote || !atText) return null;
-
-  function buildComparableIndex(text) {
-    const normalizedChars = [];
-    const offsets = [];
-    let pendingSpace = false;
-
-    for (let i = 0; i < text.length; i++) {
-      const ch = text[i];
-      if (ch === '{') {
-        const end = text.indexOf('}', i + 1);
-        if (end !== -1) {
-          for (let j = i + 1; j < end; j++) {
-            const inner = text[j];
-            if (/\s/.test(inner)) {
-              pendingSpace = normalizedChars.length > 0;
-              continue;
-            }
-            if (pendingSpace && normalizedChars.length > 0 && normalizedChars[normalizedChars.length - 1] !== ' ') {
-              normalizedChars.push(' ');
-              offsets.push(j);
-            }
-            pendingSpace = false;
-            normalizedChars.push(inner.toLowerCase());
-            offsets.push(j);
-          }
-          i = end;
-          continue;
-        }
-      }
-
-      let next = ch;
-      if (/[\u2018\u2019]/.test(ch)) next = '\'';
-      else if (/[\u201C\u201D]/.test(ch)) next = '"';
-      else if (/[\u2010-\u2015]/.test(ch)) next = '-';
-
-      if (/\s/.test(next)) {
-        pendingSpace = normalizedChars.length > 0;
-        continue;
-      }
-      if (pendingSpace && normalizedChars.length > 0 && normalizedChars[normalizedChars.length - 1] !== ' ') {
-        normalizedChars.push(' ');
-        offsets.push(i);
-      }
-      pendingSpace = false;
-      normalizedChars.push(next.toLowerCase());
-      offsets.push(i);
-    }
-
-    while (normalizedChars[0] === ' ') {
-      normalizedChars.shift();
-      offsets.shift();
-    }
-    while (normalizedChars[normalizedChars.length - 1] === ' ') {
-      normalizedChars.pop();
-      offsets.pop();
-    }
-
-    return { text: normalizedChars.join(''), offsets };
-  }
-
-  function findComparableSpan(haystack, needle, fromOriginalIndex = 0) {
-    const hay = buildComparableIndex(haystack);
-    const ndl = buildComparableIndex(needle).text;
-    if (!hay.text || !ndl) return null;
-
-    let fromNormalizedIndex = 0;
-    while (fromNormalizedIndex < hay.offsets.length && hay.offsets[fromNormalizedIndex] < fromOriginalIndex) {
-      fromNormalizedIndex++;
-    }
-    const idx = hay.text.indexOf(ndl, fromNormalizedIndex);
-    if (idx === -1) return null;
-    return {
-      start: hay.offsets[idx],
-      end: hay.offsets[idx + ndl.length - 1] + 1,
-    };
-  }
 
   const ellipsis = '\u2026';
   if (/(?:\u2026|\.{3}| & )/.test(glQuote)) {
@@ -3188,4 +3229,6 @@ module.exports = {
   _inspectOpeningBold: inspectOpeningBold,
   _resolveGlQuotes: resolveGlQuotes,
   _stripAlternateTranslation: stripAlternateTranslation,
+  _locateQuoteStart: locateQuoteStart,
+  _comparableQuoteLength: comparableQuoteLength,
 };
