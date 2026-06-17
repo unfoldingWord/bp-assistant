@@ -2376,12 +2376,21 @@ function fillOrigQuotes({ preparedJson, alignmentJson, hebrewUsfm, masterUltUsfm
 
   function chooseClosestHebrewTokenLocations(rawVerse, strippedVerse, offsetMap, targetWords, allowPartial = false) {
     const groups = [];
+    const requestedByToken = new Map();
     for (const heb of targetWords) {
       const locations = findHebrewTokenLocations(rawVerse, strippedVerse, offsetMap, heb);
       if (!locations.length) {
         if (!allowPartial) return null;
         continue;
       }
+      // Several alignment words can point at one Hebrew token (e.g. English
+      // "Is ... not" both mapping to הֲלוֹא). Only ask for as many distinct verse
+      // locations as the token actually has; any extra request refers to a word
+      // already covered, so skip it instead of dead-ending the location search.
+      const tokenKey = stripForSearch(heb).normalize('NFKD');
+      const alreadyRequested = requestedByToken.get(tokenKey) || 0;
+      if (alreadyRequested >= locations.length) continue;
+      requestedByToken.set(tokenKey, alreadyRequested + 1);
       groups.push(locations);
     }
 
@@ -2517,6 +2526,14 @@ function fillOrigQuotes({ preparedJson, alignmentJson, hebrewUsfm, masterUltUsfm
       hebWords.map(h => normalizeHeb(h)),
       normalizeHeb
     );
+
+    // Exact extraction must place every alignment token. If any token is absent
+    // from the verse, an exact span would silently drop it; defer to the
+    // plain-text fallback instead so the missing token is still represented.
+    const allLocatable = targetWords.every(
+      (heb) => findHebrewTokenLocations(rawVerse, strippedVerse, offsetMap, heb).length > 0
+    );
+    if (!allLocatable) return null;
 
     const selected = chooseClosestHebrewTokenLocations(
       rawVerse,
