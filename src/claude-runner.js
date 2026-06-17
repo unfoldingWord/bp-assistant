@@ -54,9 +54,11 @@ const EFFORT_LEVELS = ['low', 'medium', 'high', 'xhigh', 'max'];
 // Fable); Haiku and others get no thinking option (effort would 400 there).
 function resolveReasoning(thinking, resolvedModel) {
   const supportsEffort = typeof resolvedModel === 'string' && /opus|sonnet|fable/i.test(resolvedModel);
-  // Explicit off — disable extended thinking.
+  // Explicit off — disable extended thinking. Only effort-capable models accept
+  // a `thinking` param; others must omit it entirely (matches prior behavior of
+  // returning null/setting nothing) to avoid a 400.
   if (thinking === false || thinking === 'off' || thinking === 'none') {
-    return { thinking: { type: 'disabled' } };
+    return supportsEffort ? { thinking: { type: 'disabled' } } : {};
   }
   // Explicit effort level (e.g. 'high', 'xhigh').
   if (typeof thinking === 'string') {
@@ -65,9 +67,17 @@ function resolveReasoning(thinking, resolvedModel) {
     }
     return supportsEffort ? { thinking: { type: 'adaptive' }, effort: thinking } : {};
   }
-  // Legacy numeric budget: adaptive thinking ignores fixed budgets — use high effort.
+  // Legacy numeric budget: adaptive thinking has no fixed token budget. Map by
+  // magnitude to an effort level (preserving "max"-sized hints) and warn, so
+  // callers migrate to an explicit effort string ('low'..'max').
   if (typeof thinking === 'number') {
-    return supportsEffort ? { thinking: { type: 'adaptive' }, effort: 'high' } : {};
+    if (!supportsEffort) return {};
+    const effort = thinking >= 31999 ? 'max'
+      : thinking >= 20000 ? 'high'
+      : thinking >= 10000 ? 'medium'
+      : 'low';
+    console.warn(`[claude-runner] Numeric thinking budget (${thinking}) is deprecated; mapping to effort '${effort}'. Pass an effort level ('low'|'medium'|'high'|'xhigh'|'max') instead.`);
+    return { thinking: { type: 'adaptive' }, effort };
   }
   // Auto-default (null/undefined): floor of `high` effort for effort-capable
   // models; Haiku/others let the model default (no extended thinking).
