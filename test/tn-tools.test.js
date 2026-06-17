@@ -1447,6 +1447,33 @@ test('applyHintsToPreparedNotes — empty hint.quote suppresses on (verse, sref)
   assert.ok(data.items.find((it) => it.id === 'bbbb'), 'bbbb should survive');
 });
 
+test('applyHintsToPreparedNotes — empty quote + seed injects a general note (orig_quote empty, seed preserved)', () => {
+  const prepRel = tempPreparedPath();
+  writePrepared(prepRel, { book: 'ZEC', chapter: '7', items: [
+    { id: 'aaaa', reference: '7:12', sref: 'figs-other', orig_quote: 'something', ult_verse: 'Verse 12 text' },
+  ]});
+  const r = applyHintsToPreparedNotes({
+    preparedJson: prepRel,
+    hints: [{
+      rowId: 'sych', verse: 12, quote: '',
+      supportReference: null,
+      seed: 'General background: this continues the indictment from verse 11.',
+    }],
+    chapter: 7,
+  });
+  assert.equal(r.hintsApplied, 1);
+  const data = readPrepared(prepRel);
+  const injected = data.items.find((it) => it.id === 'sych');
+  assert.ok(injected, 'general-note hint item missing');
+  assert.equal(injected.fromHint, true);
+  assert.equal(injected.note_type, 'hint');
+  assert.equal(injected.orig_quote, '');           // no source phrase — whole-verse note
+  assert.equal(injected.sref, '');                 // null supportReference normalizes to ''
+  assert.equal(injected.reference, '7:12');
+  assert.equal(injected.seed, 'General background: this continues the indictment from verse 11.');
+  assert.equal(injected.ult_verse, 'Verse 12 text'); // borrowed from sibling item at same verse
+});
+
 test('applyHintsToPreparedNotes — drops hint whose verse is outside chapter scope', () => {
   const prepRel = tempPreparedPath();
   writePrepared(prepRel, { book: 'ZEC', chapter: '7', items: [
