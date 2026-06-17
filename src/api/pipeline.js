@@ -37,7 +37,20 @@ const HintSchema = z.object({
   quote: z.string().max(500),                   // source-language; may be ''
   supportReference: z.string().max(200).nullable(),
   seed: z.string().max(4000).nullable(),
-}).strict();
+}).strict().refine(
+  // A hint must carry signal: either a quote to anchor the note to a specific
+  // source phrase, or a seed framing what the note should say (a general-
+  // information note). With both empty, tn-writer has no phrase and no framing
+  // — nothing to produce — so reject it as a client error rather than
+  // emitting an empty/arbitrary note. quote OR seed may be empty, never both.
+  (h) => (typeof h.quote === 'string' && h.quote.trim() !== '')
+      || (typeof h.seed === 'string' && h.seed.trim() !== ''),
+  {
+    message: 'hint must carry a non-empty quote or seed (a general-information '
+      + 'note needs a seed; a phrase-anchored note needs a quote)',
+    path: ['seed'],
+  },
+);
 
 const OptionsSchema = z.object({
   // Common — currently a no-op on the wire (model is fixed per pipeline today),
@@ -63,7 +76,8 @@ const OptionsSchema = z.object({
   // pipeline must produce, and suppresses competing notes for the same
   // (verse, supportReference, fuzzy-quote). hint.rowId is preserved as the
   // TSV ID column for the expanded row, so bible-editor can UPDATE the
-  // existing stub row in place by ID.
+  // existing stub row in place by ID. Each hint must carry a non-empty quote
+  // or seed (see HintSchema.refine).
   hints: z.array(HintSchema).max(50).optional(),
 }).strict();
 

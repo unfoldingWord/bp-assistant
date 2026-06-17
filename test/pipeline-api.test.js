@@ -356,6 +356,28 @@ test('StartBodySchema — accepts empty hint.quote', () => {
   assert.equal(r.success, true);
 });
 
+test('StartBodySchema — accepts empty quote when seed is present (general note)', () => {
+  const r = StartBodySchema.safeParse({
+    pipelineType: 'notes', book: 'ZEC', startChapter: 7,
+    username: 'u', sessionKey: 'k',
+    options: { hints: [{ ...VALID_HINT, quote: '', seed: 'General background on this verse.' }] },
+  });
+  assert.equal(r.success, true);
+});
+
+test('StartBodySchema — rejects hint with both quote and seed empty', () => {
+  for (const seed of ['', '   ', null]) {
+    const r = StartBodySchema.safeParse({
+      pipelineType: 'notes', book: 'ZEC', startChapter: 7,
+      username: 'u', sessionKey: 'k',
+      options: { hints: [{ ...VALID_HINT, quote: '', seed }] },
+    });
+    assert.equal(r.success, false, `quote:'' + seed:${JSON.stringify(seed)} should fail`);
+    const issue = r.error.issues.find((i) => i.path.join('.') === 'options.hints.0.seed');
+    assert.ok(issue, 'expected an issue on options.hints.0.seed');
+  }
+});
+
 test('StartBodySchema — rejects hints on generate and tqs pipelines', () => {
   for (const pt of ['generate', 'tqs']) {
     const r = StartBodySchema.safeParse({
