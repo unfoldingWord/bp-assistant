@@ -42,39 +42,46 @@ async function createFreshWorkspaceToolsServer(toolSet) {
 const DEFAULT_TIMEOUT_MS = 10 * 60 * 1000;
 const DEFAULT_MAX_TURNS = 200;
 
-// Extended-thinking budgets (token counts for Claude Agent SDK thinking option).
-// Mirrors Claude Code's keyword tiers: think / megathink / ultrathink, plus an
-// extra "high" tier we use as the default for Opus calls.
-const THINKING_LOW = 4000;
-const THINKING_MEDIUM = 10000;
-const THINKING_HIGH = 20000;
-const THINKING_MAX = 31999;
+// Reasoning controls for the Claude Agent SDK. Opus 4.6+ and Sonnet 4.6 use
+// adaptive thinking plus an `effort` level instead of a fixed token budget;
+// `thinking: {type:'enabled', budget_tokens}` is removed on Opus 4.7/4.8 and
+// returns a 400. We translate the runner's `thinking` arg into {thinking, effort}.
+const EFFORT_LEVELS = ['low', 'medium', 'high', 'xhigh', 'max'];
 
-const THINKING_LEVELS = {
-  low: THINKING_LOW,
-  medium: THINKING_MEDIUM,
-  high: THINKING_HIGH,
-  max: THINKING_MAX,
-};
-
-function resolveThinkingBudget(thinking, resolvedModel) {
-  if (thinking === false || thinking === 'off' || thinking === 'none') return null;
-  if (typeof thinking === 'number') {
-    if (thinking < 1024 || thinking > THINKING_MAX) {
-      throw new Error(`Invalid thinking budget: ${thinking} (must be between 1024 and ${THINKING_MAX} tokens)`);
-    }
-    return thinking;
+// Map the runner's `thinking` arg to Agent SDK reasoning options.
+// Returns { thinking?: ThinkingConfig, effort?: EffortLevel }.
+// Effort + adaptive thinking apply only to effort-capable models (Opus, Sonnet,
+// Fable); Haiku and others get no thinking option (effort would 400 there).
+function resolveReasoning(thinking, resolvedModel) {
+  const supportsEffort = typeof resolvedModel === 'string' && /opus|sonnet|fable/i.test(resolvedModel);
+  // Explicit off — disable extended thinking. Only effort-capable models accept
+  // a `thinking` param; others must omit it entirely (matches prior behavior of
+  // returning null/setting nothing) to avoid a 400.
+  if (thinking === false || thinking === 'off' || thinking === 'none') {
+    return supportsEffort ? { thinking: { type: 'disabled' } } : {};
   }
+  // Explicit effort level (e.g. 'high', 'xhigh').
   if (typeof thinking === 'string') {
-    if (thinking in THINKING_LEVELS) return THINKING_LEVELS[thinking];
-    throw new Error(`Unrecognized thinking level: '${thinking}' (expected one of: ${Object.keys(THINKING_LEVELS).join(', ')}, 'off')`);
+    if (!EFFORT_LEVELS.includes(thinking)) {
+      throw new Error(`Unrecognized thinking level: '${thinking}' (expected one of: ${EFFORT_LEVELS.join(', ')}, 'off')`);
+    }
+    return supportsEffort ? { thinking: { type: 'adaptive' }, effort: thinking } : {};
   }
-  // Auto-default (thinking == null/undefined): Opus → HIGH, Sonnet → MEDIUM, Haiku/others → none.
-  if (typeof resolvedModel === 'string') {
-    if (/opus/i.test(resolvedModel)) return THINKING_HIGH;
-    if (/sonnet/i.test(resolvedModel)) return THINKING_MEDIUM;
+  // Legacy numeric budget: adaptive thinking has no fixed token budget. Map by
+  // magnitude to an effort level (preserving "max"-sized hints) and warn, so
+  // callers migrate to an explicit effort string ('low'..'max').
+  if (typeof thinking === 'number') {
+    if (!supportsEffort) return {};
+    const effort = thinking >= 31999 ? 'max'
+      : thinking >= 20000 ? 'high'
+      : thinking >= 10000 ? 'medium'
+      : 'low';
+    console.warn(`[claude-runner] Numeric thinking budget (${thinking}) is deprecated; mapping to effort '${effort}'. Pass an effort level ('low'|'medium'|'high'|'xhigh'|'max') instead.`);
+    return { thinking: { type: 'adaptive' }, effort };
   }
-  return null;
+  // Auto-default (null/undefined): floor of `high` effort for effort-capable
+  // models; Haiku/others let the model default (no extended thinking).
+  return supportsEffort ? { thinking: { type: 'adaptive' }, effort: 'high' } : {};
 }
 
 const DEFAULT_ALLOWED_TOOLS = [
@@ -153,10 +160,9 @@ function buildOptions({
     options.resume = resume;
   }
   options.model = model || 'opus';
-  const thinkingBudget = resolveThinkingBudget(thinking, options.model);
-  if (thinkingBudget) {
-    options.thinking = { type: 'enabled', budget_tokens: thinkingBudget };
-  }
+  const reasoning = resolveReasoning(thinking, options.model);
+  if (reasoning.thinking) options.thinking = reasoning.thinking;
+  if (reasoning.effort) options.effort = reasoning.effort;
   if (betas) {
     options.betas = betas;
   }
@@ -636,9 +642,5 @@ module.exports = {
   ClaudeTransientOutageError,
   isTransientOutageError,
   isGuardrailStop,
-  THINKING_LOW,
-  THINKING_MEDIUM,
-  THINKING_HIGH,
-  THINKING_MAX,
-  resolveThinkingBudget,
+  resolveReasoning,
 };
