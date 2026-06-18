@@ -1728,7 +1728,9 @@ async function notesPipeline(route, message) {
   // Ensure log directory
   fs.mkdirSync(LOG_DIR, { recursive: true });
   const logFile = path.join(LOG_DIR, 'notes.log');
-  const model = isTestFast ? 'haiku' : undefined;
+  // TEST_MODEL forces the whole pipeline onto one model (model benchmarks);
+  // TEST_FAST is shorthand for haiku.
+  const model = process.env.TEST_MODEL || (isTestFast ? 'haiku' : undefined);
 
   const pipelineStart = Date.now();
   const tokensBefore = getCumulativeTokens();

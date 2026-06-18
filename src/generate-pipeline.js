@@ -483,8 +483,9 @@ async function generatePipeline(route, message) {
   fs.mkdirSync(LOG_DIR, { recursive: true });
   const logFile = path.join(LOG_DIR, 'generate.log');
 
-  // Determine model
-  const model = isTestFast ? 'haiku' : undefined;
+  // Determine model. TEST_MODEL forces the whole pipeline onto one model (for
+  // model benchmarks, e.g. opus vs sonnet); TEST_FAST is shorthand for haiku.
+  const model = process.env.TEST_MODEL || (isTestFast ? 'haiku' : undefined);
   const betas = undefined;
 
   // Determine skill from route config — single content type bypasses initial-pipeline
