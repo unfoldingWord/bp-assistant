@@ -17,7 +17,7 @@
     "@modelcontextprotocol/sdk": "^1.29.0",
     "@openai/agents": "^0.8.3",
     "ccusage": "^20.0.14",
-    "dotenv": "^17.2.4",
+    "dotenv": "^17.4.2",
     "fast-glob": "^3.3.3",
     "isomorphic-git": "^1.38.5",
     "node-cron": "^4.2.1",
