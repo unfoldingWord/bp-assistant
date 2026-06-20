@@ -3002,16 +3002,19 @@ async function notesPipeline(route, message) {
   } else {
     await addReaction(msgId, 'check');
 
+    const tnPushLine = noPush
+      ? 'Door43 push skipped via --no-push.'
+      : 'Content pushed to master on en_tn';
     if (chapterCount === 1) {
       await reply(
         `Notes pipeline complete for **${rangeLabel}** (${totalDuration}s).\n` +
-        `Content pushed to master on en_tn\n` +
+        `${tnPushLine}\n` +
         `You may need to refresh the tcCreate or gatewayEdit page to see the new content.`
       );
     } else {
       await reply(
         `Notes pipeline complete for **${rangeLabel}**: all ${totalSuccess} chapter(s) succeeded (${totalDuration}s).\n` +
-        `Content pushed to master on en_tn\n` +
+        `${tnPushLine}\n` +
         `You may need to refresh the tcCreate or gatewayEdit page to see the new content.`
       );
     }
