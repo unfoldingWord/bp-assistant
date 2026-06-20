@@ -1,4 +1,12 @@
 require('dotenv').config();
+// Defense-in-depth for the Node 22.23.0 http.Agent keep-alive regression that
+// severs reused sockets mid-response (zulip-js -> node-fetch -> "Premature
+// close"). Disable keep-alive on the global agents so each request uses a fresh
+// socket; lets us safely lift the Dockerfile Node pin later.
+const http = require('node:http');
+const https = require('node:https');
+http.globalAgent = new http.Agent({ keepAlive: false });
+https.globalAgent = new https.Agent({ keepAlive: false });
 const zulip = require('zulip-js');
 const fs = require('fs');
 const { readSecret } = require('./secrets');
