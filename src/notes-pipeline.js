@@ -119,6 +119,10 @@ function hasFreshFlag(content) {
   return /--fresh\b/i.test(String(content || '')) || /--new\b/i.test(String(content || ''));
 }
 
+function hasNoPushFlag(content) {
+  return /--no-push\b/i.test(String(content || ''));
+}
+
 function hasPauseBeforeATsFlag(content) {
   const text = String(content || '');
   return /--pause-before-ats\b/i.test(text)
@@ -1643,6 +1647,7 @@ async function notesPipeline(route, message) {
 
   const isTestFast = process.env.TEST_FAST === '1';
   const isDryRun = process.env.DRY_RUN === '1';
+  const noPush = hasNoPushFlag(message.content);
 
   async function status(text) {
     try {
@@ -2761,6 +2766,14 @@ async function notesPipeline(route, message) {
       continue;
     }
 
+    // --no-push: notes were generated normally; skip only the Door43 push
+    // (e.g. model benchmarks that must not create real PRs).
+    if (noPush) {
+      await status(`**--no-push** set: generated notes for ${ref}; skipping Door43 push.`);
+      totalSuccess++;
+      continue;
+    }
+
     // If push is already deferred due to conflicting branches, collect and skip
     if (deferredPush) {
       deferredChapters.push({ ch, notesSource });
@@ -2989,16 +3002,19 @@ async function notesPipeline(route, message) {
   } else {
     await addReaction(msgId, 'check');
 
+    const tnPushLine = noPush
+      ? 'Door43 push skipped via --no-push.'
+      : 'Content pushed to master on en_tn';
     if (chapterCount === 1) {
       await reply(
         `Notes pipeline complete for **${rangeLabel}** (${totalDuration}s).\n` +
-        `Content pushed to master on en_tn\n` +
+        `${tnPushLine}\n` +
         `You may need to refresh the tcCreate or gatewayEdit page to see the new content.`
       );
     } else {
       await reply(
         `Notes pipeline complete for **${rangeLabel}**: all ${totalSuccess} chapter(s) succeeded (${totalDuration}s).\n` +
-        `Content pushed to master on en_tn\n` +
+        `${tnPushLine}\n` +
         `You may need to refresh the tcCreate or gatewayEdit page to see the new content.`
       );
     }
