@@ -119,6 +119,10 @@ function hasFreshFlag(content) {
   return /--fresh\b/i.test(String(content || '')) || /--new\b/i.test(String(content || ''));
 }
 
+function hasNoPushFlag(content) {
+  return /--no-push\b/i.test(String(content || ''));
+}
+
 function hasPauseBeforeATsFlag(content) {
   const text = String(content || '');
   return /--pause-before-ats\b/i.test(text)
@@ -1643,6 +1647,7 @@ async function notesPipeline(route, message) {
 
   const isTestFast = process.env.TEST_FAST === '1';
   const isDryRun = process.env.DRY_RUN === '1';
+  const noPush = hasNoPushFlag(message.content);
 
   async function status(text) {
     try {
@@ -2757,6 +2762,14 @@ async function notesPipeline(route, message) {
     // Dry-run: skip the entire door43-push/verify phase
     if (isDryRun) {
       console.log(`[dry-run] Would run door43-push (TN) for ${ref}`);
+      totalSuccess++;
+      continue;
+    }
+
+    // --no-push: notes were generated normally; skip only the Door43 push
+    // (e.g. model benchmarks that must not create real PRs).
+    if (noPush) {
+      await status(`**--no-push** set: generated notes for ${ref}; skipping Door43 push.`);
       totalSuccess++;
       continue;
     }

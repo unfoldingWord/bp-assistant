@@ -112,7 +112,8 @@ function parseGenerateCommand(content) {
   const noAlign = /--no-align\b/i.test(String(content || ''));
   const alignOnly = /--align-only\b/i.test(String(content || ''));
   const textOnly = /--text-only\b/i.test(String(content || ''));
-  const extra = { fresh, contentTypes, noAlign, alignOnly, textOnly };
+  const noPush = /--no-push\b/i.test(String(content || ''));
+  const extra = { fresh, contentTypes, noAlign, alignOnly, textOnly, noPush };
 
   // Verse range in a single chapter: generate lam 2:1-3
   const verseMatch = input.match(/generate\s+([a-z0-9]+)\s+(\d+):(\d+)\s*[-\u2013\u2014]\s*(\d+)/);
@@ -180,6 +181,7 @@ function buildParsedGenerateRequest(route, content) {
       noAlign: /--no-align\b/i.test(String(content || '')),
       alignOnly: /--align-only\b/i.test(String(content || '')),
       textOnly: /--text-only\b/i.test(String(content || '')),
+      noPush: /--no-push\b/i.test(String(content || '')),
     };
   }
   return parseGenerateCommand(content);
@@ -423,7 +425,7 @@ async function generatePipeline(route, message) {
     return;
   }
 
-  const { book, start, end, verseStart, verseEnd, fresh, contentTypes, noAlign, alignOnly, textOnly } = parsed;
+  const { book, start, end, verseStart, verseEnd, fresh, contentTypes, noAlign, alignOnly, textOnly, noPush } = parsed;
   const useFileResponseMode = shouldUseFileResponseMode({ isFileResponse, noAlign, textOnly });
   const sessionKey = stream ? `stream-${stream}-${topic}` : `dm-${message.sender_id}`;
   const checkpointRef = {
@@ -1522,9 +1524,13 @@ async function generatePipeline(route, message) {
         resume: { chapter: chData.ch, skill: 'door43-push' },
       });
 
-      // Pre-flight: verify source files exist (only for requested content types)
-      const pushUlt = contentTypes.includes('ult') && chData.ultAligned;
-      const pushUst = contentTypes.includes('ust') && chData.ustAligned;
+      // Pre-flight: verify source files exist (only for requested content types).
+      // --no-push gates the Door43 push only; generation + alignment still run.
+      const pushUlt = !noPush && contentTypes.includes('ult') && chData.ultAligned;
+      const pushUst = !noPush && contentTypes.includes('ust') && chData.ustAligned;
+      if (noPush) {
+        await status(`**--no-push** set: generated${noAlign ? '' : ' + aligned'} ${book} ${chData.ch}; skipping Door43 push.`);
+      }
       if (pushUlt && !fs.existsSync(path.resolve(CSKILLBP_DIR, chData.ultAligned))) {
         const ultMissingEvent = await status(`**door43-push** failed (ULT) for ${book} ${chData.ch}: aligned source file missing: ${chData.ultAligned}`);
         fireDiagnosisFor(ultMissingEvent, `Phase: door43-push (ULT)\nChapter: ${book} ${chData.ch}\nAligned source file missing at push time: ${chData.ultAligned}`);
