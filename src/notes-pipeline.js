@@ -14,6 +14,8 @@ const config = require('./config');
 const { spawn } = require("child_process");
 const { sendMessage, sendDM, addReaction, removeReaction } = require('./zulip-client');
 const { runClaude, DEFAULT_RESTRICTED_TOOLS, isTransientOutageError, isGuardrailStop } = require('./claude-runner');
+const { createGuardHooks } = require('./guard-hooks');
+const { resolveAutoModel } = require('./api-runner/provider-config');
 const { getDoor43Username, emailToFallbackUsername, buildBranchName, resolveOutputFile, discoverFreshOutput, checkPrerequisites, calcSkillTimeout, normalizeBookName, resolveConflictMention, parsePartialTsv, truncatePartialTsv, parseChunkRange, CSKILLBP_DIR } = require('./pipeline-utils');
 const { splitTsv, fixTrailingNewlines } = require('./workspace-tools/tsv-tools');
 const { fillTsvIds, generateIds, prepareNotes, fillOrigQuotes, resolveGlQuotes, flagNarrowQuotes, extractAlignmentData, prepareATContext, substituteAT, fixUnicodeQuotes, verifyBoldMatches, syncCanonicalHebrewQuotes, applyHintsToPreparedNotes, _stripAlternateTranslation: stripAlternateTranslation } = require('./workspace-tools/tn-tools');
@@ -2387,7 +2389,13 @@ async function notesPipeline(route, message) {
             prompt: skill.prompt,
             label: `${ref} ${skill.name}`,
             cwd: CSKILLBP_DIR,
-            model: model || skill.model, // TEST_FAST haiku overrides per-skill model
+            // Explicit model (TEST_FAST / per-skill) always wins. When neither is
+            // set and BP_AUTO_MODEL=1, route by effort tier (low->Haiku,
+            // medium->Sonnet, high+->Opus); unset effort defaults to 'high' so
+            // generation stays on Opus. Flag off (default) -> buildOptions' opus default.
+            model: model || skill.model || (process.env.BP_AUTO_MODEL === '1'
+              ? resolveAutoModel('claude', null, skill.thinking || 'high')
+              : undefined),
             thinking: skill.thinking, // per-stage effort (e.g. deep-issue-id: xhigh); undefined -> high default
             skill: skill.name,
             tools: toolConfig.tools,
@@ -2399,6 +2407,13 @@ async function notesPipeline(route, message) {
             appendSystemPrompt: skill.appendSystemPrompt,
             mcpToolSet: skill.mcpTools,
             guardrails,
+            // Opt-in (BP_GUARD_HOOKS=1) declarative PreToolUse guard: hard-blocks
+            // writes to the protected canonical files (issues_resolved.txt, the 5
+            // glossary CSVs, any SKILL.md) and publishes denials to admin-status.
+            // Default off so behavior is unchanged until validated.
+            hooks: process.env.BP_GUARD_HOOKS === '1'
+              ? createGuardHooks({ pipelineType: 'notes', scope: ref, publish: true })
+              : undefined,
             onProgress: ({ turnCount, lastTool, elapsedMs, timedOut }) => {
               const elapsed = Math.round(elapsedMs / 60000);
               const suffix = timedOut ? ' — **timed out**, aborting' : '';

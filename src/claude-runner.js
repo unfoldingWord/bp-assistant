@@ -129,6 +129,8 @@ function buildOptions({
   abortController,
   mcpServers,
   thinking,
+  hooks,
+  compaction,
 }) {
   const options = {
     cwd: cwd || process.cwd(),
@@ -169,6 +171,22 @@ function buildOptions({
   if (appendSystemPrompt) {
     options.systemPrompt = appendSystemPrompt;
   }
+  // Phase 3: declarative guard/observability hooks (PreToolUse/PostToolUse/…).
+  // Optional + additive — when no caller passes `hooks`, options are byte-identical.
+  if (hooks) {
+    options.hooks = hooks;
+  }
+  // Phase 3 (pilot): opt-in Agent-SDK auto-compaction, default OFF. This is the
+  // Agent SDK's CLI auto-compact (settings.autoCompactEnabled), NOT the raw
+  // Messages-API `compact-2026-01-12` beta. Spread-merge so we don't clobber the
+  // sandbox `settings` set by forceNoAutoBashSandbox above.
+  if (compaction && compaction.enabled) {
+    options.settings = {
+      ...(options.settings || {}),
+      autoCompactEnabled: true,
+      ...(compaction.window ? { autoCompactWindow: compaction.window } : {}),
+    };
+  }
   return options;
 }
 
@@ -192,6 +210,8 @@ async function runClaudeOnce({
   onProgress,
   guardrails,
   thinking,
+  hooks,
+  compaction,
 }) {
   await ensureFreshToken();
   const query = await getQuery();
@@ -260,6 +280,8 @@ async function runClaudeOnce({
     abortController,
     mcpServers: { 'workspace-tools': wsTools },
     thinking,
+    hooks,
+    compaction,
   });
 
   console.log(`${runnerPrefix} Starting query in ${cwd}`);
@@ -593,6 +615,8 @@ async function runClaudeStream({
   timeoutMs,
   appendSystemPrompt,
   thinking,
+  hooks,
+  compaction,
 }) {
   await ensureFreshToken();
   const query = await getQuery();
@@ -620,6 +644,8 @@ async function runClaudeStream({
     abortController,
     mcpServers: { 'workspace-tools': wsTools },
     thinking,
+    hooks,
+    compaction,
   });
 
   console.log(`${streamPrefix} Starting stream in ${cwd}${resume ? ` (resume: ${resume.slice(0, 8)}…)` : ''}`);
