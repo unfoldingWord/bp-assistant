@@ -242,4 +242,109 @@ function fixTrailingNewlines({ file }) {
   return `Fixed ${fixed} trailing \\n in ${path.basename(filePath)}`;
 }
 
-module.exports = { splitTsv, mergeTsvs, fixTrailingNewlines };
+// --- TN edit comparator (Phase 2 overnight Sensor) ---------------------------
+// TN is TSV, not USFM, so prepare_compare (USFM) can't parse it. This diffs two
+// versions of a book's notes TSV row-by-row, keyed by Reference+SupportReference
+// (the stable identity; the random ID column is ignored entirely, and Quote can
+// drift). Classifies each change as reworded / quote-changed / dropped / added
+// and ignores cosmetic (whitespace-only) Note edits. Returns a plain object.
+function _tnColIndices(headerLine) {
+  const cols = headerLine.split('\t').map((c) => c.trim().toLowerCase());
+  const find = (name, dflt) => { const i = cols.indexOf(name); return i >= 0 ? i : dflt; };
+  return {
+    reference: find('reference', 0),
+    supportReference: find('supportreference', 3),
+    quote: find('quote', 4),
+    note: find('note', 6),
+  };
+}
+
+function _parseTnRows(content, chapterFilter) {
+  const lines = String(content || '').split(/\r?\n/);
+  let idx = { reference: 0, supportReference: 3, quote: 4, note: 6 };
+  let start = 0;
+  if (lines.length && /^reference\t/i.test(lines[0])) { idx = _tnColIndices(lines[0]); start = 1; }
+  const rows = [];
+  for (let i = start; i < lines.length; i++) {
+    const line = lines[i];
+    if (!line.trim()) continue;
+    const cols = line.split('\t');
+    const reference = (cols[idx.reference] || '').trim();
+    if (!reference) continue;
+    if (chapterFilter != null && String(reference.split(':')[0]) !== String(chapterFilter)) continue;
+    rows.push({
+      reference,
+      supportReference: (cols[idx.supportReference] || '').trim(),
+      quote: (cols[idx.quote] || '').trim(),
+      note: (cols[idx.note] || '').trim(),
+    });
+  }
+  return rows;
+}
+
+function _normNote(s) { return String(s || '').replace(/\s+/g, ' ').trim(); }
+
+/**
+ * Row-keyed diff of two TN notes-TSV versions.
+ * @param {object} opts
+ * @param {string} [opts.oldTsv]  - old TSV content (inline)
+ * @param {string} [opts.newTsv]  - new TSV content (inline)
+ * @param {string} [opts.oldPath] - old TSV path (relative to CSKILLBP_DIR)
+ * @param {string} [opts.newPath] - new TSV path
+ * @param {string} [opts.book]    - book code (label only)
+ * @param {number|string} [opts.chapter] - restrict to one chapter (Reference prefix)
+ * @returns {{ book, chapter, summary, changes }}
+ */
+function prepareCompareTn({ oldTsv, newTsv, oldPath, newPath, book = null, chapter = null } = {}) {
+  const oldContent = oldTsv != null ? oldTsv : (oldPath ? fs.readFileSync(path.resolve(CSKILLBP_DIR, oldPath), 'utf8') : '');
+  const newContent = newTsv != null ? newTsv : (newPath ? fs.readFileSync(path.resolve(CSKILLBP_DIR, newPath), 'utf8') : '');
+  const oldRows = _parseTnRows(oldContent, chapter);
+  const newRows = _parseTnRows(newContent, chapter);
+
+  const fullKey = (r) => `${r.reference} ${r.supportReference} ${r.quote}`;
+  const pairKey = (r) => `${r.reference} ${r.supportReference}`;
+  const oldByFull = new Map();
+  for (const r of oldRows) if (!oldByFull.has(fullKey(r))) oldByFull.set(fullKey(r), r);
+  const newByFull = new Map();
+  for (const r of newRows) if (!newByFull.has(fullKey(r))) newByFull.set(fullKey(r), r);
+
+  const changes = [];
+  const oldOnly = [];
+  const newOnly = [];
+  for (const [k, oldR] of oldByFull) {
+    if (newByFull.has(k)) {
+      const newR = newByFull.get(k);
+      if (_normNote(oldR.note) !== _normNote(newR.note)) {
+        changes.push({ changeType: 'reworded', reference: oldR.reference, supportReference: oldR.supportReference,
+          before: { quote: oldR.quote, note: oldR.note }, after: { quote: newR.quote, note: newR.note } });
+      }
+    } else { oldOnly.push(oldR); }
+  }
+  for (const [k, newR] of newByFull) if (!oldByFull.has(k)) newOnly.push(newR);
+
+  // Pair a single dropped + single added on the same (Reference, SupportReference)
+  // as a quote-changed; leftovers are genuine drops/adds.
+  const groupBy = (arr) => { const m = new Map(); for (const r of arr) { const p = pairKey(r); if (!m.has(p)) m.set(p, []); m.get(p).push(r); } return m; };
+  const oldG = groupBy(oldOnly);
+  const newG = groupBy(newOnly);
+  const usedOld = new Set();
+  const usedNew = new Set();
+  for (const [p, oArr] of oldG) {
+    const nArr = newG.get(p);
+    if (oArr.length === 1 && nArr && nArr.length === 1) {
+      const o = oArr[0]; const n = nArr[0];
+      changes.push({ changeType: 'quote-changed', reference: o.reference, supportReference: o.supportReference,
+        before: { quote: o.quote, note: o.note }, after: { quote: n.quote, note: n.note } });
+      usedOld.add(o); usedNew.add(n);
+    }
+  }
+  for (const r of oldOnly) if (!usedOld.has(r)) changes.push({ changeType: 'dropped', reference: r.reference, supportReference: r.supportReference, before: { quote: r.quote, note: r.note }, after: null });
+  for (const r of newOnly) if (!usedNew.has(r)) changes.push({ changeType: 'added', reference: r.reference, supportReference: r.supportReference, before: null, after: { quote: r.quote, note: r.note } });
+
+  changes.sort((a, b) => (parseVerseNum(a.reference) || 0) - (parseVerseNum(b.reference) || 0));
+  const summary = { reworded: 0, 'quote-changed': 0, dropped: 0, added: 0, total: changes.length };
+  for (const c of changes) summary[c.changeType] = (summary[c.changeType] || 0) + 1;
+  return { book, chapter, summary, changes };
+}
+
+module.exports = { splitTsv, mergeTsvs, fixTrailingNewlines, prepareCompareTn };

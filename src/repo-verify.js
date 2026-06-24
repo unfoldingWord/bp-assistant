@@ -227,4 +227,6 @@ async function verifyDcsToken() {
   }
 }
 
-module.exports = { verifyRepoPush, verifyDcsToken };
+// apiGet + GITEA_API are reused by the overnight Sensor (overnight-watcher.js)
+// for read-only PR/branch enumeration against Door43.
+module.exports = { verifyRepoPush, verifyDcsToken, apiGet, GITEA_API };
