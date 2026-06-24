@@ -49,10 +49,35 @@ function isWriteTool(toolName) {
 }
 
 // Pull a filesystem path out of a tool's input, across the common shapes.
+// (Kept for back-compat; collectWritePaths is the comprehensive version.)
 function extractPathFromToolInput(toolName, toolInput) {
   if (!toolInput || typeof toolInput !== 'object') return null;
   return toolInput.file_path || toolInput.path || toolInput.notebook_path
     || toolInput.filePath || toolInput.file || null;
+}
+
+// Input fields that name a WRITE destination. Deliberately excludes read-source
+// fields (input/inputTsv/source/src/globPattern) so the guard never blocks a
+// legitimate READ of a protected file (skills must read issues_resolved.txt and
+// the glossaries). Covers the MCP write tools the name-regex misses
+// (assemble_notes/curly_quotes/etc. use output/preparedJson/generatedJson/tsvFile).
+const WRITE_FIELDS = new Set([
+  'file_path', 'filepath', 'path', 'notebook_path', 'output', 'outputfile', 'outputpath',
+  'out', 'dest', 'destination', 'generatedjson', 'preparedjson', 'tsvfile', 'target', 'targetfile', 'file',
+]);
+
+// All write-destination path strings referenced by a tool call. Core editor
+// tools and any MCP tool are inspected; pure read tools (Read/Grep/Glob) are not.
+function collectWritePaths(toolName, toolInput) {
+  if (!toolInput || typeof toolInput !== 'object') return [];
+  const isCoreWrite = WRITE_TOOLS.has(toolName);
+  const isMcp = /^mcp__/.test(String(toolName || ''));
+  if (!isCoreWrite && !isMcp) return [];
+  const out = [];
+  for (const [k, v] of Object.entries(toolInput)) {
+    if (typeof v === 'string' && WRITE_FIELDS.has(k.toLowerCase())) out.push(v);
+  }
+  return out;
 }
 
 function isProtectedPath(targetPath, protectedPaths = DEFAULT_PROTECTED) {
@@ -76,8 +101,9 @@ function decidePreToolUse(input, policy = {}) {
   if (policy.allowedTools && !policy.allowedTools.has(tool)) {
     return denyDecision(`tool '${tool}' is not on the allowlist for this run`);
   }
-  if (isWriteTool(tool)) {
-    const target = extractPathFromToolInput(tool, input.tool_input);
+  // Deny a write whose destination is a protected canonical file — across core
+  // editors AND MCP write tools, while never blocking reads of those files.
+  for (const target of collectWritePaths(tool, input.tool_input)) {
     if (isProtectedPath(target, policy.protectedPaths || DEFAULT_PROTECTED)) {
       return denyDecision(`write to protected canonical file is not allowed: ${target}`);
     }
@@ -148,6 +174,7 @@ module.exports = {
   createGuardHooks,
   decidePreToolUse,
   extractPathFromToolInput,
+  collectWritePaths,
   isProtectedPath,
   isWriteTool,
   WRITE_TOOLS,

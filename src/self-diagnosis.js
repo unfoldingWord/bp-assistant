@@ -287,11 +287,13 @@ async function runDiagnosisAgent({ contextSummary, runClaudeImpl }) {
     maxTurns: 40,
     timeoutMs: 5 * 60 * 1000,
     guardrails: { maxToolCalls: 40, tokenBudget: 200000 },
-    // Declarative defense-in-depth: the diagnosis sub-agent is read-only, so a
-    // PreToolUse guard denies anything outside Read/Grep and publishes any
-    // anomalous attempt to admin-status (observability for a sub-agent that
-    // should never write).
-    hooks: createGuardHooks({ allowedTools: ['Read', 'Grep'], pipelineType: 'system', publish: true }),
+    // Declarative defense-in-depth (opt-in, BP_GUARD_HOOKS=1): the diagnosis
+    // sub-agent is read-only, so a PreToolUse guard denies anything outside
+    // Read/Grep and publishes any anomalous attempt to admin-status. Default
+    // OFF so options stay byte-identical until the hook layer is validated.
+    hooks: process.env.BP_GUARD_HOOKS === '1'
+      ? createGuardHooks({ allowedTools: ['Read', 'Grep'], pipelineType: 'system', publish: true })
+      : undefined,
   });
   return {
     subtype: result?.subtype || 'unknown',

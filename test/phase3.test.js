@@ -53,6 +53,24 @@ test('decidePreToolUse: allowlist, blocklist, and protected-write denial', () =>
   assert.equal(decidePreToolUse({ tool_name: 'Write', tool_input: { file_path: 'data/quick-ref/ult_decisions.csv' } }, {}).hookSpecificOutput, undefined);
 });
 
+test('decidePreToolUse blocks MCP writes to protected files (via write-fields) but never blocks reads', () => {
+  // MCP write tool targeting a protected file via an `output` field -> deny
+  assert.equal(
+    decidePreToolUse({ tool_name: 'mcp__workspace-tools__assemble_notes', tool_input: { output: 'data/issues_resolved.txt' } }, {}).hookSpecificOutput.permissionDecision,
+    'deny',
+  );
+  // MCP tool READING a protected file via `input` -> allowed (reads must work)
+  assert.equal(
+    decidePreToolUse({ tool_name: 'mcp__workspace-tools__some_reader', tool_input: { input: 'data/issues_resolved.txt' } }, {}).hookSpecificOutput,
+    undefined,
+  );
+  // core Read of a protected glossary -> allowed
+  assert.equal(
+    decidePreToolUse({ tool_name: 'Read', tool_input: { file_path: 'data/glossary/hebrew_ot_glossary.csv' } }, {}).hookSpecificOutput,
+    undefined,
+  );
+});
+
 test('createGuardHooks returns a PreToolUse hook whose callback denies a protected write', async () => {
   const hooks = createGuardHooks({ publish: false });
   assert.ok(Array.isArray(hooks.PreToolUse));

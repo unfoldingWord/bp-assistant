@@ -255,6 +255,7 @@ function _tnColIndices(headerLine) {
     reference: find('reference', 0),
     supportReference: find('supportreference', 3),
     quote: find('quote', 4),
+    occurrence: find('occurrence', 5),
     note: find('note', 6),
   };
 }
@@ -276,6 +277,7 @@ function _parseTnRows(content, chapterFilter) {
       reference,
       supportReference: (cols[idx.supportReference] || '').trim(),
       quote: (cols[idx.quote] || '').trim(),
+      occurrence: (cols[idx.occurrence] || '').trim(),
       note: (cols[idx.note] || '').trim(),
     });
   }
@@ -301,8 +303,8 @@ function prepareCompareTn({ oldTsv, newTsv, oldPath, newPath, book = null, chapt
   const oldRows = _parseTnRows(oldContent, chapter);
   const newRows = _parseTnRows(newContent, chapter);
 
-  const fullKey = (r) => `${r.reference} ${r.supportReference} ${r.quote}`;
-  const pairKey = (r) => `${r.reference} ${r.supportReference}`;
+  const fullKey = (r) => [r.reference, r.supportReference, r.quote, r.occurrence].join("|");
+  const pairKey = (r) => [r.reference, r.supportReference].join("|");
   const oldByFull = new Map();
   for (const r of oldRows) if (!oldByFull.has(fullKey(r))) oldByFull.set(fullKey(r), r);
   const newByFull = new Map();
@@ -316,7 +318,7 @@ function prepareCompareTn({ oldTsv, newTsv, oldPath, newPath, book = null, chapt
       const newR = newByFull.get(k);
       if (_normNote(oldR.note) !== _normNote(newR.note)) {
         changes.push({ changeType: 'reworded', reference: oldR.reference, supportReference: oldR.supportReference,
-          before: { quote: oldR.quote, note: oldR.note }, after: { quote: newR.quote, note: newR.note } });
+          before: { quote: oldR.quote, occurrence: oldR.occurrence, note: oldR.note }, after: { quote: newR.quote, occurrence: newR.occurrence, note: newR.note } });
       }
     } else { oldOnly.push(oldR); }
   }
@@ -334,12 +336,12 @@ function prepareCompareTn({ oldTsv, newTsv, oldPath, newPath, book = null, chapt
     if (oArr.length === 1 && nArr && nArr.length === 1) {
       const o = oArr[0]; const n = nArr[0];
       changes.push({ changeType: 'quote-changed', reference: o.reference, supportReference: o.supportReference,
-        before: { quote: o.quote, note: o.note }, after: { quote: n.quote, note: n.note } });
+        before: { quote: o.quote, occurrence: o.occurrence, note: o.note }, after: { quote: n.quote, occurrence: n.occurrence, note: n.note } });
       usedOld.add(o); usedNew.add(n);
     }
   }
-  for (const r of oldOnly) if (!usedOld.has(r)) changes.push({ changeType: 'dropped', reference: r.reference, supportReference: r.supportReference, before: { quote: r.quote, note: r.note }, after: null });
-  for (const r of newOnly) if (!usedNew.has(r)) changes.push({ changeType: 'added', reference: r.reference, supportReference: r.supportReference, before: null, after: { quote: r.quote, note: r.note } });
+  for (const r of oldOnly) if (!usedOld.has(r)) changes.push({ changeType: 'dropped', reference: r.reference, supportReference: r.supportReference, before: { quote: r.quote, occurrence: r.occurrence, note: r.note }, after: null });
+  for (const r of newOnly) if (!usedNew.has(r)) changes.push({ changeType: 'added', reference: r.reference, supportReference: r.supportReference, before: null, after: { quote: r.quote, occurrence: r.occurrence, note: r.note } });
 
   changes.sort((a, b) => (parseVerseNum(a.reference) || 0) - (parseVerseNum(b.reference) || 0));
   const summary = { reworded: 0, 'quote-changed': 0, dropped: 0, added: 0, total: changes.length };

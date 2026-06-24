@@ -1572,7 +1572,9 @@ async function runParallelTnWriter({
         prompt,
         label: `${book} ${ch} tn-writer shard ${i}${vRange ? ` v${vRange}` : ''}`,
         cwd: CSKILLBP_DIR,
-        model: model || undefined,
+        // tn-writer is generation -> high effort -> Opus (BP_AUTO_MODEL on);
+        // explicit model still wins; flag off -> buildOptions' opus default.
+        model: model || (process.env.BP_AUTO_MODEL === '1' ? resolveAutoModel('claude', null, 'high') : undefined),
         skill: 'tn-writer',
         tools: toolConfig.tools,
         disallowedTools: toolConfig.disallowedTools,
@@ -1582,6 +1584,9 @@ async function runParallelTnWriter({
         maxTurns: guardrails.maxTurns,
         appendSystemPrompt,
         guardrails,
+        hooks: process.env.BP_GUARD_HOOKS === '1'
+          ? createGuardHooks({ pipelineType: 'notes', scope: `${book} ${ch}`, publish: true })
+          : undefined,
       }).then(r => ({ ...r, _shardIdx: i }))
         .catch(err => ({ _shardIdx: i, _error: err, subtype: 'error' }));
     });
@@ -2822,6 +2827,9 @@ async function notesPipeline(route, message) {
               maxConsecutiveToolErrors: Math.min(3, rescueGuardrails.maxConsecutiveToolErrors || 3),
               maxRepeatedToolErrorSignature: Math.min(2, rescueGuardrails.maxRepeatedToolErrorSignature || 2),
             },
+            hooks: process.env.BP_GUARD_HOOKS === '1'
+              ? createGuardHooks({ pipelineType: 'notes', scope: ref, publish: true })
+              : undefined,
           });
         } catch (err) {
           console.warn(`[notes] bounded rescue pass failed for ${ref}: ${err.message}`);

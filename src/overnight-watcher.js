@@ -131,42 +131,105 @@ function rawUrl(repo, ref, filePath) {
   return `${DOOR43_BASE.replace(/\/unfoldingWord$/, '')}/${ORG}/${repo}/raw/${ref}/${filePath}`;
 }
 
+// --- editor attribution ------------------------------------------------------
+function loadEditorMap() {
+  try {
+    const raw = fs.readFileSync(path.resolve(__dirname, '../door43-users.json'), 'utf8');
+    const obj = JSON.parse(raw);
+    const byUser = {};
+    for (const [email, user] of Object.entries(obj)) {
+      byUser[String(user).toLowerCase()] = user;
+      byUser[String(email).toLowerCase()] = user;
+    }
+    return byUser;
+  } catch { return {}; }
+}
+
+// Strict: only resolves KNOWN editors (used to gate the merged+deleted fallback
+// so we never review arbitrary merged PRs by unknown authors).
+function attributeKnownEditor(editorMap, value) {
+  if (!value) return null;
+  const key = String(value).trim().toLowerCase();
+  return editorMap[key] || null;
+}
+
+// Map a changed filename to a book code for the resource (tn_<BOOK>.tsv / NN-<BOOK>.usfm).
+function bookFromFilename(name, resource) {
+  const base = String(name || '').split('/').pop();
+  if (resource === 'tn') {
+    const m = base.match(/^tn_([A-Za-z0-9]{3})\.tsv$/);
+    return m ? m[1].toUpperCase() : null;
+  }
+  const m = base.match(/^\d{2}-([A-Za-z0-9]{3})\.usfm$/);
+  return m ? m[1].toUpperCase() : null;
+}
+
+// Changed files of a PR — reliable even after the source branch is deleted
+// (Gitea strips head.ref but the files endpoint still resolves). Mirrors
+// door43-push.checkConflictingBranches.
+async function fetchPrFiles(get, repo, prNumber, token) {
+  const res = await get(`/repos/${ORG}/${repo}/pulls/${prNumber}/files?limit=100`, token);
+  if (!res || res.status !== 200 || !Array.isArray(res.data)) return [];
+  return res.data.map((f) => f && f.filename).filter(Boolean);
+}
+
 // --- enumeration -------------------------------------------------------------
-async function enumerateUnits({ apiGetImpl, token, sinceIso }) {
+async function enumerateUnits({ apiGetImpl, token, sinceIso, editorMap = {} }) {
   const get = apiGetImpl || apiGet;
   const units = [];
   for (const { repo, resource } of WATCHED) {
-    // PRIMARY: merged -be- PRs (persist after branch deletion).
+    // PRIMARY: merged PRs. Identify -be- editor edits two ways:
+    //   (a) head.ref still present -> parse <BOOK>-be-<editor> directly.
+    //   (b) head.ref stripped (Gitea drops it once the branch is deleted — see
+    //       repo-verify.js) -> derive BOOK from the PR's changed files and
+    //       attribute to the PR author, but ONLY when the author is a known editor.
     let page = 1;
     let keepPaging = true;
     while (keepPaging && page <= 10) {
       const res = await get(`/repos/${ORG}/${repo}/pulls?state=closed&sort=recentupdate&limit=50&page=${page}`, token);
-      const list = Array.isArray(res && res.data) ? res.data : [];
+      // Status guard: a 401/403/5xx must NOT be mistaken for "no PRs" — that
+      // would let runOvernightReview advance lastRun and permanently skip this
+      // interval. Abort the whole run so state is left untouched and retried.
+      if (!res || res.status !== 200) {
+        throw new Error(`Gitea pulls query failed for ${repo}: status=${res && res.status}`);
+      }
+      const list = Array.isArray(res.data) ? res.data : [];
       if (list.length === 0) break;
       for (const pr of list) {
         if (!pr || !pr.merged) continue;
-        const be = parseBeRef(pr.head && pr.head.ref);
-        if (!be) continue;
         const mergedAt = pr.merged_at || pr.updated_at;
         if (sinceIso && mergedAt && mergedAt < sinceIso) { keepPaging = false; continue; }
+        const author = (pr.user && pr.user.login) || null;
+        const be = parseBeRef(pr.head && pr.head.ref);
+        let book = be && be.book;
+        let editor = be && be.editor;
+        if (!book) {
+          // Fallback path (deleted branch): require a known editor + a touched resource file.
+          const known = attributeKnownEditor(editorMap, author);
+          if (!known || isBotAuthor(author)) continue;
+          const files = await fetchPrFiles(get, repo, pr.number, token);
+          book = files.map((f) => bookFromFilename(f, resource)).find(Boolean);
+          if (!book) continue; // PR didn't touch this resource's file
+          editor = known;
+        }
         units.push({
-          kind: 'merged-pr', repo, resource, book: be.book, editor: be.editor,
+          kind: 'merged-pr', repo, resource, book, editor: editor || author,
           prId: pr.number,
           baseSha: pr.base && pr.base.sha,
           headSha: (pr.head && pr.head.sha) || pr.merge_commit_sha,
           mergedAt,
-          author: (pr.user && pr.user.login) || be.editor,
+          author,
         });
       }
       // recentupdate desc — once we pass the cutoff we can stop.
       if (sinceIso && list.some((pr) => (pr.merged_at || pr.updated_at || '') < sinceIso)) keepPaging = false;
       page += 1;
     }
-    // SECONDARY: live -be- branches (in-flight work).
-    try {
-      const res = await get(`/repos/${ORG}/${repo}/branches?limit=100`, token);
-      const branches = Array.isArray(res && res.data) ? res.data : [];
-      for (const b of branches) {
+    // SECONDARY: live -be- branches (in-flight work). Best-effort — a non-200
+    // here is non-fatal (the branch list is the secondary signal).
+    const bres = await get(`/repos/${ORG}/${repo}/branches?limit=100`, token);
+    if (bres && bres.status === 200 && Array.isArray(bres.data)) {
+      for (const b of bres.data) {
         const be = parseBeRef(b && b.name);
         if (!be) continue;
         units.push({
@@ -176,7 +239,7 @@ async function enumerateUnits({ apiGetImpl, token, sinceIso }) {
           author: (b.commit && b.commit.author && b.commit.author.username) || be.editor,
         });
       }
-    } catch { /* branch listing is best-effort */ }
+    }
   }
   return units;
 }
@@ -187,33 +250,43 @@ function unitKeyFor(u) {
     : state.branchUnitKey(u.repo, u.branch, u.tipSha);
 }
 
-// Review one new unit → array of proposal rows. Fetches old/new content.
+// Fetch that tolerates a genuinely-absent file (HTTP 404 -> '') but RE-THROWS
+// any other failure (network/timeout/5xx). This is what lets the caller tell
+// "fetched, no edits" (safe to mark reviewed) apart from "transient failure"
+// (must NOT mark reviewed, so the unit is retried next run).
+async function fetchAllowMissing(fetch, url) {
+  try {
+    return await fetch(url);
+  } catch (err) {
+    if (/HTTP 404\b/.test(String((err && err.message) || ''))) return '';
+    throw err;
+  }
+}
+
+// Review one new unit → array of proposal rows. THROWS on transient fetch
+// failure so the orchestrator does not mark the unit reviewed.
 async function reviewUnit(u, { fetchTextImpl }) {
   const fetch = fetchTextImpl || fetchText;
   const oldRef = u.kind === 'merged-pr' ? `commit/${u.baseSha}` : 'branch/master';
   const newRef = u.kind === 'merged-pr' ? `commit/${u.headSha}` : `branch/${u.branch}`;
   const headSha = u.kind === 'merged-pr' ? u.headSha : u.tipSha;
-  try {
-    if (u.resource === 'tn') {
-      const file = tnFileForBook(u.book);
-      const [oldTsv, newTsv] = await Promise.all([
-        fetch(rawUrl(u.repo, oldRef, file)).catch(() => ''),
-        fetch(rawUrl(u.repo, newRef, file)).catch(() => ''),
-      ]);
-      const compare = prepareCompareTn({ oldTsv, newTsv, book: u.book });
-      return tnChangesToProposals(compare, { repo: u.repo, book: u.book, editor: u.editor, prId: u.prId, headSha });
-    }
-    const file = usfmFileForBook(u.book);
-    if (!file) return [];
-    const [oldUsfm, newUsfm] = await Promise.all([
-      fetch(rawUrl(u.repo, oldRef, file)).catch(() => ''),
-      fetch(rawUrl(u.repo, newRef, file)).catch(() => ''),
+  if (u.resource === 'tn') {
+    const file = tnFileForBook(u.book);
+    const [oldTsv, newTsv] = await Promise.all([
+      fetchAllowMissing(fetch, rawUrl(u.repo, oldRef, file)),
+      fetchAllowMissing(fetch, rawUrl(u.repo, newRef, file)),
     ]);
-    const changed = changedChaptersFromUsfm(oldUsfm, newUsfm);
-    return usfmChangesToProposals(changed, { repo: u.repo, resource: u.resource, book: u.book, editor: u.editor, prId: u.prId, headSha });
-  } catch {
-    return [];
+    const compare = prepareCompareTn({ oldTsv, newTsv, book: u.book });
+    return tnChangesToProposals(compare, { repo: u.repo, book: u.book, editor: u.editor, prId: u.prId, headSha });
   }
+  const file = usfmFileForBook(u.book);
+  if (!file) return [];
+  const [oldUsfm, newUsfm] = await Promise.all([
+    fetchAllowMissing(fetch, rawUrl(u.repo, oldRef, file)),
+    fetchAllowMissing(fetch, rawUrl(u.repo, newRef, file)),
+  ]);
+  const changed = changedChaptersFromUsfm(oldUsfm, newUsfm);
+  return usfmChangesToProposals(changed, { repo: u.repo, resource: u.resource, book: u.book, editor: u.editor, prId: u.prId, headSha });
 }
 
 // --- orchestration -----------------------------------------------------------
@@ -232,7 +305,11 @@ async function runOvernightReview({
   const stateFile = path.join(skillsRepo, state.DEFAULT_STATE_REL);
 
   const st = state.loadState(stateFile, deps.readFileSync);
-  const units = await enumerateUnits({ apiGetImpl: deps.apiGetImpl, token, sinceIso: st.lastRun });
+  const editorMap = deps.editorMap || loadEditorMap();
+  // If enumeration throws (e.g. a Gitea auth/5xx error), it propagates here and
+  // aborts the run BEFORE any state write — lastRun is not advanced, so the
+  // interval is retried rather than silently skipped.
+  const units = await enumerateUnits({ apiGetImpl: deps.apiGetImpl, token, sinceIso: st.lastRun, editorMap });
   const allKeys = units.map(unitKeyFor);
 
   if (state.isColdStart(st)) {
@@ -245,8 +322,17 @@ async function runOvernightReview({
   const fresh = units.filter((u) => !state.isReviewed(st, unitKeyFor(u)) && !isBotAuthor(u.author));
   const proposals = [];
   const reviewTasks = [];
+  let failed = 0;
   for (const u of fresh) {
-    const rows = await reviewUnit(u, { fetchTextImpl: deps.fetchTextImpl });
+    let rows;
+    try {
+      rows = await reviewUnit(u, { fetchTextImpl: deps.fetchTextImpl });
+    } catch (err) {
+      // Transient fetch/compare failure — do NOT mark reviewed; retry next run.
+      failed += 1;
+      log(`[overnight] review failed for ${unitKeyFor(u)} (${(err && err.message) || err}) — not marking reviewed; will retry.`);
+      continue;
+    }
     proposals.push(...rows);
     reviewTasks.push({
       repo: u.repo, resource: u.resource, book: u.book, editor: u.editor,
@@ -269,13 +355,17 @@ async function runOvernightReview({
     writeImpl(proposalsPath, proposals.map((p) => JSON.stringify(p)).join('\n') + (proposals.length ? '\n' : ''));
     tasksPath = path.join(outDir, 'review-tasks.jsonl');
     writeImpl(tasksPath, reviewTasks.map((t) => JSON.stringify(t)).join('\n') + (reviewTasks.length ? '\n' : ''));
-    st.lastRun = now.toISOString();
+    // Persist the reviewed-set always (so successful units are never re-reviewed),
+    // but only advance the lastRun watermark on a clean run — otherwise a deferred
+    // unit would fall outside the next window and never be retried.
+    if (failed === 0) st.lastRun = now.toISOString();
     state.saveState(stateFile, st, { writeImpl, mkdirImpl: mkdir });
   }
 
-  log(`[overnight] ${dryRun ? 'would review' : 'reviewed'} ${fresh.length} unit(s) → ${proposals.length} proposal row(s), ${reviewTasks.length} review task(s).`);
+  const reviewed = fresh.length - failed;
+  log(`[overnight] ${dryRun ? 'would review' : 'reviewed'} ${reviewed} unit(s)${failed ? ` (${failed} deferred on transient failure)` : ''} → ${proposals.length} proposal row(s), ${reviewTasks.length} review task(s).`);
   return {
-    coldStart: false, dryRun, units: units.length, reviewed: fresh.length,
+    coldStart: false, dryRun, units: units.length, reviewed, failed,
     proposals: proposals.length, proposalsPath, tasksPath, reviewTasks,
     sampleProposals: proposals.slice(0, 12),
   };
