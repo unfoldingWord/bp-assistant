@@ -1067,6 +1067,23 @@ function isMalformedIssuesShape(shape) {
   return shape.blankSrefRatio >= 0.8 && shape.blankQuoteRatio >= 0.8 && shape.blankBothRatio >= 0.8;
 }
 
+// Count actual verse-note rows in a notes TSV, excluding the header and any
+// chapter-intro row. Used to detect a notes file that contains nothing but an
+// intro (or nothing at all).
+function countNoteRows(notesPath) {
+  const absPath = path.resolve(CSKILLBP_DIR, notesPath);
+  if (!fs.existsSync(absPath)) return 0;
+  const lines = fs.readFileSync(absPath, 'utf8').split('\n').filter((line) => line.trim());
+  let count = 0;
+  for (const line of lines) {
+    const col0 = String(line.split('\t')[0] || '').trim();
+    if (col0.toLowerCase() === 'reference') continue; // header
+    if (/:intro$/i.test(col0)) continue;              // chapter-intro row
+    count++;
+  }
+  return count;
+}
+
 function backupIssuesFile({ issuesPath, pipeDir }) {
   if (!issuesPath || !pipeDir) return null;
   const absIssues = path.resolve(CSKILLBP_DIR, issuesPath);
@@ -1873,6 +1890,11 @@ async function notesPipeline(route, message) {
     // --- Build skill chain based on prerequisite availability ---
     const skills = [];
     const issueProducerSkillNames = new Set(['deep-issue-id', 'post-edit-review']);
+    // Fresh issue identification (always expected to yield issue rows). Unlike
+    // post-edit-review — which can legitimately leave issues unchanged or empty
+    // when the editor already resolved everything — an empty result from these
+    // is always a silent failure, so a zero-row output hard-fails the chapter.
+    const FRESH_ISSUE_PRODUCERS = new Set(['deep-issue-id', 'issue-identification']);
 
     if (resumeIssueProducer) {
       // Placeholder for cached issue-producer output — never invoked at
@@ -2492,7 +2514,16 @@ async function notesPipeline(route, message) {
       if (skill.expectedOutput) {
         const outDir = path.dirname(skill.expectedOutput);
         const outExt = path.extname(skill.expectedOutput).replace('.', '\\.');
-        const discoverPat = new RegExp(`^${book}-0*${ch}(-.*)?${outExt}$`);
+        // For a verse-range (partial-chapter) run the expected output is a verse
+        // shard (e.g. ISA-38-v9-20.tsv for issues, ISA-38-vv9-20.tsv for notes).
+        // Match that exact shard only: the loose chapter pattern below also
+        // matches the full-chapter file (ISA-38.tsv), which let an empty shard
+        // pass verification while a stray full-chapter write satisfied the check
+        // (ISA 38:9-20 incident).
+        const escapedBase = path.basename(skill.expectedOutput).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        const discoverPat = hasVerseRange
+          ? new RegExp(`^${escapedBase}$`)
+          : new RegExp(`^${book}-0*${ch}(-.*)?${outExt}$`);
         const resolved = discoverFreshOutput(outDir, book, discoverPat, skillStart)
           || resolveOutputFile(skill.expectedOutput, book);
         if (!resolved) {
@@ -2544,6 +2575,27 @@ async function notesPipeline(route, message) {
             if (s.prompt && s.prompt.includes('--issues ')) {
               s.prompt = s.prompt.replace(/--issues\s+\S+/, `--issues ${issuesPath}`);
             }
+          }
+        }
+        // Non-empty guard for fresh issue identification. deep-issue-id can
+        // report success yet leave its issues shard empty (or write the issues
+        // to a different path). Existence + freshness alone then pass, and the
+        // run silently degrades to an intro-only/empty chapter while still
+        // reporting success (ISA 38:9-20 incident). Refuse to continue when a
+        // fresh producer resolves to zero issue rows.
+        if (FRESH_ISSUE_PRODUCERS.has(skill.name) && !isDryRun) {
+          const shape = analyzeIssuesTsvShape(resolved);
+          if (!shape.exists || shape.rowCount === 0) {
+            failedSkill = skill.name;
+            await status(`**${skill.name}** failed for ${ref} — produced no issue rows (resolved: ${resolved}). Refusing to continue with an empty issues file.`);
+            setCheckpoint(checkpointRef, {
+              state: 'failed',
+              totalSuccess,
+              totalFail,
+              current: { chapter: ch, skill: skill.name, status: 'failed', errorKind: 'empty_issues', outputStatus: 'empty', outputPath: resolved },
+              resume: { chapter: ch, skill: skill.name },
+            });
+            break;
           }
         }
         if (issueProducerSkillNames.has(skill.name)) {
@@ -2603,6 +2655,22 @@ async function notesPipeline(route, message) {
             skill.resolvedOutput = notesShardRel;
             skillOutputs[ch]['tn-writer'] = notesShardRel;
             console.log(`[notes] Wrote verse shard: ${notesShardRel}`);
+            // A verse-range request must yield at least one verse note. Zero
+            // note rows means upstream generation silently produced nothing —
+            // fail rather than pushing an empty/intro-only shard and reporting
+            // success (ISA 38:9-20 incident).
+            if (!isDryRun && countNoteRows(notesShardRel) === 0) {
+              failedSkill = skill.name;
+              await status(`**${skill.name}** failed for ${ref} — verse-range run produced no verse notes (${notesShardRel}). Refusing to push an empty shard.`);
+              setCheckpoint(checkpointRef, {
+                state: 'failed',
+                totalSuccess,
+                totalFail,
+                current: { chapter: ch, skill: skill.name, status: 'failed', errorKind: 'empty_notes', outputStatus: 'empty', outputPath: notesShardRel },
+                resume: { chapter: ch, skill: skill.name },
+              });
+              break;
+            }
             // Keep a chapter-level assembled view up-to-date for future checks/runs.
             const assembledRel = refreshChapterNotesFromShards(book, tag, notesChapterRel);
             if (assembledRel) {
@@ -3051,6 +3119,7 @@ module.exports = {
   _getSkillToolConfig: getSkillToolConfig,
   _appendIssueTagsToTsv: appendIssueTagsToTsv,
   _analyzeIssuesTsvShape: analyzeIssuesTsvShape,
+  _countNoteRows: countNoteRows,
   _collectUnresolvedQuoteFindings: collectUnresolvedQuoteFindings,
   _isMalformedIssuesShape: isMalformedIssuesShape,
   _postProcessNotesTsv: postProcessNotesTsv,
