@@ -152,4 +152,15 @@ async function checkUltEdits({ book, chapter, workspaceDir, pipeDir }) {
   return { hasEdits: true, masterPath };
 }
 
-module.exports = { checkUltEdits };
+// Primitives exported for reuse by the overnight Sensor (overnight-watcher.js):
+// USFM chapter extraction, alignment-marker stripping, whitespace normalization,
+// the redirect-following text fetcher, and the book→number map.
+module.exports = {
+  checkUltEdits,
+  extractChapter,
+  stripAlignmentMarkers,
+  normalizeWhitespace,
+  fetchText,
+  BOOK_NUMBERS,
+  DOOR43_BASE,
+};

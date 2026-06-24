@@ -4,15 +4,27 @@ const fs = require('fs');
 
 const DEFAULT_PROVIDER_CONFIGS = {
   claude: {
-    defaultModel: 'claude-opus-4-7',
+    defaultModel: 'claude-opus-4-8',
     secretName: 'anthropic_api_key',
     envName: 'ANTHROPIC_API_KEY',
     modelAliases: {
-      opus: 'claude-opus-4-7',
+      opus: 'claude-opus-4-8',
       sonnet: 'claude-sonnet-4-6',
       haiku: 'claude-haiku-4-5-20251001',
     },
+    // Effort/thinking-level -> Claude tier (cost routing): low-effort phases to
+    // Haiku, validation to Sonnet, generation to Opus. The JSON config overrides
+    // this at runtime; kept in sync so a missing config file still routes.
+    autoModelByThinking: {
+      none: 'claude-haiku-4-5-20251001',
+      low: 'claude-haiku-4-5-20251001',
+      medium: 'claude-sonnet-4-6',
+      high: 'claude-opus-4-8',
+      xhigh: 'claude-opus-4-8',
+      max: 'claude-opus-4-8',
+    },
     models: {
+      'claude-opus-4-8': { label: 'Claude Opus 4.8', inputPer1M: 5.0, outputPer1M: 25.0 },
       'claude-opus-4-7': { label: 'Claude Opus 4.7', inputPer1M: 5.0, outputPer1M: 25.0 },
       'claude-sonnet-4-6': { label: 'Claude Sonnet 4.6', inputPer1M: 3.0, outputPer1M: 15.0 },
       'claude-haiku-4-5-20251001': { label: 'Claude Haiku 4.5', inputPer1M: 0.8, outputPer1M: 4.0 },
@@ -258,6 +270,19 @@ function resolveXaiModel(model, thinking) {
   return cfg.autoModelByThinking[thinking || 'medium'] || cfg.defaultModel;
 }
 
+// Provider-agnostic auto-model resolver (Phase 3 cost routing). An explicit
+// model always wins (alias-resolved). Otherwise map the effort/thinking level
+// via the provider's `autoModelByThinking`, falling back to `defaultModel`.
+// Null-safe (unlike resolveXaiModel's hard index) so a provider without the map
+// just uses its default.
+function resolveAutoModel(provider, model, thinking) {
+  const cfg = getProviderConfig(provider);
+  if (model) return cfg.modelAliases?.[model] || model;
+  const map = cfg.autoModelByThinking;
+  if (!map) return cfg.defaultModel;
+  return map[thinking || 'medium'] || cfg.defaultModel;
+}
+
 function resolveProviderModel(provider, model) {
   const cfg = getProviderConfig(provider);
   const candidate = model || cfg.defaultModel;
@@ -305,6 +330,7 @@ module.exports = {
   getProviderNames,
   resolveProviderModel,
   resolveXaiModel,
+  resolveAutoModel,
   isConfiguredModel,
   assertProviderModel,
   getFallbackModel,
