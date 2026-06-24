@@ -4,6 +4,7 @@
 // Usage:
 //   node src/test-pipeline.js "write notes LAM 2:4-5"              # real Opus run
 //   node src/test-pipeline.js "write notes LAM 2:4-5" --fast       # Haiku instead of Opus
+//   node src/test-pipeline.js "generate NAM 1" --model sonnet      # force whole pipeline onto one model
 //   node src/test-pipeline.js "write notes LAM 2:4-5" --dry-run    # no Claude calls, stub files
 //   node src/test-pipeline.js "write notes LAM 2:4-5" --fast --dry-run
 //   node src/test-pipeline.js "api generate LAM 2:4-5" --provider openai --dry-run
@@ -13,10 +14,13 @@ const messageText = process.argv.find((a, i) => i >= 2 && !a.startsWith('--'));
 const flags = new Set(process.argv.slice(2).filter(a => a.startsWith('--')));
 const providerFlagIndex = process.argv.findIndex((a) => a === '--provider');
 const providerOverride = providerFlagIndex >= 0 ? process.argv[providerFlagIndex + 1] : null;
+const modelFlagIndex = process.argv.findIndex((a) => a === '--model');
+const modelOverride = modelFlagIndex >= 0 ? process.argv[modelFlagIndex + 1] : null;
 
 if (!messageText) {
-  console.error('Usage: node src/test-pipeline.js "<message text>" [--fast] [--dry-run] [--provider <name>]');
+  console.error('Usage: node src/test-pipeline.js "<message text>" [--fast] [--model <name>] [--dry-run] [--provider <name>]');
   console.error('  --fast      Use Haiku instead of Opus (sets TEST_FAST=1)');
+  console.error('  --model     Force the whole pipeline onto one model, e.g. sonnet|opus|haiku (sets TEST_MODEL)');
   console.error('  --dry-run   Skip all Claude calls, create stub files (sets DRY_RUN=1)');
   console.error('  --provider  Run through api-runner for the given provider');
   process.exit(1);
@@ -24,6 +28,7 @@ if (!messageText) {
 
 if (flags.has('--dry-run')) process.env.DRY_RUN = '1';
 if (flags.has('--fast'))    process.env.TEST_FAST = '1';
+if (modelOverride)          process.env.TEST_MODEL = modelOverride;
 
 // --- Stub zulip-client before anything imports it ---
 const zulipStub = {
@@ -71,6 +76,7 @@ console.log(`  test-pipeline`);
 console.log(`  message: "${messageText}"`);
 console.log(`  DRY_RUN: ${process.env.DRY_RUN || '0'}`);
 console.log(`  TEST_FAST: ${process.env.TEST_FAST || '0'}`);
+console.log(`  TEST_MODEL: ${process.env.TEST_MODEL || '(default)'}`);
 console.log(`  PROVIDER: ${providerOverride || '(default route)'}`);
 console.log(`${'='.repeat(60)}\n`);
 

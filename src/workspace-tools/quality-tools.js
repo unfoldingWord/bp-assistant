@@ -683,7 +683,7 @@ async function checkTnQuality({ tsvPath, preparedJson, ultUsfm, ustUsfm, book, h
     if (n.sref) {
       const slugMatch = n.sref.match(/rc:\/\/\*\/ta\/man\/translate\/([^\s;,]+)/);
       if (slugMatch && validIssues.size && !validIssues.has(slugMatch[1])) {
-        addFinding(n.row, n.ref, n.id, 'warning', 'unknown_sref', `Unknown issue type: "${slugMatch[1]}"`);
+        addFinding(n.row, n.ref, n.id, 'error', 'unknown_sref', `Invalid issue type "${slugMatch[1]}" — not in the issue list. Re-select a valid type from data/translation-issues.csv (e.g. wordplay/paronomasia -> writing-poetry) and set it with update_prepared_quote sref. Do not invent slugs.`);
       }
     }
 

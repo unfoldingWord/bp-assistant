@@ -1447,6 +1447,33 @@ test('applyHintsToPreparedNotes — empty hint.quote suppresses on (verse, sref)
   assert.ok(data.items.find((it) => it.id === 'bbbb'), 'bbbb should survive');
 });
 
+test('applyHintsToPreparedNotes — empty quote + seed injects a general note (orig_quote empty, seed preserved)', () => {
+  const prepRel = tempPreparedPath();
+  writePrepared(prepRel, { book: 'ZEC', chapter: '7', items: [
+    { id: 'aaaa', reference: '7:12', sref: 'figs-other', orig_quote: 'something', ult_verse: 'Verse 12 text' },
+  ]});
+  const r = applyHintsToPreparedNotes({
+    preparedJson: prepRel,
+    hints: [{
+      rowId: 'sych', verse: 12, quote: '',
+      supportReference: null,
+      seed: 'General background: this continues the indictment from verse 11.',
+    }],
+    chapter: 7,
+  });
+  assert.equal(r.hintsApplied, 1);
+  const data = readPrepared(prepRel);
+  const injected = data.items.find((it) => it.id === 'sych');
+  assert.ok(injected, 'general-note hint item missing');
+  assert.equal(injected.fromHint, true);
+  assert.equal(injected.note_type, 'hint');
+  assert.equal(injected.orig_quote, '');           // no source phrase — whole-verse note
+  assert.equal(injected.sref, '');                 // null supportReference normalizes to ''
+  assert.equal(injected.reference, '7:12');
+  assert.equal(injected.seed, 'General background: this continues the indictment from verse 11.');
+  assert.equal(injected.ult_verse, 'Verse 12 text'); // borrowed from sibling item at same verse
+});
+
 test('applyHintsToPreparedNotes — drops hint whose verse is outside chapter scope', () => {
   const prepRel = tempPreparedPath();
   writePrepared(prepRel, { book: 'ZEC', chapter: '7', items: [
@@ -1502,4 +1529,70 @@ test('applyHintsToPreparedNotes — multiple hints all applied', () => {
   const data = readPrepared(prepRel);
   const ids = data.items.map((it) => it.id).sort();
   assert.deepEqual(ids, ['ab12', 'cd34']);
+});
+
+// ---------------------------------------------------------------------------
+// Intra-verse note ordering (locateQuoteStart / assembleNotes sort)
+//
+// Regression: the note sort located the GL quote in the verse with a naive
+// indexOf that stripped brace *content* ({is} -> '') and ignored discontinuous
+// separators, so supplied-word, discontinuous, and curly-vs-straight-quote
+// notes fell to pos 9999 and sorted to the END of the verse — even when they
+// covered the very first words. The shared matcher now keeps brace content,
+// folds curly quotes/dashes, and matches discontinuous quotes by their first
+// segment.
+// ---------------------------------------------------------------------------
+
+const { _locateQuoteStart, _comparableQuoteLength, assembleNotes } = require('../src/workspace-tools/tn-tools');
+
+test('locateQuoteStart resolves supplied-word, discontinuous, and curly-quote quotes to their real position', () => {
+  const verse = 'Yahweh is my shepherd; I shall not want, for the LORD’s mercy endures';
+
+  // Supplied word in braces — content is kept, not deleted.
+  assert.equal(_locateQuoteStart(verse, 'Yahweh {is} my shepherd'), 0);
+  // Discontinuous quote — located by its first segment.
+  assert.equal(_locateQuoteStart(verse, 'Yahweh…shepherd'), 0);
+  // Straight apostrophe in the quote vs curly apostrophe in the verse.
+  assert.ok(_locateQuoteStart(verse, "the LORD's mercy") > 0);
+  // A genuinely absent quote still reports -1.
+  assert.equal(_locateQuoteStart(verse, 'no such phrase'), -1);
+  // A containing quote is longer than a quote nested inside it.
+  assert.ok(
+    _comparableQuoteLength('Yahweh {is} my shepherd; I shall not want')
+      > _comparableQuoteLength('Yahweh {is} my shepherd'),
+  );
+});
+
+test('assembleNotes orders a verse by reading position, longest-first for nested quotes', () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tn-tools-order-'));
+  const preparedAbs = path.join(tempDir, 'prepared_notes.json');
+  const generatedAbs = path.join(tempDir, 'generated_notes.json');
+  const outAbs = path.join(tempDir, 'out.tsv');
+
+  const verse = 'Yahweh is my shepherd; I shall not want, for the LORD’s mercy endures';
+  // Deliberately scrambled input order; ids encode the expected output order.
+  const items = [
+    { id: 'e_late_straight', reference: '1:1', sref: 'figs-abstractnouns', orig_quote: 'q5', gl_quote: "the LORD's mercy", ult_verse: verse },
+    { id: 'c_start_discont', reference: '1:1', sref: 'figs-metaphor',      orig_quote: 'q3', gl_quote: 'Yahweh…shepherd', ult_verse: verse },
+    { id: 'a_start_full',    reference: '1:1', sref: 'figs-parallelism',   orig_quote: 'q1', gl_quote: 'Yahweh {is} my shepherd; I shall not want', ult_verse: verse },
+    { id: 'd_mid_plain',     reference: '1:1', sref: 'figs-idiom',         orig_quote: 'q4', gl_quote: 'I shall not want', ult_verse: verse },
+    { id: 'b_start_sub',     reference: '1:1', sref: 'figs-metaphor',      orig_quote: 'q2', gl_quote: 'Yahweh {is} my shepherd', ult_verse: verse },
+  ];
+  fs.writeFileSync(preparedAbs, JSON.stringify({ book: 'PSA', chapter: '23', items }, null, 2));
+  fs.writeFileSync(generatedAbs, JSON.stringify(
+    Object.fromEntries(items.map((it) => [it.id, `Note for ${it.id}.`])), null, 2));
+
+  assembleNotes({ preparedJson: preparedAbs, generatedJson: generatedAbs, output: outAbs });
+
+  const idOrder = fs.readFileSync(outAbs, 'utf8')
+    .trim().split('\n').slice(1)            // drop header
+    .map((line) => line.split('\t')[1]);    // ID column
+
+  assert.deepEqual(idOrder, [
+    'a_start_full',    // pos 0, whole verse (longest) -> first
+    'b_start_sub',     // pos 0, nested in a_start_full -> after it
+    'c_start_discont', // pos 0, shortest -> after b
+    'd_mid_plain',     // mid-verse
+    'e_late_straight', // late, curly/straight apostrophe resolved
+  ]);
 });

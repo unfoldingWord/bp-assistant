@@ -22,7 +22,7 @@ const { getCheckpoint, setCheckpoint, clearCheckpoint, buildCheckpointKey } = re
 const { buildGenerateContext, buildUstContext } = require('./pipeline-context');
 const { publishAdminStatus } = require('./admin-status');
 const { dispatchSelfDiagnosis } = require('./self-diagnosis');
-const { validateAlignedUsfmCompleteness } = require('./workspace-tools/usfm-tools');
+const { validateAlignedUsfmCompleteness, mergeAlignedUsfm } = require('./workspace-tools/usfm-tools');
 
 const LOG_DIR = path.resolve(__dirname, '../logs');
 const REQUIRED_INITIAL_PIPELINE_FILES = [
@@ -112,7 +112,8 @@ function parseGenerateCommand(content) {
   const noAlign = /--no-align\b/i.test(String(content || ''));
   const alignOnly = /--align-only\b/i.test(String(content || ''));
   const textOnly = /--text-only\b/i.test(String(content || ''));
-  const extra = { fresh, contentTypes, noAlign, alignOnly, textOnly };
+  const noPush = /--no-push\b/i.test(String(content || ''));
+  const extra = { fresh, contentTypes, noAlign, alignOnly, textOnly, noPush };
 
   // Verse range in a single chapter: generate lam 2:1-3
   const verseMatch = input.match(/generate\s+([a-z0-9]+)\s+(\d+):(\d+)\s*[-\u2013\u2014]\s*(\d+)/);
@@ -180,6 +181,7 @@ function buildParsedGenerateRequest(route, content) {
       noAlign: /--no-align\b/i.test(String(content || '')),
       alignOnly: /--align-only\b/i.test(String(content || '')),
       textOnly: /--text-only\b/i.test(String(content || '')),
+      noPush: /--no-push\b/i.test(String(content || '')),
     };
   }
   return parseGenerateCommand(content);
@@ -302,6 +304,52 @@ function isFreshOutput(relPath, minMs) {
   }
 }
 
+// When a chapter is aligned in batches (e.g. JER-29-v01-v16-aligned.usfm +
+// JER-29-v17-v32-aligned.usfm), the pipeline must push a single merged
+// full-chapter file — never an individual batch, which would truncate the
+// chapter on door43. If the freshest discovered aligned file is a batch,
+// merge all sibling batches (in verse order) into the canonical
+// <book>-<ch>-aligned.usfm and return that path. Otherwise return the input
+// unchanged. Only batch files (…-vNN-vMM-aligned.usfm) trigger a merge;
+// full-chapter and verse-range (…-vvN-M-aligned.usfm) files pass through.
+function resolveMergedChapterAligned(book, discoveredRel) {
+  if (!discoveredRel) return discoveredRel;
+  const name = path.basename(discoveredRel);
+  const batchRe = new RegExp(`^(${book}-\\d+)-v\\d+-v\\d+-aligned\\.usfm$`);
+  const m = name.match(batchRe);
+  if (!m) return discoveredRel; // already a full-chapter or verse-range file
+
+  const dirRel = path.dirname(discoveredRel);
+  const absDir = path.resolve(CSKILLBP_DIR, dirRel);
+  const chapterPrefix = m[1]; // e.g. "JER-29"
+  const siblingRe = new RegExp(`^${chapterPrefix}-v(\\d+)-v\\d+-aligned\\.usfm$`);
+  let batches;
+  try {
+    batches = fs.readdirSync(absDir)
+      .map((f) => { const sm = f.match(siblingRe); return sm ? { f, start: parseInt(sm[1], 10) } : null; })
+      .filter(Boolean)
+      .sort((a, b) => a.start - b.start);
+  } catch (_) {
+    return discoveredRel;
+  }
+  if (batches.length < 2) return discoveredRel; // nothing to merge
+
+  const parts = batches.map((b) => path.join(dirRel, b.f));
+  const outputRel = path.join(dirRel, `${chapterPrefix}-aligned.usfm`);
+  // mergeAlignedUsfm signals failure by returning an "Error: …" string rather
+  // than throwing. Returning outputRel regardless would point validation at a
+  // file that was never written, masking the real cause behind a misleading
+  // "missing file" retry. Throw instead so the chapter fails with a clear
+  // diagnostic and no wasted re-alignment.
+  const result = mergeAlignedUsfm({ parts, output: outputRel });
+  if (String(result).startsWith('Error:')
+      || !fs.existsSync(path.resolve(CSKILLBP_DIR, outputRel))) {
+    throw new Error(`Failed to merge alignment batches for ${chapterPrefix}: ${result}`);
+  }
+  console.log(`[generate] Merged ${batches.length} alignment batches → ${outputRel}: ${result}`);
+  return outputRel;
+}
+
 function summarizeAlignmentValidation({ book, chapter, ultCheck, ustCheck }) {
   const parts = [];
   const ref = `${book} ${chapter}`;
@@ -341,6 +389,19 @@ async function generatePipeline(route, message) {
     });
   }
 
+  // Convenience wrapper for terminal failures outside Phase 1 (alignment
+  // validation, door43-push, repo-verify): attaches the current checkpoint and
+  // a short error context. Callers invoke this ONLY at terminal failures, so it
+  // forces 'error' severity rather than trusting inferSeverity on the status
+  // text — e.g. a "source file missing" message infers as 'warn', which would
+  // otherwise silently suppress the diagnosis. This decouples the dispatch
+  // decision from the human-facing wording.
+  function fireDiagnosisFor(event, errorText) {
+    if (!event) return;
+    const errorEvent = event.severity === 'error' ? event : { ...event, severity: 'error' };
+    fireDiagnosis(errorEvent, { checkpoint: getCheckpoint(checkpointRef), errorText });
+  }
+
   // Helper: reply to the originating stream
   async function reply(text) {
     try {
@@ -364,7 +425,7 @@ async function generatePipeline(route, message) {
     return;
   }
 
-  const { book, start, end, verseStart, verseEnd, fresh, contentTypes, noAlign, alignOnly, textOnly } = parsed;
+  const { book, start, end, verseStart, verseEnd, fresh, contentTypes, noAlign, alignOnly, textOnly, noPush } = parsed;
   const useFileResponseMode = shouldUseFileResponseMode({ isFileResponse, noAlign, textOnly });
   const sessionKey = stream ? `stream-${stream}-${topic}` : `dm-${message.sender_id}`;
   const checkpointRef = {
@@ -424,8 +485,9 @@ async function generatePipeline(route, message) {
   fs.mkdirSync(LOG_DIR, { recursive: true });
   const logFile = path.join(LOG_DIR, 'generate.log');
 
-  // Determine model
-  const model = isTestFast ? 'haiku' : undefined;
+  // Determine model. TEST_MODEL forces the whole pipeline onto one model (for
+  // model benchmarks, e.g. opus vs sonnet); TEST_FAST is shorthand for haiku.
+  const model = process.env.TEST_MODEL || (isTestFast ? 'haiku' : undefined);
   const betas = undefined;
 
   // Determine skill from route config — single content type bypasses initial-pipeline
@@ -1136,7 +1198,7 @@ async function generatePipeline(route, message) {
 
         if ((needUlt && !alignedUltRel) || (needUst && !alignedUstRel)) {
           const missing = [needUlt && !alignedUltRel && 'ULT', needUst && !alignedUstRel && 'UST'].filter(Boolean).join(', ');
-          await status(`**align-all-parallel** failed for ${book} ${ch} at ${new Date().toISOString()} — aligned ${missing} file(s) not found (${alignDuration}s)`);
+          const missingAlignEvent = await status(`**align-all-parallel** failed for ${book} ${ch} at ${new Date().toISOString()} — aligned ${missing} file(s) not found (${alignDuration}s)`);
           fail++;
           setCheckpoint(checkpointRef, {
             state: 'failed',
@@ -1146,11 +1208,12 @@ async function generatePipeline(route, message) {
             current: { chapter: ch, skill: 'align-all-parallel', status: 'failed', errorKind: 'missing_output', outputStatus: 'missing' },
             resume: { chapter: ch, skill: 'align-all-parallel' },
           });
+          fireDiagnosisFor(missingAlignEvent, `Phase: align-all-parallel\nChapter: ${book} ${ch}\nAligned ${missing} output file(s) not found after alignment completed.`);
           alignmentTerminalFailure = true;
           break;
         }
         if ((needUlt && !isFreshOutput(alignedUltRel, chapterStart)) || (needUst && !isFreshOutput(alignedUstRel, chapterStart))) {
-          await status(`**align-all-parallel** failed for ${book} ${ch} at ${new Date().toISOString()} — aligned output appears stale from an earlier run`);
+          const staleAlignEvent = await status(`**align-all-parallel** failed for ${book} ${ch} at ${new Date().toISOString()} — aligned output appears stale from an earlier run`);
           fail++;
           setCheckpoint(checkpointRef, {
             state: 'failed',
@@ -1160,8 +1223,17 @@ async function generatePipeline(route, message) {
             current: { chapter: ch, skill: 'align-all-parallel', status: 'failed', errorKind: 'stale_output', outputStatus: 'stale' },
             resume: { chapter: ch, skill: 'align-all-parallel' },
           });
+          fireDiagnosisFor(staleAlignEvent, `Phase: align-all-parallel\nChapter: ${book} ${ch}\nAligned output appears stale (mtime older than this run) — alignment may not have rewritten it.`);
           alignmentTerminalFailure = true;
           break;
+        }
+
+        // If alignment was split into batches, merge them into a single
+        // full-chapter file before validating/pushing. Skipped for verse-range
+        // runs, whose source is intentionally a verse subset.
+        if (!hasVerseRange) {
+          if (needUlt) alignedUltRel = resolveMergedChapterAligned(book, alignedUltRel);
+          if (needUst) alignedUstRel = resolveMergedChapterAligned(book, alignedUstRel);
         }
 
         const ultCheck = needUlt ? validateAlignedUsfmCompleteness({ alignedUsfm: alignedUltRel }) : null;
@@ -1210,7 +1282,7 @@ async function generatePipeline(route, message) {
       if (alignmentTerminalFailure) continue;
 
       if (!alignmentValidated) {
-        await status(`**align-all-parallel** failed for ${book} ${ch} at ${new Date().toISOString()} — degraded alignment (${finalValidationSummary})`);
+        const degradedEvent = await status(`**align-all-parallel** failed for ${book} ${ch} at ${new Date().toISOString()} — degraded alignment (${finalValidationSummary})`);
         fail++;
         setCheckpoint(checkpointRef, {
           state: 'failed',
@@ -1227,6 +1299,7 @@ async function generatePipeline(route, message) {
           },
           resume: { chapter: ch, skill: 'align-all-parallel' },
         });
+        fireDiagnosisFor(degradedEvent, `Phase: align-all-parallel\nChapter: ${book} ${ch}\nDegraded alignment after retries: ${finalValidationSummary}`);
         continue;
       }
 
@@ -1430,6 +1503,10 @@ async function generatePipeline(route, message) {
       return;
     }
 
+    if (noPush && completedChapters.length > 0) {
+      await status(`**--no-push** set: generated${noAlign ? '' : ' + aligned'} content for ${completedChapters.length} chapter(s); skipping Door43 push.`);
+    }
+
     for (const chData of completedChapters) {
       // Skip chapters whose push already completed in a previous run
       if (chData.ch < resumeChapter) continue;
@@ -1451,15 +1528,18 @@ async function generatePipeline(route, message) {
         resume: { chapter: chData.ch, skill: 'door43-push' },
       });
 
-      // Pre-flight: verify source files exist (only for requested content types)
-      const pushUlt = contentTypes.includes('ult') && chData.ultAligned;
-      const pushUst = contentTypes.includes('ust') && chData.ustAligned;
+      // Pre-flight: verify source files exist (only for requested content types).
+      // --no-push gates the Door43 push only; generation + alignment still run.
+      const pushUlt = !noPush && contentTypes.includes('ult') && chData.ultAligned;
+      const pushUst = !noPush && contentTypes.includes('ust') && chData.ustAligned;
       if (pushUlt && !fs.existsSync(path.resolve(CSKILLBP_DIR, chData.ultAligned))) {
-        await status(`**door43-push** SKIPPED (ULT) for ${book} ${chData.ch}: source file missing: ${chData.ultAligned}`);
+        const ultMissingEvent = await status(`**door43-push** failed (ULT) for ${book} ${chData.ch}: aligned source file missing: ${chData.ultAligned}`);
+        fireDiagnosisFor(ultMissingEvent, `Phase: door43-push (ULT)\nChapter: ${book} ${chData.ch}\nAligned source file missing at push time: ${chData.ultAligned}`);
         chapterFailed = true;
       }
       if (!chapterFailed && pushUst && !fs.existsSync(path.resolve(CSKILLBP_DIR, chData.ustAligned))) {
-        await status(`**door43-push** SKIPPED (UST) for ${book} ${chData.ch}: source file missing: ${chData.ustAligned}`);
+        const ustMissingEvent = await status(`**door43-push** failed (UST) for ${book} ${chData.ch}: aligned source file missing: ${chData.ustAligned}`);
+        fireDiagnosisFor(ustMissingEvent, `Phase: door43-push (UST)\nChapter: ${book} ${chData.ch}\nAligned source file missing at push time: ${chData.ustAligned}`);
         chapterFailed = true;
       }
 
@@ -1481,7 +1561,8 @@ async function generatePipeline(route, message) {
           });
           if (!pushResultUlt.success) {
             console.error(`[generate] door43-push ULT failed for ${book} ${chData.ch}: ${pushResultUlt.details}`);
-            await status(`**door43-push** (ULT) failed for ${book} ${chData.ch}: ${pushResultUlt.details}`);
+            const ultPushFailEvent = await status(`**door43-push** (ULT) failed for ${book} ${chData.ch}: ${pushResultUlt.details}`);
+            fireDiagnosisFor(ultPushFailEvent, `Phase: door43-push (ULT)\nChapter: ${book} ${chData.ch}\nSource: ${chData.ultAligned}\nPush failed: ${pushResultUlt.details}`);
             chapterFailed = true;
           } else {
             ultNoChanges = pushResultUlt.noChanges === true;
@@ -1490,7 +1571,8 @@ async function generatePipeline(route, message) {
           }
         } catch (err) {
           console.error(`[generate] door43-push ULT error for ${book} ${chData.ch}: ${err.message}`);
-          await status(`**door43-push** (ULT) failed for ${book} ${chData.ch}: ${err.message}`);
+          const ultPushErrEvent = await status(`**door43-push** (ULT) failed for ${book} ${chData.ch}: ${err.message}`);
+          fireDiagnosisFor(ultPushErrEvent, `Phase: door43-push (ULT)\nChapter: ${book} ${chData.ch}\nSource: ${chData.ultAligned}\nThrew: ${err.message}`);
           chapterFailed = true;
         }
       }
@@ -1507,7 +1589,8 @@ async function generatePipeline(route, message) {
           });
           if (!pushResultUst.success) {
             console.error(`[generate] door43-push UST failed for ${book} ${chData.ch}: ${pushResultUst.details}`);
-            await status(`**door43-push** (UST) failed for ${book} ${chData.ch}: ${pushResultUst.details}`);
+            const ustPushFailEvent = await status(`**door43-push** (UST) failed for ${book} ${chData.ch}: ${pushResultUst.details}`);
+            fireDiagnosisFor(ustPushFailEvent, `Phase: door43-push (UST)\nChapter: ${book} ${chData.ch}\nSource: ${chData.ustAligned}\nPush failed: ${pushResultUst.details}`);
             chapterFailed = true;
           } else {
             ustNoChanges = pushResultUst.noChanges === true;
@@ -1516,7 +1599,8 @@ async function generatePipeline(route, message) {
           }
         } catch (err) {
           console.error(`[generate] door43-push UST error for ${book} ${chData.ch}: ${err.message}`);
-          await status(`**door43-push** (UST) failed for ${book} ${chData.ch}: ${err.message}`);
+          const ustPushErrEvent = await status(`**door43-push** (UST) failed for ${book} ${chData.ch}: ${err.message}`);
+          fireDiagnosisFor(ustPushErrEvent, `Phase: door43-push (UST)\nChapter: ${book} ${chData.ch}\nSource: ${chData.ustAligned}\nThrew: ${err.message}`);
           chapterFailed = true;
         }
       }
@@ -1537,11 +1621,13 @@ async function generatePipeline(route, message) {
         const ustVerify = verifyUst ? await verifyRepoPush({ repo: 'en_ust', stagingBranch, since: pushStartTime, prNumber: ustPrNumber }) : { success: true };
 
         if (verifyUlt && !ultVerify.success) {
-          await status(`Repo verify FAILED (ULT) for ${book} ${chData.ch}: ${ultVerify.details}`);
+          const ultVerifyEvent = await status(`Repo verify FAILED (ULT) for ${book} ${chData.ch}: ${ultVerify.details}`);
+          fireDiagnosisFor(ultVerifyEvent, `Phase: repo-verify (ULT)\nChapter: ${book} ${chData.ch}\nPush reported success but post-merge verification failed: ${ultVerify.details}`);
           chapterFailed = true;
         }
         if (verifyUst && !ustVerify.success) {
-          await status(`Repo verify FAILED (UST) for ${book} ${chData.ch}: ${ustVerify.details}`);
+          const ustVerifyEvent = await status(`Repo verify FAILED (UST) for ${book} ${chData.ch}: ${ustVerify.details}`);
+          fireDiagnosisFor(ustVerifyEvent, `Phase: repo-verify (UST)\nChapter: ${book} ${chData.ch}\nPush reported success but post-merge verification failed: ${ustVerify.details}`);
           chapterFailed = true;
         }
         const verifiedTypes = [verifyUlt && 'ULT', verifyUst && 'UST'].filter(Boolean).join(' and ');
@@ -1560,6 +1646,18 @@ async function generatePipeline(route, message) {
           fail,
           completedChapters,
           current: { chapter: chData.ch, skill: 'door43-push', status: 'failed', errorKind: 'push_failed' },
+          resume: { chapter: chData.ch, skill: 'door43-push' },
+        });
+      } else if (noPush) {
+        // Push intentionally skipped (--no-push): record generation as complete
+        // but do NOT mark door43-push-done, so a later resume without --no-push
+        // still performs the push. No "merged to master" reply.
+        setCheckpoint(checkpointRef, {
+          state: 'running',
+          success,
+          fail,
+          completedChapters,
+          current: { chapter: chData.ch, skill: 'door43-push', status: 'skipped' },
           resume: { chapter: chData.ch, skill: 'door43-push' },
         });
       } else {
@@ -1597,7 +1695,9 @@ async function generatePipeline(route, message) {
       : (start === end ? `${book} ${start}` : `${book} ${start}\u2013${end}`);
     const repoList = [contentTypes.includes('ult') && 'en_ult', contentTypes.includes('ust') && 'en_ust'].filter(Boolean).join(' and ');
     await reply(
-      `Content for **${rangeLabel}** pushed to master in ${repoList}.` +
+      (noPush
+        ? `Content for **${rangeLabel}** generated in ${repoList} (Door43 push skipped via --no-push).`
+        : `Content for **${rangeLabel}** pushed to master in ${repoList}.`) +
       (fail > 0 ? `\n(${fail} chapter(s) had errors \u2014 check admin DMs for details.)` : '') +
       `\nYou may need to refresh the tcCreate or gatewayEdit page to see the new content.`
     );
@@ -1625,4 +1725,5 @@ module.exports = {
   buildParsedGenerateRequest,
   hasRequiredGeneratedOutputs,
   shouldUseFileResponseMode,
+  resolveMergedChapterAligned,
 };

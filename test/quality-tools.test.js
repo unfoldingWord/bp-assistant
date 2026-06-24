@@ -300,7 +300,11 @@ test('checkTnQuality flags AT scope mismatch against the exact selected span', a
 });
 
 test('check_tn_quality MCP handler always returns schema-valid text content', async () => {
-  const { CallToolResultSchema } = await import('../node_modules/@modelcontextprotocol/sdk/dist/esm/types.js');
+  // Resolve via the package's public subpath, not a hardcoded ../node_modules
+  // path: the latter only works when node_modules is a sibling of test/ (fails
+  // in git worktrees) and reaches past the SDK's public API into its dist
+  // layout. The subpath export resolves through normal module resolution.
+  const { CallToolResultSchema } = await import('@modelcontextprotocol/sdk/types.js');
   const sdk = await import('@anthropic-ai/claude-agent-sdk');
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'quality-tools-mcp-'));
   const relRoot = path.join('tmp', path.basename(tempDir));

@@ -202,22 +202,39 @@ jobs:
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           set -euo pipefail
-          # Pull recent logs and extract the latest PR_REVIEW_RESULT marker line.
-          # run-pr-review.js emits a single-line marker so we don't need to
-          # reassemble multi-line pretty JSON across log entries.
-          # The success-path JSON serializes as `{"request":...,"decision":...,...}`
-          # because executePrReview returns `{ request, ...aggregate, summary }`,
-          # so anchoring on `{"decision":` would only match the catch-block
-          # failure object and silently drop every PASS result.
-          # Scope to this run via the prNumber and headSha downstream filters
-          # (those substrings are emitted in the request block).
-          flyctl logs --app "$FLY_APP_NAME" --no-tail > all-logs.txt 2>&1 || true
-          marker_line="$(grep -E 'PR_REVIEW_RESULT:[[:space:]]*\{' all-logs.txt \
-            | grep "\"prNumber\":${PR_NUMBER}" \
-            | grep "\"headSha\":\"${HEAD_SHA}\"" \
-            | tail -1 || true)"
+          # Extract the PR_REVIEW_RESULT marker for THIS PR head SHA from the
+          # Fly logs. run-pr-review.js emits a single-line marker so we don't
+          # need to reassemble multi-line pretty JSON across log entries.
+          #
+          # Fly's log pipeline is eventually-consistent: a single fetch right
+          # after the machine stops often returns a stale snapshot that predates
+          # this run's marker (the machine is shared, so other PRs' markers may
+          # be all that has propagated yet — which is exactly how this step used
+          # to fail the run with no verdict). Poll, re-fetching, until this head
+          # SHA's marker appears or we time out.
+          #
+          # Scope solely on headSha: a git SHA is globally unique, present in
+          # both the success marker (executePrReview's request block) and the
+          # failure/fallback markers, and correctly distinguishes re-pushes of
+          # the same PR number.
+          deadline=$((SECONDS + 180))
+          marker_line=""
+          attempt=0
+          while [ "$SECONDS" -lt "$deadline" ]; do
+            attempt=$((attempt + 1))
+            flyctl logs --app "$FLY_APP_NAME" --no-tail > all-logs.txt 2>&1 || true
+            marker_line="$(grep -E 'PR_REVIEW_RESULT:[[:space:]]*\{' all-logs.txt \
+              | grep "\"headSha\":\"${HEAD_SHA}\"" \
+              | tail -1 || true)"
+            if [ -n "$marker_line" ]; then
+              echo "Found PR_REVIEW_RESULT marker for SHA ${HEAD_SHA} on attempt ${attempt}."
+              break
+            fi
+            echo "No marker yet for SHA ${HEAD_SHA} (attempt ${attempt}); waiting 10s for Fly log propagation..."
+            sleep 10
+          done
           if [ -z "$marker_line" ]; then
-            echo "No PR_REVIEW_RESULT marker found in logs for PR #${PR_NUMBER} SHA ${HEAD_SHA} (run may have crashed before emitting)." >&2
+            echo "No PR_REVIEW_RESULT marker found for PR #${PR_NUMBER} SHA ${HEAD_SHA} after ${attempt} attempts (~180s); the reviewer machine likely never emitted a result for this commit." >&2
             tail -100 all-logs.txt >&2 || true
             exit 1
           fi

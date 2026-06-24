@@ -147,6 +147,14 @@ test('chapter intro is auto-skipped for Psalms', () => {
   assert.equal(shouldRunIntro('ISA', 51, true), true);
 });
 
+test('chapter intro is skipped for partial-chapter (verse-range) requests', () => {
+  // Full chapter: intro runs.
+  assert.equal(shouldRunIntro('ISA', 38, true, false), true);
+  // Verse range (e.g. "write notes ISA 38:9-20"): intro is skipped even though
+  // the book/chapter would otherwise qualify.
+  assert.equal(shouldRunIntro('ISA', 38, true, true), false);
+});
+
 test('chapter intro prompt includes high parallelism hint when signal is high', () => {
   const hint = buildParallelismIntroHintArgs({
     parallelism_signal: 'high',
@@ -355,6 +363,80 @@ test('malformed issues TSV shape is detected when issue type and quote are blank
     if (oldBaseDir == null) delete process.env.CSKILLBP_DIR;
     else process.env.CSKILLBP_DIR = oldBaseDir;
     delete require.cache[notesPipelinePath];
+  }
+});
+
+test('empty issues shard is detected as zero rows (deep-issue-id non-empty guard)', () => {
+  // Reproduces the ISA 38:9-20 incident: deep-issue-id reported success but the
+  // verse-range issues shard was effectively empty. analyzeIssuesTsvShape must
+  // report rowCount 0 so the producer-stage guard can hard-fail.
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'issues-empty-'));
+  const oldBaseDir = process.env.CSKILLBP_DIR;
+  process.env.CSKILLBP_DIR = tempDir;
+
+  // CSKILLBP_DIR is a load-time constant in pipeline-utils, so clear its cache
+  // (not just notes-pipeline's) to rebind it to this temp dir.
+  const notesPipelinePath = require.resolve('../src/notes-pipeline');
+  const utilsPath = require.resolve('../src/pipeline-utils');
+  delete require.cache[notesPipelinePath];
+  delete require.cache[utilsPath];
+  const { _analyzeIssuesTsvShape } = require('../src/notes-pipeline');
+
+  try {
+    const issuesRel = 'output/issues/ISA/ISA-38-v9-20.tsv';
+    const issuesAbs = path.join(tempDir, issuesRel);
+    fs.mkdirSync(path.dirname(issuesAbs), { recursive: true });
+    fs.writeFileSync(issuesAbs, '\n\n'); // blank lines only, as seen in the incident
+
+    const shape = _analyzeIssuesTsvShape(issuesRel);
+    assert.equal(shape.exists, true);
+    assert.equal(shape.rowCount, 0);
+  } finally {
+    if (oldBaseDir == null) delete process.env.CSKILLBP_DIR;
+    else process.env.CSKILLBP_DIR = oldBaseDir;
+    delete require.cache[notesPipelinePath];
+    delete require.cache[utilsPath];
+  }
+});
+
+test('countNoteRows counts verse notes but not header or intro rows', () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'notes-count-'));
+  const oldBaseDir = process.env.CSKILLBP_DIR;
+  process.env.CSKILLBP_DIR = tempDir;
+
+  const notesPipelinePath = require.resolve('../src/notes-pipeline');
+  const utilsPath = require.resolve('../src/pipeline-utils');
+  delete require.cache[notesPipelinePath];
+  delete require.cache[utilsPath];
+  const { _countNoteRows } = require('../src/notes-pipeline');
+
+  try {
+    const dir = path.join(tempDir, 'output/notes/ISA');
+    fs.mkdirSync(dir, { recursive: true });
+
+    // Intro-only shard (the incident's final state) must count as zero notes.
+    const introOnly = 'output/notes/ISA/ISA-38-vv9-20-intro.tsv';
+    fs.writeFileSync(path.join(tempDir, introOnly),
+      'Reference\tID\tTags\tSupportReference\tQuote\tOccurrence\tNote\n' +
+      '38:intro\tcgq6\t\t\t\t\t# Isaiah 38 Introduction\n');
+    assert.equal(_countNoteRows(introOnly), 0);
+
+    // Real verse notes are counted; header and intro are excluded.
+    const withNotes = 'output/notes/ISA/ISA-38-vv9-20.tsv';
+    fs.writeFileSync(path.join(tempDir, withNotes),
+      'Reference\tID\tTags\tSupportReference\tQuote\tOccurrence\tNote\n' +
+      '38:intro\tcgq6\t\t\t\t\t# Isaiah 38 Introduction\n' +
+      '38:9\tab12\t\t\tכתב\t1\tNote one\n' +
+      '38:10\tcd34\t\t\tאני\t1\tNote two\n');
+    assert.equal(_countNoteRows(withNotes), 2);
+
+    // Missing file counts as zero.
+    assert.equal(_countNoteRows('output/notes/ISA/does-not-exist.tsv'), 0);
+  } finally {
+    if (oldBaseDir == null) delete process.env.CSKILLBP_DIR;
+    else process.env.CSKILLBP_DIR = oldBaseDir;
+    delete require.cache[notesPipelinePath];
+    delete require.cache[utilsPath];
   }
 });
 

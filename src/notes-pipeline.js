@@ -1,7 +1,8 @@
 // notes-pipeline.js — Multi-skill sequential pipeline for translation note writing
 // Triggered by: "write notes <book> <chapter>" or "write notes <book> <start>-<end>"
 // Skills: [post-edit-review OR deep-issue-id] -> [chapter-intro] -> tn-writer (Opus) -> tn-quality-check (Sonnet) -> repo-insert (Haiku)
-// chapter-intro runs by default; disabled when the user opts out or auto-excluded.
+// chapter-intro runs by default; disabled when the user opts out, for a
+// verse-range (partial-chapter) request, or when auto-excluded.
 //
 // Each chapter is fully processed (skills + repo-insert + repo-verify) before
 // moving to the next, so the editor gets access as soon as a chapter merges.
@@ -13,6 +14,8 @@ const config = require('./config');
 const { spawn } = require("child_process");
 const { sendMessage, sendDM, addReaction, removeReaction } = require('./zulip-client');
 const { runClaude, DEFAULT_RESTRICTED_TOOLS, isTransientOutageError, isGuardrailStop } = require('./claude-runner');
+const { createGuardHooks } = require('./guard-hooks');
+const { resolveAutoModel } = require('./api-runner/provider-config');
 const { getDoor43Username, emailToFallbackUsername, buildBranchName, resolveOutputFile, discoverFreshOutput, checkPrerequisites, calcSkillTimeout, normalizeBookName, resolveConflictMention, parsePartialTsv, truncatePartialTsv, parseChunkRange, CSKILLBP_DIR } = require('./pipeline-utils');
 const { splitTsv, fixTrailingNewlines } = require('./workspace-tools/tsv-tools');
 const { fillTsvIds, generateIds, prepareNotes, fillOrigQuotes, resolveGlQuotes, flagNarrowQuotes, extractAlignmentData, prepareATContext, substituteAT, fixUnicodeQuotes, verifyBoldMatches, syncCanonicalHebrewQuotes, applyHintsToPreparedNotes, _stripAlternateTranslation: stripAlternateTranslation } = require('./workspace-tools/tn-tools');
@@ -101,8 +104,13 @@ function isIntroAutoExcluded(book, chapter) {
   return SKIP_INTRO_RANGES.some(r => r.book === book && chapter >= r.start && chapter <= r.end);
 }
 
-function shouldRunIntro(book, chapter, withIntroFlag) {
+function shouldRunIntro(book, chapter, withIntroFlag, hasVerseRange) {
   if (!withIntroFlag) return false;
+  // A chapter intro describes the whole chapter, so it makes no sense for a
+  // partial-chapter (verse-range) request like "write notes ISA 38:9-20".
+  // Skipping it also prevents a run whose verse notes come up empty from
+  // pushing an intro-only chapter and reporting that as success.
+  if (hasVerseRange) return false;
   if (isIntroAutoExcluded(book, chapter)) return false;
   return true;
 }
@@ -117,6 +125,10 @@ function hasNoIntroFlag(content) {
 
 function hasFreshFlag(content) {
   return /--fresh\b/i.test(String(content || '')) || /--new\b/i.test(String(content || ''));
+}
+
+function hasNoPushFlag(content) {
+  return /--no-push\b/i.test(String(content || ''));
 }
 
 function hasPauseBeforeATsFlag(content) {
@@ -1077,6 +1089,23 @@ function isMalformedIssuesShape(shape) {
   return shape.blankSrefRatio >= 0.8 && shape.blankQuoteRatio >= 0.8 && shape.blankBothRatio >= 0.8;
 }
 
+// Count actual verse-note rows in a notes TSV, excluding the header and any
+// chapter-intro row. Used to detect a notes file that contains nothing but an
+// intro (or nothing at all).
+function countNoteRows(notesPath) {
+  const absPath = path.resolve(CSKILLBP_DIR, notesPath);
+  if (!fs.existsSync(absPath)) return 0;
+  const lines = fs.readFileSync(absPath, 'utf8').split('\n').filter((line) => line.trim());
+  let count = 0;
+  for (const line of lines) {
+    const col0 = String(line.split('\t')[0] || '').trim();
+    if (col0.toLowerCase() === 'reference') continue; // header
+    if (/:intro$/i.test(col0)) continue;              // chapter-intro row
+    count++;
+  }
+  return count;
+}
+
 function backupIssuesFile({ issuesPath, pipeDir }) {
   if (!issuesPath || !pipeDir) return null;
   const absIssues = path.resolve(CSKILLBP_DIR, issuesPath);
@@ -1563,7 +1592,9 @@ async function runParallelTnWriter({
         prompt,
         label: `${book} ${ch} tn-writer shard ${i}${vRange ? ` v${vRange}` : ''}`,
         cwd: CSKILLBP_DIR,
-        model: model || undefined,
+        // tn-writer is generation -> high effort -> Opus (BP_AUTO_MODEL on);
+        // explicit model still wins; flag off -> buildOptions' opus default.
+        model: model || (process.env.BP_AUTO_MODEL === '1' ? resolveAutoModel('claude', null, 'high') : undefined),
         skill: 'tn-writer',
         tools: toolConfig.tools,
         disallowedTools: toolConfig.disallowedTools,
@@ -1573,6 +1604,9 @@ async function runParallelTnWriter({
         maxTurns: guardrails.maxTurns,
         appendSystemPrompt,
         guardrails,
+        hooks: process.env.BP_GUARD_HOOKS === '1'
+          ? createGuardHooks({ pipelineType: 'notes', scope: `${book} ${ch}`, publish: true })
+          : undefined,
       }).then(r => ({ ...r, _shardIdx: i }))
         .catch(err => ({ _shardIdx: i, _error: err, subtype: 'error' }));
     });
@@ -1663,6 +1697,7 @@ async function notesPipeline(route, message) {
 
   const isTestFast = process.env.TEST_FAST === '1';
   const isDryRun = process.env.DRY_RUN === '1';
+  const noPush = hasNoPushFlag(message.content);
 
   async function status(text) {
     try {
@@ -1748,7 +1783,9 @@ async function notesPipeline(route, message) {
   // Ensure log directory
   fs.mkdirSync(LOG_DIR, { recursive: true });
   const logFile = path.join(LOG_DIR, 'notes.log');
-  const model = isTestFast ? 'haiku' : undefined;
+  // TEST_MODEL forces the whole pipeline onto one model (model benchmarks);
+  // TEST_FAST is shorthand for haiku.
+  const model = process.env.TEST_MODEL || (isTestFast ? 'haiku' : undefined);
 
   const pipelineStart = Date.now();
   const tokensBefore = getCumulativeTokens();
@@ -1880,6 +1917,11 @@ async function notesPipeline(route, message) {
     // --- Build skill chain based on prerequisite availability ---
     const skills = [];
     const issueProducerSkillNames = new Set(['deep-issue-id', 'post-edit-review']);
+    // Fresh issue identification (always expected to yield issue rows). Unlike
+    // post-edit-review — which can legitimately leave issues unchanged or empty
+    // when the editor already resolved everything — an empty result from these
+    // is always a silent failure, so a zero-row output hard-fails the chapter.
+    const FRESH_ISSUE_PRODUCERS = new Set(['deep-issue-id', 'issue-identification']);
 
     if (resumeIssueProducer) {
       // Placeholder for cached issue-producer output — never invoked at
@@ -1956,11 +1998,13 @@ async function notesPipeline(route, message) {
         expectedOutput: issuesPath,
         mcpTools: 'issue-id',
         ops: 3, // 2 analysts + challenger/merge
+        thinking: 'xhigh', // 3 issue-id agents inherit xhigh effort from this orchestrator session
       });
     }
 
-    // chapter-intro: only runs when "with intro" is requested (and not in auto-exclusion range)
-    if (shouldRunIntro(book, ch, withIntro)) {
+    // chapter-intro: only runs when "with intro" is requested, for a full
+    // chapter (not a verse range), and not in an auto-exclusion range.
+    if (shouldRunIntro(book, ch, withIntro, hasVerseRange)) {
       skills.push({
         name: 'chapter-intro',
         prompt: buildChapterIntroPrompt(skillRef, issuesPath, ctxFlag, chapterIntroHintArgs),
@@ -1968,6 +2012,8 @@ async function notesPipeline(route, message) {
         skipPreClean: true, // expectedOutput is also input; do not delete verse issues before intro insertion
         ops: 1,
       });
+    } else if (withIntro && hasVerseRange) {
+      await status(`**${ref}**: skipping chapter-intro (partial-chapter request)`);
     } else if (withIntro && isIntroAutoExcluded(book, ch)) {
       await status(`**${ref}**: skipping chapter-intro (auto-excluded range)`);
     }
@@ -1990,7 +2036,7 @@ async function notesPipeline(route, message) {
     });
 
     // tn-quality-check runs as a separate Opus invocation for independent review
-    // (auto-defaults to THINKING_HIGH via claude-runner's thinking-budget logic)
+    // (auto-defaults to high effort + adaptive thinking via claude-runner)
     const qualityTag = hasVerseRange ? `${tag}-vv${verseStart}-${verseEnd}` : tag;
     const defaultNotesPath = hasVerseRange ? notesShardRel : notesChapterRel;
     skills.push({
@@ -2368,7 +2414,14 @@ async function notesPipeline(route, message) {
             prompt: skill.prompt,
             label: `${ref} ${skill.name}`,
             cwd: CSKILLBP_DIR,
-            model: model || skill.model, // TEST_FAST haiku overrides per-skill model
+            // Explicit model (TEST_FAST / per-skill) always wins. When neither is
+            // set and BP_AUTO_MODEL=1, route by effort tier (low->Haiku,
+            // medium->Sonnet, high+->Opus); unset effort defaults to 'high' so
+            // generation stays on Opus. Flag off (default) -> buildOptions' opus default.
+            model: model || skill.model || (process.env.BP_AUTO_MODEL === '1'
+              ? resolveAutoModel('claude', null, skill.thinking || 'high')
+              : undefined),
+            thinking: skill.thinking, // per-stage effort (e.g. deep-issue-id: xhigh); undefined -> high default
             skill: skill.name,
             tools: toolConfig.tools,
             disallowedTools: toolConfig.disallowedTools,
@@ -2379,6 +2432,13 @@ async function notesPipeline(route, message) {
             appendSystemPrompt: skill.appendSystemPrompt,
             mcpToolSet: skill.mcpTools,
             guardrails,
+            // Opt-in (BP_GUARD_HOOKS=1) declarative PreToolUse guard: hard-blocks
+            // writes to the protected canonical files (issues_resolved.txt, the 5
+            // glossary CSVs, any SKILL.md) and publishes denials to admin-status.
+            // Default off so behavior is unchanged until validated.
+            hooks: process.env.BP_GUARD_HOOKS === '1'
+              ? createGuardHooks({ pipelineType: 'notes', scope: ref, publish: true })
+              : undefined,
             onProgress: ({ turnCount, lastTool, elapsedMs, timedOut }) => {
               const elapsed = Math.round(elapsedMs / 60000);
               const suffix = timedOut ? ' — **timed out**, aborting' : '';
@@ -2494,7 +2554,16 @@ async function notesPipeline(route, message) {
       if (skill.expectedOutput) {
         const outDir = path.dirname(skill.expectedOutput);
         const outExt = path.extname(skill.expectedOutput).replace('.', '\\.');
-        const discoverPat = new RegExp(`^${book}-0*${ch}(-.*)?${outExt}$`);
+        // For a verse-range (partial-chapter) run the expected output is a verse
+        // shard (e.g. ISA-38-v9-20.tsv for issues, ISA-38-vv9-20.tsv for notes).
+        // Match that exact shard only: the loose chapter pattern below also
+        // matches the full-chapter file (ISA-38.tsv), which let an empty shard
+        // pass verification while a stray full-chapter write satisfied the check
+        // (ISA 38:9-20 incident).
+        const escapedBase = path.basename(skill.expectedOutput).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        const discoverPat = hasVerseRange
+          ? new RegExp(`^${escapedBase}$`)
+          : new RegExp(`^${book}-0*${ch}(-.*)?${outExt}$`);
         const resolved = discoverFreshOutput(outDir, book, discoverPat, skillStart)
           || resolveOutputFile(skill.expectedOutput, book);
         if (!resolved) {
@@ -2546,6 +2615,27 @@ async function notesPipeline(route, message) {
             if (s.prompt && s.prompt.includes('--issues ')) {
               s.prompt = s.prompt.replace(/--issues\s+\S+/, `--issues ${issuesPath}`);
             }
+          }
+        }
+        // Non-empty guard for fresh issue identification. deep-issue-id can
+        // report success yet leave its issues shard empty (or write the issues
+        // to a different path). Existence + freshness alone then pass, and the
+        // run silently degrades to an intro-only/empty chapter while still
+        // reporting success (ISA 38:9-20 incident). Refuse to continue when a
+        // fresh producer resolves to zero issue rows.
+        if (FRESH_ISSUE_PRODUCERS.has(skill.name) && !isDryRun) {
+          const shape = analyzeIssuesTsvShape(resolved);
+          if (!shape.exists || shape.rowCount === 0) {
+            failedSkill = skill.name;
+            await status(`**${skill.name}** failed for ${ref} — produced no issue rows (resolved: ${resolved}). Refusing to continue with an empty issues file.`);
+            setCheckpoint(checkpointRef, {
+              state: 'failed',
+              totalSuccess,
+              totalFail,
+              current: { chapter: ch, skill: skill.name, status: 'failed', errorKind: 'empty_issues', outputStatus: 'empty', outputPath: resolved },
+              resume: { chapter: ch, skill: skill.name },
+            });
+            break;
           }
         }
         if (issueProducerSkillNames.has(skill.name)) {
@@ -2605,6 +2695,22 @@ async function notesPipeline(route, message) {
             skill.resolvedOutput = notesShardRel;
             skillOutputs[ch]['tn-writer'] = notesShardRel;
             console.log(`[notes] Wrote verse shard: ${notesShardRel}`);
+            // A verse-range request must yield at least one verse note. Zero
+            // note rows means upstream generation silently produced nothing —
+            // fail rather than pushing an empty/intro-only shard and reporting
+            // success (ISA 38:9-20 incident).
+            if (!isDryRun && countNoteRows(notesShardRel) === 0) {
+              failedSkill = skill.name;
+              await status(`**${skill.name}** failed for ${ref} — verse-range run produced no verse notes (${notesShardRel}). Refusing to push an empty shard.`);
+              setCheckpoint(checkpointRef, {
+                state: 'failed',
+                totalSuccess,
+                totalFail,
+                current: { chapter: ch, skill: skill.name, status: 'failed', errorKind: 'empty_notes', outputStatus: 'empty', outputPath: notesShardRel },
+                resume: { chapter: ch, skill: skill.name },
+              });
+              break;
+            }
             // Keep a chapter-level assembled view up-to-date for future checks/runs.
             const assembledRel = refreshChapterNotesFromShards(book, tag, notesChapterRel);
             if (assembledRel) {
@@ -2741,6 +2847,9 @@ async function notesPipeline(route, message) {
               maxConsecutiveToolErrors: Math.min(3, rescueGuardrails.maxConsecutiveToolErrors || 3),
               maxRepeatedToolErrorSignature: Math.min(2, rescueGuardrails.maxRepeatedToolErrorSignature || 2),
             },
+            hooks: process.env.BP_GUARD_HOOKS === '1'
+              ? createGuardHooks({ pipelineType: 'notes', scope: ref, publish: true })
+              : undefined,
           });
         } catch (err) {
           console.warn(`[notes] bounded rescue pass failed for ${ref}: ${err.message}`);
@@ -2773,6 +2882,14 @@ async function notesPipeline(route, message) {
     // Dry-run: skip the entire door43-push/verify phase
     if (isDryRun) {
       console.log(`[dry-run] Would run door43-push (TN) for ${ref}`);
+      totalSuccess++;
+      continue;
+    }
+
+    // --no-push: notes were generated normally; skip only the Door43 push
+    // (e.g. model benchmarks that must not create real PRs).
+    if (noPush) {
+      await status(`**--no-push** set: generated notes for ${ref}; skipping Door43 push.`);
       totalSuccess++;
       continue;
     }
@@ -3005,16 +3122,19 @@ async function notesPipeline(route, message) {
   } else {
     await addReaction(msgId, 'check');
 
+    const tnPushLine = noPush
+      ? 'Door43 push skipped via --no-push.'
+      : 'Content pushed to master on en_tn';
     if (chapterCount === 1) {
       await reply(
         `Notes pipeline complete for **${rangeLabel}** (${totalDuration}s).\n` +
-        `Content pushed to master on en_tn\n` +
+        `${tnPushLine}\n` +
         `You may need to refresh the tcCreate or gatewayEdit page to see the new content.`
       );
     } else {
       await reply(
         `Notes pipeline complete for **${rangeLabel}**: all ${totalSuccess} chapter(s) succeeded (${totalDuration}s).\n` +
-        `Content pushed to master on en_tn\n` +
+        `${tnPushLine}\n` +
         `You may need to refresh the tcCreate or gatewayEdit page to see the new content.`
       );
     }
@@ -3042,6 +3162,7 @@ module.exports = {
   _getSkillToolConfig: getSkillToolConfig,
   _appendIssueTagsToTsv: appendIssueTagsToTsv,
   _analyzeIssuesTsvShape: analyzeIssuesTsvShape,
+  _countNoteRows: countNoteRows,
   _collectUnresolvedQuoteFindings: collectUnresolvedQuoteFindings,
   _isMalformedIssuesShape: isMalformedIssuesShape,
   _postProcessNotesTsv: postProcessNotesTsv,
