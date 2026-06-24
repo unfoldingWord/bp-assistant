@@ -147,6 +147,14 @@ test('chapter intro is auto-skipped for Psalms', () => {
   assert.equal(shouldRunIntro('ISA', 51, true), true);
 });
 
+test('chapter intro is skipped for partial-chapter (verse-range) requests', () => {
+  // Full chapter: intro runs.
+  assert.equal(shouldRunIntro('ISA', 38, true, false), true);
+  // Verse range (e.g. "write notes ISA 38:9-20"): intro is skipped even though
+  // the book/chapter would otherwise qualify.
+  assert.equal(shouldRunIntro('ISA', 38, true, true), false);
+});
+
 test('chapter intro prompt includes high parallelism hint when signal is high', () => {
   const hint = buildParallelismIntroHintArgs({
     parallelism_signal: 'high',

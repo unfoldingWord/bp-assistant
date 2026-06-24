@@ -1,7 +1,8 @@
 // notes-pipeline.js — Multi-skill sequential pipeline for translation note writing
 // Triggered by: "write notes <book> <chapter>" or "write notes <book> <start>-<end>"
 // Skills: [post-edit-review OR deep-issue-id] -> [chapter-intro] -> tn-writer (Opus) -> tn-quality-check (Sonnet) -> repo-insert (Haiku)
-// chapter-intro runs by default; disabled when the user opts out or auto-excluded.
+// chapter-intro runs by default; disabled when the user opts out, for a
+// verse-range (partial-chapter) request, or when auto-excluded.
 //
 // Each chapter is fully processed (skills + repo-insert + repo-verify) before
 // moving to the next, so the editor gets access as soon as a chapter merges.
@@ -101,8 +102,13 @@ function isIntroAutoExcluded(book, chapter) {
   return SKIP_INTRO_RANGES.some(r => r.book === book && chapter >= r.start && chapter <= r.end);
 }
 
-function shouldRunIntro(book, chapter, withIntroFlag) {
+function shouldRunIntro(book, chapter, withIntroFlag, hasVerseRange) {
   if (!withIntroFlag) return false;
+  // A chapter intro describes the whole chapter, so it makes no sense for a
+  // partial-chapter (verse-range) request like "write notes ISA 38:9-20".
+  // Skipping it also prevents a run whose verse notes come up empty from
+  // pushing an intro-only chapter and reporting that as success.
+  if (hasVerseRange) return false;
   if (isIntroAutoExcluded(book, chapter)) return false;
   return true;
 }
@@ -1947,8 +1953,9 @@ async function notesPipeline(route, message) {
       });
     }
 
-    // chapter-intro: only runs when "with intro" is requested (and not in auto-exclusion range)
-    if (shouldRunIntro(book, ch, withIntro)) {
+    // chapter-intro: only runs when "with intro" is requested, for a full
+    // chapter (not a verse range), and not in an auto-exclusion range.
+    if (shouldRunIntro(book, ch, withIntro, hasVerseRange)) {
       skills.push({
         name: 'chapter-intro',
         prompt: buildChapterIntroPrompt(skillRef, issuesPath, ctxFlag, chapterIntroHintArgs),
@@ -1956,6 +1963,8 @@ async function notesPipeline(route, message) {
         skipPreClean: true, // expectedOutput is also input; do not delete verse issues before intro insertion
         ops: 1,
       });
+    } else if (withIntro && hasVerseRange) {
+      await status(`**${ref}**: skipping chapter-intro (partial-chapter request)`);
     } else if (withIntro && isIntroAutoExcluded(book, ch)) {
       await status(`**${ref}**: skipping chapter-intro (auto-excluded range)`);
     }
