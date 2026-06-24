@@ -177,7 +177,9 @@ def quote_position(quote, verse_alignments):
 def sort_notes(tsv_file, verse_map):
 
     with open(tsv_file, encoding="utf-8") as f:
-        rows = list(csv.reader(f, delimiter="\t"))
+        reader = csv.reader(f, delimiter="\t")
+        header = next(reader)
+        rows = list(reader)
 
     grouped = defaultdict(list)
 
@@ -275,7 +277,7 @@ def sort_notes(tsv_file, verse_map):
         # 3. Atomic replace
         shutil.move(temp_path, tsv_file)
 
-    safe_write_tsv(tsv_file, sorted_rows)
+    safe_write_tsv(tsv_file, [header] + sorted_rows)
 
 # ============================================================
 # MAIN
