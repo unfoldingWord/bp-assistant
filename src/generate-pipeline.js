@@ -191,6 +191,15 @@ function shouldUseFileResponseMode({ isFileResponse, noAlign, textOnly }) {
   return Boolean(isFileResponse || noAlign || textOnly);
 }
 
+// Whether a run also pushes generated USFM to Door43 (Phase 2). Normal aligned
+// runs always push. File-response / --no-align runs do NOT — EXCEPT --text-only,
+// which is special: it uploads the file to Zulip (file-response mode) AND pushes
+// the *unaligned* USFM to Door43 so the editor's output[] is populated. A plain
+// file-response user (no --text-only) still gets upload-only, no push.
+function shouldPushToDoor43({ useFileResponseMode, textOnly }) {
+  return !useFileResponseMode || Boolean(textOnly);
+}
+
 function hasRequiredGeneratedOutputs(contentTypes, outputs) {
   const neededTypes = Array.isArray(contentTypes) && contentTypes.length ? contentTypes : ['ult', 'ust'];
   return neededTypes.every((type) => (type === 'ult' ? outputs.hasUlt : outputs.hasUst));
@@ -452,9 +461,9 @@ async function generatePipeline(route, message) {
   const perChapter = (route.tokenEstimate && route.tokenEstimate.perChapter) || 5000000;
   const estimatedTotal = chapterCount * perChapter;
 
-  // --- Non-file-response pre-checks: Door43 username ---
+  // --- Door43 username pre-check (any run that pushes — incl. --text-only) ---
   let username = null;
-  if (!useFileResponseMode) {
+  if (shouldPushToDoor43({ useFileResponseMode, textOnly })) {
     username = getDoor43Username(message.sender_email);
     if (!username) {
       username = emailToFallbackUsername(message.sender_email);
@@ -476,7 +485,7 @@ async function generatePipeline(route, message) {
   // Signal working
   await addReaction(msgId, 'working_on_it');
   const typeLabel = contentTypes.length === 1 ? `${contentTypes[0].toUpperCase()}-only` : 'full pipeline';
-  const alignLabel = textOnly ? 'text-only uploads' : noAlign ? 'files-only' : alignOnly ? 'align-only' : 'align + repo-insert';
+  const alignLabel = textOnly ? 'text-only (upload + unaligned push)' : noAlign ? 'files-only' : alignOnly ? 'align-only' : 'align + repo-insert';
   const modeLabel = useFileResponseMode ? alignLabel : `${typeLabel} (${alignLabel})`;
   const refLabel = hasVerseRange ? `${book} ${start}:${verseStart}-${verseEnd}` : `${book} ${start}\u2013${end}`;
   await status(`Starting generation for **${refLabel}** (${chapterCount} chapter(s), mode: ${modeLabel}, ~${estimatedTotal} tokens estimated)`);
@@ -1037,6 +1046,19 @@ async function generatePipeline(route, message) {
 
       await reply(`**${book} ${ch}** \u2014 ${links.join(' \u00b7 ')}`);
       success++;
+      // --text-only uploads the file (above) AND pushes the unaligned USFM to
+      // Door43 via Phase 2 below, so the editor's output[] is populated. Record
+      // the unaligned source paths in the same ult/ustAligned slots Phase 2
+      // reads (here they hold UNaligned output). Gate by contentTypes so a stale
+      // off-type artifact from a prior run is never pushed. --no-align and plain
+      // file-response users skip this and stay upload-only.
+      if (textOnly && !completedChapters.some((c) => c.ch === ch)) {
+        completedChapters.push({
+          ch,
+          ultAligned: (contentTypes.includes('ult') && hasUlt) ? ultRel : null,
+          ustAligned: (contentTypes.includes('ust') && hasUst) ? ustRel : null,
+        });
+      }
       setCheckpoint(checkpointRef, {
         state: 'running',
         success,
@@ -1397,9 +1419,9 @@ async function generatePipeline(route, message) {
   }
 
   // =========================================================================
-  // Phase 2: Repo insert \u2014 push to master (non-file-response users only)
+  // Phase 2: Repo insert \u2014 push to master (non-file-response runs + --text-only)
   // =========================================================================
-  if (!useFileResponseMode && completedChapters.length > 0) {
+  if (shouldPushToDoor43({ useFileResponseMode, textOnly }) && completedChapters.length > 0) {
     // Pre-flight: verify DCS token before spending time on repo-insert
     const dcsCheck = await verifyDcsToken();
     if (!dcsCheck.valid) {
@@ -1689,7 +1711,7 @@ async function generatePipeline(route, message) {
   }
 
   // Final message
-  if (!useFileResponseMode && success > 0) {
+  if (shouldPushToDoor43({ useFileResponseMode, textOnly }) && success > 0) {
     const rangeLabel = hasVerseRange
       ? `${book} ${start}:${verseStart}-${verseEnd}`
       : (start === end ? `${book} ${start}` : `${book} ${start}\u2013${end}`);
@@ -1725,5 +1747,6 @@ module.exports = {
   buildParsedGenerateRequest,
   hasRequiredGeneratedOutputs,
   shouldUseFileResponseMode,
+  shouldPushToDoor43,
   resolveMergedChapterAligned,
 };
