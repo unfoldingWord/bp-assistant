@@ -1555,13 +1555,13 @@ async function generatePipeline(route, message) {
       const pushUlt = !noPush && contentTypes.includes('ult') && chData.ultAligned;
       const pushUst = !noPush && contentTypes.includes('ust') && chData.ustAligned;
       if (pushUlt && !fs.existsSync(path.resolve(CSKILLBP_DIR, chData.ultAligned))) {
-        const ultMissingEvent = await status(`**door43-push** failed (ULT) for ${book} ${chData.ch}: aligned source file missing: ${chData.ultAligned}`);
-        fireDiagnosisFor(ultMissingEvent, `Phase: door43-push (ULT)\nChapter: ${book} ${chData.ch}\nAligned source file missing at push time: ${chData.ultAligned}`);
+        const ultMissingEvent = await status(`**door43-push** failed (ULT) for ${book} ${chData.ch}: source file missing: ${chData.ultAligned}`);
+        fireDiagnosisFor(ultMissingEvent, `Phase: door43-push (ULT)\nChapter: ${book} ${chData.ch}\nSource file missing at push time: ${chData.ultAligned}`);
         chapterFailed = true;
       }
       if (!chapterFailed && pushUst && !fs.existsSync(path.resolve(CSKILLBP_DIR, chData.ustAligned))) {
-        const ustMissingEvent = await status(`**door43-push** failed (UST) for ${book} ${chData.ch}: aligned source file missing: ${chData.ustAligned}`);
-        fireDiagnosisFor(ustMissingEvent, `Phase: door43-push (UST)\nChapter: ${book} ${chData.ch}\nAligned source file missing at push time: ${chData.ustAligned}`);
+        const ustMissingEvent = await status(`**door43-push** failed (UST) for ${book} ${chData.ch}: source file missing: ${chData.ustAligned}`);
+        fireDiagnosisFor(ustMissingEvent, `Phase: door43-push (UST)\nChapter: ${book} ${chData.ch}\nSource file missing at push time: ${chData.ustAligned}`);
         chapterFailed = true;
       }
 

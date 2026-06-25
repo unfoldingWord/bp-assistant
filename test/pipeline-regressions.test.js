@@ -95,9 +95,13 @@ test('text-only mode ALSO pushes to Door43 (upload + push), but --no-align does 
   // --text-only: file-response (uploads the file) AND pushes the unaligned USFM
   // so the editor's output[] is populated.
   assert.equal(shouldPushToDoor43({ useFileResponseMode: true, textOnly: true }), true);
-  // --no-align (file-response, not text-only): upload-only, no push.
-  assert.equal(shouldPushToDoor43({ useFileResponseMode: true, textOnly: false }), false);
-  // Plain file-response user, no text-only: upload-only, no push.
+  // --no-align: composition of the two predicates — file-response (upload) but
+  // NOT a push, since noAlign drives useFileResponseMode without textOnly.
+  const noAlign = { isFileResponse: false, noAlign: true, textOnly: false };
+  const noAlignFRM = shouldUseFileResponseMode(noAlign);
+  assert.equal(noAlignFRM, true);
+  assert.equal(shouldPushToDoor43({ useFileResponseMode: noAlignFRM, textOnly: noAlign.textOnly }), false);
+  // Plain file-response user (no flags): upload-only, no push.
   assert.equal(shouldPushToDoor43({ useFileResponseMode: true, textOnly: false }), false);
 });
 
