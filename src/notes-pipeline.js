@@ -939,7 +939,7 @@ async function runMechanicalQualityPrep({ notesPath, pipeDir, status, ref }) {
       [
         sequenceNotes,
         ultPath,
-        notesPath,
+        tsvPath,
       ],
       120000);
 
