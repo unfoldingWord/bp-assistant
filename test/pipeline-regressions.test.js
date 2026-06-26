@@ -11,6 +11,7 @@ const {
   buildParsedGenerateRequest,
   hasRequiredGeneratedOutputs,
   shouldUseFileResponseMode,
+  shouldPushToDoor43,
 } = require('../src/generate-pipeline');
 const {
   parseWriteNotesCommand,
@@ -86,6 +87,22 @@ test('text-only mode uses file-response delivery even for non-file users', () =>
   assert.equal(shouldUseFileResponseMode({ isFileResponse: false, noAlign: false, textOnly: false }), false);
   assert.equal(shouldUseFileResponseMode({ isFileResponse: true, noAlign: false, textOnly: false }), true);
   assert.equal(shouldUseFileResponseMode({ isFileResponse: false, noAlign: true, textOnly: false }), true);
+});
+
+test('text-only mode ALSO pushes to Door43 (upload + push), but --no-align does not', () => {
+  // Normal aligned run: pushes (not file-response).
+  assert.equal(shouldPushToDoor43({ useFileResponseMode: false, textOnly: false }), true);
+  // --text-only: file-response (uploads the file) AND pushes the unaligned USFM
+  // so the editor's output[] is populated.
+  assert.equal(shouldPushToDoor43({ useFileResponseMode: true, textOnly: true }), true);
+  // --no-align: composition of the two predicates — file-response (upload) but
+  // NOT a push, since noAlign drives useFileResponseMode without textOnly.
+  const noAlign = { isFileResponse: false, noAlign: true, textOnly: false };
+  const noAlignFRM = shouldUseFileResponseMode(noAlign);
+  assert.equal(noAlignFRM, true);
+  assert.equal(shouldPushToDoor43({ useFileResponseMode: noAlignFRM, textOnly: noAlign.textOnly }), false);
+  // Plain file-response user (no flags): upload-only, no push.
+  assert.equal(shouldPushToDoor43({ useFileResponseMode: true, textOnly: false }), false);
 });
 
 test('synthetic generate route preserves verse ranges from intent scopeText', () => {
