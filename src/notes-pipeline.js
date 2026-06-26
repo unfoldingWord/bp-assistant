@@ -933,12 +933,13 @@ async function runMechanicalQualityPrep({ notesPath, pipeDir, status, ref }) {
   // Sequence notes
   const sequenceNotes = path.join(__dirname, "sequence_notes.py");
   const ultPath = '/data/workspace/' + ctx.sources.ult;
+  const tsvPath = '/data/workspace/' + notesPath;
   try {
     const pythonResult = await runPythonWithTimeout(
       [
         sequenceNotes,
         ultPath,
-        notesPath,
+        tsvPath,
       ],
       120000);
 
