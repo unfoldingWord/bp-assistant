@@ -22,7 +22,12 @@ jobs:
     if: ${{ github.event_name == 'push' || github.event.inputs.confirm == 'yes' }}
     env:
       HEALTH_URL: https://uw-bt-bot.fly.dev/health/pipelines
-      MAX_WAIT_MINUTES: '90'
+      MAX_WAIT_MINUTES: '150'
+      # Number of consecutive active:0 reads (~60s apart) required before
+      # deploying. Guards against the inter-phase race where a multi-phase
+      # run (e.g. notes -> tqs) transiently has no running checkpoint between
+      # phases and a single poll reads active:0.
+      CLEAR_CONFIRMATIONS: '2'
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -36,6 +41,7 @@ jobs:
           set -u
           deadline=$(( $(date +%s) + MAX_WAIT_MINUTES * 60 ))
           unreachable=0
+          clear_streak=0
           while :; do
             now=$(date +%s)
             if [ "$now" -ge "$deadline" ]; then
@@ -61,10 +67,17 @@ jobs:
             unreachable=0
             active=$(echo "$body" | jq -r '.active')
             if [ "$active" = "0" ]; then
-              echo "No active pipelines. Proceeding with deploy."
-              echo "$body" | jq -r '"Bot up since " + .processStartedAt'
-              break
+              clear_streak=$((clear_streak + 1))
+              if [ "$clear_streak" -ge "$CLEAR_CONFIRMATIONS" ]; then
+                echo "No active pipelines (${clear_streak} consecutive checks). Proceeding with deploy."
+                echo "$body" | jq -r '"Bot up since " + .processStartedAt'
+                break
+              fi
+              echo "No active pipelines (${clear_streak}/${CLEAR_CONFIRMATIONS}). Reconfirming in 60s to rule out an inter-phase gap."
+              sleep 60
+              continue
             fi
+            clear_streak=0
             echo "Active pipelines: $active. Rechecking in 60s."
             echo "$body" | jq -r '.pipelines[] | "  - " + .pipelineType + " " + (.scope | tostring) + " (age " + (.ageSeconds | tostring) + "s)"'
             sleep 60
