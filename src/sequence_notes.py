@@ -271,7 +271,7 @@ def sort_notes(tsv_file, verse_map):
 
         # 2. Backup old file (only AFTER successful write)
         if os.path.exists(tsv_file):
-            backup_file = tsv_file + ".bak"
+            backup_file = tsv_file + ".old"
             shutil.move(tsv_file, backup_file)
 
         # 3. Atomic replace
