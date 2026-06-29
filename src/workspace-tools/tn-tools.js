@@ -1889,12 +1889,30 @@ function syncCanonicalHebrewQuotes({ tsvFile, preparedJson, hebrewUsfm, output, 
   return result.join('\n');
 }
 
+// A reference cell is a chapter:verse, optionally prefixed by a book code
+// ("12:1" or "HOS 12:1" / "1KI 2:3"). The book prefix mirrors what
+// extractRow() strips, so a matched cell parses cleanly downstream.
+const REF_CELL = /^([A-Za-z0-9]{2,3}\s+)?\d+:\d+/;
+
+// For headerless TSVs, pick the first non-intro line whose col[0] is a
+// reference cell. Using a real data row (not lines[0], which is often a
+// chapter-intro row with a different layout) makes column detection robust.
+function findSampleDataRow(lines) {
+  for (const ln of lines) {
+    if (/:intro\b/i.test(ln)) continue;
+    const c = ln.split('\t');
+    if (REF_CELL.test((c[0] || '').trim())) return c;
+  }
+  return null;
+}
+
 function prepareNotes({ inputTsv, ultUsfm, ustUsfm, output, alignedUsfm, alignmentJson }) {
   const inputPath = path.resolve(CSKILLBP_DIR, inputTsv);
   const content = fs.readFileSync(inputPath, 'utf8');
   const lines = content.split('\n').filter(l => l.trim());
   const items = [];
   const introRows = [];
+  let skippedInvalidRef = 0; // data rows dropped because their reference wasn't chapter:verse
   const templateMap = loadTemplateMap();
 
   // --- Detect TSV column format ---
@@ -1908,6 +1926,7 @@ function prepareNotes({ inputTsv, ultUsfm, ustUsfm, output, alignedUsfm, alignme
 
   let colMap = null; // null = canonical positional mapping
   let skipFirstLine = false;
+  let sampleDataCols = null; // representative non-intro data row, used for headerless format detection
 
   if (lines.length > 0) {
     const firstCols = lines[0].split('\t');
@@ -1931,15 +1950,18 @@ function prepareNotes({ inputTsv, ultUsfm, ustUsfm, output, alignedUsfm, alignme
         explanation: hMap['explanation'] ?? hMap['hint'] ?? hMap['note'] ?? -1,
         book_col: hMap['book'] ?? -1,
       };
-    } else if (firstCols[0] && /^\d+:\d+/.test(firstCols[0].trim())) {
-      // No header, col[0] is a verse reference (new format without book code)
-      // Heuristic: Reference, Issue/SRef, ...rest varies
+    } else if ((sampleDataCols = findSampleDataRow(lines))) {
+      // No header. Detect the column layout from a representative DATA row
+      // rather than lines[0] — line 0 is frequently a chapter-intro row
+      // (e.g. "hos<TAB>12:intro<TAB>...") whose layout differs from the note
+      // rows. col[0] is the reference, optionally book-prefixed ("12:1" or
+      // "HOS 12:1"); the book prefix is stripped later in extractRow().
       colMap = { reference: 0, sref: 1, gl_quote: 3, needs_at: -1, at_provided: -1, explanation: 4, book_col: -1 };
       // If col[2] looks like Hebrew (contains Hebrew Unicode range), gl_quote is col[3]
       // If col[2] looks like English, gl_quote is col[2] and explanation is col[3]
-      if (firstCols.length > 2 && !/[\u0590-\u05FF]/.test(firstCols[2] || '')) {
+      if (sampleDataCols.length > 2 && !/[\u0590-\u05FF]/.test(sampleDataCols[2] || '')) {
         colMap.gl_quote = 2;
-        colMap.explanation = firstCols.length > 3 ? 3 : -1;
+        colMap.explanation = sampleDataCols.length > 3 ? 3 : -1;
       }
     }
     // else: canonical old format (Book, Ref, SRef, GLQuote, NeedsAT, AT, Explanation) — colMap stays null
@@ -1982,7 +2004,14 @@ function prepareNotes({ inputTsv, ultUsfm, ustUsfm, output, alignedUsfm, alignme
     while (cols.length < 7) cols.push('');
 
     const row = extractRow(cols);
-    if (row.reference.includes(':intro') || row.reference === 'intro') {
+    // Detect intro rows independently of the column mapping: the intro marker
+    // ("<ch>:intro") may live in a different column than the note rows' mapped
+    // reference (e.g. files where the intro row is "book<TAB>12:intro" but data
+    // rows merge "HOS 12:1" into col[0]).
+    const isIntroRow = row.reference.includes(':intro')
+      || row.reference === 'intro'
+      || cols.some((c) => /^\s*\d+:intro\b/i.test((c || '').trim()));
+    if (isIntroRow) {
       const normalized = normalizeIntroRow(line, {
         chapter: fileChapter,
         existingIds: introIdSet,
@@ -1991,7 +2020,7 @@ function prepareNotes({ inputTsv, ultUsfm, ustUsfm, output, alignedUsfm, alignme
       continue;
     }
     // Validate reference looks like chapter:verse
-    if (!/^\d+:\d+/.test(row.reference)) continue;
+    if (!/^\d+:\d+/.test(row.reference)) { skippedInvalidRef++; continue; }
 
     items.push({
       index: items.length,
@@ -2013,6 +2042,20 @@ function prepareNotes({ inputTsv, ultUsfm, ustUsfm, output, alignedUsfm, alignme
       candidate_templates: [],
     });
   }
+
+  // Guard: a non-empty issues TSV that yields zero parsed note items almost
+  // always means a column-format mismatch (e.g. book and reference merged into
+  // one column, as in a malformed "HOS 12:1<TAB>..." row that defeats format
+  // detection). Fail loudly with a diagnostic instead of silently handing
+  // tn-writer an empty prepared file — which otherwise surfaces much later as a
+  // misleading "expected output not found" hard failure.
+  if (items.length === 0 && skippedInvalidRef > 0) {
+    throw new Error(
+      `prepareNotes parsed 0 note items from ${skippedInvalidRef} data row(s) in ${inputTsv} — `
+      + 'likely a TSV column-format problem (e.g. book and reference merged into one column).'
+    );
+  }
+
   function parseVerses(fp) {
     if (!fp) return {};
     const full = path.resolve(CSKILLBP_DIR, fp);

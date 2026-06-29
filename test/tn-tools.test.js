@@ -177,6 +177,57 @@ test('prepareNotes writes a packetized item with deterministic template and poli
   assert.doesNotMatch(item.prompt, /discern which particular template/i);
 });
 
+test('prepareNotes parses headerless rows whose col0 is a book-prefixed reference (HOS 12 regression)', () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tn-tools-hos12-'));
+  const dir = path.join('tmp', path.basename(tempDir));
+  fs.mkdirSync(path.join('/srv/bot/workspace', dir), { recursive: true });
+  const issuesRel = path.join(dir, 'HOS-12.tsv');
+  const ultRel = path.join(dir, 'HOS-12.ult.usfm');
+  const ustRel = path.join(dir, 'HOS-12.ust.usfm');
+  const outRel = path.join(dir, 'prepared_notes.json');
+
+  // The layout that broke HOS 12: the intro row is "book<TAB>ref", but the data
+  // rows merge book + reference into col0 with a space ("HOS 12:1<TAB>..."), so
+  // detecting the format from line 0 (the intro row) mis-classified every note.
+  fs.writeFileSync(path.join('/srv/bot/workspace', issuesRel), [
+    'hos\t12:intro\t\t\t\t\t# Hosea 12 Introduction',
+    'HOS 12:1\tfigs-metaphor\tEphraim is feeding on wind\tEphraim eating wind pictures futile alliances.',
+    'HOS 12:2\tfigs-abstractnouns\tlies and destruction\tabstract nouns could be verbal.',
+  ].join('\n'));
+  fs.writeFileSync(path.join('/srv/bot/workspace', ultRel), '\\c 12\n\\v 1 Ephraim is feeding on wind.\n\\v 2 Lies and destruction.\n');
+  fs.writeFileSync(path.join('/srv/bot/workspace', ustRel), '\\c 12\n\\v 1 ...\n\\v 2 ...\n');
+
+  const result = prepareNotes({ inputTsv: issuesRel, ultUsfm: ultRel, ustUsfm: ustRel, output: outRel });
+  assert.match(result, /Prepared 2 items/);
+
+  const prepared = JSON.parse(fs.readFileSync(path.join('/srv/bot/workspace', outRel), 'utf8'));
+  assert.equal(prepared.item_count, 2);
+  assert.equal(prepared.items[0].reference, '12:1'); // book prefix stripped
+  assert.equal(prepared.items[0].sref, 'figs-metaphor');
+  assert.equal(prepared.items[0].gl_quote, 'Ephraim is feeding on wind');
+  assert.equal(prepared.items[1].reference, '12:2');
+  assert.equal(prepared.intro_rows.length, 1);
+});
+
+test('prepareNotes fails loudly when a non-empty issues TSV yields zero parsed items', () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tn-tools-empty-'));
+  const dir = path.join('tmp', path.basename(tempDir));
+  fs.mkdirSync(path.join('/srv/bot/workspace', dir), { recursive: true });
+  const issuesRel = path.join(dir, 'HOS-13.tsv');
+
+  // Rows that look like data but whose references can't be parsed — the symptom
+  // of a column-format mismatch. Must not silently produce 0 items.
+  fs.writeFileSync(path.join('/srv/bot/workspace', issuesRel), [
+    'HOS\tnope\tfigs-metaphor\tEphraim text',
+    'HOS\tnada\tfigs-simile\tIsrael text',
+  ].join('\n'));
+
+  assert.throws(
+    () => prepareNotes({ inputTsv: issuesRel, ultUsfm: '', ustUsfm: '', output: path.join(dir, 'p.json') }),
+    /parsed 0 note items/,
+  );
+});
+
 test('prepareNotes keeps at_required false when selected template has no AT slot', () => {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tn-tools-at-'));
   const issuesRel = path.join('tmp', path.basename(tempDir), 'PSA-036.tsv');
