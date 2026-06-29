@@ -364,12 +364,12 @@ writer produced PSA-07.tsv"
   assert.equal(calls.createCount, 1);
 });
 
-test('dispatchSelfDiagnosis fails with subtype details when diagnosis subtype is non-success and no usable text', async () => {
+test('dispatchSelfDiagnosis files a templated incomplete-diagnosis issue when subtype is non-success and no usable text', async () => {
   const event = makePsa1Event({ scope: 'PSA 7' });
   const calls = {};
   const fetchImpl = createGithubFetchStub({ captureCalls: calls });
   const runClaudeImpl = async () => ({
-    subtype: 'error',
+    subtype: 'timeout',
     result: '',
     error: 'no result available',
   });
@@ -382,9 +382,14 @@ test('dispatchSelfDiagnosis fails with subtype details when diagnosis subtype is
     readAdminStatusImpl: () => [event],
   });
 
-  assert.equal(result.ok, false);
-  assert.equal(calls.createCount, 0);
-  assert.match(result.reason, /subtype=error/);
+  // The originating failure must NOT be dropped: an issue is filed even though
+  // the agent produced no parseable output.
+  assert.equal(result.ok, true);
+  assert.equal(calls.createCount, 1);
+  assert.ok(calls.lastCreateBody.labels.includes('self-diagnosis-incomplete'));
+  assert.match(calls.lastCreateBody.title, /self-diagnosis incomplete \(timeout\)/);
+  assert.match(calls.lastCreateBody.body, /subtype=`timeout`/);
+  assert.match(calls.lastCreateBody.body, /pipeline-failure-fingerprint:/);
 });
 
 test('dispatchSelfDiagnosis short-circuits a guardrail-stop without invoking the agent', async () => {

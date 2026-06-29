@@ -87,7 +87,15 @@ You may use Read and Grep to inspect:
 
 Constraints:
 - You CANNOT modify files. Read-only investigation.
-- Spend at most a few tool calls — do not exhaustively read every file.
+- You have ONLY the Read and Grep tools. Bash/shell is NOT available — any Bash
+  call is denied and only wastes your turn budget. Never call Bash; locate files
+  with Grep and read them by path with Read.
+- You have a HARD time budget of ~5 minutes. After at most ~8 tool calls, STOP
+  investigating and output the JSON, even if your analysis is incomplete. A
+  partial-but-valid JSON answer is far more useful than running out of time with
+  no output at all.
+- Spend at most a few tool calls — do not exhaustively read every file. Large
+  source/USFM files: Grep for the relevant lines instead of reading them whole.
 - Bias toward filing the issue against bp-assistant unless the evidence clearly points to a skill prompt or skill code.
 
 After investigation, output a single fenced JSON block (no prose before or after) with this exact shape:
@@ -281,6 +289,9 @@ async function runDiagnosisAgent({ contextSummary, runClaudeImpl }) {
     cwd: process.cwd(),
     model: 'sonnet',
     allowedTools: ['Read', 'Grep'],
+    // Explicitly deny Bash so a stray shell attempt is rejected fast instead of
+    // burning turns against the time budget (observed timeouts had lastTool=Bash).
+    disallowedTools: ['Bash'],
     mcpToolSet: 'workspace',
     disableLocalSettings: true,
     appendSystemPrompt: SYSTEM_PROMPT,
@@ -410,6 +421,55 @@ function buildGuardrailStopDiagnosis(event, contextSummary) {
   };
 }
 
+// Templated diagnosis for a diagnosis agent that did NOT finish (timeout, max
+// turns, or token budget) and produced no parseable output. No investigation
+// findings are available, so this captures the originating failure event +
+// context so the auto-issue-handler still sees it. Previously this path threw,
+// which silently dropped the pipeline failure entirely.
+function buildIncompleteDiagnosis(event, contextSummary, agentInfo = {}) {
+  const targetRepo = classifyRepo(event);
+  const scopeLabel = event.scope || event.pipelineType || 'event';
+  const subtype = agentInfo.subtype || 'unknown';
+  const title = `Pipeline failure: ${event.pipelineType || 'unknown'} ${scopeLabel} — self-diagnosis incomplete (${subtype})`
+    .slice(0, 120);
+  const body = [
+    '## Summary',
+    `The self-diagnosis agent did not complete (subtype=\`${subtype}\`) and produced no parseable`,
+    'output, so no automated root-cause analysis is available. Filing this issue from the failure',
+    'event + context so the originating pipeline failure is captured for triage rather than dropped.',
+    '',
+    '## Failure event',
+    `- pipelineType: ${event.pipelineType || '(unknown)'}`,
+    `- scope: ${event.scope || '(none)'}`,
+    `- phase: ${event.phase || '(none)'}`,
+    `- severity: ${event.severity || '(unknown)'}`,
+    `- message: ${event.message || '(none)'}`,
+    '',
+    '## Diagnosis agent outcome',
+    `- subtype: ${subtype}`,
+    `- error: ${String(agentInfo.error || '').slice(0, 500) || '(none)'}`,
+    `- result_head: ${String(agentInfo.resultHead || '').slice(0, 500) || '(none)'}`,
+    '',
+    'A `timeout` subtype usually means the read-only investigation exceeded its time budget',
+    '(see `runDiagnosisAgent` timeoutMs). Investigate the failure event manually using the context below.',
+    '',
+    '## Diagnosis context',
+    '<details><summary>Click to expand</summary>',
+    '',
+    '```',
+    String(contextSummary || '').slice(0, 8000),
+    '```',
+    '</details>',
+  ].join('\n');
+  return {
+    repo: targetRepo,
+    title,
+    body,
+    labels: ['bug', 'pipeline-failure', 'self-diagnosis-incomplete'],
+    classification: 'self-diagnosis-incomplete',
+  };
+}
+
 async function dispatchSelfDiagnosis({
   event,
   checkpoint = null,
@@ -500,17 +560,26 @@ async function dispatchSelfDiagnosis({
         }
         if (!looksLikeDiagnosisAttempt(rawText)) {
           if (nonSuccess) {
-            throw new Error(
-              `Diagnosis agent did not complete cleanly: subtype=${cleanSubtype}; ` +
-              `error=${String(agentResult.error || '').slice(0, 200)}; ` +
-              `result_head=${String(agentResult.resultHead || '').slice(0, 200)}`
+            // Agent ran out of time/turns/budget and produced nothing usable.
+            // Don't drop the originating failure — file a concise templated
+            // issue so the auto-issue-handler still sees it.
+            console.error(
+              `[self-diagnosis] Agent non-success (subtype=${cleanSubtype}) with no usable output; filing templated incomplete-diagnosis issue.`
             );
+            diagnosis = buildIncompleteDiagnosis(event, contextSummary, {
+              subtype: cleanSubtype,
+              error: agentResult.error,
+              resultHead: agentResult.resultHead,
+            });
+            usedFallback = true;
+          } else {
+            throw err;
           }
-          throw err;
+        } else {
+          console.error(`[self-diagnosis] JSON parse failed (${err.message.slice(0, 200)}); filing fallback issue with raw output`);
+          diagnosis = buildFallbackDiagnosis(event, rawText, err, contextSummary);
+          usedFallback = true;
         }
-        console.error(`[self-diagnosis] JSON parse failed (${err.message.slice(0, 200)}); filing fallback issue with raw output`);
-        diagnosis = buildFallbackDiagnosis(event, rawText, err, contextSummary);
-        usedFallback = true;
       }
     }
 
@@ -564,6 +633,7 @@ module.exports = {
   looksLikeDiagnosisAttempt,
   buildFallbackDiagnosis,
   buildGuardrailStopDiagnosis,
+  buildIncompleteDiagnosis,
   buildContextSummary,
   appendFingerprintMarker,
   FINGERPRINT_PREFIX,
