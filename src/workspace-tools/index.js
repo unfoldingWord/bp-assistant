@@ -437,7 +437,7 @@ function createWorkspaceTools(createSdkMcpServer, tool, z) {
       tool('prepare_tq', 'Prepare translation questions data for a book/chapter', {
         book: z.string().describe('Book code'), chapter: z.number().int().optional(), wholeBook: z.boolean().optional(),
         tqRepo: z.string().optional(), ultPath: z.string().optional(), ustPath: z.string().optional(), output: z.string().optional(),
-      }, async (args) => ({ content: [{ type: 'text', text: prepareTq(args) }] })),
+      }, async (args) => ({ content: [{ type: 'text', text: await prepareTq(args) }] })),
       tool('verify_tq', 'Verify translation questions TSV format and content', {
         tsvFile: z.string().describe('TQ TSV file path'), inputJson: z.string().optional(),
       }, async (args) => ({ content: [{ type: 'text', text: verifyTq(args) }] })),

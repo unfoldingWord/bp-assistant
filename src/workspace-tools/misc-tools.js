@@ -5,8 +5,8 @@
 const fs = require('fs');
 const path = require('path');
 const https = require('https');
+const crypto = require('crypto');
 const { readSecret } = require('../secrets');
-const { resolveOutputFile } = require('../pipeline-utils');
 
 const CSKILLBP_DIR = process.env.CSKILLBP_DIR || '/srv/bot/workspace';
 const GITEA_API = 'https://git.door43.org/api/v1';
@@ -229,32 +229,170 @@ function prepareCompare({ book, chapter, type, editorUsfm, output, verses: verse
 
 // --- prepare_tq ---
 
-function prepareTq({ book, chapter, wholeBook, tqRepo, ultPath, ustPath, output }) {
-  const bookUpper = book.toUpperCase();
+const TQ_SOURCE_CACHE_DIR = path.join(CSKILLBP_DIR, 'cache', 'tq-dealigned');
 
-  function parseVersesClean(fp) {
-    if (!fp) return {};
-    const full = path.resolve(CSKILLBP_DIR, fp);
-    if (!fs.existsSync(full)) return {};
-    const text = fs.readFileSync(full, 'utf8');
-    const verses = {};
-    let ch = 0;
-    for (const l of text.split('\n')) {
-      const cm = l.trim().match(/^\\c\s+(\d+)/);
-      if (cm) { ch = parseInt(cm[1], 10); continue; }
-      const vm = l.trim().match(/^\\v\s+(\d+[-\d]*)\s*(.*)/);
-      if (vm) {
-        let txt = vm[2] || '';
-        txt = txt.replace(/\\zaln-[se][^*]*\*/g, '').replace(/\\w\s+([^|]*?)\|[^\\]*?\\w\*/g, '$1')
-          .replace(/\\[a-z]+\d?\s+/g, ' ').replace(/\\[a-z]+\d?\*/g, '').replace(/\|[^\\|\s]*/g, '')
-          .replace(/[{}]/g, '').replace(/\s+/g, ' ').trim();
-        verses[`${ch}:${vm[1].split('-')[0]}`] = txt;
+/**
+ * De-align a USFM document into { "chapter:firstVerse": "clean verse text" }.
+ *
+ * Aligned ULT/UST place each word on its own line and put \v markers mid-line
+ * after \zaln-e\*; a naive line parser captures only the \v line and drops the
+ * rest of the verse. This collapses each verse span (from one \v to the next
+ * \v or \c) into a single string and strips alignment, word, and footnote
+ * markup, so the full verse text survives. Range markers (e.g. \v 10-11) are
+ * keyed by their first verse, matching how TQ References are looked up.
+ */
+function dealignToVerses(text) {
+  const verses = {};
+  let ch = 0;
+  let curVerse = null;
+  let buf = [];
+  const flush = () => {
+    if (curVerse == null) return;
+    let raw = buf.join(' ');
+    raw = raw.replace(/\\zaln-s\s*\|[^*]*\*/g, '').replace(/\\zaln-e\\?\*/g, '');
+    raw = raw.replace(/\\w\s+([^|\\]*?)\|[^\\]*?\\w\*/g, '$1');
+    raw = raw.replace(/\\w\s+([^\\]+?)\\w\*/g, '$1');
+    raw = raw.replace(/\\f\b[\s\S]*?\\f\*/g, '').replace(/\\x\b[\s\S]*?\\x\*/g, '');
+    raw = raw.replace(/\\[a-z]+\d*\*/g, '').replace(/\\[a-z]+\d*\b/g, ' ');
+    raw = raw.replace(/\|[^\s\\|]*/g, '');
+    raw = raw.replace(/[{}]/g, '').replace(/\s+([.,;:!?'")\]])/g, '$1').replace(/\s+/g, ' ').trim();
+    const key = `${ch}:${String(curVerse).split('-')[0]}`;
+    if (raw) verses[key] = raw;
+  };
+  for (const line of text.split('\n')) {
+    if (/^\s*\\c\s+\d+/.test(line)) {
+      flush();
+      curVerse = null;
+      ch = parseInt(line.match(/\\c\s+(\d+)/)[1], 10);
+      buf = [];
+      continue;
+    }
+    const vRe = /\\v\s+(\d+(?:-\d+)?)\s?/g;
+    let m;
+    let lastIdx = 0;
+    let found = false;
+    const segs = [];
+    while ((m = vRe.exec(line)) !== null) {
+      found = true;
+      segs.push({ type: 'text', value: line.slice(lastIdx, m.index) });
+      segs.push({ type: 'verse', num: m[1] });
+      lastIdx = vRe.lastIndex;
+    }
+    segs.push({ type: 'text', value: line.slice(lastIdx) });
+    if (!found) {
+      if (curVerse != null) buf.push(line);
+      continue;
+    }
+    for (const seg of segs) {
+      if (seg.type === 'text') {
+        if (curVerse != null) buf.push(seg.value);
+      } else {
+        flush();
+        curVerse = seg.num;
+        buf = [];
       }
     }
-    return verses;
+  }
+  flush();
+  return verses;
+}
+
+/**
+ * Compute the git blob sha of content the same way git/Gitea does:
+ * sha1("blob " + byteLength + "\0" + bytes). This matches the `sha` field
+ * Gitea reports for a file, so a locally computed sha (after a download)
+ * stays comparable with the sha returned by the contents API next run.
+ */
+function gitBlobSha(content) {
+  const data = Buffer.isBuffer(content) ? content : Buffer.from(content, 'utf8');
+  return crypto.createHash('sha1').update(`blob ${data.length}\0`).update(data).digest('hex');
+}
+
+/**
+ * Get the current blob sha of a master file WITHOUT downloading its content.
+ * The contents directory listing returns a `sha` per entry with `content: null`,
+ * so this is a cheap metadata call used to decide whether a re-download +
+ * de-align is needed.
+ */
+async function fetchMasterBlobSha(repo, filename, token) {
+  const res = await apiRequest('GET', `/repos/${ORG}/${repo}/contents?ref=master`, token);
+  if (res.status !== 200 || !Array.isArray(res.data)) {
+    throw new Error(`contents listing for ${repo} returned HTTP ${res.status}`);
+  }
+  const entry = res.data.find((e) => e && e.name === filename);
+  if (!entry || !entry.sha) throw new Error(`${filename} not found in ${repo} root listing`);
+  return entry.sha;
+}
+
+/**
+ * Load de-aligned verse text for a book from Door43 master.
+ *
+ * The only valid TQ source is the current published ULT/UST on master. The blob
+ * sha is checked first (cheap metadata call); when it matches the cached
+ * de-alignment nothing is downloaded or re-parsed. Only a changed (or
+ * uncached) file is downloaded and de-aligned. If Door43 is unreachable, fall
+ * back to the last cached de-alignment when one exists.
+ *
+ * @param {string} repo   - 'en_ult' or 'en_ust'
+ * @param {string} num    - zero-padded book number (e.g. '28' for HOS)
+ * @param {string} book   - upper-case book code
+ * @param {string} [overridePath] - local file to de-align instead of fetching (tests/manual)
+ * @returns {Promise<{verses: object, source: string}>}
+ */
+async function loadDealignedVerses(repo, num, book, overridePath) {
+  if (overridePath) {
+    const full = path.resolve(CSKILLBP_DIR, overridePath);
+    if (!fs.existsSync(full)) return { verses: {}, source: `${overridePath} (not found)` };
+    return { verses: dealignToVerses(fs.readFileSync(full, 'utf8')), source: overridePath };
+  }
+  if (!num) return { verses: {}, source: `${repo}: unknown book number` };
+
+  const filename = `${num}-${book}.usfm`;
+  const url = `https://git.door43.org/${ORG}/${repo}/raw/branch/master/${filename}`;
+  const cacheFile = path.join(TQ_SOURCE_CACHE_DIR, `${repo}-${filename}.json`);
+  const readCache = () => {
+    try { return JSON.parse(fs.readFileSync(cacheFile, 'utf8')); } catch { return null; }
+  };
+  const token = getToken();
+
+  // 1. Cheap metadata check: current blob sha on master, no content transfer.
+  let blobSha = null;
+  try {
+    blobSha = await fetchMasterBlobSha(repo, filename, token);
+  } catch (err) {
+    console.error(`[prepare_tq] blob-sha lookup failed for ${repo}/${filename}: ${err.message}`);
   }
 
-  // Find ULT/UST
+  const cached = readCache();
+  if (blobSha && cached && cached.blobSha === blobSha && cached.verses) {
+    return { verses: cached.verses, source: `${repo} master ${filename} (de-aligned, cached ${blobSha.slice(0, 8)})` };
+  }
+
+  // 2. Changed or uncached — download the raw master file and de-align it.
+  let raw;
+  try {
+    raw = await httpsGet(url);
+  } catch (err) {
+    if (cached && cached.verses) {
+      return { verses: cached.verses, source: `${repo} master ${filename} (cached ${String(cached.blobSha).slice(0, 8)}; fetch failed: ${err.message})` };
+    }
+    throw new Error(`prepare_tq: cannot fetch ${repo}/${filename} from Door43 master and no cache is available: ${err.message}`);
+  }
+
+  const effSha = blobSha || gitBlobSha(raw);
+  const verses = dealignToVerses(raw);
+  try {
+    fs.mkdirSync(TQ_SOURCE_CACHE_DIR, { recursive: true });
+    fs.writeFileSync(cacheFile, JSON.stringify({ repo, filename, blobSha: effSha, verses }));
+  } catch (err) {
+    console.error(`[prepare_tq] failed to write de-align cache ${cacheFile}: ${err.message}`);
+  }
+  return { verses, source: `${repo} master ${filename} (de-aligned, sha ${effSha.slice(0, 8)})` };
+}
+
+async function prepareTq({ book, chapter, wholeBook, tqRepo, ultPath, ustPath, output }) {
+  const bookUpper = book.toUpperCase();
+
   const BOOK_NUMBERS = {};
   const OT = ['GEN','EXO','LEV','NUM','DEU','JOS','JDG','RUT','1SA','2SA','1KI','2KI','1CH','2CH','EZR','NEH','EST','JOB','PSA','PRO','ECC','SNG','ISA','JER','LAM','EZK','DAN','HOS','JOL','AMO','OBA','JON','MIC','NAM','HAB','ZEP','HAG','ZEC','MAL'];
   const NT = ['MAT','MRK','LUK','JHN','ACT','ROM','1CO','2CO','GAL','EPH','PHP','COL','1TH','2TH','1TI','2TI','TIT','PHM','HEB','JAS','1PE','2PE','1JN','2JN','3JN','JUD','REV'];
@@ -262,25 +400,9 @@ function prepareTq({ book, chapter, wholeBook, tqRepo, ultPath, ustPath, output 
   NT.forEach((b, i) => { BOOK_NUMBERS[b] = String(i + 41).padStart(2, '0'); });
   const num = BOOK_NUMBERS[bookUpper];
 
-  let ultFile = ultPath;
-  if (!ultFile) {
-    const width = bookUpper === 'PSA' ? 3 : 2;
-    const tag = `${bookUpper}-${String(chapter || 1).padStart(width, '0')}`;
-    const aiPath = resolveOutputFile(`output/AI-ULT/${bookUpper}/${tag}.usfm`, bookUpper);
-    if (aiPath) ultFile = aiPath;
-    else if (num) {
-      const pubPath = `data/published_ult_english/${num}-${bookUpper}.usfm`;
-      if (fs.existsSync(path.join(CSKILLBP_DIR, pubPath))) ultFile = pubPath;
-    }
-  }
-  let ustFile = ustPath;
-  if (!ustFile && num) {
-    const pubPath = `data/published_ust/${num}-${bookUpper}.usfm`;
-    if (fs.existsSync(path.join(CSKILLBP_DIR, pubPath))) ustFile = pubPath;
-  }
-
-  const ultVerses = parseVersesClean(ultFile);
-  const ustVerses = parseVersesClean(ustFile);
+  // The only valid ULT/UST source is current Door43 master, de-aligned (sha-cached).
+  const ult = await loadDealignedVerses('en_ult', num, bookUpper, ultPath);
+  const ust = await loadDealignedVerses('en_ust', num, bookUpper, ustPath);
 
   // Find TQ TSV
   const tqDir = tqRepo || path.join(CSKILLBP_DIR, 'data/published-tqs');
@@ -306,10 +428,10 @@ function prepareTq({ book, chapter, wholeBook, tqRepo, ultPath, ustPath, output 
   const result = {
     book: bookUpper,
     chapters: chapter ? [parseInt(chapter, 10)] : Object.keys(tqRowsByChapter).map(Number).sort((a, b) => a - b),
-    ult_source: ultFile || 'not found',
-    ust_source: ustFile || 'not found',
-    ult_by_verse: ultVerses,
-    ust_by_verse: ustVerses,
+    ult_source: ult.source,
+    ust_source: ust.source,
+    ult_by_verse: ult.verses,
+    ust_by_verse: ust.verses,
     tq_header: tqHeader,
     tq_rows_by_chapter: tqRowsByChapter,
   };
