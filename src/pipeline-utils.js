@@ -8,7 +8,7 @@ const { getVerseCount, getTotalVerses } = require('./verse-counts');
 const CSKILLBP_DIR = process.env.CSKILLBP_DIR || path.resolve(__dirname, '../../cSkillBP');
 
 const MIN_TIMEOUT_MS = 10 * 60 * 1000;   // 10 min floor
-const MAX_TIMEOUT_MS = 90 * 60 * 1000;   // 90 min cap (post-MCP migration)
+const MAX_TIMEOUT_MS = 150 * 60 * 1000;  // 150 min cap (raised from 90 to ride out Anthropic throttling)
 const MS_PER_VERSE_OP = 7 * 60 * 1000;   // 7 min per verse per operation (post-MCP)
 
 function buildOutputSearchDirs(dir, book) {
