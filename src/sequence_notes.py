@@ -237,6 +237,7 @@ def sort_notes(tsv_file, verse_map):
                     -quote_len,
                     note_index,
                 )
+                print(f"Sort key: {sort_key}")
 
             decorated.append(
                 (
@@ -287,6 +288,7 @@ def sequence_notes(ult_usfm, notes_tsv):
 
     print("Reading alignments...")
     verse_map = build_alignment_map(ult_usfm)
+    print(f"Verse Map:\n{verse_map}")
 
     print("Sorting notes...")
     sort_notes(
