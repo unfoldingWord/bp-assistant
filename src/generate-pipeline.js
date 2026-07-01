@@ -683,7 +683,10 @@ async function generatePipeline(route, message) {
             prompt: initialPrompt,
             label: `${skillRef} ${skill}`,
             cwd: CSKILLBP_DIR,
-            model,
+            // Generation defaults to Sonnet 5 in production: ULT/UST quality is at
+            // parity with Opus on the golden benchmark (NAM 1) at lower cost. A set
+            // TEST_MODEL or --fast (haiku) still overrides via the `model` variable.
+            model: model || 'claude-sonnet-5',
             betas,
             skill: invocationSkill,
             resume: invocationResume,
@@ -854,7 +857,8 @@ async function generatePipeline(route, message) {
               }),
               label: `${book} ${ch} ${skill} (cont)`,
               cwd: CSKILLBP_DIR,
-              model,
+              // Generation continuation — same Sonnet 5 default as the initial call.
+              model: model || 'claude-sonnet-5',
               betas,
               resume: claudeResult.session_id,
               appendSystemPrompt: INITIAL_PIPELINE_COMPLETION_GUARDRAIL,
