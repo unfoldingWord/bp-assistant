@@ -142,15 +142,24 @@ test('buildQuickRefCache builds then skips when unchanged (content-hash keyed)',
 });
 
 // --- buildOptions threading (behavior preservation) --------------------------
-test('buildOptions threads hooks + compaction additively and is a no-op when unset', () => {
-  const SENTINEL = { PreToolUse: [] };
-  assert.equal(buildOptions({ model: 'opus', hooks: SENTINEL }).hooks, SENTINEL);
+test('buildOptions threads hooks + compaction additively; always installs the model-resolver hook', () => {
+  // Caller PreToolUse hooks are preserved AND the always-on model-resolver matcher
+  // is appended (never mutating the caller's object).
+  const callerMatcher = { hooks: [async () => ({})] };
+  const SENTINEL = { PreToolUse: [callerMatcher], PostToolUseFailure: [callerMatcher] };
+  const threaded = buildOptions({ model: 'opus', hooks: SENTINEL }).hooks;
+  assert.notEqual(threaded, SENTINEL);                       // new object, no caller mutation
+  assert.equal(SENTINEL.PreToolUse.length, 1);              // caller's array untouched
+  assert.equal(threaded.PreToolUse.length, 2);              // caller matcher + model-resolver
+  assert.equal(threaded.PreToolUse[0], callerMatcher);      // caller's runs first
+  assert.equal(threaded.PostToolUseFailure, SENTINEL.PostToolUseFailure); // other events preserved
   const withCompact = buildOptions({ model: 'opus', compaction: { enabled: true, window: 5 } });
   assert.equal(withCompact.settings.autoCompactEnabled, true);
   assert.equal(withCompact.settings.autoCompactWindow, 5);
-  // unset -> no hooks key, no compaction settings (byte-identical to today)
+  // unset -> the model-resolver hook is present (intrinsic), exactly one PreToolUse matcher;
+  // no compaction settings (byte-identical to today except the always-on resolver).
   const plain = buildOptions({ model: 'opus' });
-  assert.equal('hooks' in plain, false);
+  assert.equal(plain.hooks.PreToolUse.length, 1);
   assert.equal(plain.settings, undefined);
   // compaction spread-merges with the sandbox settings, not clobbers them
   const both = buildOptions({ model: 'opus', forceNoAutoBashSandbox: true, compaction: { enabled: true } });

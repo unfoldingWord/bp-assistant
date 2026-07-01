@@ -5,6 +5,7 @@ const { ensureFreshToken } = require('./auth-refresh');
 const { recordRateLimit, getHeadroom } = require('./usage-tracker');
 const { createWorkspaceTools, createTnWriterTools, createQualityTools, createIssueIdTools } = require('./workspace-tools');
 const { publishAdminStatus } = require('./admin-status');
+const { resolveDifficultyModel } = require('./api-runner/provider-config');
 
 let _query = null;
 let _sdkCreateSdkMcpServer = null;
@@ -161,7 +162,9 @@ function buildOptions({
   if (resume) {
     options.resume = resume;
   }
-  options.model = model || 'opus';
+  // Resolve difficulty tiers (low/medium/high) and apply per-run model overrides
+  // (BP_FORCE_MODEL / BP_MODEL_*). No override + non-tier value => unchanged.
+  options.model = resolveDifficultyModel('claude', model || 'opus');
   const reasoning = resolveReasoning(thinking, options.model);
   if (reasoning.thinking) options.thinking = reasoning.thinking;
   if (reasoning.effort) options.effort = reasoning.effort;
@@ -176,6 +179,31 @@ function buildOptions({
   if (hooks) {
     options.hooks = hooks;
   }
+  // Difficulty-based model control for sub-agents. Skills spawn Task/Agent workers
+  // with a difficulty tier (low/medium/high) or alias; this hook resolves that to a
+  // concrete model and applies any per-run override (BP_FORCE_MODEL / BP_MODEL_*)
+  // before the sub-agent runs — the missing link that makes a run-level model force
+  // reach orchestrator-spawned workers, not just the top-level query. It only mutates
+  // input (no permissionDecision), so it composes with the guard hooks above; it is a
+  // no-op when the spawn's model is already concrete and no override is set.
+  const modelResolverMatcher = {
+    hooks: [async (input) => {
+      try {
+        const tool = input && input.tool_name;
+        if (tool !== 'Task' && tool !== 'Agent') return {};
+        const ti = input.tool_input;
+        if (!ti || typeof ti !== 'object' || typeof ti.model !== 'string') return {};
+        const resolved = resolveDifficultyModel('claude', ti.model);
+        if (!resolved || resolved === ti.model) return {};
+        return { hookSpecificOutput: { hookEventName: 'PreToolUse', updatedInput: { ...ti, model: resolved } } };
+      } catch (err) {
+        console.warn(`[claude-runner] model-resolver hook error: ${err.message}`);
+        return {};
+      }
+    }],
+  };
+  const existingPreToolUse = (options.hooks && options.hooks.PreToolUse) || [];
+  options.hooks = { ...(options.hooks || {}), PreToolUse: [...existingPreToolUse, modelResolverMatcher] };
   // Phase 3 (pilot): opt-in Agent-SDK auto-compaction, default OFF. This is the
   // Agent SDK's CLI auto-compact (settings.autoCompactEnabled), NOT the raw
   // Messages-API `compact-2026-01-12` beta. Spread-merge so we don't clobber the

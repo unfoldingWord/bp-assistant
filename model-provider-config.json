@@ -28,6 +28,11 @@
                     "inputPer1M": 5.0,
                     "outputPer1M": 25.0
                 },
+                "claude-sonnet-5": {
+                    "label": "Claude Sonnet 5",
+                    "inputPer1M": 3.0,
+                    "outputPer1M": 15.0
+                },
                 "claude-sonnet-4-6": {
                     "label": "Claude Sonnet 4.6",
                     "inputPer1M": 3.0,
