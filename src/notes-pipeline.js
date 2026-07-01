@@ -33,7 +33,6 @@ const { checkUltEdits } = require('./check-ult-edits');
 const { getVerseCount } = require('./verse-counts');
 const { publishAdminStatus } = require('./admin-status');
 const { dispatchSelfDiagnosis } = require('./self-diagnosis');
-const { sequenceNotes } = require('./lib/sequence-notes');
 
 const LOG_DIR = path.resolve(__dirname, '../logs');
 
