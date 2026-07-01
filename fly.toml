@@ -8,7 +8,11 @@ kill_timeout = 30
   dockerfile = "Dockerfile.fly"
 
 [deploy]
-  release_command = "bash -c 'cd /data/workspace && git pull --ff-only 2>&1 || true'"
+  # Refresh the /data/workspace skills checkout to origin/main on every deploy.
+  # See scripts/refresh-workspace.sh — stash→ff→pop so runtime-appended decision
+  # CSVs (and a root-owned .git) never freeze the checkout again as they did for
+  # 124 commits. Always exits 0 so it can't fail the deploy.
+  release_command = "bash /app/scripts/refresh-workspace.sh"
 
 [env]
   NODE_ENV = "production"
