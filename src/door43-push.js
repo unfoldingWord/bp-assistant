@@ -592,7 +592,12 @@ function insertContent({ type, book, chapter, source, verses, repoDir, repoFilen
     let ultFile;
     const bookNum = BOOK_NUMBERS[book.toUpperCase()];
     if (type === 'tn' && bookNum) {
-      const candidate = path.join(CSKILLBP_DIR, 'data', 'published_ult_english',
+      // insertTnRows now sequences notes by Hebrew-alignment position, which
+      // requires \zaln-s/\w alignment markup. published_ult_english is
+      // deliberately alignment-stripped (for the text-only push path), so it
+      // silently produced zero alignment pairs here; published_ult carries
+      // the alignment this step actually needs.
+      const candidate = path.join(CSKILLBP_DIR, 'data', 'published_ult',
                                   `${bookNum}-${book.toUpperCase()}.usfm`);
       if (fs.existsSync(candidate)) ultFile = candidate;
     }

@@ -214,3 +214,33 @@ test('insertTnRows does not remove single-verse rows that merely share an anchor
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test('insertTnRows orders TN rows by ULT alignment quote sequence', () => {
+  const dir = makeTempDir();
+  try {
+    const ultFile = path.join(dir, 'GEN.usfm');
+    fs.writeFileSync(ultFile, [
+      '\\id GEN',
+      '\\c 1',
+      '\\v 1 \\zaln-s |x-content="בְּרֵאשִׁ֖ית"\\*\\w In|x\\w* \\zaln-s |x-content="בָּרָ֣א"\\*\\w created|x\\w* \\zaln-s |x-content="אֱלֹהִ֑ים"\\*\\w God|x\\w*',
+    ].join('\n'), 'utf8');
+
+    const bookFile = writeTsv(dir, 'en_tn_GEN.tsv', TN_HEADER, [
+      '1:1\told1\t\t\tבְּרֵאשִׁ֖ית\t1\tOld first note',
+    ]);
+
+    const sourceFile = writeTsv(dir, 'GEN-001-source.tsv', TN_HEADER, [
+      '1:1\tlate\t\t\tאֱלֹהִ֑ים\t1\tLate quote',
+      '1:1\tearly\t\t\tבְּרֵאשִׁ֖ית\t1\tEarly quote',
+      '1:1\tmidl\t\t\tבָּרָ֣א\t1\tMiddle quote',
+    ]);
+
+    const log = insertTnRows({ bookFile, sourceFile, chapter: 1, ultFile });
+    const ids = readRows(bookFile).map((row) => row.split('\t')[1]);
+
+    assert.deepEqual(ids, ['early', 'midl', 'late']);
+    assert.ok(log.includes('Loaded ULT alignments'), 'Log must mention alignment sequencing');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});

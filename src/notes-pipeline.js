@@ -922,7 +922,6 @@ function finalCanonicalHebrewQuoteSync({ notesPath, preparedJson, hebrewUsfm }) 
 
 /**
  * Run mechanical quality checks in Node.js before invoking tn-quality-check.
- * Sequences notes according to quote order in ULT
  * Runs fix_trailing_newlines + check_tn_quality directly so Claude reads
  * pre-run findings and cannot loop on re-checking.
  *
@@ -930,26 +929,6 @@ function finalCanonicalHebrewQuoteSync({ notesPath, preparedJson, hebrewUsfm }) 
  */
 async function runMechanicalQualityPrep({ notesPath, pipeDir, status, ref }) {
   const ctx = readContext(pipeDir);
-  // Sequence notes
-  const sequenceNotes = path.join(__dirname, "sequence_notes.py");
-  const ultPath = '/data/workspace/' + ctx.sources.ult;
-  const tsvPath = '/data/workspace/' + notesPath;
-  try {
-    const pythonResult = await runPythonWithTimeout(
-      [
-        sequenceNotes,
-        ultPath,
-        tsvPath,
-      ],
-      120000);
-
-    await status(`**${ref}**: Sequencing notes complete (Python)`);
-    console.log("[notes] Sequencing notes result:", pythonResult);
-
-  } catch (err) {
-    console.warn(`[notes] Sequencing notes step failed (non-fatal): ${err.message}`);
-  }
-
   const fixResult = fixTrailingNewlines({ file: notesPath });
   const qualityResult = await checkTnQuality({
     tsvPath: notesPath,
