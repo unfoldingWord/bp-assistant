@@ -489,7 +489,7 @@ async function runPerNoteGeneration({ pipeDir, outputPath, status, book }) {
         prompt,
         label: `${item.reference || book} note`,
         cwd: CSKILLBP_DIR,
-        model: 'sonnet',
+        model: 'medium',
         maxTurns: 2,
         timeoutMs: 60 * 1000,
         appendSystemPrompt: systemPromptAppend,
@@ -699,7 +699,7 @@ async function runATGeneration({ notesPath, pipeDir, status }) {
         prompt: userPrompt,
         label: `${packet.reference || 'AT'} AT-gen`,
         cwd: CSKILLBP_DIR,
-        model: 'sonnet',
+        model: 'medium',
         maxTurns: 2,
         timeoutMs: AT_GENERATION_TIMEOUT_MS,
         appendSystemPrompt: atSystemPrompt,
@@ -737,7 +737,7 @@ async function runATGeneration({ notesPath, pipeDir, status }) {
         prompt: validatorPrompt,
         label: `${packet.reference || 'AT'} AT-val`,
         cwd: CSKILLBP_DIR,
-        model: 'haiku',
+        model: 'low',
         maxTurns: 2,
         timeoutMs: AT_VALIDATION_TIMEOUT_MS,
         appendSystemPrompt: validatorSystemPrompt,
@@ -765,7 +765,7 @@ async function runATGeneration({ notesPath, pipeDir, status }) {
         prompt: retryPrompt,
         label: `${packet.reference || 'AT'} AT-retry`,
         cwd: CSKILLBP_DIR,
-        model: 'sonnet',
+        model: 'medium',
         maxTurns: 2,
         timeoutMs: AT_RETRY_TIMEOUT_MS,
         appendSystemPrompt: atSystemPrompt,
@@ -1955,7 +1955,7 @@ async function notesPipeline(route, message) {
           appendSystemPrompt: POST_EDIT_REVIEW_HINT,
           expectedOutput: issuesPath,
           skipPreClean: true,   // expectedOutput is also the input — don't delete it
-          model: 'sonnet',      // validation/reconciliation — Sonnet suffices at lower cost
+          model: 'medium',      // validation/reconciliation — Sonnet suffices at lower cost
           ops: 1,
         });
         issuesBackupPath = backupIssuesFile({ issuesPath, pipeDir });
@@ -2027,7 +2027,7 @@ async function notesPipeline(route, message) {
       mcpTools: 'quality',
       maxTurns: 100,
       ops: 1,
-      model: 'opus',
+      model: 'high',
     });
 
     // --- Run skills sequentially ---
@@ -2813,7 +2813,7 @@ async function notesPipeline(route, message) {
             prompt: rescuePrompt,
             label: `${ref} tn-quality-check (rescue)`,
             cwd: CSKILLBP_DIR,
-            model: model || 'sonnet',
+            model: model || 'medium',
             skill: 'tn-quality-check',
             tools: DEFAULT_RESTRICTED_TOOLS,
             disallowedTools: ['Bash'],

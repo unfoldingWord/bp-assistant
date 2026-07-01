@@ -1318,7 +1318,7 @@ async function generatePipeline(route, message) {
         prompt: `${alignRef} ${alignTypeFlags}${genCtxFlag}`,
         label: `${alignRef} align-all-parallel`,
         cwd: CSKILLBP_DIR,
-        model: model || 'sonnet',  // mechanical alignment — Sonnet suffices at lower cost
+        model: model || 'medium',  // mechanical alignment — Sonnet suffices at lower cost
         betas,
         skill: 'align-all-parallel',
         tools: DEFAULT_RESTRICTED_TOOLS,
@@ -1439,7 +1439,7 @@ async function generatePipeline(route, message) {
           prompt: `${alignRef} ${alignTypeFlags}${genCtxFlag}`,
           label: `${alignRef} align-all-parallel (retry)`,
           cwd: CSKILLBP_DIR,
-          model: model || 'sonnet',
+          model: model || 'medium',
           betas,
           skill: 'align-all-parallel',
           tools: DEFAULT_RESTRICTED_TOOLS,

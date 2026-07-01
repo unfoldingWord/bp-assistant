@@ -26,6 +26,7 @@ const DEFAULT_PROVIDER_CONFIGS = {
     models: {
       'claude-opus-4-8': { label: 'Claude Opus 4.8', inputPer1M: 5.0, outputPer1M: 25.0 },
       'claude-opus-4-7': { label: 'Claude Opus 4.7', inputPer1M: 5.0, outputPer1M: 25.0 },
+      'claude-sonnet-5': { label: 'Claude Sonnet 5', inputPer1M: 3.0, outputPer1M: 15.0 },
       'claude-sonnet-4-6': { label: 'Claude Sonnet 4.6', inputPer1M: 3.0, outputPer1M: 15.0 },
       'claude-haiku-4-5-20251001': { label: 'Claude Haiku 4.5', inputPer1M: 0.8, outputPer1M: 4.0 },
     },
@@ -290,6 +291,34 @@ function resolveProviderModel(provider, model) {
   return cfg.modelAliases?.[candidate] || candidate;
 }
 
+// Difficulty-based model selection. Jobs declare a DIFFICULTY tier
+// (low/medium/high), never a specific model; this maps tier -> model via
+// `autoModelByThinking` (the single permanent source of truth). Two per-run
+// overrides let a benchmark or experiment change models without editing skills:
+//   - BP_FORCE_MODEL  : the "all" tier — force EVERY job onto one model/alias
+//                       (the clean whole-pipeline A/B knob).
+//   - BP_MODEL_{LOW,MEDIUM,HIGH} : override a single tier for the run.
+// Behavior-preserving: when no override is set and `requested` is not a tier
+// name (i.e. it's already an alias/concrete id like opus/sonnet/haiku/undefined),
+// the value passes through UNCHANGED — so existing call sites are byte-identical.
+const DIFFICULTY_TIERS = { low: 'BP_MODEL_LOW', medium: 'BP_MODEL_MEDIUM', high: 'BP_MODEL_HIGH' };
+function resolveDifficultyModel(provider, requested) {
+  let cfg;
+  try { cfg = getProviderConfig(provider); } catch { return requested; }
+  const force = process.env.BP_FORCE_MODEL;
+  if (force) return cfg.modelAliases?.[force] || force;
+  if (typeof requested === 'string') {
+    const tier = requested.toLowerCase();
+    if (Object.prototype.hasOwnProperty.call(DIFFICULTY_TIERS, tier)) {
+      const override = process.env[DIFFICULTY_TIERS[tier]];
+      if (override) return cfg.modelAliases?.[override] || override;
+      const mapped = cfg.difficultyModels?.[tier] || cfg.autoModelByThinking?.[tier];
+      if (mapped) return cfg.modelAliases?.[mapped] || mapped;
+    }
+  }
+  return requested;
+}
+
 function isConfiguredModel(provider, model) {
   if (!model || typeof model !== 'string') return false;
   const cfg = getProviderConfig(provider);
@@ -329,6 +358,7 @@ module.exports = {
   getProviderConfig,
   getProviderNames,
   resolveProviderModel,
+  resolveDifficultyModel,
   resolveXaiModel,
   resolveAutoModel,
   isConfiguredModel,
