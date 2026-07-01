@@ -269,26 +269,25 @@ jobs:
         env:
           SUMMARY: ${{ steps.review.outputs.summary }}
           DECISION: ${{ steps.review.outputs.decision }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         with:
           script: |
+            // One new comment per run (not an upsert of a single sticky comment) so
+            // rapid-fire pushes each leave a visible, timestamped verdict in the PR
+            // timeline instead of silently overwriting the previous run's comment.
             const marker = '<!-- bp-review-gate -->';
             const body = [
               marker,
               '## Remote Review Gate',
               '',
               `- Decision: ${process.env.DECISION}`,
+              `- Commit: ${process.env.HEAD_SHA}`,
               '',
               process.env.SUMMARY,
             ].join('\n');
             const { owner, repo } = context.repo;
             const issue_number = context.payload.pull_request.number;
-            const comments = await github.paginate(github.rest.issues.listComments, { owner, repo, issue_number, per_page: 100 });
-            const existing = comments.find((comment) => comment.body && comment.body.includes(marker));
-            if (existing) {
-              await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body });
-            } else {
-              await github.rest.issues.createComment({ owner, repo, issue_number, body });
-            }
+            await github.rest.issues.createComment({ owner, repo, issue_number, body });
 
       - name: Enforce Gate
         env:
