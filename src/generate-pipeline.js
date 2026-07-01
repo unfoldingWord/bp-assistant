@@ -838,10 +838,12 @@ async function generatePipeline(route, message) {
             prompt: initialPrompt,
             label: `${skillRef} ${skill}`,
             cwd: CSKILLBP_DIR,
-            // Generation defaults to Sonnet 5 in production: ULT/UST quality is at
-            // parity with Opus on the golden benchmark (NAM 1) at lower cost. A set
-            // TEST_MODEL or --fast (haiku) still overrides via the `model` variable.
-            model: model || 'claude-sonnet-5',
+            // Generation defaults to the `high` difficulty tier (Opus). The earlier
+            // "Sonnet 5 at parity" call came from a confounded NAM 1 benchmark
+            // (workers were Opus-pinned); the clean JOS 3 forced A/B showed generation
+            // quality at parity but Sonnet's initial-pipeline at ~35x the tokens.
+            // A set TEST_MODEL / BP_FORCE_MODEL / BP_MODEL_HIGH still overrides.
+            model: model || 'high',
             betas,
             skill: invocationSkill,
             resume: invocationResume,
@@ -1013,7 +1015,7 @@ async function generatePipeline(route, message) {
               label: `${book} ${ch} ${skill} (cont)`,
               cwd: CSKILLBP_DIR,
               // Generation continuation — same Sonnet 5 default as the initial call.
-              model: model || 'claude-sonnet-5',
+              model: model || 'high',
               betas,
               resume: claudeResult.session_id,
               appendSystemPrompt: INITIAL_PIPELINE_COMPLETION_GUARDRAIL,
