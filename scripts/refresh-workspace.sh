@@ -35,6 +35,24 @@ if [ "$STASHED" = 1 ]; then
   git stash pop 2>&1 || echo "[refresh-workspace] stash pop conflict — runtime changes preserved in stash@{0}"
 fi
 
+# Commit runtime decision-CSV appends back to origin/main so accumulated
+# decisions survive beyond this one machine instead of only ever living in a
+# local stash (see issue #167 — this is the loop-closer for PR #163's
+# stash/pop mitigation, which kept appends from blocking deploys but never
+# shared them back to git). Scoped to just these files so nothing else that
+# might be sitting in the tree gets swept into the commit. Best-effort: if the
+# push fails (no push credentials configured, or origin advanced meanwhile),
+# the commit stays local and is retried on the next deploy.
+if [ -n "$(git status --porcelain -- 'data/quick-ref/*_decisions.csv')" ]; then
+  git add -- 'data/quick-ref/*_decisions.csv'
+  if git -c user.name='BW Bot' -c user.email='bot@unfoldingword.org' \
+      commit -m 'data(quick-ref): sync runtime decision CSVs from live bot' 2>&1; then
+    git push origin HEAD:main 2>&1 || echo "[refresh-workspace] push failed; decision-CSV commit stays local, will retry next deploy"
+  else
+    echo "[refresh-workspace] decision-CSV commit failed; leaving changes uncommitted"
+  fi
+fi
+
 # Keep the tree writable by the app user in case this ran as root.
 chown -R botuser:botuser "$WS/.claude" "$WS/data" "$WS/.git" 2>/dev/null || true
 
