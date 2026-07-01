@@ -195,6 +195,8 @@ function buildOptions({
         if (!ti || typeof ti !== 'object' || typeof ti.model !== 'string') return {};
         const resolved = resolveDifficultyModel('claude', ti.model);
         if (!resolved || resolved === ti.model) return {};
+        // Auditable: makes a per-run force/override observable in run logs.
+        console.log(`[model-select] ${tool} sub-agent model ${ti.model} -> ${resolved}${process.env.BP_FORCE_MODEL ? ' (forced)' : ''}`);
         return { hookSpecificOutput: { hookEventName: 'PreToolUse', updatedInput: { ...ti, model: resolved } } };
       } catch (err) {
         console.warn(`[claude-runner] model-resolver hook error: ${err.message}`);
