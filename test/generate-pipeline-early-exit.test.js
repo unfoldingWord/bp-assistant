@@ -535,7 +535,7 @@ test('generatePipeline fires self-diagnosis when an aligned source is missing at
     );
 
     assert.equal(harness.runClaudeCalls.length, 0);
-    const missingDiag = harness.diagnosisCalls.find((c) => /source file missing/.test(c.errorText || ''));
+    const missingDiag = harness.diagnosisCalls.find((c) => /source file missing/i.test(c.errorText || ''));
     assert.ok(missingDiag, 'expected a self-diagnosis dispatch for the missing aligned source');
     assert.equal(missingDiag.event.severity, 'error');
   } finally {
