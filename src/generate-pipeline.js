@@ -417,6 +417,29 @@ function assessAlignedChapterCoverage(alignedRel, sourceRel, { checkCoverage }) 
   return { ok: true, reason: null, missing: [], summary: `all ${want.size} verses covered` };
 }
 
+// Delete per-batch aligned files under contentDir (flat + book-subdir) whose
+// mtime predates sourceMs — i.e. batches aligned against an older version of the
+// source. Keeps source-consistent batches (banking) but forces re-alignment of
+// stale ones. No-op when sourceMs is 0 (source mtime unknown).
+function deleteStaleBatches(book, chapter, contentDir, sourceMs) {
+  if (!sourceMs) return;
+  const width = book.toUpperCase() === 'PSA' ? 3 : 2;
+  const tag = `${book}-${String(chapter).padStart(width, '0')}`;
+  const batchRe = new RegExp(`^${tag}-v\\d+-v\\d+-aligned\\.usfm$`);
+  for (const dirRel of [contentDir, `${contentDir}/${book}`]) {
+    const absDir = path.resolve(CSKILLBP_DIR, dirRel);
+    let entries;
+    try { entries = fs.readdirSync(absDir); } catch (_) { continue; }
+    for (const entry of entries) {
+      if (!batchRe.test(entry)) continue;
+      const abs = path.join(absDir, entry);
+      try {
+        if (fs.statSync(abs).mtimeMs < sourceMs - 2000) fs.unlinkSync(abs);
+      } catch (_) { /* fine */ }
+    }
+  }
+}
+
 // Delete only the canonical merged full-chapter aligned files (flat + book-
 // subdir). Never touches per-batch …-vNN-vMM-aligned.usfm files, so banked batch
 // progress survives a retry/resume.
@@ -1273,6 +1296,16 @@ async function generatePipeline(route, message) {
         try { fs.unlinkSync(path.resolve(CSKILLBP_DIR, resolved)); } catch (_) { /* fine if missing */ }
       }
     }
+    // Delete per-batch aligned files that predate their source. The align skill
+    // skips batches whose output already exists (resume support) but is mtime-
+    // blind, so without this a stale batch (from before a source regeneration)
+    // would be skipped by the skill yet dropped by the pipeline's source-
+    // consistency gate — leaving a permanent coverage gap. Clearing them here
+    // makes the skill re-align exactly the batches the pipeline won't bank.
+    if (!hasVerseRange) {
+      if (contentTypes.includes('ult')) deleteStaleBatches(book, ch, 'output/AI-ULT', mtimeMsOf(ultRel));
+      if (contentTypes.includes('ust')) deleteStaleBatches(book, ch, 'output/AI-UST', mtimeMsOf(ustRel));
+    }
     try {
       const alignTimeout = calcSkillTimeout(book, ch, 2);
       const alignRef = hasVerseRange ? `${book} ${ch}:${verseStart}-${verseEnd}` : `${book} ${ch}`;
@@ -1884,6 +1917,7 @@ module.exports = {
   shouldPushToDoor43,
   resolveMergedChapterAligned,
   cleanupGenerateArtifacts,
+  deleteStaleBatches,
   assessAlignedChapterCoverage,
   parseVerseSetFromFile,
   formatVerseRanges,

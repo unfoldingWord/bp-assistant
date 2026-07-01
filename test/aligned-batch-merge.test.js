@@ -19,6 +19,7 @@ const {
   assessAlignedChapterCoverage,
   formatVerseRanges,
   cleanupGenerateArtifacts,
+  deleteStaleBatches,
 } = require('../src/generate-pipeline');
 
 function setMtime(rel, ms) {
@@ -207,6 +208,29 @@ test('cleanupGenerateArtifacts removes per-batch aligned files (D3)', () => {
   for (const f of ['JER-60-v01-v15-aligned.usfm', 'JER-60-v16-v30-aligned.usfm', 'JER-60-aligned.usfm', 'JER-60.usfm']) {
     assert.equal(fs.existsSync(path.join(TMP, `${d}/${f}`)), false, `${f} should be removed`);
   }
+});
+
+// --- deleteStaleBatches: clear source-predating batches so the skill re-aligns them
+
+test('deleteStaleBatches removes only batches older than the source', () => {
+  const d = 'output/AI-ULT/JER';
+  const stale = writeRel(`${d}/JER-70-v01-v15-aligned.usfm`, batch(70, ['1']));
+  const fresh = writeRel(`${d}/JER-70-v16-v30-aligned.usfm`, batch(70, ['16']));
+  const now = Date.now();
+  const sourceMs = now;
+  setMtime(stale, now - 100000); // predates source → must be deleted
+  setMtime(fresh, now);          // source-consistent → must survive
+  deleteStaleBatches('JER', 70, 'output/AI-ULT', sourceMs);
+  assert.equal(fs.existsSync(path.join(TMP, stale)), false, 'stale batch should be deleted');
+  assert.equal(fs.existsSync(path.join(TMP, fresh)), true, 'source-consistent batch should survive');
+});
+
+test('deleteStaleBatches is a no-op when source mtime is unknown (0)', () => {
+  const d = 'output/AI-ULT/JER';
+  const b = writeRel(`${d}/JER-71-v01-v15-aligned.usfm`, batch(71, ['1']));
+  setMtime(b, Date.now() - 100000);
+  deleteStaleBatches('JER', 71, 'output/AI-ULT', 0);
+  assert.equal(fs.existsSync(path.join(TMP, b)), true, 'nothing deleted without a known source mtime');
 });
 
 test.after(() => {
