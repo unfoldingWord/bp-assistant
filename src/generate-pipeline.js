@@ -1014,7 +1014,7 @@ async function generatePipeline(route, message) {
               }),
               label: `${book} ${ch} ${skill} (cont)`,
               cwd: CSKILLBP_DIR,
-              // Generation continuation — same Sonnet 5 default as the initial call.
+              // Generation continuation — same `high` (Opus) default as the initial call.
               model: model || 'high',
               betas,
               resume: claudeResult.session_id,
