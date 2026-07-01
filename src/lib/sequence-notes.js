@@ -125,12 +125,36 @@ function normalizeVerseKey(reference) {
   return `${chapter}:${verseStr.split('-')[0]}`;
 }
 
+function warnUnmatchedNote(cols, reference, verseAlignments) {
+  const quote = getQuote(cols);
+  if (!quote || /:intro$/.test(reference)) return;
+
+  const id = (cols[1] || '').trim();
+  const reason = verseAlignments.length
+    ? 'quote not found in verse alignments'
+    : 'no verse alignments found';
+  const notePreview = String(cols[6] || '').replace(/\s+/g, ' ').trim().slice(0, 120);
+  const details = [
+    `ref=${reference || '(missing)'}`,
+    id ? `id=${id}` : null,
+    `quote="${quote}"`,
+    `reason=${reason}`,
+    notePreview ? `note="${notePreview}${notePreview.length === 120 ? '...' : ''}"` : null,
+  ].filter(Boolean).join(' ');
+
+  console.warn(`[sequence-notes] Unmatched note in alignment map: ${details}`);
+}
+
 function getSequenceSortKey(row, verseMap) {
   const cols = Array.isArray(row) ? row : String(row || '').split('\t');
-  const reference = normalizeVerseKey(cols[0] || '');
+  const rawReference = cols[0] || '';
+  const reference = normalizeVerseKey(rawReference);
   const verseAlignments = verseMap[reference] || [];
   const [position, quoteLength] = quotePosition(getQuote(cols), verseAlignments);
-  if (position == null) return [Infinity, 0];
+  if (position == null) {
+    warnUnmatchedNote(cols, rawReference, verseAlignments);
+    return [Infinity, 0];
+  }
   return [position, -quoteLength];
 }
 
