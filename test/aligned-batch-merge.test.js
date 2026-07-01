@@ -14,7 +14,17 @@ const path = require('path');
 const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'batch-merge-'));
 process.env.CSKILLBP_DIR = TMP;
 
-const { resolveMergedChapterAligned } = require('../src/generate-pipeline');
+const {
+  resolveMergedChapterAligned,
+  assessAlignedChapterCoverage,
+  formatVerseRanges,
+  cleanupGenerateArtifacts,
+} = require('../src/generate-pipeline');
+
+function setMtime(rel, ms) {
+  const d = new Date(ms);
+  fs.utimesSync(path.join(TMP, rel), d, d);
+}
 
 function writeRel(rel, content) {
   const full = path.join(TMP, rel);
@@ -87,6 +97,116 @@ test('throws (instead of returning a non-existent path) when a merge fails', () 
 
 test('null input returns null', () => {
   assert.equal(resolveMergedChapterAligned('JER', null), null);
+});
+
+// --- source-consistency gate: bank valid batches, drop stale ones -----------
+
+test('source-consistency: a batch older than the source is dropped from the merge', () => {
+  const d = 'output/AI-ULT/JER';
+  const b1 = writeRel(`${d}/JER-40-v01-v10-aligned.usfm`, batch(40, ['1', '2']));
+  const b2 = writeRel(`${d}/JER-40-v11-v20-aligned.usfm`, batch(40, ['11', '12']));
+  const now = Date.now();
+  setMtime(b1, now - 100000); // stale — predates source
+  setMtime(b2, now);          // source-consistent
+  // With minMtime = now, only b2 survives → single batch, no merge produced.
+  const resolved = resolveMergedChapterAligned('JER', b2, now);
+  assert.equal(resolved, b2);
+  assert.equal(fs.existsSync(path.join(TMP, `${d}/JER-40-aligned.usfm`)), false);
+});
+
+test('source-consistency: all batches stale → null (forces re-align)', () => {
+  const d = 'output/AI-ULT/JER';
+  const b1 = writeRel(`${d}/JER-41-v01-v10-aligned.usfm`, batch(41, ['1', '2']));
+  const now = Date.now();
+  setMtime(b1, now - 100000);
+  assert.equal(resolveMergedChapterAligned('JER', b1, now), null);
+});
+
+test('source-consistency: a full-chapter file older than source is rejected', () => {
+  const rel = writeRel('output/AI-ULT/JER/JER-42-aligned.usfm', batch(42, ['1', '2']));
+  const now = Date.now();
+  setMtime(rel, now - 100000);
+  assert.equal(resolveMergedChapterAligned('JER', rel, now), null);
+});
+
+// --- coverage gate: catch truncated chapters before push ---------------------
+
+test('coverage: flags missing verses vs source', () => {
+  const src = writeRel('output/AI-ULT/JER/JER-50.usfm', batch(50, ['1', '2', '3', '4']));
+  const aligned = writeRel('output/AI-ULT/JER/JER-50-aligned.usfm', batch(50, ['1', '2']));
+  const now = Date.now();
+  setMtime(src, now - 5000);
+  setMtime(aligned, now);
+  const r = assessAlignedChapterCoverage(aligned, src, { checkCoverage: true });
+  assert.equal(r.ok, false);
+  assert.equal(r.reason, 'incomplete');
+  assert.deepEqual(r.missing, [3, 4]);
+});
+
+test('coverage: a complete chapter passes', () => {
+  const src = writeRel('output/AI-ULT/JER/JER-51.usfm', batch(51, ['1', '2', '3']));
+  const aligned = writeRel('output/AI-ULT/JER/JER-51-aligned.usfm', batch(51, ['1', '2', '3']));
+  const now = Date.now();
+  setMtime(src, now - 5000);
+  setMtime(aligned, now);
+  assert.equal(assessAlignedChapterCoverage(aligned, src, { checkCoverage: true }).ok, true);
+});
+
+test('coverage: bridges (\\v 1-2) count as both verses', () => {
+  const src = writeRel('output/AI-ULT/JER/JER-53.usfm', batch(53, ['1-2', '3']));
+  const aligned = writeRel('output/AI-ULT/JER/JER-53-aligned.usfm', batch(53, ['1-2', '3']));
+  const now = Date.now();
+  setMtime(src, now - 5000);
+  setMtime(aligned, now);
+  assert.equal(assessAlignedChapterCoverage(aligned, src, { checkCoverage: true }).ok, true);
+});
+
+test('coverage: aligned older than source is reported stale, not incomplete', () => {
+  const src = writeRel('output/AI-ULT/JER/JER-52.usfm', batch(52, ['1', '2']));
+  const aligned = writeRel('output/AI-ULT/JER/JER-52-aligned.usfm', batch(52, ['1', '2']));
+  const now = Date.now();
+  setMtime(src, now);
+  setMtime(aligned, now - 100000);
+  const r = assessAlignedChapterCoverage(aligned, src, { checkCoverage: true });
+  assert.equal(r.ok, false);
+  assert.equal(r.reason, 'stale');
+});
+
+test('coverage: missing aligned file', () => {
+  const r = assessAlignedChapterCoverage('output/AI-ULT/JER/does-not-exist-aligned.usfm', 'output/AI-ULT/JER/JER-52.usfm', { checkCoverage: true });
+  assert.equal(r.ok, false);
+  assert.equal(r.reason, 'missing');
+});
+
+test('coverage: verse-range runs skip the full-chapter check', () => {
+  const src = writeRel('output/AI-ULT/JER/JER-54.usfm', batch(54, ['1', '2', '3', '4']));
+  const aligned = writeRel('output/AI-ULT/JER/JER-54-vv1-2-aligned.usfm', batch(54, ['1', '2']));
+  const now = Date.now();
+  setMtime(src, now - 5000);
+  setMtime(aligned, now);
+  // checkCoverage:false → only existence + source-consistency, not full 1..N.
+  assert.equal(assessAlignedChapterCoverage(aligned, src, { checkCoverage: false }).ok, true);
+});
+
+test('formatVerseRanges compacts consecutive runs', () => {
+  assert.equal(formatVerseRanges([1, 2, 3, 7]), '1-3, 7');
+  assert.equal(formatVerseRanges([5]), '5');
+  assert.equal(formatVerseRanges([]), '');
+  assert.equal(formatVerseRanges([1, 2, 4, 5, 6, 9]), '1-2, 4-6, 9');
+});
+
+// --- --fresh must clear per-batch aligned files ------------------------------
+
+test('cleanupGenerateArtifacts removes per-batch aligned files (D3)', () => {
+  const d = 'output/AI-UST/JER';
+  writeRel(`${d}/JER-60-v01-v15-aligned.usfm`, batch(60, ['1']));
+  writeRel(`${d}/JER-60-v16-v30-aligned.usfm`, batch(60, ['16']));
+  writeRel(`${d}/JER-60-aligned.usfm`, batch(60, ['1']));
+  writeRel(`${d}/JER-60.usfm`, batch(60, ['1']));
+  cleanupGenerateArtifacts({ book: 'JER', chapter: 60 });
+  for (const f of ['JER-60-v01-v15-aligned.usfm', 'JER-60-v16-v30-aligned.usfm', 'JER-60-aligned.usfm', 'JER-60.usfm']) {
+    assert.equal(fs.existsSync(path.join(TMP, `${d}/${f}`)), false, `${f} should be removed`);
+  }
 });
 
 test.after(() => {

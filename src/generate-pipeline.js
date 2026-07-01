@@ -98,6 +98,22 @@ function cleanupGenerateArtifacts({ book, chapter, verseStart, verseEnd }) {
   for (const rel of candidates) {
     removeIfExists(path.resolve(CSKILLBP_DIR, rel));
   }
+
+  // Per-batch aligned files (…-vNN-vMM-aligned.usfm) have variable verse
+  // suffixes, so sweep them by pattern. A --fresh run MUST clear these — the
+  // pipeline now banks source-consistent batches across runs, so a leftover
+  // batch here would otherwise be silently reused by a "fresh" run.
+  if (!hasVerseRange) {
+    const batchRe = new RegExp(`^${tag}-v\\d+-v\\d+-aligned\\.usfm$`);
+    for (const dirRel of [`output/AI-ULT`, `output/AI-UST`, `output/AI-ULT/${book}`, `output/AI-UST/${book}`]) {
+      const absDir = path.resolve(CSKILLBP_DIR, dirRel);
+      let entries;
+      try { entries = fs.readdirSync(absDir); } catch (_) { continue; }
+      for (const entry of entries) {
+        if (batchRe.test(entry)) removeIfExists(path.join(absDir, entry));
+      }
+    }
+  }
 }
 
 function parseGenerateCommand(content) {
@@ -313,6 +329,110 @@ function isFreshOutput(relPath, minMs) {
   }
 }
 
+function mtimeMsOf(relPath) {
+  if (!relPath) return 0;
+  try {
+    return fs.statSync(path.resolve(CSKILLBP_DIR, relPath)).mtimeMs;
+  } catch {
+    return 0;
+  }
+}
+
+// True if relPath exists and was written no earlier than minMtimeMs (with a
+// small slack for same-second writes). This gates reuse of an aligned artifact
+// on *source-consistency* — "was it aligned against the current source text" —
+// rather than "was it written during this run". That lets a resume BANK valid
+// batches from an earlier run (so long chapters make incremental progress
+// instead of restarting all batches every time) while still rejecting a batch
+// that predates a regeneration of its source and would corrupt the merge.
+function isAlignedAtLeast(relPath, minMtimeMs) {
+  if (!relPath) return false;
+  try {
+    const abs = path.resolve(CSKILLBP_DIR, relPath);
+    return fs.statSync(abs).mtimeMs >= ((minMtimeMs || 0) - 2000);
+  } catch {
+    return false;
+  }
+}
+
+// Collect the set of verse numbers a USFM chapter file covers, expanding
+// bridges (\v 1-2 → {1,2}). Used to compare an aligned output's coverage
+// against its unaligned source so a merged/partial file that omits verses (a
+// truncated chapter) is caught before it is ever pushed to Door43.
+function parseVerseSetFromFile(relPath) {
+  const set = new Set();
+  if (!relPath) return set;
+  let content;
+  try {
+    content = fs.readFileSync(path.resolve(CSKILLBP_DIR, relPath), 'utf8');
+  } catch {
+    return set;
+  }
+  const re = /\\v\s+(\d+)(?:-(\d+))?/g;
+  let m;
+  while ((m = re.exec(content)) !== null) {
+    const a = parseInt(m[1], 10);
+    const b = m[2] ? parseInt(m[2], 10) : a;
+    for (let v = a; v <= b; v += 1) set.add(v);
+  }
+  return set;
+}
+
+// Compact a sorted verse-number list into ranges: [1,2,3,7] → "1-3, 7".
+function formatVerseRanges(nums) {
+  if (!nums.length) return '';
+  const parts = [];
+  let start = nums[0];
+  let prev = nums[0];
+  for (let i = 1; i < nums.length; i += 1) {
+    if (nums[i] === prev + 1) { prev = nums[i]; continue; }
+    parts.push(start === prev ? `${start}` : `${start}-${prev}`);
+    start = nums[i];
+    prev = nums[i];
+  }
+  parts.push(start === prev ? `${start}` : `${start}-${prev}`);
+  return parts.join(', ');
+}
+
+// Assess whether an aligned output is usable: it must exist, be source-consistent
+// (mtime ≥ its unaligned source), and — for full-chapter runs — cover every
+// verse present in that source. Returns { ok, reason, missing, summary } where
+// reason ∈ 'missing' (no file) | 'stale' (predates source) | 'incomplete' (gaps).
+function assessAlignedChapterCoverage(alignedRel, sourceRel, { checkCoverage }) {
+  if (!alignedRel) return { ok: false, reason: 'missing', missing: [], summary: 'no aligned output found' };
+  const alignedMs = mtimeMsOf(alignedRel);
+  if (!alignedMs) return { ok: false, reason: 'missing', missing: [], summary: `aligned file not found: ${alignedRel}` };
+  const sourceMs = mtimeMsOf(sourceRel);
+  if (sourceMs && alignedMs < sourceMs - 2000) {
+    return { ok: false, reason: 'stale', missing: [], summary: `aligned output older than source (${alignedRel})` };
+  }
+  if (!checkCoverage) return { ok: true, reason: null, missing: [], summary: 'ok' };
+  const want = parseVerseSetFromFile(sourceRel);
+  if (want.size === 0) return { ok: true, reason: null, missing: [], summary: 'source verse set unavailable — coverage not checked' };
+  const have = parseVerseSetFromFile(alignedRel);
+  const missing = [...want].filter((v) => !have.has(v)).sort((a, b) => a - b);
+  if (missing.length > 0) {
+    return { ok: false, reason: 'incomplete', missing, summary: `covers ${have.size}/${want.size} verses, missing ${formatVerseRanges(missing)}` };
+  }
+  return { ok: true, reason: null, missing: [], summary: `all ${want.size} verses covered` };
+}
+
+// Delete only the canonical merged full-chapter aligned files (flat + book-
+// subdir). Never touches per-batch …-vNN-vMM-aligned.usfm files, so banked batch
+// progress survives a retry/resume.
+function deleteMergedAligned(book, chapter) {
+  const width = book.toUpperCase() === 'PSA' ? 3 : 2;
+  const tag = `${book}-${String(chapter).padStart(width, '0')}`;
+  for (const rel of [
+    `output/AI-ULT/${tag}-aligned.usfm`,
+    `output/AI-UST/${tag}-aligned.usfm`,
+    `output/AI-ULT/${book}/${tag}-aligned.usfm`,
+    `output/AI-UST/${book}/${tag}-aligned.usfm`,
+  ]) {
+    try { fs.unlinkSync(path.resolve(CSKILLBP_DIR, rel)); } catch (_) { /* fine if missing */ }
+  }
+}
+
 // When a chapter is aligned in batches (e.g. JER-29-v01-v16-aligned.usfm +
 // JER-29-v17-v32-aligned.usfm), the pipeline must push a single merged
 // full-chapter file — never an individual batch, which would truncate the
@@ -321,12 +441,18 @@ function isFreshOutput(relPath, minMs) {
 // <book>-<ch>-aligned.usfm and return that path. Otherwise return the input
 // unchanged. Only batch files (…-vNN-vMM-aligned.usfm) trigger a merge;
 // full-chapter and verse-range (…-vvN-M-aligned.usfm) files pass through.
-function resolveMergedChapterAligned(book, discoveredRel) {
+function resolveMergedChapterAligned(book, discoveredRel, minMtimeMs = 0) {
   if (!discoveredRel) return discoveredRel;
   const name = path.basename(discoveredRel);
   const batchRe = new RegExp(`^(${book}-\\d+)-v\\d+-v\\d+-aligned\\.usfm$`);
   const m = name.match(batchRe);
-  if (!m) return discoveredRel; // already a full-chapter or verse-range file
+  if (!m) {
+    // Already a full-chapter or verse-range file. Reuse it only if it is
+    // source-consistent; a file that predates its source is a stale artifact
+    // from before a regeneration and must not be trusted (return null so the
+    // caller's coverage gate treats the chapter as needing re-alignment).
+    return isAlignedAtLeast(discoveredRel, minMtimeMs) ? discoveredRel : null;
+  }
 
   const dirRel = path.dirname(discoveredRel);
   const absDir = path.resolve(CSKILLBP_DIR, dirRel);
@@ -337,11 +463,17 @@ function resolveMergedChapterAligned(book, discoveredRel) {
     batches = fs.readdirSync(absDir)
       .map((f) => { const sm = f.match(siblingRe); return sm ? { f, start: parseInt(sm[1], 10) } : null; })
       .filter(Boolean)
+      // Only merge batches that are source-consistent. A batch older than the
+      // current source predates a regeneration and would splice in text that no
+      // longer matches — drop it so the coverage gate flags the gap and the
+      // pipeline re-aligns just those verses instead of pushing stale content.
+      .filter((b) => isAlignedAtLeast(path.join(dirRel, b.f), minMtimeMs))
       .sort((a, b) => a.start - b.start);
   } catch (_) {
-    return discoveredRel;
+    return null;
   }
-  if (batches.length < 2) return discoveredRel; // nothing to merge
+  if (batches.length === 0) return null;                          // no source-consistent batch present
+  if (batches.length < 2) return path.join(dirRel, batches[0].f); // single partial batch — coverage gate will flag it
 
   const parts = batches.map((b) => path.join(dirRel, b.f));
   const outputRel = path.join(dirRel, `${chapterPrefix}-aligned.usfm`);
@@ -1100,18 +1232,18 @@ async function generatePipeline(route, message) {
     if (resumeSkill === 'align-all-parallel' && ch === resumeChapter) {
       const needUltCheck = contentTypes.includes('ult');
       const needUstCheck = contentTypes.includes('ust');
-      const ultAlreadyDone = !needUltCheck || (() => {
-        const r = resolveOutputFile(`output/AI-ULT/${vAlign}-aligned.usfm`, book);
-        return r && fs.statSync(path.resolve(CSKILLBP_DIR, r)).size > 1000;
-      })();
-      const ustAlreadyDone = !needUstCheck || (() => {
-        const r = resolveOutputFile(`output/AI-UST/${vAlign}-aligned.usfm`, book);
-        return r && fs.statSync(path.resolve(CSKILLBP_DIR, r)).size > 1000;
-      })();
+      // Only skip re-alignment when the merged file is genuinely complete:
+      // present, source-consistent (not left over from before a regeneration),
+      // and — for full-chapter runs — covering every source verse. A bare
+      // size>1000 check would wrongly skip on a stale or truncated merge.
+      const ultMergedRel = needUltCheck ? resolveOutputFile(`output/AI-ULT/${vAlign}-aligned.usfm`, book) : null;
+      const ustMergedRel = needUstCheck ? resolveOutputFile(`output/AI-UST/${vAlign}-aligned.usfm`, book) : null;
+      const ultAlreadyDone = !needUltCheck || assessAlignedChapterCoverage(ultMergedRel, ultRel, { checkCoverage: !hasVerseRange }).ok;
+      const ustAlreadyDone = !needUstCheck || assessAlignedChapterCoverage(ustMergedRel, ustRel, { checkCoverage: !hasVerseRange }).ok;
       if (ultAlreadyDone && ustAlreadyDone) {
         await status(`Aligned outputs already complete for ${book} ${ch} — skipping alignment re-run.`);
-        const alignedUltRel = needUltCheck ? resolveOutputFile(`output/AI-ULT/${vAlign}-aligned.usfm`, book) : null;
-        const alignedUstRel = needUstCheck ? resolveOutputFile(`output/AI-UST/${vAlign}-aligned.usfm`, book) : null;
+        const alignedUltRel = ultMergedRel;
+        const alignedUstRel = ustMergedRel;
         if (!completedChapters.some((c) => c.ch === ch)) {
           completedChapters.push({ ch, ultAligned: alignedUltRel, ustAligned: alignedUstRel });
         }
@@ -1209,72 +1341,63 @@ async function generatePipeline(route, message) {
       let alignedUltRel = null;
       let alignedUstRel = null;
       let alignmentValidated = false;
-      let alignmentTerminalFailure = false;
       let finalValidationSummary = '';
+      // Source mtimes gate reuse of aligned artifacts on source-consistency (see
+      // isAlignedAtLeast) — ultRel/ustRel are the unaligned sources being aligned.
+      const ultSourceMs = needUlt ? mtimeMsOf(ultRel) : 0;
+      const ustSourceMs = needUst ? mtimeMsOf(ustRel) : 0;
+      let ultCov = { ok: true, reason: null };
+      let ustCov = { ok: true, reason: null };
+      let lastFailReason = null; // 'coverage' | 'density'
 
       for (let alignAttempt = 1; alignAttempt <= 2; alignAttempt++) {
-        // Discover aligned output files by recency — handles any naming variant
+        // Discover aligned output files by name (any run). Source-consistency
+        // and full-chapter coverage are enforced below — this replaces the old
+        // "written since this run started" freshness gate so a resume can bank
+        // valid batches from an earlier run instead of restarting every batch.
         const alignPat = new RegExp(`^${book}-0*${ch}(-.*)?-aligned\\.usfm$`);
-        alignedUltRel = needUlt ? discoverFreshOutput('output/AI-ULT', book, alignPat, chapterStart) : null;
-        alignedUstRel = needUst ? discoverFreshOutput('output/AI-UST', book, alignPat, chapterStart) : null;
+        alignedUltRel = needUlt ? discoverFreshOutput('output/AI-ULT', book, alignPat, null) : null;
+        alignedUstRel = needUst ? discoverFreshOutput('output/AI-UST', book, alignPat, null) : null;
 
-        if ((needUlt && !alignedUltRel) || (needUst && !alignedUstRel)) {
-          const missing = [needUlt && !alignedUltRel && 'ULT', needUst && !alignedUstRel && 'UST'].filter(Boolean).join(', ');
-          const missingAlignEvent = await status(`**align-all-parallel** failed for ${book} ${ch} at ${new Date().toISOString()} — aligned ${missing} file(s) not found (${alignDuration}s)`);
-          fail++;
-          setCheckpoint(checkpointRef, {
-            state: 'failed',
-            success,
-            fail,
-            completedChapters,
-            current: { chapter: ch, skill: 'align-all-parallel', status: 'failed', errorKind: 'missing_output', outputStatus: 'missing' },
-            resume: { chapter: ch, skill: 'align-all-parallel' },
-          });
-          fireDiagnosisFor(missingAlignEvent, `Phase: align-all-parallel\nChapter: ${book} ${ch}\nAligned ${missing} output file(s) not found after alignment completed.`);
-          alignmentTerminalFailure = true;
-          break;
-        }
-        if ((needUlt && !isFreshOutput(alignedUltRel, chapterStart)) || (needUst && !isFreshOutput(alignedUstRel, chapterStart))) {
-          const staleAlignEvent = await status(`**align-all-parallel** failed for ${book} ${ch} at ${new Date().toISOString()} — aligned output appears stale from an earlier run`);
-          fail++;
-          setCheckpoint(checkpointRef, {
-            state: 'failed',
-            success,
-            fail,
-            completedChapters,
-            current: { chapter: ch, skill: 'align-all-parallel', status: 'failed', errorKind: 'stale_output', outputStatus: 'stale' },
-            resume: { chapter: ch, skill: 'align-all-parallel' },
-          });
-          fireDiagnosisFor(staleAlignEvent, `Phase: align-all-parallel\nChapter: ${book} ${ch}\nAligned output appears stale (mtime older than this run) — alignment may not have rewritten it.`);
-          alignmentTerminalFailure = true;
-          break;
-        }
-
-        // If alignment was split into batches, merge them into a single
-        // full-chapter file before validating/pushing. Skipped for verse-range
-        // runs, whose source is intentionally a verse subset.
+        // Merge source-consistent batches into a single full-chapter file before
+        // validating/pushing. Skipped for verse-range runs, whose source is
+        // intentionally a verse subset.
         if (!hasVerseRange) {
-          if (needUlt) alignedUltRel = resolveMergedChapterAligned(book, alignedUltRel);
-          if (needUst) alignedUstRel = resolveMergedChapterAligned(book, alignedUstRel);
+          if (needUlt) alignedUltRel = resolveMergedChapterAligned(book, alignedUltRel, ultSourceMs);
+          if (needUst) alignedUstRel = resolveMergedChapterAligned(book, alignedUstRel, ustSourceMs);
         }
 
-        const ultCheck = needUlt ? validateAlignedUsfmCompleteness({ alignedUsfm: alignedUltRel }) : null;
-        const ustCheck = needUst ? validateAlignedUsfmCompleteness({ alignedUsfm: alignedUstRel }) : null;
-        finalValidationSummary = summarizeAlignmentValidation({ book, chapter: ch, ultCheck, ustCheck });
-        const validationOk = (!ultCheck || ultCheck.ok) && (!ustCheck || ustCheck.ok);
-        if (validationOk) {
-          alignmentValidated = true;
-          break;
+        // Coverage gate: the (merged) output must exist, be source-consistent,
+        // and — for full-chapter runs — cover every verse in its source. This is
+        // what catches a truncated push (e.g. only 2 of 3 batches merged).
+        ultCov = needUlt ? assessAlignedChapterCoverage(alignedUltRel, ultRel, { checkCoverage: !hasVerseRange }) : { ok: true, reason: null };
+        ustCov = needUst ? assessAlignedChapterCoverage(alignedUstRel, ustRel, { checkCoverage: !hasVerseRange }) : { ok: true, reason: null };
+
+        if (!ultCov.ok || !ustCov.ok) {
+          const covParts = [needUlt && !ultCov.ok && `ULT: ${ultCov.summary}`, needUst && !ustCov.ok && `UST: ${ustCov.summary}`].filter(Boolean).join(' || ');
+          finalValidationSummary = `${book} ${ch} — ${covParts}`;
+          lastFailReason = 'coverage';
+        } else {
+          const ultCheck = needUlt ? validateAlignedUsfmCompleteness({ alignedUsfm: alignedUltRel }) : null;
+          const ustCheck = needUst ? validateAlignedUsfmCompleteness({ alignedUsfm: alignedUstRel }) : null;
+          finalValidationSummary = summarizeAlignmentValidation({ book, chapter: ch, ultCheck, ustCheck });
+          const validationOk = (!ultCheck || ultCheck.ok) && (!ustCheck || ustCheck.ok);
+          if (validationOk) {
+            alignmentValidated = true;
+            break;
+          }
+          lastFailReason = 'density';
         }
 
-        await status(`Alignment validation failed for ${book} ${ch} (attempt ${alignAttempt}/2): ${finalValidationSummary}`);
+        const attemptLabel = lastFailReason === 'coverage' ? 'incomplete' : 'validation failed';
+        await status(`Alignment ${attemptLabel} for ${book} ${ch} (attempt ${alignAttempt}/2): ${finalValidationSummary}`);
         if (alignAttempt === 2) break;
 
-        // Retry once: remove detected outputs and rerun alignment
-        for (const rel of [alignedUltRel, alignedUstRel].filter(Boolean)) {
-          try { fs.unlinkSync(path.resolve(CSKILLBP_DIR, rel)); } catch (_) { /* ignore */ }
-        }
-        await status(`Retrying **align-all-parallel** for ${book} ${ch} after degraded alignment check...`);
+        // Retry once. Drop only the merged full-chapter file — never the per-batch
+        // files — so banked batch progress survives and the align skill only has
+        // to (re)produce the missing/degraded batches.
+        deleteMergedAligned(book, ch);
+        await status(`Retrying **align-all-parallel** for ${book} ${ch} to fill missing/degraded verses...`);
         const retryResult = await runClaude({
           prompt: `${alignRef} ${alignTypeFlags}${genCtxFlag}`,
           label: `${alignRef} align-all-parallel (retry)`,
@@ -1301,10 +1424,21 @@ async function generatePipeline(route, message) {
         }
       }
 
-      if (alignmentTerminalFailure) continue;
-
       if (!alignmentValidated) {
-        const degradedEvent = await status(`**align-all-parallel** failed for ${book} ${ch} at ${new Date().toISOString()} — degraded alignment (${finalValidationSummary})`);
+        // Map the last attempt's failure to a checkpoint errorKind. Coverage
+        // failures distinguish "nothing produced" (missing_output) from a
+        // resumable partial (incomplete_coverage) from a source-predating file
+        // (stale_output); a passing coverage gate but failing density is degraded.
+        let errorKind = 'degraded_alignment';
+        let outputStatus = 'degraded';
+        if (lastFailReason === 'coverage') {
+          const reasons = [needUlt && ultCov.reason, needUst && ustCov.reason].filter(Boolean);
+          if (reasons.length && reasons.every((r) => r === 'missing')) { errorKind = 'missing_output'; outputStatus = 'missing'; }
+          else if (reasons.includes('incomplete')) { errorKind = 'incomplete_coverage'; outputStatus = 'incomplete'; }
+          else if (reasons.includes('stale')) { errorKind = 'stale_output'; outputStatus = 'stale'; }
+          else { errorKind = 'missing_output'; outputStatus = 'missing'; }
+        }
+        const failEvent = await status(`**align-all-parallel** failed for ${book} ${ch} at ${new Date().toISOString()} — ${finalValidationSummary}`);
         fail++;
         setCheckpoint(checkpointRef, {
           state: 'failed',
@@ -1315,13 +1449,13 @@ async function generatePipeline(route, message) {
             chapter: ch,
             skill: 'align-all-parallel',
             status: 'failed',
-            errorKind: 'degraded_alignment',
-            outputStatus: 'degraded',
+            errorKind,
+            outputStatus,
             validationSummary: finalValidationSummary,
           },
           resume: { chapter: ch, skill: 'align-all-parallel' },
         });
-        fireDiagnosisFor(degradedEvent, `Phase: align-all-parallel\nChapter: ${book} ${ch}\nDegraded alignment after retries: ${finalValidationSummary}`);
+        fireDiagnosisFor(failEvent, `Phase: align-all-parallel\nChapter: ${book} ${ch}\n${finalValidationSummary}`);
         continue;
       }
 
@@ -1749,4 +1883,8 @@ module.exports = {
   shouldUseFileResponseMode,
   shouldPushToDoor43,
   resolveMergedChapterAligned,
+  cleanupGenerateArtifacts,
+  assessAlignedChapterCoverage,
+  parseVerseSetFromFile,
+  formatVerseRanges,
 };
