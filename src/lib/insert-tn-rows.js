@@ -159,10 +159,11 @@ function refCompare(a, b) {
 // --- ULT alignment sequencing ---
 
 function compareSequenceKeys(a, b) {
-  if (a[0] === b[0]) return a[1] - b[1];
-  if (a[0] === Infinity) return 1;
-  if (b[0] === Infinity) return -1;
-  return a[0] - b[0];
+  // a[0]/b[0] are always a finite position or exactly Infinity (never
+  // -Infinity), so plain subtraction already yields the correct sign in
+  // every case Array.prototype.sort needs — no special-casing required.
+  if (a[0] !== b[0]) return a[0] - b[0];
+  return a[1] - b[1];
 }
 
 // --- Chapter/position helpers ---
@@ -280,13 +281,14 @@ function doPerReference(bookRows, sourceGroups, verseMap, log) {
       log.push(`  ${ref}: inserting ${dedupedSource.length} new rows at position ${insertPos}`);
     }
 
-    const merged = [...dedupedSource, ...keepRows];
+    let merged = [...dedupedSource, ...keepRows];
     if (verseMap && Object.keys(verseMap).length && keepRows.length) {
-      merged.sort((a, b) => {
-        const ka = getSequenceSortKey(a, verseMap);
-        const kb = getSequenceSortKey(b, verseMap);
-        return compareSequenceKeys(ka, kb);
-      });
+      // Decorate-sort-undecorate: compute each row's sort key once instead of
+      // recomputing it on every comparator call.
+      merged = merged
+        .map((row) => ({ row, key: getSequenceSortKey(row, verseMap) }))
+        .sort((a, b) => compareSequenceKeys(a.key, b.key))
+        .map(({ row }) => row);
     }
 
     if (keepRows.length) {
@@ -475,17 +477,24 @@ function doFullChapter(bookRows, sourceRows, chapter, skipIntro, verseMap, log) 
   const filteredSourceNormalized = normalizeIntros(filteredSource);
 
   // Build combined rows
-  const combined = [...normalizedPreserveIntro, ...filteredSourceNormalized, ...keepRows, ...preservedRows];
+  let combined = [...normalizedPreserveIntro, ...filteredSourceNormalized, ...keepRows, ...preservedRows];
 
   // Sort by reference with optional ULT alignment ordering
   if (verseMap && Object.keys(verseMap).length) {
-    combined.sort((a, b) => {
-      const refCmp = refCompare(a, b);
-      if (refCmp !== 0) return refCmp;
-      const ka = getSequenceSortKey(a, verseMap);
-      const kb = getSequenceSortKey(b, verseMap);
-      return compareSequenceKeys(ka, kb);
-    });
+    // Decorate-sort-undecorate: compute each row's reference/sequence keys
+    // once instead of recomputing them on every comparator call.
+    combined = combined
+      .map((row) => ({
+        row,
+        refKey: parseReference(getReference(row)),
+        seqKey: getSequenceSortKey(row, verseMap),
+      }))
+      .sort((a, b) => {
+        if (a.refKey[0] !== b.refKey[0]) return a.refKey[0] - b.refKey[0];
+        if (a.refKey[1] !== b.refKey[1]) return a.refKey[1] - b.refKey[1];
+        return compareSequenceKeys(a.seqKey, b.seqKey);
+      })
+      .map(({ row }) => row);
   } else {
     combined.sort(refCompare);
   }

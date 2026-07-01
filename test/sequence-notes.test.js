@@ -6,6 +6,7 @@ const path = require('path');
 
 const {
   buildAlignmentMap,
+  getSequenceSortKey,
   normalizeHebrew,
   quotePosition,
   sortRowsBySequence,
@@ -55,4 +56,18 @@ test('buildAlignmentMap and sortRowsBySequence port sequence_notes.py ordering',
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test('getSequenceSortKey normalizes a verse-bridge reference to match the alignment map', () => {
+  const verseMap = { '10:1': [['ישראל', 1], ['בוקק', 2]] };
+
+  const bridged = ['10:1-2', 'note1', '', '', 'ישראל', '1', 'Bridged note'];
+  const single = ['10:1', 'note2', '', '', 'ישראל', '1', 'Single-verse note'];
+
+  assert.deepEqual(
+    getSequenceSortKey(bridged, verseMap),
+    getSequenceSortKey(single, verseMap),
+    'a verse-bridge reference should resolve to the same alignment entry as its starting verse'
+  );
+  assert.notDeepEqual(getSequenceSortKey(bridged, verseMap), [Infinity, 0]);
 });

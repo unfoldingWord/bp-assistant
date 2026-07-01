@@ -107,13 +107,27 @@ function quotePosition(quote, verseAlignments) {
 }
 
 function getQuote(row) {
+  // Assumes TN column layout (Quote at index 4); callers must not pass TQ
+  // rows (Quote at index 3) through this path.
   const cols = Array.isArray(row) ? row : String(row || '').split('\t');
   return (cols[4] || '').trim();
 }
 
+// verseMap keys are always "chapter:verse" for a single starting verse (see
+// buildAlignmentMap's \v regex, which only ever captures a lone number).
+// Normalize a verse-bridge reference like "1:1-2" down to "1:1" the same way
+// parseReference/refCompare do in insert-tn-rows.js, or bridged rows never
+// match and always sort last within their verse group.
+function normalizeVerseKey(reference) {
+  const parts = String(reference || '').split(':', 2);
+  if (parts.length !== 2) return reference;
+  const [chapter, verseStr] = parts;
+  return `${chapter}:${verseStr.split('-')[0]}`;
+}
+
 function getSequenceSortKey(row, verseMap) {
   const cols = Array.isArray(row) ? row : String(row || '').split('\t');
-  const reference = cols[0] || '';
+  const reference = normalizeVerseKey(cols[0] || '');
   const verseAlignments = verseMap[reference] || [];
   const [position, quoteLength] = quotePosition(getQuote(cols), verseAlignments);
   if (position == null) return [Infinity, 0];

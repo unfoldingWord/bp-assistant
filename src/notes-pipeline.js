@@ -27,6 +27,7 @@ const { recordMetrics, getCumulativeTokens, recordRunSummary, getAdaptiveSkillGu
 const { door43Push, checkConflictingBranches, REPO_MAP, getRepoFilename } = require('./door43-push');
 const { setPendingMerge } = require('./pending-merges');
 const { mergeTsvs } = require('./workspace-tools/tsv-tools');
+const { sequenceNotes } = require('./lib/sequence-notes');
 const { getCheckpoint, setCheckpoint, clearCheckpoint, buildCheckpointKey } = require('./pipeline-checkpoints');
 const { buildNotesContext, updateContextArtifacts, readContext, writeContext } = require('./pipeline-context');
 const { checkUltEdits } = require('./check-ult-edits');
@@ -929,6 +930,22 @@ function finalCanonicalHebrewQuoteSync({ notesPath, preparedJson, hebrewUsfm }) 
  */
 async function runMechanicalQualityPrep({ notesPath, pipeDir, status, ref }) {
   const ctx = readContext(pipeDir);
+
+  // Sequence notes by ULT-alignment quote position (skip gracefully when no
+  // aligned USFM is available for this context, same convention as the
+  // extractAlignmentData/fillOrigQuotes steps in runMechanicalPrep above).
+  if (ctx.sources && ctx.sources.ultAligned) {
+    try {
+      sequenceNotes(
+        path.resolve(CSKILLBP_DIR, ctx.sources.ultAligned),
+        path.resolve(CSKILLBP_DIR, notesPath)
+      );
+      await status(`**${ref}**: Sequencing notes complete`);
+    } catch (err) {
+      console.warn(`[notes] Sequencing notes step failed (non-fatal): ${err.message}`);
+    }
+  }
+
   const fixResult = fixTrailingNewlines({ file: notesPath });
   const qualityResult = await checkTnQuality({
     tsvPath: notesPath,
