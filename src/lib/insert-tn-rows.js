@@ -4,7 +4,7 @@
 // chapter replacement, KEEP-tag support, and ULT-based intra-verse ordering.
 
 const fs = require('fs');
-const path = require('path');
+const { buildAlignmentMap, getSequenceSortKey } = require('./sequence-notes');
 
 // --- TSV field helpers ---
 
@@ -121,13 +121,6 @@ function hasKeepTag(row) {
   return tags.split(',').some(t => t.trim().toUpperCase() === 'KEEP');
 }
 
-function extractBoldPhrase(row) {
-  const parts = row.split('\t');
-  const note = parts.length > 6 ? parts[6] : '';
-  const m = note.match(/\*\*([^*]+)\*\*/);
-  return m ? m[1] : '';
-}
-
 // --- Reference sorting ---
 
 function parseReference(ref) {
@@ -163,73 +156,13 @@ function refCompare(a, b) {
   return aVs - bVs;
 }
 
-// --- ULT verse parsing for intra-verse ordering ---
+// --- ULT alignment sequencing ---
 
-function stripUsfm(text) {
-  text = text.replace(/\\zaln-[se][^*]*\*/g, '');
-  text = text.replace(/\\w\s+/g, '');
-  text = text.replace(/\\w\*/g, '');
-  text = text.replace(/\\[a-z]+\d?\s+/g, ' ');
-  text = text.replace(/\\[a-z]+\d?\*/g, '');
-  text = text.replace(/\s+/g, ' ');
-  return text.trim();
-}
-
-function parseUltVerses(usfmPath, chapter) {
-  const content = fs.readFileSync(usfmPath, 'utf8');
-  const verses = {};
-  let inChapter = false;
-  let currentVerse = null;
-  const currentText = [];
-
-  for (const line of content.split('\n')) {
-    const trimmed = line.trim();
-    const cMatch = trimmed.match(/^\\c\s+(\d+)/);
-    if (cMatch) {
-      if (inChapter && currentVerse !== null) {
-        verses[currentVerse] = currentText.join(' ').trim();
-      }
-      currentVerse = null;
-      currentText.length = 0;
-      inChapter = parseInt(cMatch[1], 10) === chapter;
-      continue;
-    }
-    if (!inChapter) continue;
-
-    const vMatch = trimmed.match(/^\\v\s+(\d+[-\d]*)\s*(.*)/);
-    if (vMatch) {
-      if (currentVerse !== null) {
-        verses[currentVerse] = currentText.join(' ').trim();
-      }
-      const vs = vMatch[1].split('-')[0];
-      currentVerse = `${chapter}:${vs}`;
-      currentText.length = 0;
-      if (vMatch[2]) currentText.push(stripUsfm(vMatch[2]));
-      continue;
-    }
-
-    if (currentVerse !== null && trimmed && !trimmed.startsWith('\\c ')) {
-      currentText.push(stripUsfm(trimmed));
-    }
-  }
-
-  if (inChapter && currentVerse !== null) {
-    verses[currentVerse] = currentText.join(' ').trim();
-  }
-  return verses;
-}
-
-function ultPositionKey(row, ultVerses) {
-  const ref = getReference(row);
-  const ultText = ultVerses[ref] || '';
-  if (!ultText) return [9998, 0];
-
-  const phrase = extractBoldPhrase(row);
-  if (!phrase) return [9998, 0];
-
-  let pos = ultText.toLowerCase().indexOf(phrase.toLowerCase());
-  if (pos < 0) pos = 9999;
-  return [pos, -phrase.length];
+function compareSequenceKeys(a, b) {
+  if (a[0] === b[0]) return a[1] - b[1];
+  if (a[0] === Infinity) return 1;
+  if (b[0] === Infinity) return -1;
+  return a[0] - b[0];
 }
 
 // --- Chapter/position helpers ---
@@ -290,7 +223,7 @@ function detectLineEnding(filepath) {
 
 // --- Per-reference replacement ---
 
-function doPerReference(bookRows, sourceGroups, ultVerses, log) {
+function doPerReference(bookRows, sourceGroups, verseMap, log) {
   const newRows = [...bookRows];
   let totalRemoved = 0;
   let totalAdded = 0;
@@ -348,11 +281,11 @@ function doPerReference(bookRows, sourceGroups, ultVerses, log) {
     }
 
     const merged = [...dedupedSource, ...keepRows];
-    if (ultVerses && Object.keys(ultVerses).length && keepRows.length) {
+    if (verseMap && Object.keys(verseMap).length && keepRows.length) {
       merged.sort((a, b) => {
-        const ka = ultPositionKey(a, ultVerses);
-        const kb = ultPositionKey(b, ultVerses);
-        return ka[0] !== kb[0] ? ka[0] - kb[0] : ka[1] - kb[1];
+        const ka = getSequenceSortKey(a, verseMap);
+        const kb = getSequenceSortKey(b, verseMap);
+        return compareSequenceKeys(ka, kb);
       });
     }
 
@@ -373,7 +306,7 @@ function doPerReference(bookRows, sourceGroups, ultVerses, log) {
 
 // --- Full-chapter replacement ---
 
-function doFullChapter(bookRows, sourceRows, chapter, skipIntro, ultVerses, log) {
+function doFullChapter(bookRows, sourceRows, chapter, skipIntro, verseMap, log) {
   const newRows = [...bookRows];
 
   const sourceRefs = new Set();
@@ -544,14 +477,14 @@ function doFullChapter(bookRows, sourceRows, chapter, skipIntro, ultVerses, log)
   // Build combined rows
   const combined = [...normalizedPreserveIntro, ...filteredSourceNormalized, ...keepRows, ...preservedRows];
 
-  // Sort by reference with optional ULT ordering
-  if (ultVerses && Object.keys(ultVerses).length) {
+  // Sort by reference with optional ULT alignment ordering
+  if (verseMap && Object.keys(verseMap).length) {
     combined.sort((a, b) => {
       const refCmp = refCompare(a, b);
       if (refCmp !== 0) return refCmp;
-      const ka = ultPositionKey(a, ultVerses);
-      const kb = ultPositionKey(b, ultVerses);
-      return ka[0] !== kb[0] ? ka[0] - kb[0] : ka[1] - kb[1];
+      const ka = getSequenceSortKey(a, verseMap);
+      const kb = getSequenceSortKey(b, verseMap);
+      return compareSequenceKeys(ka, kb);
     });
   } else {
     combined.sort(refCompare);
@@ -591,13 +524,13 @@ function insertTnRows({ bookFile, sourceFile, chapter, skipIntro = false, ultFil
   if (bookHeader === null) throw new Error('Book file is empty');
   if (!sourceRows.length) throw new Error('Source file has no data rows');
 
-  // Parse ULT verses for intra-verse ordering
-  let ultVerses = {};
+  // Parse ULT alignments for intra-verse ordering
+  let verseMap = {};
   if (ultFile) {
     try {
-      ultVerses = parseUltVerses(ultFile, chapter);
-      if (Object.keys(ultVerses).length) {
-        log.push(`Loaded ULT verse text for ${Object.keys(ultVerses).length} verses (intra-verse ordering enabled)`);
+      verseMap = buildAlignmentMap(ultFile);
+      if (Object.keys(verseMap).length) {
+        log.push(`Loaded ULT alignments for ${Object.keys(verseMap).length} verses (intra-verse ordering enabled)`);
       }
     } catch (e) {
       log.push(`WARNING: Could not parse ULT file: ${e.message}`);
@@ -609,7 +542,7 @@ function insertTnRows({ bookFile, sourceFile, chapter, skipIntro = false, ultFil
   if (skipIntro) log.push('Preserving existing intro row (--skip-intro)');
 
   const [newRows, totalRemoved, totalAdded] = doFullChapter(
-    bookRows, sourceRows, chapter, skipIntro, ultVerses, log
+    bookRows, sourceRows, chapter, skipIntro, verseMap, log
   );
 
   log.push('');
