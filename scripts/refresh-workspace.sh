@@ -35,7 +35,9 @@ git fetch origin main 2>&1 || { echo "[refresh-workspace] fetch failed; skip"; e
 # The quoted pathspec keeps git (not the shell) expanding the glob, and scopes
 # the capture to just the decision CSVs. Only these tracked files are mutated at
 # runtime, so nothing else needs preserving across the reset.
-CSV_PATCH="$(mktemp 2>/dev/null || echo /tmp/refresh-csv-delta.patch)"
+# PID-suffixed fallback path so two overlapping deploys can't clobber each other's
+# capture if mktemp is unavailable (unlikely — single Fly machine — but cheap).
+CSV_PATCH="$(mktemp 2>/dev/null || echo "/tmp/refresh-csv-delta.$$.patch")"
 git diff origin/main -- 'data/quick-ref/*_decisions.csv' > "$CSV_PATCH" 2>/dev/null
 
 # Reconcile the skills checkout to origin/main unconditionally — fast-forward OR
@@ -46,10 +48,11 @@ git reset --hard origin/main 2>&1 || echo "[refresh-workspace] reset to origin/m
 # Reapply the captured decision-CSV appends on top of the fresh origin/main.
 # --3way first so an upstream reseed of the same CSVs merges rather than rejects;
 # plain apply as a fallback. On failure the appends stay in $CSV_PATCH (not lost).
+CSV_APPLIED=1
 if [ -s "$CSV_PATCH" ]; then
   git apply --3way "$CSV_PATCH" 2>/dev/null \
     || git apply "$CSV_PATCH" 2>/dev/null \
-    || echo "[refresh-workspace] could not re-apply decision-CSV delta (kept at $CSV_PATCH)"
+    || { CSV_APPLIED=0; echo "[refresh-workspace] could not re-apply decision-CSV delta (kept at $CSV_PATCH)"; }
 fi
 
 # Commit runtime decision-CSV appends back to origin/main so accumulated
@@ -74,7 +77,11 @@ if [ "$AHEAD" != "0" ]; then
   git push origin HEAD:main 2>&1 || echo "[refresh-workspace] push failed; local commit self-heals next deploy (reset --hard re-captures the delta)"
 fi
 
-rm -f "$CSV_PATCH" 2>/dev/null
+# Remove the temp patch only when it applied cleanly (or was empty). On apply
+# failure keep it so the captured rows stay recoverable at the logged path.
+if [ "$CSV_APPLIED" = 1 ]; then
+  rm -f "$CSV_PATCH" 2>/dev/null
+fi
 
 # Keep the tree writable by the app user in case this ran as root.
 chown -R botuser:botuser "$WS/.claude" "$WS/data" "$WS/.git" 2>/dev/null || true
