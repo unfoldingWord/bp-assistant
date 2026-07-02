@@ -22,6 +22,8 @@ const {
   buildGuardrailStopDiagnosis,
   buildAlignMissingOutputDiagnosis,
   isAlignMissingOutput,
+  buildAlignTransportClosedDiagnosis,
+  isAlignTransportClosed,
   FINGERPRINT_PREFIX,
 } = require('../src/self-diagnosis');
 
@@ -510,5 +512,79 @@ test('dispatchSelfDiagnosis short-circuits an align "no aligned output found" wi
   assert.equal(calls.createCount, 1);
   assert.ok(calls.lastCreateBody.labels.includes('align-missing-output'));
   assert.match(calls.lastCreateBody.title, /align: no aligned output found/);
+  assert.match(calls.lastCreateBody.body, /pipeline-failure-fingerprint:/);
+});
+
+test('isAlignTransportClosed matches the align-all-parallel MCP-transport-closed signature', () => {
+  assert.equal(
+    isAlignTransportClosed('**align-all-parallel** failed for JER 33 at 2026-07-02T19:31:00.000Z — JER 33 — align-all-parallel aborted: workspace-tools MCP transport closed (Stream closed) before aligned USFM was produced'),
+    true,
+  );
+  assert.equal(
+    isAlignTransportClosed('Phase: align-all-parallel\nChapter: JER 33\nStream closed'),
+    true,
+    'align phase + "Stream closed" is enough',
+  );
+  // Missing-output stops keep their own template — a "no aligned output found"
+  // summary without a transport signal must NOT match this one.
+  assert.equal(
+    isAlignTransportClosed('AMO 5 — ULT: no aligned output found'),
+    false,
+  );
+  // "Stream closed" outside an align context doesn't match (avoids stealing other
+  // phases' diagnoses).
+  assert.equal(
+    isAlignTransportClosed('tn-writer failed: Stream closed'),
+    false,
+  );
+  assert.equal(isAlignTransportClosed(''), false);
+  assert.equal(isAlignTransportClosed(null), false);
+  assert.equal(isAlignTransportClosed(undefined), false);
+});
+
+test('buildAlignTransportClosedDiagnosis returns a templated issue tagged align-transport-closed', () => {
+  const event = makePsa1Event({
+    pipelineType: 'generate',
+    scope: 'JER 33',
+    phase: 'align',
+    message: '**align-all-parallel** failed for JER 33 — workspace-tools MCP transport closed (Stream closed)',
+  });
+  const d = buildAlignTransportClosedDiagnosis(event, 'some context');
+  assert.ok(d.title.length <= 120);
+  assert.match(d.title, /align: MCP transport closed/);
+  assert.ok(d.labels.includes('align-transport-closed'));
+  assert.equal(d.classification, 'align-transport-closed');
+  assert.match(d.body, /salvageAlignedFromMappingJson/);
+  assert.match(d.body, /Stream closed/);
+});
+
+test('dispatchSelfDiagnosis short-circuits an align "Stream closed" transport failure without invoking the agent', async () => {
+  const event = makePsa1Event({
+    pipelineType: 'generate',
+    scope: 'JER 33',
+    phase: 'align',
+    message: '**align-all-parallel** failed for JER 33 at 2026-07-02T19:31:00.000Z — JER 33 — align-all-parallel aborted: workspace-tools MCP transport closed (Stream closed) before aligned USFM was produced',
+  });
+  const calls = {};
+  const fetchImpl = createGithubFetchStub({ captureCalls: calls });
+  let claudeWasCalled = false;
+  const runClaudeImpl = async () => { claudeWasCalled = true; return { subtype: 'success', result: VALID_AGENT_OUTPUT }; };
+
+  const result = await dispatchSelfDiagnosis({
+    event,
+    errorText: 'Phase: align-all-parallel\nChapter: JER 33\nworkspace-tools MCP transport closed (Stream closed)',
+    checkpoint: { state: 'failed', current: { errorKind: 'mcp_transport_closed' }, resume: { chapter: 33, skill: 'align-all-parallel' } },
+    runClaudeImpl,
+    fetchImpl,
+    readSecretImpl: () => 'fake-token',
+    readAdminStatusImpl: () => [event],
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.action, 'created-align-transport-closed');
+  assert.equal(claudeWasCalled, false, 'a known MCP-transport-closed stop must not invoke the diagnosis agent');
+  assert.equal(calls.createCount, 1);
+  assert.ok(calls.lastCreateBody.labels.includes('align-transport-closed'));
+  assert.match(calls.lastCreateBody.title, /align: MCP transport closed/);
   assert.match(calls.lastCreateBody.body, /pipeline-failure-fingerprint:/);
 });

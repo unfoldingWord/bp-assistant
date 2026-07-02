@@ -1332,7 +1332,15 @@ async function generatePipeline(route, message) {
       });
       const alignDuration = ((Date.now() - chapterStart) / 1000).toFixed(1);
 
-      if (!alignResult || alignResult.subtype !== 'success') {
+      // The runner bails with this subtype when the in-process workspace-tools MCP
+      // transport is torn down mid-align ("Stream closed"). Don't fail-and-continue:
+      // fall through to the coverage gate + deterministic salvage below, which can
+      // still recover the chapter from any banked mapping JSON without the MCP. Threads
+      // into the final errorKind so self-diagnosis short-circuits (a fresh diagnosis
+      // agent would hit the same dead transport).
+      let transportClosed = !!(alignResult && alignResult.subtype === 'mcp_transport_closed');
+
+      if ((!alignResult || alignResult.subtype !== 'success') && !transportClosed) {
         const errText = !alignResult
           ? 'timed out or was aborted (no result returned)'
           : (alignResult.error || alignResult.result || `non-success subtype: "${alignResult.subtype}"`);
@@ -1360,6 +1368,10 @@ async function generatePipeline(route, message) {
           resume: { chapter: ch, skill: 'align-all-parallel' },
         });
         continue;
+      }
+
+      if (transportClosed) {
+        await status(`**align-all-parallel** hit an MCP transport outage (Stream closed) for ${book} ${ch} on the first pass — attempting salvage from any banked mapping JSON before failing.`);
       }
 
       // Record metrics for align-all-parallel
@@ -1452,6 +1464,7 @@ async function generatePipeline(route, message) {
           },
         });
         if (!retryResult || retryResult.subtype !== 'success') {
+          if (retryResult && retryResult.subtype === 'mcp_transport_closed') transportClosed = true;
           finalValidationSummary = !retryResult
             ? 'retry timed out or was aborted (no result returned)'
             : (retryResult.error || retryResult.result || `retry non-success subtype: "${retryResult.subtype}"`);
@@ -1527,6 +1540,19 @@ async function generatePipeline(route, message) {
           else if (reasons.includes('incomplete')) { errorKind = 'incomplete_coverage'; outputStatus = 'incomplete'; }
           else if (reasons.includes('stale')) { errorKind = 'stale_output'; outputStatus = 'stale'; }
           else { errorKind = 'missing_output'; outputStatus = 'missing'; }
+        }
+        if (transportClosed) {
+          // The align coordinator's in-process workspace-tools MCP transport was torn
+          // down mid-run ("Stream closed") and salvage could not close the gap from
+          // banked mapping JSON. Record a distinct kind (overriding the coverage-derived
+          // one) so self-diagnosis short-circuits to a templated issue — a fresh LLM
+          // diagnosis agent would hit the same dead transport — and enrich the summary
+          // so that short-circuit's text match fires.
+          errorKind = 'mcp_transport_closed';
+          if (outputStatus === 'degraded') outputStatus = 'missing';
+          if (!/transport closed|stream closed/i.test(finalValidationSummary || '')) {
+            finalValidationSummary = `${book} ${ch} — align-all-parallel aborted: workspace-tools MCP transport closed (Stream closed) before aligned USFM was produced${finalValidationSummary ? `; ${finalValidationSummary}` : ''}`;
+          }
         }
         const failEvent = await status(`**align-all-parallel** failed for ${book} ${ch} at ${new Date().toISOString()} — ${finalValidationSummary}`);
         fail++;

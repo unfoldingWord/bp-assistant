@@ -395,6 +395,18 @@ function isAlignMissingOutput(text) {
   return /no aligned output found/i.test(msg) && /align/i.test(msg);
 }
 
+// True when the align failure is the in-process workspace-tools MCP transport being
+// torn down mid-run ("Stream closed"), typically an align sub-agent outliving the
+// parent query's message stream (JER 33, 2026-07-02). The runner now bails fast
+// (`mcp_transport_closed`) and the pipeline salvages from banked mapping JSON; when
+// salvage can't close the gap this signature reaches diagnosis. A fresh LLM agent
+// would hit the same dead transport, so short-circuit to a templated issue.
+function isAlignTransportClosed(text) {
+  const msg = typeof text === 'string' ? text : String((text && text.message) || text || '');
+  if (!msg) return false;
+  return /(stream closed|mcp transport closed)/i.test(msg) && /align/i.test(msg);
+}
+
 // Templated diagnosis for the "align-all-parallel: no aligned output found"
 // signature. Skips the LLM investigation (which was timing out on real runs —
 // AMO 5, 2026-07-01) and files a concise, actionable issue that points at the
@@ -446,6 +458,60 @@ function buildAlignMissingOutputDiagnosis(event, contextSummary) {
     body,
     labels: ['bug', 'pipeline-failure', 'align-missing-output'],
     classification: 'align-missing-output',
+  };
+}
+
+// Templated diagnosis for the "align-all-parallel: MCP transport closed" signature.
+// Skips the LLM investigation (which would hit the same dead in-process transport)
+// and files a concise, actionable issue pointing at the runner bail, the salvage
+// path, and the sub-agent lifecycle as the root cause to chase if it recurs.
+function buildAlignTransportClosedDiagnosis(event, contextSummary) {
+  const targetRepo = classifyRepo(event);
+  const scopeLabel = event.scope || event.pipelineType || 'event';
+  const title = `Pipeline failure: ${event.pipelineType || 'generate'} ${scopeLabel} — align: MCP transport closed (Stream closed)`
+    .slice(0, 120);
+  const body = [
+    '## Summary',
+    'The in-process `workspace-tools` MCP transport was torn down mid-alignment: every',
+    '`create_aligned_usfm` call returned `Stream closed` (a transport-level error, not a',
+    "tool error). The typical cause is an align sub-agent outliving the parent query's",
+    'message stream (observed: JER 33, 2026-07-02). The transport does not recover within',
+    'a session, so the runner now bails after a few consecutive `Stream closed` results',
+    '(`mcp_transport_closed`) instead of looping to the skill timeout, and the pipeline',
+    'attempts deterministic Node-side salvage (`salvageAlignedFromMappingJson`) from any',
+    'banked mapping JSON. This issue was filed because salvage could not fully recover the',
+    'chapter; the LLM diagnosis agent was skipped because it would hit the same dead transport.',
+    '',
+    '## Failure event',
+    `- pipelineType: ${event.pipelineType || '(unknown)'}`,
+    `- scope: ${event.scope || '(none)'}`,
+    `- phase: ${event.phase || '(none)'}`,
+    `- severity: ${event.severity || '(unknown)'}`,
+    `- message: ${event.message || '(none)'}`,
+    '',
+    '## Next steps',
+    '- Re-run the chapter — a fresh query spawns a fresh in-process MCP transport, and the',
+    '  banked mapping JSON in `tmp/alignments/` makes the conversion fast on the retry.',
+    '- If it recurs on the same chapter, chase the root cause: the align skill leaving a',
+    '  `general-purpose` batch sub-agent still calling MCP tools after the parent query',
+    "  stream has closed (sub-agent lifecycle vs. the coordinator's message stream).",
+    '- Confirm salvage ran: inspect `output/AI-ULT/<BOOK>/<TAG>-aligned.usfm` and',
+    '  `output/AI-UST/<BOOK>/<TAG>-aligned.usfm` for partial verse coverage.',
+    '',
+    '## Diagnosis context',
+    '<details><summary>Click to expand</summary>',
+    '',
+    '```',
+    String(contextSummary || '').slice(0, 8000),
+    '```',
+    '</details>',
+  ].join('\n');
+  return {
+    repo: targetRepo,
+    title,
+    body,
+    labels: ['bug', 'pipeline-failure', 'align-transport-closed'],
+    classification: 'align-transport-closed',
   };
 }
 
@@ -600,6 +666,14 @@ async function dispatchSelfDiagnosis({
       diagnosis = buildGuardrailStopDiagnosis(event, contextSummary);
       shortCircuited = true;
       shortCircuitTag = 'guardrail';
+    } else if (isAlignTransportClosed(errorText) || isAlignTransportClosed(event.message)) {
+      // Known signature — the in-process workspace-tools MCP transport was torn down
+      // mid-align ("Stream closed"). A fresh diagnosis agent would hit the same dead
+      // transport, so short-circuit to a templated issue.
+      console.log('[self-diagnosis] Align "Stream closed" MCP-transport signature recognized; filing templated issue without running the agent.');
+      diagnosis = buildAlignTransportClosedDiagnosis(event, contextSummary);
+      shortCircuited = true;
+      shortCircuitTag = 'align-transport-closed';
     } else if (isAlignMissingOutput(errorText) || isAlignMissingOutput(event.message)) {
       // Known signature — align-all-parallel produced no aligned output. The LLM
       // diagnosis agent times out on this signature (issue #174), so short-circuit.
@@ -713,6 +787,8 @@ module.exports = {
   buildGuardrailStopDiagnosis,
   buildAlignMissingOutputDiagnosis,
   isAlignMissingOutput,
+  buildAlignTransportClosedDiagnosis,
+  isAlignTransportClosed,
   buildIncompleteDiagnosis,
   buildContextSummary,
   appendFingerprintMarker,

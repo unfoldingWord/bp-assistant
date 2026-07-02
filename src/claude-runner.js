@@ -279,6 +279,15 @@ async function runClaudeOnce({
   let localTimeoutFired = false;
   const toolErrorSigs = new Map();
   let consecutiveToolErrors = 0;
+  // Repeated "Stream closed" tool_results mean the in-process workspace-tools MCP
+  // transport has been torn down (typically an align sub-agent outliving the parent
+  // query's message stream — JER 33, 2026-07-02). It is transport-level, not a tool
+  // error, and never recovers within a session, so retrying is pure wasted wall-clock
+  // (observed: 15+ min looping to the skill timeout). Bail after a few and return a
+  // distinct outcome so the caller can salvage from banked mapping JSON / short-circuit.
+  const MCP_TRANSPORT_ERROR_LIMIT = 3;
+  let consecutiveTransportErrors = 0;
+  let transportClosedFired = false;
 
   const timer = setTimeout(() => {
     localTimeoutFired = true;
@@ -354,8 +363,33 @@ async function runClaudeOnce({
           ? message.message.content
           : JSON.stringify(message.message?.content || '');
         const lower = text.toLowerCase();
+        // Transport-level teardown of the in-process workspace-tools MCP surfaces as an
+        // is_error tool_result whose content is "Stream closed" (NOT a tool_use_error):
+        // the channel is gone, so every subsequent MCP call fails identically until the
+        // query ends. Retrying can't help — bail fast after a few.
+        const isTransportClosed = lower.includes('stream closed') && lower.includes('is_error');
         const isToolError = lower.includes('tool_use_error');
-        if (isToolError) {
+        if (isTransportClosed) {
+          consecutiveTransportErrors += 1;
+          console.warn(
+            `${runnerPrefix} MCP transport error ("Stream closed") ` +
+            `${consecutiveTransportErrors}/${MCP_TRANSPORT_ERROR_LIMIT} — ` +
+            `workspace-tools stream is closed; retrying is futile within this session`
+          );
+          if (consecutiveTransportErrors >= MCP_TRANSPORT_ERROR_LIMIT) {
+            transportClosedFired = true;
+            console.error(
+              `${runnerPrefix} Aborting query — workspace-tools MCP transport closed ` +
+              `(${consecutiveTransportErrors} consecutive "Stream closed"). The in-process ` +
+              `SDK MCP transport does not recover within a session; bailing to salvage / ` +
+              `short-circuit instead of looping to the ${timeout / 1000}s timeout.`
+            );
+            abortController.abort();
+            break;
+          }
+        } else if (isToolError) {
+          // A live tool-level error means the MCP transport is up again.
+          consecutiveTransportErrors = 0;
           const sig = lower.includes('string to replace not found')
             ? 'string_not_found'
             : lower.includes('no changes to make')
@@ -381,6 +415,7 @@ async function runClaudeOnce({
           // Only reset on non-error tool results to avoid false positives during
           // legitimate read/validation sequences.
           consecutiveToolErrors = 0;
+          consecutiveTransportErrors = 0;
         }
         if (text.includes('command-stderr') || text.includes('Error')) {
           console.error(`${runnerPrefix} SDK user message (error): ${text.slice(0, 500)}`);
@@ -450,6 +485,25 @@ async function runClaudeOnce({
   // so callers can classify AT failures precisely instead of lumping everything
   // into "empty response".
   const elapsedMs = Date.now() - queryStart;
+  // The in-process workspace-tools MCP transport was torn down mid-run — take
+  // precedence over the abort→timeout classification below (we abort()ed to bail).
+  if (transportClosedFired) {
+    console.warn(
+      `${runnerPrefix} Returning mcp_transport_closed outcome — ` +
+      `reason=mcp_transport_closed consecutive=${consecutiveTransportErrors} elapsed=${elapsedMs}ms`
+    );
+    return {
+      subtype: 'mcp_transport_closed',
+      timedOut: false,
+      reason: 'mcp_transport_closed',
+      queryId,
+      elapsedMs,
+      configuredTimeoutMs: timeout,
+      turnCount,
+      lastTool,
+      consecutiveTransportErrors,
+    };
+  }
   if (localTimeoutFired || abortController.signal.aborted) {
     const driftMs = elapsedMs - timeout;
     console.warn(
