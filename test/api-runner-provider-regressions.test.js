@@ -7,6 +7,8 @@ const path = require('path');
 const {
   getProviderConfig,
   resolveProviderModel,
+  resolveDifficultyModel,
+  resolveDifficultyEffort,
 } = require('../src/api-runner/provider-config');
 const { parseArgs } = require('../src/api-runner/cli');
 const {
@@ -692,4 +694,36 @@ test('readPreparedNotes accepts object-backed prepared_notes packets', () => {
   const summary = JSON.parse(readPreparedNotes({ preparedJson: preparedRel, summaryOnly: true }));
   assert.equal(summary.total, 2);
   assert.deepEqual(summary.ids, ['a1b2', 'c3d4']);
+});
+
+test('difficulty tiers resolve to Opus with tier-as-effort (Opus everywhere)', () => {
+  for (const tier of ['low', 'medium', 'high']) {
+    assert.equal(resolveDifficultyModel('claude', tier), 'claude-opus-4-8', `${tier} -> Opus`);
+    assert.equal(resolveDifficultyEffort(tier), tier, `${tier} -> effort ${tier}`);
+  }
+  // Non-tier values pass through unchanged; no effort override.
+  assert.equal(resolveDifficultyModel('claude', 'sonnet'), 'sonnet');
+  assert.equal(resolveDifficultyModel('claude', 'opus'), 'opus');
+  assert.equal(resolveDifficultyEffort('opus'), null);
+  assert.equal(resolveDifficultyEffort(undefined), null);
+});
+
+test('BP_FORCE_MODEL forces model and opts out of effort mapping', () => {
+  process.env.BP_FORCE_MODEL = 'claude-sonnet-5';
+  try {
+    assert.equal(resolveDifficultyModel('claude', 'high'), 'claude-sonnet-5');
+    assert.equal(resolveDifficultyEffort('high'), null);
+  } finally {
+    delete process.env.BP_FORCE_MODEL;
+  }
+});
+
+test('BP_MODEL_<TIER> pins a tier to a model and opts out of effort mapping', () => {
+  process.env.BP_MODEL_LOW = 'haiku';
+  try {
+    assert.equal(resolveDifficultyModel('claude', 'low'), 'claude-haiku-4-5-20251001');
+    assert.equal(resolveDifficultyEffort('low'), null);
+  } finally {
+    delete process.env.BP_MODEL_LOW;
+  }
 });

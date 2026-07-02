@@ -5,7 +5,7 @@ const { ensureFreshToken } = require('./auth-refresh');
 const { recordRateLimit, getHeadroom } = require('./usage-tracker');
 const { createWorkspaceTools, createTnWriterTools, createQualityTools, createIssueIdTools } = require('./workspace-tools');
 const { publishAdminStatus } = require('./admin-status');
-const { resolveDifficultyModel } = require('./api-runner/provider-config');
+const { resolveDifficultyModel, resolveDifficultyEffort } = require('./api-runner/provider-config');
 
 let _query = null;
 let _sdkCreateSdkMcpServer = null;
@@ -162,10 +162,14 @@ function buildOptions({
   if (resume) {
     options.resume = resume;
   }
-  // Resolve difficulty tiers (low/medium/high) and apply per-run model overrides
-  // (BP_FORCE_MODEL / BP_MODEL_*). No override + non-tier value => unchanged.
-  options.model = resolveDifficultyModel('claude', model || 'opus');
-  const reasoning = resolveReasoning(thinking, options.model);
+  // Resolve difficulty tiers (low/medium/high) -> top model (Opus) + effort, and
+  // apply per-run overrides (BP_FORCE_MODEL / BP_MODEL_*). Non-tier value => model
+  // unchanged. When the caller didn't pass an explicit `thinking`, a difficulty
+  // tier sets the reasoning effort (that's the cost/latency lever now).
+  const requestedModel = model || 'opus';
+  options.model = resolveDifficultyModel('claude', requestedModel);
+  const tierEffort = resolveDifficultyEffort(requestedModel);
+  const reasoning = resolveReasoning(thinking != null ? thinking : tierEffort, options.model);
   if (reasoning.thinking) options.thinking = reasoning.thinking;
   if (reasoning.effort) options.effort = reasoning.effort;
   if (betas) {
@@ -194,10 +198,16 @@ function buildOptions({
         const ti = input.tool_input;
         if (!ti || typeof ti !== 'object' || typeof ti.model !== 'string') return {};
         const resolved = resolveDifficultyModel('claude', ti.model);
-        if (!resolved || resolved === ti.model) return {};
-        // Auditable: makes a per-run force/override observable in run logs.
-        console.log(`[model-select] ${tool} sub-agent model ${ti.model} -> ${resolved}${process.env.BP_FORCE_MODEL ? ' (forced)' : ''}`);
-        return { hookSpecificOutput: { hookEventName: 'PreToolUse', updatedInput: { ...ti, model: resolved } } };
+        const tierEffort = resolveDifficultyEffort(ti.model); // set effort only when spawn used a tier and caller didn't specify one
+        const modelChanged = resolved && resolved !== ti.model;
+        const effortChanged = tierEffort && ti.effort == null && ti.effort !== tierEffort;
+        if (!modelChanged && !effortChanged) return {};
+        const updatedInput = { ...ti };
+        if (modelChanged) updatedInput.model = resolved;
+        if (effortChanged) updatedInput.effort = tierEffort;
+        // Auditable: makes a per-run force/override + difficulty->effort observable in run logs.
+        console.log(`[model-select] ${tool} sub-agent ${ti.model}${modelChanged ? ` model->${resolved}` : ''}${effortChanged ? ` effort->${tierEffort}` : ''}${process.env.BP_FORCE_MODEL ? ' (forced)' : ''}`);
+        return { hookSpecificOutput: { hookEventName: 'PreToolUse', updatedInput } };
       } catch (err) {
         console.warn(`[claude-runner] model-resolver hook error: ${err.message}`);
         return {};
