@@ -291,32 +291,49 @@ function resolveProviderModel(provider, model) {
   return cfg.modelAliases?.[candidate] || candidate;
 }
 
-// Difficulty-based model selection. Jobs declare a DIFFICULTY tier
-// (low/medium/high), never a specific model; this maps tier -> model via
-// `autoModelByThinking` (the single permanent source of truth). Two per-run
-// overrides let a benchmark or experiment change models without editing skills:
-//   - BP_FORCE_MODEL  : the "all" tier — force EVERY job onto one model/alias
-//                       (the clean whole-pipeline A/B knob).
-//   - BP_MODEL_{LOW,MEDIUM,HIGH} : override a single tier for the run.
-// Behavior-preserving: when no override is set and `requested` is not a tier
-// name (i.e. it's already an alias/concrete id like opus/sonnet/haiku/undefined),
-// the value passes through UNCHANGED — so existing call sites are byte-identical.
+// Difficulty-based selection. Jobs declare a DIFFICULTY tier (low/medium/high),
+// never a specific model. Difficulty maps to reasoning EFFORT on the top model
+// (Opus): every tier runs Opus, and the tier controls how hard it thinks.
+// Rationale: the clean JOS 3 A/B showed Opus is both higher-quality AND fewer
+// tokens than Sonnet on the heavy pipeline work, so downgrading the model class
+// to save cost was a false economy (and weak models mishandled USFM shape in the
+// split/merge orchestration). The cost/latency lever is now thinking effort, not
+// model class. Pair resolveDifficultyModel (-> Opus) with resolveDifficultyEffort
+// (-> the tier as an EffortLevel).
+// Per-run overrides:
+//   - BP_FORCE_MODEL  : force EVERY job onto one model/alias (whole-pipeline A/B knob).
+//   - BP_MODEL_{LOW,MEDIUM,HIGH} : pin a tier to a specific model for a run.
+// Non-tier values (opus/sonnet/haiku/concrete/undefined) pass through UNCHANGED.
 const DIFFICULTY_TIERS = { low: 'BP_MODEL_LOW', medium: 'BP_MODEL_MEDIUM', high: 'BP_MODEL_HIGH' };
+function isDifficultyTier(x) {
+  return typeof x === 'string' && Object.prototype.hasOwnProperty.call(DIFFICULTY_TIERS, x.toLowerCase());
+}
+function topModel(cfg) {
+  return cfg.difficultyModel || cfg.modelAliases?.opus || cfg.defaultModel;
+}
 function resolveDifficultyModel(provider, requested) {
   let cfg;
   try { cfg = getProviderConfig(provider); } catch { return requested; }
   const force = process.env.BP_FORCE_MODEL;
   if (force) return cfg.modelAliases?.[force] || force;
-  if (typeof requested === 'string') {
+  if (isDifficultyTier(requested)) {
     const tier = requested.toLowerCase();
-    if (Object.prototype.hasOwnProperty.call(DIFFICULTY_TIERS, tier)) {
-      const override = process.env[DIFFICULTY_TIERS[tier]];
-      if (override) return cfg.modelAliases?.[override] || override;
-      const mapped = cfg.difficultyModels?.[tier] || cfg.autoModelByThinking?.[tier];
-      if (mapped) return cfg.modelAliases?.[mapped] || mapped;
-    }
+    const override = process.env[DIFFICULTY_TIERS[tier]];
+    if (override) return cfg.modelAliases?.[override] || override;
+    return topModel(cfg); // every tier runs the top model; the tier is an EFFORT level
   }
   return requested;
+}
+// Difficulty tier -> reasoning EffortLevel ('low'|'medium'|'high'). This is the
+// cost/latency lever now that all tiers share one model. Returns null for
+// non-tier inputs (no effort override) and when a per-run BP_MODEL_* pin is set
+// (an explicit model pin opts out of the effort mapping).
+function resolveDifficultyEffort(requested) {
+  if (process.env.BP_FORCE_MODEL) return null;
+  if (!isDifficultyTier(requested)) return null;
+  const tier = requested.toLowerCase();
+  if (process.env[DIFFICULTY_TIERS[tier]]) return null;
+  return tier;
 }
 
 function isConfiguredModel(provider, model) {
@@ -359,6 +376,8 @@ module.exports = {
   getProviderNames,
   resolveProviderModel,
   resolveDifficultyModel,
+  resolveDifficultyEffort,
+  isDifficultyTier,
   resolveXaiModel,
   resolveAutoModel,
   isConfiguredModel,
