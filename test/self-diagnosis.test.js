@@ -20,6 +20,8 @@ const {
   appendFingerprintMarker,
   buildContextSummary,
   buildGuardrailStopDiagnosis,
+  buildAlignMissingOutputDiagnosis,
+  isAlignMissingOutput,
   FINGERPRINT_PREFIX,
 } = require('../src/self-diagnosis');
 
@@ -437,4 +439,76 @@ test('buildGuardrailStopDiagnosis returns a templated issue tagged guardrail-sto
   assert.ok(d.labels.includes('guardrail-stop'));
   assert.equal(d.classification, 'guardrail-stop');
   assert.match(d.body, /guardrail/i);
+});
+
+test('isAlignMissingOutput matches the align-all-parallel missing-output signature', () => {
+  assert.equal(
+    isAlignMissingOutput('**align-all-parallel** failed for AMO 5 at 2026-07-01T23:34:53.134Z — AMO 5 — ULT: no aligned output found || UST: no aligned output found'),
+    true,
+  );
+  assert.equal(
+    isAlignMissingOutput('AMO 5 — ULT: no aligned output found'),
+    true,
+    'align + no-aligned-output-found alone is enough — the failure message may omit the phase name',
+  );
+  // Guardrail stops still get their own template — no double-match.
+  assert.equal(
+    isAlignMissingOutput('Guardrail stop: repeated tool errors (string_not_found, consecutive=17)'),
+    false,
+  );
+  // Unrelated failures don't match.
+  assert.equal(
+    isAlignMissingOutput('**PSA 1** failed: expected output file missing: output/tq/PSA/PSA-001.tsv'),
+    false,
+  );
+  assert.equal(isAlignMissingOutput(''), false);
+  assert.equal(isAlignMissingOutput(null), false);
+  assert.equal(isAlignMissingOutput(undefined), false);
+});
+
+test('buildAlignMissingOutputDiagnosis returns a templated issue tagged align-missing-output', () => {
+  const event = makePsa1Event({
+    pipelineType: 'generate',
+    scope: 'AMO 5',
+    phase: 'align',
+    message: '**align-all-parallel** failed for AMO 5 — AMO 5 — ULT: no aligned output found || UST: no aligned output found',
+  });
+  const d = buildAlignMissingOutputDiagnosis(event, 'some context');
+  assert.ok(d.title.length <= 120);
+  assert.match(d.title, /align: no aligned output found/);
+  assert.ok(d.labels.includes('align-missing-output'));
+  assert.equal(d.classification, 'align-missing-output');
+  assert.match(d.body, /salvageAlignedFromMappingJson/);
+  assert.match(d.body, /tmp\/alignments/);
+});
+
+test('dispatchSelfDiagnosis short-circuits an align "no aligned output found" without invoking the agent', async () => {
+  const event = makePsa1Event({
+    pipelineType: 'generate',
+    scope: 'AMO 5',
+    phase: 'align',
+    message: '**align-all-parallel** failed for AMO 5 at 2026-07-01T23:34:53.134Z — AMO 5 — ULT: no aligned output found || UST: no aligned output found',
+  });
+  const calls = {};
+  const fetchImpl = createGithubFetchStub({ captureCalls: calls });
+  let claudeWasCalled = false;
+  const runClaudeImpl = async () => { claudeWasCalled = true; return { subtype: 'success', result: VALID_AGENT_OUTPUT }; };
+
+  const result = await dispatchSelfDiagnosis({
+    event,
+    errorText: 'Phase: align-all-parallel\nChapter: AMO 5\nAMO 5 — ULT: no aligned output found || UST: no aligned output found',
+    checkpoint: { state: 'failed', resume: { chapter: 5, skill: 'align-all-parallel' } },
+    runClaudeImpl,
+    fetchImpl,
+    readSecretImpl: () => 'fake-token',
+    readAdminStatusImpl: () => [event],
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.action, 'created-align-missing-output');
+  assert.equal(claudeWasCalled, false, 'a known align missing-output stop must not invoke the diagnosis agent');
+  assert.equal(calls.createCount, 1);
+  assert.ok(calls.lastCreateBody.labels.includes('align-missing-output'));
+  assert.match(calls.lastCreateBody.title, /align: no aligned output found/);
+  assert.match(calls.lastCreateBody.body, /pipeline-failure-fingerprint:/);
 });
