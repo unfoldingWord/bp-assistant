@@ -519,7 +519,10 @@ test('runMechanicalQualityPrep forwards Hebrew USFM into quality checks', async 
     }, null, 2));
 
     const summary = await runMechanicalQualityPrep({ notesPath: notesRel, pipeDir });
-    assert.match(summary, /^Quality check: 1 notes, 1 errors, 3 warnings/);
+    // 2 warnings (was 3): template_deviation no longer fires here — this note has
+    // no resolved template_text, and the check no longer falls back to an arbitrary
+    // templates.csv sub-type example (which produced a false positive).
+    assert.match(summary, /^Quality check: 1 notes, 1 errors, 2 warnings/);
   } finally {
     if (oldBaseDir == null) delete process.env.CSKILLBP_DIR;
     else process.env.CSKILLBP_DIR = oldBaseDir;

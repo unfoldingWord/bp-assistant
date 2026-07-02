@@ -34,6 +34,9 @@ async function createFreshWorkspaceToolsServer(toolSet) {
     'tn-writer': createTnWriterTools,
     quality: createQualityTools,
     'issue-id': createIssueIdTools,
+    // Empty server for pure-text calls (per-note/AT generation) that pass
+    // tools:[] — avoids attaching the full ~52-tool workspace set they never use.
+    none: (createServer) => createServer({ name: 'workspace-tools', version: '1.0.0', tools: [] }),
   };
   const factory = factories[toolSet] || createWorkspaceTools;
   return factory(_sdkCreateSdkMcpServer, _sdkTool, _z);

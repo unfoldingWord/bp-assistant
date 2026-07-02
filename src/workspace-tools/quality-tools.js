@@ -445,9 +445,11 @@ async function checkTnQuality({ tsvPath, preparedJson, ultUsfm, ustUsfm, book, h
       addFinding(n.row, n.ref, n.id, 'warning', 'id_collision', `ID "${n.id}" collides with upstream TN`);
     }
 
-    // 4. Hebrew quote (RTL check) — empty quote is error, no RTL is error
+    // 4. Hebrew quote (RTL check) — empty quote is error, no RTL is error.
+    // :intro rows legitimately have an empty Quote column, so exempt them.
+    const isIntroRow = /:intro$/.test(n.ref || '');
     if (!n.quote) {
-      addFinding(n.row, n.ref, n.id, 'error', 'empty_quote', 'Quote column is empty');
+      if (!isIntroRow) addFinding(n.row, n.ref, n.id, 'error', 'empty_quote', 'Quote column is empty');
     } else {
       const hasRtl = /[\u0590-\u05FF\u0600-\u06FF\uFB1D-\uFDFF\uFE70-\uFEFF]/.test(n.quote);
       if (!hasRtl) addFinding(n.row, n.ref, n.id, 'error', 'no_hebrew_in_quote', 'Quote column has no RTL characters');
@@ -757,9 +759,12 @@ async function checkTnQuality({ tsvPath, preparedJson, ultUsfm, ustUsfm, book, h
       }
     }
 
-    // 22. Missing AT when required
+    // 22. Missing AT when required.
+    // Notes that defer to an earlier rendering ("see how you translated ...")
+    // legitimately carry no alternate translation of their own, so exempt them.
     if (resolveAtRequirement(prepItem).at_required) {
-      if (!n.note.includes('Alternate translation:')) {
+      const refersToEarlierRendering = /see how you translated/i.test(n.note);
+      if (!n.note.includes('Alternate translation:') && !refersToEarlierRendering) {
         addFinding(n.row, n.ref, n.id, 'error', 'missing_at', 'Note requires Alternate translation but none found');
       }
     }
@@ -827,14 +832,15 @@ async function checkTnQuality({ tsvPath, preparedJson, ultUsfm, ustUsfm, book, h
       }
     }
 
-    // 25. Template conformance — note opening must match the first fixed phrase from its canonical template
+    // 25. Template conformance — note opening must match the first fixed phrase
+    // from the RESOLVED template selected for this note (prepItem.template_text).
+    // Do not fall back to the first templates.csv row for the sref: that pulls in
+    // a different sub-type's filled example (e.g. figs-metaphor "heart", whose
+    // fixed phrase is "represents where a person's thoughts/feelings ... exist"),
+    // which a note on another passage legitimately will not contain — a false
+    // positive. With no resolved template, skip the check.
     {
-      const srefSlug = n.sref ? (n.sref.match(/translate\/([^\s;,]+)/) || [])[1] : '';
-      let templateText = prepItem?.template_text || '';
-      if (!templateText && srefSlug) {
-        const tpl = _templateMap.get(srefSlug);
-        if (tpl && tpl.length) templateText = tpl[0].template;
-      }
+      const templateText = prepItem?.template_text || '';
       if (templateText) {
         // Extract the first fixed phrase from the template (between start/placeholder boundaries)
         // Strip AT, bold placeholders, and split on ALL-CAPS words
