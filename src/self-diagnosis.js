@@ -382,6 +382,73 @@ function buildFallbackDiagnosis(event, rawText, parseError, contextSummary) {
   };
 }
 
+// True when the failure message matches the well-understood "align-all-parallel
+// produced no aligned output" signature. `assessAlignedChapterCoverage` emits
+// "no aligned output found" when the coordinator returns success but leaves no
+// aligned USFM. The deterministic Node-side salvage (see `salvageAlignedFromMappingJson`
+// in `src/workspace-tools/usfm-tools.js`) is the canonical fix; the LLM diagnosis
+// agent adds nothing and, on chapters with lots of leftover mapping JSON, tends
+// to exhaust its 5-min time budget before producing usable JSON (issue #174).
+function isAlignMissingOutput(text) {
+  const msg = typeof text === 'string' ? text : String((text && text.message) || text || '');
+  if (!msg) return false;
+  return /no aligned output found/i.test(msg) && /align/i.test(msg);
+}
+
+// Templated diagnosis for the "align-all-parallel: no aligned output found"
+// signature. Skips the LLM investigation (which was timing out on real runs —
+// AMO 5, 2026-07-01) and files a concise, actionable issue that points at the
+// deterministic salvage path and the leftover mapping JSON to inspect.
+function buildAlignMissingOutputDiagnosis(event, contextSummary) {
+  const targetRepo = classifyRepo(event);
+  const scopeLabel = event.scope || event.pipelineType || 'event';
+  const title = `Pipeline failure: ${event.pipelineType || 'generate'} ${scopeLabel} — align: no aligned output found`
+    .slice(0, 120);
+  const body = [
+    '## Summary',
+    '`align-all-parallel` reported "no aligned output found" for one or both of ULT/UST.',
+    'This is a well-understood failure mode: the alignment coordinator returned success',
+    'but produced no merged aligned USFM (typically leaving only per-verse mapping JSON',
+    'in `tmp/alignments`). The deterministic Node-side salvage',
+    '(`salvageAlignedFromMappingJson` in `src/workspace-tools/usfm-tools.js`, wired',
+    'terminally into the align step in `src/generate-pipeline.js`) recovers the chapter',
+    'when mapping JSON is present. This templated issue was filed instead of running the',
+    'LLM diagnosis agent because the signature is known and the diagnosis agent has been',
+    'observed to exceed its 5-minute time budget on this failure mode (see #174).',
+    '',
+    '## Failure event',
+    `- pipelineType: ${event.pipelineType || '(unknown)'}`,
+    `- scope: ${event.scope || '(none)'}`,
+    `- phase: ${event.phase || '(none)'}`,
+    `- severity: ${event.severity || '(unknown)'}`,
+    `- message: ${event.message || '(none)'}`,
+    '',
+    '## Next steps',
+    '- Check `tmp/alignments/` under the workspace for leftover per-verse mapping JSON',
+    '  for this chapter (naming: `<BOOK>-<NN>-vNN.json` or `<BOOK>-<NNN>-vNN.json`).',
+    '- If mapping JSON is present, salvage should have produced partial (or full) recovery —',
+    '  inspect `output/AI-ULT/<BOOK>/<TAG>-aligned.usfm` and',
+    '  `output/AI-UST/<BOOK>/<TAG>-aligned.usfm` for verse coverage before re-running.',
+    '- If no mapping JSON exists, the coordinator failed before creating any batches;',
+    '  investigate the coordinator prompt / model or simply re-run `align-all-parallel`.',
+    '',
+    '## Diagnosis context',
+    '<details><summary>Click to expand</summary>',
+    '',
+    '```',
+    String(contextSummary || '').slice(0, 8000),
+    '```',
+    '</details>',
+  ].join('\n');
+  return {
+    repo: targetRepo,
+    title,
+    body,
+    labels: ['bug', 'pipeline-failure', 'align-missing-output'],
+    classification: 'align-missing-output',
+  };
+}
+
 // Templated diagnosis for a recognized runner guardrail stop (looping tool errors
 // or budget exhaustion). No LLM investigation is run — the signature is well
 // understood — so we file a concise, actionable issue directly.
@@ -525,12 +592,21 @@ async function dispatchSelfDiagnosis({
     let usedFallback = false;
     let parseError = null;
     let shortCircuited = false;
+    let shortCircuitTag = null;
 
     if (isGuardrailStop(errorText) || isGuardrailStop(event.message)) {
       // Known signature — skip the LLM investigation and file a templated issue.
       console.log('[self-diagnosis] Guardrail-stop signature recognized; filing templated issue without running the agent.');
       diagnosis = buildGuardrailStopDiagnosis(event, contextSummary);
       shortCircuited = true;
+      shortCircuitTag = 'guardrail';
+    } else if (isAlignMissingOutput(errorText) || isAlignMissingOutput(event.message)) {
+      // Known signature — align-all-parallel produced no aligned output. The LLM
+      // diagnosis agent times out on this signature (issue #174), so short-circuit.
+      console.log('[self-diagnosis] Align "no aligned output found" signature recognized; filing templated issue without running the agent.');
+      diagnosis = buildAlignMissingOutputDiagnosis(event, contextSummary);
+      shortCircuited = true;
+      shortCircuitTag = 'align-missing-output';
     } else {
       const agentResult = await runDiagnosisAgent({ contextSummary, runClaudeImpl });
       const rawText = agentResult.rawText;
@@ -602,7 +678,9 @@ async function dispatchSelfDiagnosis({
       });
     } catch (_) { /* non-fatal */ }
 
-    const action = shortCircuited ? 'created-guardrail' : (usedFallback ? 'created-fallback' : 'created');
+    const action = shortCircuited
+      ? (shortCircuitTag === 'guardrail' ? 'created-guardrail' : `created-${shortCircuitTag}`)
+      : (usedFallback ? 'created-fallback' : 'created');
     console.log(`[self-diagnosis] Done (action=${action} issue=${finalRepo}#${created.number}${usedFallback ? ' parse-error=' + (parseError && parseError.message ? parseError.message.slice(0, 120) : 'unknown') : ''})`);
     return { ok: true, action, issue: created, fingerprint, classification: diagnosis.classification };
   } catch (err) {
@@ -633,6 +711,8 @@ module.exports = {
   looksLikeDiagnosisAttempt,
   buildFallbackDiagnosis,
   buildGuardrailStopDiagnosis,
+  buildAlignMissingOutputDiagnosis,
+  isAlignMissingOutput,
   buildIncompleteDiagnosis,
   buildContextSummary,
   appendFingerprintMarker,
