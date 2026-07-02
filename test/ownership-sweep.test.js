@@ -54,3 +54,19 @@ test('sweepStaleTmp is a no-op when ttlDays <= 0', () => {
   assert.equal(res, null);
   assert.equal(fs.existsSync(f), true);
 });
+
+test('sweepStaleTmp never touches tmp/pipeline (resumable run state)', () => {
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), 'sweep-tmp-pipe-'));
+  const pipeDir = path.join(base, 'tmp', 'pipeline', 'HAB-01');
+  fs.mkdirSync(pipeDir, { recursive: true });
+  const ctx = path.join(pipeDir, 'context.json');
+  fs.writeFileSync(ctx, '{}');
+  const old = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
+  fs.utimesSync(ctx, old, old);
+  fs.utimesSync(pipeDir, old, old);
+  fs.utimesSync(path.join(base, 'tmp', 'pipeline'), old, old);
+
+  const res = sweepStaleTmp({ baseDir: base, ttlDays: 7, log: silent });
+  assert.equal(res.removed, 0);
+  assert.equal(fs.existsSync(ctx), true);
+});

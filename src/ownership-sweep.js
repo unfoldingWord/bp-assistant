@@ -75,6 +75,10 @@ function sweepStaleTmp({ baseDir = CSKILLBP_DIR, ttlDays = TMP_TTL_DAYS, log = c
   let entries = [];
   try { entries = fs.readdirSync(tmpDir); } catch (_) { return null; }
   for (const e of entries) {
+    // tmp/pipeline holds resumable run state (context.json, prepared/generated
+    // notes) with its own retention policy in pipeline-context.js — a 7-day
+    // scratch TTL here would delete a resumable run out from under a checkpoint.
+    if (e === 'pipeline') continue;
     const p = path.join(tmpDir, e);
     let st;
     try { st = fs.lstatSync(p); } catch (_) { continue; }

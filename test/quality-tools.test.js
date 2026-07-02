@@ -414,3 +414,71 @@ test('checkTnQuality template_deviation compares only the resolved template, not
     .filter((f) => f.category === 'template_deviation').map((f) => f.id);
   assert.deepEqual(deviationIds, ['a2b3']);
 });
+
+test('checkTnQuality missing_at exemption requires a genuine see-how note, not a mid-text mention', async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'quality-seehow-mid-'));
+  const relRoot = path.join('tmp', path.basename(tempDir));
+  fs.mkdirSync(path.join('/srv/bot/workspace', relRoot), { recursive: true });
+
+  const tsvRel = path.join(relRoot, 'tn.tsv');
+  const prepRel = path.join(relRoot, 'prepared_notes.json');
+  const ultRel = path.join(relRoot, 'ult.usfm');
+  const ustRel = path.join(relRoot, 'ust.usfm');
+  const findingsRel = path.join(relRoot, 'findings.json');
+
+  fs.writeFileSync(path.join('/srv/bot/workspace', tsvRel), [
+    'Reference\tID\tTags\tSupportReference\tQuote\tOccurrence\tNote',
+    // Mentions the phrase mid-note but is an ordinary explanatory note: still needs its AT.
+    '1:1\ta1b2\t\trc://*/ta/man/translate/figs-metaphor\tמֶלֶךְ\t1\tHere the figure recurs; see how you translated it earlier, but this occurrence differs.',
+    // Typed see_how item without the leading phrase: exempt via note_type.
+    '1:2\ta2b3\t\trc://*/ta/man/translate/figs-metaphor\tמֶלֶךְ\t1\tTranslate this the same way as before.',
+  ].join('\n'));
+  fs.writeFileSync(path.join('/srv/bot/workspace', prepRel), JSON.stringify({
+    items: [
+      { id: 'a1b2', reference: '1:1', at_required: true, gl_quote: 'king', issue_span_gl_quote: 'king', ult_verse: 'The king spoke.', ust_verse: 'The ruler spoke.' },
+      { id: 'a2b3', reference: '1:2', at_required: true, note_type: 'see_how', gl_quote: 'king', issue_span_gl_quote: 'king', ult_verse: 'The king answered.', ust_verse: 'The ruler answered.' },
+    ],
+  }, null, 2));
+  fs.writeFileSync(path.join('/srv/bot/workspace', ultRel), '\\c 1\n\\v 1 The king spoke.\n\\v 2 The king answered.\n');
+  fs.writeFileSync(path.join('/srv/bot/workspace', ustRel), '\\c 1\n\\v 1 The ruler spoke.\n\\v 2 The ruler answered.\n');
+
+  await checkTnQuality({ tsvPath: tsvRel, preparedJson: prepRel, ultUsfm: ultRel, ustUsfm: ustRel, output: findingsRel });
+
+  const missingAtIds = readFindings(findingsRel)
+    .filter((f) => f.category === 'missing_at').map((f) => f.id);
+  assert.deepEqual(missingAtIds, ['a1b2']);
+});
+
+test('checkTnQuality bold check tolerates curled quotes introduced by post-processing', async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'quality-bold-curl-'));
+  const relRoot = path.join('tmp', path.basename(tempDir));
+  fs.mkdirSync(path.join('/srv/bot/workspace', relRoot), { recursive: true });
+
+  const tsvRel = path.join(relRoot, 'tn.tsv');
+  const prepRel = path.join(relRoot, 'prepared_notes.json');
+  const ultRel = path.join(relRoot, 'ult.usfm');
+  const ustRel = path.join(relRoot, 'ust.usfm');
+  const findingsRel = path.join(relRoot, 'findings.json');
+
+  fs.writeFileSync(path.join('/srv/bot/workspace', tsvRel), [
+    'Reference\tID\tTags\tSupportReference\tQuote\tOccurrence\tNote',
+    // curly_quotes has curled the note's apostrophe; the parsed ULT keeps the straight form.
+    '1:1\ta1b2\t\trc://*/ta/man/translate/figs-metaphor\tמֶלֶךְ\t1\tHere ‘’ aside, the phrase **the king’s word** is a figure.',
+    // A genuinely absent bold span must still be flagged.
+    '1:2\ta2b3\t\trc://*/ta/man/translate/figs-metaphor\tמֶלֶךְ\t1\tHere **the queen’s word** is a figure.',
+  ].join('\n'));
+  fs.writeFileSync(path.join('/srv/bot/workspace', prepRel), JSON.stringify({
+    items: [
+      { id: 'a1b2', reference: '1:1', gl_quote: "the king's word", issue_span_gl_quote: "the king's word", ult_verse: "The king's word stood firm.", ust_verse: 'What the king said stood firm.' },
+      { id: 'a2b3', reference: '1:2', gl_quote: "the king's word", issue_span_gl_quote: "the king's word", ult_verse: "The king's word stood firm.", ust_verse: 'What the king said stood firm.' },
+    ],
+  }, null, 2));
+  fs.writeFileSync(path.join('/srv/bot/workspace', ultRel), "\\c 1\n\\v 1 The king's word stood firm.\n\\v 2 The king's word stood firm.\n");
+  fs.writeFileSync(path.join('/srv/bot/workspace', ustRel), '\\c 1\n\\v 1 What the king said stood firm.\n\\v 2 What the king said stood firm.\n');
+
+  await checkTnQuality({ tsvPath: tsvRel, preparedJson: prepRel, ultUsfm: ultRel, ustUsfm: ustRel, output: findingsRel });
+
+  const boldIds = readFindings(findingsRel)
+    .filter((f) => f.category === 'bold_not_in_ult').map((f) => f.id);
+  assert.deepEqual(boldIds, ['a2b3']);
+});

@@ -3255,6 +3255,7 @@ function readPreparedNotes({ preparedJson, start = 0, end, summaryOnly = false }
 }
 
 module.exports = {
+  countCaseInsensitiveOccurrences,
   extractAlignmentData,
   fixHebrewQuotes,
   flagNarrowQuotes,

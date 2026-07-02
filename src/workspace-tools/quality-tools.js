@@ -6,7 +6,7 @@ const fs = require('fs');
 const path = require('path');
 const https = require('https');
 
-const { loadTemplateMap, resolveAtRequirement, _inspectOpeningBold } = require('./tn-tools');
+const { loadTemplateMap, resolveAtRequirement, _inspectOpeningBold, countCaseInsensitiveOccurrences } = require('./tn-tools');
 
 const CSKILLBP_DIR = process.env.CSKILLBP_DIR || '/srv/bot/workspace';
 
@@ -539,11 +539,13 @@ async function checkTnQuality({ tsvPath, preparedJson, ultUsfm, ustUsfm, book, h
       }
     }
 
-    // 8. Bold accuracy
+    // 8. Bold accuracy — normalized comparison (curly vs straight quotes,
+    // whitespace, case): curly_quotes runs on the TSV before this check, so a
+    // raw includes() would flag valid spans whose apostrophes were curled.
     const boldMatches = n.note.match(/\*\*([^*]+)\*\*/g) || [];
     for (const bold of boldMatches) {
       const text = bold.slice(2, -2);
-      if (ultVerse && !ultVerse.includes(text)) {
+      if (ultVerse && countCaseInsensitiveOccurrences(ultVerse, text) === 0) {
         addFinding(n.row, n.ref, n.id, 'warning', 'bold_not_in_ult', `Bold text "${text.slice(0, 40)}" not in ULT`);
       }
     }
@@ -763,8 +765,12 @@ async function checkTnQuality({ tsvPath, preparedJson, ultUsfm, ustUsfm, book, h
     // Notes that defer to an earlier rendering ("see how you translated ...")
     // legitimately carry no alternate translation of their own, so exempt them.
     if (resolveAtRequirement(prepItem).at_required) {
-      const refersToEarlierRendering = /see how you translated/i.test(n.note);
-      if (!n.note.includes('Alternate translation:') && !refersToEarlierRendering) {
+      // Only genuine see-how notes are exempt: the programmatic shape starts
+      // with the phrase (or the prepared item is typed see_how). A note that
+      // merely mentions the phrase mid-text still needs its AT.
+      const isSeeHowNote = (prepItem?.note_type === 'see_how') ||
+        /^see how you translated/i.test(n.note.trim());
+      if (!n.note.includes('Alternate translation:') && !isSeeHowNote) {
         addFinding(n.row, n.ref, n.id, 'error', 'missing_at', 'Note requires Alternate translation but none found');
       }
     }
@@ -834,13 +840,18 @@ async function checkTnQuality({ tsvPath, preparedJson, ultUsfm, ustUsfm, book, h
 
     // 25. Template conformance — note opening must match the first fixed phrase
     // from the RESOLVED template selected for this note (prepItem.template_text).
-    // Do not fall back to the first templates.csv row for the sref: that pulls in
-    // a different sub-type's filled example (e.g. figs-metaphor "heart", whose
-    // fixed phrase is "represents where a person's thoughts/feelings ... exist"),
-    // which a note on another passage legitimately will not contain — a false
-    // positive. With no resolved template, skip the check.
+    // Falling back to the first templates.csv row for the sref pulls in a
+    // different sub-type's filled example when several templates exist (e.g.
+    // figs-metaphor "heart") — a false positive. So the fallback applies only
+    // when the sref has exactly one template; otherwise, with no resolved
+    // template, skip the check.
     {
-      const templateText = prepItem?.template_text || '';
+      let templateText = prepItem?.template_text || '';
+      if (!templateText) {
+        const srefSlug25 = n.sref ? (n.sref.match(/translate\/([^\s;,]+)/) || [])[1] : '';
+        const tpls25 = srefSlug25 ? _templateMap.get(srefSlug25) : null;
+        if (tpls25 && tpls25.length === 1) templateText = tpls25[0].template;
+      }
       if (templateText) {
         // Extract the first fixed phrase from the template (between start/placeholder boundaries)
         // Strip AT, bold placeholders, and split on ALL-CAPS words
