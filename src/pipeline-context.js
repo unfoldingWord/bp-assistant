@@ -55,6 +55,16 @@ const BOOK_NUMBERS = {
 };
 
 /**
+ * Hebrew-bible source path for a book (e.g. AMO → data/hebrew_bible/30-AMO.usfm).
+ * Returns null for an unknown book abbreviation.
+ */
+function hebrewPathForBook(book) {
+  const bookUpper = String(book).toUpperCase();
+  const num = BOOK_NUMBERS[bookUpper];
+  return num ? `data/hebrew_bible/${num}-${bookUpper}.usfm` : null;
+}
+
+/**
  * Build the pipeline directory name for a chapter.
  * PSA uses 3-digit padding, all others use 2-digit.
  */
@@ -465,4 +475,5 @@ module.exports = {
   buildGenerateContext,
   buildUstContext,
   stripAlignmentMarkers,
+  hebrewPathForBook,
 };

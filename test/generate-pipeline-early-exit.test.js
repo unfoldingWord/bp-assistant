@@ -152,6 +152,7 @@ function createHarness({ runClaudeImpl, initialCheckpoint = null, door43PushImpl
   installStub(pipelineContextPath, {
     buildGenerateContext: () => ({ contextPath: 'tmp/context.json', dirPath: 'tmp/pipeline/ISA-52' }),
     buildUstContext: async () => ({ contextPath: 'tmp/ust-context.json', dirPath: 'tmp/pipeline/ISA-52', selectedUltPath: null }),
+    hebrewPathForBook: (book) => `data/hebrew_bible/00-${String(book).toUpperCase()}.usfm`,
   });
   installStub(selfDiagnosisPath, {
     dispatchSelfDiagnosis: async (payload) => {
