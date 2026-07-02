@@ -166,3 +166,41 @@ test('buildOptions threads hooks + compaction additively; always installs the mo
   assert.equal(both.settings.sandbox.enabled, true);
   assert.equal(both.settings.autoCompactEnabled, true);
 });
+
+// --- enableBash (Phase 1) ----------------------------------------------------
+test('enableBash adds Bash to the allowlist, injects scoped rules, disables sandbox', () => {
+  const prev = process.env.BP_DISABLE_BASH;
+  delete process.env.BP_DISABLE_BASH;
+  try {
+    const opts = buildOptions({ model: 'opus', tools: ['Read', 'Grep'], enableBash: true });
+    assert.ok(opts.tools.includes('Bash'), 'Bash added to tools allowlist');
+    assert.equal(opts.settings.sandbox.enabled, false, 'sandbox disabled (no infra on Fly)');
+    const allow = opts.settings.permissions.allow;
+    assert.ok(allow.some((r) => r.includes('workspace-tools-cli.js')), 'CLI wrapper rule present');
+    assert.ok(allow.every((r) => /^Bash\(/.test(r)), 'only Bash rules');
+    // Composes with compaction without clobbering permissions/sandbox.
+    const withCompact = buildOptions({ model: 'opus', tools: ['Read'], enableBash: true, compaction: { enabled: true } });
+    assert.equal(withCompact.settings.autoCompactEnabled, true);
+    assert.equal(withCompact.settings.sandbox.enabled, false);
+    assert.ok(withCompact.settings.permissions.allow.length > 0);
+  } finally {
+    if (prev === undefined) delete process.env.BP_DISABLE_BASH; else process.env.BP_DISABLE_BASH = prev;
+  }
+});
+
+test('BP_DISABLE_BASH=1 strips Bash even when the caller passed it (kill switch)', () => {
+  const prev = process.env.BP_DISABLE_BASH;
+  process.env.BP_DISABLE_BASH = '1';
+  try {
+    // Caller passes a Bash-containing profile (like DEFAULT_BASH_TOOLS) + enableBash;
+    // the kill switch must remove Bash from the allowlist, not just skip the rules.
+    const opts = buildOptions({ model: 'opus', tools: ['Read', 'Grep', 'Bash'], enableBash: true });
+    assert.ok(!opts.tools.includes('Bash'), 'Bash stripped from tools when disabled');
+    assert.equal(opts.settings, undefined, 'no permission/sandbox settings injected');
+    // allowedTools form too
+    const opts2 = buildOptions({ model: 'opus', allowedTools: ['Read', 'Bash'], enableBash: true });
+    assert.ok(!opts2.allowedTools.includes('Bash'), 'Bash stripped from allowedTools when disabled');
+  } finally {
+    if (prev === undefined) delete process.env.BP_DISABLE_BASH; else process.env.BP_DISABLE_BASH = prev;
+  }
+});
