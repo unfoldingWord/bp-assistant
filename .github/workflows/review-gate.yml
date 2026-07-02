@@ -55,42 +55,31 @@ jobs:
           echo "Resolved reviewer machine: $machine_id"
           echo "machine_id=$machine_id" >> "$GITHUB_OUTPUT"
 
-      # Cross-workflow Fly-machine lock. We no longer rely on a shared
-      # concurrency group between this workflow and review-gate-automerge, so
-      # serialize machine access here: wait until the machine is `stopped`
-      # before reconfiguring it.
-      - name: Wait for machine to be stopped
-        env:
-          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
-          FLY_APP_NAME: ${{ secrets.FLY_APP_NAME }}
-          FLY_MACHINE_ID: ${{ steps.resolve.outputs.machine_id }}
-        run: |
-          set -euo pipefail
-          get_state() {
-            flyctl machines list --app "$FLY_APP_NAME" --json 2>/dev/null \
-              | node -e "let s=''; process.stdin.on('data',c=>s+=c); process.stdin.on('end',()=>{ try { const j=JSON.parse(s); const m=Array.isArray(j)?j.find(x=>x&&x.id===process.argv[1]):null; if (m) process.stdout.write(String(m.state||'')); } catch {} });" \
-                "$FLY_MACHINE_ID" \
-              || echo ""
-          }
-          deadline=$((SECONDS + 1800))
-          state=""
-          while [ "$SECONDS" -lt "$deadline" ]; do
-            state="$(get_state)"
-            if [ "$state" = "stopped" ]; then
-              break
-            fi
-            sleep 10
-          done
-          if [ "$state" != "stopped" ]; then
-            echo "Machine never reached stopped state (last: ${state:-<unknown>}); another workflow may be holding the machine." >&2
-            exit 1
-          fi
-
+      # Cross-workflow Fly-machine lock, implemented as a compare-and-swap
+      # lease on the machine's own env config. The single reviewer machine is
+      # shared across every PR's review-gate run (and the hourly cron), and the
+      # per-PR concurrency group above deliberately does NOT serialize distinct
+      # PRs against each other. The old "wait for stopped, then separately
+      # configure + start" sequence had a TOCTOU gap: two runs could both
+      # observe `stopped` at the same instant, both reconfigure+start the one
+      # machine, and knock it into Fly's `replacing` state -- failing both runs
+      # with a cryptic "entered failure state: replacing".
+      #
+      # Instead we wait for `stopped`, write our PR's env (the claim), then read
+      # the config back. PR_REVIEW_HEAD_SHA is unique per run, so it doubles as
+      # the lease token: if the readback shows our SHA we won the machine; if it
+      # shows another run's SHA we lost the race, so we back off and retry the
+      # whole acquire -- by then the winner has started the machine, so the
+      # wait-for-stopped blocks us until it finishes. Verdicts stay correct
+      # regardless of any residual race because "Read review result" scopes
+      # strictly on our head SHA, so the worst case is a clean, clearly-messaged
+      # failure, never a mis-attributed verdict.
+      #
       # The reviewer Fly machine is one-shot: starting it runs run-hourly-once.sh
       # and exits when the script returns. We can't SSH into a stopped machine,
-      # so instead we configure the machine's env vars to drive a pr-review run,
-      # start it, wait for it to exit, then read the JSON marker out of the logs.
-      - name: Configure machine for pr-review
+      # so driving it means writing env vars, starting it, waiting for it to
+      # exit, then reading the JSON marker out of the logs.
+      - name: Acquire reviewer machine (claim + verify)
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
           FLY_APP_NAME: ${{ secrets.FLY_APP_NAME }}
@@ -102,21 +91,70 @@ jobs:
           REVIEW_PROVIDER: claude
         run: |
           set -euo pipefail
+          get_state() {
+            flyctl machines list --app "$FLY_APP_NAME" --json 2>/dev/null \
+              | node -e "let s=''; process.stdin.on('data',c=>s+=c); process.stdin.on('end',()=>{ try { const j=JSON.parse(s); const m=Array.isArray(j)?j.find(x=>x&&x.id===process.argv[1]):null; if (m) process.stdout.write(String(m.state||'')); } catch {} });" \
+                "$FLY_MACHINE_ID" \
+              || echo ""
+          }
+          # Read back the lease token (PR_REVIEW_HEAD_SHA) from the machine's
+          # committed env config so we can tell whether our claim actually stuck.
+          get_owner() {
+            flyctl machines list --app "$FLY_APP_NAME" --json 2>/dev/null \
+              | node -e "let s=''; process.stdin.on('data',c=>s+=c); process.stdin.on('end',()=>{ try { const j=JSON.parse(s); const m=Array.isArray(j)?j.find(x=>x&&x.id===process.argv[1]):null; const e=m&&m.config?m.config.env:null; if (e) process.stdout.write(String(e.PR_REVIEW_HEAD_SHA||'')); } catch {} });" \
+                "$FLY_MACHINE_ID" \
+              || echo ""
+          }
           # --restart no keeps the machine from auto-looping on non-zero exits,
-          # so the wait-for-stopped poll observes a clean terminal state.
-          flyctl machine update "$FLY_MACHINE_ID" --app "$FLY_APP_NAME" --yes --skip-start --restart no \
-            --env "RUN_MODE=pr-review" \
-            --env "PR_REVIEW_REPO=${REVIEW_REPO}" \
-            --env "PR_REVIEW_NUMBER=${REVIEW_PR}" \
-            --env "PR_REVIEW_BASE_SHA=${REVIEW_BASE}" \
-            --env "PR_REVIEW_HEAD_SHA=${REVIEW_HEAD}" \
-            --env "PR_REVIEW_PROVIDER=${REVIEW_PROVIDER}"
+          # so the completion poll observes a clean terminal state.
+          claim() {
+            flyctl machine update "$FLY_MACHINE_ID" --app "$FLY_APP_NAME" --yes --skip-start --restart no \
+              --env "RUN_MODE=pr-review" \
+              --env "PR_REVIEW_REPO=${REVIEW_REPO}" \
+              --env "PR_REVIEW_NUMBER=${REVIEW_PR}" \
+              --env "PR_REVIEW_BASE_SHA=${REVIEW_BASE}" \
+              --env "PR_REVIEW_HEAD_SHA=${REVIEW_HEAD}" \
+              --env "PR_REVIEW_PROVIDER=${REVIEW_PROVIDER}"
+          }
+          deadline=$((SECONDS + 1800))
+          acquired=0
+          while [ "$SECONDS" -lt "$deadline" ]; do
+            state="$(get_state)"
+            if [ "$state" != "stopped" ]; then
+              # Another run (or the hourly cron) holds the machine; wait it out.
+              sleep 10
+              continue
+            fi
+            if ! claim; then
+              echo "Claim update failed (transient Fly API error); retrying..."
+              sleep 10
+              continue
+            fi
+            # Let a racing writer's update propagate to the API, then confirm we
+            # hold the lease. Fly's list is eventually consistent, so this
+            # narrows -- but does not fully close -- the claim race; the head-SHA
+            # scoping in "Read review result" is the actual correctness backstop.
+            sleep 8
+            owner="$(get_owner)"
+            if [ "$owner" = "$REVIEW_HEAD" ]; then
+              echo "Acquired reviewer machine for PR #${REVIEW_PR} (${REVIEW_HEAD})."
+              acquired=1
+              break
+            fi
+            echo "Lost claim race (machine now leased to '${owner:-<none>}'); backing off and retrying."
+            sleep 15
+          done
+          if [ "$acquired" != "1" ]; then
+            echo "Could not acquire the reviewer machine within ~30m; another workflow may be holding it." >&2
+            exit 1
+          fi
 
       - name: Start machine and wait for completion
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
           FLY_APP_NAME: ${{ secrets.FLY_APP_NAME }}
           FLY_MACHINE_ID: ${{ steps.resolve.outputs.machine_id }}
+          REVIEW_HEAD: ${{ github.event.pull_request.head.sha }}
         run: |
           set -euo pipefail
           flyctl machine start "$FLY_MACHINE_ID" --app "$FLY_APP_NAME"
@@ -127,6 +165,12 @@ jobs:
           get_state() {
             flyctl machines list --app "$FLY_APP_NAME" --json 2>/dev/null \
               | node -e "let s=''; process.stdin.on('data',c=>s+=c); process.stdin.on('end',()=>{ try { const j=JSON.parse(s); const m=Array.isArray(j)?j.find(x=>x&&x.id===process.argv[1]):null; if (m) process.stdout.write(String(m.state||'')); } catch {} });" \
+                "$FLY_MACHINE_ID" \
+              || echo ""
+          }
+          get_owner() {
+            flyctl machines list --app "$FLY_APP_NAME" --json 2>/dev/null \
+              | node -e "let s=''; process.stdin.on('data',c=>s+=c); process.stdin.on('end',()=>{ try { const j=JSON.parse(s); const m=Array.isArray(j)?j.find(x=>x&&x.id===process.argv[1]):null; const e=m&&m.config?m.config.env:null; if (e) process.stdout.write(String(e.PR_REVIEW_HEAD_SHA||'')); } catch {} });" \
                 "$FLY_MACHINE_ID" \
               || echo ""
           }
@@ -148,8 +192,22 @@ jobs:
             exit 1
           fi
 
+          # Ownership recheck: if another run re-leased the machine in the brief
+          # window between our claim-verify and this start, it is now running a
+          # different PR's review and our marker will never appear. Fail fast
+          # with an actionable message instead of polling the full 15 minutes.
+          owner="$(get_owner)"
+          if [ -n "$owner" ] && [ "$owner" != "$REVIEW_HEAD" ]; then
+            echo "Reviewer machine was re-leased to '${owner}' after our claim; this run lost the race and will not produce a result. Re-run the gate for this PR." >&2
+            exit 1
+          fi
+
           # Poll until the machine returns to a stopped state (entrypoint exited).
           # Cap at ~15 minutes; review runs typically finish in a few minutes.
+          # `replacing` is a *transient* Fly state during a config update (e.g. a
+          # racing run's claim landing), not a terminal failure, so wait it out
+          # rather than aborting — treating it as fatal was the old spurious
+          # cross-PR failure mode.
           deadline=$((SECONDS + 900))
           while [ "$SECONDS" -lt "$deadline" ]; do
             state="$(get_state)"
@@ -157,7 +215,7 @@ jobs:
               stopped|destroyed)
                 break
                 ;;
-              failed|crashed|error|replacing)
+              failed|crashed|error)
                 echo "Fly machine entered failure state: $state" >&2
                 exit 1
                 ;;
