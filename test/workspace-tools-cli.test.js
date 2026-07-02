@@ -47,12 +47,14 @@ test('every registry handler is a function', () => {
 
 test('cliToolNames excludes exactly the cli:false tools', () => {
   const names = cliToolNames();
-  for (const excluded of ['gitea_pr', 'fetch_issues_resolved', 'read_prepared_notes']) {
+  for (const excluded of ['gitea_pr', 'fetch_issues_resolved']) {
     assert.ok(TOOLS[excluded], `${excluded} should exist in registry`);
     assert.equal(TOOLS[excluded].cli, false, `${excluded} should be cli:false`);
     assert.ok(!names.includes(excluded), `${excluded} should not be CLI-exposed`);
   }
-  assert.equal(names.length, Object.keys(TOOLS).length - 3);
+  // read_prepared_notes IS exposed (item-index slicing tn-writer needs).
+  assert.ok(names.includes('read_prepared_notes'));
+  assert.equal(names.length, Object.keys(TOOLS).length - 2);
 });
 
 test('--list prints the CLI-exposed tool names', () => {

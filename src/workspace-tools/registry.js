@@ -16,8 +16,8 @@
 //     orchestrator-only, and the push flow already has door43-push-cli.js.
 //   - fetch_issues_resolved: chains an LLM optimizer (spends API tokens) —
 //     must not be invocable from arbitrary Bash loops.
-//   - read_prepared_notes: an MCP-era ergonomic for shell-less agents (token-
-//     limited JSON slicing); Bash-era agents use Read with offset/limit.
+// (read_prepared_notes IS CLI-exposed: it slices prepared_notes.json by item
+//  index — the Read tool can only slice by line, so tn-writer needs this.)
 //
 // A parity test (test/workspace-tools-cli.test.js) asserts every tool name
 // registered in index.js exists here, so the two surfaces cannot drift.
@@ -103,7 +103,7 @@ const TOOLS = {
   fix_unicode_quotes: { handler: fixUnicodeQuotes },
   verify_bold_matches: { handler: verifyBoldMatches },
   prepare_at_context: { handler: prepareATContext },
-  read_prepared_notes: { handler: readPreparedNotes, cli: false },
+  read_prepared_notes: { handler: readPreparedNotes },
 
   // --- Structured note edits (quality server) ---
   update_note_text: { handler: updateNoteText },

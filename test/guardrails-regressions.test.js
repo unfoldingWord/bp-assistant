@@ -48,7 +48,11 @@ test('tn-writer tool profile blocks wandering tools but keeps file tools', () =>
   assert.equal(toolConfig.tools.includes('Agent'), false);
   assert.equal(toolConfig.tools.includes('WebSearch'), false);
   assert.equal(toolConfig.tools.includes('WebFetch'), false);
-  assert.ok(toolConfig.disallowedTools.includes('Bash'));
+  // Bash is now ENABLED for tn-writer (workspace tools run via the CLI wrapper);
+  // enableBash injects it + the scoped permission rules in buildOptions.
+  assert.equal(toolConfig.disallowedTools.includes('Bash'), false);
+  assert.equal(toolConfig.enableBash, true);
+  // The tn-writer sub-agent blocklist (Task/Agent/WebSearch) still holds.
   assert.ok(toolConfig.disallowedTools.includes('Task'));
   assert.ok(toolConfig.disallowedTools.includes('Agent'));
   assert.ok(toolConfig.disallowedTools.includes('WebSearch'));

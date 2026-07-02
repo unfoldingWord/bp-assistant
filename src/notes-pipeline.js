@@ -1360,15 +1360,20 @@ function applySkillSpecificGuardrails(skill, guardrails) {
 }
 
 function getSkillToolConfig(skill) {
+  // enableBash appends 'Bash' to the allowlist + injects the scoped
+  // permission rules (claude-runner). Skills invoke workspace tools via the
+  // CLI wrapper (node /app/src/workspace-tools-cli.js) instead of the MCP
+  // transport; MCP stays registered as the fallback. Honors BP_DISABLE_BASH.
   if (skill === 'tn-writer') {
     return {
       tools: TN_WRITER_RESTRICTED_TOOLS,
-      disallowedTools: ['Bash', ...TN_WRITER_TOOL_BLOCKLIST],
+      disallowedTools: [...TN_WRITER_TOOL_BLOCKLIST],
+      enableBash: true,
     };
   }
   return {
     tools: DEFAULT_RESTRICTED_TOOLS,
-    disallowedTools: ['Bash'],
+    enableBash: true,
   };
 }
 
@@ -1583,8 +1588,8 @@ async function runParallelTnWriter({
         skill: 'tn-writer',
         tools: toolConfig.tools,
         disallowedTools: toolConfig.disallowedTools,
+        enableBash: toolConfig.enableBash,
         disableLocalSettings: true,
-        forceNoAutoBashSandbox: true,
         timeoutMs,
         maxTurns: guardrails.maxTurns,
         appendSystemPrompt,
@@ -2410,8 +2415,8 @@ async function notesPipeline(route, message) {
             skill: skill.name,
             tools: toolConfig.tools,
             disallowedTools: toolConfig.disallowedTools,
+            enableBash: toolConfig.enableBash,
             disableLocalSettings: true,
-            forceNoAutoBashSandbox: true,
             timeoutMs,
             maxTurns,
             appendSystemPrompt: skill.appendSystemPrompt,
