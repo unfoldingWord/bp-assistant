@@ -16,7 +16,7 @@ const { sendMessage, sendDM, addReaction, removeReaction } = require('./zulip-cl
 const { runClaude, DEFAULT_RESTRICTED_TOOLS, isTransientOutageError, isGuardrailStop } = require('./claude-runner');
 const { createGuardHooks } = require('./guard-hooks');
 const { resolveAutoModel } = require('./api-runner/provider-config');
-const { getDoor43Username, emailToFallbackUsername, buildBranchName, resolveOutputFile, discoverFreshOutput, checkPrerequisites, calcSkillTimeout, normalizeBookName, resolveConflictMention, parsePartialTsv, truncatePartialTsv, parseChunkRange, CSKILLBP_DIR } = require('./pipeline-utils');
+const { getDoor43Username, emailToFallbackUsername, buildBranchName, resolveOutputFile, discoverFreshOutput, checkPrerequisites, calcSkillTimeout, normalizeBookName, resolveConflictMention, parsePartialTsv, truncatePartialTsv, parseChunkRange, isUsageLimitError, CSKILLBP_DIR } = require('./pipeline-utils');
 const { splitTsv, fixTrailingNewlines } = require('./workspace-tools/tsv-tools');
 const { fillTsvIds, generateIds, prepareNotes, fillOrigQuotes, resolveGlQuotes, flagNarrowQuotes, extractAlignmentData, prepareATContext, substituteAT, fixUnicodeQuotes, verifyBoldMatches, syncCanonicalHebrewQuotes, applyHintsToPreparedNotes, _stripAlternateTranslation: stripAlternateTranslation } = require('./workspace-tools/tn-tools');
 const { checkTnQuality } = require('./workspace-tools/quality-tools');
@@ -47,33 +47,26 @@ const DEEP_ISSUE_ID_HINT =
   'Do NOT output text without a tool call or the session will end prematurely.';
 
 const TN_QUALITY_CHECK_HINT =
-  'Mechanical checks have already run. Read runtime.tnQualityFindings from context.json — ' +
-  'this is the starting findings list. Do not re-run fix_trailing_newlines or check_tn_quality before reviewing. ' +
+  'Pipeline mode: check_tn_quality has already run mechanically and its findings are in context.json ' +
+  'at runtime.tnQualityFindings — treat that as your starting findings list rather than re-running it up front. ' +
   'Do not guess alternate file paths or probe missing runtime files outside context.json. ' +
-  'Do the full semantic review (Steps 3a-3j), fix issues found, then re-run check_tn_quality ' +
-  'at most once to verify fixes. If issues still persist after that one re-check, report them ' +
-  'as unresolved and stop. Do not loop further. ' +
-  'To apply fixes, use the structured tools update_note_text / update_prepared_quote / remove_note ' +
+  'Apply fixes with the structured tools update_note_text / update_prepared_quote / remove_note ' +
   '(they locate items by id) — never hand-Edit generated_notes.json or prepared_notes.json. ' +
+  'After your final edits, re-run check_tn_quality once to machine-verify them (ship a verified result, ' +
+  'not a reasoned-correct-but-unverified one). If issues still persist after that verification, report them ' +
+  'as unresolved and stop — do not loop further. ' +
   'If any Edit returns "string to replace not found", do NOT retry that edit: re-Read the file once ' +
   'or switch to the structured tool; if the target still cannot be matched, tag that row as ' +
   'unresolved and move on.';
 
 const TN_WRITER_HINT =
-  'The pipeline has already run all mechanical preparation (prepare_notes, fill_orig_quotes, resolve_gl_quotes, flag_narrow_quotes). ' +
-  'Read runtime.preparedNotes from context.json — all fields are populated. Do not re-run preparation MCP tools. ' +
-  'Never use the raw Read tool on prepared_notes.json. Use read_prepared_notes with summaryOnly:true first, then fetch bounded slices. ' +
-  'Stay in the tn-writer lane. Do not use Task/Agent/Team tools, web tools, SendMessage, or notebook editing. ' +
-  'Do not hunt for alternate templates or run exploratory repair loops. ' +
-  'Use only the prepared inputs, especially writer_packet, named canonical references, and workspace MCP tools needed for the documented tn-writer sequence. ' +
-  'Do not re-decide templates, parse raw explanation directives again, or invent a new AT policy when the prepared item already provides them. ' +
-  'Do not generate alternate translations — the pipeline handles AT generation separately after note writing. Write only the explanatory note text. ' +
-  'Run the sequence once in order: read prepared data, read style/canonical refs, generate notes, assemble TSV, post-process, final review. ' +
-  'Skip AT-fit verification — that is handled by the separate AT generation step. ' +
-  'If a subset still fails after that bounded pass, stop and report the unresolved IDs instead of exploring side paths. ' +
-  'TEMPLATE FIDELITY: Each note MUST begin by filling in writer_packet.template_text — that is the only authorized sentence structure. ' +
-  'Do not prepend extra sentences before the template or substitute phrasings from Translation Academy definitions, issue-identification skill files, or published notes in data/published-tns/. ' +
-  'In particular, never use phrases like "not looking for information" or "not seeking information" — these come from TA descriptions and are not part of any canonical template.';
+  'Pipeline mode: all mechanical preparation has already run and its output is in context.json at ' +
+  'runtime.preparedNotes (writer_packet, template_text, resolved quotes are populated). Read it with ' +
+  'read_prepared_notes (summaryOnly:true first, then bounded slices) — never the raw Read tool on prepared_notes.json. ' +
+  'AT generation is a separate pipeline step that runs after note writing, so write only the explanatory note text ' +
+  'and do not generate alternate translations or run AT-fit verification here. ' +
+  'If an Edit returns "string to replace not found", do not retry it: re-Read once or use the structured tool, ' +
+  'then tag the row unresolved and move on if it still cannot be matched.';
 
 const TN_WRITER_TOOL_BLOCKLIST = [
   'Task',
@@ -437,7 +430,7 @@ async function runPerNoteGeneration({ pipeDir, outputPath, status, book }) {
 
   // Load canonical references if available
   let canonicalRefs = '';
-  const glGuidelinesPath = path.resolve(CSKILLBP_DIR, '.claude/skills/tn-writer/reference/gl_guidelines.md');
+  const glGuidelinesPath = path.resolve(CSKILLBP_DIR, '.claude/skills/reference/gl_guidelines.md');
   try {
     canonicalRefs = fs.readFileSync(glGuidelinesPath, 'utf8');
   } catch (_) { /* optional */ }
@@ -493,6 +486,7 @@ async function runPerNoteGeneration({ pipeDir, outputPath, status, book }) {
         maxTurns: 2,
         timeoutMs: 60 * 1000,
         appendSystemPrompt: systemPromptAppend,
+        mcpToolSet: 'none',
         tools: [],
         disallowedTools: ['Bash', 'Read', 'Write', 'Edit', 'Glob', 'Grep', 'Agent', 'Task', 'Skill'],
       });
@@ -619,6 +613,17 @@ async function runATGeneration({ notesPath, pipeDir, status }) {
     results.reasons[key] = (results.reasons[key] || 0) + 1;
   };
 
+  // Load the AT style guide if the skills checkout provides it. It splits the
+  // AT-authoring rules out of note-style-guide.md; older checkouts may not have
+  // it yet, so load defensively and proceed without it.
+  let atStyleGuide = '';
+  const atStyleGuidePath = path.resolve(CSKILLBP_DIR, '.claude/skills/tn-writer/reference/at-style-guide.md');
+  try {
+    atStyleGuide = fs.readFileSync(atStyleGuidePath, 'utf8');
+  } catch (_) {
+    console.warn(`[notes] AT style guide not found at ${atStyleGuidePath} \u2014 proceeding without it`);
+  }
+
   // AT Writer system prompt
   const atSystemPrompt = [
     'You write alternate translations for Bible translation notes.',
@@ -633,6 +638,7 @@ async function runATGeneration({ notesPath, pipeDir, status }) {
     '- Keep leading conjunctions/prepositions if present in original',
     '- No ending punctuation unless the note specifically suggests modifying punctuation (e.g. figs-rquestion changing ? to .)',
     '- For discontinuous quotes (with \u2026), use \u2026 between AT parts',
+    atStyleGuide ? '\n--- AT STYLE GUIDE ---\n' + atStyleGuide : '',
   ].join('\n');
 
   // Haiku validator system prompt
@@ -703,6 +709,7 @@ async function runATGeneration({ notesPath, pipeDir, status }) {
         maxTurns: 2,
         timeoutMs: AT_GENERATION_TIMEOUT_MS,
         appendSystemPrompt: atSystemPrompt,
+        mcpToolSet: 'none',
         tools: [],
         disallowedTools: ['Bash', 'Read', 'Write', 'Edit', 'Glob', 'Grep', 'Agent', 'Task', 'Skill'],
       });
@@ -741,6 +748,7 @@ async function runATGeneration({ notesPath, pipeDir, status }) {
         maxTurns: 2,
         timeoutMs: AT_VALIDATION_TIMEOUT_MS,
         appendSystemPrompt: validatorSystemPrompt,
+        mcpToolSet: 'none',
         tools: [],
         disallowedTools: ['Bash', 'Read', 'Write', 'Edit', 'Glob', 'Grep', 'Agent', 'Task', 'Skill'],
       });
@@ -769,6 +777,7 @@ async function runATGeneration({ notesPath, pipeDir, status }) {
         maxTurns: 2,
         timeoutMs: AT_RETRY_TIMEOUT_MS,
         appendSystemPrompt: atSystemPrompt,
+        mcpToolSet: 'none',
         tools: [],
         disallowedTools: ['Bash', 'Read', 'Write', 'Edit', 'Glob', 'Grep', 'Agent', 'Task', 'Skill'],
       });
@@ -1112,10 +1121,6 @@ function refreshChapterNotesFromShards(book, tag, chapterRel) {
   const merged = mergeTsvs({ globPattern: shardGlob, output: chapterRel, noSort: true });
   if (!merged.startsWith('Merged')) return null;
   return chapterRel;
-}
-
-function isUsageLimitError(text) {
-  return /hit your limit|usage limit|rate limit|too many requests|out of .* usage|429/i.test(String(text || ''));
 }
 
 function chicagoIsoFromUtcDate(date) {
@@ -2815,6 +2820,7 @@ async function notesPipeline(route, message) {
             cwd: CSKILLBP_DIR,
             model: model || 'medium',
             skill: 'tn-quality-check',
+            mcpToolSet: 'quality',
             tools: DEFAULT_RESTRICTED_TOOLS,
             disallowedTools: ['Bash'],
             disableLocalSettings: true,

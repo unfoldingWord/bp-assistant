@@ -12,7 +12,7 @@ const config = require('./config');
 const { sendMessage, sendDM, addReaction, removeReaction, uploadFile } = require('./zulip-client');
 const { runClaude, DEFAULT_RESTRICTED_TOOLS, isTransientOutageError } = require('./claude-runner');
 const { extractContentTypes } = require('./router');
-const { getDoor43Username, emailToFallbackUsername, buildBranchName, resolveOutputFile, discoverFreshOutput, calcSkillTimeout, normalizeBookName, resolveConflictMention, CSKILLBP_DIR } = require('./pipeline-utils');
+const { getDoor43Username, emailToFallbackUsername, buildBranchName, resolveOutputFile, discoverFreshOutput, calcSkillTimeout, normalizeBookName, resolveConflictMention, isUsageLimitError, CSKILLBP_DIR } = require('./pipeline-utils');
 const { verifyRepoPush, verifyDcsToken } = require('./repo-verify');
 const { ensureFreshToken, isAuthError } = require('./auth-refresh');
 const { recordMetrics, getCumulativeTokens, recordRunSummary } = require('./usage-tracker');
@@ -262,10 +262,6 @@ function getInitialPipelineOutputStatus({ book, chapter, verseStart, verseEnd })
   }
 
   return { missing, found, observedTempArtifacts };
-}
-
-function isUsageLimitError(text) {
-  return /hit your limit|usage limit|rate limit|too many requests|429/i.test(String(text || ''));
 }
 
 function chicagoIsoFromUtcDate(date) {

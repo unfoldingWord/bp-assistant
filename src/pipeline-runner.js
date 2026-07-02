@@ -1,4 +1,17 @@
+// Pipelines that write under CSKILLBP_DIR/output and CSKILLBP_DIR/tmp. Sweep
+// foreign-owned leftovers before they cause mid-run EACCES failures.
+const WORKSPACE_WRITING_ROUTES = new Set(['sdk', 'notes', 'tqs']);
+
 async function runPipeline(route, message) {
+  if (WORKSPACE_WRITING_ROUTES.has(route.type)) {
+    try {
+      const { sweepWorkspaceOwnership, sweepStaleTmp } = require('./ownership-sweep');
+      sweepWorkspaceOwnership();
+      sweepStaleTmp();
+    } catch (err) {
+      console.warn(`[ownership-sweep] skipped: ${err.message}`);
+    }
+  }
   if (route.type === 'sdk') {
     console.log(`[pipeline] Running SDK pipeline (route: ${route.name})`);
     const { generatePipeline } = require('./generate-pipeline');
