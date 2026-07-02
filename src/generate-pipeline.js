@@ -19,10 +19,10 @@ const { recordMetrics, getCumulativeTokens, recordRunSummary } = require('./usag
 const { door43Push, checkConflictingBranches, REPO_MAP, getRepoFilename } = require('./door43-push');
 const { setPendingMerge } = require('./pending-merges');
 const { getCheckpoint, setCheckpoint, clearCheckpoint, buildCheckpointKey } = require('./pipeline-checkpoints');
-const { buildGenerateContext, buildUstContext } = require('./pipeline-context');
+const { buildGenerateContext, buildUstContext, hebrewPathForBook } = require('./pipeline-context');
 const { publishAdminStatus } = require('./admin-status');
 const { dispatchSelfDiagnosis } = require('./self-diagnosis');
-const { validateAlignedUsfmCompleteness, mergeAlignedUsfm } = require('./workspace-tools/usfm-tools');
+const { validateAlignedUsfmCompleteness, mergeAlignedUsfm, salvageAlignedFromMappingJson } = require('./workspace-tools/usfm-tools');
 
 const LOG_DIR = path.resolve(__dirname, '../logs');
 const REQUIRED_INITIAL_PIPELINE_FILES = [
@@ -1461,6 +1461,61 @@ async function generatePipeline(route, message) {
             : (retryResult.error || retryResult.result || `retry non-success subtype: "${retryResult.subtype}"`);
           break;
         }
+      }
+
+      // Deterministic salvage (last resort, full-chapter runs only). The align
+      // coordinator can return "success" while its subagents left only per-verse
+      // mapping JSON in tmp/alignments and never ran create_aligned_usfm / the
+      // merge (observed: AMO 5, 2026-07-01 — 27 ULT + 13 UST mapping JSON, zero
+      // aligned USFM), which the loop above surfaces as missing_output. Rather
+      // than throw that work away, convert the leftover JSON to aligned USFM in
+      // Node — no LLM, no shell. Scoped to a type with NO aligned output at all
+      // (reason 'missing') so it can never collide with, or regress, batches the
+      // coordinator did produce. A complete set of mapping JSON then yields a
+      // finished chapter with no re-run; a partial set banks what it can and the
+      // (smaller) gap is reported for a resume to fill.
+      if (!alignmentValidated && !hasVerseRange) try {
+        const hebrewRel = hebrewPathForBook(book);
+        let salvagedAny = false;
+        const runSalvage = async (type, sourceRel, cov) => {
+          if (!hebrewRel || cov.reason !== 'missing') return;
+          const s = salvageAlignedFromMappingJson({ book, chapter: ch, type, sourceRel, hebrewRel });
+          if (s.converted.length) {
+            salvagedAny = true;
+            const total = s.converted.length + s.missing.length;
+            await status(`Salvaged ${s.converted.length}/${total} ${type.toUpperCase()} verse(s) for ${book} ${ch} from leftover mapping JSON${s.missing.length ? ` (still missing ${formatVerseRanges(s.missing)})` : ''}.`);
+          }
+        };
+        if (needUlt) await runSalvage('ult', ultRel, ultCov);
+        if (needUst) await runSalvage('ust', ustRel, ustCov);
+
+        if (salvagedAny) {
+          const alignPat = new RegExp(`^${book}-0*${ch}(-.*)?-aligned\\.usfm$`);
+          alignedUltRel = needUlt ? resolveMergedChapterAligned(book, discoverFreshOutput('output/AI-ULT', book, alignPat, null), ultSourceMs) : null;
+          alignedUstRel = needUst ? resolveMergedChapterAligned(book, discoverFreshOutput('output/AI-UST', book, alignPat, null), ustSourceMs) : null;
+          ultCov = needUlt ? assessAlignedChapterCoverage(alignedUltRel, ultRel, { checkCoverage: true }) : { ok: true, reason: null };
+          ustCov = needUst ? assessAlignedChapterCoverage(alignedUstRel, ustRel, { checkCoverage: true }) : { ok: true, reason: null };
+          if (ultCov.ok && ustCov.ok) {
+            const ultCheck = needUlt ? validateAlignedUsfmCompleteness({ alignedUsfm: alignedUltRel }) : null;
+            const ustCheck = needUst ? validateAlignedUsfmCompleteness({ alignedUsfm: alignedUstRel }) : null;
+            finalValidationSummary = summarizeAlignmentValidation({ book, chapter: ch, ultCheck, ustCheck });
+            if ((!ultCheck || ultCheck.ok) && (!ustCheck || ustCheck.ok)) {
+              alignmentValidated = true;
+              await status(`Recovered **${book} ${ch}** from leftover mapping JSON — no re-alignment needed.`);
+            }
+          } else {
+            // Salvage narrowed but did not close the gap — refresh the summary so
+            // the recorded failure reflects the smaller remaining coverage hole
+            // (and the errorKind below maps to incomplete_coverage, not
+            // missing_output).
+            const covParts = [needUlt && !ultCov.ok && `ULT: ${ultCov.summary}`, needUst && !ustCov.ok && `UST: ${ustCov.summary}`].filter(Boolean).join(' || ');
+            if (covParts) { finalValidationSummary = `${book} ${ch} — ${covParts}`; lastFailReason = 'coverage'; }
+          }
+        }
+      } catch (salvageErr) {
+        // Salvage is a best-effort last resort — never let it mask or reclassify
+        // the real alignment failure. Log and fall through to normal reporting.
+        console.warn(`[generate] alignment salvage failed for ${book} ${ch} (non-fatal): ${salvageErr.message}`);
       }
 
       if (!alignmentValidated) {
