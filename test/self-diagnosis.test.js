@@ -468,6 +468,32 @@ test('isAlignMissingOutput matches the align-all-parallel missing-output signatu
   assert.equal(isAlignMissingOutput(undefined), false);
 });
 
+test('isAlignMissingOutput matches on checkpoint errorKind (missing_output + incomplete_coverage)', () => {
+  // missing_output on the align phase — matches regardless of message text.
+  assert.equal(
+    isAlignMissingOutput('AMO 5 failed', { current: { skill: 'align-all-parallel', errorKind: 'missing_output' } }),
+    true,
+  );
+  // incomplete_coverage (partial salvage) — message text lacks "no aligned output
+  // found", so ONLY the errorKind path can catch it. This is the #179 follow-up gap.
+  assert.equal(
+    isAlignMissingOutput('AMO 5 — ULT: covers 13/27 verses, missing 1-14', { current: { skill: 'align-all-parallel', errorKind: 'incomplete_coverage' } }),
+    true,
+  );
+  // missing_output is NOT align-exclusive: the notes/generate phase uses it too.
+  // Must not short-circuit to the align template for a non-align phase.
+  assert.equal(
+    isAlignMissingOutput('PSA 1 — expected output file missing', { current: { skill: 'tn-writer', errorKind: 'missing_output' } }),
+    false,
+  );
+  // A partial-coverage message with no checkpoint does NOT match (text fallback
+  // only knows the "no aligned output found" phrase).
+  assert.equal(
+    isAlignMissingOutput('AMO 5 — ULT: covers 13/27 verses, missing 1-14'),
+    false,
+  );
+});
+
 test('buildAlignMissingOutputDiagnosis returns a templated issue tagged align-missing-output', () => {
   const event = makePsa1Event({
     pipelineType: 'generate',
@@ -482,6 +508,19 @@ test('buildAlignMissingOutputDiagnosis returns a templated issue tagged align-mi
   assert.equal(d.classification, 'align-missing-output');
   assert.match(d.body, /salvageAlignedFromMappingJson/);
   assert.match(d.body, /tmp\/alignments/);
+});
+
+test('buildAlignMissingOutputDiagnosis reflects partial coverage for incomplete_coverage', () => {
+  const event = makePsa1Event({
+    pipelineType: 'generate',
+    scope: 'AMO 5',
+    phase: 'align',
+    message: '**align-all-parallel** failed for AMO 5 — AMO 5 — ULT: covers 13/27 verses, missing 1-14',
+  });
+  const d = buildAlignMissingOutputDiagnosis(event, 'some context', 'incomplete_coverage');
+  assert.match(d.title, /align: incomplete aligned output/);
+  assert.match(d.body, /partial verse coverage/);
+  assert.equal(d.classification, 'align-missing-output');
 });
 
 test('dispatchSelfDiagnosis short-circuits an align "no aligned output found" without invoking the agent', async () => {
@@ -499,7 +538,7 @@ test('dispatchSelfDiagnosis short-circuits an align "no aligned output found" wi
   const result = await dispatchSelfDiagnosis({
     event,
     errorText: 'Phase: align-all-parallel\nChapter: AMO 5\nAMO 5 — ULT: no aligned output found || UST: no aligned output found',
-    checkpoint: { state: 'failed', resume: { chapter: 5, skill: 'align-all-parallel' } },
+    checkpoint: { state: 'failed', current: { skill: 'align-all-parallel', errorKind: 'missing_output' }, resume: { chapter: 5, skill: 'align-all-parallel' } },
     runClaudeImpl,
     fetchImpl,
     readSecretImpl: () => 'fake-token',
@@ -587,4 +626,34 @@ test('dispatchSelfDiagnosis short-circuits an align "Stream closed" transport fa
   assert.ok(calls.lastCreateBody.labels.includes('align-transport-closed'));
   assert.match(calls.lastCreateBody.title, /align: MCP transport closed/);
   assert.match(calls.lastCreateBody.body, /pipeline-failure-fingerprint:/);
+});
+
+test('dispatchSelfDiagnosis short-circuits a partial-salvage incomplete_coverage without invoking the agent', async () => {
+  // Partial salvage: message text lacks "no aligned output found", so this can
+  // only be caught via the checkpoint errorKind (the #179 follow-up gap).
+  const event = makePsa1Event({
+    pipelineType: 'generate',
+    scope: 'AMO 5',
+    phase: 'align',
+    message: '**align-all-parallel** failed for AMO 5 — AMO 5 — ULT: covers 13/27 verses, missing 1-14',
+  });
+  const calls = {};
+  const fetchImpl = createGithubFetchStub({ captureCalls: calls });
+  let claudeWasCalled = false;
+  const runClaudeImpl = async () => { claudeWasCalled = true; return { subtype: 'success', result: VALID_AGENT_OUTPUT }; };
+
+  const result = await dispatchSelfDiagnosis({
+    event,
+    errorText: 'Phase: align-all-parallel\nChapter: AMO 5\nAMO 5 — ULT: covers 13/27 verses, missing 1-14',
+    checkpoint: { state: 'failed', current: { skill: 'align-all-parallel', errorKind: 'incomplete_coverage' }, resume: { chapter: 5, skill: 'align-all-parallel' } },
+    runClaudeImpl,
+    fetchImpl,
+    readSecretImpl: () => 'fake-token',
+    readAdminStatusImpl: () => [event],
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.action, 'created-align-missing-output');
+  assert.equal(claudeWasCalled, false, 'partial-salvage incomplete_coverage must not invoke the diagnosis agent');
+  assert.match(calls.lastCreateBody.title, /align: incomplete aligned output/);
 });

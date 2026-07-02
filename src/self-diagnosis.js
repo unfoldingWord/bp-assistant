@@ -382,17 +382,39 @@ function buildFallbackDiagnosis(event, rawText, parseError, contextSummary) {
   };
 }
 
-// True when the failure message matches the well-understood "align-all-parallel
-// produced no aligned output" signature. `assessAlignedChapterCoverage` emits
-// "no aligned output found" when the coordinator returns success but leaves no
-// aligned USFM. The deterministic Node-side salvage (see `salvageAlignedFromMappingJson`
-// in `src/workspace-tools/usfm-tools.js`) is the canonical fix; the LLM diagnosis
+// errorKinds the align step records when a chapter has no usable aligned USFM:
+// `missing_output` (coordinator returned success but left nothing, or salvage
+// found no mapping JSON) and `incomplete_coverage` (salvage recovered only part
+// of the chapter). Both leave the deterministic Node-side salvage as the
+// canonical fix, and both were observed to time out the LLM diagnosis agent
+// (issue #174) — so both short-circuit.
+const ALIGN_SHORT_CIRCUIT_ERROR_KINDS = new Set(['missing_output', 'incomplete_coverage']);
+
+// True for the well-understood "align-all-parallel produced no (or only partial)
+// aligned output" signature. `assessAlignedChapterCoverage` emits "no aligned
+// output found" when the coordinator returns success but leaves no aligned USFM;
+// partial salvage rewrites the summary to "covers N/M verses, missing …". The
+// deterministic Node-side salvage (see `salvageAlignedFromMappingJson` in
+// `src/workspace-tools/usfm-tools.js`) is the canonical fix; the LLM diagnosis
 // agent adds nothing and, on chapters with lots of leftover mapping JSON, tends
 // to exhaust its 5-min time budget before producing usable JSON (issue #174).
-function isAlignMissingOutput(text) {
+//
+// Prefers the checkpoint's structured `errorKind` (which also catches the
+// partial-salvage `incomplete_coverage` case, whose message text does NOT
+// contain "no aligned output found"), guarded on the align phase because
+// `missing_output` is also used by the notes/generate phase. Falls back to the
+// message text when no checkpoint errorKind is available.
+function isAlignMissingOutput(text, checkpoint) {
+  const current = checkpoint && checkpoint.current;
+  const errorKind = current && current.errorKind;
+  if (errorKind && ALIGN_SHORT_CIRCUIT_ERROR_KINDS.has(errorKind)) {
+    const skill = String((current && current.skill) || '');
+    // Only align-phase failures — `missing_output` is not align-exclusive.
+    if (!skill || /align/i.test(skill)) return true;
+  }
   const msg = typeof text === 'string' ? text : String((text && text.message) || text || '');
   if (!msg) return false;
-  return /no aligned output found/i.test(msg) && /align/i.test(msg);
+  return /no aligned output found/i.test(msg);
 }
 
 // True when the align failure is the in-process workspace-tools MCP transport being
@@ -407,18 +429,25 @@ function isAlignTransportClosed(text) {
   return /(stream closed|mcp transport closed)/i.test(msg) && /align/i.test(msg);
 }
 
-// Templated diagnosis for the "align-all-parallel: no aligned output found"
-// signature. Skips the LLM investigation (which was timing out on real runs —
-// AMO 5, 2026-07-01) and files a concise, actionable issue that points at the
-// deterministic salvage path and the leftover mapping JSON to inspect.
-function buildAlignMissingOutputDiagnosis(event, contextSummary) {
+// Templated diagnosis for the "align-all-parallel: no (or only partial) aligned
+// output" signature. Skips the LLM investigation (which was timing out on real
+// runs — AMO 5, 2026-07-01) and files a concise, actionable issue that points at
+// the deterministic salvage path and the leftover mapping JSON to inspect.
+// `errorKind` (from the checkpoint) is `missing_output` for a total miss or
+// `incomplete_coverage` when salvage recovered only part of the chapter.
+function buildAlignMissingOutputDiagnosis(event, contextSummary, errorKind) {
   const targetRepo = classifyRepo(event);
   const scopeLabel = event.scope || event.pipelineType || 'event';
-  const title = `Pipeline failure: ${event.pipelineType || 'generate'} ${scopeLabel} — align: no aligned output found`
+  const partial = errorKind === 'incomplete_coverage';
+  const titleSuffix = partial ? 'align: incomplete aligned output' : 'align: no aligned output found';
+  const summaryLine = partial
+    ? '`align-all-parallel` recovered only partial verse coverage for one or both of ULT/UST.'
+    : '`align-all-parallel` reported "no aligned output found" for one or both of ULT/UST.';
+  const title = `Pipeline failure: ${event.pipelineType || 'generate'} ${scopeLabel} — ${titleSuffix}`
     .slice(0, 120);
   const body = [
     '## Summary',
-    '`align-all-parallel` reported "no aligned output found" for one or both of ULT/UST.',
+    summaryLine,
     'This is a well-understood failure mode: the alignment coordinator returned success',
     'but produced no merged aligned USFM (typically leaving only per-verse mapping JSON',
     'in `tmp/alignments`). The deterministic Node-side salvage',
@@ -674,11 +703,13 @@ async function dispatchSelfDiagnosis({
       diagnosis = buildAlignTransportClosedDiagnosis(event, contextSummary);
       shortCircuited = true;
       shortCircuitTag = 'align-transport-closed';
-    } else if (isAlignMissingOutput(errorText) || isAlignMissingOutput(event.message)) {
-      // Known signature — align-all-parallel produced no aligned output. The LLM
-      // diagnosis agent times out on this signature (issue #174), so short-circuit.
-      console.log('[self-diagnosis] Align "no aligned output found" signature recognized; filing templated issue without running the agent.');
-      diagnosis = buildAlignMissingOutputDiagnosis(event, contextSummary);
+    } else if (isAlignMissingOutput(errorText, checkpoint) || isAlignMissingOutput(event.message, checkpoint)) {
+      // Known signature — align-all-parallel produced no (or only partial) aligned
+      // output. The LLM diagnosis agent times out on this signature (issue #174),
+      // so short-circuit for both missing_output and incomplete_coverage.
+      const alignErrorKind = checkpoint && checkpoint.current && checkpoint.current.errorKind;
+      console.log(`[self-diagnosis] Align missing/partial-output signature recognized (errorKind=${alignErrorKind || 'text-match'}); filing templated issue without running the agent.`);
+      diagnosis = buildAlignMissingOutputDiagnosis(event, contextSummary, alignErrorKind);
       shortCircuited = true;
       shortCircuitTag = 'align-missing-output';
     } else {
