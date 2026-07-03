@@ -12,17 +12,17 @@ const config = require('./config');
 const { sendMessage, sendDM, addReaction, removeReaction, uploadFile } = require('./zulip-client');
 const { runClaude, DEFAULT_RESTRICTED_TOOLS, isTransientOutageError } = require('./claude-runner');
 const { extractContentTypes } = require('./router');
-const { getDoor43Username, emailToFallbackUsername, buildBranchName, resolveOutputFile, discoverFreshOutput, calcSkillTimeout, normalizeBookName, resolveConflictMention, CSKILLBP_DIR } = require('./pipeline-utils');
+const { getDoor43Username, emailToFallbackUsername, buildBranchName, resolveOutputFile, discoverFreshOutput, calcSkillTimeout, normalizeBookName, resolveConflictMention, isUsageLimitError, CSKILLBP_DIR } = require('./pipeline-utils');
 const { verifyRepoPush, verifyDcsToken } = require('./repo-verify');
 const { ensureFreshToken, isAuthError } = require('./auth-refresh');
 const { recordMetrics, getCumulativeTokens, recordRunSummary } = require('./usage-tracker');
 const { door43Push, checkConflictingBranches, REPO_MAP, getRepoFilename } = require('./door43-push');
 const { setPendingMerge } = require('./pending-merges');
 const { getCheckpoint, setCheckpoint, clearCheckpoint, buildCheckpointKey } = require('./pipeline-checkpoints');
-const { buildGenerateContext, buildUstContext } = require('./pipeline-context');
+const { buildGenerateContext, buildUstContext, hebrewPathForBook } = require('./pipeline-context');
 const { publishAdminStatus } = require('./admin-status');
 const { dispatchSelfDiagnosis } = require('./self-diagnosis');
-const { validateAlignedUsfmCompleteness, mergeAlignedUsfm } = require('./workspace-tools/usfm-tools');
+const { validateAlignedUsfmCompleteness, mergeAlignedUsfm, salvageAlignedFromMappingJson } = require('./workspace-tools/usfm-tools');
 
 const LOG_DIR = path.resolve(__dirname, '../logs');
 const REQUIRED_INITIAL_PIPELINE_FILES = [
@@ -262,10 +262,6 @@ function getInitialPipelineOutputStatus({ book, chapter, verseStart, verseEnd })
   }
 
   return { missing, found, observedTempArtifacts };
-}
-
-function isUsageLimitError(text) {
-  return /hit your limit|usage limit|rate limit|too many requests|429/i.test(String(text || ''));
 }
 
 function chicagoIsoFromUtcDate(date) {
@@ -838,10 +834,12 @@ async function generatePipeline(route, message) {
             prompt: initialPrompt,
             label: `${skillRef} ${skill}`,
             cwd: CSKILLBP_DIR,
-            // Generation defaults to Sonnet 5 in production: ULT/UST quality is at
-            // parity with Opus on the golden benchmark (NAM 1) at lower cost. A set
-            // TEST_MODEL or --fast (haiku) still overrides via the `model` variable.
-            model: model || 'claude-sonnet-5',
+            // Generation defaults to the `high` difficulty tier (Opus). The earlier
+            // "Sonnet 5 at parity" call came from a confounded NAM 1 benchmark
+            // (workers were Opus-pinned); the clean JOS 3 forced A/B showed generation
+            // quality at parity but Sonnet's initial-pipeline at ~35x the tokens.
+            // A set TEST_MODEL / BP_FORCE_MODEL / BP_MODEL_HIGH still overrides.
+            model: model || 'high',
             betas,
             skill: invocationSkill,
             resume: invocationResume,
@@ -1012,8 +1010,8 @@ async function generatePipeline(route, message) {
               }),
               label: `${book} ${ch} ${skill} (cont)`,
               cwd: CSKILLBP_DIR,
-              // Generation continuation — same Sonnet 5 default as the initial call.
-              model: model || 'claude-sonnet-5',
+              // Generation continuation — same `high` (Opus) default as the initial call.
+              model: model || 'high',
               betas,
               resume: claudeResult.session_id,
               appendSystemPrompt: INITIAL_PIPELINE_COMPLETION_GUARDRAIL,
@@ -1334,7 +1332,15 @@ async function generatePipeline(route, message) {
       });
       const alignDuration = ((Date.now() - chapterStart) / 1000).toFixed(1);
 
-      if (!alignResult || alignResult.subtype !== 'success') {
+      // The runner bails with this subtype when the in-process workspace-tools MCP
+      // transport is torn down mid-align ("Stream closed"). Don't fail-and-continue:
+      // fall through to the coverage gate + deterministic salvage below, which can
+      // still recover the chapter from any banked mapping JSON without the MCP. Threads
+      // into the final errorKind so self-diagnosis short-circuits (a fresh diagnosis
+      // agent would hit the same dead transport).
+      let transportClosed = !!(alignResult && alignResult.subtype === 'mcp_transport_closed');
+
+      if ((!alignResult || alignResult.subtype !== 'success') && !transportClosed) {
         const errText = !alignResult
           ? 'timed out or was aborted (no result returned)'
           : (alignResult.error || alignResult.result || `non-success subtype: "${alignResult.subtype}"`);
@@ -1362,6 +1368,10 @@ async function generatePipeline(route, message) {
           resume: { chapter: ch, skill: 'align-all-parallel' },
         });
         continue;
+      }
+
+      if (transportClosed) {
+        await status(`**align-all-parallel** hit an MCP transport outage (Stream closed) for ${book} ${ch} on the first pass — attempting salvage from any banked mapping JSON before failing.`);
       }
 
       // Record metrics for align-all-parallel
@@ -1454,11 +1464,67 @@ async function generatePipeline(route, message) {
           },
         });
         if (!retryResult || retryResult.subtype !== 'success') {
+          if (retryResult && retryResult.subtype === 'mcp_transport_closed') transportClosed = true;
           finalValidationSummary = !retryResult
             ? 'retry timed out or was aborted (no result returned)'
             : (retryResult.error || retryResult.result || `retry non-success subtype: "${retryResult.subtype}"`);
           break;
         }
+      }
+
+      // Deterministic salvage (last resort, full-chapter runs only). The align
+      // coordinator can return "success" while its subagents left only per-verse
+      // mapping JSON in tmp/alignments and never ran create_aligned_usfm / the
+      // merge (observed: AMO 5, 2026-07-01 — 27 ULT + 13 UST mapping JSON, zero
+      // aligned USFM), which the loop above surfaces as missing_output. Rather
+      // than throw that work away, convert the leftover JSON to aligned USFM in
+      // Node — no LLM, no shell. Scoped to a type with NO aligned output at all
+      // (reason 'missing') so it can never collide with, or regress, batches the
+      // coordinator did produce. A complete set of mapping JSON then yields a
+      // finished chapter with no re-run; a partial set banks what it can and the
+      // (smaller) gap is reported for a resume to fill.
+      if (!alignmentValidated && !hasVerseRange) try {
+        const hebrewRel = hebrewPathForBook(book);
+        let salvagedAny = false;
+        const runSalvage = async (type, sourceRel, cov) => {
+          if (!hebrewRel || cov.reason !== 'missing') return;
+          const s = salvageAlignedFromMappingJson({ book, chapter: ch, type, sourceRel, hebrewRel });
+          if (s.converted.length) {
+            salvagedAny = true;
+            const total = s.converted.length + s.missing.length;
+            await status(`Salvaged ${s.converted.length}/${total} ${type.toUpperCase()} verse(s) for ${book} ${ch} from leftover mapping JSON${s.missing.length ? ` (still missing ${formatVerseRanges(s.missing)})` : ''}.`);
+          }
+        };
+        if (needUlt) await runSalvage('ult', ultRel, ultCov);
+        if (needUst) await runSalvage('ust', ustRel, ustCov);
+
+        if (salvagedAny) {
+          const alignPat = new RegExp(`^${book}-0*${ch}(-.*)?-aligned\\.usfm$`);
+          alignedUltRel = needUlt ? resolveMergedChapterAligned(book, discoverFreshOutput('output/AI-ULT', book, alignPat, null), ultSourceMs) : null;
+          alignedUstRel = needUst ? resolveMergedChapterAligned(book, discoverFreshOutput('output/AI-UST', book, alignPat, null), ustSourceMs) : null;
+          ultCov = needUlt ? assessAlignedChapterCoverage(alignedUltRel, ultRel, { checkCoverage: true }) : { ok: true, reason: null };
+          ustCov = needUst ? assessAlignedChapterCoverage(alignedUstRel, ustRel, { checkCoverage: true }) : { ok: true, reason: null };
+          if (ultCov.ok && ustCov.ok) {
+            const ultCheck = needUlt ? validateAlignedUsfmCompleteness({ alignedUsfm: alignedUltRel }) : null;
+            const ustCheck = needUst ? validateAlignedUsfmCompleteness({ alignedUsfm: alignedUstRel }) : null;
+            finalValidationSummary = summarizeAlignmentValidation({ book, chapter: ch, ultCheck, ustCheck });
+            if ((!ultCheck || ultCheck.ok) && (!ustCheck || ustCheck.ok)) {
+              alignmentValidated = true;
+              await status(`Recovered **${book} ${ch}** from leftover mapping JSON — no re-alignment needed.`);
+            }
+          } else {
+            // Salvage narrowed but did not close the gap — refresh the summary so
+            // the recorded failure reflects the smaller remaining coverage hole
+            // (and the errorKind below maps to incomplete_coverage, not
+            // missing_output).
+            const covParts = [needUlt && !ultCov.ok && `ULT: ${ultCov.summary}`, needUst && !ustCov.ok && `UST: ${ustCov.summary}`].filter(Boolean).join(' || ');
+            if (covParts) { finalValidationSummary = `${book} ${ch} — ${covParts}`; lastFailReason = 'coverage'; }
+          }
+        }
+      } catch (salvageErr) {
+        // Salvage is a best-effort last resort — never let it mask or reclassify
+        // the real alignment failure. Log and fall through to normal reporting.
+        console.warn(`[generate] alignment salvage failed for ${book} ${ch} (non-fatal): ${salvageErr.message}`);
       }
 
       if (!alignmentValidated) {
@@ -1474,6 +1540,19 @@ async function generatePipeline(route, message) {
           else if (reasons.includes('incomplete')) { errorKind = 'incomplete_coverage'; outputStatus = 'incomplete'; }
           else if (reasons.includes('stale')) { errorKind = 'stale_output'; outputStatus = 'stale'; }
           else { errorKind = 'missing_output'; outputStatus = 'missing'; }
+        }
+        if (transportClosed) {
+          // The align coordinator's in-process workspace-tools MCP transport was torn
+          // down mid-run ("Stream closed") and salvage could not close the gap from
+          // banked mapping JSON. Record a distinct kind (overriding the coverage-derived
+          // one) so self-diagnosis short-circuits to a templated issue — a fresh LLM
+          // diagnosis agent would hit the same dead transport — and enrich the summary
+          // so that short-circuit's text match fires.
+          errorKind = 'mcp_transport_closed';
+          if (outputStatus === 'degraded') outputStatus = 'missing';
+          if (!/transport closed|stream closed/i.test(finalValidationSummary || '')) {
+            finalValidationSummary = `${book} ${ch} — align-all-parallel aborted: workspace-tools MCP transport closed (Stream closed) before aligned USFM was produced${finalValidationSummary ? `; ${finalValidationSummary}` : ''}`;
+          }
         }
         const failEvent = await status(`**align-all-parallel** failed for ${book} ${ch} at ${new Date().toISOString()} — ${finalValidationSummary}`);
         fail++;

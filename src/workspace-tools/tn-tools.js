@@ -2268,7 +2268,13 @@ function verifyBoldMatches({ tsvFile, ultUsfm, preparedJson, output }) {
     let changed = false;
 
     note = note.replace(/\*\*([^*]+)\*\*/g, (match, boldText) => {
-      if (ult.includes(boldText)) return match; // exact match, keep bold
+      // Compare against the ULT with quote/whitespace normalization (curly vs
+      // straight, case) rather than a raw substring test. By the time this runs,
+      // curly_quotes (notes-pipeline) has already curled the note's quotes and
+      // apostrophes while the ULT parsed from USFM keeps its straight forms, so a
+      // raw `ult.includes(boldText)` mismatched and stripped nearly every span.
+      // This matches inspectOpeningBold's own comparison for consistency.
+      if (countCaseInsensitiveOccurrences(ult, boldText) > 0) return match; // keep bold
       stripped++;
       changed = true;
       log.push(`${ref}: stripped bold from "${boldText}"`);
@@ -3249,6 +3255,7 @@ function readPreparedNotes({ preparedJson, start = 0, end, summaryOnly = false }
 }
 
 module.exports = {
+  countCaseInsensitiveOccurrences,
   extractAlignmentData,
   fixHebrewQuotes,
   flagNarrowQuotes,

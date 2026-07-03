@@ -7,12 +7,11 @@ kill_timeout = 30
 [build]
   dockerfile = "Dockerfile.fly"
 
-[deploy]
-  # Refresh the /data/workspace skills checkout to origin/main on every deploy.
-  # See scripts/refresh-workspace.sh — stash→ff→pop so runtime-appended decision
-  # CSVs (and a root-owned .git) never freeze the checkout again as they did for
-  # 124 commits. Always exits 0 so it can't fail the deploy.
-  release_command = "bash /app/scripts/refresh-workspace.sh"
+# NOTE: the /data/workspace skills refresh is intentionally NOT a release_command.
+# Fly release commands run in an ephemeral machine with NO volumes mounted, so
+# refresh-workspace.sh only ever saw a missing /data/workspace and skipped,
+# freezing the bot on stale skills. It now runs from entrypoint.sh on the live,
+# volume-bearing machine (fires on every immediate-strategy deploy, at boot).
 
 [env]
   NODE_ENV = "production"
@@ -22,6 +21,7 @@ kill_timeout = 30
   HEBREW_DIR = "/data/workspace/data/hebrew_bible"
   CLAUDE_CONFIG_DIR = "/data/claude-config"
   MODEL_PROVIDER_CONFIG_FILE = "/config/model-provider-config.json"
+  BP_GUARD_HOOKS = "1"
 
 [http_service]
   internal_port = 8080

@@ -520,6 +520,13 @@ function parseChunkRange(filePath) {
   return { vStart: parseInt(match[1], 10), vEnd: parseInt(match[2], 10) };
 }
 
+// Shared usage/rate-limit detection for both the generate and notes pipelines.
+// These had drifted (the "out of ... usage" phrasing existed only in notes), so
+// the same upstream error paused notes but hard-failed generate.
+function isUsageLimitError(text) {
+  return /hit your limit|usage limit|rate limit|too many requests|out of .* usage|429/i.test(String(text || ''));
+}
+
 module.exports = {
   getDoor43Username,
   emailToFallbackUsername,
@@ -535,5 +542,6 @@ module.exports = {
   parsePartialTsv,
   truncatePartialTsv,
   parseChunkRange,
+  isUsageLimitError,
   CSKILLBP_DIR,
 };

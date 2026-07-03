@@ -382,6 +382,168 @@ function buildFallbackDiagnosis(event, rawText, parseError, contextSummary) {
   };
 }
 
+// errorKinds the align step records when a chapter has no usable aligned USFM:
+// `missing_output` (coordinator returned success but left nothing, or salvage
+// found no mapping JSON) and `incomplete_coverage` (salvage recovered only part
+// of the chapter). Both leave the deterministic Node-side salvage as the
+// canonical fix, and both were observed to time out the LLM diagnosis agent
+// (issue #174) — so both short-circuit.
+const ALIGN_SHORT_CIRCUIT_ERROR_KINDS = new Set(['missing_output', 'incomplete_coverage']);
+
+// True for the well-understood "align-all-parallel produced no (or only partial)
+// aligned output" signature. `assessAlignedChapterCoverage` emits "no aligned
+// output found" when the coordinator returns success but leaves no aligned USFM;
+// partial salvage rewrites the summary to "covers N/M verses, missing …". The
+// deterministic Node-side salvage (see `salvageAlignedFromMappingJson` in
+// `src/workspace-tools/usfm-tools.js`) is the canonical fix; the LLM diagnosis
+// agent adds nothing and, on chapters with lots of leftover mapping JSON, tends
+// to exhaust its 5-min time budget before producing usable JSON (issue #174).
+//
+// Prefers the checkpoint's structured `errorKind` (which also catches the
+// partial-salvage `incomplete_coverage` case, whose message text does NOT
+// contain "no aligned output found"), guarded on the align phase because
+// `missing_output` is also used by the notes/generate phase. Falls back to the
+// message text when no checkpoint errorKind is available.
+function isAlignMissingOutput(text, checkpoint) {
+  const current = checkpoint && checkpoint.current;
+  const errorKind = current && current.errorKind;
+  if (errorKind && ALIGN_SHORT_CIRCUIT_ERROR_KINDS.has(errorKind)) {
+    const skill = String((current && current.skill) || '');
+    // Only align-phase failures — `missing_output` is not align-exclusive.
+    if (!skill || /align/i.test(skill)) return true;
+  }
+  const msg = typeof text === 'string' ? text : String((text && text.message) || text || '');
+  if (!msg) return false;
+  return /no aligned output found/i.test(msg);
+}
+
+// True when the align failure is the in-process workspace-tools MCP transport being
+// torn down mid-run ("Stream closed"), typically an align sub-agent outliving the
+// parent query's message stream (JER 33, 2026-07-02). The runner now bails fast
+// (`mcp_transport_closed`) and the pipeline salvages from banked mapping JSON; when
+// salvage can't close the gap this signature reaches diagnosis. A fresh LLM agent
+// would hit the same dead transport, so short-circuit to a templated issue.
+function isAlignTransportClosed(text) {
+  const msg = typeof text === 'string' ? text : String((text && text.message) || text || '');
+  if (!msg) return false;
+  return /(stream closed|mcp transport closed)/i.test(msg) && /align/i.test(msg);
+}
+
+// Templated diagnosis for the "align-all-parallel: no (or only partial) aligned
+// output" signature. Skips the LLM investigation (which was timing out on real
+// runs — AMO 5, 2026-07-01) and files a concise, actionable issue that points at
+// the deterministic salvage path and the leftover mapping JSON to inspect.
+// `errorKind` (from the checkpoint) is `missing_output` for a total miss or
+// `incomplete_coverage` when salvage recovered only part of the chapter.
+function buildAlignMissingOutputDiagnosis(event, contextSummary, errorKind) {
+  const targetRepo = classifyRepo(event);
+  const scopeLabel = event.scope || event.pipelineType || 'event';
+  const partial = errorKind === 'incomplete_coverage';
+  const titleSuffix = partial ? 'align: incomplete aligned output' : 'align: no aligned output found';
+  const summaryLine = partial
+    ? '`align-all-parallel` recovered only partial verse coverage for one or both of ULT/UST.'
+    : '`align-all-parallel` reported "no aligned output found" for one or both of ULT/UST.';
+  const title = `Pipeline failure: ${event.pipelineType || 'generate'} ${scopeLabel} — ${titleSuffix}`
+    .slice(0, 120);
+  const body = [
+    '## Summary',
+    summaryLine,
+    'This is a well-understood failure mode: the alignment coordinator returned success',
+    'but produced no merged aligned USFM (typically leaving only per-verse mapping JSON',
+    'in `tmp/alignments`). The deterministic Node-side salvage',
+    '(`salvageAlignedFromMappingJson` in `src/workspace-tools/usfm-tools.js`, wired',
+    'terminally into the align step in `src/generate-pipeline.js`) recovers the chapter',
+    'when mapping JSON is present. This templated issue was filed instead of running the',
+    'LLM diagnosis agent because the signature is known and the diagnosis agent has been',
+    'observed to exceed its 5-minute time budget on this failure mode (see #174).',
+    '',
+    '## Failure event',
+    `- pipelineType: ${event.pipelineType || '(unknown)'}`,
+    `- scope: ${event.scope || '(none)'}`,
+    `- phase: ${event.phase || '(none)'}`,
+    `- severity: ${event.severity || '(unknown)'}`,
+    `- message: ${event.message || '(none)'}`,
+    '',
+    '## Next steps',
+    '- Check `tmp/alignments/` under the workspace for leftover per-verse mapping JSON',
+    '  for this chapter (naming: `<BOOK>-<NN>-vNN.json` or `<BOOK>-<NNN>-vNN.json`).',
+    '- If mapping JSON is present, salvage should have produced partial (or full) recovery —',
+    '  inspect `output/AI-ULT/<BOOK>/<TAG>-aligned.usfm` and',
+    '  `output/AI-UST/<BOOK>/<TAG>-aligned.usfm` for verse coverage before re-running.',
+    '- If no mapping JSON exists, the coordinator failed before creating any batches;',
+    '  investigate the coordinator prompt / model or simply re-run `align-all-parallel`.',
+    '',
+    '## Diagnosis context',
+    '<details><summary>Click to expand</summary>',
+    '',
+    '```',
+    String(contextSummary || '').slice(0, 8000),
+    '```',
+    '</details>',
+  ].join('\n');
+  return {
+    repo: targetRepo,
+    title,
+    body,
+    labels: ['bug', 'pipeline-failure', 'align-missing-output'],
+    classification: 'align-missing-output',
+  };
+}
+
+// Templated diagnosis for the "align-all-parallel: MCP transport closed" signature.
+// Skips the LLM investigation (which would hit the same dead in-process transport)
+// and files a concise, actionable issue pointing at the runner bail, the salvage
+// path, and the sub-agent lifecycle as the root cause to chase if it recurs.
+function buildAlignTransportClosedDiagnosis(event, contextSummary) {
+  const targetRepo = classifyRepo(event);
+  const scopeLabel = event.scope || event.pipelineType || 'event';
+  const title = `Pipeline failure: ${event.pipelineType || 'generate'} ${scopeLabel} — align: MCP transport closed (Stream closed)`
+    .slice(0, 120);
+  const body = [
+    '## Summary',
+    'The in-process `workspace-tools` MCP transport was torn down mid-alignment: every',
+    '`create_aligned_usfm` call returned `Stream closed` (a transport-level error, not a',
+    "tool error). The typical cause is an align sub-agent outliving the parent query's",
+    'message stream (observed: JER 33, 2026-07-02). The transport does not recover within',
+    'a session, so the runner now bails after a few consecutive `Stream closed` results',
+    '(`mcp_transport_closed`) instead of looping to the skill timeout, and the pipeline',
+    'attempts deterministic Node-side salvage (`salvageAlignedFromMappingJson`) from any',
+    'banked mapping JSON. This issue was filed because salvage could not fully recover the',
+    'chapter; the LLM diagnosis agent was skipped because it would hit the same dead transport.',
+    '',
+    '## Failure event',
+    `- pipelineType: ${event.pipelineType || '(unknown)'}`,
+    `- scope: ${event.scope || '(none)'}`,
+    `- phase: ${event.phase || '(none)'}`,
+    `- severity: ${event.severity || '(unknown)'}`,
+    `- message: ${event.message || '(none)'}`,
+    '',
+    '## Next steps',
+    '- Re-run the chapter — a fresh query spawns a fresh in-process MCP transport, and the',
+    '  banked mapping JSON in `tmp/alignments/` makes the conversion fast on the retry.',
+    '- If it recurs on the same chapter, chase the root cause: the align skill leaving a',
+    '  `general-purpose` batch sub-agent still calling MCP tools after the parent query',
+    "  stream has closed (sub-agent lifecycle vs. the coordinator's message stream).",
+    '- Confirm salvage ran: inspect `output/AI-ULT/<BOOK>/<TAG>-aligned.usfm` and',
+    '  `output/AI-UST/<BOOK>/<TAG>-aligned.usfm` for partial verse coverage.',
+    '',
+    '## Diagnosis context',
+    '<details><summary>Click to expand</summary>',
+    '',
+    '```',
+    String(contextSummary || '').slice(0, 8000),
+    '```',
+    '</details>',
+  ].join('\n');
+  return {
+    repo: targetRepo,
+    title,
+    body,
+    labels: ['bug', 'pipeline-failure', 'align-transport-closed'],
+    classification: 'align-transport-closed',
+  };
+}
+
 // Templated diagnosis for a recognized runner guardrail stop (looping tool errors
 // or budget exhaustion). No LLM investigation is run — the signature is well
 // understood — so we file a concise, actionable issue directly.
@@ -525,12 +687,31 @@ async function dispatchSelfDiagnosis({
     let usedFallback = false;
     let parseError = null;
     let shortCircuited = false;
+    let shortCircuitTag = null;
 
     if (isGuardrailStop(errorText) || isGuardrailStop(event.message)) {
       // Known signature — skip the LLM investigation and file a templated issue.
       console.log('[self-diagnosis] Guardrail-stop signature recognized; filing templated issue without running the agent.');
       diagnosis = buildGuardrailStopDiagnosis(event, contextSummary);
       shortCircuited = true;
+      shortCircuitTag = 'guardrail';
+    } else if (isAlignTransportClosed(errorText) || isAlignTransportClosed(event.message)) {
+      // Known signature — the in-process workspace-tools MCP transport was torn down
+      // mid-align ("Stream closed"). A fresh diagnosis agent would hit the same dead
+      // transport, so short-circuit to a templated issue.
+      console.log('[self-diagnosis] Align "Stream closed" MCP-transport signature recognized; filing templated issue without running the agent.');
+      diagnosis = buildAlignTransportClosedDiagnosis(event, contextSummary);
+      shortCircuited = true;
+      shortCircuitTag = 'align-transport-closed';
+    } else if (isAlignMissingOutput(errorText, checkpoint) || isAlignMissingOutput(event.message, checkpoint)) {
+      // Known signature — align-all-parallel produced no (or only partial) aligned
+      // output. The LLM diagnosis agent times out on this signature (issue #174),
+      // so short-circuit for both missing_output and incomplete_coverage.
+      const alignErrorKind = checkpoint && checkpoint.current && checkpoint.current.errorKind;
+      console.log(`[self-diagnosis] Align missing/partial-output signature recognized (errorKind=${alignErrorKind || 'text-match'}); filing templated issue without running the agent.`);
+      diagnosis = buildAlignMissingOutputDiagnosis(event, contextSummary, alignErrorKind);
+      shortCircuited = true;
+      shortCircuitTag = 'align-missing-output';
     } else {
       const agentResult = await runDiagnosisAgent({ contextSummary, runClaudeImpl });
       const rawText = agentResult.rawText;
@@ -602,7 +783,9 @@ async function dispatchSelfDiagnosis({
       });
     } catch (_) { /* non-fatal */ }
 
-    const action = shortCircuited ? 'created-guardrail' : (usedFallback ? 'created-fallback' : 'created');
+    const action = shortCircuited
+      ? (shortCircuitTag === 'guardrail' ? 'created-guardrail' : `created-${shortCircuitTag}`)
+      : (usedFallback ? 'created-fallback' : 'created');
     console.log(`[self-diagnosis] Done (action=${action} issue=${finalRepo}#${created.number}${usedFallback ? ' parse-error=' + (parseError && parseError.message ? parseError.message.slice(0, 120) : 'unknown') : ''})`);
     return { ok: true, action, issue: created, fingerprint, classification: diagnosis.classification };
   } catch (err) {
@@ -633,6 +816,10 @@ module.exports = {
   looksLikeDiagnosisAttempt,
   buildFallbackDiagnosis,
   buildGuardrailStopDiagnosis,
+  buildAlignMissingOutputDiagnosis,
+  isAlignMissingOutput,
+  buildAlignTransportClosedDiagnosis,
+  isAlignTransportClosed,
   buildIncompleteDiagnosis,
   buildContextSummary,
   appendFingerprintMarker,

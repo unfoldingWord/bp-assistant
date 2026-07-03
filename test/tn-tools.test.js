@@ -1647,3 +1647,56 @@ test('assembleNotes orders a verse by reading position, longest-first for nested
     'e_late_straight', // late, curly/straight apostrophe resolved
   ]);
 });
+
+// ---------------------------------------------------------------------------
+// Bold round-trip regression
+//
+// A generated note bolds a span quoting the ULT. The pipeline runs curly_quotes
+// on the assembled TSV *before* verify_bold_matches, so the note's apostrophe/
+// quote chars are curled while the ULT parsed from USFM keeps its straight
+// forms. verify_bold_matches used a raw `ult.includes(boldText)`, which then
+// mismatched and stripped nearly every span. The comparison must normalize
+// quotes/case so the bold survives the round-trip.
+// ---------------------------------------------------------------------------
+
+const { curlyQuotes } = require('../src/workspace-tools/usfm-tools');
+
+test('bold round-trip: assemble -> curly_quotes -> verify_bold_matches keeps a span quoting the ULT', () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tn-tools-bold-roundtrip-'));
+  const relRoot = path.join('tmp', path.basename(tempDir));
+  fs.mkdirSync(path.join('/srv/bot/workspace', relRoot), { recursive: true });
+
+  const tsvRel = path.join(relRoot, 'notes.tsv');
+  const ultRel = path.join(relRoot, 'ult.usfm');
+  const prepRel = path.join(relRoot, 'prepared_notes.json');
+  const genRel = path.join(relRoot, 'generated_notes.json');
+
+  // ULT keeps a straight possessive apostrophe (as parsed from USFM).
+  fs.writeFileSync(path.join('/srv/bot/workspace', ultRel),
+    "\\c 1\n\\v 1 Then Yahweh's anger burned against the people.\n");
+  fs.writeFileSync(path.join('/srv/bot/workspace', prepRel), JSON.stringify({
+    book: 'JOS', chapter: '1',
+    items: [{
+      id: 'a1b2',
+      reference: '1:1',
+      sref: 'figs-metonymy',
+      orig_quote: 'אַף',
+      gl_quote: "Yahweh's anger",
+      ult_verse: "Then Yahweh's anger burned against the people.",
+    }],
+  }, null, 2));
+  // Generated note bolds the exact ULT span (straight apostrophe at this stage).
+  fs.writeFileSync(path.join('/srv/bot/workspace', genRel), JSON.stringify({
+    a1b2: "Here, **Yahweh's anger** represents his judgment against the people.",
+  }, null, 2));
+
+  assembleNotes({ preparedJson: prepRel, generatedJson: genRel, output: tsvRel });
+  // curly_quotes runs on the TSV before the bold check (matches the pipeline).
+  curlyQuotes({ input: tsvRel, inPlace: true });
+  const summary = verifyBoldMatches({ tsvFile: tsvRel, ultUsfm: ultRel, preparedJson: prepRel });
+  const content = fs.readFileSync(path.join('/srv/bot/workspace', tsvRel), 'utf8');
+
+  assert.match(summary, /stripped 0 non-matching bold/);
+  // The bold survives with its (now curled) apostrophe intact.
+  assert.match(content, /\*\*Yahweh’s anger\*\*/);
+});

@@ -325,3 +325,160 @@ test('check_tn_quality MCP handler always returns schema-valid text content', as
   assert.equal(parsed.success, true, parsed.success ? '' : parsed.error.message);
   assert.equal(typeof parsed.data.content[0].text, 'string');
 });
+
+// Reads the findings written by checkTnQuality for a given output path.
+function readFindings(findingsRel) {
+  return JSON.parse(fs.readFileSync(path.join('/srv/bot/workspace', findingsRel), 'utf8')).findings || [];
+}
+
+test('checkTnQuality exempts :intro rows from the empty_quote check', async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'quality-intro-'));
+  const relRoot = path.join('tmp', path.basename(tempDir));
+  fs.mkdirSync(path.join('/srv/bot/workspace', relRoot), { recursive: true });
+
+  const tsvRel = path.join(relRoot, 'tn.tsv');
+  const findingsRel = path.join(relRoot, 'findings.json');
+
+  fs.writeFileSync(path.join('/srv/bot/workspace', tsvRel), [
+    'Reference\tID\tTags\tSupportReference\tQuote\tOccurrence\tNote',
+    '1:intro\ti0b2\t\t\t\t\tGeneral notes about chapter 1.',
+    '1:1\ta1b2\t\trc://*/ta/man/translate/figs-metaphor\t\t\tHere the writer uses a figure.',
+  ].join('\n'));
+
+  await checkTnQuality({ tsvPath: tsvRel, output: findingsRel });
+
+  const emptyQuoteIds = readFindings(findingsRel)
+    .filter((f) => f.category === 'empty_quote').map((f) => f.id);
+  assert.deepEqual(emptyQuoteIds, ['a1b2']);
+});
+
+test('checkTnQuality exempts "see how you translated" notes from missing_at', async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'quality-seehow-'));
+  const relRoot = path.join('tmp', path.basename(tempDir));
+  fs.mkdirSync(path.join('/srv/bot/workspace', relRoot), { recursive: true });
+
+  const tsvRel = path.join(relRoot, 'tn.tsv');
+  const prepRel = path.join(relRoot, 'prepared_notes.json');
+  const ultRel = path.join(relRoot, 'ult.usfm');
+  const ustRel = path.join(relRoot, 'ust.usfm');
+  const findingsRel = path.join(relRoot, 'findings.json');
+
+  fs.writeFileSync(path.join('/srv/bot/workspace', tsvRel), [
+    'Reference\tID\tTags\tSupportReference\tQuote\tOccurrence\tNote',
+    '1:1\ta1b2\t\trc://*/ta/man/translate/figs-metaphor\tמֶלֶךְ\t1\tSee how you translated this word in 1:1.',
+    '1:2\ta2b3\t\trc://*/ta/man/translate/figs-metaphor\tמֶלֶךְ\t1\tHere the writer uses a figure.',
+  ].join('\n'));
+  fs.writeFileSync(path.join('/srv/bot/workspace', prepRel), JSON.stringify({
+    items: [
+      { id: 'a1b2', reference: '1:1', at_required: true, gl_quote: 'king', issue_span_gl_quote: 'king', ult_verse: 'The king spoke.', ust_verse: 'The ruler spoke.' },
+      { id: 'a2b3', reference: '1:2', at_required: true, gl_quote: 'king', issue_span_gl_quote: 'king', ult_verse: 'The king answered.', ust_verse: 'The ruler answered.' },
+    ],
+  }, null, 2));
+  fs.writeFileSync(path.join('/srv/bot/workspace', ultRel), '\\c 1\n\\v 1 The king spoke.\n\\v 2 The king answered.\n');
+  fs.writeFileSync(path.join('/srv/bot/workspace', ustRel), '\\c 1\n\\v 1 The ruler spoke.\n\\v 2 The ruler answered.\n');
+
+  await checkTnQuality({ tsvPath: tsvRel, preparedJson: prepRel, ultUsfm: ultRel, ustUsfm: ustRel, output: findingsRel });
+
+  const missingAtIds = readFindings(findingsRel)
+    .filter((f) => f.category === 'missing_at').map((f) => f.id);
+  assert.deepEqual(missingAtIds, ['a2b3']);
+});
+
+test('checkTnQuality template_deviation compares only the resolved template, not a sub-type example', async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'quality-tpl-'));
+  const relRoot = path.join('tmp', path.basename(tempDir));
+  fs.mkdirSync(path.join('/srv/bot/workspace', relRoot), { recursive: true });
+
+  const tsvRel = path.join(relRoot, 'tn.tsv');
+  const prepRel = path.join(relRoot, 'prepared_notes.json');
+  const findingsRel = path.join(relRoot, 'findings.json');
+
+  fs.writeFileSync(path.join('/srv/bot/workspace', tsvRel), [
+    'Reference\tID\tTags\tSupportReference\tQuote\tOccurrence\tNote',
+    // No resolved template for this note: must NOT fall back to a templates.csv
+    // sub-type example (e.g. figs-metaphor "heart") and flag a false positive.
+    '1:1\ta1b2\t\trc://*/ta/man/translate/figs-metaphor\tמֶלֶךְ\t1\tHere the author uses a vivid comparison.',
+    // Resolved template present but the note omits its fixed phrase: still flagged.
+    '1:2\ta2b3\t\trc://*/ta/man/translate/figs-metaphor\tמֶלֶךְ\t1\tHere the king is powerful.',
+  ].join('\n'));
+  fs.writeFileSync(path.join('/srv/bot/workspace', prepRel), JSON.stringify({
+    items: [
+      { id: 'a1b2', reference: '1:1', sref: 'figs-metaphor', gl_quote: 'king', issue_span_gl_quote: 'king', ult_verse: 'The king is a lion.' },
+      { id: 'a2b3', reference: '1:2', sref: 'figs-metaphor', gl_quote: 'king', issue_span_gl_quote: 'king', ult_verse: 'The king is powerful.', template_text: 'Here the **X** represents a specific important idea in this passage.' },
+    ],
+  }, null, 2));
+
+  await checkTnQuality({ tsvPath: tsvRel, preparedJson: prepRel, output: findingsRel });
+
+  const deviationIds = readFindings(findingsRel)
+    .filter((f) => f.category === 'template_deviation').map((f) => f.id);
+  assert.deepEqual(deviationIds, ['a2b3']);
+});
+
+test('checkTnQuality missing_at exemption requires a genuine see-how note, not a mid-text mention', async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'quality-seehow-mid-'));
+  const relRoot = path.join('tmp', path.basename(tempDir));
+  fs.mkdirSync(path.join('/srv/bot/workspace', relRoot), { recursive: true });
+
+  const tsvRel = path.join(relRoot, 'tn.tsv');
+  const prepRel = path.join(relRoot, 'prepared_notes.json');
+  const ultRel = path.join(relRoot, 'ult.usfm');
+  const ustRel = path.join(relRoot, 'ust.usfm');
+  const findingsRel = path.join(relRoot, 'findings.json');
+
+  fs.writeFileSync(path.join('/srv/bot/workspace', tsvRel), [
+    'Reference\tID\tTags\tSupportReference\tQuote\tOccurrence\tNote',
+    // Mentions the phrase mid-note but is an ordinary explanatory note: still needs its AT.
+    '1:1\ta1b2\t\trc://*/ta/man/translate/figs-metaphor\tמֶלֶךְ\t1\tHere the figure recurs; see how you translated it earlier, but this occurrence differs.',
+    // Typed see_how item without the leading phrase: exempt via note_type.
+    '1:2\ta2b3\t\trc://*/ta/man/translate/figs-metaphor\tמֶלֶךְ\t1\tTranslate this the same way as before.',
+  ].join('\n'));
+  fs.writeFileSync(path.join('/srv/bot/workspace', prepRel), JSON.stringify({
+    items: [
+      { id: 'a1b2', reference: '1:1', at_required: true, gl_quote: 'king', issue_span_gl_quote: 'king', ult_verse: 'The king spoke.', ust_verse: 'The ruler spoke.' },
+      { id: 'a2b3', reference: '1:2', at_required: true, note_type: 'see_how', gl_quote: 'king', issue_span_gl_quote: 'king', ult_verse: 'The king answered.', ust_verse: 'The ruler answered.' },
+    ],
+  }, null, 2));
+  fs.writeFileSync(path.join('/srv/bot/workspace', ultRel), '\\c 1\n\\v 1 The king spoke.\n\\v 2 The king answered.\n');
+  fs.writeFileSync(path.join('/srv/bot/workspace', ustRel), '\\c 1\n\\v 1 The ruler spoke.\n\\v 2 The ruler answered.\n');
+
+  await checkTnQuality({ tsvPath: tsvRel, preparedJson: prepRel, ultUsfm: ultRel, ustUsfm: ustRel, output: findingsRel });
+
+  const missingAtIds = readFindings(findingsRel)
+    .filter((f) => f.category === 'missing_at').map((f) => f.id);
+  assert.deepEqual(missingAtIds, ['a1b2']);
+});
+
+test('checkTnQuality bold check tolerates curled quotes introduced by post-processing', async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'quality-bold-curl-'));
+  const relRoot = path.join('tmp', path.basename(tempDir));
+  fs.mkdirSync(path.join('/srv/bot/workspace', relRoot), { recursive: true });
+
+  const tsvRel = path.join(relRoot, 'tn.tsv');
+  const prepRel = path.join(relRoot, 'prepared_notes.json');
+  const ultRel = path.join(relRoot, 'ult.usfm');
+  const ustRel = path.join(relRoot, 'ust.usfm');
+  const findingsRel = path.join(relRoot, 'findings.json');
+
+  fs.writeFileSync(path.join('/srv/bot/workspace', tsvRel), [
+    'Reference\tID\tTags\tSupportReference\tQuote\tOccurrence\tNote',
+    // curly_quotes has curled the note's apostrophe; the parsed ULT keeps the straight form.
+    '1:1\ta1b2\t\trc://*/ta/man/translate/figs-metaphor\tמֶלֶךְ\t1\tHere ‘’ aside, the phrase **the king’s word** is a figure.',
+    // A genuinely absent bold span must still be flagged.
+    '1:2\ta2b3\t\trc://*/ta/man/translate/figs-metaphor\tמֶלֶךְ\t1\tHere **the queen’s word** is a figure.',
+  ].join('\n'));
+  fs.writeFileSync(path.join('/srv/bot/workspace', prepRel), JSON.stringify({
+    items: [
+      { id: 'a1b2', reference: '1:1', gl_quote: "the king's word", issue_span_gl_quote: "the king's word", ult_verse: "The king's word stood firm.", ust_verse: 'What the king said stood firm.' },
+      { id: 'a2b3', reference: '1:2', gl_quote: "the king's word", issue_span_gl_quote: "the king's word", ult_verse: "The king's word stood firm.", ust_verse: 'What the king said stood firm.' },
+    ],
+  }, null, 2));
+  fs.writeFileSync(path.join('/srv/bot/workspace', ultRel), "\\c 1\n\\v 1 The king's word stood firm.\n\\v 2 The king's word stood firm.\n");
+  fs.writeFileSync(path.join('/srv/bot/workspace', ustRel), '\\c 1\n\\v 1 What the king said stood firm.\n\\v 2 What the king said stood firm.\n');
+
+  await checkTnQuality({ tsvPath: tsvRel, preparedJson: prepRel, ultUsfm: ultRel, ustUsfm: ustRel, output: findingsRel });
+
+  const boldIds = readFindings(findingsRel)
+    .filter((f) => f.category === 'bold_not_in_ult').map((f) => f.id);
+  assert.deepEqual(boldIds, ['a2b3']);
+});

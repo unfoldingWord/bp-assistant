@@ -436,6 +436,153 @@ function mergeAlignedUsfm({ parts, output }) {
 }
 
 /**
+ * Deterministically recover aligned USFM from leftover mapping JSON.
+ *
+ * The align-all-parallel coordinator can return a nominal "success" while its
+ * subagents left only per-verse mapping JSON in tmp/alignments and never ran
+ * create_aligned_usfm / the merge (observed: AMO 5, 2026-07-01 — 27 ULT + 13
+ * UST mapping JSON, zero aligned USFM). The pipeline's coverage gate correctly
+ * flags missing_output, but a blind retry re-drives the same flaky coordinator.
+ *
+ * This converts whatever mapping JSON exists into a merged full-chapter aligned
+ * file in Node — no LLM, no shell — so the coverage gate can bank the verses
+ * that were genuinely produced and any retry only has to re-align the verses
+ * whose JSON is still missing.
+ *
+ * Disambiguation is by CONTENT, not filename: ULT and UST mapping JSON have
+ * historically landed in the shared tmp/alignments dir under inconsistent names
+ * (AMO-05-NNN.json vs AMO-005-NNN.json), so we match each candidate's
+ * english_text to the requested type's source verse text and convert with the
+ * correct source. Robust to 1/2/3-digit chapter padding and to the new
+ * `-ult`/`-ust` token (used only as a tiebreaker).
+ *
+ * @returns {{converted:number[], missing:number[], mergedOutput:string|null, note:string}}
+ */
+function salvageAlignedFromMappingJson({ book, chapter, type, sourceRel, hebrewRel, alignmentsDir = 'tmp/alignments' }) {
+  const result = { converted: [], missing: [], mergedOutput: null, note: '' };
+  const abs = (rel) => path.resolve(CSKILLBP_DIR, rel);
+  const isUst = String(type).toLowerCase() === 'ust';
+  const typeTok = isUst ? 'ust' : 'ult';
+  const bookU = String(book).toUpperCase();
+  const ch = parseInt(chapter, 10);
+
+  if (!sourceRel || !fs.existsSync(abs(sourceRel))) { result.note = `source missing: ${sourceRel}`; return result; }
+  if (!hebrewRel || !fs.existsSync(abs(hebrewRel))) { result.note = `hebrew missing: ${hebrewRel}`; return result; }
+
+  const norm = (s) => String(s || '')
+    .toLowerCase()
+    .replace(/\\[a-z]+\d*\*?/g, ' ')      // strip any usfm markers
+    .replace(/[^a-z0-9 ]+/g, ' ')          // drop punctuation
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  // --- 1) verse plain-text from the (unaligned) source chapter ---
+  // \v markers are not line-anchored — they follow poetry/paragraph markers on
+  // the same line (e.g. "\q1 \v 1 Hear this word"). Scan for \v N anywhere and
+  // capture its text up to the next \v (or the chapter's end).
+  const srcVerses = new Map(); // verseNum -> normalized text
+  {
+    let raw = fs.readFileSync(abs(sourceRel), 'utf8');
+    // If the source spans multiple chapters, restrict to the requested one.
+    const cIdx = raw.search(new RegExp(`\\\\c\\s+${ch}\\b`));
+    if (cIdx >= 0) {
+      raw = raw.slice(cIdx);
+      const nextC = raw.slice(3).search(/\\c\s+\d+\b/);
+      if (nextC >= 0) raw = raw.slice(0, nextC + 3);
+    }
+    const re = /\\v\s+(\d+)([\s\S]*?)(?=\\v\s+\d+|$)/g;
+    let m;
+    while ((m = re.exec(raw)) !== null) {
+      const v = parseInt(m[1], 10);
+      if (!srcVerses.has(v)) srcVerses.set(v, norm(m[2]));
+    }
+  }
+  if (srcVerses.size === 0) { result.note = 'no verses parsed from source'; return result; }
+
+  // --- 2) index candidate mapping JSON for this book+chapter (padding-agnostic) ---
+  const candidates = new Map(); // verseNum -> [{path, english, tokenMatch}]
+  const walk = (dirRel) => {
+    let entries;
+    try { entries = fs.readdirSync(abs(dirRel), { withFileTypes: true }); } catch (_) { return; }
+    for (const e of entries) {
+      const childRel = `${dirRel}/${e.name}`;
+      if (e.isDirectory()) { walk(childRel); continue; }
+      if (!e.name.endsWith('.json')) continue;
+      let data;
+      try { data = JSON.parse(fs.readFileSync(abs(childRel), 'utf8')); } catch (_) { continue; }
+      const ref = String(data.reference || '');
+      const m = ref.match(/^([1-3]?[A-Z]{2,3})\s+(\d+):(\d+)/);
+      if (!m) continue;
+      if (m[1].toUpperCase() !== bookU || parseInt(m[2], 10) !== ch) continue;
+      const verse = parseInt(m[3], 10);
+      if (!candidates.has(verse)) candidates.set(verse, []);
+      candidates.get(verse).push({
+        path: childRel,
+        english: norm(data.english_text),
+        tokenMatch: /-(ult|ust)\.json$/i.test(e.name) ? e.name.toLowerCase().includes(`-${typeTok}.json`) : null,
+      });
+    }
+  };
+  walk(alignmentsDir);
+
+  // token-overlap similarity (Jaccard on word sets)
+  const sim = (a, b) => {
+    if (!a || !b) return 0;
+    const A = new Set(a.split(' ')), B = new Set(b.split(' '));
+    let inter = 0;
+    for (const w of A) if (B.has(w)) inter++;
+    return inter / (A.size + B.size - inter);
+  };
+
+  // --- 3) per-verse: pick the JSON matching THIS type's source, then convert ---
+  const parts = [];
+  const salvageDir = `tmp/aligned/salvage`;
+  const pad2 = (n) => String(n).padStart(2, '0');
+  const pad3 = (n) => String(n).padStart(3, '0');
+  for (const verse of [...srcVerses.keys()].sort((a, b) => a - b)) {
+    const cands = candidates.get(verse) || [];
+    if (cands.length === 0) { result.missing.push(verse); continue; }
+    const srcPlain = srcVerses.get(verse);
+    // best by content similarity to this type's source; break ties by explicit token
+    let best = null, bestScore = -1;
+    for (const c of cands) {
+      let score = sim(c.english, srcPlain);
+      if (c.tokenMatch === true) score += 0.001;      // nudge toward correctly-tokened file
+      if (c.tokenMatch === false) score -= 0.001;
+      if (score > bestScore) { bestScore = score; best = c; }
+    }
+    // A correct mapping JSON's english_text essentially EQUALS its source verse
+    // text (alignment is a 1:1 mapping of the source — see ULT/UST Step 7 "match
+    // exactly"). A high bar rejects both cross-type contamination (a ULT JSON
+    // standing in for a missing UST verse, or vice versa) and stale JSON that no
+    // longer matches the current source — those verses are reported missing so a
+    // retry re-aligns them properly rather than banking wrong text.
+    if (!best || bestScore < 0.85) { result.missing.push(verse); continue; }
+    const outRel = `${salvageDir}/${bookU}-${pad2(ch)}-${pad3(verse)}-${typeTok}-aligned.usfm`;
+    try { fs.mkdirSync(path.dirname(abs(outRel)), { recursive: true }); } catch (_) { /* ok */ }
+    const conv = createAlignedUsfm({ hebrew: hebrewRel, mapping: best.path, source: sourceRel, output: outRel, chapter: ch, verse, ust: isUst });
+    if (typeof conv === 'string' && conv.startsWith('Error')) { result.missing.push(verse); continue; }
+    let produced;
+    try { produced = fs.readFileSync(abs(outRel), 'utf8'); } catch (_) { result.missing.push(verse); continue; }
+    if (!/\\zaln-s/.test(produced) || !new RegExp(`\\\\v\\s+${verse}\\b`).test(produced)) { result.missing.push(verse); continue; }
+    parts.push({ verse, rel: outRel });
+    result.converted.push(verse);
+  }
+
+  if (parts.length === 0) { result.note = 'no verses converted'; return result; }
+
+  // --- 4) merge per-verse parts (verse order) into the full-chapter aligned file ---
+  parts.sort((a, b) => a.verse - b.verse);
+  const chTok = bookU === 'PSA' ? String(ch).padStart(3, '0') : pad2(ch);
+  const mergedRel = `output/AI-${isUst ? 'UST' : 'ULT'}/${bookU}/${bookU}-${chTok}-aligned.usfm`;
+  const mres = mergeAlignedUsfm({ parts: parts.map((p) => p.rel), output: mergedRel });
+  if (typeof mres === 'string' && mres.startsWith('Error')) { result.note = mres; return result; }
+  result.mergedOutput = mergedRel;
+  result.note = mres;
+  return result;
+}
+
+/**
  * Validate alignment JSON files for the ULT/UST-alignment workflow.
  * Port of: validate_alignment_json.py
  */
@@ -1164,6 +1311,7 @@ module.exports = {
   repairAlignmentXContent,
   readUsfmChapter,
   mergeAlignedUsfm,
+  salvageAlignedFromMappingJson,
   validateAlignmentJson,
   validateAlignedUsfmMarkup,
   summarizeAlignedUsfmMarkupFindings,

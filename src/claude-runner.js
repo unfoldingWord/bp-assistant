@@ -5,7 +5,7 @@ const { ensureFreshToken } = require('./auth-refresh');
 const { recordRateLimit, getHeadroom } = require('./usage-tracker');
 const { createWorkspaceTools, createTnWriterTools, createQualityTools, createIssueIdTools } = require('./workspace-tools');
 const { publishAdminStatus } = require('./admin-status');
-const { resolveDifficultyModel } = require('./api-runner/provider-config');
+const { resolveDifficultyModel, resolveDifficultyEffort } = require('./api-runner/provider-config');
 
 let _query = null;
 let _sdkCreateSdkMcpServer = null;
@@ -34,6 +34,9 @@ async function createFreshWorkspaceToolsServer(toolSet) {
     'tn-writer': createTnWriterTools,
     quality: createQualityTools,
     'issue-id': createIssueIdTools,
+    // Empty server for pure-text calls (per-note/AT generation) that pass
+    // tools:[] — avoids attaching the full ~52-tool workspace set they never use.
+    none: (createServer) => createServer({ name: 'workspace-tools', version: '1.0.0', tools: [] }),
   };
   const factory = factories[toolSet] || createWorkspaceTools;
   return factory(_sdkCreateSdkMcpServer, _sdkTool, _z);
@@ -162,10 +165,14 @@ function buildOptions({
   if (resume) {
     options.resume = resume;
   }
-  // Resolve difficulty tiers (low/medium/high) and apply per-run model overrides
-  // (BP_FORCE_MODEL / BP_MODEL_*). No override + non-tier value => unchanged.
-  options.model = resolveDifficultyModel('claude', model || 'opus');
-  const reasoning = resolveReasoning(thinking, options.model);
+  // Resolve difficulty tiers (low/medium/high) -> top model (Opus) + effort, and
+  // apply per-run overrides (BP_FORCE_MODEL / BP_MODEL_*). Non-tier value => model
+  // unchanged. When the caller didn't pass an explicit `thinking`, a difficulty
+  // tier sets the reasoning effort (that's the cost/latency lever now).
+  const requestedModel = model || 'opus';
+  options.model = resolveDifficultyModel('claude', requestedModel);
+  const tierEffort = resolveDifficultyEffort(requestedModel);
+  const reasoning = resolveReasoning(thinking != null ? thinking : tierEffort, options.model);
   if (reasoning.thinking) options.thinking = reasoning.thinking;
   if (reasoning.effort) options.effort = reasoning.effort;
   if (betas) {
@@ -194,10 +201,16 @@ function buildOptions({
         const ti = input.tool_input;
         if (!ti || typeof ti !== 'object' || typeof ti.model !== 'string') return {};
         const resolved = resolveDifficultyModel('claude', ti.model);
-        if (!resolved || resolved === ti.model) return {};
-        // Auditable: makes a per-run force/override observable in run logs.
-        console.log(`[model-select] ${tool} sub-agent model ${ti.model} -> ${resolved}${process.env.BP_FORCE_MODEL ? ' (forced)' : ''}`);
-        return { hookSpecificOutput: { hookEventName: 'PreToolUse', updatedInput: { ...ti, model: resolved } } };
+        const tierEffort = resolveDifficultyEffort(ti.model); // set effort only when spawn used a tier and caller didn't specify one
+        const modelChanged = resolved && resolved !== ti.model;
+        const effortChanged = tierEffort && ti.effort == null && ti.effort !== tierEffort;
+        if (!modelChanged && !effortChanged) return {};
+        const updatedInput = { ...ti };
+        if (modelChanged) updatedInput.model = resolved;
+        if (effortChanged) updatedInput.effort = tierEffort;
+        // Auditable: makes a per-run force/override + difficulty->effort observable in run logs.
+        console.log(`[model-select] ${tool} sub-agent ${ti.model}${modelChanged ? ` model->${resolved}` : ''}${effortChanged ? ` effort->${tierEffort}` : ''}${process.env.BP_FORCE_MODEL ? ' (forced)' : ''}`);
+        return { hookSpecificOutput: { hookEventName: 'PreToolUse', updatedInput } };
       } catch (err) {
         console.warn(`[claude-runner] model-resolver hook error: ${err.message}`);
         return {};
@@ -266,6 +279,15 @@ async function runClaudeOnce({
   let localTimeoutFired = false;
   const toolErrorSigs = new Map();
   let consecutiveToolErrors = 0;
+  // Repeated "Stream closed" tool_results mean the in-process workspace-tools MCP
+  // transport has been torn down (typically an align sub-agent outliving the parent
+  // query's message stream — JER 33, 2026-07-02). It is transport-level, not a tool
+  // error, and never recovers within a session, so retrying is pure wasted wall-clock
+  // (observed: 15+ min looping to the skill timeout). Bail after a few and return a
+  // distinct outcome so the caller can salvage from banked mapping JSON / short-circuit.
+  const MCP_TRANSPORT_ERROR_LIMIT = 3;
+  let consecutiveTransportErrors = 0;
+  let transportClosedFired = false;
 
   const timer = setTimeout(() => {
     localTimeoutFired = true;
@@ -341,8 +363,33 @@ async function runClaudeOnce({
           ? message.message.content
           : JSON.stringify(message.message?.content || '');
         const lower = text.toLowerCase();
+        // Transport-level teardown of the in-process workspace-tools MCP surfaces as an
+        // is_error tool_result whose content is "Stream closed" (NOT a tool_use_error):
+        // the channel is gone, so every subsequent MCP call fails identically until the
+        // query ends. Retrying can't help — bail fast after a few.
+        const isTransportClosed = lower.includes('stream closed') && lower.includes('is_error');
         const isToolError = lower.includes('tool_use_error');
-        if (isToolError) {
+        if (isTransportClosed) {
+          consecutiveTransportErrors += 1;
+          console.warn(
+            `${runnerPrefix} MCP transport error ("Stream closed") ` +
+            `${consecutiveTransportErrors}/${MCP_TRANSPORT_ERROR_LIMIT} — ` +
+            `workspace-tools stream is closed; retrying is futile within this session`
+          );
+          if (consecutiveTransportErrors >= MCP_TRANSPORT_ERROR_LIMIT) {
+            transportClosedFired = true;
+            console.error(
+              `${runnerPrefix} Aborting query — workspace-tools MCP transport closed ` +
+              `(${consecutiveTransportErrors} consecutive "Stream closed"). The in-process ` +
+              `SDK MCP transport does not recover within a session; bailing to salvage / ` +
+              `short-circuit instead of looping to the ${timeout / 1000}s timeout.`
+            );
+            abortController.abort();
+            break;
+          }
+        } else if (isToolError) {
+          // A live tool-level error means the MCP transport is up again.
+          consecutiveTransportErrors = 0;
           const sig = lower.includes('string to replace not found')
             ? 'string_not_found'
             : lower.includes('no changes to make')
@@ -368,6 +415,7 @@ async function runClaudeOnce({
           // Only reset on non-error tool results to avoid false positives during
           // legitimate read/validation sequences.
           consecutiveToolErrors = 0;
+          consecutiveTransportErrors = 0;
         }
         if (text.includes('command-stderr') || text.includes('Error')) {
           console.error(`${runnerPrefix} SDK user message (error): ${text.slice(0, 500)}`);
@@ -437,6 +485,25 @@ async function runClaudeOnce({
   // so callers can classify AT failures precisely instead of lumping everything
   // into "empty response".
   const elapsedMs = Date.now() - queryStart;
+  // The in-process workspace-tools MCP transport was torn down mid-run — take
+  // precedence over the abort→timeout classification below (we abort()ed to bail).
+  if (transportClosedFired) {
+    console.warn(
+      `${runnerPrefix} Returning mcp_transport_closed outcome — ` +
+      `reason=mcp_transport_closed consecutive=${consecutiveTransportErrors} elapsed=${elapsedMs}ms`
+    );
+    return {
+      subtype: 'mcp_transport_closed',
+      timedOut: false,
+      reason: 'mcp_transport_closed',
+      queryId,
+      elapsedMs,
+      configuredTimeoutMs: timeout,
+      turnCount,
+      lastTool,
+      consecutiveTransportErrors,
+    };
+  }
   if (localTimeoutFired || abortController.signal.aborted) {
     const driftMs = elapsedMs - timeout;
     console.warn(
