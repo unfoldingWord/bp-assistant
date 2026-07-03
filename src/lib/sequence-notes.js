@@ -61,7 +61,8 @@ function buildAlignmentMap(usfmPath) {
       }
     }
   }
-  console.log(`Built alignment map:\n${JSON.stringify(verseMap)}`);
+  const lines = JSON.stringify(verseMap, null, 2).split('\n');
+  console.log(lines.slice(0, 20).join('\n'));
   return verseMap;
 }
 
