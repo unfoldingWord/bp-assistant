@@ -12,6 +12,13 @@ function normalizeHebrew(text) {
     .trim();
 }
 
+function splitHebrewContent(content) {
+  return String(content || '')
+    .split(/\s+/)
+    .map((word) => normalizeHebrew(word))
+    .filter(Boolean);
+}
+
 function buildAlignmentMap(usfmPath) {
   const usfm = fs.readFileSync(usfmPath, 'utf8');
   const verseMap = {};
@@ -40,7 +47,7 @@ function buildAlignmentMap(usfmPath) {
     }
 
     if (hebrew) {
-      pendingHebrew.push(normalizeHebrew(hebrew));
+      pendingHebrew.push(...splitHebrewContent(hebrew));
       continue;
     }
 
@@ -54,7 +61,8 @@ function buildAlignmentMap(usfmPath) {
       }
     }
   }
-
+  const lines = JSON.stringify(verseMap, null, 2).split('\n');
+  console.log(lines.slice(0, 20).join('\n'));
   return verseMap;
 }
 
@@ -125,6 +133,13 @@ function normalizeVerseKey(reference) {
   return `${chapter}:${verseStr.split('-')[0]}`;
 }
 
+function getReferenceOrder(reference) {
+  const normalized = normalizeVerseKey(reference);
+  const match = String(normalized || '').match(/^(\d+):(\d+)$/);
+  if (!match) return [Number.MAX_SAFE_INTEGER, Number.MAX_SAFE_INTEGER];
+  return [Number(match[1]), Number(match[2])];
+}
+
 function warnUnmatchedNote(cols, reference, verseAlignments) {
   const quote = getQuote(cols);
   if (!quote || /:intro$/.test(reference)) return;
@@ -159,32 +174,23 @@ function getSequenceSortKey(row, verseMap) {
 }
 
 function sortRowsBySequence(rows, verseMap) {
-  const grouped = new Map();
-  rows.forEach((row, index) => {
+  const decorated = rows.map((row, index) => {
     const cols = Array.isArray(row) ? row : String(row || '').split('\t');
     const reference = cols[0] || '';
-    if (!grouped.has(reference)) grouped.set(reference, []);
-    grouped.get(reference).push({ row, index });
+    return {
+      row,
+      sortKey: [...getReferenceOrder(reference), ...getSequenceSortKey(row, verseMap), index],
+    };
   });
 
-  const sortedRows = [];
-  for (const verseNotes of grouped.values()) {
-    const decorated = verseNotes.map((note, noteIndex) => ({
-      row: note.row,
-      sortKey: [...getSequenceSortKey(note.row, verseMap), noteIndex],
-    }));
+  decorated.sort((a, b) => {
+    for (let i = 0; i < a.sortKey.length; i++) {
+      if (a.sortKey[i] !== b.sortKey[i]) return a.sortKey[i] - b.sortKey[i];
+    }
+    return 0;
+  });
 
-    decorated.sort((a, b) => {
-      for (let i = 0; i < a.sortKey.length; i++) {
-        if (a.sortKey[i] !== b.sortKey[i]) return a.sortKey[i] - b.sortKey[i];
-      }
-      return 0;
-    });
-
-    sortedRows.push(...decorated.map(({ row }) => row));
-  }
-
-  return sortedRows;
+  return decorated.map(({ row }) => row);
 }
 
 function parseTsvLine(line) {

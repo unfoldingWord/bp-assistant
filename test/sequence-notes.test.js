@@ -58,6 +58,61 @@ test('buildAlignmentMap and sortRowsBySequence port sequence_notes.py ordering',
   }
 });
 
+test('buildAlignmentMap splits phrase x-content and sorts same-position quotes longest first', () => {
+  const dir = makeTempDir();
+  try {
+    const usfmPath = path.join(dir, 'ZEC.usfm');
+    fs.writeFileSync(usfmPath, [
+      '\\id ZEC',
+      '\\c 10',
+      '\\v 3 \\zaln-s |x-content="כִּֽי פָקַד֩ יְהוָ֨ה"\\*\\w For|x\\w* \\w Yahweh|x\\w* \\w attended|x\\w*',
+    ].join('\n'), 'utf8');
+
+    const verseMap = buildAlignmentMap(usfmPath);
+    assert.deepEqual(verseMap['10:3'], [
+      ['כי', 1],
+      ['פקד', 1],
+      ['יהוה', 1],
+    ]);
+
+    const rows = [
+      ['10:3', 'short', '', '', 'כִּֽי', '1', 'Short quote'],
+      ['10:3', 'long', '', '', 'כִּֽי פָקַד֩ יְהוָ֨ה', '1', 'Long quote'],
+    ];
+
+    const sortedIds = sortRowsBySequence(rows, verseMap).map((row) => row[1]);
+    assert.deepEqual(sortedIds, ['long', 'short']);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('sortRowsBySequence groups bridged references with their starting verse before ordering', () => {
+  const dir = makeTempDir();
+  try {
+    const usfmPath = path.join(dir, 'ZEC.usfm');
+    fs.writeFileSync(usfmPath, [
+      '\\id ZEC',
+      '\\c 10',
+      '\\v 3 \\zaln-s |x-content="כִּֽי"\\*\\w For|x\\w*',
+      '\\zaln-s |x-content="פָקַד֩"\\*\\w attended|x\\w*',
+      '\\zaln-s |x-content="יְהוָ֨ה"\\*\\w Yahweh|x\\w*',
+    ].join('\n'), 'utf8');
+
+    const verseMap = buildAlignmentMap(usfmPath);
+    const rows = [
+      ['10:3-4', 'bridged', '', '', 'כִּֽי', '1', 'Bridged note'],
+      ['10:3', 'short', '', '', 'כִּֽי', '1', 'Short note'],
+      ['10:3', 'long', '', '', 'כִּֽי פָקַד֩ יְהוָ֨ה', '1', 'Long note'],
+    ];
+
+    const sortedIds = sortRowsBySequence(rows, verseMap).map((row) => row[1]);
+    assert.deepEqual(sortedIds, ['long', 'bridged', 'short']);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('getSequenceSortKey normalizes a verse-bridge reference to match the alignment map', () => {
   const verseMap = { '10:1': [['ישראל', 1], ['בוקק', 2]] };
 
