@@ -265,8 +265,8 @@ async function tqsPipeline(route, message) {
         prompt: `Write translation questions for ${book} chapter ${chapter}.`,
         mcpToolSet: 'workspace',
         allowedTools: DEFAULT_RESTRICTED_TOOLS,
+        enableBash: true,
         disableLocalSettings: true,
-        forceNoAutoBashSandbox: true,
         timeoutMs: calcSkillTimeout(book, chapter, 1),
       });
       recordMetrics({ pipeline: 'tqs', skill: 'tq-writer', book, chapter, result, success: true, userId: message.sender_id });

@@ -11,6 +11,10 @@ const NEEDED_TOOLS = [
   'Agent', 'TeamCreate', 'TeamDelete',
   'TaskCreate', 'TaskUpdate', 'TaskList', 'TaskGet',
   'NotebookEdit', 'WebFetch', 'WebSearch',
+  // Pipeline agents run workspace tools via the Bash CLI wrapper; per-run
+  // scoped permission rules (claude-runner BASH_ALLOW_RULES) gate what
+  // actually executes. Kept off when BP_DISABLE_BASH=1 via enableBash.
+  'Bash',
 ];
 
 function ensureClaudeConfig() {

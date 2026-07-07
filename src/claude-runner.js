@@ -105,6 +105,32 @@ const DEFAULT_RESTRICTED_TOOLS = [
   'NotebookEdit', 'WebFetch', 'WebSearch',
 ];
 
+// Restricted profile + Bash. Used by pipeline runs that opt in via
+// enableBash so agents run workspace tools through the CLI wrapper
+// (node /app/src/workspace-tools-cli.js) instead of the in-process MCP
+// transport that tears down mid-run (JER 32/33, AMO 5, ZEC 10). The MCP
+// server stays registered as the Option-B fallback.
+const DEFAULT_BASH_TOOLS = [...DEFAULT_RESTRICTED_TOOLS, 'Bash'];
+
+// Scoped Bash permission rules that auto-approve deterministically under
+// permissionMode:'auto' (zero prompt latency). Anything outside these prefixes
+// falls to the model classifier — which approves/denies but never hangs an
+// unattended run. Phase 5 will harvest real usage from logs and flip to
+// 'dontAsk'. Rule syntax: Bash(<prefix>:*) — see SDK sdk.d.ts permissions.allow.
+const BASH_ALLOW_RULES = [
+  'Bash(node /app/src/workspace-tools-cli.js:*)',
+  'Bash(node /app/src/door43-push-cli.js:*)',
+  'Bash(node .claude/skills/utilities/scripts/:*)', // live validation .mjs; cwd=/data/workspace
+  'Bash(grep:*)', 'Bash(head:*)', 'Bash(tail:*)', 'Bash(wc:*)', 'Bash(ls:*)', 'Bash(cat:*)',
+];
+
+// Kill switch: `fly secrets set BP_DISABLE_BASH=1` reverts the fleet to
+// MCP-only on the next machine restart without touching either repo (skills
+// keep their Option-B MCP fallback). enableBash is a no-op when set.
+function bashEnabled(enableBash) {
+  return Boolean(enableBash) && process.env.BP_DISABLE_BASH !== '1';
+}
+
 const TRANSIENT_RETRY_WINDOW_MS = 10 * 60 * 1000;
 const RETRY_BASE_DELAY_MS = 5000;
 const RETRY_MAX_DELAY_MS = 60000;
@@ -127,6 +153,7 @@ function buildOptions({
   disallowedTools,
   disableLocalSettings,
   forceNoAutoBashSandbox,
+  enableBash,
   maxTurns,
   timeoutMs,
   appendSystemPrompt,
@@ -230,6 +257,37 @@ function buildOptions({
       ...(compaction.window ? { autoCompactWindow: compaction.window } : {}),
     };
   }
+  // Bash enablement (Phase 1). Runs last so it composes with the sandbox and
+  // compaction settings above.
+  if (enableBash) {
+    if (bashEnabled(enableBash)) {
+      // Ensure Bash is in the tool allowlist, add the scoped auto-approve
+      // rules, and disable the (nonexistent on Fly) sandbox so Bash doesn't
+      // prompt/hang unattended.
+      if (Array.isArray(options.tools) && !options.tools.includes('Bash')) {
+        options.tools = [...options.tools, 'Bash'];
+      }
+      if (Array.isArray(options.allowedTools) && !options.allowedTools.includes('Bash')) {
+        options.allowedTools = [...options.allowedTools, 'Bash'];
+      }
+      const prevPerms = (options.settings && options.settings.permissions) || {};
+      options.settings = {
+        ...(options.settings || {}),
+        sandbox: { enabled: false },
+        permissions: {
+          ...prevPerms,
+          allow: [...(prevPerms.allow || []), ...BASH_ALLOW_RULES],
+        },
+      };
+    } else {
+      // Kill switch (BP_DISABLE_BASH=1): callers still pass DEFAULT_BASH_TOOLS
+      // (which contains 'Bash'), so we must STRIP it from the allowlist to
+      // truly revert the fleet to MCP-only — skipping the permission rules
+      // alone would leave Bash usable via the 'auto' classifier.
+      if (Array.isArray(options.tools)) options.tools = options.tools.filter((t) => t !== 'Bash');
+      if (Array.isArray(options.allowedTools)) options.allowedTools = options.allowedTools.filter((t) => t !== 'Bash');
+    }
+  }
   return options;
 }
 
@@ -245,6 +303,7 @@ async function runClaudeOnce({
   disallowedTools,
   disableLocalSettings,
   forceNoAutoBashSandbox,
+  enableBash,
   skill,
   maxTurns,
   timeoutMs,
@@ -327,6 +386,7 @@ async function runClaudeOnce({
     disallowedTools,
     disableLocalSettings,
     forceNoAutoBashSandbox,
+    enableBash,
     maxTurns,
     appendSystemPrompt,
     abortController,
@@ -708,6 +768,7 @@ async function runClaudeStream({
   disallowedTools,
   disableLocalSettings,
   forceNoAutoBashSandbox,
+  enableBash,
   maxTurns,
   timeoutMs,
   appendSystemPrompt,
@@ -736,6 +797,7 @@ async function runClaudeStream({
     disallowedTools,
     disableLocalSettings,
     forceNoAutoBashSandbox,
+    enableBash,
     maxTurns,
     appendSystemPrompt,
     abortController,
@@ -762,6 +824,8 @@ module.exports = {
   buildOptions,
   createFreshWorkspaceToolsServer,
   DEFAULT_RESTRICTED_TOOLS,
+  DEFAULT_BASH_TOOLS,
+  BASH_ALLOW_RULES,
   ClaudeTransientOutageError,
   isTransientOutageError,
   isGuardrailStop,

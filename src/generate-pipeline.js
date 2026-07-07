@@ -10,7 +10,7 @@ const fs = require('fs');
 const path = require('path');
 const config = require('./config');
 const { sendMessage, sendDM, addReaction, removeReaction, uploadFile } = require('./zulip-client');
-const { runClaude, DEFAULT_RESTRICTED_TOOLS, isTransientOutageError } = require('./claude-runner');
+const { runClaude, DEFAULT_BASH_TOOLS, isTransientOutageError } = require('./claude-runner');
 const { extractContentTypes } = require('./router');
 const { getDoor43Username, emailToFallbackUsername, buildBranchName, resolveOutputFile, discoverFreshOutput, calcSkillTimeout, normalizeBookName, resolveConflictMention, isUsageLimitError, CSKILLBP_DIR } = require('./pipeline-utils');
 const { verifyRepoPush, verifyDcsToken } = require('./repo-verify');
@@ -844,10 +844,9 @@ async function generatePipeline(route, message) {
             skill: invocationSkill,
             resume: invocationResume,
             appendSystemPrompt: isInitialPipelineSkill ? INITIAL_PIPELINE_COMPLETION_GUARDRAIL : undefined,
-            tools: DEFAULT_RESTRICTED_TOOLS,
-            disallowedTools: ['Bash'],
+            tools: DEFAULT_BASH_TOOLS,
+            enableBash: true,
             disableLocalSettings: true,
-            forceNoAutoBashSandbox: true,
             timeoutMs,
             onProgress: ({ turnCount, lastTool, elapsedMs, timedOut }) => {
               const elapsed = Math.round(elapsedMs / 60000);
@@ -1015,10 +1014,9 @@ async function generatePipeline(route, message) {
               betas,
               resume: claudeResult.session_id,
               appendSystemPrompt: INITIAL_PIPELINE_COMPLETION_GUARDRAIL,
-              tools: DEFAULT_RESTRICTED_TOOLS,
-              disallowedTools: ['Bash'],
+              tools: DEFAULT_BASH_TOOLS,
+              enableBash: true,
               disableLocalSettings: true,
-              forceNoAutoBashSandbox: true,
               timeoutMs: calcSkillTimeout(book, ch, route.operations || 6),
               onProgress: ({ turnCount, lastTool, elapsedMs, timedOut }) => {
                 const elapsed = Math.round(elapsedMs / 60000);
@@ -1319,10 +1317,9 @@ async function generatePipeline(route, message) {
         model: model || 'medium',  // mechanical alignment — Sonnet suffices at lower cost
         betas,
         skill: 'align-all-parallel',
-        tools: DEFAULT_RESTRICTED_TOOLS,
-        disallowedTools: ['Bash'],
+        tools: DEFAULT_BASH_TOOLS,
+        enableBash: true,
         disableLocalSettings: true,
-        forceNoAutoBashSandbox: true,
         timeoutMs: alignTimeout,
         onProgress: ({ turnCount, lastTool, elapsedMs, timedOut }) => {
           const elapsed = Math.round(elapsedMs / 60000);
@@ -1452,10 +1449,9 @@ async function generatePipeline(route, message) {
           model: model || 'medium',
           betas,
           skill: 'align-all-parallel',
-          tools: DEFAULT_RESTRICTED_TOOLS,
-          disallowedTools: ['Bash'],
+          tools: DEFAULT_BASH_TOOLS,
+          enableBash: true,
           disableLocalSettings: true,
-          forceNoAutoBashSandbox: true,
           timeoutMs: alignTimeout,
           onProgress: ({ turnCount, lastTool, elapsedMs, timedOut }) => {
             const elapsed = Math.round(elapsedMs / 60000);
