@@ -479,22 +479,22 @@ def find_sequence(ult_dict_combined, notes_dict, unique_numbers):
                 forward_match = re.search(forward_search_phrase, gloss_text)
                 if forward_match:
                     forward_text = forward_match.group(0)
-                else:
-                    mod_search_phrase = re.sub(r'[\)\(]', '', search_phrase)
-                    mod_search_phrase = re.sub(r'\\ ', r' ', mod_search_phrase)
-                    reverse_search_phrase = ' '.join(mod_search_phrase.split()[::-1])
-                    reverse_search_phrase = re.sub(r' (\\d\+)', r'.*?\1', reverse_search_phrase)
-                    reverse_search_phrase = '(' + reverse_search_phrase + ')'
-                    num_tokens = len(forward_search_phrase.split()) // 2
-                    if num_tokens <= 25:
 
-                        reverse_gloss_text = ' '.join(gloss_text.split()[::-1])
+                mod_search_phrase = re.sub(r'[\)\(]', '', search_phrase)
+                mod_search_phrase = re.sub(r'\\ ', r' ', mod_search_phrase)
+                reverse_search_phrase = ' '.join(mod_search_phrase.split()[::-1])
+                reverse_search_phrase = re.sub(r' (\\d\+)', r'.*?\1', reverse_search_phrase)
+                reverse_search_phrase = '(' + reverse_search_phrase + ')'
+                num_tokens = len(forward_search_phrase.split()) // 2
+                if num_tokens <= 25:
 
-                        reverse_match = re.search(reverse_search_phrase, reverse_gloss_text)
+                    reverse_gloss_text = ' '.join(gloss_text.split()[::-1])
 
-                        if reverse_match:
-                            reversed_text = reverse_match.group(0)
-                            reversed_text = ' '.join(reversed_text.split()[::-1])
+                    reverse_match = re.search(reverse_search_phrase, reverse_gloss_text)
+
+                    if reverse_match:
+                        reversed_text = reverse_match.group(0)
+                        reversed_text = ' '.join(reversed_text.split()[::-1])
 
                 # --- Choose shortest match ---
                 candidate_matches = [
