@@ -15,6 +15,22 @@ on:
         required: false
         default: 'no'
 
+# Serialize deploys to the single uw-bt-bot machine. Two `flyctl deploy --strategy
+# immediate` runs racing on the same machine is what caused the 2026-07 outage:
+# the skills repo auto-dispatched this workflow on a PR merge and a human manually
+# dispatched it ~4s later; both hit `machine is replacing: concurrent update in
+# progress`, and that churn saturated Fly's machine-start rate limit, which then
+# combined with `auto_start_machines=true` + inbound traffic into a proxy
+# auto-start storm the machine could never boot out of.
+#
+# cancel-in-progress is intentionally FALSE: a second deploy QUEUES behind the
+# first and runs only after it fully finishes. Cancelling an in-flight
+# immediate-strategy deploy would leave the machine half-replaced — the exact
+# damaged state we are preventing — so we must let the first one complete.
+concurrency:
+  group: deploy-uw-bt-bot
+  cancel-in-progress: false
+
 jobs:
   deploy:
     name: Deploy
