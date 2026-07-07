@@ -52,11 +52,15 @@ count="$(printf '%s\n' "$recent" | grep -c '^[0-9]' 2>/dev/null)"
 echo "[boot-guard] boot #${count} within the last ${WINDOW}s"
 
 # Circuit break: too many boots too fast. Hold the machine up but idle instead of
-# launching the app (which would just crash and restart again). A human clears
-# this by fixing the cause and restarting the machine, which resets the count.
+# launching the app (which would just crash and restart again). NOTE: a plain
+# restart does NOT clear this — the boot timestamps live in $HISTORY_FILE on the
+# persistent /data volume and survive reboots, so a restart inside $WINDOW just
+# re-trips the break. Recovery = fix the cause, then delete $HISTORY_FILE (or wait
+# for the timestamps to age past $WINDOW), then restart.
 if [ "$count" -ge "$HARD" ]; then
   echo "[boot-guard] CIRCUIT BREAK: ${count} boots in ${WINDOW}s (>= ${HARD}). Not launching the app."
-  echo "[boot-guard] Holding the machine idle. Fix the crash cause, then restart the machine to reset."
+  echo "[boot-guard] Holding the machine idle (boot history persists on /data across reboots)."
+  echo "[boot-guard] To recover: fix the crash cause, then 'rm ${HISTORY_FILE}' (or wait ${WINDOW}s for it to age out), then restart the machine."
   exec sleep infinity
 fi
 
