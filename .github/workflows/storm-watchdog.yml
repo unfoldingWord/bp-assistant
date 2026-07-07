@@ -1,0 +1,113 @@
+name: Restart Storm Watchdog
+
+# Breaks the Fly proxy auto-start-vs-rate-limit storm (failure mode A) that took
+# uw-bt-bot down: with the single machine `stopped` and inbound requests still
+# arriving (Fly health checks, the external /admin/status poller, deploy polling
+# /health/pipelines), Fly's proxy fires `Starting machine` many times/second;
+# every attempt returns `machines API returned an error: "rate limit exceeded"`,
+# so the machine can never boot. It is a self-sustaining deadlock — nothing in the
+# container can break it because nothing is running. This scheduled watchdog
+# detects the storm signature in `flyctl logs` and does exactly what the manual
+# recovery did: stop the machine and disable autostart, then open a tracking
+# issue. It NEVER starts the machine (that would feed the storm) and acts only on
+# a strong, fresh signature, so it leaves a cleanly stopped machine (deploy
+# recreate, intentional down) untouched. Complements the in-container mode-B
+# guard in scripts/boot-guard.sh.
+
+on:
+  schedule:
+    # GitHub cron lags 30-60 min, but the storm is a deadlock that persists until
+    # something acts on it, so lag only delays recovery — it never misses.
+    - cron: '*/15 * * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: storm-watchdog
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  issues: write   # to open the tracking / notification issue
+
+jobs:
+  watchdog:
+    runs-on: ubuntu-latest
+    env:
+      FLY_APP_NAME: uw-bt-bot
+      FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # Minimum count of fresh storm markers in the recent log buffer before we
+      # act. A cleanly stopped machine shows ~0; a real storm shows dozens.
+      STORM_MARKER_THRESHOLD: '20'
+    steps:
+      # Pinned to a SHA (v1.6) — same pin as issue-event-fly-machine-start.yml —
+      # since the action is colocated with FLY_API_TOKEN.
+      - uses: superfly/flyctl-actions/setup-flyctl@ed8efb33836e8b2096c7fd3ba1c8afe303ebbff1
+
+      - name: Detect and break restart storm
+        run: |
+          set -uo pipefail
+          test -n "$FLY_API_TOKEN"
+
+          # Resolve the machine ID dynamically — immediate-strategy deploys
+          # destroy and recreate the machine, so a hardcoded ID goes stale.
+          machine_id="$(flyctl machines list --app "$FLY_APP_NAME" --json \
+            | node -e "let s=''; process.stdin.on('data',c=>s+=c); process.stdin.on('end',()=>{ try { const j=JSON.parse(s); const m=Array.isArray(j)?j.find(x=>x&&x.id&&String(x.state||'').toLowerCase()!=='destroyed'):null; if (m) process.stdout.write(m.id); } catch {} });")"
+          if [ -z "$machine_id" ]; then
+            echo "Could not resolve a machine for $FLY_APP_NAME; nothing to do."
+            exit 0
+          fi
+          state="$(flyctl machines list --app "$FLY_APP_NAME" --json \
+            | node -e "let s=''; process.stdin.on('data',c=>s+=c); process.stdin.on('end',()=>{ try { const j=JSON.parse(s); const m=Array.isArray(j)?j.find(x=>x&&x.id===process.argv[1]):null; if (m) process.stdout.write(String(m.state||'')); } catch {} });" "$machine_id" || echo "")"
+          echo "Machine $machine_id state: ${state:-unknown}"
+
+          # The storm only exists while the machine is NOT started. A started
+          # machine is healthy from the storm's perspective — leave it alone.
+          if [ "$state" = "started" ]; then
+            echo "Machine is started; no storm. Exiting."
+            exit 0
+          fi
+
+          # Machine is not started. Distinguish a storm (proxy hammering a
+          # stoppable machine) from a benign stop by the density of fresh storm
+          # markers in the recent log buffer.
+          logs="$(flyctl logs --app "$FLY_APP_NAME" --no-tail 2>/dev/null | tail -n 400 || true)"
+          markers="$(printf '%s\n' "$logs" | grep -c -E 'rate limit exceeded|Starting machine' || true)"
+          markers="${markers:-0}"
+          echo "Fresh storm markers in recent logs: $markers (threshold $STORM_MARKER_THRESHOLD)"
+
+          if [ "$markers" -lt "$STORM_MARKER_THRESHOLD" ]; then
+            echo "No storm signature; machine is stopped for a benign reason. Leaving as-is."
+            exit 0
+          fi
+
+          echo "::error::Restart storm detected on $FLY_APP_NAME (machine $machine_id, state ${state:-unknown}, $markers markers). Breaking it."
+
+          # Break the storm exactly as the manual recovery did: stop the machine,
+          # then disable autostart so the proxy cannot re-trigger it. Both are
+          # idempotent, so this is safe if the machine is already stopped /
+          # autostart already off. We deliberately do NOT start the machine.
+          flyctl machine stop "$machine_id" --app "$FLY_APP_NAME" || true
+          flyctl machine update "$machine_id" --app "$FLY_APP_NAME" --yes --skip-start --autostart=false || true
+
+          # Notify via a deduplicated GitHub issue (Actions has no Zulip secret).
+          # Only one open issue at a time while the condition is unresolved.
+          existing="$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --label storm-watchdog --json number --jq 'length' 2>/dev/null || echo 0)"
+          if [ "${existing:-0}" = "0" ]; then
+            gh label create storm-watchdog --description "Restart-storm watchdog alerts" --color B60205 2>/dev/null || true
+            body="$(printf '%s\n' \
+              "The restart-storm watchdog detected a Fly proxy auto-start / rate-limit storm on \`$FLY_APP_NAME\` (machine \`$machine_id\`) and recovered it by stopping the machine and disabling autostart." \
+              "" \
+              "**The bot is now stopped and will NOT auto-start.** Investigate why the machine could not boot (check \`flyctl logs\` for repeated \`rate limit exceeded\` / \`Starting machine\`), then bring it back:" \
+              "" \
+              "    flyctl machine start $machine_id --app $FLY_APP_NAME" \
+              "" \
+              "A redeploy also restores \`auto_start_machines = true\` from fly.toml. Close this issue once the bot is healthy.")"
+            gh issue create --repo "$GITHUB_REPOSITORY" \
+              --label storm-watchdog \
+              --title "uw-bt-bot restart storm broken by watchdog ($(date -u +%Y-%m-%dT%H:%MZ))" \
+              --body "$body" \
+              || echo "Could not open tracking issue (continuing)."
+          else
+            echo "An open storm-watchdog issue already exists; not opening another."
+          fi

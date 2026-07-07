@@ -15,6 +15,13 @@ if [ -n "$CONFIG_LOCAL_JSON" ]; then
   printf '%s' "$CONFIG_LOCAL_JSON" > /app/data/config.local.json
 fi
 
+# Crash-loop backoff + circuit breaker (failure mode B). Runs BEFORE the workspace
+# refresh and the app launch so a tight restart loop backs off (or holds idle)
+# instead of re-refreshing and re-crashing at full speed. Invoked without exec so
+# its optional sleep applies to this boot; `|| true` keeps a guard bug from ever
+# aborting an otherwise-healthy boot (the circuit-break path never returns).
+bash /app/scripts/boot-guard.sh || true
+
 # Refresh the /data/workspace skills checkout to origin/main on every boot.
 # This MUST run here, not as a fly.toml release_command: release commands run in
 # an ephemeral machine that does NOT mount the /data volume, so the refresh only
