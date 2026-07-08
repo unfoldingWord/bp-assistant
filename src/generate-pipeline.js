@@ -1495,6 +1495,13 @@ async function generatePipeline(route, message) {
             salvagedAny = true;
             const total = s.converted.length + s.missing.length;
             await status(`Salvaged ${s.converted.length}/${total} ${type.toUpperCase()} verse(s) for ${book} ${ch} from leftover mapping JSON${s.missing.length ? ` (still missing ${formatVerseRanges(s.missing)})` : ''}.`);
+          } else if (s.note) {
+            // Salvage produced nothing but has a diagnostic reason — surface it so
+            // operators can distinguish "no mapping JSON banked" from "non-regression
+            // guard blocked overwrite that would drop existing verse(s)" from
+            // "no verses converted". Silent skips here were a diagnosis gap flagged
+            // in #195: transient partials looked identical to real misses in the log.
+            await status(`Salvage produced no ${type.toUpperCase()} coverage for ${book} ${ch}: ${s.note}${s.missing.length ? ` (missing ${formatVerseRanges(s.missing)})` : ''}.`);
           }
         };
         if (needUlt) await runSalvage('ult', ultRel, ultCov);
