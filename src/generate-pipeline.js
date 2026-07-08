@@ -1483,7 +1483,13 @@ async function generatePipeline(route, message) {
         const hebrewRel = hebrewPathForBook(book);
         let salvagedAny = false;
         const runSalvage = async (type, sourceRel, cov) => {
-          if (!hebrewRel || cov.reason !== 'missing') return;
+          // 'missing' — no aligned output at all: salvage builds the merged file
+          // from scratch. 'incomplete' — a partial merged file exists: salvage
+          // gap-fills from any banked mapping JSON the coordinator wrote but never
+          // merged, and its non-regression guard refuses to overwrite unless the
+          // salvaged set is a superset of the existing coverage (so it can only
+          // add verses, never drop them). 'stale' is left to a full re-run.
+          if (!hebrewRel || (cov.reason !== 'missing' && cov.reason !== 'incomplete')) return;
           const s = salvageAlignedFromMappingJson({ book, chapter: ch, type, sourceRel, hebrewRel });
           if (s.converted.length) {
             salvagedAny = true;
