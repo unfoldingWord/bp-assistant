@@ -640,6 +640,7 @@ function resolveTemplateSelection({
 
 const ISSUE_STYLE_RULES = {
   'writing-background': ['no_at', 'no_narrative_elaboration'],
+  'writing-foreground': ['no_narrative_elaboration'],
   'writing-newevent': ['no_at', 'no_narrative_elaboration'],
   'figs-imperative': ['no_extra_imperative_explanation'],
   'grammar-connect-logic-result': ['keep_to_template', 'do_not_identify_specific_phrases'],
