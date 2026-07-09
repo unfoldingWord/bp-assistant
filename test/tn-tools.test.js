@@ -64,6 +64,17 @@ test('deriveStyleProfile keeps no-at style rule metadata without suppressing tem
   assert.equal(templateStrict.at_required, true);
   assert.ok(templateStrict.style_rules.includes('no_at'));
 
+  const foregroundStrict = _deriveStyleProfile({
+    sref: 'writing-foreground',
+    mustInclude: [],
+    atProvided: '',
+    needsAt: true,
+    selectedTemplate: { template: 'Foreground template. Alternate translation: [ALT]' },
+  });
+  assert.equal(foregroundStrict.at_policy, 'required');
+  assert.equal(foregroundStrict.at_required, true);
+  assert.ok(foregroundStrict.style_rules.includes('no_narrative_elaboration'));
+
   const overridden = _deriveStyleProfile({
     sref: 'writing-background',
     mustInclude: ['Include an alternate translation if needed'],
