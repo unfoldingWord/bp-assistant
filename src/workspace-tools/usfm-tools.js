@@ -458,6 +458,28 @@ function mergeAlignedUsfm({ parts, output }) {
  *
  * @returns {{converted:number[], missing:number[], mergedOutput:string|null, note:string}}
  */
+/** Verse numbers present (any `\v N`) in an aligned USFM string, ascending & deduped. */
+function versesPresentInUsfm(usfm) {
+  const out = new Set();
+  const re = /\\v\s+(\d+)\b/g;
+  let m;
+  while ((m = re.exec(String(usfm || ''))) !== null) out.add(parseInt(m[1], 10));
+  return [...out].sort((a, b) => a - b);
+}
+
+/**
+ * Non-regression check for salvage's whole-chapter overwrite. Salvage rebuilds
+ * the merged file from ONLY the verses it recovered, so overwriting a partial
+ * that already covers some verses can DROP a verse whose mapping JSON is now
+ * missing/stale. Returns the verses present in `existingUsfm` that `salvagedVerses`
+ * does NOT cover (ascending); empty means the salvage set is a superset and the
+ * overwrite is safe (can only add coverage, never remove it).
+ */
+function salvageDroppedVerses(existingUsfm, salvagedVerses) {
+  const salvaged = new Set(salvagedVerses);
+  return versesPresentInUsfm(existingUsfm).filter((v) => !salvaged.has(v));
+}
+
 function salvageAlignedFromMappingJson({ book, chapter, type, sourceRel, hebrewRel, alignmentsDir = 'tmp/alignments' }) {
   const result = { converted: [], missing: [], mergedOutput: null, note: '' };
   const abs = (rel) => path.resolve(CSKILLBP_DIR, rel);
@@ -575,6 +597,31 @@ function salvageAlignedFromMappingJson({ book, chapter, type, sourceRel, hebrewR
   parts.sort((a, b) => a.verse - b.verse);
   const chTok = bookU === 'PSA' ? String(ch).padStart(3, '0') : pad2(ch);
   const mergedRel = `output/AI-${isUst ? 'UST' : 'ULT'}/${bookU}/${bookU}-${chTok}-aligned.usfm`;
+
+  // Non-regression guard. The merge below writes the whole-chapter file from ONLY
+  // the salvaged per-verse parts, so it is safe when the file is absent
+  // (reason 'missing'). When called on an 'incomplete' partial (a merged file
+  // already covers some verses), overwriting with a salvage set that omits a
+  // verse the existing file has would REGRESS coverage — e.g. a verse whose
+  // mapping JSON is now stale/low-similarity is rejected here yet is present and
+  // valid in the existing file. Only overwrite when the salvaged verse set is a
+  // superset of what the existing file already covers; otherwise leave the
+  // existing file untouched and report nothing salvaged (caller re-checks the
+  // file and reports the unchanged, smaller gap).
+  const existingAbs = abs(mergedRel);
+  if (fs.existsSync(existingAbs)) {
+    let existingUsfm = '';
+    try { existingUsfm = fs.readFileSync(existingAbs, 'utf8'); } catch (_) { /* unreadable — treat as no coverage */ }
+    const wouldDrop = salvageDroppedVerses(existingUsfm, parts.map((p) => p.verse));
+    if (wouldDrop.length) {
+      result.converted = [];
+      const existingCovered = new Set(versesPresentInUsfm(existingUsfm));
+      result.missing = [...srcVerses.keys()].filter((v) => !existingCovered.has(v)).sort((a, b) => a - b);
+      result.note = `skipped overwrite — salvage (${parts.length} verses) would drop verse(s) ${wouldDrop.join(', ')} present in existing ${mergedRel}`;
+      return result;
+    }
+  }
+
   const mres = mergeAlignedUsfm({ parts: parts.map((p) => p.rel), output: mergedRel });
   if (typeof mres === 'string' && mres.startsWith('Error')) { result.note = mres; return result; }
   result.mergedOutput = mergedRel;
@@ -1312,6 +1359,8 @@ module.exports = {
   readUsfmChapter,
   mergeAlignedUsfm,
   salvageAlignedFromMappingJson,
+  salvageDroppedVerses,
+  versesPresentInUsfm,
   validateAlignmentJson,
   validateAlignedUsfmMarkup,
   summarizeAlignedUsfmMarkupFindings,

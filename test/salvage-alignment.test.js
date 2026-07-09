@@ -13,7 +13,7 @@ const path = require('path');
 const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'salvage-'));
 process.env.CSKILLBP_DIR = TMP;
 
-const { salvageAlignedFromMappingJson } = require('../src/workspace-tools/usfm-tools');
+const { salvageAlignedFromMappingJson, salvageDroppedVerses, versesPresentInUsfm } = require('../src/workspace-tools/usfm-tools');
 
 function writeRel(rel, content) {
   const abs = path.join(TMP, rel);
@@ -66,4 +66,27 @@ test('salvage restricts to the requested chapter in a multi-chapter source', () 
     sourceRel: 'output/AI-ULT/AMO/multi.usfm', hebrewRel: 'data/hebrew_bible/30-AMO.usfm',
   });
   assert.deepEqual(r.missing, [1, 2]);       // only chapter 5's verses, not chapter 4's
+});
+
+// --- non-regression guard for the 'incomplete' gap-fill path ---
+
+test('versesPresentInUsfm finds mid-line \\v markers, deduped and sorted', () => {
+  const usfm = '\\c 5\n\\q1 \\v 3 c\n\\q1 \\v 1 a\n\\v 1 dup\n\\q1 \\v 2 b\n';
+  assert.deepEqual(versesPresentInUsfm(usfm), [1, 2, 3]);
+  assert.deepEqual(versesPresentInUsfm(''), []);
+});
+
+test('salvageDroppedVerses: superset overwrite is safe (no drops)', () => {
+  const existing = '\\c 1\n\\v 1 a\n\\v 2 b\n';
+  // salvage recovered v1,v2,v3 — strict superset of the existing v1,v2 → safe
+  assert.deepEqual(salvageDroppedVerses(existing, [1, 2, 3]), []);
+  // exact-equal set is also safe (harmless identical overwrite)
+  assert.deepEqual(salvageDroppedVerses(existing, [1, 2]), []);
+});
+
+test('salvageDroppedVerses: overwrite that omits an existing verse is flagged', () => {
+  const existing = '\\c 1\n\\v 1 a\n\\v 2 b\n\\v 8 h\n';
+  // salvage only found v1,v2 (v8's mapping JSON stale/missing) — overwriting
+  // would drop v8, so the guard reports it and the caller keeps the existing file
+  assert.deepEqual(salvageDroppedVerses(existing, [1, 2]), [8]);
 });

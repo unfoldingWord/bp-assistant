@@ -616,6 +616,8 @@ function isTransientSdkMessage(text) {
     t.includes('bad gateway') ||
     t.includes('overloaded') ||
     t.includes('connection reset') ||
+    t.includes('connection closed') ||
+    t.includes('mid-response') ||
     t.includes('socket hang up') ||
     t.includes('econnreset') ||
     t.includes('etimedout')
