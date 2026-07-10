@@ -416,6 +416,7 @@ function getPipelineType(route) {
   if (route.type === 'sdk') return 'generate';
   if (route.type === 'notes') return 'notes';
   if (route.type === 'tqs') return 'tqs';
+  if (route.type === 'translate') return 'translate';
   return null;
 }
 
@@ -766,7 +767,7 @@ function calcResumeTimeout(checkpoint) {
  * Returns an array of keys, or null for route types that don't need conflict detection.
  */
 function getPipelineKeys(route, message) {
-  if (route.type !== 'sdk' && route.type !== 'notes' && route.type !== 'tqs') return null;
+  if (route.type !== 'sdk' && route.type !== 'notes' && route.type !== 'tqs' && route.type !== 'translate') return null;
 
   let book, chapters;
 
@@ -777,7 +778,13 @@ function getPipelineKeys(route, message) {
   chapters = parsed.chapters;
 
   if (!book || !chapters.length) return null;
-  return chapters.map(ch => `${route.name}-${book}-${ch}`);
+  // translate runs are additionally keyed by target language: ar OBA 1 and
+  // es OBA 1 are independent work and must not conflict. Zulip-triggered
+  // translate runs (no _translate) fall back to language-less keys, which
+  // over-blocks (safe) rather than under-blocks.
+  const langDim = route.type === 'translate' && route._translate?.targetLang
+    ? `-${route._translate.targetLang}` : '';
+  return chapters.map(ch => `${route.name}${langDim}-${book}-${ch}`);
 }
 
 /**
@@ -1406,6 +1413,7 @@ const API_PIPELINE_ROUTE_NAMES = {
   generate: 'generate-content',
   notes: 'write-notes',
   tqs: 'write-tqs',
+  translate: 'translate-notes',
 };
 
 // API-triggered runs (POST /api/pipeline/start) have no originating Zulip
@@ -1433,7 +1441,8 @@ function buildApiRunLabel({ pipelineType, scope }) {
       : `${startChapter}-${endChapter}`;
   const typeLabel = pipelineType === 'generate' ? 'content'
     : pipelineType === 'notes' ? 'notes'
-      : 'tqs';
+      : pipelineType === 'translate' ? 'translate'
+        : 'tqs';
   return `${book} ${chPart} ${typeLabel}`;
 }
 
@@ -1463,6 +1472,20 @@ function buildApiSyntheticRoute(pipelineType, scope, options) {
     ? options.hints
     : null;
 
+  // translate carries its per-run parameters structurally, like hints do —
+  // they can't ride the stringly-typed message flags. translate-pipeline.js
+  // reads route._translate; Zulip-origin runs parse the message instead.
+  const translateOpts = pipelineType === 'translate' && options
+    ? {
+      targetLang: options.targetLang,
+      targetOrg: options.targetOrg,
+      sourceRef: options.sourceRef,
+      contextRef: options.contextRef,
+      model: options.model,
+      branchOnly: options.branchOnly,
+    }
+    : null;
+
   return {
     ...baseRoute,
     _synthetic: true,
@@ -1472,6 +1495,7 @@ function buildApiSyntheticRoute(pipelineType, scope, options) {
     _verseStart: verseStart ?? null,
     _verseEnd: verseEnd ?? null,
     _hints: hints,
+    _translate: translateOpts,
     _scopeText: rangeLabel.replace(/^\S+\s+/, ''),
     _apiOrigin: true,
     confirmMessage: null,
@@ -1502,9 +1526,12 @@ function buildApiSyntheticMessage({ pipelineType, scope, username, options }) {
   const chapterPart = startChapter === endChapter ? String(startChapter) : `${startChapter}-${endChapter}`;
   const commandWord = pipelineType === 'generate' ? 'generate'
     : pipelineType === 'notes' ? 'write notes'
+    : pipelineType === 'translate' ? 'translate notes'
     : 'write tqs';
   const flags = buildApiContentFlags(pipelineType, options);
-  const content = [commandWord, book, chapterPart, ...flags].join(' ');
+  const langSuffix = pipelineType === 'translate' && options?.targetLang
+    ? ['to', options.targetLang] : [];
+  const content = [commandWord, book, chapterPart, ...langSuffix, ...flags].join(' ');
   // Adopt the API control thread as this run's originating stream/topic. The
   // pipelines derive sessionKey, checkpoints, pending-merge keys and all Zulip
   // posts from message.display_recipient/subject, so this single substitution
@@ -1526,10 +1553,18 @@ function buildApiSyntheticMessage({ pipelineType, scope, username, options }) {
   };
 }
 
-function buildApiJobId({ pipelineType, scope }) {
+function buildApiSessionKey(pipelineType, options) {
   const { stream, topic } = getApiControlThread();
-  const derivedSessionKey = `stream-${stream}-${topic}`;
-  return buildCheckpointKey({ sessionKey: derivedSessionKey, pipelineType, scope });
+  // translate checkpoints carry the target language in the sessionKey so
+  // runs for different languages on the same scope never share a job/
+  // checkpoint (matches translate-pipeline.js buildSessionKey).
+  const langSuffix = pipelineType === 'translate' && options?.targetLang
+    ? `-${options.targetLang}` : '';
+  return `stream-${stream}-${topic}${langSuffix}`;
+}
+
+function buildApiJobId({ pipelineType, scope, options }) {
+  return buildCheckpointKey({ sessionKey: buildApiSessionKey(pipelineType, options), pipelineType, scope });
 }
 
 /**
@@ -1567,8 +1602,8 @@ function triggerPipelineFromApi(input) {
   }
   const message = buildApiSyntheticMessage({ pipelineType, scope, username, options });
   const { stream: controlStream, topic: controlTopic } = getApiControlThread();
-  const derivedSessionKey = `stream-${controlStream}-${controlTopic}`;
-  const jobId = buildApiJobId({ pipelineType, scope });
+  const derivedSessionKey = buildApiSessionKey(pipelineType, options);
+  const jobId = buildApiJobId({ pipelineType, scope, options });
 
   // Conflict check 1: same (sessionKey, pipelineType, scope) already running?
   const activeCp = getActiveCheckpoint(route, derivedSessionKey, []);
