@@ -81,6 +81,8 @@ const OptionsSchema = z.object({
   sourceRef: z.string().min(3).max(200).regex(/^[^/@\s]+\/[^/@\s]+@\S+$/).optional(),
   contextRef: z.string().min(3).max(200).regex(/^[^/@\s]+\/[^/@\s]+@\S+$/).optional(),
   branchOnly: z.boolean().optional(),
+  delivery: z.enum(['path', 'branch']).optional(),
+  direction: z.enum(['ltr', 'rtl']).optional(),
   // Editor-marked TN row "hints" — each entry seeds one specific note the
   // pipeline must produce, and suppresses competing notes for the same
   // (verse, supportReference, fuzzy-quote). hint.rowId is preserved as the
@@ -136,7 +138,7 @@ const StartBodySchema = z.object({
       });
     }
   } else {
-    for (const k of ['targetLang', 'targetOrg', 'sourceRef', 'contextRef', 'branchOnly']) {
+    for (const k of ['targetLang', 'targetOrg', 'sourceRef', 'contextRef', 'branchOnly', 'delivery', 'direction']) {
       if (o[k] !== undefined) {
         ctx.addIssue({
           code: z.ZodIssueCode.custom,

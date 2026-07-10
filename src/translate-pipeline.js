@@ -37,9 +37,18 @@ const LOG_PREFIX = '[translate]';
 // "translate notes OBA 1 to ar [--flags]" — mirrors the config.json route match.
 const COMMAND_RE = /translate\s+notes?\s+(\w{3})\s+(\d+(?:\s*[-–—]\s*\d+)?)\s+(?:to|into)\s+([A-Za-z0-9-]+)/i;
 
-// Display names for the pilot candidates; anything else falls back to the tag.
-const LANG_NAMES = { ar: 'Arabic', 'es-419': 'Latin American Spanish', es: 'Spanish', ru: 'Russian', fr: 'French', hi: 'Hindi', sw: 'Swahili' };
-const RTL_LANGS = new Set(['ar', 'he', 'fa', 'ur']);
+// Display names are a convenience only; any ISO 639-1/639-3 code (optionally
+// with a region/script subtag, e.g. es-419, zh-Hans) is accepted, and an
+// unknown code simply falls back to showing the code itself.
+const LANG_NAMES = {
+  ar: 'Arabic', 'es-419': 'Latin American Spanish', es: 'Spanish', ru: 'Russian',
+  fr: 'French', hi: 'Hindi', sw: 'Swahili', pt: 'Portuguese', id: 'Indonesian',
+  zh: 'Chinese', vi: 'Vietnamese', bn: 'Bengali', ur: 'Urdu', fa: 'Persian',
+  he: 'Hebrew', am: 'Amharic', ne: 'Nepali', my: 'Burmese', th: 'Thai',
+};
+// Base subtags whose default script is right-to-left. Direction can always be
+// overridden per run via options.direction.
+const RTL_LANGS = new Set(['ar', 'he', 'fa', 'ur', 'ps', 'sd', 'ug', 'yi', 'dv', 'ckb', 'arc', 'syr', 'prs']);
 
 const MAX_BATCH_ATTEMPTS = 2; // 1 draft + 1 repair pass
 
@@ -63,18 +72,27 @@ function resolveParams(route, message) {
   }
   if (!targetLang) throw new Error('translate: targetLang is required');
 
+  // Delivery mode:
+  //   'path'   — stage the file locally and return its path; NO Door43 push.
+  //   'branch' — push to a review branch in the GL org (no auto-merge).
+  // Beta default is per-origin: Zulip-triggered runs return a path (fast
+  // loop, no GL repo required); API-triggered runs push to a branch (Bible
+  // Editor consumes the DCS branch). Either can be forced via options.delivery.
+  const delivery = opts.delivery || (route._synthetic ? 'branch' : 'path');
+
   return {
     book: book.toUpperCase(),
     startChapter,
     endChapter,
     targetLang,
     targetLangName: LANG_NAMES[targetLang] || targetLang,
-    direction: RTL_LANGS.has(targetLang.split('-')[0]) ? 'rtl' : 'ltr',
+    direction: opts.direction || (RTL_LANGS.has(targetLang.split('-')[0]) ? 'rtl' : 'ltr'),
     targetOrg: opts.targetOrg || `${targetLang}_gl`,
     sourceRef: opts.sourceRef || 'unfoldingWord/en_tn@master',
     contextRef: opts.contextRef || `${(opts.targetOrg || `${targetLang}_gl`)}/translation-context@master`,
     model: opts.model || route.model || 'opus',
-    branchOnly: opts.branchOnly !== false, // default TRUE: land on a branch for review, no auto-merge (unlike en pipelines)
+    delivery,
+    branchOnly: opts.branchOnly !== false, // when delivery==='branch': land on a branch, no auto-merge (unlike en pipelines)
   };
 }
 
@@ -276,13 +294,25 @@ async function translatePipeline(route, message) {
       },
     });
 
-    // Stage the whole-book file + report for the push.
+    // Stage the whole-book file + report.
     const outDir = path.join(CSKILLBP_DIR, 'output', `notes-${params.targetLang}`, params.book);
     fs.mkdirSync(outDir, { recursive: true });
     const bookFile = path.join(outDir, `tn_${params.book}.tsv`);
     const reportFile = path.join(outDir, `translate-report-${params.startChapter}-${params.endChapter}.json`);
     fs.writeFileSync(bookFile, bookText, 'utf8');
     fs.writeFileSync(reportFile, JSON.stringify(report, null, 2), 'utf8');
+
+    setCheckpoint(ckptId, { state: 'done', current: { chapter: params.endChapter, skill: 'translate-tn', status: 'done' } });
+    const summary = `${targetRows.length} notes, ${report.checks.warningCount} warning(s), 0 blocking violations`;
+
+    if (params.delivery === 'path') {
+      // Beta path-return mode: no Door43 push. Report where the files landed
+      // in the bot workspace so a human can fetch/inspect them.
+      await post(`:check: Translated **${label}** — ${summary}.\n`
+        + `File: \`${bookFile}\`\nReport: \`${reportFile}\``);
+      console.log(`${LOG_PREFIX} ${label} delivered as path: ${bookFile}`);
+      return { bookFile, reportFile, delivery: 'path' };
+    }
 
     // Push to the GL org. branchOnly by default: a human (or Bible Editor's
     // apply step) reviews before merge — translated drafts are not
@@ -307,12 +337,11 @@ async function translatePipeline(route, message) {
     // and translate defaults to branchOnly (no merge to verify). Parameterize
     // repo-verify when auto-merge mode is enabled for a GL org.
 
-    setCheckpoint(ckptId, { state: 'done', current: { chapter: params.endChapter, skill: 'translate-tn', status: 'done' } });
     const where = pushResult.branchUrl
       ? `branch [${branch}](${pushResult.branchUrl}) (review before merge)`
       : `PR #${pushResult.prNumber || '?'} (merged)`;
-    await post(`:check: Translated **${label}** — ${targetRows.length} notes, `
-      + `${report.checks.warningCount} warning(s), 0 blocking violations. Landed on ${where}.`);
+    await post(`:check: Translated **${label}** — ${summary}. Landed on ${where}.`);
+    return { bookFile, reportFile, delivery: 'branch', branch, prNumber: pushResult.prNumber };
   } catch (err) {
     console.error(`${LOG_PREFIX} ${label} failed: ${err.message}`);
     setCheckpoint(ckptId, {
