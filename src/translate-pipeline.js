@@ -173,8 +173,25 @@ async function translateChapters(params, { workDir, onProgress, runBatchImpl, ma
       direction: params.direction,
       book: params.book,
     });
-    const impl = runBatchImpl || runBatch;
-    const { rows: outRows, attempts } = await impl({ files, batchRows, params });
+    // Resume support: a batch whose output already exists and passes checks
+    // (from an interrupted earlier run over the same workDir) is reused
+    // instead of re-translated. Batch files are deterministic for a given
+    // (sourceRef, contextRef, scope), so reuse is safe.
+    let outRows = null;
+    let attempts = 0;
+    if (fs.existsSync(files.outputFile)) {
+      try {
+        const prev = core.readBatchOutput(files.outputFile, batchRows);
+        if (prev.checks.ok) {
+          outRows = prev.rows;
+          progress(`batch ${files.nn} reused from previous run (checks ok)`);
+        }
+      } catch { /* unreadable partial output — retranslate */ }
+    }
+    if (!outRows) {
+      const impl = runBatchImpl || runBatch;
+      ({ rows: outRows, attempts } = await impl({ files, batchRows, params }));
+    }
     targetRows.push(...outRows);
     batchMeta.push({
       nn: files.nn,
