@@ -78,6 +78,7 @@ const OptionsSchema = z.object({
   // the source of truth for translation (bp-bot/translate-pipeline/DECISION.md).
   targetLang: z.string().min(2).max(12).regex(/^[a-z]{2,3}(-[A-Za-z0-9]{2,8})?$/).optional(),
   targetOrg: z.string().min(1).max(60).regex(/^[A-Za-z0-9._-]+$/).optional(),
+  repoName: z.string().min(1).max(60).regex(/^[A-Za-z0-9._-]+$/).optional(),
   sourceRef: z.string().min(3).max(200).regex(/^[^/@\s]+\/[^/@\s]+@\S+$/).optional(),
   contextRef: z.string().min(3).max(200).regex(/^[^/@\s]+\/[^/@\s]+@\S+$/).optional(),
   branchOnly: z.boolean().optional(),
@@ -142,7 +143,7 @@ const StartBodySchema = z.object({
       });
     }
   } else {
-    for (const k of ['targetLang', 'targetOrg', 'sourceRef', 'contextRef', 'branchOnly', 'delivery', 'direction', 'rowIds']) {
+    for (const k of ['targetLang', 'targetOrg', 'repoName', 'sourceRef', 'contextRef', 'branchOnly', 'delivery', 'direction', 'rowIds']) {
       if (o[k] !== undefined) {
         ctx.addIssue({
           code: z.ZodIssueCode.custom,

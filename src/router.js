@@ -1479,6 +1479,7 @@ function buildApiSyntheticRoute(pipelineType, scope, options) {
     ? {
       targetLang: options.targetLang,
       targetOrg: options.targetOrg,
+      repoName: options.repoName,
       sourceRef: options.sourceRef,
       contextRef: options.contextRef,
       model: options.model,

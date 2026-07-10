@@ -107,6 +107,31 @@ test('resolveParams: verse range 1:5-7 → by-id mode', () => {
   assert.strictEqual(p.targetLang, 'es-419');
 });
 
+test('resolveParams: targets config resolves ar to BSOJ, options override', () => {
+  const ar = resolveParams({}, zmsg('translate notes OBA 1 to ar'));
+  assert.strictEqual(ar.targetOrg, 'BSOJ');       // NOT ar_gl
+  assert.strictEqual(ar.tnRepo, 'ar_tn');
+  assert.strictEqual(ar.sourceRef, 'BSOJ/ar_tn@master');
+  assert.strictEqual(ar.direction, 'rtl');
+
+  const id = resolveParams({}, zmsg('translate notes OBA 1 to id'));
+  assert.strictEqual(id.targetOrg, 'id_gl');
+  assert.strictEqual(id.tnRepo, 'id_tn');
+
+  // Unknown lang falls back to {lang}_gl / {lang}_tn derivation.
+  const xx = resolveParams({}, zmsg('translate notes OBA 1 to xyz'));
+  assert.strictEqual(xx.targetOrg, 'xyz_gl');
+  assert.strictEqual(xx.tnRepo, 'xyz_tn');
+
+  // Per-call options beat the config.
+  const ov = resolveParams({
+    _synthetic: true, _book: 'OBA', _startChapter: 1, _endChapter: 1, _verseStart: null, _verseEnd: null,
+    _translate: { targetLang: 'ar', targetOrg: 'other_org', repoName: 'other_tn' },
+  }, {});
+  assert.strictEqual(ov.targetOrg, 'other_org');
+  assert.strictEqual(ov.tnRepo, 'other_tn');
+});
+
 test('resolveParams: API rowIds → by-id mode', () => {
   const route = {
     _synthetic: true, _book: 'OBA', _startChapter: 1, _endChapter: 1,

@@ -53,6 +53,16 @@ const LANG_NAMES = {
 // overridden per run via options.direction.
 const RTL_LANGS = new Set(['ar', 'he', 'fa', 'ur', 'ps', 'sd', 'ug', 'yi', 'dv', 'ckb', 'arc', 'syr', 'prs']);
 
+// Per-language Door43 target config (org/repo/source are NOT derivable from
+// the language code — verified 2026-07-10). Precedence: per-call options >
+// this file > {lang}_gl / {lang}_tn derivation. Missing file is non-fatal.
+let TRANSLATE_TARGETS = {};
+try {
+  TRANSLATE_TARGETS = require('../config/translate-targets.json');
+} catch (err) {
+  console.warn(`${LOG_PREFIX} no translate-targets.json (${err.message}) — using {lang}_gl/{lang}_tn derivation`);
+}
+
 const MAX_BATCH_ATTEMPTS = 2; // 1 draft + 1 repair pass
 
 function resolveParams(route, message) {
@@ -102,6 +112,14 @@ function resolveParams(route, message) {
   // Editor consumes the DCS branch). Either can be forced via options.delivery.
   const delivery = opts.delivery || (route._synthetic ? 'branch' : 'path');
 
+  // Resolve Door43 targets: per-call options > translate-targets.json > derivation.
+  // Org/repo naming is NOT derivable from the language code (ar → org BSOJ,
+  // not ar_gl — verified 2026-07-10), so the config file supplies the truth
+  // and the {lang}_gl / {lang}_tn derivation is only a last-resort fallback.
+  const cfg = TRANSLATE_TARGETS[targetLang] || {};
+  const targetOrg = opts.targetOrg || cfg.targetOrg || `${targetLang}_gl`;
+  const tnRepo = opts.repoName || cfg.tnRepo || `${targetLang}_tn`;
+
   return {
     book: book.toUpperCase(),
     startChapter,
@@ -112,10 +130,11 @@ function resolveParams(route, message) {
     mergeMode,
     targetLang,
     targetLangName: LANG_NAMES[targetLang] || targetLang,
-    direction: opts.direction || (RTL_LANGS.has(targetLang.split('-')[0]) ? 'rtl' : 'ltr'),
-    targetOrg: opts.targetOrg || `${targetLang}_gl`,
-    sourceRef: opts.sourceRef || 'unfoldingWord/en_tn@master',
-    contextRef: opts.contextRef || `${(opts.targetOrg || `${targetLang}_gl`)}/translation-context@master`,
+    direction: opts.direction || cfg.direction || (RTL_LANGS.has(targetLang.split('-')[0]) ? 'rtl' : 'ltr'),
+    targetOrg,
+    tnRepo,
+    sourceRef: opts.sourceRef || cfg.sourceRef || 'unfoldingWord/en_tn@master',
+    contextRef: opts.contextRef || cfg.contextRef || `${targetOrg}/translation-context@master`,
     model: opts.model || route.model || 'opus',
     delivery,
     branchOnly: opts.branchOnly !== false, // when delivery==='branch': land on a branch, no auto-merge (unlike en pipelines)
@@ -269,7 +288,7 @@ async function translateChapters(params, { workDir, onProgress, runBatchImpl, ma
   //    existingTargetText (tests/dry-run) short-circuits the DCS fetch.
   let existingBookText = existingTargetText ?? null;
   if (existingBookText == null) {
-    const targetRepoRef = `${params.targetOrg}/${params.targetLang}_tn@master`;
+    const targetRepoRef = `${params.targetOrg}/${params.tnRepo}@master`;
     try {
       existingBookText = await core.fetchTnBook(targetRepoRef, params.book);
     } catch (err) {
@@ -386,7 +405,7 @@ async function translatePipeline(route, message) {
       branch,
       source: path.relative(CSKILLBP_DIR, bookFile),
       org: params.targetOrg,
-      repoName: `${params.targetLang}_tn`,
+      repoName: params.tnRepo,
       wholeFile: true,
       branchOnly: params.branchOnly,
     });
