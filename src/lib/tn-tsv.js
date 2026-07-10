@@ -63,6 +63,19 @@ function refChapter(reference) {
 }
 
 /**
+ * Verse range of a row's Reference, or null for intro/front rows.
+ * "1:1" → {start:1,end:1}; "1:5-7" → {start:5,end:7}; "1:intro"/"front:intro" → null.
+ */
+function refVerseRange(reference) {
+  const parts = String(reference).split(':');
+  if (parts.length < 2) return null;
+  const m = /^(\d+)(?:\s*[-–—]\s*(\d+))?/.exec(parts[1]);
+  if (!m) return null;
+  const start = Number(m[1]);
+  return { start, end: m[2] ? Number(m[2]) : start };
+}
+
+/**
  * Select the rows belonging to a chapter range. Book-front matter
  * (front:intro) belongs to the range only when it starts at chapter 1 —
  * translating "OBA 1" means the whole translation unit including the intro,
@@ -76,4 +89,4 @@ function sliceChapterRows(rows, startChapter, endChapter) {
   });
 }
 
-module.exports = { TN_COLUMNS, TN_HEADER, parseTnTsv, serializeTnTsv, refChapter, sliceChapterRows };
+module.exports = { TN_COLUMNS, TN_HEADER, parseTnTsv, serializeTnTsv, refChapter, refVerseRange, sliceChapterRows };

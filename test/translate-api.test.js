@@ -63,6 +63,22 @@ test('notes-only hints rejected on translate', () => {
   assert.ok(res.error.issues.some((i) => /only valid for pipelineType "notes"/.test(i.message)));
 });
 
+test('rowIds accepted on translate, rejected elsewhere, shape-checked', () => {
+  const ok = StartBodySchema.safeParse({ ...base, options: { targetLang: 'ar', rowIds: ['xm1w', 'k9wc'] } });
+  assert.ok(ok.success, JSON.stringify(ok.error?.issues));
+  const badShape = StartBodySchema.safeParse({ ...base, options: { targetLang: 'ar', rowIds: ['BAD-ID'] } });
+  assert.ok(!badShape.success);
+  const onNotes = StartBodySchema.safeParse({ ...base, pipelineType: 'notes', options: { rowIds: ['xm1w'] } });
+  assert.ok(!onNotes.success);
+});
+
+test('delivery/direction accepted on translate only', () => {
+  const ok = StartBodySchema.safeParse({ ...base, options: { targetLang: 'ar', delivery: 'path', direction: 'rtl' } });
+  assert.ok(ok.success, JSON.stringify(ok.error?.issues));
+  const bad = StartBodySchema.safeParse({ ...base, pipelineType: 'tqs', options: { delivery: 'path' } });
+  assert.ok(!bad.success);
+});
+
 test('sourceRef/contextRef must be org/repo@ref shaped', () => {
   const res = StartBodySchema.safeParse({
     ...base,

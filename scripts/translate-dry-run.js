@@ -33,6 +33,18 @@ async function main() {
   const outDir = path.resolve(arg('out', `./dry-run-${targetLang}-${book}`));
   const model = arg('model', 'sonnet');
   const maxRows = arg('max-rows') ? parseInt(arg('max-rows'), 10) : null;
+  // Subset selection (individual-note / single-verse). --rows a,b,c or --verse 5 / --verse 5-7.
+  const rowIds = arg('rows') ? arg('rows').split(',').map((s) => s.trim()).filter(Boolean) : null;
+  const verseArg = arg('verse');
+  let verseStart = null; let verseEnd = null;
+  if (verseArg) {
+    const [vs, ve] = verseArg.split('-').map((x) => parseInt(x.trim(), 10));
+    verseStart = vs; verseEnd = Number.isInteger(ve) ? ve : vs;
+  }
+  // by-id merge needs an existing target book; --existing-target supplies one
+  // locally (e.g. a prior whole-chapter dry-run output) since there's no DCS push here.
+  const existingTargetPath = arg('existing-target');
+  const hasSubset = (rowIds && rowIds.length) || verseStart != null;
 
   if (!contextRef) {
     console.error('Missing --context <dir | org/repo@ref>');
@@ -56,7 +68,17 @@ async function main() {
     sourceRef: arg('source', 'unfoldingWord/en_tn@master'),
     contextRef,
     model,
+    verseStart,
+    verseEnd,
+    rowIds,
+    mergeMode: hasSubset ? 'by-id' : 'range',
   };
+
+  const existingTargetText = existingTargetPath ? fs.readFileSync(existingTargetPath, 'utf8') : undefined;
+  if (params.mergeMode === 'by-id' && existingTargetText === undefined) {
+    console.error('[dry-run] by-id (subset) mode needs --existing-target <file> in a dry run (no DCS push to fetch from).');
+    process.exit(2);
+  }
 
   const workDir = path.join(outDir, 'work');
   fs.mkdirSync(workDir, { recursive: true });
@@ -68,6 +90,7 @@ async function main() {
   const { sourceRows, targetRows, checks, report, bookText } = await translateChapters(params, {
     workDir,
     maxRows,
+    existingTargetText,
     onProgress: (m) => console.log(`[dry-run] ${m}`),
   });
 

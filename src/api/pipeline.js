@@ -83,6 +83,10 @@ const OptionsSchema = z.object({
   branchOnly: z.boolean().optional(),
   delivery: z.enum(['path', 'branch']).optional(),
   direction: z.enum(['ltr', 'rtl']).optional(),
+  // Individual-note / subset selection: translate only these published rows
+  // and UPDATE them by ID into the existing target book (verse scoping uses
+  // the top-level verseStart/verseEnd instead).
+  rowIds: z.array(z.string().regex(HINT_ROW_ID_RE)).min(1).max(50).optional(),
   // Editor-marked TN row "hints" — each entry seeds one specific note the
   // pipeline must produce, and suppresses competing notes for the same
   // (verse, supportReference, fuzzy-quote). hint.rowId is preserved as the
@@ -138,7 +142,7 @@ const StartBodySchema = z.object({
       });
     }
   } else {
-    for (const k of ['targetLang', 'targetOrg', 'sourceRef', 'contextRef', 'branchOnly', 'delivery', 'direction']) {
+    for (const k of ['targetLang', 'targetOrg', 'sourceRef', 'contextRef', 'branchOnly', 'delivery', 'direction', 'rowIds']) {
       if (o[k] !== undefined) {
         ctx.addIssue({
           code: z.ZodIssueCode.custom,

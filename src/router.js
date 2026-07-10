@@ -1485,6 +1485,7 @@ function buildApiSyntheticRoute(pipelineType, scope, options) {
       branchOnly: options.branchOnly,
       delivery: options.delivery,
       direction: options.direction,
+      rowIds: options.rowIds,
     }
     : null;
 

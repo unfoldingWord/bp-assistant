@@ -34,8 +34,11 @@ const core = require('./lib/translate-core');
 
 const LOG_PREFIX = '[translate]';
 
-// "translate notes OBA 1 to ar [--flags]" — mirrors the config.json route match.
-const COMMAND_RE = /translate\s+notes?\s+(\w{3})\s+(\d+(?:\s*[-–—]\s*\d+)?)\s+(?:to|into)\s+([A-Za-z0-9-]+)/i;
+// Scope forms accepted after the book:
+//   "1"      whole chapter        "1-2"    chapter range
+//   "1:5"    one verse            "1:5-7"  verse range (single chapter)
+// Groups: 1=book 2=startChapter 3=verse-or-verse-range 4=endChapter 5=lang.
+const COMMAND_RE = /translate\s+notes?\s+(\w{3})\s+(\d+)(?::(\d+(?:\s*[-–—]\s*\d+)?))?(?:\s*[-–—]\s*(\d+))?\s+(?:to|into)\s+([A-Za-z0-9-]+)/i;
 
 // Display names are a convenience only; any ISO 639-1/639-3 code (optionally
 // with a region/script subtag, e.g. es-419, zh-Hans) is accepted, and an
@@ -54,6 +57,9 @@ const MAX_BATCH_ATTEMPTS = 2; // 1 draft + 1 repair pass
 
 function resolveParams(route, message) {
   let book, startChapter, endChapter, targetLang;
+  let verseStart = null;
+  let verseEnd = null;
+  let rowIds = null;
   const opts = route._translate || {};
 
   if (route._synthetic && route._book) {
@@ -61,16 +67,32 @@ function resolveParams(route, message) {
     startChapter = route._startChapter;
     endChapter = route._endChapter;
     targetLang = opts.targetLang;
+    verseStart = route._verseStart ?? null;
+    verseEnd = route._verseEnd ?? null;
+    rowIds = Array.isArray(opts.rowIds) && opts.rowIds.length ? opts.rowIds : null;
   } else {
     const m = COMMAND_RE.exec(String(message.content || ''));
-    if (!m) throw new Error('Could not parse translate command. Usage: translate notes OBA 1 to ar');
+    if (!m) throw new Error('Could not parse translate command. Usage: translate notes OBA 1 to ar (or OBA 1:5 / OBA 1:5-7 / OBA 1-2)');
     book = m[1].toUpperCase();
-    const [s, e] = m[2].split(/[-–—]/).map((x) => parseInt(x.trim(), 10));
-    startChapter = s;
-    endChapter = Number.isInteger(e) ? e : s;
-    targetLang = m[3].toLowerCase();
+    startChapter = parseInt(m[2], 10);
+    if (m[3]) {
+      // verse or verse range within a single chapter
+      const [vs, ve] = m[3].split(/[-–—]/).map((x) => parseInt(x.trim(), 10));
+      endChapter = startChapter;
+      verseStart = vs;
+      verseEnd = Number.isInteger(ve) ? ve : vs;
+    } else {
+      endChapter = m[4] ? parseInt(m[4], 10) : startChapter;
+    }
+    targetLang = m[5].toLowerCase();
   }
   if (!targetLang) throw new Error('translate: targetLang is required');
+
+  // A subset selection (specific rows, or a verse narrower than the whole
+  // chapter) switches the merge from whole-range replacement to update-by-ID,
+  // so untouched notes in the same chapter are preserved in place.
+  const hasSubset = (rowIds && rowIds.length > 0) || verseStart != null;
+  const mergeMode = hasSubset ? 'by-id' : 'range';
 
   // Delivery mode:
   //   'path'   — stage the file locally and return its path; NO Door43 push.
@@ -84,6 +106,10 @@ function resolveParams(route, message) {
     book: book.toUpperCase(),
     startChapter,
     endChapter,
+    verseStart,
+    verseEnd,
+    rowIds,
+    mergeMode,
     targetLang,
     targetLangName: LANG_NAMES[targetLang] || targetLang,
     direction: opts.direction || (RTL_LANGS.has(targetLang.split('-')[0]) ? 'rtl' : 'ltr'),
@@ -155,17 +181,25 @@ async function runBatch({ files, batchRows, params, guard }) {
  * can drive it. Returns { targetRows, checks, report, bookText }.
  * opts.runBatchImpl allows tests to stub the LLM step.
  */
-async function translateChapters(params, { workDir, onProgress, runBatchImpl, maxRows } = {}) {
+async function translateChapters(params, { workDir, onProgress, runBatchImpl, maxRows, existingTargetText } = {}) {
   const progress = onProgress || (() => {});
 
-  // 1. Source rows at the pinned ref.
+  // 1. Source rows at the pinned ref, sliced to the chapter range then
+  //    optionally narrowed to a subset (specific rowIds and/or a verse range)
+  //    for individual-note / single-verse translation.
   const sourceText = await core.fetchTnBook(params.sourceRef, params.book);
   if (!sourceText) throw new Error(`source not found: ${params.sourceRef} tn_${params.book}.tsv`);
   const allRows = parseTnTsv(sourceText);
   let rows = core.sliceChapterRows(allRows, params.startChapter, params.endChapter);
-  if (!rows.length) throw new Error(`no source rows for ${params.book} ${params.startChapter}-${params.endChapter}`);
+  rows = core.selectRows(rows, { rowIds: params.rowIds, verseStart: params.verseStart, verseEnd: params.verseEnd });
+  if (!rows.length) {
+    const sel = params.rowIds ? `rowIds ${params.rowIds.join(',')}`
+      : params.verseStart != null ? `${params.startChapter}:${params.verseStart}${params.verseEnd !== params.verseStart ? `-${params.verseEnd}` : ''}`
+        : `${params.startChapter}-${params.endChapter}`;
+    throw new Error(`no source rows for ${params.book} ${sel}`);
+  }
   if (maxRows && rows.length > maxRows) rows = rows.slice(0, maxRows); // dry-run trimming only
-  progress(`source: ${rows.length} rows from ${params.sourceRef}`);
+  progress(`source: ${rows.length} row(s) from ${params.sourceRef}${params.mergeMode === 'by-id' ? ' (by-id subset)' : ''}`);
 
   // 2. Context pack at the pinned ref.
   const pack = await loadContextPack(params.contextRef);
@@ -228,15 +262,23 @@ async function translateChapters(params, { workDir, onProgress, runBatchImpl, ma
     throw new Error(`whole-range deterministic checks failed: ${summary}`);
   }
 
-  // 5. Merge into the whole-book target file (existing target book or fresh).
-  const targetRepoRef = `${params.targetOrg}/${params.targetLang}_tn@master`;
-  let existingBookText = null;
-  try {
-    existingBookText = await core.fetchTnBook(targetRepoRef, params.book);
-  } catch (err) {
-    console.warn(`${LOG_PREFIX} could not fetch existing target book (${err.message}) — starting fresh`);
+  // 5. Merge into the whole-book target file.
+  //    - range mode: replace the whole chapter range (default, whole-chapter).
+  //    - by-id mode: update only the selected rows in the existing target,
+  //      leaving all other notes in place (individual-note / single-verse).
+  //    existingTargetText (tests/dry-run) short-circuits the DCS fetch.
+  let existingBookText = existingTargetText ?? null;
+  if (existingBookText == null) {
+    const targetRepoRef = `${params.targetOrg}/${params.targetLang}_tn@master`;
+    try {
+      existingBookText = await core.fetchTnBook(targetRepoRef, params.book);
+    } catch (err) {
+      console.warn(`${LOG_PREFIX} could not fetch existing target book (${err.message}) — starting fresh`);
+    }
   }
-  const bookText = core.mergeChapterIntoBook(existingBookText, targetRows, params);
+  const bookText = params.mergeMode === 'by-id'
+    ? core.updateRowsById(existingBookText, targetRows)
+    : core.mergeChapterIntoBook(existingBookText, targetRows, params);
 
   const report = core.buildTranslateReport({
     book: params.book,
@@ -248,6 +290,12 @@ async function translateChapters(params, { workDir, onProgress, runBatchImpl, ma
     contextSha: pack.sha,
     batches: batchMeta,
     checks,
+    selection: {
+      mergeMode: params.mergeMode,
+      verseStart: params.verseStart ?? null,
+      verseEnd: params.verseEnd ?? null,
+      rowIds: params.rowIds ?? null,
+    },
   });
 
   return { sourceRows: rows, targetRows, checks, report, bookText, existingBookText };
@@ -260,12 +308,17 @@ async function translatePipeline(route, message) {
     book: params.book,
     startChapter: params.startChapter,
     endChapter: params.endChapter,
-    verseStart: null,
-    verseEnd: null,
+    verseStart: params.verseStart,
+    verseEnd: params.verseEnd,
   };
   const ckptId = { sessionKey, pipelineType: 'translate', scope };
-  const label = `${params.book} ${params.startChapter === params.endChapter
-    ? params.startChapter : `${params.startChapter}-${params.endChapter}`} → ${params.targetLangName}`;
+  const scopeLabel = params.rowIds
+    ? `${params.startChapter} [${params.rowIds.join(',')}]`
+    : params.verseStart != null
+      ? `${params.startChapter}:${params.verseStart}${params.verseEnd !== params.verseStart ? `-${params.verseEnd}` : ''}`
+      : params.startChapter === params.endChapter
+        ? `${params.startChapter}` : `${params.startChapter}-${params.endChapter}`;
+  const label = `${params.book} ${scopeLabel} → ${params.targetLangName}`;
 
   const post = (text) => {
     const p = message.type === 'stream'
@@ -279,8 +332,15 @@ async function translatePipeline(route, message) {
     || message.sender_full_name
     || 'bp-assistant';
 
+  // Selection discriminant keeps subset runs from colliding with each other
+  // or with the whole-chapter run in the resume-reuse batch cache.
+  const selTag = params.rowIds
+    ? `-ids-${params.rowIds.join('-')}`
+    : params.verseStart != null
+      ? `-v${params.verseStart}-${params.verseEnd}`
+      : '';
   const workDir = path.join(CSKILLBP_DIR, 'tmp',
-    `translate-${params.targetLang}-${params.book}-${params.startChapter}-${params.endChapter}`);
+    `translate-${params.targetLang}-${params.book}-${params.startChapter}-${params.endChapter}${selTag}`);
 
   console.log(`${LOG_PREFIX} Starting ${label} (org=${params.targetOrg}, source=${params.sourceRef}, context=${params.contextRef})`);
   setCheckpoint(ckptId, { state: 'running', current: { chapter: params.startChapter, skill: 'translate-tn', status: 'running' } });

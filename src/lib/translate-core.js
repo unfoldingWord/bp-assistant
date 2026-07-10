@@ -10,7 +10,7 @@
 
 const fs = require('fs');
 const path = require('path');
-const { parseTnTsv, serializeTnTsv, refChapter, sliceChapterRows } = require('./tn-tsv');
+const { parseTnTsv, serializeTnTsv, refChapter, refVerseRange, sliceChapterRows } = require('./tn-tsv');
 const { runChecks } = require('./translate-checks');
 
 const DCS_BASE = 'https://git.door43.org';
@@ -209,8 +209,58 @@ function mergeChapterIntoBook(existingBookText, newRows, { startChapter, endChap
   return serializeTnTsv([...before, ...newRows, ...after]);
 }
 
+/**
+ * Narrow a chapter-sliced row set to a subset by explicit row IDs and/or a
+ * verse range. Used for individual-note / single-verse translation. With no
+ * criteria, returns the input unchanged.
+ * - rowIds: keep only rows whose ID is in the list (precise single-note).
+ * - verseStart/verseEnd: keep rows whose reference verse range OVERLAPS
+ *   [verseStart, verseEnd]; intro/front rows (no verse) are excluded.
+ */
+function selectRows(rows, { rowIds, verseStart, verseEnd } = {}) {
+  let out = rows;
+  if (Array.isArray(rowIds) && rowIds.length) {
+    const want = new Set(rowIds);
+    out = out.filter((r) => want.has(r.ID));
+  }
+  if (verseStart != null) {
+    const vEnd = verseEnd != null ? verseEnd : verseStart;
+    out = out.filter((r) => {
+      const vr = refVerseRange(r.Reference);
+      return vr && vr.start <= vEnd && vr.end >= verseStart;
+    });
+  }
+  return out;
+}
+
+/**
+ * Update specific rows in an existing whole-book target TSV by ID, leaving
+ * every other row — and all row positions — untouched. This is the merge for
+ * individual-note / single-verse translation (generalizes the English
+ * applyTnHintExpansion by-id UPDATE pattern). Requires the target book to
+ * already contain each row being updated.
+ */
+function updateRowsById(existingBookText, newRows) {
+  if (!existingBookText) {
+    throw new Error('by-id update requires an existing target book (none found). '
+      + 'Translate the whole chapter first, or run in whole-chapter mode.');
+  }
+  const existing = parseTnTsv(existingBookText);
+  const newById = new Map(newRows.map((r) => [r.ID, r]));
+  const applied = new Set();
+  const merged = existing.map((r) => {
+    if (newById.has(r.ID)) { applied.add(r.ID); return newById.get(r.ID); }
+    return r;
+  });
+  const missing = newRows.filter((r) => !applied.has(r.ID));
+  if (missing.length) {
+    throw new Error(`by-id update: row id(s) not present in target book: ${missing.map((r) => r.ID).join(', ')}`);
+  }
+  return serializeTnTsv(merged);
+}
+
 /** Machine-readable per-run report (spec §2.3 sidecar, adapted — see PLAN.md). */
-function buildTranslateReport({ book, startChapter, endChapter, targetLang, sourceRef, contextRef, contextSha, batches, checks }) {
+function buildTranslateReport({ book, startChapter, endChapter, targetLang, sourceRef, contextRef, contextSha, batches, checks, selection }) {
   return {
     version: 1,
     generatedBy: 'bp-assistant/translate',
@@ -221,6 +271,7 @@ function buildTranslateReport({ book, startChapter, endChapter, targetLang, sour
     sourceRef,
     contextRef,
     contextSha: contextSha || null,
+    selection: selection || { mergeMode: 'range', verseStart: null, verseEnd: null, rowIds: null },
     rowCount: batches.reduce((s, b) => s + b.rowCount, 0),
     batches: batches.map((b) => ({
       batch: b.nn,
@@ -246,6 +297,8 @@ module.exports = {
   writeBatchFiles,
   readBatchOutput,
   mergeChapterIntoBook,
+  updateRowsById,
+  selectRows,
   buildTranslateReport,
   slugFromSupportReference,
   sliceChapterRows,
