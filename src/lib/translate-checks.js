@@ -33,6 +33,15 @@ const MD_LINK_TARGET_RE = /\]\(([^)]+)\)/g;
 // Wiki-style [[...]] link contents (tW/tA cross-references).
 const WIKI_LINK_RE = /\[\[([^\]]+)\]\]/g;
 
+// Hebrew (and other combining-mark scripts) can round-trip through the model in
+// a different Unicode normalization than the UHB source — visually identical,
+// byte-different (e.g. consonant-dagesh-vowel ordering vs NFC). Every pass-through
+// compare goes through NFC so a normalization-only difference is not mistaken for
+// corruption. Same rule the Bible Editor enforces via web/src/lib/hebrew.ts nfc().
+function nfc(s) {
+  return String(s ?? '').normalize('NFC');
+}
+
 function extractRcLinks(s) {
   return (String(s).match(RC_LINK_RE) || []).map((x) => x.replace(/[).,;]+$/, ''));
 }
@@ -133,8 +142,10 @@ function checkRow(source, target, { passThroughColumns, translateColumns }) {
   const multi = translateColumns.length > 1;
 
   // 1. Pass-through columns byte-identical (the Aquilla-corruption class).
+  //    Compared under NFC so a normalization-only round-trip difference on a
+  //    Hebrew Quote isn't flagged as corruption (see nfc()).
   for (const col of passThroughColumns) {
-    if (source[col] !== target[col]) {
+    if (nfc(source[col]) !== nfc(target[col])) {
       v.push(violation(`passthrough-${col.toLowerCase()}`, 'error', id,
         `${col} modified: ${JSON.stringify(source[col])} → ${JSON.stringify(target[col])}`, col));
     }
@@ -257,6 +268,7 @@ module.exports = {
   runArticleChecks,
   checkRow,
   extractRcLinks,
+  nfc,
   PASS_THROUGH_COLUMNS,
   TN_PASS_THROUGH_COLUMNS,
   TN_TRANSLATE_COLUMNS,

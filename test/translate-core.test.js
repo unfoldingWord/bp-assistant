@@ -176,3 +176,24 @@ test('readBatchOutput surfaces check results and throws on missing file', () => 
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test('readBatchOutput byte-preserves pass-through columns from source', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'batch-out-'));
+  try {
+    const batch = rows().slice(1, 4);
+    // Simulate the skill round-trip mangling the Quote: Note localized, and the
+    // Hebrew Quote returned byte-different from source (a normalization drift or
+    // any other re-emission). Healing must restore the source bytes verbatim.
+    const out = batch.map((r) => ({ ...r, Note: 'ترجمة', Quote: r.Quote + 'ּ' }));
+    const outFile = path.join(dir, 'out.tsv');
+    fs.writeFileSync(outFile, serializeTnTsv(out));
+    const { rows: parsed } = core.readBatchOutput(outFile, batch);
+    // Healed: each output Quote is byte-identical to its source row again.
+    for (const p of parsed) {
+      const src = batch.find((r) => r.ID === p.ID);
+      assert.strictEqual(p.Quote, src.Quote, `Quote must be restored verbatim for ${p.ID}`);
+    }
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
