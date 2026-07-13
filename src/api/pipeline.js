@@ -12,6 +12,7 @@ const { z } = require('zod');
 const { readSecret } = require('../secrets');
 const { getCheckpoint } = require('../pipeline-checkpoints');
 const { triggerPipelineFromApi, buildApiJobId, API_PIPELINE_ROUTE_NAMES } = require('../router');
+const { RESOURCE_TYPE_KEYS, isArticleResource } = require('../lib/resource-types');
 const { BOOK_NUMBERS } = require('../api-runner/verse-data');
 const {
   getExpectedOutputs,
@@ -76,6 +77,16 @@ const OptionsSchema = z.object({
   // from the published repo at sourceRef — NOT sent inline — because the
   // 32 KB body cap can't fit a chapter of notes and the published repo is
   // the source of truth for translation (bp-bot/translate-pipeline/DECISION.md).
+  // resourceType selects tn (default), tq (both TSV, book+chapter scoped) or
+  // tw/ta (markdown articles, articleId/articleUrl scoped, no book/chapter).
+  resourceType: z.enum(RESOURCE_TYPE_KEYS).optional(),
+  // Article identity (tw/ta): a name (e.g. "kt/god", "figs-aside") OR a Door43
+  // URL. Exactly one is required for article resourceTypes.
+  articleId: z.string().min(1).max(200).optional(),
+  articleUrl: z.string().url().max(400).optional(),
+  // Source language selector (default English). The sourceRef already carries
+  // the org/repo; sourceLang only affects prompt/report wording today.
+  sourceLang: z.string().min(2).max(12).regex(/^[a-z]{2,3}(-[A-Za-z0-9]{2,8})?$/).optional(),
   targetLang: z.string().min(2).max(12).regex(/^[a-z]{2,3}(-[A-Za-z0-9]{2,8})?$/).optional(),
   targetOrg: z.string().min(1).max(60).regex(/^[A-Za-z0-9._-]+$/).optional(),
   repoName: z.string().min(1).max(60).regex(/^[A-Za-z0-9._-]+$/).optional(),
@@ -99,8 +110,11 @@ const OptionsSchema = z.object({
 
 const StartBodySchema = z.object({
   pipelineType: z.enum(PIPELINE_TYPES),
-  book: z.string().regex(/^[A-Za-z0-9]{3}$/),
-  startChapter: z.number().int().min(1).max(150),
+  // book/startChapter are required for every pipeline EXCEPT translate article
+  // resources (tw/ta), which are scoped by articleId/articleUrl instead. The
+  // superRefine below enforces presence per pipelineType/resourceType.
+  book: z.string().regex(/^[A-Za-z0-9]{3}$/).optional(),
+  startChapter: z.number().int().min(1).max(150).optional(),
   endChapter: z.number().int().min(1).max(150).optional(),
   verseStart: z.number().int().min(1).max(200).nullable().optional(),
   verseEnd: z.number().int().min(1).max(200).nullable().optional(),
@@ -111,6 +125,16 @@ const StartBodySchema = z.object({
   options: OptionsSchema.optional(),
 }).superRefine((body, ctx) => {
   const o = body.options || {};
+  const isTranslateArticle = body.pipelineType === 'translate' && isArticleResource(o.resourceType);
+  // book + startChapter are required for everything except translate articles.
+  if (!isTranslateArticle) {
+    if (!body.book) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['book'], message: 'book is required' });
+    }
+    if (body.startChapter == null) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['startChapter'], message: 'startChapter is required' });
+    }
+  }
   // Mutually-exclusive align mode flags.
   const alignFlags = ['noAlign', 'alignOnly', 'textOnly'].filter((k) => o[k]);
   if (alignFlags.length > 1) {
@@ -142,29 +166,56 @@ const StartBodySchema = z.object({
         message: 'options.targetLang is required for pipelineType "translate"',
       });
     }
-    // Verse scoping is single-chapter only: the verse filter is applied to
-    // every chapter in the range, so a verse range across multiple chapters
-    // would translate those verse numbers in each chapter. Require one chapter.
-    const endCh = body.endChapter ?? body.startChapter;
-    if (body.verseStart != null && endCh !== body.startChapter) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        path: ['verseStart'],
-        message: 'verse scoping requires a single chapter (startChapter must equal endChapter)',
-      });
-    }
-    // verseEnd without verseStart is an incomplete scope — the pipeline only
-    // switches to subset mode on verseStart, so it would silently run the
-    // whole chapter. Reject rather than mis-scope.
-    if (body.verseEnd != null && body.verseStart == null) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        path: ['verseEnd'],
-        message: 'verseEnd requires verseStart',
-      });
+    if (isTranslateArticle) {
+      // Article resources: exactly one of articleId / articleUrl; no verse/row scoping.
+      const hasId = !!o.articleId;
+      const hasUrl = !!o.articleUrl;
+      if (hasId === hasUrl) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['options', 'articleId'],
+          message: 'article resources require exactly one of options.articleId or options.articleUrl',
+        });
+      }
+      for (const k of ['rowIds']) {
+        if (o[k] !== undefined) {
+          ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['options', k], message: `options.${k} is not valid for article resources (tw/ta)` });
+        }
+      }
+      if (body.verseStart != null || body.verseEnd != null) {
+        ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['verseStart'], message: 'verse scoping is not valid for article resources (tw/ta)' });
+      }
+    } else {
+      // TSV resources (tn/tq): articleId/articleUrl not allowed.
+      for (const k of ['articleId', 'articleUrl']) {
+        if (o[k] !== undefined) {
+          ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['options', k], message: `options.${k} only valid for article resources (tw/ta)` });
+        }
+      }
+      // Verse scoping is single-chapter only: the verse filter is applied to
+      // every chapter in the range, so a verse range across multiple chapters
+      // would translate those verse numbers in each chapter. Require one chapter.
+      const endCh = body.endChapter ?? body.startChapter;
+      if (body.verseStart != null && endCh !== body.startChapter) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['verseStart'],
+          message: 'verse scoping requires a single chapter (startChapter must equal endChapter)',
+        });
+      }
+      // verseEnd without verseStart is an incomplete scope — the pipeline only
+      // switches to subset mode on verseStart, so it would silently run the
+      // whole chapter. Reject rather than mis-scope.
+      if (body.verseEnd != null && body.verseStart == null) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['verseEnd'],
+          message: 'verseEnd requires verseStart',
+        });
+      }
     }
   } else {
-    for (const k of ['targetLang', 'targetOrg', 'repoName', 'sourceRef', 'contextRef', 'branchOnly', 'delivery', 'direction', 'rowIds']) {
+    for (const k of ['resourceType', 'targetLang', 'targetOrg', 'repoName', 'sourceRef', 'sourceLang', 'contextRef', 'branchOnly', 'delivery', 'direction', 'rowIds', 'articleId', 'articleUrl']) {
       if (o[k] !== undefined) {
         ctx.addIssue({
           code: z.ZodIssueCode.custom,
@@ -379,21 +430,28 @@ async function handleStartRequest(req, res) {
       return;
     }
     const body = result.data;
-    const book = body.book.toUpperCase();
-    if (!BOOK_NUMBERS[book]) {
-      reply(res, 400, { error: 'unknown_book', book: body.book });
-      return;
-    }
+    const o = body.options || {};
+    const isTranslateArticle = body.pipelineType === 'translate' && isArticleResource(o.resourceType);
 
-    const startChapter = body.startChapter;
-    const endChapter = body.endChapter ?? body.startChapter;
-    if (endChapter < startChapter) {
-      reply(res, 400, { error: 'validation_failed', message: 'endChapter < startChapter' });
-      return;
-    }
-    if (body.verseStart != null && body.verseEnd != null && body.verseEnd < body.verseStart) {
-      reply(res, 400, { error: 'validation_failed', message: 'verseEnd < verseStart' });
-      return;
+    let book = null;
+    let startChapter = 1;
+    let endChapter = 1;
+    if (!isTranslateArticle) {
+      book = body.book.toUpperCase();
+      if (!BOOK_NUMBERS[book]) {
+        reply(res, 400, { error: 'unknown_book', book: body.book });
+        return;
+      }
+      startChapter = body.startChapter;
+      endChapter = body.endChapter ?? body.startChapter;
+      if (endChapter < startChapter) {
+        reply(res, 400, { error: 'validation_failed', message: 'endChapter < startChapter' });
+        return;
+      }
+      if (body.verseStart != null && body.verseEnd != null && body.verseEnd < body.verseStart) {
+        reply(res, 400, { error: 'validation_failed', message: 'verseEnd < verseStart' });
+        return;
+      }
     }
 
     const trigger = triggerPipelineFromApi({

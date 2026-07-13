@@ -86,6 +86,30 @@
       "operations": 1
     },
     {
+      "name": "translate-questions",
+      "match": "/translate\\s+(?:questions?|tq)\\s+(\\w{3})\\s+(\\d+(?::\\d+(?:\\s*[-–—]\\s*\\d+)?)?(?:\\s*[-–—]\\s*\\d+)?)\\s+(?:to|into)\\s+([A-Za-z0-9-]+)/i",
+      "type": "translate",
+      "reply": false,
+      "confirmMessage": "I'll translate the translationQuestions for **$1 $2** into **$3**. Sound right? (yes/no)",
+      "operations": 1
+    },
+    {
+      "name": "translate-tw",
+      "match": "/translate\\s+(?:words?|tw)\\s+(\\S+)\\s+(?:to|into)\\s+([A-Za-z0-9-]+)/i",
+      "type": "translate",
+      "reply": false,
+      "confirmMessage": "I'll translate the translationWords article **$1** into **$2**. Sound right? (yes/no)",
+      "operations": 1
+    },
+    {
+      "name": "translate-ta",
+      "match": "/translate\\s+(?:articles?|ta)\\s+(\\S+)\\s+(?:to|into)\\s+([A-Za-z0-9-]+)/i",
+      "type": "translate",
+      "reply": false,
+      "confirmMessage": "I'll translate the translationAcademy article **$1** into **$2**. Sound right? (yes/no)",
+      "operations": 1
+    },
+    {
       "name": "write-tqs",
       "match": "/write\\s+tqs?(?:\\s+for)?\\s+(\\w+)(?:\\s+(\\d+(?:\\s*[-–—]\\s*\\d+)?))?\\s*$/i",
       "type": "tqs",

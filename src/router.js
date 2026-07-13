@@ -11,6 +11,9 @@ const { listCheckpoints } = require('./pipeline-checkpoints');
 const { resumeInsertion } = require('./insertion-resume');
 const { normalizeBookName, isValidBook } = require('./pipeline-utils');
 const { translateSessionSuffix } = require('./lib/translate-core');
+const {
+  ROUTE_RESOURCE_TYPE, ROUTE_NAME_BY_RESOURCE_TYPE, articleScopeBook, isArticleResource,
+} = require('./lib/resource-types');
 const { isTransientOutageError } = require('./claude-runner');
 const { publishAdminStatus } = require('./admin-status');
 const { handlePendingHumanDecisionConflictReply } = require('./issue-report-pipeline');
@@ -384,6 +387,16 @@ function getParsedRouteScope(route, captures) {
       verseEnd: route._verseEnd ?? null,
       wholeBook: !!route._wholeBook,
     };
+  }
+
+  // translate article routes (tW/tA) have no book/chapter — their checkpoint/
+  // conflict scope uses a fixed placeholder book (the sessionKey suffix carries
+  // the article id). Zulip captures for these routes are [articleRef, lang].
+  if (route?.type === 'translate') {
+    const rt = ROUTE_RESOURCE_TYPE[route.name] || 'tn';
+    if (isArticleResource(rt)) {
+      return { book: articleScopeBook(rt), chapters: [1], verseStart: null, verseEnd: null, wholeBook: false };
+    }
   }
 
   const parsed = parseBookChapters(captures || []);
@@ -781,13 +794,22 @@ function getPipelineKeys(route, message) {
 
   if (!book || !chapters.length) return null;
   // translate runs are additionally keyed by target language: ar OBA 1 and
-  // es OBA 1 are independent work and must not conflict. The language comes
-  // from _translate (API/synthetic) or the trailing command capture (Zulip,
-  // e.g. "translate notes OBA 1 to ar" → captures[2] === "ar").
-  const lang = route._translate?.targetLang
-    || (route.type === 'translate' ? String(captures[2] || '').toLowerCase() : '');
-  const langDim = route.type === 'translate' && lang ? `-${lang}` : '';
-  return chapters.map(ch => `${route.name}${langDim}-${book}-${ch}`);
+  // es OBA 1 are independent work and must not conflict. resourceType is
+  // implicit in route.name (translate-notes/questions/tw/ta).
+  if (route.type === 'translate') {
+    const rt = route._translate?.resourceType || ROUTE_RESOURCE_TYPE[route.name] || 'tn';
+    // Article routes: [articleRef, lang]; TSV routes: [book, scope, lang].
+    const lang = (route._translate?.targetLang
+      || String(captures[isArticleResource(rt) ? 1 : 2] || '')).toLowerCase();
+    const langDim = lang ? `-${lang}` : '';
+    if (isArticleResource(rt)) {
+      const ref = route._translate?.articleId || route._translate?.articleUrl || String(captures[0] || '');
+      const suffix = translateSessionSuffix(lang || 'x', null, { resourceType: rt, articleId: ref });
+      return [`${route.name}${suffix}`];
+    }
+    return chapters.map(ch => `${route.name}${langDim}-${book}-${ch}`);
+  }
+  return chapters.map(ch => `${route.name}-${book}-${ch}`);
 }
 
 /**
@@ -808,8 +830,13 @@ function firePipeline(route, message) {
     // buildSessionKey); match that here or the guard never finds them. On a
     // scope mismatch getActiveCheckpoint returns null (no false block).
     if (route.type === 'translate') {
-      const lang = route._translate?.targetLang || String(captures[2] || '').toLowerCase();
-      sessionKey = `${sessionKey}${translateSessionSuffix(lang, route._translate?.rowIds)}`;
+      const rt = route._translate?.resourceType || ROUTE_RESOURCE_TYPE[route.name] || 'tn';
+      const article = isArticleResource(rt);
+      const lang = (route._translate?.targetLang || String(captures[article ? 1 : 2] || '')).toLowerCase();
+      const articleId = article
+        ? (route._translate?.articleId || route._translate?.articleUrl || String(captures[0] || ''))
+        : null;
+      sessionKey = `${sessionKey}${translateSessionSuffix(lang, route._translate?.rowIds, { resourceType: rt, articleId })}`;
     }
     activeCp = getActiveCheckpoint(route, sessionKey, captures);
     if (isStaleRunningCheckpoint(activeCp)) {
@@ -846,9 +873,10 @@ function firePipeline(route, message) {
   if (keys) {
     const conflicts = keys.filter(k => activePipelines.has(k));
     if (conflicts.length > 0) {
-      const [, book, ch] = conflicts[0].match(/^[^-]+-(.+)-(\d+)$/);
+      const m = conflicts[0].match(/^[^-]+-(.+)-(\d+)$/);
       const label = route.name.replace(/-/g, ' ');
-      const text = `A **${label}** pipeline is already running for **${book} ${ch}**. Please wait for it to finish.`;
+      const scopeLabel = m ? `${m[1]} ${m[2]}` : conflicts[0];
+      const text = `A **${label}** pipeline is already running for **${scopeLabel}**. Please wait for it to finish.`;
 
       if (message.type === 'stream') {
         sendMessage(message.display_recipient, message.subject, text).catch(err =>
@@ -1462,7 +1490,11 @@ function buildApiRunStamp({ pipelineType, scope, username, jobId }) {
 }
 
 function buildApiSyntheticRoute(pipelineType, scope, options) {
-  const routeName = API_PIPELINE_ROUTE_NAMES[pipelineType];
+  // translate picks its base route by resourceType (four routes, all type
+  // 'translate'); other pipelines have a single route name.
+  const routeName = pipelineType === 'translate'
+    ? (ROUTE_NAME_BY_RESOURCE_TYPE[options?.resourceType || 'tn'] || API_PIPELINE_ROUTE_NAMES.translate)
+    : API_PIPELINE_ROUTE_NAMES[pipelineType];
   if (!routeName) return null;
   const baseRoute = config.routes.find((r) => r.name === routeName);
   if (!baseRoute) return null;
@@ -1487,16 +1519,20 @@ function buildApiSyntheticRoute(pipelineType, scope, options) {
   // reads route._translate; Zulip-origin runs parse the message instead.
   const translateOpts = pipelineType === 'translate' && options
     ? {
+      resourceType: options.resourceType || 'tn',
       targetLang: options.targetLang,
       targetOrg: options.targetOrg,
       repoName: options.repoName,
       sourceRef: options.sourceRef,
+      sourceLang: options.sourceLang,
       contextRef: options.contextRef,
       model: options.model,
       branchOnly: options.branchOnly,
       delivery: options.delivery,
       direction: options.direction,
       rowIds: options.rowIds,
+      articleId: options.articleId,
+      articleUrl: options.articleUrl,
     }
     : null;
 
@@ -1574,7 +1610,11 @@ function buildApiSessionKey(pipelineType, options) {
   // so status polling resolves the right job and distinct rowIds runs on the
   // same scope don't alias to one jobId/checkpoint.
   const suffix = pipelineType === 'translate'
-    ? translateSessionSuffix(options?.targetLang, options?.rowIds) : '';
+    ? translateSessionSuffix(options?.targetLang, options?.rowIds, {
+      resourceType: options?.resourceType || 'tn',
+      articleId: options?.articleId || options?.articleUrl || null,
+    })
+    : '';
   return `stream-${stream}-${topic}${suffix}`;
 }
 
@@ -1610,7 +1650,14 @@ function triggerPipelineFromApi(input) {
     options = {},
   } = input;
 
-  const scope = { book, startChapter, endChapter, verseStart, verseEnd };
+  // Article translate runs have no book/chapter — synthesize a placeholder
+  // scope (the sessionKey suffix carries the article id). Keep in sync with
+  // translate-pipeline.translatePipeline's article checkpoint scope.
+  const isTranslateArticle = pipelineType === 'translate'
+    && isArticleResource(options?.resourceType || 'tn');
+  const scope = isTranslateArticle
+    ? { book: articleScopeBook(options.resourceType), startChapter: 1, endChapter: 1, verseStart: null, verseEnd: null }
+    : { book, startChapter, endChapter, verseStart, verseEnd };
   const route = buildApiSyntheticRoute(pipelineType, scope, options);
   if (!route) {
     return { status: 'invalid', message: `Unknown pipelineType: ${pipelineType}` };

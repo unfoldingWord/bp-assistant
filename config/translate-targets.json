@@ -1,16 +1,21 @@
 {
-  "_comment": "Per-language Door43 target config for the translate pipeline. Verified 2026-07-10: org/repo naming is NOT derivable from the language code (ar lives in org 'BSOJ' not 'ar_gl'; es-419_gl uses per-book 'tN_{book}' repos; ru_gl uses legacy tStudio repos). Precedence: per-call options.{targetOrg,repoName,sourceRef,contextRef,direction} > this file > the {lang}_gl / {lang}_tn derivation fallback. contextRef is intentionally omitted here (no translation-context repo exists in any org yet); pass it per-call until one is created.",
+  "_comment": "Per-language Door43 target config for the translate pipeline. Verified 2026-07-13: org/repo naming is NOT derivable from the language code (ar lives in org 'BSOJ' not 'ar_gl'). Precedence for each field: per-call options > this file > derivation ({lang}_gl org, {lang}_{resource} repo, unfoldingWord/en_{resource}@master source). Per resourceType: tnRepo/tqRepo/twRepo/taRepo name the target repos; {tn,tq,tw,ta}SourceRef optionally override the SOURCE ref for that resource (org/repo@ref). SOURCE LANGUAGE is a first-class parameter: set sourceLang (default 'en') plus a matching {rt}SourceRef to translate FROM a non-English gateway language (e.g. Russian->Georgian: sourceLang 'ru', tnSourceRef 'ru_gl/ru_tn@master'). contextRef is intentionally omitted (no translation-context repo exists yet); pass it per-call until one is created.",
   "ar": {
     "targetOrg": "BSOJ",
     "tnRepo": "ar_tn",
-    "sourceRef": "BSOJ/ar_tn@master",
+    "tqRepo": "ar_tq",
+    "twRepo": "ar_tw",
+    "taRepo": "ar_ta",
+    "tnSourceRef": "BSOJ/ar_tn@master",
     "direction": "rtl",
-    "note": "BSOJ = Arabic partner. ar_tn currently holds their (English) copy of tN, whole-book layout, row IDs identical to unfoldingWord/en_tn — translate in place. Standard layout, works with the pipeline as-is."
+    "note": "BSOJ = Arabic partner. All four repos exist (verified 2026-07-13, master, non-empty). ar_tn holds the partner's English copy of tN (row IDs identical to unfoldingWord/en_tn) -> translate TN in place from BSOJ/ar_tn. TQ/TW/TA source from unfoldingWord/en_* (the pilot default) since the pilot builds fresh gateway drafts; switch to in-place by adding tqSourceRef/twSourceRef/taSourceRef here once the partner content is confirmed."
   },
   "id": {
     "targetOrg": "id_gl",
     "tnRepo": "id_tn",
-    "sourceRef": "unfoldingWord/en_tn@master",
-    "note": "Matches the {lang}_gl / {lang}_tn convention; standard whole-book layout."
+    "tqRepo": "id_tq",
+    "twRepo": "id_tw",
+    "taRepo": "id_ta",
+    "note": "Matches the {lang}_gl / {lang}_{resource} convention; standard whole-book / standard article layout. All resources source from unfoldingWord/en_* by default."
   }
 }

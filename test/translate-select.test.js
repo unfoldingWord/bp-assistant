@@ -110,18 +110,18 @@ test('resolveParams: verse range 1:5-7 → by-id mode', () => {
 test('resolveParams: targets config resolves ar to BSOJ, options override', () => {
   const ar = resolveParams({}, zmsg('translate notes OBA 1 to ar'));
   assert.strictEqual(ar.targetOrg, 'BSOJ');       // NOT ar_gl
-  assert.strictEqual(ar.tnRepo, 'ar_tn');
+  assert.strictEqual(ar.repoName, 'ar_tn');
   assert.strictEqual(ar.sourceRef, 'BSOJ/ar_tn@master');
   assert.strictEqual(ar.direction, 'rtl');
 
   const id = resolveParams({}, zmsg('translate notes OBA 1 to id'));
   assert.strictEqual(id.targetOrg, 'id_gl');
-  assert.strictEqual(id.tnRepo, 'id_tn');
+  assert.strictEqual(id.repoName, 'id_tn');
 
   // Unknown lang falls back to {lang}_gl / {lang}_tn derivation.
   const xx = resolveParams({}, zmsg('translate notes OBA 1 to xyz'));
   assert.strictEqual(xx.targetOrg, 'xyz_gl');
-  assert.strictEqual(xx.tnRepo, 'xyz_tn');
+  assert.strictEqual(xx.repoName, 'xyz_tn');
 
   // Per-call options beat the config.
   const ov = resolveParams({
@@ -129,7 +129,7 @@ test('resolveParams: targets config resolves ar to BSOJ, options override', () =
     _translate: { targetLang: 'ar', targetOrg: 'other_org', repoName: 'other_tn' },
   }, {});
   assert.strictEqual(ov.targetOrg, 'other_org');
-  assert.strictEqual(ov.tnRepo, 'other_tn');
+  assert.strictEqual(ov.repoName, 'other_tn');
 });
 
 test('resolveParams: API rowIds → by-id mode', () => {
