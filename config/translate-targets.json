@@ -1,0 +1,16 @@
+{
+  "_comment": "Per-language Door43 target config for the translate pipeline. Verified 2026-07-10: org/repo naming is NOT derivable from the language code (ar lives in org 'BSOJ' not 'ar_gl'; es-419_gl uses per-book 'tN_{book}' repos; ru_gl uses legacy tStudio repos). Precedence: per-call options.{targetOrg,repoName,sourceRef,contextRef,direction} > this file > the {lang}_gl / {lang}_tn derivation fallback. contextRef is intentionally omitted here (no translation-context repo exists in any org yet); pass it per-call until one is created.",
+  "ar": {
+    "targetOrg": "BSOJ",
+    "tnRepo": "ar_tn",
+    "sourceRef": "BSOJ/ar_tn@master",
+    "direction": "rtl",
+    "note": "BSOJ = Arabic partner. ar_tn currently holds their (English) copy of tN, whole-book layout, row IDs identical to unfoldingWord/en_tn — translate in place. Standard layout, works with the pipeline as-is."
+  },
+  "id": {
+    "targetOrg": "id_gl",
+    "tnRepo": "id_tn",
+    "sourceRef": "unfoldingWord/en_tn@master",
+    "note": "Matches the {lang}_gl / {lang}_tn convention; standard whole-book layout."
+  }
+}

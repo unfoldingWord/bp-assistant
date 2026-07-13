@@ -37,6 +37,11 @@ const PIPELINE_OUTPUT_TYPES = {
   generate: ['ult', 'ust'],
   notes: ['tn'],
   tqs: ['tq'],
+  // translate outputs land in {targetOrg}/{targetLang}_tn, which is not
+  // derivable from (pipelineType, book) alone. Status for translate runs is
+  // served by the persistent 'done' checkpoint (translate-pipeline.js) —
+  // the Door43 probe has nothing to probe, so expected outputs are empty.
+  translate: [],
 };
 
 function rawUrl(repo, file) {

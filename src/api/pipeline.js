@@ -72,6 +72,22 @@ const OptionsSchema = z.object({
   // notes-only:
   noIntro: z.boolean().optional(),
   pauseBeforeATs: z.boolean().optional(),
+  // translate-only (see src/translate-pipeline.js). Source rows are fetched
+  // from the published repo at sourceRef — NOT sent inline — because the
+  // 32 KB body cap can't fit a chapter of notes and the published repo is
+  // the source of truth for translation (bp-bot/translate-pipeline/DECISION.md).
+  targetLang: z.string().min(2).max(12).regex(/^[a-z]{2,3}(-[A-Za-z0-9]{2,8})?$/).optional(),
+  targetOrg: z.string().min(1).max(60).regex(/^[A-Za-z0-9._-]+$/).optional(),
+  repoName: z.string().min(1).max(60).regex(/^[A-Za-z0-9._-]+$/).optional(),
+  sourceRef: z.string().min(3).max(200).regex(/^[^/@\s]+\/[^/@\s]+@\S+$/).optional(),
+  contextRef: z.string().min(3).max(200).regex(/^[^/@\s]+\/[^/@\s]+@\S+$/).optional(),
+  branchOnly: z.boolean().optional(),
+  delivery: z.enum(['path', 'branch']).optional(),
+  direction: z.enum(['ltr', 'rtl']).optional(),
+  // Individual-note / subset selection: translate only these published rows
+  // and UPDATE them by ID into the existing target book (verse scoping uses
+  // the top-level verseStart/verseEnd instead).
+  rowIds: z.array(z.string().regex(HINT_ROW_ID_RE)).min(1).max(50).optional(),
   // Editor-marked TN row "hints" — each entry seeds one specific note the
   // pipeline must produce, and suppresses competing notes for the same
   // (verse, supportReference, fuzzy-quote). hint.rowId is preserved as the
@@ -112,6 +128,48 @@ const StartBodySchema = z.object({
           code: z.ZodIssueCode.custom,
           path: ['options', k],
           message: `options.${k} only valid for pipelineType "generate"`,
+        });
+      }
+    }
+  }
+  // translate-only fields must not appear on other types; targetLang is
+  // required for translate.
+  if (body.pipelineType === 'translate') {
+    if (!o.targetLang) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['options', 'targetLang'],
+        message: 'options.targetLang is required for pipelineType "translate"',
+      });
+    }
+    // Verse scoping is single-chapter only: the verse filter is applied to
+    // every chapter in the range, so a verse range across multiple chapters
+    // would translate those verse numbers in each chapter. Require one chapter.
+    const endCh = body.endChapter ?? body.startChapter;
+    if (body.verseStart != null && endCh !== body.startChapter) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['verseStart'],
+        message: 'verse scoping requires a single chapter (startChapter must equal endChapter)',
+      });
+    }
+    // verseEnd without verseStart is an incomplete scope — the pipeline only
+    // switches to subset mode on verseStart, so it would silently run the
+    // whole chapter. Reject rather than mis-scope.
+    if (body.verseEnd != null && body.verseStart == null) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['verseEnd'],
+        message: 'verseEnd requires verseStart',
+      });
+    }
+  } else {
+    for (const k of ['targetLang', 'targetOrg', 'repoName', 'sourceRef', 'contextRef', 'branchOnly', 'delivery', 'direction', 'rowIds']) {
+      if (o[k] !== undefined) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['options', k],
+          message: `options.${k} only valid for pipelineType "translate"`,
         });
       }
     }

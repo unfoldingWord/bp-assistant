@@ -10,6 +10,7 @@ const { getCheckpoint, setCheckpoint, clearCheckpoint, buildCheckpointKey } = re
 const { listCheckpoints } = require('./pipeline-checkpoints');
 const { resumeInsertion } = require('./insertion-resume');
 const { normalizeBookName, isValidBook } = require('./pipeline-utils');
+const { translateSessionSuffix } = require('./lib/translate-core');
 const { isTransientOutageError } = require('./claude-runner');
 const { publishAdminStatus } = require('./admin-status');
 const { handlePendingHumanDecisionConflictReply } = require('./issue-report-pipeline');
@@ -328,9 +329,11 @@ function parseBookChapters(captures) {
     if (c == null) continue;
     // Pre-normalize dashes to standard hyphens
     const s = String(c).trim().replace(/[-–—]/g, '-');
-    // Book name: all letters
+    // Book name: all letters. First all-letters token wins — later alpha
+    // tokens (e.g. the target-language code in "translate notes OBA 1 to ar")
+    // must not overwrite the book.
     if (/^[a-zA-Z]+$/.test(s)) {
-      book = normalizeBookName(s);
+      if (book === null) book = normalizeBookName(s);
     } else {
       // Verse-range format "CH:VS-VS"
       const verseRange = s.match(/^(\d+):(\d+)-(\d+)$/);
@@ -416,6 +419,7 @@ function getPipelineType(route) {
   if (route.type === 'sdk') return 'generate';
   if (route.type === 'notes') return 'notes';
   if (route.type === 'tqs') return 'tqs';
+  if (route.type === 'translate') return 'translate';
   return null;
 }
 
@@ -766,18 +770,24 @@ function calcResumeTimeout(checkpoint) {
  * Returns an array of keys, or null for route types that don't need conflict detection.
  */
 function getPipelineKeys(route, message) {
-  if (route.type !== 'sdk' && route.type !== 'notes' && route.type !== 'tqs') return null;
+  if (route.type !== 'sdk' && route.type !== 'notes' && route.type !== 'tqs' && route.type !== 'translate') return null;
 
   let book, chapters;
 
-  const parsed = route._synthetic
-    ? getParsedRouteScope(route, [])
-    : getParsedRouteScope(route, matchRoute(message.content).captures);
+  const captures = route._synthetic ? [] : matchRoute(message.content).captures;
+  const parsed = getParsedRouteScope(route, captures);
   book = parsed.book;
   chapters = parsed.chapters;
 
   if (!book || !chapters.length) return null;
-  return chapters.map(ch => `${route.name}-${book}-${ch}`);
+  // translate runs are additionally keyed by target language: ar OBA 1 and
+  // es OBA 1 are independent work and must not conflict. The language comes
+  // from _translate (API/synthetic) or the trailing command capture (Zulip,
+  // e.g. "translate notes OBA 1 to ar" → captures[2] === "ar").
+  const lang = route._translate?.targetLang
+    || (route.type === 'translate' ? String(captures[2] || '').toLowerCase() : '');
+  const langDim = route.type === 'translate' && lang ? `-${lang}` : '';
+  return chapters.map(ch => `${route.name}${langDim}-${book}-${ch}`);
 }
 
 /**
@@ -789,11 +799,18 @@ function firePipeline(route, message) {
   let activeCp = null;
 
   // Guard against duplicate retriggers for the same scope while resume/work is in progress.
-  if (route.type === 'sdk' || route.type === 'notes' || route.type === 'tqs') {
+  if (route.type === 'sdk' || route.type === 'notes' || route.type === 'tqs' || route.type === 'translate') {
     const captures = route._synthetic ? [] : matchRoute(message.content).captures;
-    const sessionKey = message.type === 'stream'
+    let sessionKey = message.type === 'stream'
       ? `stream-${message.display_recipient}-${message.subject}`
       : `dm-${message.sender_id}`;
+    // translate checkpoints are lang-suffixed (see translate-pipeline
+    // buildSessionKey); match that here or the guard never finds them. On a
+    // scope mismatch getActiveCheckpoint returns null (no false block).
+    if (route.type === 'translate') {
+      const lang = route._translate?.targetLang || String(captures[2] || '').toLowerCase();
+      sessionKey = `${sessionKey}${translateSessionSuffix(lang, route._translate?.rowIds)}`;
+    }
     activeCp = getActiveCheckpoint(route, sessionKey, captures);
     if (isStaleRunningCheckpoint(activeCp)) {
       // Convert interrupted 'running' to 'failed' so it becomes resumable
@@ -1406,6 +1423,7 @@ const API_PIPELINE_ROUTE_NAMES = {
   generate: 'generate-content',
   notes: 'write-notes',
   tqs: 'write-tqs',
+  translate: 'translate-notes',
 };
 
 // API-triggered runs (POST /api/pipeline/start) have no originating Zulip
@@ -1433,7 +1451,8 @@ function buildApiRunLabel({ pipelineType, scope }) {
       : `${startChapter}-${endChapter}`;
   const typeLabel = pipelineType === 'generate' ? 'content'
     : pipelineType === 'notes' ? 'notes'
-      : 'tqs';
+      : pipelineType === 'translate' ? 'translate'
+        : 'tqs';
   return `${book} ${chPart} ${typeLabel}`;
 }
 
@@ -1463,6 +1482,24 @@ function buildApiSyntheticRoute(pipelineType, scope, options) {
     ? options.hints
     : null;
 
+  // translate carries its per-run parameters structurally, like hints do —
+  // they can't ride the stringly-typed message flags. translate-pipeline.js
+  // reads route._translate; Zulip-origin runs parse the message instead.
+  const translateOpts = pipelineType === 'translate' && options
+    ? {
+      targetLang: options.targetLang,
+      targetOrg: options.targetOrg,
+      repoName: options.repoName,
+      sourceRef: options.sourceRef,
+      contextRef: options.contextRef,
+      model: options.model,
+      branchOnly: options.branchOnly,
+      delivery: options.delivery,
+      direction: options.direction,
+      rowIds: options.rowIds,
+    }
+    : null;
+
   return {
     ...baseRoute,
     _synthetic: true,
@@ -1472,6 +1509,7 @@ function buildApiSyntheticRoute(pipelineType, scope, options) {
     _verseStart: verseStart ?? null,
     _verseEnd: verseEnd ?? null,
     _hints: hints,
+    _translate: translateOpts,
     _scopeText: rangeLabel.replace(/^\S+\s+/, ''),
     _apiOrigin: true,
     confirmMessage: null,
@@ -1502,9 +1540,12 @@ function buildApiSyntheticMessage({ pipelineType, scope, username, options }) {
   const chapterPart = startChapter === endChapter ? String(startChapter) : `${startChapter}-${endChapter}`;
   const commandWord = pipelineType === 'generate' ? 'generate'
     : pipelineType === 'notes' ? 'write notes'
+    : pipelineType === 'translate' ? 'translate notes'
     : 'write tqs';
   const flags = buildApiContentFlags(pipelineType, options);
-  const content = [commandWord, book, chapterPart, ...flags].join(' ');
+  const langSuffix = pipelineType === 'translate' && options?.targetLang
+    ? ['to', options.targetLang] : [];
+  const content = [commandWord, book, chapterPart, ...langSuffix, ...flags].join(' ');
   // Adopt the API control thread as this run's originating stream/topic. The
   // pipelines derive sessionKey, checkpoints, pending-merge keys and all Zulip
   // posts from message.display_recipient/subject, so this single substitution
@@ -1526,10 +1567,19 @@ function buildApiSyntheticMessage({ pipelineType, scope, username, options }) {
   };
 }
 
-function buildApiJobId({ pipelineType, scope }) {
+function buildApiSessionKey(pipelineType, options) {
   const { stream, topic } = getApiControlThread();
-  const derivedSessionKey = `stream-${stream}-${topic}`;
-  return buildCheckpointKey({ sessionKey: derivedSessionKey, pipelineType, scope });
+  // translate checkpoints are suffixed by language + rowIds (matches
+  // translate-pipeline buildSessionKey via the shared translateSessionSuffix)
+  // so status polling resolves the right job and distinct rowIds runs on the
+  // same scope don't alias to one jobId/checkpoint.
+  const suffix = pipelineType === 'translate'
+    ? translateSessionSuffix(options?.targetLang, options?.rowIds) : '';
+  return `stream-${stream}-${topic}${suffix}`;
+}
+
+function buildApiJobId({ pipelineType, scope, options }) {
+  return buildCheckpointKey({ sessionKey: buildApiSessionKey(pipelineType, options), pipelineType, scope });
 }
 
 /**
@@ -1567,8 +1617,8 @@ function triggerPipelineFromApi(input) {
   }
   const message = buildApiSyntheticMessage({ pipelineType, scope, username, options });
   const { stream: controlStream, topic: controlTopic } = getApiControlThread();
-  const derivedSessionKey = `stream-${controlStream}-${controlTopic}`;
-  const jobId = buildApiJobId({ pipelineType, scope });
+  const derivedSessionKey = buildApiSessionKey(pipelineType, options);
+  const jobId = buildApiJobId({ pipelineType, scope, options });
 
   // Conflict check 1: same (sessionKey, pipelineType, scope) already running?
   const activeCp = getActiveCheckpoint(route, derivedSessionKey, []);

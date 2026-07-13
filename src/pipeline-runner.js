@@ -1,6 +1,6 @@
 // Pipelines that write under CSKILLBP_DIR/output and CSKILLBP_DIR/tmp. Sweep
 // foreign-owned leftovers before they cause mid-run EACCES failures.
-const WORKSPACE_WRITING_ROUTES = new Set(['sdk', 'notes', 'tqs']);
+const WORKSPACE_WRITING_ROUTES = new Set(['sdk', 'notes', 'tqs', 'translate']);
 
 async function runPipeline(route, message) {
   if (WORKSPACE_WRITING_ROUTES.has(route.type)) {
@@ -24,6 +24,10 @@ async function runPipeline(route, message) {
     console.log(`[pipeline] Running TQ pipeline (route: ${route.name})`);
     const { tqsPipeline } = require('./tqs-pipeline');
     await tqsPipeline(route, message);
+  } else if (route.type === 'translate') {
+    console.log(`[pipeline] Running translate pipeline (route: ${route.name})`);
+    const { translatePipeline } = require('./translate-pipeline');
+    await translatePipeline(route, message);
   } else if (route.type === 'editor-note') {
     console.log(`[pipeline] Running editor-note pipeline (route: ${route.name})`);
     const { editorNotePipeline } = require('./note-pipeline');

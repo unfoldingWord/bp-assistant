@@ -490,8 +490,8 @@ function getRepoFilename(type, book) {
 // syncRepo — clone if needed, create fresh branch from origin/{baseBranch}
 // ---------------------------------------------------------------------------
 
-async function syncRepo(repoDir, repoName, branch, baseBranch = 'master') {
-  const repoUrl = `https://git.door43.org/${ORG}/${repoName}.git`;
+async function syncRepo(repoDir, repoName, branch, baseBranch = 'master', org = ORG) {
+  const repoUrl = `https://git.door43.org/${org}/${repoName}.git`;
   const { token } = getConfig();
   const onAuth = token ? makeOnAuth(token) : undefined;
 
@@ -528,10 +528,10 @@ async function syncRepo(repoDir, repoName, branch, baseBranch = 'master') {
     }
   }
 
-  // Verify remote URL points to unfoldingWord
+  // Verify remote URL points to Door43 (unfoldingWord or a GL org)
   const remoteUrl = await git.getConfig({ fs, dir: repoDir, path: 'remote.origin.url' });
   if (remoteUrl && !remoteUrl.includes('unfoldingWord') && !remoteUrl.includes('door43.org')) {
-    throw new Error(`Remote URL does not point to unfoldingWord: ${remoteUrl}`);
+    throw new Error(`Remote URL does not point to Door43: ${remoteUrl}`);
   }
   // Ensure remote URL is set correctly (clean URL — auth via onAuth callback, not embedded)
   await git.setConfig({ fs, dir: repoDir, path: 'remote.origin.url', value: repoUrl });
@@ -671,24 +671,24 @@ async function commitAndPush(repoDir, branch, filename, commitMsg, { force = fal
 // createAndMergePR — Gitea API: create PR, merge, delete branch
 // ---------------------------------------------------------------------------
 
-async function createAndMergePR(token, repo, branch, title, baseBranch = 'master') {
+async function createAndMergePR(token, repo, branch, title, baseBranch = 'master', org = ORG) {
   // Validate token
-  const tokenCheck = await apiRequest('GET', `/repos/${ORG}/${repo}`, token);
+  const tokenCheck = await apiRequest('GET', `/repos/${org}/${repo}`, token);
   if (tokenCheck.status === 401 || tokenCheck.status === 403) {
     return { success: false, details: `API token invalid/expired (HTTP ${tokenCheck.status})` };
   }
 
   // Verify branch exists on remote
-  const branchCheck = await apiRequest('GET', `/repos/${ORG}/${repo}/branches/${branch}`, token);
+  const branchCheck = await apiRequest('GET', `/repos/${org}/${repo}/branches/${branch}`, token);
   if (branchCheck.status === 404) {
-    return { success: false, details: `Branch '${branch}' does not exist on ${ORG}/${repo} — push may have failed` };
+    return { success: false, details: `Branch '${branch}' does not exist on ${org}/${repo} — push may have failed` };
   }
 
   // Create PR (handle 409 = already exists)
   let prNumber;
   const createResult = await withRetry(
     async () => {
-      const res = await apiRequest('POST', `/repos/${ORG}/${repo}/pulls`, token, {
+      const res = await apiRequest('POST', `/repos/${org}/${repo}/pulls`, token, {
         title,
         head: branch,
         base: baseBranch,
@@ -704,10 +704,10 @@ async function createAndMergePR(token, repo, branch, title, baseBranch = 'master
         const msg = typeof res.data === 'object' ? (res.data.message || '') : String(res.data);
         const m = msg.match(/issue_id:\s*(\d+)/);
         if (m) {
-          return { prNumber: parseInt(m[1], 10), url: `https://git.door43.org/${ORG}/${repo}/pulls/${m[1]}` };
+          return { prNumber: parseInt(m[1], 10), url: `https://git.door43.org/${org}/${repo}/pulls/${m[1]}` };
         }
         // If we can't parse the existing PR number, search for it
-        const searchRes = await apiRequest('GET', `/repos/${ORG}/${repo}/pulls?state=open&head=${ORG}:${branch}&limit=5`, token);
+        const searchRes = await apiRequest('GET', `/repos/${org}/${repo}/pulls?state=open&head=${org}:${branch}&limit=5`, token);
         if (searchRes.status === 200 && Array.isArray(searchRes.data) && searchRes.data.length > 0) {
           const pr = searchRes.data[0];
           return { prNumber: pr.number, url: pr.html_url || '' };
@@ -734,7 +734,7 @@ async function createAndMergePR(token, repo, branch, title, baseBranch = 'master
   // Merge PR
   await withRetry(
     async () => {
-      const res = await apiRequest('POST', `/repos/${ORG}/${repo}/pulls/${prNumber}/merge`, token, {
+      const res = await apiRequest('POST', `/repos/${org}/${repo}/pulls/${prNumber}/merge`, token, {
         Do: 'merge',
         merge_message_field: `Merge ${title}`,
       });
@@ -753,7 +753,7 @@ async function createAndMergePR(token, repo, branch, title, baseBranch = 'master
 
   // Delete branch (best-effort)
   try {
-    const delRes = await apiRequest('DELETE', `/repos/${ORG}/${repo}/branches/${branch}`, token);
+    const delRes = await apiRequest('DELETE', `/repos/${org}/${repo}/branches/${branch}`, token);
     if (delRes.status === 200 || delRes.status === 204 || delRes.status === 404) {
       console.log(`${LOG_PREFIX} Branch ${branch} deleted from ${repo}`);
     } else {
@@ -781,11 +781,18 @@ async function createAndMergePR(token, repo, branch, title, baseBranch = 'master
  * @param {string} opts.branch - staging branch name (e.g. 'AI-PSA-030')
  * @param {string} opts.source - relative path to source file (from CSKILLBP_DIR)
  * @param {string} [opts.verses] - verse range (e.g. '1-20'), auto-computed if omitted
+ * @param {string} [opts.org] - Door43 org override (default unfoldingWord); used by the translate pipeline for GL orgs
+ * @param {string} [opts.repoName] - repo name override (default REPO_MAP[type], e.g. 'ar_tn' instead of 'en_tn')
+ * @param {boolean} [opts.wholeFile] - source is the complete book file; copy it over the repo file instead of chapter-splicing
+ * @param {number} [opts.endChapter] - last chapter written (for wholeFile multi-chapter runs); defaults to chapter. The CI gate blocks on errors in [chapter, endChapter].
+ * @param {string} [opts.pipeline] - explicit X-AI-Pipeline commit trailer (notes|tqs|generate|translate); defaults from type
  * @returns {{ success: boolean, details: string, prNumber?: number }}
  */
 async function door43Push(opts) {
-  const { type, book, chapter, username, branch, source, verses, branchOnly } = opts;
-  const repo = REPO_MAP[type];
+  const { type, book, chapter, username, branch, source, verses, branchOnly, wholeFile } = opts;
+  const endChapter = opts.endChapter || chapter;
+  const org = opts.org || ORG;
+  const repo = opts.repoName || REPO_MAP[type];
   if (!repo) {
     return { success: false, details: `Unknown type: ${type}. Expected tn, tq, ult, or ust.` };
   }
@@ -799,15 +806,26 @@ async function door43Push(opts) {
   const repoFilename = getRepoFilename(type, book);
   const prTitle = `AI ${type.toUpperCase()} for ${book} ${chapter} [${username}]`;
 
-  console.log(`${LOG_PREFIX} Starting push: ${type.toUpperCase()} ${book} ${chapter} → ${repo}/${branch} (target: master)`);
+  console.log(`${LOG_PREFIX} Starting push: ${type.toUpperCase()} ${book} ${chapter} → ${org}/${repo}/${branch} (target: master)`);
   const startTime = Date.now();
 
   try {
     // Step 1: Sync repo (clone/fetch, create staging branch from master)
-    await syncRepo(repoDir, repo, branch);
+    await syncRepo(repoDir, repo, branch, 'master', org);
 
-    // Step 3: Insert content via Python script
-    insertContent({ type, book, chapter, source, verses, repoDir, repoFilename });
+    // Step 3: Insert content
+    if (wholeFile) {
+      // The caller assembled and validated the complete book file (translate
+      // pipeline: deterministic chapter merge + blocking checks upstream).
+      const sourcePath = path.resolve(CSKILLBP_DIR, source);
+      if (!fs.existsSync(sourcePath)) {
+        throw new Error(`Source file not found: ${source} (resolved: ${sourcePath})`);
+      }
+      console.log(`${LOG_PREFIX} Replacing whole file: ${source} → ${repoFilename}`);
+      fs.copyFileSync(sourcePath, path.join(repoDir, repoFilename));
+    } else {
+      insertContent({ type, book, chapter, source, verses, repoDir, repoFilename });
+    }
 
     // Step 3b: Door43 CI validation gate (TN only)
     // JS port of TN TSV validation checks (distroless-safe; no python dependency).
@@ -831,9 +849,18 @@ async function door43Push(opts) {
           message: f.message,
         }));
 
-        // Only block on errors in the chapter we're inserting
-        const chapterPrefix = String(chapter) + ':';
-        const ourErrors = allErrors.filter(e => e.ref && String(e.ref).startsWith(chapterPrefix));
+        // Block on errors in the chapter range we wrote. For chapter-splice
+        // that's the single `chapter`; for wholeFile multi-chapter runs it is
+        // [chapter, endChapter] — every chapter we freshly wrote, not just the
+        // first. Errors in untouched chapters stay non-blocking.
+        const refChapterNum = (ref) => {
+          const m = /^(\d+):/.exec(String(ref || ''));
+          return m ? Number(m[1]) : null;
+        };
+        const ourErrors = allErrors.filter(e => {
+          const ch = refChapterNum(e.ref);
+          return ch !== null && ch >= chapter && ch <= endChapter;
+        });
         const otherCount = allErrors.length - ourErrors.length;
 
         if (otherCount > 0) {
@@ -841,10 +868,11 @@ async function door43Push(opts) {
         }
 
         if (ourErrors.length > 0) {
+          const rangeLabel = chapter === endChapter ? `chapter ${chapter}` : `chapters ${chapter}-${endChapter}`;
           const errorSummary = ourErrors.slice(0, 10).map(e =>
             `  Line ${e.line || '?'}: [${e.ref}] ${e.message}`
           ).join('\n');
-          let details = `Door43 CI validation failed for ${repoFilename} — ${ourErrors.length} error(s) in chapter ${chapter}:\n${errorSummary}`;
+          let details = `Door43 CI validation failed for ${repoFilename} — ${ourErrors.length} error(s) in ${rangeLabel}:\n${errorSummary}`;
           if (ourErrors.length > 10) details += `\n  ... and ${ourErrors.length - 10} more`;
           await git.checkout({ fs, dir: repoDir, filepaths: [repoFilename], force: true });
           console.error(`${LOG_PREFIX} ${details}`);
@@ -881,7 +909,7 @@ async function door43Push(opts) {
     }
 
     // Step 4: Commit and push
-    const pipelineForTrailer = type === 'tn' ? 'notes' : type === 'tq' ? 'tqs' : 'generate';
+    const pipelineForTrailer = opts.pipeline || (type === 'tn' ? 'notes' : type === 'tq' ? 'tqs' : 'generate');
     const commitMsg = `${type.toUpperCase()}: ${book} ${chapter} [${username}]\n\nX-AI-Pipeline: bp-assistant/${pipelineForTrailer}`;
     const pushResult = await commitAndPush(repoDir, branch, repoFilename, commitMsg, { force: !!branchOnly });
 
@@ -897,12 +925,12 @@ async function door43Push(opts) {
     //         Skip when branchOnly=true — leave the branch open for review
     if (branchOnly) {
       const duration = ((Date.now() - startTime) / 1000).toFixed(1);
-      const branchUrl = `https://git.door43.org/${ORG}/${repo}/src/branch/${branch}`;
+      const branchUrl = `https://git.door43.org/${org}/${repo}/src/branch/${branch}`;
       console.log(`${LOG_PREFIX} branchOnly: skipping PR for ${type.toUpperCase()} ${book} ${chapter} — branch at ${branchUrl}`);
       return { success: true, branchOnly: true, branchUrl, duration };
     }
 
-    const prResult = await createAndMergePR(config.token, repo, branch, prTitle);
+    const prResult = await createAndMergePR(config.token, repo, branch, prTitle, 'master', org);
     const duration = ((Date.now() - startTime) / 1000).toFixed(1);
 
     if (prResult.success) {
