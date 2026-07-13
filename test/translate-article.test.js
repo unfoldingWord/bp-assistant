@@ -126,6 +126,16 @@ test('tW resolver: bare "god" probes categories and finds bible/kt/god.md', asyn
   assert.strictEqual(r.files[0].path, 'bible/kt/god.md');
 });
 
+test('resolver rejects path-traversal in article names and URLs', async () => {
+  const fetchImpl = fakeFetch({}, {});
+  await assert.rejects(
+    resolveArticle({ resourceType: 'tw', articleId: '../../etc/passwd', sourceRef: 'unfoldingWord/en_tw@master', fetchImpl }),
+    /unsafe article path/);
+  await assert.rejects(
+    resolveArticle({ resourceType: 'ta', articleUrl: 'https://git.door43.org/o/r/src/branch/master/../../../secret.md', fetchImpl }),
+    /unsafe article path/);
+});
+
 test('tW resolver: unknown term throws', async () => {
   const fetchImpl = fakeFetch({}, {});
   await assert.rejects(resolveArticle({ resourceType: 'tw', articleId: 'nope', sourceRef: 'unfoldingWord/en_tw@master', fetchImpl }), /not found/);

@@ -77,8 +77,26 @@ function parseDoor43Url(url) {
   return { org: m[1], repo: m[2], ref: decodeURIComponent(m[3]), path: m[4] };
 }
 
+/**
+ * Reject an in-repo path that could escape the staging dir or the cloned repo
+ * when written (path traversal). Article paths are derived from caller-supplied
+ * names/URLs and later fed to fs.copyFileSync(repoDir + path), so they must be
+ * plain relative POSIX paths — no absolute paths, no `.`/`..` segments.
+ */
+function assertSafeRepoPath(p) {
+  const norm = String(p).replace(/\\/g, '/');
+  if (!norm || norm.startsWith('/') || /^[A-Za-z]:/.test(norm)) {
+    throw new Error(`unsafe article path (absolute): ${p}`);
+  }
+  if (norm.split('/').some((seg) => seg === '..' || seg === '.')) {
+    throw new Error(`unsafe article path (traversal): ${p}`);
+  }
+  return norm;
+}
+
 /** Fetch several file bodies in parallel, preserving `paths` order; skip 404s. */
 async function fetchFiles(loc, paths, fetchImpl) {
+  paths.forEach(assertSafeRepoPath);
   const bodies = await Promise.all(paths.map((p) => fetchRaw(loc, p, fetchImpl)));
   const files = [];
   paths.forEach((p, i) => { if (bodies[i] != null) files.push({ path: p, sourceMarkdown: bodies[i] }); });
@@ -90,14 +108,14 @@ async function resolveTwByName(loc, name, fetchImpl) {
   let rel = String(name).trim().replace(/\.md$/i, '');
   rel = rel.replace(/^bible\//i, ''); // accept "bible/kt/god" too
   if (rel.includes('/')) {
-    const path = `bible/${rel}.md`;
+    const path = assertSafeRepoPath(`bible/${rel}.md`);
     const md = await fetchRaw(loc, path, fetchImpl);
     if (md == null) throw new Error(`tW article not found: ${path} in ${loc.org}/${loc.repo}@${loc.ref}`);
     return { articleId: rel, files: [{ path, sourceMarkdown: md }] };
   }
   // Bare term → probe the three categories.
   for (const cat of TW_CATEGORIES) {
-    const path = `bible/${cat}/${rel}.md`;
+    const path = assertSafeRepoPath(`bible/${cat}/${rel}.md`);
     const md = await fetchRaw(loc, path, fetchImpl);
     if (md != null) return { articleId: `${cat}/${rel}`, files: [{ path, sourceMarkdown: md }] };
   }
@@ -128,6 +146,7 @@ async function resolveByUrl(resourceType, url, fetchImpl) {
   const { org, repo, ref, path } = parseDoor43Url(url);
   const loc = { org, repo, ref };
   if (path.endsWith('.md')) {
+    assertSafeRepoPath(path);
     const md = await fetchRaw(loc, path, fetchImpl);
     if (md == null) throw new Error(`article file not found at URL: ${url}`);
     const articleId = deriveArticleId(resourceType, path);

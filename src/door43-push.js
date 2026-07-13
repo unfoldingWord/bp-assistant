@@ -791,7 +791,14 @@ async function pushArticleFiles(opts) {
       const inRepoPath = String(f.path).replace(/\\/g, '/').replace(/^\/+/, '');
       const sourcePath = path.resolve(CSKILLBP_DIR, f.source);
       if (!fs.existsSync(sourcePath)) throw new Error(`article source not found: ${f.source} (resolved: ${sourcePath})`);
-      const dest = path.join(repoDir, inRepoPath);
+      const dest = path.resolve(repoDir, inRepoPath);
+      // Containment guard: the resolved destination must stay inside the repo
+      // clone. Article paths originate from caller-supplied names/URLs; a `..`
+      // segment must never let a write escape the repo (defense in depth — the
+      // resolver already rejects traversal).
+      if (dest !== path.resolve(repoDir) && !dest.startsWith(path.resolve(repoDir) + path.sep)) {
+        throw new Error(`article path escapes repo dir: ${f.path}`);
+      }
       fs.mkdirSync(path.dirname(dest), { recursive: true });
       fs.copyFileSync(sourcePath, dest);
       filepaths.push(inRepoPath);
