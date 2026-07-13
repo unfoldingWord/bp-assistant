@@ -79,6 +79,19 @@ test('extra invented row is a blocking error', () => {
   assert.ok(res.errors.some((e) => e.check === 'extra-row' && e.rowId === 'zz99'));
 });
 
+test('extractRcLinks captures the full link body (not just the scheme)', () => {
+  const links = extractRcLinks('see [[rc://*/ta/man/translate/figs-metaphor]] and rc://*/tw/dict/bible/kt/god.');
+  assert.deepStrictEqual(links, ['rc://*/ta/man/translate/figs-metaphor', 'rc://*/tw/dict/bible/kt/god']);
+});
+
+test('CHANGED rc:// link target is a blocking error (not just add/remove)', () => {
+  const src = [{ Reference: '1:1', ID: 'ab12', Tags: '', SupportReference: 'rc://*/ta/man/translate/figs-metaphor', Quote: 'x', Occurrence: '1', Note: 'See [[rc://*/ta/man/translate/figs-metaphor]].' }];
+  const tgt = [{ ...src[0], Note: 'انظر [[rc://*/ta/man/translate/figs-simile]].' }]; // target slug corrupted
+  const res = runChecks(src, tgt);
+  assert.ok(res.errors.some((e) => e.check === 'rc-links' && e.rowId === 'ab12'),
+    'a changed rc:// target must be caught: ' + JSON.stringify(res.errors));
+});
+
 test('dropped rc:// link is a blocking error', () => {
   const src = loadOba().filter((r) => /rc:\/\//.test(r.Note)).slice(0, 3);
   assert.ok(src.length >= 1, 'fixture must contain rc:// notes');

@@ -134,14 +134,19 @@ async function loadContextPack(contextRef, { fetchImpl } = {}) {
     return fetchText(rawUrl(parsed, rel), fetchImpl);
   }
 
+  // Pack files are independent; fetch them (and the SHA) in one parallel wave
+  // rather than ~8 serial round-trips to DCS.
+  const entries = Object.entries(PACK_FILES);
   const raw = {};
   const missing = [];
-  for (const [key, rel] of Object.entries(PACK_FILES)) {
-    raw[key] = await readPackFile(rel);
+  const [contents, sha] = await Promise.all([
+    Promise.all(entries.map(([, rel]) => readPackFile(rel))),
+    isLocal ? Promise.resolve(null) : resolveContextSha(parsed, fetchImpl),
+  ]);
+  entries.forEach(([key, rel], i) => {
+    raw[key] = contents[i];
     if (raw[key] == null) missing.push(rel);
-  }
-
-  const sha = isLocal ? null : await resolveContextSha(parsed, fetchImpl);
+  });
 
   return {
     ref: String(contextRef),

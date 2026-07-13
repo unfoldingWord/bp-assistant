@@ -328,9 +328,11 @@ function parseBookChapters(captures) {
     if (c == null) continue;
     // Pre-normalize dashes to standard hyphens
     const s = String(c).trim().replace(/[-–—]/g, '-');
-    // Book name: all letters
+    // Book name: all letters. First all-letters token wins — later alpha
+    // tokens (e.g. the target-language code in "translate notes OBA 1 to ar")
+    // must not overwrite the book.
     if (/^[a-zA-Z]+$/.test(s)) {
-      book = normalizeBookName(s);
+      if (book === null) book = normalizeBookName(s);
     } else {
       // Verse-range format "CH:VS-VS"
       const verseRange = s.match(/^(\d+):(\d+)-(\d+)$/);
@@ -771,19 +773,19 @@ function getPipelineKeys(route, message) {
 
   let book, chapters;
 
-  const parsed = route._synthetic
-    ? getParsedRouteScope(route, [])
-    : getParsedRouteScope(route, matchRoute(message.content).captures);
+  const captures = route._synthetic ? [] : matchRoute(message.content).captures;
+  const parsed = getParsedRouteScope(route, captures);
   book = parsed.book;
   chapters = parsed.chapters;
 
   if (!book || !chapters.length) return null;
   // translate runs are additionally keyed by target language: ar OBA 1 and
-  // es OBA 1 are independent work and must not conflict. Zulip-triggered
-  // translate runs (no _translate) fall back to language-less keys, which
-  // over-blocks (safe) rather than under-blocks.
-  const langDim = route.type === 'translate' && route._translate?.targetLang
-    ? `-${route._translate.targetLang}` : '';
+  // es OBA 1 are independent work and must not conflict. The language comes
+  // from _translate (API/synthetic) or the trailing command capture (Zulip,
+  // e.g. "translate notes OBA 1 to ar" → captures[2] === "ar").
+  const lang = route._translate?.targetLang
+    || (route.type === 'translate' ? String(captures[2] || '').toLowerCase() : '');
+  const langDim = route.type === 'translate' && lang ? `-${lang}` : '';
   return chapters.map(ch => `${route.name}${langDim}-${book}-${ch}`);
 }
 
@@ -796,11 +798,18 @@ function firePipeline(route, message) {
   let activeCp = null;
 
   // Guard against duplicate retriggers for the same scope while resume/work is in progress.
-  if (route.type === 'sdk' || route.type === 'notes' || route.type === 'tqs') {
+  if (route.type === 'sdk' || route.type === 'notes' || route.type === 'tqs' || route.type === 'translate') {
     const captures = route._synthetic ? [] : matchRoute(message.content).captures;
-    const sessionKey = message.type === 'stream'
+    let sessionKey = message.type === 'stream'
       ? `stream-${message.display_recipient}-${message.subject}`
       : `dm-${message.sender_id}`;
+    // translate checkpoints are lang-suffixed (see translate-pipeline
+    // buildSessionKey); match that here or the guard never finds them. On a
+    // scope mismatch getActiveCheckpoint returns null (no false block).
+    if (route.type === 'translate') {
+      const lang = route._translate?.targetLang || String(captures[2] || '').toLowerCase();
+      if (lang) sessionKey = `${sessionKey}-${lang}`;
+    }
     activeCp = getActiveCheckpoint(route, sessionKey, captures);
     if (isStaleRunningCheckpoint(activeCp)) {
       // Convert interrupted 'running' to 'failed' so it becomes resumable

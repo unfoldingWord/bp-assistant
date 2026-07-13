@@ -407,6 +407,8 @@ async function translatePipeline(route, message) {
       org: params.targetOrg,
       repoName: params.tnRepo,
       wholeFile: true,
+      endChapter: params.endChapter,
+      pipeline: 'translate',
       branchOnly: params.branchOnly,
     });
     if (!pushResult.success) {

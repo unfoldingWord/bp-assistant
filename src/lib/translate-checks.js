@@ -10,10 +10,15 @@
 
 'use strict';
 
-const PASS_THROUGH_COLUMNS = ['Reference', 'ID', 'Tags', 'SupportReference', 'Quote', 'Occurrence'];
+const { TN_COLUMNS } = require('./tn-tsv');
 
-// rc:// URIs. Link targets are never localized; display text may be.
-const RC_LINK_RE = /rc:\/\/[^\s\])*]*/g;
+// Everything except the Note column must pass through byte-identical.
+const PASS_THROUGH_COLUMNS = TN_COLUMNS.filter((c) => c !== 'Note');
+
+// rc:// URIs. Link targets are never localized; display text may be. The body
+// of a link (`rc://*/ta/man/translate/figs-metaphor`) contains `*` and `/`, so
+// only stop at whitespace or the closing `]`/`)` of the surrounding markdown.
+const RC_LINK_RE = /rc:\/\/[^\s\])]+/g;
 
 function extractRcLinks(s) {
   return (s.match(RC_LINK_RE) || []).map((x) => x.replace(/[).,;]+$/, ''));
@@ -113,8 +118,7 @@ function checkRow(source, target) {
     //    (verse refs inside notes). Warning — legit renumbering exists (e.g.
     //    Eastern Arabic numerals), so never block on this.
     const srcNums = src.match(/\d+/g) || [];
-    const tgtJoined = tgt;
-    const missing = srcNums.filter((n) => !tgtJoined.includes(n));
+    const missing = srcNums.filter((n) => !tgt.includes(n));
     if (missing.length) {
       v.push(violation('number-integrity', 'warning', id,
         `digits from source missing in target: ${[...new Set(missing)].join(', ')}`));

@@ -784,10 +784,13 @@ async function createAndMergePR(token, repo, branch, title, baseBranch = 'master
  * @param {string} [opts.org] - Door43 org override (default unfoldingWord); used by the translate pipeline for GL orgs
  * @param {string} [opts.repoName] - repo name override (default REPO_MAP[type], e.g. 'ar_tn' instead of 'en_tn')
  * @param {boolean} [opts.wholeFile] - source is the complete book file; copy it over the repo file instead of chapter-splicing
+ * @param {number} [opts.endChapter] - last chapter written (for wholeFile multi-chapter runs); defaults to chapter. The CI gate blocks on errors in [chapter, endChapter].
+ * @param {string} [opts.pipeline] - explicit X-AI-Pipeline commit trailer (notes|tqs|generate|translate); defaults from type
  * @returns {{ success: boolean, details: string, prNumber?: number }}
  */
 async function door43Push(opts) {
   const { type, book, chapter, username, branch, source, verses, branchOnly, wholeFile } = opts;
+  const endChapter = opts.endChapter || chapter;
   const org = opts.org || ORG;
   const repo = opts.repoName || REPO_MAP[type];
   if (!repo) {
@@ -846,9 +849,18 @@ async function door43Push(opts) {
           message: f.message,
         }));
 
-        // Only block on errors in the chapter we're inserting
-        const chapterPrefix = String(chapter) + ':';
-        const ourErrors = allErrors.filter(e => e.ref && String(e.ref).startsWith(chapterPrefix));
+        // Block on errors in the chapter range we wrote. For chapter-splice
+        // that's the single `chapter`; for wholeFile multi-chapter runs it is
+        // [chapter, endChapter] — every chapter we freshly wrote, not just the
+        // first. Errors in untouched chapters stay non-blocking.
+        const refChapterNum = (ref) => {
+          const m = /^(\d+):/.exec(String(ref || ''));
+          return m ? Number(m[1]) : null;
+        };
+        const ourErrors = allErrors.filter(e => {
+          const ch = refChapterNum(e.ref);
+          return ch !== null && ch >= chapter && ch <= endChapter;
+        });
         const otherCount = allErrors.length - ourErrors.length;
 
         if (otherCount > 0) {
@@ -856,10 +868,11 @@ async function door43Push(opts) {
         }
 
         if (ourErrors.length > 0) {
+          const rangeLabel = chapter === endChapter ? `chapter ${chapter}` : `chapters ${chapter}-${endChapter}`;
           const errorSummary = ourErrors.slice(0, 10).map(e =>
             `  Line ${e.line || '?'}: [${e.ref}] ${e.message}`
           ).join('\n');
-          let details = `Door43 CI validation failed for ${repoFilename} — ${ourErrors.length} error(s) in chapter ${chapter}:\n${errorSummary}`;
+          let details = `Door43 CI validation failed for ${repoFilename} — ${ourErrors.length} error(s) in ${rangeLabel}:\n${errorSummary}`;
           if (ourErrors.length > 10) details += `\n  ... and ${ourErrors.length - 10} more`;
           await git.checkout({ fs, dir: repoDir, filepaths: [repoFilename], force: true });
           console.error(`${LOG_PREFIX} ${details}`);
@@ -896,7 +909,7 @@ async function door43Push(opts) {
     }
 
     // Step 4: Commit and push
-    const pipelineForTrailer = wholeFile ? 'translate' : type === 'tn' ? 'notes' : type === 'tq' ? 'tqs' : 'generate';
+    const pipelineForTrailer = opts.pipeline || (type === 'tn' ? 'notes' : type === 'tq' ? 'tqs' : 'generate');
     const commitMsg = `${type.toUpperCase()}: ${book} ${chapter} [${username}]\n\nX-AI-Pipeline: bp-assistant/${pipelineForTrailer}`;
     const pushResult = await commitAndPush(repoDir, branch, repoFilename, commitMsg, { force: !!branchOnly });
 

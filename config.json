@@ -79,7 +79,7 @@
     },
     {
       "name": "translate-notes",
-      "match": "/translate\\s+notes?\\s+(\\w{3})\\s+(\\d+(?:\\s*[-–—]\\s*\\d+)?)\\s+(?:to|into)\\s+([A-Za-z0-9-]+)/i",
+      "match": "/translate\\s+notes?\\s+(\\w{3})\\s+(\\d+(?::\\d+(?:\\s*[-–—]\\s*\\d+)?)?(?:\\s*[-–—]\\s*\\d+)?)\\s+(?:to|into)\\s+([A-Za-z0-9-]+)/i",
       "type": "translate",
       "reply": false,
       "confirmMessage": "I'll translate the notes for **$1 $2** into **$3**. Sound right? (yes/no)",
