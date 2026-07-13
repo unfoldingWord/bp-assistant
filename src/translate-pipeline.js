@@ -290,10 +290,15 @@ async function translateChapters(params, { workDir, onProgress, runBatchImpl, ma
   let existingBookText = existingTargetText ?? null;
   if (existingBookText == null) {
     const targetRepoRef = `${params.targetOrg}/${params.tnRepo}@master`;
-    try {
-      existingBookText = await core.fetchTnBook(targetRepoRef, params.book);
-    } catch (err) {
-      console.warn(`${LOG_PREFIX} could not fetch existing target book (${err.message}) — starting fresh`);
+    // fetchTnBook returns null ONLY for a genuine 404 (target book absent →
+    // legitimately start fresh) and THROWS on any other failure (network,
+    // 5xx). We must NOT swallow the throw: with wholeFile push, treating a
+    // transient fetch failure as "fresh" would overwrite a populated target
+    // book with just this run's slice, deleting untouched chapters. Let it
+    // propagate and fail the run instead.
+    existingBookText = await core.fetchTnBook(targetRepoRef, params.book);
+    if (existingBookText == null) {
+      progress(`no existing target book at ${targetRepoRef} — starting fresh`);
     }
   }
   const bookText = params.mergeMode === 'by-id'
@@ -383,8 +388,12 @@ async function translatePipeline(route, message) {
       },
     });
 
-    // Stage the whole-book file + report.
-    const outDir = path.join(CSKILLBP_DIR, 'output', `notes-${params.targetLang}`, params.book);
+    // Stage the whole-book file + report inside the per-run workDir (unique
+    // by runHash). Concurrent runs on the same book/lang must not share this
+    // path, or a co-running run could overwrite bookText between write and the
+    // push that reads it back. The remote filename is always tn_{BOOK}.tsv
+    // (door43Push derives it); the local staging name is free.
+    const outDir = path.join(workDir, 'out');
     fs.mkdirSync(outDir, { recursive: true });
     const bookFile = path.join(outDir, `tn_${params.book}.tsv`);
     const reportFile = path.join(outDir, `translate-report-${params.startChapter}-${params.endChapter}.json`);

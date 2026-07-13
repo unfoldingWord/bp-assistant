@@ -72,7 +72,29 @@ test('loadContextPack loads a local fixture pack', async () => {
 test('loadContextPack throws on a pack with no files present (misconfig guard)', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ctx-empty-'));
   try {
-    await assert.rejects(loadContextPack(dir), /no files/);
+    await assert.rejects(loadContextPack(dir), /no content files/);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('loadContextPack throws when only manifest.yaml is present (no content)', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ctx-manifest-'));
+  try {
+    fs.writeFileSync(path.join(dir, 'manifest.yaml'), 'language: xx\n');
+    await assert.rejects(loadContextPack(dir), /no content files/);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('loadContextPack succeeds when at least one content file is present', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ctx-partial-'));
+  try {
+    fs.writeFileSync(path.join(dir, 'instructions.md'), 'do the thing');
+    const pack = await loadContextPack(dir);
+    assert.strictEqual(pack.instructions, 'do the thing');
+    assert.ok(pack.missing.includes('manifest.yaml'));
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }

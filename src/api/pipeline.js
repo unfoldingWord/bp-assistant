@@ -142,6 +142,17 @@ const StartBodySchema = z.object({
         message: 'options.targetLang is required for pipelineType "translate"',
       });
     }
+    // Verse scoping is single-chapter only: the verse filter is applied to
+    // every chapter in the range, so a verse range across multiple chapters
+    // would translate those verse numbers in each chapter. Require one chapter.
+    const endCh = body.endChapter ?? body.startChapter;
+    if (body.verseStart != null && endCh !== body.startChapter) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['verseStart'],
+        message: 'verse scoping requires a single chapter (startChapter must equal endChapter)',
+      });
+    }
   } else {
     for (const k of ['targetLang', 'targetOrg', 'repoName', 'sourceRef', 'contextRef', 'branchOnly', 'delivery', 'direction', 'rowIds']) {
       if (o[k] !== undefined) {

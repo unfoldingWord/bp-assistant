@@ -79,6 +79,25 @@ test('delivery/direction accepted on translate only', () => {
   assert.ok(!bad.success);
 });
 
+test('verse range spanning multiple chapters is rejected', () => {
+  const res = StartBodySchema.safeParse({
+    ...base, startChapter: 1, endChapter: 2,
+    verseStart: 1, verseEnd: 3,
+    options: { targetLang: 'ar' },
+  });
+  assert.ok(!res.success);
+  assert.ok(res.error.issues.some((i) => /single chapter/.test(i.message)));
+});
+
+test('verse scope within a single chapter is accepted', () => {
+  const res = StartBodySchema.safeParse({
+    ...base, startChapter: 1, endChapter: 1,
+    verseStart: 5, verseEnd: 7,
+    options: { targetLang: 'ar' },
+  });
+  assert.ok(res.success, JSON.stringify(res.error?.issues));
+});
+
 test('sourceRef/contextRef must be org/repo@ref shaped', () => {
   const res = StartBodySchema.safeParse({
     ...base,
