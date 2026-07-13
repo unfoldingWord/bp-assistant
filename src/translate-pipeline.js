@@ -21,6 +21,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 const { sendMessage, sendDM } = require('./zulip-client');
 const { runClaude } = require('./claude-runner');
 const { CSKILLBP_DIR, getDoor43Username, emailToFallbackUsername } = require('./pipeline-utils');
@@ -358,8 +359,17 @@ async function translatePipeline(route, message) {
     : params.verseStart != null
       ? `-v${params.verseStart}-${params.verseEnd}`
       : '';
+  // Run identity beyond (lang, book, chapter range, selection): the source
+  // and context refs, model, and direction. Folding these into the workDir
+  // (batch-reuse cache) prevents a same-scope run with a NEW sourceRef/
+  // contextRef from silently reusing stale batch outputs; folding the same
+  // hash into the branch name keeps distinct logical runs from clobbering
+  // each other's pending review branch on push.
+  const runHash = crypto.createHash('sha1')
+    .update([params.sourceRef, params.contextRef, params.model, params.direction, selTag].join('|'))
+    .digest('hex').slice(0, 8);
   const workDir = path.join(CSKILLBP_DIR, 'tmp',
-    `translate-${params.targetLang}-${params.book}-${params.startChapter}-${params.endChapter}${selTag}`);
+    `translate-${params.targetLang}-${params.book}-${params.startChapter}-${params.endChapter}${selTag}-${runHash}`);
 
   console.log(`${LOG_PREFIX} Starting ${label} (org=${params.targetOrg}, source=${params.sourceRef}, context=${params.contextRef})`);
   setCheckpoint(ckptId, { state: 'running', current: { chapter: params.startChapter, skill: 'translate-tn', status: 'running' } });
@@ -396,7 +406,14 @@ async function translatePipeline(route, message) {
     // Push to the GL org. branchOnly by default: a human (or Bible Editor's
     // apply step) reviews before merge — translated drafts are not
     // auto-published the way English pipeline output is.
-    const branch = `AI-translate-${params.targetLang}-${params.book}-${String(params.startChapter).padStart(2, '0')}`;
+    // Branch identity includes the chapter range and runHash (selection +
+    // refs + model) so distinct logical runs never share — and thus never
+    // force-overwrite — the same pending review branch. A re-run of the same
+    // logical run reuses the branch (intended idempotent update).
+    const chapterTag = params.startChapter === params.endChapter
+      ? String(params.startChapter).padStart(2, '0')
+      : `${String(params.startChapter).padStart(2, '0')}-${String(params.endChapter).padStart(2, '0')}`;
+    const branch = `AI-translate-${params.targetLang}-${params.book}-${chapterTag}-${runHash}`;
     const pushResult = await door43Push({
       type: 'tn',
       book: params.book,
