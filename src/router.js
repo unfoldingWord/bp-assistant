@@ -10,6 +10,7 @@ const { getCheckpoint, setCheckpoint, clearCheckpoint, buildCheckpointKey } = re
 const { listCheckpoints } = require('./pipeline-checkpoints');
 const { resumeInsertion } = require('./insertion-resume');
 const { normalizeBookName, isValidBook } = require('./pipeline-utils');
+const { translateSessionSuffix } = require('./lib/translate-core');
 const { isTransientOutageError } = require('./claude-runner');
 const { publishAdminStatus } = require('./admin-status');
 const { handlePendingHumanDecisionConflictReply } = require('./issue-report-pipeline');
@@ -808,7 +809,7 @@ function firePipeline(route, message) {
     // scope mismatch getActiveCheckpoint returns null (no false block).
     if (route.type === 'translate') {
       const lang = route._translate?.targetLang || String(captures[2] || '').toLowerCase();
-      if (lang) sessionKey = `${sessionKey}-${lang}`;
+      sessionKey = `${sessionKey}${translateSessionSuffix(lang, route._translate?.rowIds)}`;
     }
     activeCp = getActiveCheckpoint(route, sessionKey, captures);
     if (isStaleRunningCheckpoint(activeCp)) {
@@ -1568,12 +1569,13 @@ function buildApiSyntheticMessage({ pipelineType, scope, username, options }) {
 
 function buildApiSessionKey(pipelineType, options) {
   const { stream, topic } = getApiControlThread();
-  // translate checkpoints carry the target language in the sessionKey so
-  // runs for different languages on the same scope never share a job/
-  // checkpoint (matches translate-pipeline.js buildSessionKey).
-  const langSuffix = pipelineType === 'translate' && options?.targetLang
-    ? `-${options.targetLang}` : '';
-  return `stream-${stream}-${topic}${langSuffix}`;
+  // translate checkpoints are suffixed by language + rowIds (matches
+  // translate-pipeline buildSessionKey via the shared translateSessionSuffix)
+  // so status polling resolves the right job and distinct rowIds runs on the
+  // same scope don't alias to one jobId/checkpoint.
+  const suffix = pipelineType === 'translate'
+    ? translateSessionSuffix(options?.targetLang, options?.rowIds) : '';
+  return `stream-${stream}-${topic}${suffix}`;
 }
 
 function buildApiJobId({ pipelineType, scope, options }) {

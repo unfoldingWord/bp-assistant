@@ -10,8 +10,28 @@
 
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 const { parseTnTsv, serializeTnTsv, refChapter, refVerseRange, sliceChapterRows } = require('./tn-tsv');
 const { runChecks } = require('./translate-checks');
+
+/**
+ * Session/job-key suffix that makes translate runs distinguishable by target
+ * language and (for individual-note runs) the exact row set. Used identically
+ * by the router (API jobId/checkpoint key) and the pipeline (checkpoint write)
+ * so a status poll finds the right job and distinct rowIds runs don't alias.
+ * rowIds are sorted so order doesn't change the key. (sourceRef/contextRef/
+ * model/direction are NOT folded in here — they are resolved from defaults
+ * downstream of the router, so hashing them here would desync the two sides;
+ * that divergence is a documented low-severity limitation, PLAN.md §5a.)
+ */
+function translateSessionSuffix(targetLang, rowIds) {
+  if (!targetLang) return '';
+  let s = `-${targetLang}`;
+  if (Array.isArray(rowIds) && rowIds.length) {
+    s += `-r${crypto.createHash('sha1').update(rowIds.slice().sort().join(',')).digest('hex').slice(0, 8)}`;
+  }
+  return s;
+}
 
 const DCS_BASE = 'https://git.door43.org';
 
@@ -291,6 +311,7 @@ function buildTranslateReport({ book, startChapter, endChapter, targetLang, sour
 }
 
 module.exports = {
+  translateSessionSuffix,
   fetchTnBook,
   buildBatches,
   renderBatchPack,

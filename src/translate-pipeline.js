@@ -148,13 +148,15 @@ function resolveParams(route, message) {
   };
 }
 
-function buildSessionKey(message, targetLang) {
+function buildSessionKey(message, params) {
   const base = message.type === 'stream'
     ? `stream-${message.display_recipient}-${message.subject}`
     : `dm-${message.sender_id}`;
-  // The language is part of the run's identity: ar OBA 1 and es OBA 1 are
-  // different work and must never share a checkpoint (see DECISION.md §dev-3).
-  return `${base}-${targetLang}`;
+  // Language (and, for individual-note runs, the row set) are part of the
+  // run's identity: ar OBA 1 and es OBA 1 — and two different rowIds runs on
+  // OBA 1 ar — must never share a checkpoint. Uses the same suffix helper as
+  // the router's jobId so an API status poll resolves this exact run.
+  return `${base}${core.translateSessionSuffix(params.targetLang, params.rowIds)}`;
 }
 
 /**
@@ -341,7 +343,7 @@ async function translateChapters(params, { workDir, onProgress, runBatchImpl, ma
 
 async function translatePipeline(route, message) {
   const params = resolveParams(route, message);
-  const sessionKey = buildSessionKey(message, params.targetLang);
+  const sessionKey = buildSessionKey(message, params);
   const scope = {
     book: params.book,
     startChapter: params.startChapter,
