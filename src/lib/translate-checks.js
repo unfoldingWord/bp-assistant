@@ -1,27 +1,48 @@
-// translate-checks.js — deterministic QA checks for translated tN rows.
+// translate-checks.js — deterministic QA checks for translated resources.
 //
-// Pure functions, no LLM, no I/O. Implements PIPELINE-SPEC.md §5 (blocking
-// subset + warnings), adapted where the spec met reality:
-// - Input is (sourceRows, targetRows) keyed by the ID column. Every check is
-//   per-row; runChecks also emits row-set-level violations (missing/extra IDs).
-// - severity 'error' → must block apply. severity 'warning' → surface, don't block.
+// Pure functions, no LLM, no I/O. Two check suites:
+//   runChecks(sourceRows, targetRows, opts)  — TSV resources (tN, tQ). Every
+//     pass-through column byte-identical; each translate column empty/identical/
+//     control-char/rc-link/markdown/number/whitespace checked. Column sets are
+//     PARAMETERS (default to tN) so the same suite serves any TSV resource.
+//   runArticleChecks(sourceMd, targetMd)     — article resources (tW, tA).
+//     Link multiset + heading parity + empty/identical over a whole markdown body.
 //
-// Check IDs are stable strings so callers can allowlist/deny specific checks.
+// severity 'error' → must block apply. severity 'warning' → surface, don't block.
+// Check IDs are stable strings; a `.column` field disambiguates multi-column
+// resources (tQ's Question vs Response) without changing the base IDs tN uses.
 
 'use strict';
 
-const { TN_COLUMNS } = require('./tn-tsv');
+const { TN_COLUMNS } = require('./resource-types');
 
-// Everything except the Note column must pass through byte-identical.
-const PASS_THROUGH_COLUMNS = TN_COLUMNS.filter((c) => c !== 'Note');
+// Default column sets preserve the original tN behavior for callers that don't
+// pass explicit sets (the existing translate-tn pipeline + its tests).
+const TN_PASS_THROUGH_COLUMNS = TN_COLUMNS.filter((c) => c !== 'Note');
+const TN_TRANSLATE_COLUMNS = ['Note'];
+// Back-compat export (was TN_COLUMNS.filter(...) in the tN-only version).
+const PASS_THROUGH_COLUMNS = TN_PASS_THROUGH_COLUMNS;
 
 // rc:// URIs. Link targets are never localized; display text may be. The body
 // of a link (`rc://*/ta/man/translate/figs-metaphor`) contains `*` and `/`, so
 // only stop at whitespace or the closing `]`/`)` of the surrounding markdown.
 const RC_LINK_RE = /rc:\/\/[^\s\])]+/g;
+// Markdown link targets: the (...) part of [text](target). Used by article
+// checks so relative links like (../kt/god.md) are preserved byte-for-byte.
+const MD_LINK_TARGET_RE = /\]\(([^)]+)\)/g;
+// Wiki-style [[...]] link contents (tW/tA cross-references).
+const WIKI_LINK_RE = /\[\[([^\]]+)\]\]/g;
 
 function extractRcLinks(s) {
-  return (s.match(RC_LINK_RE) || []).map((x) => x.replace(/[).,;]+$/, ''));
+  return (String(s).match(RC_LINK_RE) || []).map((x) => x.replace(/[).,;]+$/, ''));
+}
+
+function extractAll(re, s) {
+  const out = [];
+  let m;
+  re.lastIndex = 0;
+  while ((m = re.exec(String(s))) !== null) out.push(m[1]);
+  return out;
 }
 
 // Multiset compare of two string arrays.
@@ -37,108 +58,110 @@ function sameMultiset(a, b) {
   return true;
 }
 
-function violation(check, severity, rowId, message) {
-  return { check, severity, rowId, message };
-}
-
-/**
- * Per-row checks. source and target are parsed tN row objects sharing an ID.
- * Returns array of violations (possibly empty).
- */
-function checkRow(source, target) {
-  const v = [];
-  const id = source.ID;
-
-  // 1. Pass-through columns byte-identical (the Aquilla-corruption class).
-  for (const col of PASS_THROUGH_COLUMNS) {
-    if (source[col] !== target[col]) {
-      v.push(violation(`passthrough-${col.toLowerCase()}`, 'error', id,
-        `${col} modified: ${JSON.stringify(source[col])} → ${JSON.stringify(target[col])}`));
-    }
-  }
-
-  // 2. Occurrence parses as non-negative integer (defense in depth; if
-  //    pass-through held, this only fails when the source itself is corrupt).
-  if (!/^-?\d+$/.test(target.Occurrence) || Number(target.Occurrence) < -1) {
-    // -1 is legal in tN TSVs ("all occurrences"); anything below is not.
-    v.push(violation('occurrence-int', 'error', id,
-      `Occurrence not a valid integer: ${JSON.stringify(target.Occurrence)}`));
-  }
-
-  const src = source.Note ?? '';
-  const tgt = target.Note ?? '';
-
-  // 3. Empty translation.
-  if (src.trim() !== '' && tgt.trim() === '') {
-    v.push(violation('empty-translation', 'error', id, 'target Note empty while source non-empty'));
-  }
-
-  // 4. Untranslated pass-through (identical to source). Warning: legitimate
-  //    for notes that are pure rc:// link lists or names.
-  if (src.trim() !== '' && src === tgt) {
-    v.push(violation('identical-to-source', 'warning', id, 'target Note identical to source'));
-  }
-
-  // 5. Embedded real tab/newline would corrupt the TSV. (Parsed rows can
-  //    only carry these if constructed programmatically — still check.)
-  if (/[\t\n\r]/.test(tgt)) {
-    v.push(violation('embedded-control-char', 'error', id, 'target Note contains real tab/newline'));
-  }
-
-  // 6. rc:// links preserved verbatim (multiset).
-  const srcLinks = extractRcLinks(src);
-  const tgtLinks = extractRcLinks(tgt);
-  if (!sameMultiset(srcLinks, tgtLinks)) {
-    v.push(violation('rc-links', 'error', id,
-      `rc:// links differ: source has [${srcLinks.join(', ')}], target has [${tgtLinks.join(', ')}]`));
-  }
-
-  if (tgt.trim() !== '') {
-    // 7. Markdown structure parity: balanced ** in target; alternate-translation
-    //    bracket-construct count parity with source. Warning severity.
-    const boldCount = (tgt.match(/\*\*/g) || []).length;
-    if (boldCount % 2 !== 0) {
-      v.push(violation('markdown-bold-balance', 'warning', id, `unbalanced ** markers (${boldCount})`));
-    }
-    // en_tn alternate translations use [bracketed] segments after "Alternate
-    // translation:"; count parity of [ and ] within each note.
-    const srcAltOpens = (src.match(/\[/g) || []).length;
-    const srcAltCloses = (src.match(/\]/g) || []).length;
-    const tgtAltOpens = (tgt.match(/\[/g) || []).length;
-    const tgtAltCloses = (tgt.match(/\]/g) || []).length;
-    if (tgtAltOpens !== tgtAltCloses) {
-      v.push(violation('bracket-balance', 'warning', id,
-        `unpaired brackets in target ([=${tgtAltOpens}, ]=${tgtAltCloses})`));
-    } else if (srcAltOpens === srcAltCloses && srcAltOpens !== tgtAltOpens) {
-      v.push(violation('bracket-count-parity', 'warning', id,
-        `bracket construct count differs (source ${srcAltOpens}, target ${tgtAltOpens})`));
-    }
-
-    // 8. Number integrity: digit runs in source Note should appear in target
-    //    (verse refs inside notes). Warning — legit renumbering exists (e.g.
-    //    Eastern Arabic numerals), so never block on this.
-    const srcNums = src.match(/\d+/g) || [];
-    const missing = srcNums.filter((n) => !tgt.includes(n));
-    if (missing.length) {
-      v.push(violation('number-integrity', 'warning', id,
-        `digits from source missing in target: ${[...new Set(missing)].join(', ')}`));
-    }
-
-    // 9. Whitespace hygiene. Warning.
-    if (/^\s|\s$/.test(tgt) || /  /.test(tgt.replace(/\\n/g, ' '))) {
-      v.push(violation('whitespace', 'warning', id, 'leading/trailing/double spaces in target Note'));
-    }
-  }
-
+function violation(check, severity, rowId, message, column) {
+  const v = { check, severity, rowId, message };
+  if (column) v.column = column;
   return v;
 }
 
 /**
- * Whole-batch check. sourceRows/targetRows are parsed tN row arrays.
- * Returns { ok, errors, warnings, violations, perRow } where ok means
- * zero error-severity violations.
+ * Checks on one translated free-text column (tN Note, tQ Question/Response).
+ * `id` is the base check id family; when `multi` is true the column name is
+ * appended so violations across columns stay distinguishable.
  */
-function runChecks(sourceRows, targetRows) {
+function checkTextColumn(source, target, col, { rowId, multi }) {
+  const v = [];
+  const src = source[col] ?? '';
+  const tgt = target[col] ?? '';
+  const tag = (base) => (multi ? `${base}-${col.toLowerCase()}` : base);
+
+  // Empty translation.
+  if (src.trim() !== '' && tgt.trim() === '') {
+    v.push(violation(tag('empty-translation'), 'error', rowId, `target ${col} empty while source non-empty`, col));
+  }
+  // Untranslated pass-through (identical to source). Warning.
+  if (src.trim() !== '' && src === tgt) {
+    v.push(violation(tag('identical-to-source'), 'warning', rowId, `target ${col} identical to source`, col));
+  }
+  // Embedded real tab/newline would corrupt the TSV.
+  if (/[\t\n\r]/.test(tgt)) {
+    v.push(violation(tag('embedded-control-char'), 'error', rowId, `target ${col} contains real tab/newline`, col));
+  }
+  // rc:// links preserved verbatim (multiset).
+  if (!sameMultiset(extractRcLinks(src), extractRcLinks(tgt))) {
+    v.push(violation(tag('rc-links'), 'error', rowId,
+      `rc:// links differ in ${col}: source [${extractRcLinks(src).join(', ')}], target [${extractRcLinks(tgt).join(', ')}]`, col));
+  }
+
+  if (tgt.trim() !== '') {
+    // Markdown ** balance (warning).
+    const boldCount = (tgt.match(/\*\*/g) || []).length;
+    if (boldCount % 2 !== 0) {
+      v.push(violation(tag('markdown-bold-balance'), 'warning', rowId, `unbalanced ** markers (${boldCount}) in ${col}`, col));
+    }
+    // Bracket construct parity (warning).
+    const srcOpens = (src.match(/\[/g) || []).length;
+    const srcCloses = (src.match(/\]/g) || []).length;
+    const tgtOpens = (tgt.match(/\[/g) || []).length;
+    const tgtCloses = (tgt.match(/\]/g) || []).length;
+    if (tgtOpens !== tgtCloses) {
+      v.push(violation(tag('bracket-balance'), 'warning', rowId, `unpaired brackets in target ${col} ([=${tgtOpens}, ]=${tgtCloses})`, col));
+    } else if (srcOpens === srcCloses && srcOpens !== tgtOpens) {
+      v.push(violation(tag('bracket-count-parity'), 'warning', rowId, `bracket construct count differs in ${col} (source ${srcOpens}, target ${tgtOpens})`, col));
+    }
+    // Number integrity (warning — Eastern Arabic renumbering is legitimate).
+    const srcNums = src.match(/\d+/g) || [];
+    const missing = srcNums.filter((num) => !tgt.includes(num));
+    if (missing.length) {
+      v.push(violation(tag('number-integrity'), 'warning', rowId, `digits from source missing in target ${col}: ${[...new Set(missing)].join(', ')}`, col));
+    }
+    // Whitespace hygiene (warning).
+    if (/^\s|\s$/.test(tgt) || /  /.test(tgt.replace(/\\n/g, ' '))) {
+      v.push(violation(tag('whitespace'), 'warning', rowId, `leading/trailing/double spaces in target ${col}`, col));
+    }
+  }
+  return v;
+}
+
+/**
+ * Per-row checks for a TSV resource. `passThroughColumns` must be byte-identical
+ * source→target; `translateColumns` are localized and text-checked.
+ */
+function checkRow(source, target, { passThroughColumns, translateColumns }) {
+  const v = [];
+  const id = source.ID;
+  const multi = translateColumns.length > 1;
+
+  // 1. Pass-through columns byte-identical (the Aquilla-corruption class).
+  for (const col of passThroughColumns) {
+    if (source[col] !== target[col]) {
+      v.push(violation(`passthrough-${col.toLowerCase()}`, 'error', id,
+        `${col} modified: ${JSON.stringify(source[col])} → ${JSON.stringify(target[col])}`, col));
+    }
+  }
+
+  // 2. Occurrence parses as a valid integer (when the resource has that column).
+  if (Object.prototype.hasOwnProperty.call(target, 'Occurrence')) {
+    if (!/^-?\d+$/.test(target.Occurrence) || Number(target.Occurrence) < -1) {
+      v.push(violation('occurrence-int', 'error', id, `Occurrence not a valid integer: ${JSON.stringify(target.Occurrence)}`, 'Occurrence'));
+    }
+  }
+
+  // 3. Each translate column.
+  for (const col of translateColumns) {
+    v.push(...checkTextColumn(source, target, col, { rowId: id, multi }));
+  }
+  return v;
+}
+
+/**
+ * Whole-set TSV check. sourceRows/targetRows are parsed row arrays.
+ * opts.passThroughColumns / opts.translateColumns default to tN's sets.
+ * Returns { ok, errors, warnings, violations, perRow }.
+ */
+function runChecks(sourceRows, targetRows, opts = {}) {
+  const passThroughColumns = opts.passThroughColumns || TN_PASS_THROUGH_COLUMNS;
+  const translateColumns = opts.translateColumns || TN_TRANSLATE_COLUMNS;
   const violations = [];
 
   const srcById = new Map(sourceRows.map((r) => [r.ID, r]));
@@ -152,14 +175,10 @@ function runChecks(sourceRows, targetRows) {
 
   // Row-set parity: exactly one target row per source row, same IDs, same order.
   for (const s of sourceRows) {
-    if (!tgtById.has(s.ID)) {
-      violations.push(violation('missing-row', 'error', s.ID, 'source row has no target row'));
-    }
+    if (!tgtById.has(s.ID)) violations.push(violation('missing-row', 'error', s.ID, 'source row has no target row'));
   }
   for (const t of targetRows) {
-    if (!srcById.has(t.ID)) {
-      violations.push(violation('extra-row', 'error', t.ID, 'target row has no source row'));
-    }
+    if (!srcById.has(t.ID)) violations.push(violation('extra-row', 'error', t.ID, 'target row has no source row'));
   }
   if (sourceRows.length === targetRows.length
       && sourceRows.some((s, i) => targetRows[i] && targetRows[i].ID !== s.ID)) {
@@ -168,18 +187,77 @@ function runChecks(sourceRows, targetRows) {
 
   for (const s of sourceRows) {
     const t = tgtById.get(s.ID);
-    if (t) violations.push(...checkRow(s, t));
+    if (t) violations.push(...checkRow(s, t, { passThroughColumns, translateColumns }));
   }
 
+  return summarize(violations);
+}
+
+/**
+ * Whole-body checks for an article markdown file (tW term, tA article file).
+ * The article is multi-line, so real newlines are legal (no control-char check).
+ * Enforced: link multisets (rc://, markdown targets, [[wiki]]) preserved; body
+ * non-empty when source is. Warnings: identical-to-source, heading-count parity.
+ */
+function runArticleChecks(sourceMd, targetMd, { articleId, path: filePath } = {}) {
+  const violations = [];
+  const rowId = filePath || articleId || null;
+  const src = String(sourceMd ?? '');
+  const tgt = String(targetMd ?? '');
+
+  if (src.trim() !== '' && tgt.trim() === '') {
+    violations.push(violation('empty-translation', 'error', rowId, 'target article body empty while source non-empty'));
+  }
+  if (src.trim() !== '' && src === tgt) {
+    violations.push(violation('identical-to-source', 'warning', rowId, 'target article identical to source'));
+  }
+
+  // Links: three multisets, each compared independently.
+  if (!sameMultiset(extractRcLinks(src), extractRcLinks(tgt))) {
+    violations.push(violation('rc-links', 'error', rowId,
+      `rc:// links differ: source [${extractRcLinks(src).join(', ')}], target [${extractRcLinks(tgt).join(', ')}]`));
+  }
+  const srcMd = extractAll(MD_LINK_TARGET_RE, src);
+  const tgtMd = extractAll(MD_LINK_TARGET_RE, tgt);
+  if (!sameMultiset(srcMd, tgtMd)) {
+    violations.push(violation('markdown-links', 'error', rowId,
+      `markdown link targets differ: source [${srcMd.join(', ')}], target [${tgtMd.join(', ')}]`));
+  }
+  const srcWiki = extractAll(WIKI_LINK_RE, src);
+  const tgtWiki = extractAll(WIKI_LINK_RE, tgt);
+  if (!sameMultiset(srcWiki, tgtWiki)) {
+    violations.push(violation('wiki-links', 'error', rowId,
+      `[[wiki]] links differ: source [${srcWiki.join(', ')}], target [${tgtWiki.join(', ')}]`));
+  }
+
+  // Heading count parity (warning): lines beginning with one or more '#'.
+  const headings = (s) => (String(s).match(/^#{1,6}\s/gm) || []).length;
+  if (headings(src) !== headings(tgt)) {
+    violations.push(violation('heading-parity', 'warning', rowId,
+      `heading count differs (source ${headings(src)}, target ${headings(tgt)})`));
+  }
+
+  return summarize(violations);
+}
+
+function summarize(violations) {
   const errors = violations.filter((x) => x.severity === 'error');
   const warnings = violations.filter((x) => x.severity === 'warning');
   const perRow = new Map();
   for (const x of violations) {
-    const key = x.rowId ?? '(batch)';
+    const key = x.rowId ?? '(set)';
     if (!perRow.has(key)) perRow.set(key, []);
     perRow.get(key).push(x);
   }
   return { ok: errors.length === 0, errors, warnings, violations, perRow };
 }
 
-module.exports = { runChecks, checkRow, extractRcLinks, PASS_THROUGH_COLUMNS };
+module.exports = {
+  runChecks,
+  runArticleChecks,
+  checkRow,
+  extractRcLinks,
+  PASS_THROUGH_COLUMNS,
+  TN_PASS_THROUGH_COLUMNS,
+  TN_TRANSLATE_COLUMNS,
+};

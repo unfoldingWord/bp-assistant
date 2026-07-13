@@ -114,3 +114,59 @@ test('sourceRef/contextRef must be org/repo@ref shaped', () => {
   });
   assert.ok(!res.success);
 });
+
+// --- resourceType / articles ---
+
+test('tq resourceType still requires book + startChapter', () => {
+  const ok = StartBodySchema.safeParse({ ...base, options: { resourceType: 'tq', targetLang: 'ar' } });
+  assert.ok(ok.success, JSON.stringify(ok.error?.issues));
+  const noBook = StartBodySchema.safeParse({ pipelineType: 'translate', username: 'u', sessionKey: 's', options: { resourceType: 'tq', targetLang: 'ar' } });
+  assert.ok(!noBook.success);
+  assert.ok(noBook.error.issues.some((i) => i.path.join('.') === 'book'));
+});
+
+test('tw article accepts articleId without book/startChapter', () => {
+  const res = StartBodySchema.safeParse({
+    pipelineType: 'translate', username: 'u', sessionKey: 's',
+    options: { resourceType: 'tw', targetLang: 'ar', articleId: 'kt/god' },
+  });
+  assert.ok(res.success, JSON.stringify(res.error?.issues));
+});
+
+test('ta article accepts a Door43 articleUrl', () => {
+  const res = StartBodySchema.safeParse({
+    pipelineType: 'translate', username: 'u', sessionKey: 's',
+    options: { resourceType: 'ta', targetLang: 'ar', articleUrl: 'https://git.door43.org/unfoldingWord/en_ta/src/branch/master/translate/figs-aside' },
+  });
+  assert.ok(res.success, JSON.stringify(res.error?.issues));
+});
+
+test('article requires exactly one of articleId / articleUrl', () => {
+  const both = StartBodySchema.safeParse({
+    pipelineType: 'translate', username: 'u', sessionKey: 's',
+    options: { resourceType: 'tw', targetLang: 'ar', articleId: 'kt/god', articleUrl: 'https://git.door43.org/x/y/src/branch/master/a.md' },
+  });
+  assert.ok(!both.success);
+  const neither = StartBodySchema.safeParse({
+    pipelineType: 'translate', username: 'u', sessionKey: 's',
+    options: { resourceType: 'tw', targetLang: 'ar' },
+  });
+  assert.ok(!neither.success);
+});
+
+test('articleId rejected on tsv resources; rowIds rejected on articles', () => {
+  const idOnTn = StartBodySchema.safeParse({ ...base, options: { resourceType: 'tn', targetLang: 'ar', articleId: 'kt/god' } });
+  assert.ok(!idOnTn.success);
+  const rowsOnTw = StartBodySchema.safeParse({
+    pipelineType: 'translate', username: 'u', sessionKey: 's',
+    options: { resourceType: 'tw', targetLang: 'ar', articleId: 'kt/god', rowIds: ['xm1w'] },
+  });
+  assert.ok(!rowsOnTw.success);
+});
+
+test('sourceLang accepted on translate only', () => {
+  const ok = StartBodySchema.safeParse({ ...base, options: { targetLang: 'ka', sourceLang: 'ru', sourceRef: 'ru_gl/ru_tn@master' } });
+  assert.ok(ok.success, JSON.stringify(ok.error?.issues));
+  const bad = StartBodySchema.safeParse({ ...base, pipelineType: 'notes', options: { sourceLang: 'ru' } });
+  assert.ok(!bad.success);
+});

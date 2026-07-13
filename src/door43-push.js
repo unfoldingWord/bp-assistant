@@ -767,6 +767,89 @@ async function createAndMergePR(token, repo, branch, title, baseBranch = 'master
 }
 
 // ---------------------------------------------------------------------------
+// pushArticleFiles — translate pipeline article delivery (tW/tA)
+//
+// Writes a set of markdown files to explicit in-repo paths on a staging branch.
+// No book/chapter, no TSV CI gate (translate ran its own article checks). Only
+// exercised by the translate pipeline in branch delivery mode.
+// ---------------------------------------------------------------------------
+
+async function pushArticleFiles(opts) {
+  const { org, repo, branch, username, branchOnly, config } = opts;
+  const files = Array.isArray(opts.files) ? opts.files : [];
+  if (!files.length) return { success: false, details: 'article push: no files provided' };
+
+  const repoDir = path.join(config.reposPath, repo);
+  const startTime = Date.now();
+  console.log(`${LOG_PREFIX} Starting article push: ${files.length} file(s) → ${org}/${repo}/${branch}`);
+
+  try {
+    await syncRepo(repoDir, repo, branch, 'master', org);
+
+    const filepaths = [];
+    for (const f of files) {
+      const inRepoPath = String(f.path).replace(/\\/g, '/').replace(/^\/+/, '');
+      const sourcePath = path.resolve(CSKILLBP_DIR, f.source);
+      if (!fs.existsSync(sourcePath)) throw new Error(`article source not found: ${f.source} (resolved: ${sourcePath})`);
+      const dest = path.resolve(repoDir, inRepoPath);
+      // Containment guard: the resolved destination must stay inside the repo
+      // clone. Article paths originate from caller-supplied names/URLs; a `..`
+      // segment must never let a write escape the repo (defense in depth — the
+      // resolver already rejects traversal).
+      if (dest !== path.resolve(repoDir) && !dest.startsWith(path.resolve(repoDir) + path.sep)) {
+        throw new Error(`article path escapes repo dir: ${f.path}`);
+      }
+      fs.mkdirSync(path.dirname(dest), { recursive: true });
+      fs.copyFileSync(sourcePath, dest);
+      filepaths.push(inRepoPath);
+    }
+
+    const commitMsg = `translate ${files.length} article file(s) [${username}]\n\nX-AI-Pipeline: bp-assistant/${opts.pipeline || 'translate'}`;
+    const pushResult = await commitAndPushFiles(repoDir, branch, filepaths, commitMsg, { force: !!branchOnly });
+    if (pushResult.noChanges) {
+      return { success: true, noChanges: true, details: `No changes detected for ${files.length} article file(s) — content already matches master` };
+    }
+
+    if (branchOnly) {
+      const duration = ((Date.now() - startTime) / 1000).toFixed(1);
+      const branchUrl = `https://git.door43.org/${org}/${repo}/src/branch/${branch}`;
+      console.log(`${LOG_PREFIX} branchOnly: article branch at ${branchUrl}`);
+      return { success: true, branchOnly: true, branchUrl, duration };
+    }
+
+    const prTitle = `AI article translation (${files.length} file(s)) [${username}]`;
+    const prResult = await createAndMergePR(config.token, repo, branch, prTitle, 'master', org);
+    return { ...prResult, duration: ((Date.now() - startTime) / 1000).toFixed(1) };
+  } catch (err) {
+    const duration = ((Date.now() - startTime) / 1000).toFixed(1);
+    console.error(`${LOG_PREFIX} Article push failed after ${duration}s — ${err.message}`);
+    return { success: false, details: err.message, duration };
+  }
+}
+
+// commitAndPush variant that stages several files in one commit.
+async function commitAndPushFiles(repoDir, branch, filepaths, commitMsg, { force = false } = {}) {
+  const { token } = getConfig();
+  const onAuth = token ? makeOnAuth(token) : undefined;
+
+  for (const fp of filepaths) await git.add({ fs, dir: repoDir, filepath: fp });
+  const matrix = await git.statusMatrix({ fs, dir: repoDir, filepaths });
+  const hasChanges = matrix.some(([, head, , stage]) => head !== stage);
+  if (!hasChanges) {
+    console.warn(`${LOG_PREFIX} No changes to commit for ${filepaths.length} file(s) — content may already match master`);
+    return { noChanges: true };
+  }
+
+  await git.commit({ fs, dir: repoDir, message: commitMsg, author: { name: 'BW Bot', email: 'bot@unfoldingword.org' } });
+  await withRetry(
+    () => withTimeout(git.push({ fs, http: gitHttp, dir: repoDir, remote: 'origin', ref: branch, onAuth, force }), 60000, `push ${branch}`),
+    { maxAttempts: 3, baseDelayMs: 2000, label: `push ${branch}` },
+  );
+  console.log(`${LOG_PREFIX} Pushed ${branch} to origin (${filepaths.length} file(s))`);
+  return { noChanges: false };
+}
+
+// ---------------------------------------------------------------------------
 // door43Push — main entry point called by pipelines
 // ---------------------------------------------------------------------------
 
@@ -800,6 +883,13 @@ async function door43Push(opts) {
   const config = getConfig();
   if (!config.token) {
     return { success: false, details: 'No Door43 token found (DOOR43_TOKEN / GITEA_TOKEN not set)' };
+  }
+
+  // Article resources (tW/tA): the payload is a set of markdown files at
+  // explicit in-repo paths (no book/chapter, no BOOK_NUMBERS, no TSV CI gate).
+  // Handled entirely here and returned before the book-file machinery.
+  if (type === 'article') {
+    return pushArticleFiles({ ...opts, org, repo, config });
   }
 
   const repoDir = path.join(config.reposPath, repo);
@@ -890,7 +980,11 @@ async function door43Push(opts) {
     // to fresh unique IDs before the git commit.  This makes the pipeline
     // self-healing for the rare random collision rather than fatally aborting.
     // Only reverts and throws if the fix itself fails (ID space exhausted).
-    if (type === 'tq') {
+    //
+    // NOT for the translate pipeline: translate enforces byte-identical ID
+    // pass-through (translate-checks.js), so remapping IDs here would silently
+    // break that guarantee. Translate's own deterministic checks already ran.
+    if (type === 'tq' && opts.pipeline !== 'translate') {
       const bookFilePathFull = path.join(repoDir, repoFilename);
       try {
         const fixResult = fixTqWholeBookIds(bookFilePathFull);

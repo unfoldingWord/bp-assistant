@@ -1,21 +1,30 @@
-// translate-pipeline.js — translate published translationNotes into a
-// gateway language, chapter-batched, with deterministic pass-through checks.
+// translate-pipeline.js — translate published unfoldingWord resources into a
+// gateway language with deterministic pass-through / structure-preserving checks.
+//
+// Resource types (the `resourceType` dimension):
+//   tn  translationNotes    — 7-col TSV, translate Note                (family tsv)
+//   tq  translationQuestions— 7-col TSV, translate Question + Response (family tsv)
+//   tw  translationWords    — markdown article (one file per term)     (family article)
+//   ta  translationAcademy  — markdown article (folder of .md files)   (family article)
 //
 // Triggered by:
-//   Zulip:  "translate notes OBA 1 to ar"  /  "translate notes OBA 1-2 into es-419"
-//   HTTP:   POST /api/pipeline/start { pipelineType: "translate", ... options:
-//           { targetLang, targetOrg?, sourceRef?, contextRef? } }
+//   Zulip:  "translate notes OBA 1 to ar"     (tn)
+//           "translate questions OBA 1 to ar"  (tq)
+//           "translate word kt/god to ar"      (tw)
+//           "translate article figs-aside to ar" | "translate ta <door43-url> to ar" (ta)
+//   HTTP:   POST /api/pipeline/start { pipelineType: "translate", options: {
+//             resourceType, targetLang, articleId?|articleUrl?, sourceRef?, ... } }
 //
-// Contract (see bp-bot/translate-pipeline/PLAN.md and DECISION.md):
-// - Source rows come from the PUBLISHED source repo at a pinned ref
-//   (sourceRef, default unfoldingWord/en_tn@master) — not inline in the
-//   request (32 KB body cap; published repo is the source of truth).
-// - Output: exactly one target row per source row, same order;
-//   Reference/ID/Tags/SupportReference/Quote/Occurrence byte-identical;
-//   only Note is translated. Enforced by src/lib/translate-checks.js —
-//   error-severity violations BLOCK the push.
-// - Per-language context pack (templates/terminology/instructions/examples)
-//   pinned by contextRef and injected per batch (src/lib/context-pack.js).
+// Contract (bp-bot/translate-pipeline/PLAN.md, DECISION.md, CONTEXT-REPO-CONTRACT.md):
+// - Source is fetched from the PUBLISHED source repo at a pinned ref (sourceRef;
+//   default unfoldingWord/en_{resource}@master) — not inline (32 KB body cap).
+//   The source LANGUAGE is a first-class parameter (sourceLang/sourceLangName,
+//   default English) so a future Russian→Georgian run works unchanged.
+// - TSV: exactly one target row per source row, same order; pass-through columns
+//   byte-identical; only the translate columns localized. Article: whole-body
+//   translation preserving headings + every rc://, [[wiki]], and ](target) link.
+//   Enforced by src/lib/translate-checks.js — error-severity violations BLOCK.
+// - Per-language context pack pinned by contextRef, injected per batch/article.
 
 'use strict';
 
@@ -29,65 +38,80 @@ const { setCheckpoint } = require('./pipeline-checkpoints');
 const { publishAdminStatus } = require('./admin-status');
 const { door43Push } = require('./door43-push');
 const { loadContextPack } = require('./lib/context-pack');
-const { parseTnTsv } = require('./lib/tn-tsv');
-const { runChecks } = require('./lib/translate-checks');
+const { runChecks, runArticleChecks } = require('./lib/translate-checks');
+const { makeTsvCodec } = require('./lib/tsv-resource');
+const { getResourceType, ROUTE_RESOURCE_TYPE, articleScopeBook } = require('./lib/resource-types');
+const { resolveArticle } = require('./lib/article-resolver');
 const core = require('./lib/translate-core');
 
 const LOG_PREFIX = '[translate]';
 
-// Scope forms accepted after the book:
-//   "1"      whole chapter        "1-2"    chapter range
-//   "1:5"    one verse            "1:5-7"  verse range (single chapter)
-// Groups: 1=book 2=startChapter 3=verse-or-verse-range 4=endChapter 5=lang.
-const COMMAND_RE = /translate\s+notes?\s+(\w{3})\s+(\d+)(?::(\d+(?:\s*[-–—]\s*\d+)?))?(?:\s*[-–—]\s*(\d+))?\s+(?:to|into)\s+([A-Za-z0-9-]+)/i;
+// Zulip scope grammar for TSV resources (book + chapter/verse scope + lang).
+//   "1" chapter · "1-2" range · "1:5" verse · "1:5-7" verse range
+const TSV_COMMAND_RE = /translate\s+(?:notes?|questions?|tn|tq)\s+(\w{3})\s+(\d+)(?::(\d+(?:\s*[-–—]\s*\d+)?))?(?:\s*[-–—]\s*(\d+))?\s+(?:to|into)\s+([A-Za-z0-9-]+)/i;
+// Zulip grammar for article resources (article name or Door43 URL + lang).
+const ARTICLE_COMMAND_RE = /translate\s+(?:words?|tw|articles?|ta)\s+(\S+)\s+(?:to|into)\s+([A-Za-z0-9-]+)/i;
+// Kept for backward compatibility (tests import COMMAND_RE).
+const COMMAND_RE = TSV_COMMAND_RE;
 
-// Display names are a convenience only; any ISO 639-1/639-3 code (optionally
-// with a region/script subtag, e.g. es-419, zh-Hans) is accepted, and an
-// unknown code simply falls back to showing the code itself.
 const LANG_NAMES = {
   ar: 'Arabic', 'es-419': 'Latin American Spanish', es: 'Spanish', ru: 'Russian',
   fr: 'French', hi: 'Hindi', sw: 'Swahili', pt: 'Portuguese', id: 'Indonesian',
   zh: 'Chinese', vi: 'Vietnamese', bn: 'Bengali', ur: 'Urdu', fa: 'Persian',
   he: 'Hebrew', am: 'Amharic', ne: 'Nepali', my: 'Burmese', th: 'Thai',
+  en: 'English', ka: 'Georgian',
 };
-// Base subtags whose default script is right-to-left. Direction can always be
-// overridden per run via options.direction.
 const RTL_LANGS = new Set(['ar', 'he', 'fa', 'ur', 'ps', 'sd', 'ug', 'yi', 'dv', 'ckb', 'arc', 'syr', 'prs']);
 
-// Per-language Door43 target config (org/repo/source are NOT derivable from
-// the language code — verified 2026-07-10). Precedence: per-call options >
-// this file > {lang}_gl / {lang}_tn derivation. Missing file is non-fatal.
 let TRANSLATE_TARGETS = {};
 try {
   TRANSLATE_TARGETS = require('../config/translate-targets.json');
 } catch (err) {
-  console.warn(`${LOG_PREFIX} no translate-targets.json (${err.message}) — using {lang}_gl/{lang}_tn derivation`);
+  console.warn(`${LOG_PREFIX} no translate-targets.json (${err.message}) — using {lang}_{resource} derivation`);
 }
 
 const MAX_BATCH_ATTEMPTS = 2; // 1 draft + 1 repair pass
 
-function resolveParams(route, message) {
-  let book, startChapter, endChapter, targetLang;
-  let verseStart = null;
-  let verseEnd = null;
-  let rowIds = null;
-  const opts = route._translate || {};
+function langName(code) {
+  return LANG_NAMES[code] || code;
+}
 
-  if (route._synthetic && route._book) {
+function resolveParams(route, message) {
+  const opts = route._translate || {};
+  // resourceType: synthetic carries it explicitly; Zulip derives from route name.
+  const resourceType = opts.resourceType || ROUTE_RESOURCE_TYPE[route.name] || 'tn';
+  const rt = getResourceType(resourceType);
+  const family = rt.family;
+
+  let book = null; let startChapter = null; let endChapter = null;
+  let verseStart = null; let verseEnd = null; let rowIds = null;
+  let articleId = null; let articleUrl = null;
+  let zulipLang = null;
+
+  if (family === 'article') {
+    if (route._synthetic) {
+      articleId = opts.articleId || null;
+      articleUrl = opts.articleUrl || null;
+    } else {
+      const m = ARTICLE_COMMAND_RE.exec(String(message.content || ''));
+      if (!m) throw new Error('Could not parse translate command. Usage: translate word kt/god to ar  |  translate article figs-aside to ar');
+      const ref = m[1];
+      if (/^https?:\/\//i.test(ref)) articleUrl = ref; else articleId = ref;
+      zulipLang = m[2].toLowerCase();
+    }
+  } else if (route._synthetic && route._book) {
     book = route._book;
     startChapter = route._startChapter;
     endChapter = route._endChapter;
-    targetLang = opts.targetLang;
     verseStart = route._verseStart ?? null;
     verseEnd = route._verseEnd ?? null;
     rowIds = Array.isArray(opts.rowIds) && opts.rowIds.length ? opts.rowIds : null;
   } else {
-    const m = COMMAND_RE.exec(String(message.content || ''));
-    if (!m) throw new Error('Could not parse translate command. Usage: translate notes OBA 1 to ar (or OBA 1:5 / OBA 1:5-7 / OBA 1-2)');
+    const m = TSV_COMMAND_RE.exec(String(message.content || ''));
+    if (!m) throw new Error('Could not parse translate command. Usage: translate notes OBA 1 to ar (or OBA 1:5 / OBA 1:5-7 / OBA 1-2); questions likewise');
     book = m[1].toUpperCase();
     startChapter = parseInt(m[2], 10);
     if (m[3]) {
-      // verse or verse range within a single chapter
       const [vs, ve] = m[3].split(/[-–—]/).map((x) => parseInt(x.trim(), 10));
       endChapter = startChapter;
       verseStart = vs;
@@ -95,56 +119,60 @@ function resolveParams(route, message) {
     } else {
       endChapter = m[4] ? parseInt(m[4], 10) : startChapter;
     }
-    targetLang = m[5].toLowerCase();
+    zulipLang = m[5].toLowerCase();
   }
+
+  const targetLang = opts.targetLang || zulipLang;
   if (!targetLang) throw new Error('translate: targetLang is required');
 
-  // A subset selection (specific rows, or a verse narrower than the whole
-  // chapter) switches the merge from whole-range replacement to update-by-ID,
-  // so untouched notes in the same chapter are preserved in place.
   const hasSubset = (rowIds && rowIds.length > 0) || verseStart != null;
   const mergeMode = hasSubset ? 'by-id' : 'range';
-
-  // Delivery mode:
-  //   'path'   — stage the file locally and return its path; NO Door43 push.
-  //   'branch' — push to a review branch in the GL org (no auto-merge).
-  // Beta default is per-origin: Zulip-triggered runs return a path (fast
-  // loop, no GL repo required); API-triggered runs push to a branch (Bible
-  // Editor consumes the DCS branch). Either can be forced via options.delivery.
   const delivery = opts.delivery || (route._synthetic ? 'branch' : 'path');
 
-  // Resolve Door43 targets: per-call options > translate-targets.json > derivation.
-  // Org/repo naming is NOT derivable from the language code (ar → org BSOJ,
-  // not ar_gl — verified 2026-07-10), so the config file supplies the truth
-  // and the {lang}_gl / {lang}_tn derivation is only a last-resort fallback.
   const cfg = TRANSLATE_TARGETS[targetLang] || {};
   const targetOrg = opts.targetOrg || cfg.targetOrg || `${targetLang}_gl`;
-  const tnRepo = opts.repoName || cfg.tnRepo || `${targetLang}_tn`;
-  // An explicit contextRef (from the caller or the per-language config) must
-  // resolve to a populated pack — a missing one is a misconfig and errors. A
-  // DEFAULTED contextRef (no repo created yet) may be empty: early-beta runs
-  // proceed as a raw baseline with a loud warning.
+  const repoName = opts.repoName || cfg[rt.configRepoKey] || rt.defaultRepo(targetLang);
+  const sourceLang = opts.sourceLang || cfg.sourceLang || 'en';
+  // Per-resource source ref only (no generic cfg.sourceRef — it would bleed one
+  // resource's source, e.g. TN's translate-in-place BSOJ/ar_tn, into others).
+  const sourceRef = opts.sourceRef || cfg[`${resourceType}SourceRef`]
+    || `unfoldingWord/${rt.defaultSourceRepo}@master`;
+  const contextRef = opts.contextRef || cfg.contextRef || `${targetOrg}/translation-context@master`;
   const contextRefExplicit = !!(opts.contextRef || cfg.contextRef);
 
   return {
-    book: book.toUpperCase(),
+    resourceType,
+    family,
+    resourceLabel: rt.label,
+    skill: rt.skill,
+    pushType: rt.pushType,
+    passThroughColumns: rt.passThroughColumns,
+    translateColumns: rt.translateColumns,
+    // tsv scope
+    book: book ? book.toUpperCase() : null,
     startChapter,
     endChapter,
     verseStart,
     verseEnd,
     rowIds,
     mergeMode,
+    // article scope
+    articleId,
+    articleUrl,
+    // common
     targetLang,
-    targetLangName: LANG_NAMES[targetLang] || targetLang,
+    targetLangName: langName(targetLang),
+    sourceLang,
+    sourceLangName: langName(sourceLang),
     direction: opts.direction || cfg.direction || (RTL_LANGS.has(targetLang.split('-')[0]) ? 'rtl' : 'ltr'),
     targetOrg,
-    tnRepo,
-    sourceRef: opts.sourceRef || cfg.sourceRef || 'unfoldingWord/en_tn@master',
-    contextRef: opts.contextRef || cfg.contextRef || `${targetOrg}/translation-context@master`,
+    repoName,
+    sourceRef,
+    contextRef,
     contextRefExplicit,
     model: opts.model || route.model || 'opus',
     delivery,
-    branchOnly: opts.branchOnly !== false, // when delivery==='branch': land on a branch, no auto-merge (unlike en pipelines)
+    branchOnly: opts.branchOnly !== false,
   };
 }
 
@@ -152,31 +180,45 @@ function buildSessionKey(message, params) {
   const base = message.type === 'stream'
     ? `stream-${message.display_recipient}-${message.subject}`
     : `dm-${message.sender_id}`;
-  // Language (and, for individual-note runs, the row set) are part of the
-  // run's identity: ar OBA 1 and es OBA 1 — and two different rowIds runs on
-  // OBA 1 ar — must never share a checkpoint. Uses the same suffix helper as
-  // the router's jobId so an API status poll resolves this exact run.
-  return `${base}${core.translateSessionSuffix(params.targetLang, params.rowIds)}`;
+  return `${base}${core.translateSessionSuffix(params.targetLang, params.rowIds, {
+    resourceType: params.resourceType,
+    articleId: params.articleId || params.articleUrl || null,
+  })}`;
 }
 
-/**
- * Run the translate-tn skill over one batch, with one repair pass on
- * deterministic-check errors. Returns { rows, checks, attempts }.
- */
-async function runBatch({ files, batchRows, params, guard }) {
+// ---------------------------------------------------------------------------
+// TSV family (tn, tq)
+// ---------------------------------------------------------------------------
+
+function tsvResource(params) {
+  const rt = getResourceType(params.resourceType);
+  const codec = makeTsvCodec(rt.columns);
+  return {
+    resourceType: params.resourceType,
+    passThroughColumns: rt.passThroughColumns,
+    translateColumns: rt.translateColumns,
+    file: rt.file,
+    _codec: codec,
+    checkOpts: { passThroughColumns: rt.passThroughColumns, translateColumns: rt.translateColumns },
+    sizeOf: (r) => rt.translateColumns.reduce((s, c) => s + (r[c] || '').length, 0),
+  };
+}
+
+async function runTsvBatch({ files, batchRows, params, resource, guard }) {
   let lastChecks = null;
+  const cols = params.translateColumns.join(' + ');
 
   for (let attempt = 1; attempt <= MAX_BATCH_ATTEMPTS; attempt++) {
     const isRepair = attempt > 1 && lastChecks;
     const repairNote = isRepair
       ? `\n\nYour previous output FAILED deterministic validation. Violations:\n${
-        lastChecks.errors.map((e) => `- [${e.check}] row ${e.rowId}: ${e.message}`).join('\n')
-      }\nRewrite ${files.outputFile} fixing every violation. Do not change any column except Note.`
+        lastChecks.errors.map((e) => `- [${e.check}]${e.column ? ` (${e.column})` : ''} row ${e.rowId}: ${e.message}`).join('\n')
+      }\nRewrite ${files.outputFile} fixing every violation. Translate ONLY these columns: ${cols}. Every other column must be byte-identical to the source.`
       : '';
 
     const result = await runClaude({
       prompt: `${files.taskFile}${repairNote}`,
-      skill: 'translate-tn',
+      skill: params.skill,
       cwd: CSKILLBP_DIR,
       model: params.model,
       thinking: 'medium',
@@ -186,38 +228,38 @@ async function runBatch({ files, batchRows, params, guard }) {
       mcpToolSet: 'none',
       maxTurns: 50,
       timeoutMs: 20 * 60 * 1000,
-      label: `translate-${params.targetLang}-batch${files.nn}${isRepair ? '-repair' : ''}`,
+      label: `translate-${params.resourceType}-${params.targetLang}-batch${files.nn}${isRepair ? '-repair' : ''}`,
       guardrails: guard,
     });
     if (result?.subtype !== 'success') {
-      throw new Error(`translate-tn batch ${files.nn} failed: ${result?.error || result?.subtype || 'unknown'}`);
+      throw new Error(`${params.skill} batch ${files.nn} failed: ${result?.error || result?.subtype || 'unknown'}`);
     }
 
-    const { rows, checks } = core.readBatchOutput(files.outputFile, batchRows);
+    const { rows, checks } = core.readBatchOutput(files.outputFile, batchRows, {
+      parse: resource._codec.parse, checkOpts: resource.checkOpts,
+    });
     if (checks.ok) return { rows, checks, attempts: attempt };
     lastChecks = checks;
     console.warn(`${LOG_PREFIX} batch ${files.nn} attempt ${attempt}: ${checks.errors.length} blocking violation(s)`
       + (attempt < MAX_BATCH_ATTEMPTS ? ' — running repair pass' : ''));
   }
-
   const summary = lastChecks.errors.slice(0, 5).map((e) => `[${e.check}] ${e.rowId}: ${e.message}`).join('; ');
   throw new Error(`batch ${files.nn} still failing deterministic checks after repair pass: ${summary}`);
 }
 
 /**
- * Core run, independent of Zulip/checkpoint plumbing so the dry-run script
- * can drive it. Returns { targetRows, checks, report, bookText }.
- * opts.runBatchImpl allows tests to stub the LLM step.
+ * Core TSV run, independent of Zulip/checkpoint plumbing (dry-run driveable).
+ * Returns { sourceRows, targetRows, checks, report, bookText, existingBookText }.
  */
 async function translateChapters(params, { workDir, onProgress, runBatchImpl, maxRows, existingTargetText } = {}) {
   const progress = onProgress || (() => {});
+  const resource = tsvResource(params);
 
-  // 1. Source rows at the pinned ref, sliced to the chapter range then
-  //    optionally narrowed to a subset (specific rowIds and/or a verse range)
-  //    for individual-note / single-verse translation.
-  const sourceText = await core.fetchTnBook(params.sourceRef, params.book);
-  if (!sourceText) throw new Error(`source not found: ${params.sourceRef} tn_${params.book}.tsv`);
-  const allRows = parseTnTsv(sourceText);
+  // 1. Source rows at the pinned ref, sliced to the chapter range then optionally
+  //    narrowed to a subset (rowIds and/or verse range).
+  const sourceText = await core.fetchResourceFile(params.sourceRef, resource.file(params.book));
+  if (!sourceText) throw new Error(`source not found: ${params.sourceRef} ${resource.file(params.book)}`);
+  const allRows = resource._codec.parse(sourceText);
   let rows = core.sliceChapterRows(allRows, params.startChapter, params.endChapter);
   rows = core.selectRows(rows, { rowIds: params.rowIds, verseStart: params.verseStart, verseEnd: params.verseEnd });
   if (!rows.length) {
@@ -226,26 +268,22 @@ async function translateChapters(params, { workDir, onProgress, runBatchImpl, ma
         : `${params.startChapter}-${params.endChapter}`;
     throw new Error(`no source rows for ${params.book} ${sel}`);
   }
-  if (maxRows && rows.length > maxRows) rows = rows.slice(0, maxRows); // dry-run trimming only
+  if (maxRows && rows.length > maxRows) rows = rows.slice(0, maxRows);
   progress(`source: ${rows.length} row(s) from ${params.sourceRef}${params.mergeMode === 'by-id' ? ' (by-id subset)' : ''}`);
 
-  // 2. Context pack at the pinned ref. An explicit ref must be populated; a
-  //    defaulted ref (context repo not created yet) may be empty → raw baseline.
+  // 2. Context pack.
   const pack = await loadContextPack(params.contextRef, { allowEmpty: !params.contextRefExplicit });
   if (!pack.hasContent) {
-    progress(`WARNING: no context pack at ${params.contextRef} (repo absent/empty) — `
-      + 'translating as a RAW BASELINE with no templates/terminology/examples. '
-      + 'Create + populate the translation-context repo, or pass a contextRef, for assisted output.');
+    progress(`WARNING: no context pack at ${params.contextRef} (repo absent/empty) — translating as a RAW BASELINE.`);
   } else {
     progress(`context pack: ${params.contextRef}${pack.sha ? ` @ ${pack.sha.slice(0, 10)}` : ''}`
-      + ` — ${pack.templates.size} templates, ${pack.terms.length} terms, ${pack.examples.length} examples`
-      + (pack.missing.length ? ` (missing: ${pack.missing.join(', ')})` : ''));
+      + ` — ${pack.templates.size} templates, ${pack.terms.length} terms, ${pack.examples.length} examples`);
   }
 
-  // 3. Batch → translate → validate (+1 repair pass) per batch.
+  // 3. Batch → translate → validate (+1 repair) per batch.
   fs.mkdirSync(workDir, { recursive: true });
-  const batches = core.buildBatches(rows);
-  progress(`translating in ${batches.length} batch(es)`);
+  const batches = core.buildBatches(rows, { sizeOf: resource.sizeOf });
+  progress(`translating ${params.resourceType} in ${batches.length} batch(es)`);
 
   const batchMeta = [];
   const targetRows = [];
@@ -257,108 +295,203 @@ async function translateChapters(params, { workDir, onProgress, runBatchImpl, ma
       packMarkdown: rendered.markdown,
       targetLang: params.targetLang,
       targetLangName: params.targetLangName,
+      sourceLangName: params.sourceLangName,
       direction: params.direction,
       book: params.book,
+      resource,
     });
-    // Resume support: a batch whose output already exists and passes checks
-    // (from an interrupted earlier run over the same workDir) is reused
-    // instead of re-translated. Batch files are deterministic for a given
-    // (sourceRef, contextRef, scope), so reuse is safe.
     let outRows = null;
     let attempts = 0;
     if (fs.existsSync(files.outputFile)) {
       try {
-        const prev = core.readBatchOutput(files.outputFile, batchRows);
-        if (prev.checks.ok) {
-          outRows = prev.rows;
-          progress(`batch ${files.nn} reused from previous run (checks ok)`);
-        }
-      } catch { /* unreadable partial output — retranslate */ }
+        const prev = core.readBatchOutput(files.outputFile, batchRows, { parse: resource._codec.parse, checkOpts: resource.checkOpts });
+        if (prev.checks.ok) { outRows = prev.rows; progress(`batch ${files.nn} reused from previous run (checks ok)`); }
+      } catch { /* retranslate */ }
     }
     if (!outRows) {
-      const impl = runBatchImpl || runBatch;
-      ({ rows: outRows, attempts } = await impl({ files, batchRows, params }));
+      const impl = runBatchImpl || runTsvBatch;
+      ({ rows: outRows, attempts } = await impl({ files, batchRows, params, resource }));
     }
     targetRows.push(...outRows);
-    batchMeta.push({
-      nn: files.nn,
-      rowCount: batchRows.length,
-      attempts,
-      templateFallbacks: rendered.templateFallbacks,
-      slugs: rendered.slugs,
-    });
+    batchMeta.push({ nn: files.nn, rowCount: batchRows.length, attempts, templateFallbacks: rendered.templateFallbacks, slugs: rendered.slugs });
     progress(`batch ${files.nn}/${String(batches.length).padStart(2, '0')} done (${batchRows.length} rows, ${attempts} attempt(s))`);
   }
 
-  // 4. Whole-range validation (belt over the per-batch suspenders).
-  const checks = runChecks(rows, targetRows);
+  // 4. Whole-range validation.
+  const checks = runChecks(rows, targetRows, resource.checkOpts);
   if (!checks.ok) {
     const summary = checks.errors.slice(0, 5).map((e) => `[${e.check}] ${e.rowId}: ${e.message}`).join('; ');
     throw new Error(`whole-range deterministic checks failed: ${summary}`);
   }
 
   // 5. Merge into the whole-book target file.
-  //    - range mode: replace the whole chapter range (default, whole-chapter).
-  //    - by-id mode: update only the selected rows in the existing target,
-  //      leaving all other notes in place (individual-note / single-verse).
-  //    existingTargetText (tests/dry-run) short-circuits the DCS fetch.
   let existingBookText = existingTargetText ?? null;
   if (existingBookText == null) {
-    const targetRepoRef = `${params.targetOrg}/${params.tnRepo}@master`;
-    // fetchTnBook returns null ONLY for a genuine 404 (target book absent →
-    // legitimately start fresh) and THROWS on any other failure (network,
-    // 5xx). We must NOT swallow the throw: with wholeFile push, treating a
-    // transient fetch failure as "fresh" would overwrite a populated target
-    // book with just this run's slice, deleting untouched chapters. Let it
-    // propagate and fail the run instead.
-    existingBookText = await core.fetchTnBook(targetRepoRef, params.book);
-    if (existingBookText == null) {
-      progress(`no existing target book at ${targetRepoRef} — starting fresh`);
-    }
+    const targetRepoRef = `${params.targetOrg}/${params.repoName}@master`;
+    existingBookText = await core.fetchResourceFile(targetRepoRef, resource.file(params.book));
+    if (existingBookText == null) progress(`no existing target book at ${targetRepoRef} — starting fresh`);
   }
   const bookText = params.mergeMode === 'by-id'
-    ? core.updateRowsById(existingBookText, targetRows)
-    : core.mergeChapterIntoBook(existingBookText, targetRows, params);
+    ? core.updateRowsById(existingBookText, targetRows, { parse: resource._codec.parse, serialize: resource._codec.serialize })
+    : core.mergeChapterIntoBook(existingBookText, targetRows, { ...params, parse: resource._codec.parse, serialize: resource._codec.serialize });
 
   const report = core.buildTranslateReport({
-    book: params.book,
-    startChapter: params.startChapter,
-    endChapter: params.endChapter,
-    targetLang: params.targetLang,
-    sourceRef: params.sourceRef,
-    contextRef: params.contextRef,
-    contextSha: pack.sha,
-    batches: batchMeta,
-    checks,
-    selection: {
-      mergeMode: params.mergeMode,
-      verseStart: params.verseStart ?? null,
-      verseEnd: params.verseEnd ?? null,
-      rowIds: params.rowIds ?? null,
-    },
+    resourceType: params.resourceType,
+    book: params.book, startChapter: params.startChapter, endChapter: params.endChapter,
+    targetLang: params.targetLang, sourceLang: params.sourceLang,
+    sourceRef: params.sourceRef, contextRef: params.contextRef, contextSha: pack.sha,
+    batches: batchMeta, checks,
+    selection: { mergeMode: params.mergeMode, verseStart: params.verseStart ?? null, verseEnd: params.verseEnd ?? null, rowIds: params.rowIds ?? null },
   });
 
   return { sourceRows: rows, targetRows, checks, report, bookText, existingBookText };
 }
 
+// ---------------------------------------------------------------------------
+// Article family (tw, ta)
+// ---------------------------------------------------------------------------
+
+async function runArticleFile({ files, sourceMarkdown, params, guard }) {
+  let lastChecks = null;
+  for (let attempt = 1; attempt <= MAX_BATCH_ATTEMPTS; attempt++) {
+    const isRepair = attempt > 1 && lastChecks;
+    const repairNote = isRepair
+      ? `\n\nYour previous output FAILED deterministic validation. Violations:\n${
+        lastChecks.errors.map((e) => `- [${e.check}]: ${e.message}`).join('\n')
+      }\nRewrite ${files.outputFile} fixing every violation. Preserve every rc://, [[wiki]], and ](link) target byte-for-byte and keep the heading structure.`
+      : '';
+    const result = await runClaude({
+      prompt: `${files.taskFile}${repairNote}`,
+      skill: params.skill,
+      cwd: CSKILLBP_DIR,
+      model: params.model,
+      thinking: 'medium',
+      tools: ['Read', 'Write'],
+      enableBash: false,
+      disableLocalSettings: true,
+      mcpToolSet: 'none',
+      maxTurns: 50,
+      timeoutMs: 20 * 60 * 1000,
+      label: `translate-${params.resourceType}-${params.targetLang}-${files.nn}${isRepair ? '-repair' : ''}`,
+      guardrails: guard,
+    });
+    if (result?.subtype !== 'success') {
+      throw new Error(`${params.skill} file ${files.nn} failed: ${result?.error || result?.subtype || 'unknown'}`);
+    }
+    const { markdown, checks } = core.readArticleOutput(files.outputFile, sourceMarkdown, { articleId: params.articleId, path: files.path });
+    if (checks.ok) return { markdown, checks, attempts: attempt };
+    lastChecks = checks;
+    console.warn(`${LOG_PREFIX} ${files.nn} attempt ${attempt}: ${checks.errors.length} blocking violation(s)`
+      + (attempt < MAX_BATCH_ATTEMPTS ? ' — running repair pass' : ''));
+  }
+  const summary = lastChecks.errors.slice(0, 5).map((e) => `[${e.check}]: ${e.message}`).join('; ');
+  throw new Error(`article file ${files.nn} still failing checks after repair pass: ${summary}`);
+}
+
+/**
+ * Core article run (dry-run driveable). Returns
+ * { articleId, files: [{path, markdown, checks}], report, allChecks }.
+ * opts.resolveImpl / opts.runFileImpl let tests stub network + LLM.
+ */
+async function translateArticles(params, { workDir, onProgress, resolveImpl, runFileImpl, maxFiles } = {}) {
+  const progress = onProgress || (() => {});
+
+  // 1. Resolve the article to its concrete files.
+  const resolved = await (resolveImpl || resolveArticle)({
+    resourceType: params.resourceType,
+    articleId: params.articleId,
+    articleUrl: params.articleUrl,
+    sourceRef: params.sourceRef,
+  });
+  let sourceFiles = resolved.files;
+  if (maxFiles && sourceFiles.length > maxFiles) sourceFiles = sourceFiles.slice(0, maxFiles);
+  progress(`article ${resolved.articleId}: ${sourceFiles.length} file(s) from ${params.sourceRef}`);
+
+  // 2. Context pack.
+  const pack = await loadContextPack(params.contextRef, { allowEmpty: !params.contextRefExplicit });
+  if (!pack.hasContent) progress(`WARNING: no context pack at ${params.contextRef} — RAW BASELINE.`);
+  else progress(`context pack: ${params.contextRef}${pack.sha ? ` @ ${pack.sha.slice(0, 10)}` : ''}`);
+
+  // 3. Translate each file (per-file checks + 1 repair pass).
+  fs.mkdirSync(workDir, { recursive: true });
+  // resolved.articleId (the canonical path-keyed id) must win over params.articleId
+  // (null for URL-triggered runs) — spread params FIRST, then override.
+  const rendered = core.renderArticlePack({ ...params, pack, articleId: resolved.articleId });
+  const outFiles = [];
+  const fileMeta = [];
+  for (let i = 0; i < sourceFiles.length; i++) {
+    const { path: filePath, sourceMarkdown } = sourceFiles[i];
+    const files = core.writeArticleFiles(workDir, i, {
+      sourceMarkdown,
+      packMarkdown: rendered.markdown,
+      articleId: resolved.articleId,
+      filePath,
+      targetLang: params.targetLang,
+      targetLangName: params.targetLangName,
+      sourceLangName: params.sourceLangName,
+      direction: params.direction,
+    });
+    files.path = filePath;
+    let markdown = null; let checks = null; let attempts = 0;
+    if (fs.existsSync(files.outputFile)) {
+      try {
+        const prev = core.readArticleOutput(files.outputFile, sourceMarkdown, { articleId: resolved.articleId, path: filePath });
+        if (prev.checks.ok) { markdown = prev.markdown; checks = prev.checks; progress(`${files.nn} (${filePath}) reused from previous run`); }
+      } catch { /* retranslate */ }
+    }
+    if (markdown == null) {
+      const impl = runFileImpl || runArticleFile;
+      ({ markdown, checks, attempts } = await impl({ files, sourceMarkdown, params }));
+    }
+    outFiles.push({ path: filePath, markdown, checks });
+    fileMeta.push({ nn: files.nn, path: filePath, attempts, rowCount: 1, templateFallbacks: rendered.templateFallbacks, slugs: rendered.slug ? [rendered.slug] : [] });
+    progress(`file ${files.nn}/${String(sourceFiles.length).padStart(2, '0')} done (${filePath}, ${attempts} attempt(s))`);
+  }
+
+  // 4. Aggregate checks (per-file already enforced; this rolls warnings up).
+  const allViol = outFiles.flatMap((f) => f.checks.violations);
+  const allChecks = {
+    ok: allViol.every((v) => v.severity !== 'error'),
+    errors: allViol.filter((v) => v.severity === 'error'),
+    warnings: allViol.filter((v) => v.severity === 'warning'),
+    violations: allViol,
+  };
+  if (!allChecks.ok) throw new Error(`article checks failed: ${allChecks.errors.slice(0, 5).map((e) => e.message).join('; ')}`);
+
+  const report = core.buildTranslateReport({
+    resourceType: params.resourceType,
+    articleId: resolved.articleId, files: outFiles.map((f) => f.path),
+    targetLang: params.targetLang, sourceLang: params.sourceLang,
+    sourceRef: params.sourceRef, contextRef: params.contextRef, contextSha: pack.sha,
+    batches: fileMeta, checks: allChecks,
+    selection: { mergeMode: 'article', verseStart: null, verseEnd: null, rowIds: null },
+  });
+
+  return { articleId: resolved.articleId, files: outFiles, report, allChecks };
+}
+
+// ---------------------------------------------------------------------------
+// Pipeline entrypoint (Zulip + API)
+// ---------------------------------------------------------------------------
+
 async function translatePipeline(route, message) {
   const params = resolveParams(route, message);
+  const isArticle = params.family === 'article';
   const sessionKey = buildSessionKey(message, params);
-  const scope = {
-    book: params.book,
-    startChapter: params.startChapter,
-    endChapter: params.endChapter,
-    verseStart: params.verseStart,
-    verseEnd: params.verseEnd,
-  };
+
+  const scope = isArticle
+    ? { book: articleScopeBook(params.resourceType), startChapter: 1, endChapter: 1, verseStart: null, verseEnd: null }
+    : { book: params.book, startChapter: params.startChapter, endChapter: params.endChapter, verseStart: params.verseStart, verseEnd: params.verseEnd };
   const ckptId = { sessionKey, pipelineType: 'translate', scope };
-  const scopeLabel = params.rowIds
-    ? `${params.startChapter} [${params.rowIds.join(',')}]`
-    : params.verseStart != null
-      ? `${params.startChapter}:${params.verseStart}${params.verseEnd !== params.verseStart ? `-${params.verseEnd}` : ''}`
-      : params.startChapter === params.endChapter
-        ? `${params.startChapter}` : `${params.startChapter}-${params.endChapter}`;
-  const label = `${params.book} ${scopeLabel} → ${params.targetLangName}`;
+
+  const scopeLabel = isArticle
+    ? (params.articleId || params.articleUrl)
+    : params.rowIds ? `${params.startChapter} [${params.rowIds.join(',')}]`
+      : params.verseStart != null ? `${params.startChapter}:${params.verseStart}${params.verseEnd !== params.verseStart ? `-${params.verseEnd}` : ''}`
+        : params.startChapter === params.endChapter ? `${params.startChapter}` : `${params.startChapter}-${params.endChapter}`;
+  const label = isArticle
+    ? `${params.resourceLabel} ${scopeLabel} → ${params.targetLangName}`
+    : `${params.book} ${scopeLabel} ${params.resourceType.toUpperCase()} → ${params.targetLangName}`;
 
   const post = (text) => {
     const p = message.type === 'stream'
@@ -372,111 +505,127 @@ async function translatePipeline(route, message) {
     || message.sender_full_name
     || 'bp-assistant';
 
-  // Selection discriminant keeps subset runs from colliding with each other
-  // or with the whole-chapter run in the resume-reuse batch cache.
-  const selTag = params.rowIds
-    ? `-ids-${params.rowIds.join('-')}`
-    : params.verseStart != null
-      ? `-v${params.verseStart}-${params.verseEnd}`
-      : '';
-  // Run identity beyond (lang, book, chapter range, selection): the source
-  // and context refs, model, and direction. Folding these into the workDir
-  // (batch-reuse cache) prevents a same-scope run with a NEW sourceRef/
-  // contextRef from silently reusing stale batch outputs; folding the same
-  // hash into the branch name keeps distinct logical runs from clobbering
-  // each other's pending review branch on push.
+  // runHash separates distinct logical runs in the batch-reuse cache + branch name.
+  const selTag = isArticle
+    ? `-a-${(params.articleId || params.articleUrl || '').replace(/[^A-Za-z0-9]+/g, '_').slice(0, 40)}`
+    : params.rowIds ? `-ids-${params.rowIds.join('-')}`
+      : params.verseStart != null ? `-v${params.verseStart}-${params.verseEnd}` : '';
   const runHash = crypto.createHash('sha1')
-    .update([params.sourceRef, params.contextRef, params.model, params.direction, selTag].join('|'))
+    .update([params.resourceType, params.sourceRef, params.contextRef, params.model, params.direction, selTag].join('|'))
     .digest('hex').slice(0, 8);
-  const workDir = path.join(CSKILLBP_DIR, 'tmp',
-    `translate-${params.targetLang}-${params.book}-${params.startChapter}-${params.endChapter}${selTag}-${runHash}`);
+  const scopePart = isArticle
+    ? `${params.resourceType}${selTag}`
+    : `${params.book}-${params.startChapter}-${params.endChapter}${selTag}`;
+  const workDir = path.join(CSKILLBP_DIR, 'tmp', `translate-${params.targetLang}-${scopePart}-${runHash}`);
 
-  console.log(`${LOG_PREFIX} Starting ${label} (org=${params.targetOrg}, source=${params.sourceRef}, context=${params.contextRef})`);
-  setCheckpoint(ckptId, { state: 'running', current: { chapter: params.startChapter, skill: 'translate-tn', status: 'running' } });
+  console.log(`${LOG_PREFIX} Starting ${label} (org=${params.targetOrg}/${params.repoName}, source=${params.sourceRef}, context=${params.contextRef})`);
+  setCheckpoint(ckptId, { state: 'running', current: { chapter: scope.startChapter, skill: params.skill, status: 'running' } });
 
   try {
-    const { targetRows, report, bookText } = await translateChapters(params, {
-      workDir,
-      onProgress: (msg) => {
-        console.log(`${LOG_PREFIX} ${msg}`);
-        setCheckpoint(ckptId, { state: 'running', current: { chapter: params.startChapter, skill: 'translate-tn', status: msg.slice(0, 120) } });
-      },
-    });
-
-    // Stage the whole-book file + report inside the per-run workDir (unique
-    // by runHash). Concurrent runs on the same book/lang must not share this
-    // path, or a co-running run could overwrite bookText between write and the
-    // push that reads it back. The remote filename is always tn_{BOOK}.tsv
-    // (door43Push derives it); the local staging name is free.
-    const outDir = path.join(workDir, 'out');
-    fs.mkdirSync(outDir, { recursive: true });
-    const bookFile = path.join(outDir, `tn_${params.book}.tsv`);
-    const reportFile = path.join(outDir, `translate-report-${params.startChapter}-${params.endChapter}.json`);
-    fs.writeFileSync(bookFile, bookText, 'utf8');
-    fs.writeFileSync(reportFile, JSON.stringify(report, null, 2), 'utf8');
-
-    setCheckpoint(ckptId, { state: 'done', current: { chapter: params.endChapter, skill: 'translate-tn', status: 'done' } });
-    const summary = `${targetRows.length} notes, ${report.checks.warningCount} warning(s), 0 blocking violations`;
-
-    if (params.delivery === 'path') {
-      // Beta path-return mode: no Door43 push. Report where the files landed
-      // in the bot workspace so a human can fetch/inspect them.
-      await post(`:check: Translated **${label}** — ${summary}.\n`
-        + `File: \`${bookFile}\`\nReport: \`${reportFile}\``);
-      console.log(`${LOG_PREFIX} ${label} delivered as path: ${bookFile}`);
-      return { bookFile, reportFile, delivery: 'path' };
+    if (isArticle) {
+      return await runArticleDelivery({ params, ckptId, scope, workDir, runHash, label, username, post });
     }
-
-    // Push to the GL org. branchOnly by default: a human (or Bible Editor's
-    // apply step) reviews before merge — translated drafts are not
-    // auto-published the way English pipeline output is.
-    // Branch identity includes the chapter range and runHash (selection +
-    // refs + model) so distinct logical runs never share — and thus never
-    // force-overwrite — the same pending review branch. A re-run of the same
-    // logical run reuses the branch (intended idempotent update).
-    const chapterTag = params.startChapter === params.endChapter
-      ? String(params.startChapter).padStart(2, '0')
-      : `${String(params.startChapter).padStart(2, '0')}-${String(params.endChapter).padStart(2, '0')}`;
-    const branch = `AI-translate-${params.targetLang}-${params.book}-${chapterTag}-${runHash}`;
-    const pushResult = await door43Push({
-      type: 'tn',
-      book: params.book,
-      chapter: params.startChapter,
-      username,
-      branch,
-      source: path.relative(CSKILLBP_DIR, bookFile),
-      org: params.targetOrg,
-      repoName: params.tnRepo,
-      wholeFile: true,
-      endChapter: params.endChapter,
-      pipeline: 'translate',
-      branchOnly: params.branchOnly,
-    });
-    if (!pushResult.success) {
-      throw new Error(`Door43 push failed: ${pushResult.details}`);
-    }
-    // NOTE: verifyRepoPush is unfoldingWord-org-hardcoded (repo-verify.js:12-13)
-    // and translate defaults to branchOnly (no merge to verify). Parameterize
-    // repo-verify when auto-merge mode is enabled for a GL org.
-
-    const where = pushResult.branchUrl
-      ? `branch [${branch}](${pushResult.branchUrl}) (review before merge)`
-      : `PR #${pushResult.prNumber || '?'} (merged)`;
-    await post(`:check: Translated **${label}** — ${summary}. Landed on ${where}.`);
-    return { bookFile, reportFile, delivery: 'branch', branch, prNumber: pushResult.prNumber };
+    return await runTsvDelivery({ params, ckptId, scope, workDir, runHash, label, username, post });
   } catch (err) {
     console.error(`${LOG_PREFIX} ${label} failed: ${err.message}`);
-    setCheckpoint(ckptId, {
-      state: 'failed',
-      current: { chapter: params.startChapter, skill: 'translate-tn', status: 'failed', error: String(err.message).slice(0, 300) },
-    });
-    await publishAdminStatus({
-      source: 'translate-pipeline', pipelineType: 'translate', scope: label,
-      phase: 'run', severity: 'error', message: err.message,
-    }).catch(() => {});
+    setCheckpoint(ckptId, { state: 'failed', current: { chapter: scope.startChapter, skill: params.skill, status: 'failed', error: String(err.message).slice(0, 300) } });
+    await publishAdminStatus({ source: 'translate-pipeline', pipelineType: 'translate', scope: label, phase: 'run', severity: 'error', message: err.message }).catch(() => {});
     await post(`:cross_mark: Translate **${label}** failed: ${err.message}`);
     throw err;
   }
 }
 
-module.exports = { translatePipeline, translateChapters, resolveParams, COMMAND_RE };
+async function runTsvDelivery({ params, ckptId, scope, workDir, runHash, label, username, post }) {
+  const { targetRows, report, bookText } = await translateChapters(params, {
+    workDir,
+    onProgress: (msg) => {
+      console.log(`${LOG_PREFIX} ${msg}`);
+      setCheckpoint(ckptId, { state: 'running', current: { chapter: scope.startChapter, skill: params.skill, status: msg.slice(0, 120) } });
+    },
+  });
+
+  const outDir = path.join(workDir, 'out');
+  fs.mkdirSync(outDir, { recursive: true });
+  const bookFile = path.join(outDir, getResourceType(params.resourceType).file(params.book));
+  const reportFile = path.join(outDir, `translate-report-${params.startChapter}-${params.endChapter}.json`);
+  fs.writeFileSync(bookFile, bookText, 'utf8');
+  fs.writeFileSync(reportFile, JSON.stringify(report, null, 2), 'utf8');
+
+  setCheckpoint(ckptId, { state: 'done', current: { chapter: params.endChapter, skill: params.skill, status: 'done' } });
+  const summary = `${targetRows.length} rows, ${report.checks.warningCount} warning(s), 0 blocking violations`;
+
+  if (params.delivery === 'path') {
+    await post(`:check: Translated **${label}** — ${summary}.\nFile: \`${bookFile}\`\nReport: \`${reportFile}\``);
+    console.log(`${LOG_PREFIX} ${label} delivered as path: ${bookFile}`);
+    return { bookFile, reportFile, delivery: 'path' };
+  }
+
+  const chapterTag = params.startChapter === params.endChapter
+    ? String(params.startChapter).padStart(2, '0')
+    : `${String(params.startChapter).padStart(2, '0')}-${String(params.endChapter).padStart(2, '0')}`;
+  const branch = `AI-translate-${params.targetLang}-${params.resourceType}-${params.book}-${chapterTag}-${runHash}`;
+  const pushResult = await door43Push({
+    type: params.pushType, book: params.book, chapter: params.startChapter, username, branch,
+    source: path.relative(CSKILLBP_DIR, bookFile), org: params.targetOrg, repoName: params.repoName,
+    wholeFile: true, endChapter: params.endChapter, pipeline: 'translate', branchOnly: params.branchOnly,
+  });
+  if (!pushResult.success) throw new Error(`Door43 push failed: ${pushResult.details}`);
+
+  const where = pushResult.branchUrl ? `branch [${branch}](${pushResult.branchUrl}) (review before merge)` : `PR #${pushResult.prNumber || '?'} (merged)`;
+  await post(`:check: Translated **${label}** — ${summary}. Landed on ${where}.`);
+  return { bookFile, reportFile, delivery: 'branch', branch, prNumber: pushResult.prNumber };
+}
+
+async function runArticleDelivery({ params, ckptId, scope, workDir, runHash, label, username, post }) {
+  const { articleId, files, report } = await translateArticles(params, {
+    workDir,
+    onProgress: (msg) => {
+      console.log(`${LOG_PREFIX} ${msg}`);
+      setCheckpoint(ckptId, { state: 'running', current: { chapter: 1, skill: params.skill, status: msg.slice(0, 120) } });
+    },
+  });
+
+  const outDir = path.join(workDir, 'out');
+  const staged = [];
+  for (const f of files) {
+    const local = path.join(outDir, f.path);
+    fs.mkdirSync(path.dirname(local), { recursive: true });
+    fs.writeFileSync(local, f.markdown, 'utf8');
+    staged.push({ path: f.path, local });
+  }
+  const reportFile = path.join(outDir, `translate-report-${articleId.replace(/[^A-Za-z0-9]+/g, '_')}.json`);
+  fs.writeFileSync(reportFile, JSON.stringify(report, null, 2), 'utf8');
+
+  setCheckpoint(ckptId, { state: 'done', current: { chapter: 1, skill: params.skill, status: 'done' } });
+  const summary = `${files.length} file(s), ${report.checks.warningCount} warning(s), 0 blocking violations`;
+
+  if (params.delivery === 'path') {
+    await post(`:check: Translated **${label}** — ${summary}.\nFiles:\n${staged.map((s) => `- \`${s.local}\``).join('\n')}\nReport: \`${reportFile}\``);
+    console.log(`${LOG_PREFIX} ${label} delivered as path (${staged.length} files)`);
+    return { articleId, files: staged, reportFile, delivery: 'path' };
+  }
+
+  const branch = `AI-translate-${params.targetLang}-${params.resourceType}-${articleId.replace(/[^A-Za-z0-9]+/g, '-')}-${runHash}`;
+  const pushResult = await door43Push({
+    type: 'article',
+    files: staged.map((s) => ({ path: s.path, source: path.relative(CSKILLBP_DIR, s.local) })),
+    username, branch, org: params.targetOrg, repoName: params.repoName,
+    pipeline: 'translate', branchOnly: params.branchOnly,
+  });
+  if (!pushResult.success) throw new Error(`Door43 push failed: ${pushResult.details}`);
+  const where = pushResult.branchUrl ? `branch [${branch}](${pushResult.branchUrl}) (review before merge)` : `PR #${pushResult.prNumber || '?'} (merged)`;
+  await post(`:check: Translated **${label}** — ${summary}. Landed on ${where}.`);
+  return { articleId, files: staged, reportFile, delivery: 'branch', branch, prNumber: pushResult.prNumber };
+}
+
+module.exports = {
+  translatePipeline,
+  translateChapters,
+  translateArticles,
+  resolveParams,
+  articleScopeBook,
+  ROUTE_RESOURCE_TYPE,
+  COMMAND_RE,
+  TSV_COMMAND_RE,
+  ARTICLE_COMMAND_RE,
+};
