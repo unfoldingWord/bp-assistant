@@ -148,6 +148,17 @@ async function loadContextPack(contextRef, { fetchImpl } = {}) {
     if (raw[key] == null) missing.push(rel);
   });
 
+  // A pack with NO files present is almost always a misconfiguration (wrong
+  // org, repo not created/populated, bad ref) rather than an intentional
+  // empty pack. Fail loudly instead of silently translating with zero context.
+  // Partial packs (some templates/examples missing) are legitimate and degrade.
+  if (missing.length === entries.length) {
+    throw new Error(
+      `context pack has no files at "${contextRef}" — every expected file is missing `
+      + `(${missing.join(', ')}). Check the org/repo/ref exists and is populated, `
+      + `or pass a contextRef that resolves. Translating with an empty pack is refused.`);
+  }
+
   return {
     ref: String(contextRef),
     sha,

@@ -69,6 +69,15 @@ test('loadContextPack loads a local fixture pack', async () => {
   }
 });
 
+test('loadContextPack throws on a pack with no files present (misconfig guard)', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ctx-empty-'));
+  try {
+    await assert.rejects(loadContextPack(dir), /no files/);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('renderBatchPack injects matching templates, flags fallbacks, caps examples', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ctx-pack-'));
   try {
