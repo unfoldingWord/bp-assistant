@@ -88,6 +88,17 @@ test('loadContextPack throws when only manifest.yaml is present (no content)', a
   }
 });
 
+test('loadContextPack with allowEmpty returns hasContent:false instead of throwing', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ctx-allowempty-'));
+  try {
+    const pack = await loadContextPack(dir, { allowEmpty: true });
+    assert.strictEqual(pack.hasContent, false);
+    assert.strictEqual(pack.templates.size, 0);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('loadContextPack succeeds when at least one content file is present', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ctx-partial-'));
   try {

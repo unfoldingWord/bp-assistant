@@ -89,6 +89,15 @@ test('verse range spanning multiple chapters is rejected', () => {
   assert.ok(res.error.issues.some((i) => /single chapter/.test(i.message)));
 });
 
+test('verseEnd without verseStart is rejected', () => {
+  const res = StartBodySchema.safeParse({
+    ...base, startChapter: 1, endChapter: 1, verseEnd: 5,
+    options: { targetLang: 'ar' },
+  });
+  assert.ok(!res.success);
+  assert.ok(res.error.issues.some((i) => /verseEnd requires verseStart/.test(i.message)));
+});
+
 test('verse scope within a single chapter is accepted', () => {
   const res = StartBodySchema.safeParse({
     ...base, startChapter: 1, endChapter: 1,

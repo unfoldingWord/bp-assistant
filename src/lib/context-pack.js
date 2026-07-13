@@ -116,10 +116,15 @@ function parseExamplesJsonl(text) {
 /**
  * Load and parse a context pack.
  * @param {string} contextRef - "org/repo@ref" or a local directory path
+ * @param {object} [opts]
+ * @param {boolean} [opts.allowEmpty=false] - if false, throw when the pack has
+ *   no prompt-affecting content files (misconfig guard for an EXPLICIT ref).
+ *   Pass true when the ref was defaulted (e.g. a GL context repo not created
+ *   yet) so an early-beta raw-baseline run can proceed with a warning.
  * @returns {Promise<{ref, sha, manifest, brief, instructions, standards,
- *   templates: Map, terms: Array, examples: Array, missing: string[]}>}
+ *   templates: Map, terms: Array, examples: Array, missing: string[], hasContent: boolean}>}
  */
-async function loadContextPack(contextRef, { fetchImpl } = {}) {
+async function loadContextPack(contextRef, { fetchImpl, allowEmpty = false } = {}) {
   const parsed = parseContextRef(contextRef);
   const isLocal = !parsed && fs.existsSync(contextRef) && fs.statSync(contextRef).isDirectory();
   if (!parsed && !isLocal) {
@@ -156,7 +161,7 @@ async function loadContextPack(contextRef, { fetchImpl } = {}) {
   // templates/examples present) are legitimate and degrade.
   const contentPresent = ['brief', 'instructions', 'standards', 'templates', 'terminology', 'examples']
     .some((k) => raw[k] != null);
-  if (!contentPresent) {
+  if (!contentPresent && !allowEmpty) {
     throw new Error(
       `context pack has no content files at "${contextRef}" — every prompt-affecting file is missing `
       + `(present: ${entries.filter(([, rel]) => !missing.includes(rel)).map(([, rel]) => rel).join(', ') || 'none'}). `
@@ -174,6 +179,7 @@ async function loadContextPack(contextRef, { fetchImpl } = {}) {
     terms: raw.terminology ? parseTermsCsv(raw.terminology) : [],
     examples: raw.examples ? parseExamplesJsonl(raw.examples) : [],
     missing,
+    hasContent: contentPresent,
   };
 }
 

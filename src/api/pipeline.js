@@ -153,6 +153,16 @@ const StartBodySchema = z.object({
         message: 'verse scoping requires a single chapter (startChapter must equal endChapter)',
       });
     }
+    // verseEnd without verseStart is an incomplete scope — the pipeline only
+    // switches to subset mode on verseStart, so it would silently run the
+    // whole chapter. Reject rather than mis-scope.
+    if (body.verseEnd != null && body.verseStart == null) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['verseEnd'],
+        message: 'verseEnd requires verseStart',
+      });
+    }
   } else {
     for (const k of ['targetLang', 'targetOrg', 'repoName', 'sourceRef', 'contextRef', 'branchOnly', 'delivery', 'direction', 'rowIds']) {
       if (o[k] !== undefined) {

@@ -120,6 +120,11 @@ function resolveParams(route, message) {
   const cfg = TRANSLATE_TARGETS[targetLang] || {};
   const targetOrg = opts.targetOrg || cfg.targetOrg || `${targetLang}_gl`;
   const tnRepo = opts.repoName || cfg.tnRepo || `${targetLang}_tn`;
+  // An explicit contextRef (from the caller or the per-language config) must
+  // resolve to a populated pack — a missing one is a misconfig and errors. A
+  // DEFAULTED contextRef (no repo created yet) may be empty: early-beta runs
+  // proceed as a raw baseline with a loud warning.
+  const contextRefExplicit = !!(opts.contextRef || cfg.contextRef);
 
   return {
     book: book.toUpperCase(),
@@ -136,6 +141,7 @@ function resolveParams(route, message) {
     tnRepo,
     sourceRef: opts.sourceRef || cfg.sourceRef || 'unfoldingWord/en_tn@master',
     contextRef: opts.contextRef || cfg.contextRef || `${targetOrg}/translation-context@master`,
+    contextRefExplicit,
     model: opts.model || route.model || 'opus',
     delivery,
     branchOnly: opts.branchOnly !== false, // when delivery==='branch': land on a branch, no auto-merge (unlike en pipelines)
@@ -221,11 +227,18 @@ async function translateChapters(params, { workDir, onProgress, runBatchImpl, ma
   if (maxRows && rows.length > maxRows) rows = rows.slice(0, maxRows); // dry-run trimming only
   progress(`source: ${rows.length} row(s) from ${params.sourceRef}${params.mergeMode === 'by-id' ? ' (by-id subset)' : ''}`);
 
-  // 2. Context pack at the pinned ref.
-  const pack = await loadContextPack(params.contextRef);
-  progress(`context pack: ${params.contextRef}${pack.sha ? ` @ ${pack.sha.slice(0, 10)}` : ''}`
-    + ` — ${pack.templates.size} templates, ${pack.terms.length} terms, ${pack.examples.length} examples`
-    + (pack.missing.length ? ` (missing: ${pack.missing.join(', ')})` : ''));
+  // 2. Context pack at the pinned ref. An explicit ref must be populated; a
+  //    defaulted ref (context repo not created yet) may be empty → raw baseline.
+  const pack = await loadContextPack(params.contextRef, { allowEmpty: !params.contextRefExplicit });
+  if (!pack.hasContent) {
+    progress(`WARNING: no context pack at ${params.contextRef} (repo absent/empty) — `
+      + 'translating as a RAW BASELINE with no templates/terminology/examples. '
+      + 'Create + populate the translation-context repo, or pass a contextRef, for assisted output.');
+  } else {
+    progress(`context pack: ${params.contextRef}${pack.sha ? ` @ ${pack.sha.slice(0, 10)}` : ''}`
+      + ` — ${pack.templates.size} templates, ${pack.terms.length} terms, ${pack.examples.length} examples`
+      + (pack.missing.length ? ` (missing: ${pack.missing.join(', ')})` : ''));
+  }
 
   // 3. Batch → translate → validate (+1 repair pass) per batch.
   fs.mkdirSync(workDir, { recursive: true });
