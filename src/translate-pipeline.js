@@ -414,7 +414,9 @@ async function translateArticles(params, { workDir, onProgress, resolveImpl, run
 
   // 3. Translate each file (per-file checks + 1 repair pass).
   fs.mkdirSync(workDir, { recursive: true });
-  const rendered = core.renderArticlePack({ articleId: resolved.articleId, pack, ...params });
+  // resolved.articleId (the canonical path-keyed id) must win over params.articleId
+  // (null for URL-triggered runs) — spread params FIRST, then override.
+  const rendered = core.renderArticlePack({ ...params, pack, articleId: resolved.articleId });
   const outFiles = [];
   const fileMeta = [];
   for (let i = 0; i < sourceFiles.length; i++) {
@@ -521,9 +523,9 @@ async function translatePipeline(route, message) {
 
   try {
     if (isArticle) {
-      return await runArticleDelivery({ params, ckptId, scope, workDir, label, username, post });
+      return await runArticleDelivery({ params, ckptId, scope, workDir, runHash, label, username, post });
     }
-    return await runTsvDelivery({ params, ckptId, scope, workDir, label, username, post });
+    return await runTsvDelivery({ params, ckptId, scope, workDir, runHash, label, username, post });
   } catch (err) {
     console.error(`${LOG_PREFIX} ${label} failed: ${err.message}`);
     setCheckpoint(ckptId, { state: 'failed', current: { chapter: scope.startChapter, skill: params.skill, status: 'failed', error: String(err.message).slice(0, 300) } });
@@ -533,7 +535,7 @@ async function translatePipeline(route, message) {
   }
 }
 
-async function runTsvDelivery({ params, ckptId, scope, workDir, label, username, post }) {
+async function runTsvDelivery({ params, ckptId, scope, workDir, runHash, label, username, post }) {
   const { targetRows, report, bookText } = await translateChapters(params, {
     workDir,
     onProgress: (msg) => {
@@ -544,7 +546,7 @@ async function runTsvDelivery({ params, ckptId, scope, workDir, label, username,
 
   const outDir = path.join(workDir, 'out');
   fs.mkdirSync(outDir, { recursive: true });
-  const bookFile = path.join(outDir, params.resourceType === 'tq' ? `tq_${params.book}.tsv` : `tn_${params.book}.tsv`);
+  const bookFile = path.join(outDir, getResourceType(params.resourceType).file(params.book));
   const reportFile = path.join(outDir, `translate-report-${params.startChapter}-${params.endChapter}.json`);
   fs.writeFileSync(bookFile, bookText, 'utf8');
   fs.writeFileSync(reportFile, JSON.stringify(report, null, 2), 'utf8');
@@ -561,7 +563,7 @@ async function runTsvDelivery({ params, ckptId, scope, workDir, label, username,
   const chapterTag = params.startChapter === params.endChapter
     ? String(params.startChapter).padStart(2, '0')
     : `${String(params.startChapter).padStart(2, '0')}-${String(params.endChapter).padStart(2, '0')}`;
-  const branch = `AI-translate-${params.targetLang}-${params.resourceType}-${params.book}-${chapterTag}-${path.basename(workDir).split('-').pop()}`;
+  const branch = `AI-translate-${params.targetLang}-${params.resourceType}-${params.book}-${chapterTag}-${runHash}`;
   const pushResult = await door43Push({
     type: params.pushType, book: params.book, chapter: params.startChapter, username, branch,
     source: path.relative(CSKILLBP_DIR, bookFile), org: params.targetOrg, repoName: params.repoName,
@@ -574,7 +576,7 @@ async function runTsvDelivery({ params, ckptId, scope, workDir, label, username,
   return { bookFile, reportFile, delivery: 'branch', branch, prNumber: pushResult.prNumber };
 }
 
-async function runArticleDelivery({ params, ckptId, scope, workDir, label, username, post }) {
+async function runArticleDelivery({ params, ckptId, scope, workDir, runHash, label, username, post }) {
   const { articleId, files, report } = await translateArticles(params, {
     workDir,
     onProgress: (msg) => {
@@ -603,7 +605,7 @@ async function runArticleDelivery({ params, ckptId, scope, workDir, label, usern
     return { articleId, files: staged, reportFile, delivery: 'path' };
   }
 
-  const branch = `AI-translate-${params.targetLang}-${params.resourceType}-${articleId.replace(/[^A-Za-z0-9]+/g, '-')}-${path.basename(workDir).split('-').pop()}`;
+  const branch = `AI-translate-${params.targetLang}-${params.resourceType}-${articleId.replace(/[^A-Za-z0-9]+/g, '-')}-${runHash}`;
   const pushResult = await door43Push({
     type: 'article',
     files: staged.map((s) => ({ path: s.path, source: path.relative(CSKILLBP_DIR, s.local) })),

@@ -77,6 +77,14 @@ function parseDoor43Url(url) {
   return { org: m[1], repo: m[2], ref: decodeURIComponent(m[3]), path: m[4] };
 }
 
+/** Fetch several file bodies in parallel, preserving `paths` order; skip 404s. */
+async function fetchFiles(loc, paths, fetchImpl) {
+  const bodies = await Promise.all(paths.map((p) => fetchRaw(loc, p, fetchImpl)));
+  const files = [];
+  paths.forEach((p, i) => { if (bodies[i] != null) files.push({ path: p, sourceMarkdown: bodies[i] }); });
+  return files;
+}
+
 /** tW: normalize a name to an in-repo path list (single file). */
 async function resolveTwByName(loc, name, fetchImpl) {
   let rel = String(name).trim().replace(/\.md$/i, '');
@@ -111,11 +119,7 @@ async function resolveTaByName(loc, name, fetchImpl) {
   }
   const paths = await listMarkdownFiles(loc, dir, fetchImpl);
   if (!paths || !paths.length) throw new Error(`tA article folder empty or absent: ${dir} in ${loc.org}/${loc.repo}@${loc.ref}`);
-  const files = [];
-  for (const path of paths) {
-    const md = await fetchRaw(loc, path, fetchImpl);
-    if (md != null) files.push({ path, sourceMarkdown: md });
-  }
+  const files = await fetchFiles(loc, paths, fetchImpl);
   return { articleId: dir, files };
 }
 
@@ -132,11 +136,7 @@ async function resolveByUrl(resourceType, url, fetchImpl) {
   // Folder URL → list .md files.
   const paths = await listMarkdownFiles(loc, path.replace(/\/+$/, ''), fetchImpl);
   if (!paths || !paths.length) throw new Error(`no .md files under folder URL: ${url}`);
-  const files = [];
-  for (const p of paths) {
-    const md = await fetchRaw(loc, p, fetchImpl);
-    if (md != null) files.push({ path: p, sourceMarkdown: md });
-  }
+  const files = await fetchFiles(loc, paths, fetchImpl);
   return { articleId: deriveArticleId(resourceType, path), loc, files };
 }
 

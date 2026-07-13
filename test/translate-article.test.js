@@ -6,10 +6,11 @@ const { test } = require('node:test');
 const assert = require('node:assert');
 const path = require('path');
 const fs = require('fs');
+const os = require('os');
 
 const { runArticleChecks } = require('../src/lib/translate-checks');
 const { resolveArticle, parseDoor43Url, deriveArticleId } = require('../src/lib/article-resolver');
-const { resolveParams } = require('../src/translate-pipeline');
+const { resolveParams, translateArticles } = require('../src/translate-pipeline');
 
 const FIX = path.join(__dirname, 'fixtures');
 const GOD = fs.readFileSync(path.join(FIX, 'tw_kt_god.md'), 'utf8');
@@ -186,6 +187,29 @@ test('resolveParams: article via Door43 URL', () => {
   const p = resolveParams({ name: 'translate-ta' }, zmsg(`translate ta ${url} to ar`));
   assert.strictEqual(p.articleUrl, url);
   assert.strictEqual(p.articleId, null);
+});
+
+test('translateArticles uses the resolver-canonical articleId for the pack, even on URL runs (params.articleId=null)', async () => {
+  const ctxDir = fs.mkdtempSync(path.join(os.tmpdir(), 'artctx-'));
+  const workDir = fs.mkdtempSync(path.join(os.tmpdir(), 'artwork-'));
+  try {
+    fs.writeFileSync(path.join(ctxDir, 'instructions.md'), 'translate faithfully');
+    const params = {
+      resourceType: 'ta', family: 'article', skill: 'translate-article',
+      articleId: null, articleUrl: 'https://git.door43.org/unfoldingWord/en_ta/src/branch/master/translate/figs-aside',
+      targetLang: 'ar', targetLangName: 'Arabic', sourceLang: 'en', sourceLangName: 'English',
+      direction: 'rtl', sourceRef: 'unfoldingWord/en_ta@master', contextRef: ctxDir, contextRefExplicit: true, model: 'sonnet',
+    };
+    const resolveImpl = async () => ({ articleId: 'translate/figs-aside', files: [{ path: 'translate/figs-aside/01.md', sourceMarkdown: '# Aside\n\nbody' }] });
+    const runFileImpl = async () => ({ markdown: '# استطراد\n\nنص', checks: { ok: true, errors: [], warnings: [], violations: [] }, attempts: 1 });
+    const res = await translateArticles(params, { workDir, resolveImpl, runFileImpl });
+    assert.strictEqual(res.articleId, 'translate/figs-aside');
+    // The slug is derived from the CANONICAL article id, not the null params.articleId.
+    assert.deepStrictEqual(res.report.batches[0].slugs, ['figs-aside']);
+  } finally {
+    fs.rmSync(ctxDir, { recursive: true, force: true });
+    fs.rmSync(workDir, { recursive: true, force: true });
+  }
 });
 
 test('resolveParams: API synthetic article route carries resourceType + articleId', () => {
