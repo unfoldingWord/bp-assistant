@@ -64,6 +64,23 @@ test('Quote column corruption is a blocking error (the Aquilla failure)', () => 
   assert.ok(!res.ok);
 });
 
+test('normalization-only Quote difference is NOT flagged (Hebrew combining-mark reorder)', () => {
+  // The live OBA failure: source Quote and round-tripped Quote are visually
+  // identical Hebrew that differ only in combining-mark order (legacy
+  // consonant-dagesh-vowel vs NFC canonical). Byte-different, NFC-equal. A
+  // byte-wise compare flags it as passthrough corruption; an NFC compare must not.
+  const legacy = 'ב' + 'ּ' + 'ִ';      // bet + dagesh(ccc21) + hiriq(ccc14): non-canonical
+  const canonical = 'ב' + 'ִ' + 'ּ';   // bet + hiriq + dagesh: NFC canonical
+  assert.notStrictEqual(legacy, canonical, 'orderings must be byte-different');
+  assert.strictEqual(legacy.normalize('NFC'), canonical.normalize('NFC'), 'and NFC-equal');
+  const src = [{ Reference: '1:1', ID: 'ab12', Tags: '', SupportReference: '', Quote: legacy, Occurrence: '1', Note: 'x' }];
+  const tgt = [{ ...src[0], Quote: canonical, Note: 'ترجمة' }];
+  const res = runChecks(src, tgt);
+  assert.ok(!res.errors.some((e) => e.check === 'passthrough-quote'),
+    'normalization-only Quote difference must not block: ' + JSON.stringify(res.errors));
+  assert.ok(res.ok, JSON.stringify(res.errors.slice(0, 5), null, 2));
+});
+
 test('ID drop / row loss is a blocking error', () => {
   const src = loadOba().slice(0, 5);
   const tgt = src.slice(0, 4).map((r) => ({ ...r, Note: fakeTranslateNote(r.Note) }));

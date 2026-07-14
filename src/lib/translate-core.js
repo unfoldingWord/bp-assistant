@@ -17,7 +17,7 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const { parseTnTsv, serializeTnTsv, refChapter, refVerseRange, sliceChapterRows } = require('./tn-tsv');
-const { runChecks, runArticleChecks } = require('./translate-checks');
+const { runChecks, runArticleChecks, PASS_THROUGH_COLUMNS } = require('./translate-checks');
 
 /**
  * Session/job-key suffix that makes translate runs distinguishable by target
@@ -287,6 +287,21 @@ function writeArticleFiles(workDir, index, { sourceMarkdown, packMarkdown, artic
 function readBatchOutput(outputFile, batchRows, { parse = parseTnTsv, checkOpts = {} } = {}) {
   if (!fs.existsSync(outputFile)) throw new Error(`skill produced no output file: ${outputFile}`);
   const rows = parse(fs.readFileSync(outputFile, 'utf8'));
+  // Byte-preserve pass-through columns by construction. The skill round-trips
+  // whole rows, so a pass-through cell — e.g. a Hebrew UHB Quote — can come back
+  // in a different Unicode normalization (visually identical, byte-different) or
+  // otherwise mangled. Copy each pass-through cell straight from the source row
+  // so passthrough is exact, not merely re-emitted; the passthrough checks then
+  // only guard rows the model failed to round-trip by ID at all.
+  const passThroughColumns = checkOpts.passThroughColumns || PASS_THROUGH_COLUMNS;
+  const srcById = new Map(batchRows.map((r) => [r.ID, r]));
+  for (const row of rows) {
+    const src = srcById.get(row.ID);
+    if (!src) continue;
+    for (const col of passThroughColumns) {
+      if (Object.prototype.hasOwnProperty.call(src, col)) row[col] = src[col];
+    }
+  }
   const checks = runChecks(batchRows, rows, checkOpts);
   return { rows, checks };
 }
