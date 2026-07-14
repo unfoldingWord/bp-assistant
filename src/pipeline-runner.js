@@ -1,12 +1,18 @@
-// Pipelines that write under CSKILLBP_DIR/output and CSKILLBP_DIR/tmp. Sweep
-// foreign-owned leftovers before they cause mid-run EACCES failures.
+// Pipelines that write under CSKILLBP_DIR/{output,tmp,door43-repos}. Sweep
+// foreign-owned leftovers before they cause mid-run EACCES failures. The
+// door43-repos tree is included because door43-push.js writes directly into
+// door43-repos/<repo>/.git/objects/** on every push; a prior privileged/root
+// launch (or a container restart mid-write) can leave objects or shard dirs
+// owned by root, and the next unprivileged push into the same shard directory
+// fails with EACCES on open() (see issue #207).
 const WORKSPACE_WRITING_ROUTES = new Set(['sdk', 'notes', 'tqs', 'translate']);
+const SWEEP_SUBDIRS = ['output', 'tmp', 'door43-repos'];
 
 async function runPipeline(route, message) {
   if (WORKSPACE_WRITING_ROUTES.has(route.type)) {
     try {
       const { sweepWorkspaceOwnership, sweepStaleTmp } = require('./ownership-sweep');
-      sweepWorkspaceOwnership();
+      sweepWorkspaceOwnership({ subdirs: SWEEP_SUBDIRS });
       sweepStaleTmp();
     } catch (err) {
       console.warn(`[ownership-sweep] skipped: ${err.message}`);
