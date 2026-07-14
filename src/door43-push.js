@@ -566,9 +566,15 @@ async function syncRepo(repoDir, repoName, branch, baseBranch = 'master', org = 
     // Branch didn't exist locally — fine
   }
 
-  // Create fresh branch from origin/{baseBranch} and check it out
+  // Create fresh branch from origin/{baseBranch} and check it out.
+  // force: true discards any leftover uncommitted working-tree drift from a
+  // prior chapter/run that inserted rows into this shared persistent clone
+  // but never reached the commit/push step (e.g. an earlier chapter failed
+  // mid-run). Without force, isomorphic-git refuses the branch switch with
+  // "Your local changes ... would be overwritten by checkout" and blocks
+  // every subsequent chapter's push until the clone is manually cleaned.
   await git.branch({ fs, dir: repoDir, ref: branch, object: `origin/${baseBranch}` });
-  await git.checkout({ fs, dir: repoDir, ref: branch });
+  await git.checkout({ fs, dir: repoDir, ref: branch, force: true });
   console.log(`${LOG_PREFIX} On branch ${branch} (from origin/${baseBranch}) in ${repoDir}`);
 }
 
