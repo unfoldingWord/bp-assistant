@@ -25,6 +25,28 @@ test('sweepWorkspaceOwnership returns null when the workspace root is absent', (
   assert.equal(res, null);
 });
 
+test('sweepWorkspaceOwnership walks custom subdirs (e.g. door43-repos) when provided', () => {
+  // Regression for issue #207: door43-repos/<repo>/.git/objects/** must be
+  // reachable by the sweep so a root-owned git object shard from a prior
+  // privileged run doesn't EACCES the next unprivileged push.
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), 'sweep-door43-'));
+  const shardDir = path.join(base, 'door43-repos', 'en_tn', '.git', 'objects', '6d');
+  fs.mkdirSync(shardDir, { recursive: true });
+  const objFile = path.join(shardDir, '125395a5993b8cca36e4218751d6a00fc574b8');
+  fs.writeFileSync(objFile, 'x');
+
+  const res = sweepWorkspaceOwnership({
+    baseDir: base,
+    subdirs: ['output', 'tmp', 'door43-repos'],
+    log: silent,
+  });
+  // All files here match the workspace owner (the test process), so foreign
+  // should be empty — but the walk must have reached objFile, i.e. it must
+  // not throw and must return a normal result object.
+  assert.ok(res && Array.isArray(res.foreign));
+  assert.deepEqual(res.foreign, []);
+});
+
 test('sweepStaleTmp removes tmp entries older than the TTL and keeps fresh ones', () => {
   const base = fs.mkdtempSync(path.join(os.tmpdir(), 'sweep-tmp-'));
   const tmpDir = path.join(base, 'tmp');
