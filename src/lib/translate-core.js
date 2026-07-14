@@ -55,13 +55,69 @@ const DCS_BASE = 'https://git.door43.org';
 const BATCH_MAX_ROWS = 15;
 const BATCH_MAX_NOTE_CHARS = 7000;
 
-// Few-shot budget per batch.
-const MAX_EXAMPLES_PER_BATCH = 10;
+// Few-shot budget per batch (CONTEXT-REPO-CONTRACT.md §3.4 — start at 15).
+const MAX_EXAMPLES_PER_BATCH = 15;
 
 function slugFromSupportReference(sr) {
   if (!sr) return null;
   const m = /([a-z0-9-]+)\s*$/i.exec(String(sr).trim());
   return m ? m[1] : null;
+}
+
+/** Format terminology sections from the concept-oriented status vocab. */
+function renderTerminologySections(terms) {
+  const preferred = terms.filter((t) => t.status === 'preferred');
+  const admitted = terms.filter((t) => t.status === 'admitted');
+  const deprecated = terms.filter((t) => t.status === 'deprecated');
+  const forbidden = terms.filter((t) => t.status === 'forbidden');
+  const doNotTranslate = terms.filter((t) => t.status === 'do_not_translate');
+  const parts = [];
+
+  if (preferred.length) {
+    parts.push('## Terminology — HARD CONSTRAINTS (preferred renderings; always use these)\n\n'
+      + preferred.map((t) => `- "${t.source}" → "${t.target}"${t.comment ? ` (${t.comment})` : ''}`).join('\n'));
+  }
+  if (admitted.length) {
+    parts.push('## Terminology — admitted (valid; prefer a preferred sibling when drafting fresh)\n\n'
+      + admitted.map((t) => `- "${t.source}" → "${t.target}"`).join('\n'));
+  }
+  if (forbidden.length) {
+    parts.push('## Terminology — FORBIDDEN (never emit; use the replacement)\n\n'
+      + forbidden.map((t) => `- never "${t.target || t.source}"; use "${t.replacement || '?'}" instead`
+        + `${t.comment ? ` (${t.comment})` : ''}`).join('\n'));
+  }
+  if (deprecated.length) {
+    parts.push('## Terminology — deprecated (do not emit in new drafts)\n\n'
+      + deprecated.map((t) => `- do not use "${t.target}" for "${t.source}"`).join('\n'));
+  }
+  if (doNotTranslate.length) {
+    parts.push('## Terminology — do not translate (leave the source term as-is)\n\n'
+      + doNotTranslate.map((t) => `- leave "${t.source}" untranslated / untransliterated`).join('\n'));
+  }
+  return parts;
+}
+
+/** Select up to N live examples: SupportReference match first, then recency. */
+function selectExamples(examples, slugs, max = MAX_EXAMPLES_PER_BATCH) {
+  const live = (examples || []).slice().sort(
+    (a, b) => (b.validated_at - a.validated_at) || ((b._seq || 0) - (a._seq || 0)));
+  const slugSet = new Set(slugs || []);
+  const bySlug = live.filter((e) => slugSet.has(slugFromSupportReference(e.supportReference)));
+  const general = live.filter((e) => !bySlug.includes(e));
+  return [...bySlug, ...general].slice(0, max);
+}
+
+function renderPackPreamble({ pack, targetLang, targetLangName, direction }) {
+  const parts = [];
+  parts.push(`# Translation context — ${targetLangName} (${targetLang}, ${direction === 'rtl' ? 'right-to-left' : 'left-to-right'})`);
+  if (pack.register) {
+    parts.push(`## Formality register\n\nUse **${pack.register}** register throughout this draft.`);
+  }
+  if (pack.brief) parts.push(`## Translation brief\n\n${pack.brief.trim()}`);
+  if (pack.instructions) parts.push(`## Standing instructions\n\n${pack.instructions.trim()}`);
+  if (pack.standards) parts.push(`## Quality standards (self-check your drafts against these)\n\n${pack.standards.trim()}`);
+  parts.push(...renderTerminologySections(pack.terms || []));
+  return parts;
 }
 
 /** Fetch a file from DCS at a pinned ref ("org/repo@ref"); null on 404. */
@@ -120,32 +176,14 @@ function renderBatchPack({ batchRows, pack, targetLang, targetLangName, directio
   const templateLines = [];
   const templateFallbacks = [];
   for (const slug of slugs) {
-    const t = pack.templates.get(slug);
+    const t = pack.templates.get(slug); // Map only holds status=active
     if (t) templateLines.push(`- \`${slug}\`: ${t.template}`);
     else templateFallbacks.push(slug);
   }
 
-  const approvedTerms = pack.terms.filter((t) => t.status === 'approved');
-  const candidateTerms = pack.terms.filter((t) => t.status !== 'approved');
+  const examples = selectExamples(pack.examples, slugs);
 
-  const bySlug = pack.examples.filter((e) => slugs.includes(slugFromSupportReference(e.supportReference)));
-  const general = pack.examples.filter((e) => !bySlug.includes(e));
-  const examples = [...bySlug, ...general].slice(0, MAX_EXAMPLES_PER_BATCH);
-
-  const parts = [];
-  parts.push(`# Translation context — ${targetLangName} (${targetLang}, ${direction === 'rtl' ? 'right-to-left' : 'left-to-right'})`);
-  if (pack.brief) parts.push(`## Translation brief\n\n${pack.brief.trim()}`);
-  if (pack.instructions) parts.push(`## Standing instructions\n\n${pack.instructions.trim()}`);
-  if (pack.standards) parts.push(`## Quality standards (self-check your drafts against these)\n\n${pack.standards.trim()}`);
-
-  if (approvedTerms.length) {
-    parts.push('## Terminology — HARD CONSTRAINTS (approved renderings; always use these)\n\n'
-      + approvedTerms.map((t) => `- "${t.source}" → "${t.target}"${t.notes ? ` (${t.notes})` : ''}`).join('\n'));
-  }
-  if (candidateTerms.length) {
-    parts.push('## Terminology — candidates (prefer these unless context demands otherwise)\n\n'
-      + candidateTerms.map((t) => `- "${t.source}" → "${t.target}"`).join('\n'));
-  }
+  const parts = renderPackPreamble({ pack, targetLang, targetLangName, direction });
 
   if (templateLines.length) {
     parts.push('## Note templates for this batch\n\nEach note type has a standard phrasing pattern in '
@@ -181,23 +219,9 @@ function renderArticlePack({ articleId, pack, targetLang, targetLangName, direct
   if (t) templateLines.push(`- \`${slug}\`: ${t.template}`);
   else if (slug) templateFallbacks.push(slug);
 
-  const approvedTerms = pack.terms.filter((x) => x.status === 'approved');
-  const candidateTerms = pack.terms.filter((x) => x.status !== 'approved');
-  const examples = pack.examples.slice(0, MAX_EXAMPLES_PER_BATCH);
+  const examples = selectExamples(pack.examples, slug ? [slug] : []);
+  const parts = renderPackPreamble({ pack, targetLang, targetLangName, direction });
 
-  const parts = [];
-  parts.push(`# Translation context — ${targetLangName} (${targetLang}, ${direction === 'rtl' ? 'right-to-left' : 'left-to-right'})`);
-  if (pack.brief) parts.push(`## Translation brief\n\n${pack.brief.trim()}`);
-  if (pack.instructions) parts.push(`## Standing instructions\n\n${pack.instructions.trim()}`);
-  if (pack.standards) parts.push(`## Quality standards (self-check your drafts against these)\n\n${pack.standards.trim()}`);
-  if (approvedTerms.length) {
-    parts.push('## Terminology — HARD CONSTRAINTS (approved renderings; always use these)\n\n'
-      + approvedTerms.map((x) => `- "${x.source}" → "${x.target}"${x.notes ? ` (${x.notes})` : ''}`).join('\n'));
-  }
-  if (candidateTerms.length) {
-    parts.push('## Terminology — candidates (prefer these unless context demands otherwise)\n\n'
-      + candidateTerms.map((x) => `- "${x.source}" → "${x.target}"`).join('\n'));
-  }
   if (templateLines.length) {
     parts.push(`## Phrasing template for this article\n\nFollow this ${targetLangName} phrasing pattern:\n\n` + templateLines.join('\n'));
   }
@@ -384,11 +408,18 @@ function updateRowsById(existingBookText, newRows, { parse = parseTnTsv, seriali
   return serialize(merged);
 }
 
-/** Machine-readable per-run report (spec §2.3 sidecar, adapted — see PLAN.md). */
-function buildTranslateReport({ resourceType = 'tn', book, startChapter, endChapter, articleId, files, targetLang, sourceLang, sourceRef, contextRef, contextSha, batches, checks, selection }) {
+/** Machine-readable per-run report (CONTEXT-REPO-CONTRACT.md §4.2). */
+function buildTranslateReport({
+  resourceType = 'tn', book, startChapter, endChapter, articleId, files,
+  targetLang, sourceLang, sourceRef, contextRef, contextSha, batches, checks, selection,
+  runId = null, jobId = null, generatedAt = null, targetOrg = null, targetRepo = null, branch = null,
+}) {
   return {
     version: 1,
     generatedBy: 'bp-assistant/translate',
+    runId: runId || null,
+    jobId: jobId || null,
+    generatedAt: generatedAt || new Date().toISOString(),
     resourceType,
     book: book || null,
     startChapter: startChapter ?? null,
@@ -400,6 +431,15 @@ function buildTranslateReport({ resourceType = 'tn', book, startChapter, endChap
     sourceRef,
     contextRef,
     contextSha: contextSha || null,
+    targetOrg: targetOrg || null,
+    targetRepo: targetRepo || null,
+    branch: branch || null,
+    scope: {
+      book: book || null,
+      startChapter: startChapter ?? null,
+      endChapter: endChapter ?? null,
+      articleId: articleId || null,
+    },
     selection: selection || { mergeMode: 'range', verseStart: null, verseEnd: null, rowIds: null },
     rowCount: (batches || []).reduce((s, b) => s + (b.rowCount || 0), 0),
     batches: (batches || []).map((b) => ({
@@ -427,6 +467,8 @@ module.exports = {
   buildBatches,
   renderBatchPack,
   renderArticlePack,
+  renderTerminologySections,
+  selectExamples,
   writeBatchFiles,
   writeArticleFiles,
   readBatchOutput,
@@ -439,4 +481,5 @@ module.exports = {
   sliceChapterRows,
   BATCH_MAX_ROWS,
   BATCH_MAX_NOTE_CHARS,
+  MAX_EXAMPLES_PER_BATCH,
 };

@@ -42,6 +42,8 @@ const { runChecks, runArticleChecks } = require('./lib/translate-checks');
 const { makeTsvCodec } = require('./lib/tsv-resource');
 const { getResourceType, ROUTE_RESOURCE_TYPE, articleScopeBook } = require('./lib/resource-types');
 const { resolveArticle } = require('./lib/article-resolver');
+const { buildSuggestionInbox, shouldWriteContextBack } = require('./lib/translate-suggestions');
+const { writeContextArtifactsSafe } = require('./lib/context-write');
 const core = require('./lib/translate-core');
 
 const LOG_PREFIX = '[translate]';
@@ -170,6 +172,10 @@ function resolveParams(route, message) {
     sourceRef,
     contextRef,
     contextRefExplicit,
+    writeContextBack: opts.writeContextBack === true ? true
+      : opts.writeContextBack === false ? false
+        : null,
+    jobId: opts.jobId || route._jobId || null,
     model: opts.model || route.model || 'opus',
     delivery,
     branchOnly: opts.branchOnly !== false,
@@ -340,11 +346,13 @@ async function translateChapters(params, { workDir, onProgress, runBatchImpl, ma
     book: params.book, startChapter: params.startChapter, endChapter: params.endChapter,
     targetLang: params.targetLang, sourceLang: params.sourceLang,
     sourceRef: params.sourceRef, contextRef: params.contextRef, contextSha: pack.sha,
+    targetOrg: params.targetOrg, targetRepo: params.repoName,
+    jobId: params.jobId || null,
     batches: batchMeta, checks,
     selection: { mergeMode: params.mergeMode, verseStart: params.verseStart ?? null, verseEnd: params.verseEnd ?? null, rowIds: params.rowIds ?? null },
   });
 
-  return { sourceRows: rows, targetRows, checks, report, bookText, existingBookText };
+  return { sourceRows: rows, targetRows, checks, report, bookText, existingBookText, pack };
 }
 
 // ---------------------------------------------------------------------------
@@ -463,11 +471,13 @@ async function translateArticles(params, { workDir, onProgress, resolveImpl, run
     articleId: resolved.articleId, files: outFiles.map((f) => f.path),
     targetLang: params.targetLang, sourceLang: params.sourceLang,
     sourceRef: params.sourceRef, contextRef: params.contextRef, contextSha: pack.sha,
+    targetOrg: params.targetOrg, targetRepo: params.repoName,
+    jobId: params.jobId || null,
     batches: fileMeta, checks: allChecks,
     selection: { mergeMode: 'article', verseStart: null, verseEnd: null, rowIds: null },
   });
 
-  return { articleId: resolved.articleId, files: outFiles, report, allChecks };
+  return { articleId: resolved.articleId, files: outFiles, report, allChecks, pack };
 }
 
 // ---------------------------------------------------------------------------
@@ -535,8 +545,80 @@ async function translatePipeline(route, message) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Post-delivery context-repo write-back (non-fatal)
+// ---------------------------------------------------------------------------
+
+async function finalizeContextWriteBack({
+  params, pack, report, sourceRows = [], targetRows = [], deliveryBranch = null, label,
+}) {
+  if (!shouldWriteContextBack(params, pack)) {
+    return { ok: true, written: [], skipped: 'write-back-not-eligible' };
+  }
+
+  const runId = crypto.randomUUID();
+  report.runId = runId;
+  report.jobId = report.jobId || params.jobId || null;
+  report.generatedAt = report.generatedAt || new Date().toISOString();
+  report.targetOrg = report.targetOrg || params.targetOrg;
+  report.targetRepo = report.targetRepo || params.repoName;
+  report.branch = deliveryBranch || report.branch || null;
+  report.scope = report.scope || {
+    book: params.book || null,
+    startChapter: params.startChapter ?? null,
+    endChapter: params.endChapter ?? null,
+    articleId: params.articleId || null,
+  };
+
+  // Article runs pass no TSV rows — reconstruct template-needed signals from report batches.
+  let rowsForSuggestions = sourceRows;
+  if (!rowsForSuggestions.length && report.batches) {
+    rowsForSuggestions = [];
+    for (const b of report.batches) {
+      for (const slug of b.templateFallbacks || []) {
+        rowsForSuggestions.push({ SupportReference: slug, ID: b.path || String(b.batch || b.nn || '') });
+      }
+    }
+  }
+
+  const inbox = buildSuggestionInbox({
+    runId,
+    jobId: report.jobId,
+    generatedAt: report.generatedAt,
+    contextRef: params.contextRef,
+    contextSha: report.contextSha,
+    sourceRef: params.sourceRef,
+    targetOrg: params.targetOrg,
+    targetRepo: params.repoName,
+    branch: deliveryBranch,
+    resourceType: params.resourceType,
+    scope: report.scope,
+    pack,
+    sourceRows: rowsForSuggestions,
+    targetRows,
+  });
+
+  return writeContextArtifactsSafe({
+    contextRef: params.contextRef,
+    runId,
+    report,
+    inbox,
+  }, {
+    onError: async (err) => {
+      await publishAdminStatus({
+        source: 'translate-pipeline',
+        pipelineType: 'translate',
+        scope: label,
+        phase: 'context-write',
+        severity: 'warn',
+        message: `context write-back failed: ${err.message}`,
+      });
+    },
+  });
+}
+
 async function runTsvDelivery({ params, ckptId, scope, workDir, runHash, label, username, post }) {
-  const { targetRows, report, bookText } = await translateChapters(params, {
+  const { sourceRows, targetRows, report, bookText, pack } = await translateChapters(params, {
     workDir,
     onProgress: (msg) => {
       console.log(`${LOG_PREFIX} ${msg}`);
@@ -548,7 +630,29 @@ async function runTsvDelivery({ params, ckptId, scope, workDir, runHash, label, 
   fs.mkdirSync(outDir, { recursive: true });
   const bookFile = path.join(outDir, getResourceType(params.resourceType).file(params.book));
   const reportFile = path.join(outDir, `translate-report-${params.startChapter}-${params.endChapter}.json`);
-  fs.writeFileSync(bookFile, bookText, 'utf8');
+
+  let deliveryBranch = null;
+  let pushResult = null;
+
+  if (params.delivery !== 'path') {
+    const chapterTag = params.startChapter === params.endChapter
+      ? String(params.startChapter).padStart(2, '0')
+      : `${String(params.startChapter).padStart(2, '0')}-${String(params.endChapter).padStart(2, '0')}`;
+    deliveryBranch = `AI-translate-${params.targetLang}-${params.resourceType}-${params.book}-${chapterTag}-${runHash}`;
+    fs.writeFileSync(bookFile, bookText, 'utf8');
+    pushResult = await door43Push({
+      type: params.pushType, book: params.book, chapter: params.startChapter, username, branch: deliveryBranch,
+      source: path.relative(CSKILLBP_DIR, bookFile), org: params.targetOrg, repoName: params.repoName,
+      wholeFile: true, endChapter: params.endChapter, pipeline: 'translate', branchOnly: params.branchOnly,
+    });
+    if (!pushResult.success) throw new Error(`Door43 push failed: ${pushResult.details}`);
+  } else {
+    fs.writeFileSync(bookFile, bookText, 'utf8');
+  }
+
+  await finalizeContextWriteBack({
+    params, pack, report, sourceRows, targetRows, deliveryBranch, label,
+  });
   fs.writeFileSync(reportFile, JSON.stringify(report, null, 2), 'utf8');
 
   setCheckpoint(ckptId, { state: 'done', current: { chapter: params.endChapter, skill: params.skill, status: 'done' } });
@@ -557,27 +661,16 @@ async function runTsvDelivery({ params, ckptId, scope, workDir, runHash, label, 
   if (params.delivery === 'path') {
     await post(`:check: Translated **${label}** — ${summary}.\nFile: \`${bookFile}\`\nReport: \`${reportFile}\``);
     console.log(`${LOG_PREFIX} ${label} delivered as path: ${bookFile}`);
-    return { bookFile, reportFile, delivery: 'path' };
+    return { bookFile, reportFile, delivery: 'path', runId: report.runId || null };
   }
 
-  const chapterTag = params.startChapter === params.endChapter
-    ? String(params.startChapter).padStart(2, '0')
-    : `${String(params.startChapter).padStart(2, '0')}-${String(params.endChapter).padStart(2, '0')}`;
-  const branch = `AI-translate-${params.targetLang}-${params.resourceType}-${params.book}-${chapterTag}-${runHash}`;
-  const pushResult = await door43Push({
-    type: params.pushType, book: params.book, chapter: params.startChapter, username, branch,
-    source: path.relative(CSKILLBP_DIR, bookFile), org: params.targetOrg, repoName: params.repoName,
-    wholeFile: true, endChapter: params.endChapter, pipeline: 'translate', branchOnly: params.branchOnly,
-  });
-  if (!pushResult.success) throw new Error(`Door43 push failed: ${pushResult.details}`);
-
-  const where = pushResult.branchUrl ? `branch [${branch}](${pushResult.branchUrl}) (review before merge)` : `PR #${pushResult.prNumber || '?'} (merged)`;
+  const where = pushResult.branchUrl ? `branch [${deliveryBranch}](${pushResult.branchUrl}) (review before merge)` : `PR #${pushResult.prNumber || '?'} (merged)`;
   await post(`:check: Translated **${label}** — ${summary}. Landed on ${where}.`);
-  return { bookFile, reportFile, delivery: 'branch', branch, prNumber: pushResult.prNumber };
+  return { bookFile, reportFile, delivery: 'branch', branch: deliveryBranch, prNumber: pushResult.prNumber, runId: report.runId || null };
 }
 
 async function runArticleDelivery({ params, ckptId, scope, workDir, runHash, label, username, post }) {
-  const { articleId, files, report } = await translateArticles(params, {
+  const { articleId, files, report, pack } = await translateArticles(params, {
     workDir,
     onProgress: (msg) => {
       console.log(`${LOG_PREFIX} ${msg}`);
@@ -594,6 +687,24 @@ async function runArticleDelivery({ params, ckptId, scope, workDir, runHash, lab
     staged.push({ path: f.path, local });
   }
   const reportFile = path.join(outDir, `translate-report-${articleId.replace(/[^A-Za-z0-9]+/g, '_')}.json`);
+
+  let deliveryBranch = null;
+  let pushResult = null;
+  if (params.delivery !== 'path') {
+    deliveryBranch = `AI-translate-${params.targetLang}-${params.resourceType}-${articleId.replace(/[^A-Za-z0-9]+/g, '-')}-${runHash}`;
+    pushResult = await door43Push({
+      type: 'article',
+      files: staged.map((s) => ({ path: s.path, source: path.relative(CSKILLBP_DIR, s.local) })),
+      username, branch: deliveryBranch, org: params.targetOrg, repoName: params.repoName,
+      pipeline: 'translate', branchOnly: params.branchOnly,
+    });
+    if (!pushResult.success) throw new Error(`Door43 push failed: ${pushResult.details}`);
+  }
+
+  // Article runs have no TSV source/target rows for term harvest; templates only.
+  await finalizeContextWriteBack({
+    params, pack, report, sourceRows: [], targetRows: [], deliveryBranch, label,
+  });
   fs.writeFileSync(reportFile, JSON.stringify(report, null, 2), 'utf8');
 
   setCheckpoint(ckptId, { state: 'done', current: { chapter: 1, skill: params.skill, status: 'done' } });
@@ -602,20 +713,12 @@ async function runArticleDelivery({ params, ckptId, scope, workDir, runHash, lab
   if (params.delivery === 'path') {
     await post(`:check: Translated **${label}** — ${summary}.\nFiles:\n${staged.map((s) => `- \`${s.local}\``).join('\n')}\nReport: \`${reportFile}\``);
     console.log(`${LOG_PREFIX} ${label} delivered as path (${staged.length} files)`);
-    return { articleId, files: staged, reportFile, delivery: 'path' };
+    return { articleId, files: staged, reportFile, delivery: 'path', runId: report.runId || null };
   }
 
-  const branch = `AI-translate-${params.targetLang}-${params.resourceType}-${articleId.replace(/[^A-Za-z0-9]+/g, '-')}-${runHash}`;
-  const pushResult = await door43Push({
-    type: 'article',
-    files: staged.map((s) => ({ path: s.path, source: path.relative(CSKILLBP_DIR, s.local) })),
-    username, branch, org: params.targetOrg, repoName: params.repoName,
-    pipeline: 'translate', branchOnly: params.branchOnly,
-  });
-  if (!pushResult.success) throw new Error(`Door43 push failed: ${pushResult.details}`);
-  const where = pushResult.branchUrl ? `branch [${branch}](${pushResult.branchUrl}) (review before merge)` : `PR #${pushResult.prNumber || '?'} (merged)`;
+  const where = pushResult.branchUrl ? `branch [${deliveryBranch}](${pushResult.branchUrl}) (review before merge)` : `PR #${pushResult.prNumber || '?'} (merged)`;
   await post(`:check: Translated **${label}** — ${summary}. Landed on ${where}.`);
-  return { articleId, files: staged, reportFile, delivery: 'branch', branch, prNumber: pushResult.prNumber };
+  return { articleId, files: staged, reportFile, delivery: 'branch', branch: deliveryBranch, prNumber: pushResult.prNumber, runId: report.runId || null };
 }
 
 module.exports = {
