@@ -32,13 +32,18 @@ function collectTemplateNeeded(sourceRows, pack) {
     .map(([slug, hitCount]) => ({ slug, hitCount, sampleRowIds: samples.get(slug) || [] }));
 }
 
-function freeText(row) {
-  return String(row.Note || row.Question || row.Response || '');
+const FREE_TEXT_COLUMNS = ['Note', 'Question', 'Response'];
+
+function boldSpans(text) {
+  return [...String(text || '').matchAll(/\*\*([^*]+)\*\*/g)]
+    .map((m) => m[1].trim().normalize('NFC'))
+    .filter(Boolean);
 }
 
 /**
- * Harvest bold-span source→target pairs when source/target notes share the
- * same number of **bold** markers. Skip pairs already preferred/admitted.
+ * Harvest bold-span source→target pairs per free-text column (Note, Question,
+ * Response). Columns are matched independently so tQ Response bolds are not
+ * dropped when Question is present. Skip pairs already preferred/admitted.
  */
 function collectTermObservations(sourceRows, targetRows, pack) {
   const known = new Map(); // lower source -> Set of lower targets
@@ -56,25 +61,29 @@ function collectTermObservations(sourceRows, targetRows, pack) {
   for (const src of sourceRows || []) {
     const tgt = byId.get(src.ID);
     if (!tgt) continue;
-    const srcText = freeText(src);
-    const tgtText = freeText(tgt);
-    const boldSrc = [...srcText.matchAll(/\*\*([^*]+)\*\*/g)].map((m) => m[1].trim().normalize('NFC'));
-    const boldTgt = [...tgtText.matchAll(/\*\*([^*]+)\*\*/g)].map((m) => m[1].trim().normalize('NFC'));
-    if (!boldSrc.length || boldSrc.length !== boldTgt.length) continue;
 
-    for (let i = 0; i < boldSrc.length; i++) {
-      const s = boldSrc[i];
-      const t = boldTgt[i];
-      if (!s || !t || s === t) continue;
-      const existing = known.get(s.toLowerCase());
-      if (existing && existing.size) continue; // already in human vocabulary
-      const key = `${s}\0${t}`;
-      if (!observed.has(key)) {
-        observed.set(key, { source: s, target: t, count: 0, sampleRowIds: [] });
+    for (const col of FREE_TEXT_COLUMNS) {
+      const srcText = src[col];
+      const tgtText = tgt[col];
+      if (srcText == null && tgtText == null) continue;
+      const boldSrc = boldSpans(srcText);
+      const boldTgt = boldSpans(tgtText);
+      if (!boldSrc.length || boldSrc.length !== boldTgt.length) continue;
+
+      for (let i = 0; i < boldSrc.length; i++) {
+        const s = boldSrc[i];
+        const t = boldTgt[i];
+        if (!s || !t || s === t) continue;
+        const existing = known.get(s.toLowerCase());
+        if (existing && existing.size) continue;
+        const key = `${s}\0${t}`;
+        if (!observed.has(key)) {
+          observed.set(key, { source: s, target: t, count: 0, sampleRowIds: [] });
+        }
+        const o = observed.get(key);
+        o.count += 1;
+        if (o.sampleRowIds.length < 3 && src.ID) o.sampleRowIds.push(src.ID);
       }
-      const o = observed.get(key);
-      o.count += 1;
-      if (o.sampleRowIds.length < 3 && src.ID) o.sampleRowIds.push(src.ID);
     }
   }
 

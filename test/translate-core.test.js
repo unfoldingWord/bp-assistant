@@ -15,6 +15,7 @@ const {
 } = require('../src/lib/context-pack');
 const {
   buildSuggestionInbox, shouldWriteContextBack, MAX_SUGGESTIONS,
+  collectTermObservations,
 } = require('../src/lib/translate-suggestions');
 
 const OBA_PATH = path.join(__dirname, 'fixtures', 'tn_OBA.tsv');
@@ -87,6 +88,24 @@ test('parseTermsCsv handles 7-col schema, quoting, and status vocab', () => {
   assert.strictEqual(terms[1].replacement, 'الرب');
   assert.strictEqual(terms[2].status, 'do_not_translate');
   assert.strictEqual(terms[2].target, '');
+});
+
+test('parseTermsCsv preserves multiline quoted fields (RFC-4180)', () => {
+  const csv = [
+    'concept_id,source_term,target_term,status,replacement,comment,tw_link',
+    'kt/x,grace,"نعمة',
+    'with newline",preferred,,"line1',
+    'line2",',
+    'kt/y,mercy,رحمة,preferred,,,',
+  ].join('\n');
+  const terms = parseTermsCsv(csv);
+  assert.strictEqual(terms.length, 2);
+  assert.strictEqual(terms[0].source, 'grace');
+  assert.strictEqual(terms[0].target, 'نعمة\nwith newline');
+  assert.strictEqual(terms[0].status, 'preferred');
+  assert.strictEqual(terms[0].comment, 'line1\nline2');
+  assert.strictEqual(terms[1].source, 'mercy');
+  assert.strictEqual(terms[1].target, 'رحمة');
 });
 
 test('parseTemplatesTsv keeps only active rows', () => {
@@ -241,6 +260,25 @@ test('buildSuggestionInbox caps at MAX_SUGGESTIONS and prioritizes templates', (
   assert.strictEqual(inbox.suggestions.length, MAX_SUGGESTIONS);
   assert.ok(inbox.suggestions.every((s) => s.kind === 'template_needed'));
   assert.strictEqual(inbox.runId, 'run-1');
+});
+
+test('collectTermObservations harvests Response bolds even when Question is set', () => {
+  const pack = { templates: new Map(), terms: [] };
+  const sourceRows = [{
+    ID: 'q1',
+    Question: 'What does **grace** mean?',
+    Response: 'It means **favor** from God.',
+  }];
+  const targetRows = [{
+    ID: 'q1',
+    Question: 'ماذا تعني **النعمة**؟',
+    Response: 'تعني **رعًا** من الله.',
+  }];
+  const observed = collectTermObservations(sourceRows, targetRows, pack);
+  const sources = observed.map((o) => o.source).sort();
+  assert.deepStrictEqual(sources, ['favor', 'grace']);
+  assert.ok(observed.some((o) => o.source === 'favor' && o.target === 'رعًا'));
+  assert.ok(observed.some((o) => o.source === 'grace' && o.target === 'النعمة'));
 });
 
 test('mergeChapterIntoBook: fresh book equals serialized new rows', () => {

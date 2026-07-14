@@ -103,18 +103,23 @@ function parseRegisterFromBrief(brief) {
 }
 
 /**
- * RFC-4180 CSV row parser (quoted fields, escaped "").
- * Returns array of string fields for one line (or null if line is empty).
+ * RFC-4180 CSV parsers. Quoted fields may contain commas, "" escapes, and
+ * CRLF/LF newlines — so we scan the whole text as a record stream rather than
+ * splitting on physical lines first.
  */
-function parseCsvLine(line) {
-  const s = String(line);
-  if (!s.trim()) return null;
+
+/** Parse one CSV record starting at `start`. Returns { fields, next } or null at EOF. */
+function parseCsvRecord(text, start = 0) {
+  const s = String(text);
+  let i = start;
+  while (i < s.length && (s[i] === '\n' || s[i] === '\r')) i += 1;
+  if (i >= s.length) return null;
+
   const fields = [];
-  let i = 0;
   while (i <= s.length) {
-    if (i === s.length) {
+    if (i >= s.length) {
       fields.push('');
-      break;
+      return { fields, next: i };
     }
     if (s[i] === '"') {
       let out = '';
@@ -130,15 +135,40 @@ function parseCsvLine(line) {
       }
       fields.push(out);
       if (s[i] === ',') { i += 1; continue; }
-      break;
+      if (s[i] === '\r') i += 1;
+      if (s[i] === '\n') i += 1;
+      return { fields, next: i };
     }
+
     let j = i;
-    while (j < s.length && s[j] !== ',') j += 1;
+    while (j < s.length && s[j] !== ',' && s[j] !== '\n' && s[j] !== '\r') j += 1;
     fields.push(s.slice(i, j));
-    i = j + 1;
-    if (j === s.length) break;
+    if (s[j] === ',') { i = j + 1; continue; }
+    if (s[j] === '\r') j += 1;
+    if (s[j] === '\n') j += 1;
+    return { fields, next: j };
   }
-  return fields;
+  return { fields, next: i };
+}
+
+/** Yield all CSV records from text (skips blank all-empty records). */
+function parseCsvRecords(text) {
+  const records = [];
+  let pos = 0;
+  while (true) {
+    const rec = parseCsvRecord(text, pos);
+    if (!rec) break;
+    pos = rec.next;
+    if (rec.fields.length === 1 && rec.fields[0] === '') continue;
+    records.push(rec.fields);
+  }
+  return records;
+}
+
+/** @deprecated Prefer parseCsvRecord; kept for callers that already have one physical line. */
+function parseCsvLine(line) {
+  const rec = parseCsvRecord(String(line).replace(/\r?\n$/, ''), 0);
+  return rec ? rec.fields : null;
 }
 
 // templates.tsv: support_reference \t target_template \t status \t comment
@@ -165,15 +195,11 @@ function parseTemplatesTsv(text) {
 // terms.csv: concept_id,source_term,target_term,status,replacement,comment,tw_link
 function parseTermsCsv(text) {
   const terms = [];
-  const lines = String(text).replace(/\r\n/g, '\n').split('\n');
-  let header = null;
-  for (const line of lines) {
-    const fields = parseCsvLine(line);
-    if (!fields) continue;
-    if (!header) {
-      header = fields.map((h) => h.trim().toLowerCase());
-      continue;
-    }
+  const records = parseCsvRecords(text);
+  if (!records.length) return terms;
+  const header = records[0].map((h) => h.trim().toLowerCase());
+  for (let r = 1; r < records.length; r++) {
+    const fields = records[r];
     const row = {};
     header.forEach((h, idx) => { row[h] = fields[idx] != null ? fields[idx] : ''; });
 
@@ -322,6 +348,8 @@ module.exports = {
   parseManifestYaml,
   parseRegisterFromBrief,
   parseCsvLine,
+  parseCsvRecord,
+  parseCsvRecords,
   PACK_FILES,
   SUPPORTED_MANIFEST_FORMAT,
 };
