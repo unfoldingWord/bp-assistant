@@ -15,7 +15,7 @@
     "@anthropic-ai/sdk": "^0.110.0",
     "@google/genai": "^1.46.0",
     "@modelcontextprotocol/sdk": "^1.29.0",
-    "@openai/agents": "^0.8.3",
+    "@openai/agents": "^0.13.4",
     "ccusage": "^20.0.14",
     "dotenv": "^17.4.2",
     "fast-glob": "^3.3.3",
