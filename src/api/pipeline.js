@@ -92,6 +92,7 @@ const OptionsSchema = z.object({
   repoName: z.string().min(1).max(60).regex(/^[A-Za-z0-9._-]+$/).optional(),
   sourceRef: z.string().min(3).max(200).regex(/^[^/@\s]+\/[^/@\s]+@\S+$/).optional(),
   contextRef: z.string().min(3).max(200).regex(/^[^/@\s]+\/[^/@\s]+@\S+$/).optional(),
+  writeContextBack: z.boolean().optional(),
   branchOnly: z.boolean().optional(),
   delivery: z.enum(['path', 'branch']).optional(),
   direction: z.enum(['ltr', 'rtl']).optional(),
@@ -215,7 +216,7 @@ const StartBodySchema = z.object({
       }
     }
   } else {
-    for (const k of ['resourceType', 'targetLang', 'targetOrg', 'repoName', 'sourceRef', 'sourceLang', 'contextRef', 'branchOnly', 'delivery', 'direction', 'rowIds', 'articleId', 'articleUrl']) {
+    for (const k of ['resourceType', 'targetLang', 'targetOrg', 'repoName', 'sourceRef', 'sourceLang', 'contextRef', 'writeContextBack', 'branchOnly', 'delivery', 'direction', 'rowIds', 'articleId', 'articleUrl']) {
       if (o[k] !== undefined) {
         ctx.addIssue({
           code: z.ZodIssueCode.custom,
