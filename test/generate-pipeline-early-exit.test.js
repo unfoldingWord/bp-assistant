@@ -585,3 +585,91 @@ test('generatePipeline reruns align-all-parallel when first post-align validatio
     harness.cleanup();
   }
 });
+
+// Issue #212: a prior ULT-only run left the checkpoint at align-all-parallel with
+// only ULT on disk (UST was never produced). A follow-up run in full-pipeline mode
+// resumed from that checkpoint and *skipped* initial-pipeline entirely because the
+// resume shortcut only looked at resumeSkill, not at what content the current run
+// actually requires. The skip meant UST was still never generated, so the
+// missing-output gate fired ~140ms after start and spawned a spurious diagnosis
+// issue. The fix: before taking the shortcut, verify every required content type
+// already has an output file on disk; otherwise fall through to initial-pipeline.
+test('generatePipeline reruns initial-pipeline when align-all-parallel resume lacks a required content type', async () => {
+  const initialCheckpoint = {
+    state: 'failed',
+    success: 0,
+    fail: 1,
+    completedChapters: [],
+    current: {
+      chapter: 52,
+      skill: 'align-all-parallel',
+      status: 'failed',
+      errorKind: 'non_success_result',
+    },
+    // Prior run was ULT-only; checkpoint records align-all-parallel as the resume skill.
+    resume: { chapter: 52, skill: 'align-all-parallel' },
+  };
+  const initialPipelineCalls = [];
+  const harness = createHarness({
+    initialCheckpoint,
+    runClaudeImpl: async ({ options, tempDir }) => {
+      if (options.skill === 'initial-pipeline') {
+        initialPipelineCalls.push(options);
+        fs.mkdirSync(path.join(tempDir, 'output', 'AI-ULT', 'ISA'), { recursive: true });
+        fs.mkdirSync(path.join(tempDir, 'output', 'AI-UST', 'ISA'), { recursive: true });
+        fs.mkdirSync(path.join(tempDir, 'output', 'issues', 'ISA'), { recursive: true });
+        fs.writeFileSync(path.join(tempDir, 'output', 'AI-ULT', 'ISA', 'ISA-52.usfm'), '\\id ISA\n\\c 52\n\\v 1 ult\n');
+        fs.writeFileSync(path.join(tempDir, 'output', 'AI-UST', 'ISA', 'ISA-52.usfm'), '\\id ISA\n\\c 52\n\\v 1 ust\n');
+        fs.writeFileSync(path.join(tempDir, 'output', 'issues', 'ISA', 'ISA-52.tsv'), 'Reference\tID\nISA 52:1\ta1b2\n');
+        return { subtype: 'success', usage: {}, total_cost_usd: 0 };
+      }
+      if (options.skill === 'align-all-parallel') {
+        fs.mkdirSync(path.join(tempDir, 'output', 'AI-ULT', 'ISA'), { recursive: true });
+        fs.mkdirSync(path.join(tempDir, 'output', 'AI-UST', 'ISA'), { recursive: true });
+        const good = '\\id ISA\n\\c 52\n\\v 1 \\zaln-s |x-strong="H1" x-content="א"\\*\\w Joshua|x-occurrence="1" x-occurrences="1"\\w*\\zaln-e\\*\n';
+        fs.writeFileSync(path.join(tempDir, 'output', 'AI-ULT', 'ISA', 'ISA-52-aligned.usfm'), good);
+        fs.writeFileSync(path.join(tempDir, 'output', 'AI-UST', 'ISA', 'ISA-52-aligned.usfm'), good);
+        return { subtype: 'success', usage: {}, total_cost_usd: 0 };
+      }
+      return { subtype: 'success', usage: {}, total_cost_usd: 0 };
+    },
+  });
+
+  try {
+    // Pre-populate the ULT-only artifact the prior run produced. UST is absent —
+    // exactly the on-disk state described in issue #212.
+    fs.mkdirSync(path.join(harness.tempDir, 'output', 'AI-ULT', 'ISA'), { recursive: true });
+    fs.writeFileSync(
+      path.join(harness.tempDir, 'output', 'AI-ULT', 'ISA', 'ISA-52.usfm'),
+      '\\id ISA\n\\c 52\n\\v 1 prior ult from ULT-only run\n'
+    );
+
+    await harness.generatePipeline(
+      { _synthetic: true, _book: 'ISA', _startChapter: 52, _endChapter: 52, skill: 'initial-pipeline', operations: 6 },
+      buildMessage('generate isa 52')
+    );
+
+    // The regression: initial-pipeline was skipped and the missing-output gate
+    // fired with errorKind='missing_output'. After the fix, initial-pipeline
+    // runs, both artifacts are generated, alignment proceeds, and no
+    // missing-output / resume_scope_mismatch checkpoint is written.
+    assert.equal(initialPipelineCalls.length, 1, 'expected initial-pipeline to run when UST is missing on a full-pipeline resume');
+    assert.ok(
+      harness.readStatusTexts().some((text) => text.includes('narrower content-type set')),
+      'expected a status message explaining why we fell through to initial-pipeline'
+    );
+    assert.equal(
+      harness.checkpoints.some((patch) => patch.current?.errorKind === 'missing_output'),
+      false,
+      'missing-output gate must not fire when initial-pipeline was allowed to run'
+    );
+    assert.equal(
+      harness.checkpoints.some((patch) => patch.current?.errorKind === 'resume_scope_mismatch'),
+      false,
+      'resume_scope_mismatch must not fire when the guard successfully re-ran initial-pipeline'
+    );
+    assert.equal(harness.runSummaries.at(-1).success, true);
+  } finally {
+    harness.cleanup();
+  }
+});
