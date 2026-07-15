@@ -726,7 +726,33 @@ async function generatePipeline(route, message) {
     const chapterStart = Date.now();
     let claudeResult = null;
     let sdkError = null;
-    const runInitialSkill = !(ch === resumeChapter && resumeSkill === 'align-all-parallel');
+    // Guard against the align-all-parallel resume shortcut incorrectly skipping
+    // initial-pipeline when the current run requires content the checkpointed
+    // run never produced (e.g. prior run was ULT-only, current run needs UST too).
+    // Without this check the missing-output gate below fires instantly on the
+    // resumed run and spawns a spurious diagnosis issue (see issue #212).
+    let alignResumeShortcut = ch === resumeChapter && resumeSkill === 'align-all-parallel';
+    if (alignResumeShortcut) {
+      const preExistPat = new RegExp(`^${book}-0*${ch}(-(?!.*aligned).*)?\\.usfm$`);
+      const preExistUlt = !!discoverFreshOutput('output/AI-ULT', book, preExistPat, null);
+      const preExistUst = !!discoverFreshOutput('output/AI-UST', book, preExistPat, null);
+      if (!hasRequiredGeneratedOutputs(contentTypes, { hasUlt: preExistUlt, hasUst: preExistUst })) {
+        const missingForResume = contentTypes
+          .filter((type) => (type === 'ult' ? !preExistUlt : !preExistUst))
+          .map((type) => type.toUpperCase());
+        await status(
+          `Resume checkpoint at **align-all-parallel** for ${book} ${ch} was written by a run using a narrower content-type set ` +
+          `(missing ${missingForResume.join(', ')} on disk). Falling through to **${skill}** so the missing content is generated ` +
+          `before alignment.`
+        );
+        alignResumeShortcut = false;
+        // Clear resumeSkill so the downstream "align outputs already complete"
+        // shortcut (which trusts the checkpoint) also re-evaluates from scratch
+        // instead of hunting for aligned files that were never produced.
+        resumeSkill = null;
+      }
+    }
+    const runInitialSkill = !alignResumeShortcut;
     const resumeInitialPipelineEarlyExit = (
       ch === resumeChapter &&
       isInitialPipelineSkill &&
@@ -1104,7 +1130,16 @@ async function generatePipeline(route, message) {
 
     if (!hasRequiredGeneratedOutputs(contentTypes, { hasUlt, hasUst })) {
       const missingTypes = contentTypes.filter((type) => (type === 'ult' ? !hasUlt : !hasUst)).map((type) => type.toUpperCase());
-      const missingEvent = await status(`Failed to generate **${book} ${ch}**. Missing expected output: ${missingTypes.join(', ')}.${hasUlt || hasUst ? ' Some artifacts exist but may be incomplete.' : ''} Check logs for details.`);
+      // Distinguish a genuine post-generation failure from the case where
+      // initial-pipeline never ran this pass because we resumed at align-all-parallel.
+      // The former is a real generation bug; the latter is a resume/scope mismatch
+      // that should have been caught by the guard above — surfacing it here still
+      // avoids the misdiagnosis-as-content-bug pattern that spawned issue #211.
+      const skippedGeneration = !runInitialSkill;
+      const contextNote = skippedGeneration
+        ? ' (initial-pipeline was skipped this run because we resumed at align-all-parallel; the prior run likely used a narrower content-type mode)'
+        : (hasUlt || hasUst ? ' Some artifacts exist but may be incomplete.' : '');
+      const missingEvent = await status(`Failed to generate **${book} ${ch}**. Missing expected output: ${missingTypes.join(', ')}.${contextNote} Check logs for details.`);
       fail++;
       setCheckpoint(checkpointRef, {
         state: 'failed',
@@ -1115,7 +1150,7 @@ async function generatePipeline(route, message) {
           chapter: ch,
           skill,
           status: 'failed',
-          errorKind: 'missing_output',
+          errorKind: skippedGeneration ? 'resume_scope_mismatch' : 'missing_output',
           outputStatus: 'missing',
           missingTypes,
         },
@@ -1123,7 +1158,7 @@ async function generatePipeline(route, message) {
       });
       fireDiagnosis(missingEvent, {
         checkpoint: getCheckpoint(checkpointRef),
-        errorText: `Skill: ${skill}\nChapter: ${book} ${ch}\nMissing types: ${missingTypes.join(', ')}\nhasUlt=${hasUlt} hasUst=${hasUst}`,
+        errorText: `Skill: ${skill}\nChapter: ${book} ${ch}\nMissing types: ${missingTypes.join(', ')}\nhasUlt=${hasUlt} hasUst=${hasUst}\nrunInitialSkill=${runInitialSkill}${skippedGeneration ? '\nNote: initial-pipeline was skipped this run (resumed at align-all-parallel with narrower content-type mode).' : ''}`,
       });
       continue;
     }
