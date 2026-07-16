@@ -8,9 +8,12 @@
 // existing firePipeline → runPipeline path.
 
 const crypto = require('crypto');
+const fs = require('fs');
+const path = require('path');
 const { z } = require('zod');
 const { readSecret } = require('../secrets');
 const { getCheckpoint } = require('../pipeline-checkpoints');
+const { CSKILLBP_DIR } = require('../pipeline-utils');
 const { triggerPipelineFromApi, buildApiJobId, API_PIPELINE_ROUTE_NAMES } = require('../router');
 const { RESOURCE_TYPE_KEYS, isArticleResource } = require('../lib/resource-types');
 const { BOOK_NUMBERS } = require('../api-runner/verse-data');
@@ -94,7 +97,7 @@ const OptionsSchema = z.object({
   contextRef: z.string().min(3).max(200).regex(/^[^/@\s]+\/[^/@\s]+@\S+$/).optional(),
   writeContextBack: z.boolean().optional(),
   branchOnly: z.boolean().optional(),
-  delivery: z.enum(['path', 'branch']).optional(),
+  delivery: z.enum(['path', 'branch', 'editor']).optional(),
   direction: z.enum(['ltr', 'rtl']).optional(),
   // Individual-note / subset selection: translate only these published rows
   // and UPDATE them by ID into the existing target book (verse scoping uses
@@ -390,6 +393,11 @@ function serializeCheckpoint(jobId, cp) {
       ...(cp.current.error ? { error: cp.current.error } : {}),
     };
   }
+  // Editor-delivery jobs record their result manifest on the done checkpoint.
+  // Pass it through: when a checkpoint exists this serialized form is the ONLY
+  // status payload (detectLandedOutputs never runs), and bible-editor's import
+  // gate requires output.length > 0.
+  if (Array.isArray(cp.output)) out.output = cp.output;
   const updatedMs = Date.parse(cp.updatedAt || '');
   if (Number.isFinite(updatedMs) && cp.state === 'running') {
     // Mirror /health/pipelines' heuristic: a 'running' checkpoint untouched
@@ -559,9 +567,68 @@ async function handleStatusRequest(req, res, jobId) {
   }
 }
 
+// GET /api/pipeline/{jobId}/output?file=… — serve a finished editor-delivery
+// file from the run's out/ dir. The done checkpoint's output[] manifest is the
+// allowlist; anything not on it (unknown job, wrong file, traversal attempt,
+// swept file) is an opaque 404.
+async function handleOutputRequest(req, res, jobId, fileParam) {
+  try {
+    applyCors(req, res);
+
+    if (!checkAuth(req, res)) return;
+
+    const parsed = parseJobId(jobId);
+    const cp = parsed ? getCheckpoint({
+      sessionKey: parsed.sessionKey,
+      pipelineType: parsed.pipelineType,
+      scope: parsed.scope,
+    }) : null;
+
+    const entry = (cp && cp.state === 'done' && typeof cp.outDir === 'string'
+      && Array.isArray(cp.output) && typeof fileParam === 'string' && fileParam)
+      ? cp.output.find((e) => e && e.file === fileParam)
+      : null;
+    if (!entry) {
+      reply(res, 404, { error: 'not_found' });
+      return;
+    }
+
+    // Containment: the manifest is the allowlist, but defend in depth against
+    // a poisoned checkpoint — the resolved path must stay inside CSKILLBP_DIR.
+    const root = path.resolve(CSKILLBP_DIR);
+    const resolved = path.resolve(root, cp.outDir, fileParam);
+    if (resolved !== root && !resolved.startsWith(root + path.sep)) {
+      reply(res, 404, { error: 'not_found' });
+      return;
+    }
+
+    let data;
+    try {
+      data = fs.readFileSync(resolved);
+    } catch {
+      reply(res, 404, { error: 'not_found' });
+      return;
+    }
+
+    const ext = path.extname(resolved).toLowerCase();
+    const contentType = ext === '.tsv' ? 'text/tab-separated-values; charset=utf-8'
+      : ext === '.md' ? 'text/markdown; charset=utf-8'
+        : ext === '.json' ? 'application/json; charset=utf-8'
+          : 'application/octet-stream';
+    res.writeHead(200, { 'Content-Type': contentType, 'Content-Length': data.length });
+    res.end(data);
+  } catch (err) {
+    console.error(`[pipeline-api] output unhandled: ${err.stack || err.message}`);
+    if (!res.headersSent) {
+      reply(res, 500, { error: 'internal_error' });
+    }
+  }
+}
+
 module.exports = {
   handleStartRequest,
   handleStatusRequest,
+  handleOutputRequest,
   // exposed for testing
   parseJobId,
   StartBodySchema,
