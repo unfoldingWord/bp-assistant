@@ -129,7 +129,10 @@ function resolveParams(route, message) {
 
   const hasSubset = (rowIds && rowIds.length > 0) || verseStart != null;
   const mergeMode = hasSubset ? 'by-id' : 'range';
-  const delivery = opts.delivery || (route._synthetic ? 'branch' : 'path');
+  // Synthetic (API) runs default to 'editor': results stay on the bot and are
+  // pulled by bible-editor via GET /api/pipeline/{jobId}/output — unapproved AI
+  // output never touches Door43. 'branch' remains an explicit expert override.
+  const delivery = opts.delivery || (route._synthetic ? 'editor' : 'path');
 
   const cfg = TRANSLATE_TARGETS[targetLang] || {};
   const targetOrg = opts.targetOrg || cfg.targetOrg || `${targetLang}_gl`;
@@ -617,8 +620,10 @@ async function finalizeContextWriteBack({
   });
 }
 
-async function runTsvDelivery({ params, ckptId, scope, workDir, runHash, label, username, post }) {
-  const { sourceRows, targetRows, report, bookText, pack } = await translateChapters(params, {
+async function runTsvDelivery({ params, ckptId, scope, workDir, runHash, label, username, post }, deps = {}) {
+  const translateImpl = deps.translateImpl || translateChapters;
+  const pushImpl = deps.pushImpl || door43Push;
+  const { sourceRows, targetRows, report, bookText, pack } = await translateImpl(params, {
     workDir,
     onProgress: (msg) => {
       console.log(`${LOG_PREFIX} ${msg}`);
@@ -634,20 +639,21 @@ async function runTsvDelivery({ params, ckptId, scope, workDir, runHash, label, 
   let deliveryBranch = null;
   let pushResult = null;
 
-  if (params.delivery !== 'path') {
+  // The merged book file is written unconditionally, before any delivery
+  // branching — every mode ('path', 'branch', 'editor') serves it from disk.
+  fs.writeFileSync(bookFile, bookText, 'utf8');
+
+  if (params.delivery === 'branch') {
     const chapterTag = params.startChapter === params.endChapter
       ? String(params.startChapter).padStart(2, '0')
       : `${String(params.startChapter).padStart(2, '0')}-${String(params.endChapter).padStart(2, '0')}`;
     deliveryBranch = `AI-translate-${params.targetLang}-${params.resourceType}-${params.book}-${chapterTag}-${runHash}`;
-    fs.writeFileSync(bookFile, bookText, 'utf8');
-    pushResult = await door43Push({
+    pushResult = await pushImpl({
       type: params.pushType, book: params.book, chapter: params.startChapter, username, branch: deliveryBranch,
       source: path.relative(CSKILLBP_DIR, bookFile), org: params.targetOrg, repoName: params.repoName,
       wholeFile: true, endChapter: params.endChapter, pipeline: 'translate', branchOnly: params.branchOnly,
     });
     if (!pushResult.success) throw new Error(`Door43 push failed: ${pushResult.details}`);
-  } else {
-    fs.writeFileSync(bookFile, bookText, 'utf8');
   }
 
   await finalizeContextWriteBack({
@@ -655,7 +661,26 @@ async function runTsvDelivery({ params, ckptId, scope, workDir, runHash, label, 
   });
   fs.writeFileSync(reportFile, JSON.stringify(report, null, 2), 'utf8');
 
-  setCheckpoint(ckptId, { state: 'done', current: { chapter: params.endChapter, skill: params.skill, status: 'done' } });
+  const donePatch = { state: 'done', current: { chapter: params.endChapter, skill: params.skill, status: 'done' } };
+  let output = null;
+  if (params.delivery === 'editor') {
+    // Editor delivery: no Door43 push. The done checkpoint carries the output
+    // manifest; bible-editor fetches each entry's `file` from
+    // GET /api/pipeline/{jobId}/output?file=… (the manifest is the allowlist).
+    output = [
+      {
+        delivery: 'editor',
+        type: params.resourceType,
+        repo: `${params.targetOrg}/${params.repoName}`,
+        path: path.basename(bookFile),
+        file: path.basename(bookFile),
+      },
+      { delivery: 'editor', type: 'report', file: path.basename(reportFile) },
+    ];
+    donePatch.outDir = path.relative(CSKILLBP_DIR, outDir);
+    donePatch.output = output;
+  }
+  setCheckpoint(ckptId, donePatch);
   const summary = `${targetRows.length} rows, ${report.checks.warningCount} warning(s), 0 blocking violations`;
 
   if (params.delivery === 'path') {
@@ -664,13 +689,21 @@ async function runTsvDelivery({ params, ckptId, scope, workDir, runHash, label, 
     return { bookFile, reportFile, delivery: 'path', runId: report.runId || null };
   }
 
+  if (params.delivery === 'editor') {
+    await post(`:check: Translated **${label}** — ${summary}. Delivered to bible-editor as drafts (no Door43 push).`);
+    console.log(`${LOG_PREFIX} ${label} delivered to bible-editor: ${bookFile}`);
+    return { bookFile, reportFile, delivery: 'editor', output, runId: report.runId || null };
+  }
+
   const where = pushResult.branchUrl ? `branch [${deliveryBranch}](${pushResult.branchUrl}) (review before merge)` : `PR #${pushResult.prNumber || '?'} (merged)`;
   await post(`:check: Translated **${label}** — ${summary}. Landed on ${where}.`);
   return { bookFile, reportFile, delivery: 'branch', branch: deliveryBranch, prNumber: pushResult.prNumber, runId: report.runId || null };
 }
 
-async function runArticleDelivery({ params, ckptId, scope, workDir, runHash, label, username, post }) {
-  const { articleId, files, report, pack } = await translateArticles(params, {
+async function runArticleDelivery({ params, ckptId, scope, workDir, runHash, label, username, post }, deps = {}) {
+  const translateImpl = deps.translateImpl || translateArticles;
+  const pushImpl = deps.pushImpl || door43Push;
+  const { articleId, files, report, pack } = await translateImpl(params, {
     workDir,
     onProgress: (msg) => {
       console.log(`${LOG_PREFIX} ${msg}`);
@@ -690,9 +723,9 @@ async function runArticleDelivery({ params, ckptId, scope, workDir, runHash, lab
 
   let deliveryBranch = null;
   let pushResult = null;
-  if (params.delivery !== 'path') {
+  if (params.delivery === 'branch') {
     deliveryBranch = `AI-translate-${params.targetLang}-${params.resourceType}-${articleId.replace(/[^A-Za-z0-9]+/g, '-')}-${runHash}`;
-    pushResult = await door43Push({
+    pushResult = await pushImpl({
       type: 'article',
       files: staged.map((s) => ({ path: s.path, source: path.relative(CSKILLBP_DIR, s.local) })),
       username, branch: deliveryBranch, org: params.targetOrg, repoName: params.repoName,
@@ -705,15 +738,41 @@ async function runArticleDelivery({ params, ckptId, scope, workDir, runHash, lab
   await finalizeContextWriteBack({
     params, pack, report, sourceRows: [], targetRows: [], deliveryBranch, label,
   });
+  fs.mkdirSync(outDir, { recursive: true });
   fs.writeFileSync(reportFile, JSON.stringify(report, null, 2), 'utf8');
 
-  setCheckpoint(ckptId, { state: 'done', current: { chapter: 1, skill: params.skill, status: 'done' } });
+  const donePatch = { state: 'done', current: { chapter: 1, skill: params.skill, status: 'done' } };
+  let output = null;
+  if (params.delivery === 'editor') {
+    // Editor delivery: one manifest entry per staged article file. `file` is
+    // the repo-relative md path (may be nested, e.g. bible/kt/god.md) — the
+    // output endpoint resolves it under outDir, so nesting round-trips.
+    output = [
+      ...staged.map((s) => ({
+        delivery: 'editor',
+        type: params.resourceType,
+        repo: `${params.targetOrg}/${params.repoName}`,
+        path: s.path,
+        file: s.path,
+      })),
+      { delivery: 'editor', type: 'report', file: path.basename(reportFile) },
+    ];
+    donePatch.outDir = path.relative(CSKILLBP_DIR, outDir);
+    donePatch.output = output;
+  }
+  setCheckpoint(ckptId, donePatch);
   const summary = `${files.length} file(s), ${report.checks.warningCount} warning(s), 0 blocking violations`;
 
   if (params.delivery === 'path') {
     await post(`:check: Translated **${label}** — ${summary}.\nFiles:\n${staged.map((s) => `- \`${s.local}\``).join('\n')}\nReport: \`${reportFile}\``);
     console.log(`${LOG_PREFIX} ${label} delivered as path (${staged.length} files)`);
     return { articleId, files: staged, reportFile, delivery: 'path', runId: report.runId || null };
+  }
+
+  if (params.delivery === 'editor') {
+    await post(`:check: Translated **${label}** — ${summary}. Delivered to bible-editor as drafts (no Door43 push).`);
+    console.log(`${LOG_PREFIX} ${label} delivered to bible-editor (${staged.length} files)`);
+    return { articleId, files: staged, reportFile, delivery: 'editor', output, runId: report.runId || null };
   }
 
   const where = pushResult.branchUrl ? `branch [${deliveryBranch}](${pushResult.branchUrl}) (review before merge)` : `PR #${pushResult.prNumber || '?'} (merged)`;
@@ -725,6 +784,8 @@ module.exports = {
   translatePipeline,
   translateChapters,
   translateArticles,
+  runTsvDelivery,
+  runArticleDelivery,
   resolveParams,
   articleScopeBook,
   ROUTE_RESOURCE_TYPE,
