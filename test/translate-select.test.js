@@ -141,5 +141,5 @@ test('resolveParams: API rowIds → by-id mode', () => {
   const p = resolveParams(route, {});
   assert.strictEqual(p.mergeMode, 'by-id');
   assert.deepStrictEqual(p.rowIds, ['xm1w', 'k9wc']);
-  assert.strictEqual(p.delivery, 'branch'); // API default
+  assert.strictEqual(p.delivery, 'editor'); // API default: results stay on the bot, never pushed to Door43
 });
