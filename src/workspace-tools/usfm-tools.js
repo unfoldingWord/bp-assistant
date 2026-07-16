@@ -533,6 +533,20 @@ function salvageAlignedFromMappingJson({ book, chapter, type, sourceRel, hebrewR
 
   // --- 2) index candidate mapping JSON for this book+chapter (padding-agnostic) ---
   const candidates = new Map(); // verseNum -> [{path, english, tokenMatch}]
+  const rejectedCandidates = new Map(); // verseNum -> unreadable/invalid mapping reason
+  const recordRejectedCandidate = (filename, reason) => {
+    // Mapping filenames historically use BOOK-CHAPTER-VERSE.json or
+    // BOOK-CHAPTER-vVERSE-TYPE.json. Use that fallback only when the file
+    // cannot supply a trustworthy JSON reference.
+    const m = filename.match(/^([1-3]?[A-Z]{2,3})-(\d{1,3})-v?(\d{1,3})(?:-(?:ult|ust))?\.json$/i);
+    if (!m || m[1].toUpperCase() !== bookU || parseInt(m[2], 10) !== ch) return;
+    const verse = parseInt(m[3], 10);
+    // Preserve the more actionable filesystem failure if multiple bad files
+    // target the same verse.
+    if (!rejectedCandidates.has(verse) || reason === 'unreadable_mapping_json') {
+      rejectedCandidates.set(verse, reason);
+    }
+  };
   const walk = (dirRel) => {
     let entries;
     try { entries = fs.readdirSync(abs(dirRel), { withFileTypes: true }); } catch (_) { return; }
@@ -540,11 +554,22 @@ function salvageAlignedFromMappingJson({ book, chapter, type, sourceRel, hebrewR
       const childRel = `${dirRel}/${e.name}`;
       if (e.isDirectory()) { walk(childRel); continue; }
       if (!e.name.endsWith('.json')) continue;
+      let raw;
+      try { raw = fs.readFileSync(abs(childRel), 'utf8'); } catch (_) {
+        recordRejectedCandidate(e.name, 'unreadable_mapping_json');
+        continue;
+      }
       let data;
-      try { data = JSON.parse(fs.readFileSync(abs(childRel), 'utf8')); } catch (_) { continue; }
+      try { data = JSON.parse(raw); } catch (_) {
+        recordRejectedCandidate(e.name, 'invalid_mapping_json');
+        continue;
+      }
       const ref = String(data.reference || '');
       const m = ref.match(/^([1-3]?[A-Z]{2,3})\s+(\d+):(\d+)/);
-      if (!m) continue;
+      if (!m) {
+        recordRejectedCandidate(e.name, 'invalid_mapping_json');
+        continue;
+      }
       if (m[1].toUpperCase() !== bookU || parseInt(m[2], 10) !== ch) continue;
       const verse = parseInt(m[3], 10);
       if (!candidates.has(verse)) candidates.set(verse, []);
@@ -573,7 +598,7 @@ function salvageAlignedFromMappingJson({ book, chapter, type, sourceRel, hebrewR
   const pad3 = (n) => String(n).padStart(3, '0');
   for (const verse of [...srcVerses.keys()].sort((a, b) => a - b)) {
     const cands = candidates.get(verse) || [];
-    if (cands.length === 0) { markMissing(verse, 'no_mapping_json'); continue; }
+    if (cands.length === 0) { markMissing(verse, rejectedCandidates.get(verse) || 'no_mapping_json'); continue; }
     const srcPlain = srcVerses.get(verse);
     // best by content similarity to this type's source; break ties by explicit token
     let best = null, bestScore = -1;
@@ -673,7 +698,7 @@ function summarizeSalvageMissingReasons(missingReasons) {
   }
   if (buckets.size === 0) return '';
   const parts = [];
-  const order = ['no_mapping_json', 'conversion_error', 'unreadable_output', 'invalid_output', 'not_in_source_pass'];
+  const order = ['no_mapping_json', 'unreadable_mapping_json', 'invalid_mapping_json', 'conversion_error', 'unreadable_output', 'invalid_output', 'not_in_source_pass'];
   const keys = [...buckets.keys()].sort((a, b) => {
     const ai = order.indexOf(a); const bi = order.indexOf(b);
     if (ai !== -1 && bi !== -1) return ai - bi;
@@ -684,6 +709,8 @@ function summarizeSalvageMissingReasons(missingReasons) {
   for (const key of keys) {
     const verses = buckets.get(key).sort((a, b) => a - b);
     const pretty = key === 'no_mapping_json' ? 'no JSON'
+      : key === 'unreadable_mapping_json' ? 'unreadable mapping JSON'
+      : key === 'invalid_mapping_json' ? 'invalid mapping JSON'
       : key === 'conversion_error' ? 'conversion error'
       : key === 'unreadable_output' ? 'unreadable output'
       : key === 'invalid_output' ? 'invalid output'

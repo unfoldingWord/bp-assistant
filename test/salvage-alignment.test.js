@@ -143,6 +143,23 @@ test('summarizeSalvageMissingReasons buckets by reason, groups low-similarity by
   assert.equal(s, '1 no JSON (13); 1 invalid output (22); 2 low similarity 0.62 (14,18)');
 });
 
+test('salvage distinguishes malformed mapping JSON from an absent candidate', () => {
+  writeRel('output/AI-ULT/HOS/HOS-02.usfm',
+    '\\id HOS\n\\c 2\n\\q1 \\v 3 A source verse\n');
+  writeRel('data/hebrew_bible/28-HOS.usfm', '\\id HOS\n\\c 2\n\\v 3 x\n');
+  writeRel('tmp/alignments-invalid/HOS-02-v003-ult.json', '{ not valid JSON');
+
+  const r = salvageAlignedFromMappingJson({
+    book: 'HOS', chapter: 2, type: 'ult',
+    sourceRel: 'output/AI-ULT/HOS/HOS-02.usfm', hebrewRel: 'data/hebrew_bible/28-HOS.usfm',
+    alignmentsDir: 'tmp/alignments-invalid',
+  });
+
+  assert.deepEqual(r.missing, [3]);
+  assert.equal(r.missingReasons[3], 'invalid_mapping_json');
+  assert.equal(summarizeSalvageMissingReasons(r.missingReasons), '1 invalid mapping JSON (3)');
+});
+
 test('summarizeSalvageMissingReasons returns empty string for empty/undefined input', () => {
   assert.equal(summarizeSalvageMissingReasons({}), '');
   assert.equal(summarizeSalvageMissingReasons(undefined), '');

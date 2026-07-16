@@ -1526,19 +1526,20 @@ async function generatePipeline(route, message) {
           // add verses, never drop them). 'stale' is left to a full re-run.
           if (!hebrewRel || (cov.reason !== 'missing' && cov.reason !== 'incomplete')) return;
           const s = salvageAlignedFromMappingJson({ book, chapter: ch, type, sourceRel, hebrewRel });
+          const reasonDetail = s.missing.length ? summarizeSalvageMissingReasons(s.missingReasons) : '';
           if (s.converted.length) {
             salvagedAny = true;
             const total = s.converted.length + s.missing.length;
-            // Append the per-reason breakdown of remaining gaps so the
-            // resulting pipeline-failure issue tells operators *why* each
-            // verse could not be salvaged (no coordinator JSON vs stale/low-
-            // similarity JSON vs conversion error) without a workspace dig.
-            // See src/workspace-tools/usfm-tools.js summarizeSalvageMissingReasons.
-            const reasonDetail = s.missing.length ? summarizeSalvageMissingReasons(s.missingReasons) : '';
             const gapText = s.missing.length
               ? ` (still missing ${formatVerseRanges(s.missing)}${reasonDetail ? `; ${reasonDetail}` : ''})`
               : '';
             await status(`Salvaged ${s.converted.length}/${total} ${type.toUpperCase()} verse(s) for ${book} ${ch} from leftover mapping JSON${gapText}.`);
+          } else if (reasonDetail) {
+            // Report all-failed attempts and non-regression-guard rejections too.
+            // These paths have no committed salvage, but their per-verse reasons
+            // are still needed by the templated pipeline-failure issue.
+            const noteDetail = s.note ? `; ${s.note}` : '';
+            await status(`Could not salvage ${type.toUpperCase()} verses for ${book} ${ch} from leftover mapping JSON (still missing ${formatVerseRanges(s.missing)}; ${reasonDetail}${noteDetail}).`);
           }
         };
         if (needUlt) await runSalvage('ult', ultRel, ultCov);
