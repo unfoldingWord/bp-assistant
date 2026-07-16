@@ -1526,6 +1526,7 @@ function buildApiSyntheticRoute(pipelineType, scope, options) {
       sourceRef: options.sourceRef,
       sourceLang: options.sourceLang,
       contextRef: options.contextRef,
+      writeContextBack: options.writeContextBack,
       model: options.model,
       branchOnly: options.branchOnly,
       delivery: options.delivery,
