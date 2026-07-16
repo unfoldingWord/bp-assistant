@@ -156,7 +156,7 @@ Content is pushed to Door43/Gitea repos via deterministic JS code -- no Claude i
 - `door43-push.js` / `door43-push-cli.js` -- Git operations + Gitea API PR creation
 - `repo-verify.js` -- Confirms PR merged to master by querying Gitea API
 - `door43-users.json` (gitignored) -- Maps email addresses to Door43 usernames
-- Requires `DCS_TOKEN` env var for Gitea API access
+- Requires `DOOR43_TOKEN` (or `GITEA_TOKEN`) env var for Gitea API access, plus `DOOR43_USERNAME` (or `GITEA_USERNAME`) for commit attribution
 
 ## MCP server
 
