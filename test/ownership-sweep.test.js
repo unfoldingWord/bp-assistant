@@ -92,3 +92,24 @@ test('sweepStaleTmp never touches tmp/pipeline (resumable run state)', () => {
   assert.equal(res.removed, 0);
   assert.equal(fs.existsSync(ctx), true);
 });
+
+test('sweepStaleTmp never touches tmp/translate-* (editor-delivery outputs)', () => {
+  // Editor-delivery files must remain fetchable via GET /api/pipeline/{jobId}/output
+  // after 'done' — the checkpoint outlives the scratch TTL, so the run dir must too.
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), 'sweep-tmp-tr-'));
+  const trDir = path.join(base, 'tmp', 'translate-ar-OBA-1-1-cafe1234', 'out');
+  fs.mkdirSync(trDir, { recursive: true });
+  const tsv = path.join(trDir, 'tq_OBA.tsv');
+  fs.writeFileSync(tsv, 'x');
+  const other = path.join(base, 'tmp', 'other-scratch.txt');
+  fs.writeFileSync(other, 'y');
+  const old = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
+  for (const p of [tsv, trDir, path.join(base, 'tmp', 'translate-ar-OBA-1-1-cafe1234'), other]) {
+    fs.utimesSync(p, old, old);
+  }
+
+  const res = sweepStaleTmp({ baseDir: base, ttlDays: 7, log: silent });
+  assert.equal(res.removed, 1);
+  assert.equal(fs.existsSync(tsv), true);
+  assert.equal(fs.existsSync(other), false);
+});

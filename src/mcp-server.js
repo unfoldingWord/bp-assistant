@@ -13,7 +13,7 @@ const { readSecret } = require('./secrets');
 const { readAdminStatus } = require('./admin-status');
 const { listCheckpoints } = require('./pipeline-checkpoints');
 const { handleTnQuickRequest } = require('./api/tn-quick');
-const { handleStartRequest, handleStatusRequest } = require('./api/pipeline');
+const { handleStartRequest, handleStatusRequest, handleOutputRequest } = require('./api/pipeline');
 const { loadCache: loadVerseDataCache } = require('./api-runner/verse-data');
 const { readFetchStatus } = require('./curate-data');
 
@@ -735,6 +735,19 @@ function createHttpServer() {
 
     if (req.method === 'POST' && urlPath === '/api/pipeline/start') {
       await handleStartRequest(req, res);
+      return;
+    }
+
+    // Output route must be matched BEFORE the status catch-all below.
+    if (req.method === 'GET' && urlPath.startsWith('/api/pipeline/') && urlPath.endsWith('/output')) {
+      const jobId = decodeURIComponent(urlPath.slice('/api/pipeline/'.length, -'/output'.length));
+      if (!jobId) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'missing_job_id' }));
+        return;
+      }
+      // searchParams.get already URL-decodes the file value.
+      await handleOutputRequest(req, res, jobId, reqUrl.searchParams.get('file') || '');
       return;
     }
 

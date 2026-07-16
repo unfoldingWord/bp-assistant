@@ -229,5 +229,5 @@ test('resolveParams: API synthetic article route carries resourceType + articleI
   }, {});
   assert.strictEqual(p.resourceType, 'tw');
   assert.strictEqual(p.articleId, 'kt/god');
-  assert.strictEqual(p.delivery, 'branch'); // API default
+  assert.strictEqual(p.delivery, 'editor'); // API default: results stay on the bot, never pushed to Door43
 });
