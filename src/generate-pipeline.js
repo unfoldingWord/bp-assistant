@@ -22,7 +22,7 @@ const { getCheckpoint, setCheckpoint, clearCheckpoint, buildCheckpointKey } = re
 const { buildGenerateContext, buildUstContext, hebrewPathForBook } = require('./pipeline-context');
 const { publishAdminStatus } = require('./admin-status');
 const { dispatchSelfDiagnosis } = require('./self-diagnosis');
-const { validateAlignedUsfmCompleteness, mergeAlignedUsfm, salvageAlignedFromMappingJson } = require('./workspace-tools/usfm-tools');
+const { validateAlignedUsfmCompleteness, mergeAlignedUsfm, salvageAlignedFromMappingJson, summarizeSalvageMissingReasons } = require('./workspace-tools/usfm-tools');
 
 const LOG_DIR = path.resolve(__dirname, '../logs');
 const REQUIRED_INITIAL_PIPELINE_FILES = [
@@ -1529,7 +1529,16 @@ async function generatePipeline(route, message) {
           if (s.converted.length) {
             salvagedAny = true;
             const total = s.converted.length + s.missing.length;
-            await status(`Salvaged ${s.converted.length}/${total} ${type.toUpperCase()} verse(s) for ${book} ${ch} from leftover mapping JSON${s.missing.length ? ` (still missing ${formatVerseRanges(s.missing)})` : ''}.`);
+            // Append the per-reason breakdown of remaining gaps so the
+            // resulting pipeline-failure issue tells operators *why* each
+            // verse could not be salvaged (no coordinator JSON vs stale/low-
+            // similarity JSON vs conversion error) without a workspace dig.
+            // See src/workspace-tools/usfm-tools.js summarizeSalvageMissingReasons.
+            const reasonDetail = s.missing.length ? summarizeSalvageMissingReasons(s.missingReasons) : '';
+            const gapText = s.missing.length
+              ? ` (still missing ${formatVerseRanges(s.missing)}${reasonDetail ? `; ${reasonDetail}` : ''})`
+              : '';
+            await status(`Salvaged ${s.converted.length}/${total} ${type.toUpperCase()} verse(s) for ${book} ${ch} from leftover mapping JSON${gapText}.`);
           }
         };
         if (needUlt) await runSalvage('ult', ultRel, ultCov);
