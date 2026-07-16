@@ -13,7 +13,7 @@ const path = require('path');
 const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'salvage-'));
 process.env.CSKILLBP_DIR = TMP;
 
-const { salvageAlignedFromMappingJson, salvageDroppedVerses, versesPresentInUsfm } = require('../src/workspace-tools/usfm-tools');
+const { salvageAlignedFromMappingJson, salvageDroppedVerses, versesPresentInUsfm, summarizeSalvageMissingReasons } = require('../src/workspace-tools/usfm-tools');
 
 function writeRel(rel, content) {
   const abs = path.join(TMP, rel);
@@ -89,4 +89,79 @@ test('salvageDroppedVerses: overwrite that omits an existing verse is flagged', 
   // salvage only found v1,v2 (v8's mapping JSON stale/missing) — overwriting
   // would drop v8, so the guard reports it and the caller keeps the existing file
   assert.deepEqual(salvageDroppedVerses(existing, [1, 2]), [8]);
+});
+
+// --- per-verse missing-reason categorization (issue #222) ---
+
+test('salvage records missing reason "no_mapping_json" when candidate JSON is absent', () => {
+  // Reuse the existing "every verse missing" fixture: no tmp/alignments at all,
+  // so every verse in the source falls into the no-candidate branch and must
+  // carry the `no_mapping_json` reason for the templated failure summary.
+  writeRel('output/AI-ULT/AMO/AMO-05-nocands.usfm',
+    '\\id AMO\n\\c 5\n\\q1 \\v 1 Hear this word\n\\q1 \\v 2 She has fallen\n');
+  writeRel('data/hebrew_bible/30-AMO.usfm', '\\id AMO\n\\c 5\n\\v 1 x\n');
+  const r = salvageAlignedFromMappingJson({
+    book: 'AMO', chapter: 5, type: 'ult',
+    sourceRel: 'output/AI-ULT/AMO/AMO-05-nocands.usfm', hebrewRel: 'data/hebrew_bible/30-AMO.usfm',
+    alignmentsDir: 'tmp/alignments-absent',
+  });
+  assert.deepEqual(r.missing, [1, 2]);
+  assert.equal(r.missingReasons[1], 'no_mapping_json');
+  assert.equal(r.missingReasons[2], 'no_mapping_json');
+});
+
+test('salvage records "low_similarity(score)" when candidate JSON exists but scores below threshold', () => {
+  // Write a mapping JSON whose english_text is completely different from the
+  // source verse (Jaccard similarity ≈ 0) so it is rejected by the 0.85 gate.
+  writeRel('output/AI-ULT/JOL/JOL-01.usfm',
+    '\\id JOL\n\\c 1\n\\q1 \\v 1 The word of the LORD that came to Joel\n');
+  writeRel('data/hebrew_bible/29-JOL.usfm', '\\id JOL\n\\c 1\n\\v 1 x\n');
+  writeRel('tmp/alignments-lowsim/JOL-01-v01-ult.json', JSON.stringify({
+    reference: 'JOL 1:1',
+    english_text: 'entirely unrelated text about mangoes',
+    alignments: [],
+  }));
+  const r = salvageAlignedFromMappingJson({
+    book: 'JOL', chapter: 1, type: 'ult',
+    sourceRel: 'output/AI-ULT/JOL/JOL-01.usfm', hebrewRel: 'data/hebrew_bible/29-JOL.usfm',
+    alignmentsDir: 'tmp/alignments-lowsim',
+  });
+  assert.deepEqual(r.missing, [1]);
+  assert.match(r.missingReasons[1], /^low_similarity\(\d\.\d\d\)$/);
+});
+
+test('summarizeSalvageMissingReasons buckets by reason, groups low-similarity by score, orders known reasons first', () => {
+  const s = summarizeSalvageMissingReasons({
+    13: 'no_mapping_json',
+    14: 'low_similarity(0.62)',
+    18: 'low_similarity(0.62)',
+    22: 'invalid_output',
+  });
+  // no-JSON bucket first, invalid_output next (in the known-order list), then
+  // low_similarity — verses within a bucket are ascending, and 14/18 share a
+  // score so they collapse into a single bucket, not one per verse.
+  assert.equal(s, '1 no JSON (13); 1 invalid output (22); 2 low similarity 0.62 (14,18)');
+});
+
+test('salvage distinguishes malformed mapping JSON from an absent candidate', () => {
+  writeRel('output/AI-ULT/HOS/HOS-02.usfm',
+    '\\id HOS\n\\c 2\n\\q1 \\v 3 A source verse\n');
+  writeRel('data/hebrew_bible/28-HOS.usfm', '\\id HOS\n\\c 2\n\\v 3 x\n');
+  writeRel('tmp/alignments-invalid/HOS-02-v003-ult.json', '{ not valid JSON');
+
+  const r = salvageAlignedFromMappingJson({
+    book: 'HOS', chapter: 2, type: 'ult',
+    sourceRel: 'output/AI-ULT/HOS/HOS-02.usfm', hebrewRel: 'data/hebrew_bible/28-HOS.usfm',
+    alignmentsDir: 'tmp/alignments-invalid',
+  });
+
+  assert.deepEqual(r.missing, [3]);
+  assert.equal(r.missingReasons[3], 'invalid_mapping_json');
+  assert.equal(summarizeSalvageMissingReasons(r.missingReasons), '1 invalid mapping JSON (3)');
+});
+
+test('summarizeSalvageMissingReasons returns empty string for empty/undefined input', () => {
+  assert.equal(summarizeSalvageMissingReasons({}), '');
+  assert.equal(summarizeSalvageMissingReasons(undefined), '');
+  assert.equal(summarizeSalvageMissingReasons(null), '');
 });

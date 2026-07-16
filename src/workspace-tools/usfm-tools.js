@@ -481,8 +481,18 @@ function salvageDroppedVerses(existingUsfm, salvagedVerses) {
 }
 
 function salvageAlignedFromMappingJson({ book, chapter, type, sourceRel, hebrewRel, alignmentsDir = 'tmp/alignments' }) {
-  const result = { converted: [], missing: [], mergedOutput: null, note: '' };
+  const result = { converted: [], missing: [], missingReasons: {}, mergedOutput: null, note: '' };
   const abs = (rel) => path.resolve(CSKILLBP_DIR, rel);
+  // Record a per-verse reason alongside pushing onto result.missing so a
+  // downstream failure summary can distinguish "coordinator never produced
+  // mapping JSON for this verse" from "JSON exists but scored below the
+  // similarity threshold (likely stale after source regeneration)". Operators
+  // reading a templated pipeline-failure issue (see #222) can then act on the
+  // right root cause without inspecting tmp/alignments by hand.
+  const markMissing = (verse, reason) => {
+    result.missing.push(verse);
+    result.missingReasons[verse] = reason;
+  };
   const isUst = String(type).toLowerCase() === 'ust';
   const typeTok = isUst ? 'ust' : 'ult';
   const bookU = String(book).toUpperCase();
@@ -523,6 +533,20 @@ function salvageAlignedFromMappingJson({ book, chapter, type, sourceRel, hebrewR
 
   // --- 2) index candidate mapping JSON for this book+chapter (padding-agnostic) ---
   const candidates = new Map(); // verseNum -> [{path, english, tokenMatch}]
+  const rejectedCandidates = new Map(); // verseNum -> unreadable/invalid mapping reason
+  const recordRejectedCandidate = (filename, reason) => {
+    // Mapping filenames historically use BOOK-CHAPTER-VERSE.json or
+    // BOOK-CHAPTER-vVERSE-TYPE.json. Use that fallback only when the file
+    // cannot supply a trustworthy JSON reference.
+    const m = filename.match(/^([1-3]?[A-Z]{2,3})-(\d{1,3})-v?(\d{1,3})(?:-(?:ult|ust))?\.json$/i);
+    if (!m || m[1].toUpperCase() !== bookU || parseInt(m[2], 10) !== ch) return;
+    const verse = parseInt(m[3], 10);
+    // Preserve the more actionable filesystem failure if multiple bad files
+    // target the same verse.
+    if (!rejectedCandidates.has(verse) || reason === 'unreadable_mapping_json') {
+      rejectedCandidates.set(verse, reason);
+    }
+  };
   const walk = (dirRel) => {
     let entries;
     try { entries = fs.readdirSync(abs(dirRel), { withFileTypes: true }); } catch (_) { return; }
@@ -530,11 +554,22 @@ function salvageAlignedFromMappingJson({ book, chapter, type, sourceRel, hebrewR
       const childRel = `${dirRel}/${e.name}`;
       if (e.isDirectory()) { walk(childRel); continue; }
       if (!e.name.endsWith('.json')) continue;
+      let raw;
+      try { raw = fs.readFileSync(abs(childRel), 'utf8'); } catch (_) {
+        recordRejectedCandidate(e.name, 'unreadable_mapping_json');
+        continue;
+      }
       let data;
-      try { data = JSON.parse(fs.readFileSync(abs(childRel), 'utf8')); } catch (_) { continue; }
+      try { data = JSON.parse(raw); } catch (_) {
+        recordRejectedCandidate(e.name, 'invalid_mapping_json');
+        continue;
+      }
       const ref = String(data.reference || '');
       const m = ref.match(/^([1-3]?[A-Z]{2,3})\s+(\d+):(\d+)/);
-      if (!m) continue;
+      if (!m) {
+        recordRejectedCandidate(e.name, 'invalid_mapping_json');
+        continue;
+      }
       if (m[1].toUpperCase() !== bookU || parseInt(m[2], 10) !== ch) continue;
       const verse = parseInt(m[3], 10);
       if (!candidates.has(verse)) candidates.set(verse, []);
@@ -563,7 +598,7 @@ function salvageAlignedFromMappingJson({ book, chapter, type, sourceRel, hebrewR
   const pad3 = (n) => String(n).padStart(3, '0');
   for (const verse of [...srcVerses.keys()].sort((a, b) => a - b)) {
     const cands = candidates.get(verse) || [];
-    if (cands.length === 0) { result.missing.push(verse); continue; }
+    if (cands.length === 0) { markMissing(verse, rejectedCandidates.get(verse) || 'no_mapping_json'); continue; }
     const srcPlain = srcVerses.get(verse);
     // best by content similarity to this type's source; break ties by explicit token
     let best = null, bestScore = -1;
@@ -579,14 +614,17 @@ function salvageAlignedFromMappingJson({ book, chapter, type, sourceRel, hebrewR
     // standing in for a missing UST verse, or vice versa) and stale JSON that no
     // longer matches the current source — those verses are reported missing so a
     // retry re-aligns them properly rather than banking wrong text.
-    if (!best || bestScore < 0.85) { result.missing.push(verse); continue; }
+    if (!best || bestScore < 0.85) {
+      markMissing(verse, `low_similarity(${bestScore < 0 ? 'n/a' : bestScore.toFixed(2)})`);
+      continue;
+    }
     const outRel = `${salvageDir}/${bookU}-${pad2(ch)}-${pad3(verse)}-${typeTok}-aligned.usfm`;
     try { fs.mkdirSync(path.dirname(abs(outRel)), { recursive: true }); } catch (_) { /* ok */ }
     const conv = createAlignedUsfm({ hebrew: hebrewRel, mapping: best.path, source: sourceRel, output: outRel, chapter: ch, verse, ust: isUst });
-    if (typeof conv === 'string' && conv.startsWith('Error')) { result.missing.push(verse); continue; }
+    if (typeof conv === 'string' && conv.startsWith('Error')) { markMissing(verse, 'conversion_error'); continue; }
     let produced;
-    try { produced = fs.readFileSync(abs(outRel), 'utf8'); } catch (_) { result.missing.push(verse); continue; }
-    if (!/\\zaln-s/.test(produced) || !new RegExp(`\\\\v\\s+${verse}\\b`).test(produced)) { result.missing.push(verse); continue; }
+    try { produced = fs.readFileSync(abs(outRel), 'utf8'); } catch (_) { markMissing(verse, 'unreadable_output'); continue; }
+    if (!/\\zaln-s/.test(produced) || !new RegExp(`\\\\v\\s+${verse}\\b`).test(produced)) { markMissing(verse, 'invalid_output'); continue; }
     parts.push({ verse, rel: outRel });
     result.converted.push(verse);
   }
@@ -616,7 +654,16 @@ function salvageAlignedFromMappingJson({ book, chapter, type, sourceRel, hebrewR
     if (wouldDrop.length) {
       result.converted = [];
       const existingCovered = new Set(versesPresentInUsfm(existingUsfm));
+      const priorReasons = result.missingReasons;
       result.missing = [...srcVerses.keys()].filter((v) => !existingCovered.has(v)).sort((a, b) => a - b);
+      // Rebuild reasons for the new (post-guard) missing set. Verses that were
+      // in the salvage loop keep their per-verse reason; verses that only
+      // appear because the existing file already lacks them (i.e. never went
+      // through the loop) are marked so operators can distinguish the two.
+      result.missingReasons = {};
+      for (const v of result.missing) {
+        result.missingReasons[v] = priorReasons[v] || 'not_in_source_pass';
+      }
       result.note = `skipped overwrite — salvage (${parts.length} verses) would drop verse(s) ${wouldDrop.join(', ')} present in existing ${mergedRel}`;
       return result;
     }
@@ -627,6 +674,52 @@ function salvageAlignedFromMappingJson({ book, chapter, type, sourceRel, hebrewR
   result.mergedOutput = mergedRel;
   result.note = mres;
   return result;
+}
+
+/**
+ * Group `result.missingReasons` from `salvageAlignedFromMappingJson` into a
+ * compact, human-readable summary: `"3 no-JSON (13,14,27); 1 low-similarity
+ * 0.62 (18)"`. Empty input returns ''. This is what the align phase's status
+ * message appends after "still missing 13-14" so the templated pipeline-failure
+ * issue (see #222) carries actionable diagnosis without a workspace hand-inspection.
+ */
+function summarizeSalvageMissingReasons(missingReasons) {
+  if (!missingReasons || typeof missingReasons !== 'object') return '';
+  const buckets = new Map(); // reasonLabel -> verse[]
+  for (const [verseStr, reason] of Object.entries(missingReasons)) {
+    const verse = parseInt(verseStr, 10);
+    if (!Number.isFinite(verse)) continue;
+    // Collapse low_similarity(X.XX) into one bucket per distinct score so a
+    // gap of many stale verses reads as one line, not one per verse. Keep the
+    // score visible — it tells the operator whether the miss was borderline.
+    const label = String(reason || 'unknown');
+    if (!buckets.has(label)) buckets.set(label, []);
+    buckets.get(label).push(verse);
+  }
+  if (buckets.size === 0) return '';
+  const parts = [];
+  const order = ['no_mapping_json', 'unreadable_mapping_json', 'invalid_mapping_json', 'conversion_error', 'unreadable_output', 'invalid_output', 'not_in_source_pass'];
+  const keys = [...buckets.keys()].sort((a, b) => {
+    const ai = order.indexOf(a); const bi = order.indexOf(b);
+    if (ai !== -1 && bi !== -1) return ai - bi;
+    if (ai !== -1) return -1;
+    if (bi !== -1) return 1;
+    return a.localeCompare(b);
+  });
+  for (const key of keys) {
+    const verses = buckets.get(key).sort((a, b) => a - b);
+    const pretty = key === 'no_mapping_json' ? 'no JSON'
+      : key === 'unreadable_mapping_json' ? 'unreadable mapping JSON'
+      : key === 'invalid_mapping_json' ? 'invalid mapping JSON'
+      : key === 'conversion_error' ? 'conversion error'
+      : key === 'unreadable_output' ? 'unreadable output'
+      : key === 'invalid_output' ? 'invalid output'
+      : key === 'not_in_source_pass' ? 'gap in existing file'
+      : key.startsWith('low_similarity(') ? `low similarity ${key.slice('low_similarity('.length, -1)}`
+      : key;
+    parts.push(`${verses.length} ${pretty} (${verses.join(',')})`);
+  }
+  return parts.join('; ');
 }
 
 /**
@@ -1360,6 +1453,7 @@ module.exports = {
   mergeAlignedUsfm,
   salvageAlignedFromMappingJson,
   salvageDroppedVerses,
+  summarizeSalvageMissingReasons,
   versesPresentInUsfm,
   validateAlignmentJson,
   validateAlignedUsfmMarkup,
