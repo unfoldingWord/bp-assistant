@@ -170,7 +170,7 @@ function buildBatches(rows, { maxRows = BATCH_MAX_ROWS, maxNoteChars = BATCH_MAX
  * column names so the batch preview shows the right columns; when omitted the
  * tN Note column is assumed.
  */
-function renderBatchPack({ batchRows, pack, targetLang, targetLangName, direction, sourceLangName = 'English' }) {
+function renderBatchPack({ batchRows, pack, targetLang, targetLangName, direction, sourceLangName = 'English', scripture }) {
   const slugs = [...new Set(batchRows.map((r) => slugFromSupportReference(r.SupportReference)).filter(Boolean))];
 
   const templateLines = [];
@@ -200,6 +200,38 @@ function renderBatchPack({ batchRows, pack, targetLang, targetLangName, directio
       + examples.map((e, i) =>
         `### Example ${i + 1}${e.supportReference ? ` (${slugFromSupportReference(e.supportReference)})` : ''}\n`
         + `**${sourceLangName} source:**\n${e.source}\n\n**${targetLangName} translation:**\n${e.target}`).join('\n\n'));
+  }
+
+  if (scripture && Array.isArray(scripture.versions) && scripture.versions.length) {
+    const refs = [];
+    const seen = new Set();
+    for (const row of batchRows) {
+      const chapter = refChapter(row.Reference);
+      if (chapter === 'front' || typeof chapter !== 'number') continue;
+      const range = refVerseRange(row.Reference);
+      if (!range) continue;
+      const end = Math.min(range.end, range.start + 9);
+      for (let verse = range.start; verse <= end; verse++) {
+        const key = `${chapter}:${verse}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        refs.push({ chapter, verse, key });
+      }
+    }
+
+    const scriptureParts = ['## Scripture for these verses (use for bold ULT-quoted words and "Alternate translation:" wording)'];
+    if (scripture.targetLiteralFound === false && scripture.targetSimplifiedFound === false) {
+      scriptureParts.push('_No target-language literal/simplified Bible is available for these verses yet — translate the bold and alternate-translation wording from the source text above._');
+    }
+    for (const { chapter, verse, key } of refs) {
+      const lines = [`### ${chapter}:${verse}`];
+      for (const version of scripture.versions) {
+        const text = version.byRef && version.byRef[key];
+        if (text) lines.push(`- ${version.label}: ${text}`);
+      }
+      scriptureParts.push(lines.join('\n'));
+    }
+    parts.push(scriptureParts.join('\n\n'));
   }
 
   return { markdown: parts.join('\n\n') + '\n', templateFallbacks, slugs };

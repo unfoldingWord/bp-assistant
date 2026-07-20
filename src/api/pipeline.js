@@ -95,6 +95,10 @@ const OptionsSchema = z.object({
   repoName: z.string().min(1).max(60).regex(/^[A-Za-z0-9._-]+$/).optional(),
   sourceRef: z.string().min(3).max(200).regex(/^[^/@\s]+\/[^/@\s]+@\S+$/).optional(),
   contextRef: z.string().min(3).max(200).regex(/^[^/@\s]+\/[^/@\s]+@\S+$/).optional(),
+  // Per-request overrides for the target-language literal/simplified Bible
+  // repos injected into batch context (src/lib/scripture-verses.js).
+  literalRef: z.string().min(3).max(200).regex(/^[^/@\s]+\/[^/@\s]+@\S+$/).optional(),
+  simplifiedRef: z.string().min(3).max(200).regex(/^[^/@\s]+\/[^/@\s]+@\S+$/).optional(),
   writeContextBack: z.boolean().optional(),
   branchOnly: z.boolean().optional(),
   delivery: z.enum(['path', 'branch', 'editor']).optional(),
