@@ -151,3 +151,33 @@ test('renderBatchPack omits the scripture section when scripture is not provided
   });
   assert.ok(!/## Scripture for these verses/.test(rendered.markdown));
 });
+
+test('buildScripturePack builds maps for every covered verse (no silent global cap)', async () => {
+  // A large run (>80 distinct verses across chapters) must not silently drop
+  // scripture for later verses — regression for the removed MAX_TOTAL_VERSES cap.
+  let usfm = '';
+  const rows = [];
+  for (let ch = 1; ch <= 3; ch++) {
+    usfm += `\\c ${ch}\n`;
+    for (let v = 1; v <= 40; v++) {
+      usfm += `\\v ${v} \\w word${ch}_${v}|x-occurrence="1"\\w*.\n`;
+      rows.push({ Reference: `${ch}:${v}`, ID: `r${ch}_${v}` });
+    }
+  }
+  // 120 distinct verses total.
+  const fetchImpl = fakeFetch({ en_ult: usfm, en_ust: usfm });
+
+  const pack = await buildScripturePack({
+    book: 'GEN',
+    rows,
+    sourceLiteralRef: 'unfoldingWord/en_ult@master',
+    sourceSimplifiedRef: 'unfoldingWord/en_ust@master',
+    targetLiteralRef: null,
+    targetSimplifiedRef: null,
+  }, { fetchImpl });
+
+  const lit = pack.versions.find((v) => v.role === 'source-literal');
+  assert.strictEqual(Object.keys(lit.byRef).length, 120);
+  // A verse well past the old 80-verse cap is still present.
+  assert.strictEqual(lit.byRef['3:40'], 'word3_40');
+});

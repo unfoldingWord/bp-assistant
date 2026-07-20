@@ -13,7 +13,6 @@ const { extractChapterVerse, stripMarkup, BOOK_NUMBERS } = require('../api-runne
 const { refChapter, refVerseRange } = require('./tn-tsv');
 
 const MAX_ROW_VERSE_SPAN = 10;
-const MAX_TOTAL_VERSES = 80;
 
 /** Ordered, de-duplicated list of {chapter, verse} covered by a row set. */
 function collectVerseRefs(rows) {
@@ -32,7 +31,11 @@ function collectVerseRefs(rows) {
       refs.push({ chapter, verse });
     }
   }
-  return refs.length > MAX_TOTAL_VERSES ? refs.slice(0, MAX_TOTAL_VERSES) : refs;
+  // No global verse cap: buildScripturePack is called once with the full row
+  // set, so every verse any batch covers must be present in byRef — truncating
+  // here would silently strip scripture from later batches (the per-row span
+  // cap above already bounds any single pathological range).
+  return refs;
 }
 
 /** Parse "org/repo@ref" and return just the repo (or the raw string if unparseable). */
