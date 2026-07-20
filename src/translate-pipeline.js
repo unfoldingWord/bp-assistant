@@ -45,6 +45,7 @@ const { resolveArticle } = require('./lib/article-resolver');
 const { buildSuggestionInbox, shouldWriteContextBack } = require('./lib/translate-suggestions');
 const { writeContextArtifactsSafe } = require('./lib/context-write');
 const core = require('./lib/translate-core');
+const scriptureVerses = require('./lib/scripture-verses');
 
 const LOG_PREFIX = '[translate]';
 
@@ -142,6 +143,10 @@ function resolveParams(route, message) {
   // resource's source, e.g. TN's translate-in-place BSOJ/ar_tn, into others).
   const sourceRef = opts.sourceRef || cfg[`${resourceType}SourceRef`]
     || `unfoldingWord/${rt.defaultSourceRepo}@master`;
+  const sourceLiteralRef = opts.sourceLiteralRef || cfg.sourceLiteralRef || 'unfoldingWord/en_ult@master';
+  const sourceSimplifiedRef = opts.sourceSimplifiedRef || cfg.sourceSimplifiedRef || 'unfoldingWord/en_ust@master';
+  const targetLiteralRef = opts.literalRef || cfg.literalRef || `${targetOrg}/${cfg.literalRepo || `${targetLang}_glt`}@master`;
+  const targetSimplifiedRef = opts.simplifiedRef || cfg.simplifiedRef || `${targetOrg}/${cfg.simplifiedRepo || `${targetLang}_gst`}@master`;
   const contextRef = opts.contextRef || cfg.contextRef || `${targetOrg}/translation-context@master`;
   const contextRefExplicit = !!(opts.contextRef || cfg.contextRef);
 
@@ -173,6 +178,10 @@ function resolveParams(route, message) {
     targetOrg,
     repoName,
     sourceRef,
+    sourceLiteralRef,
+    sourceSimplifiedRef,
+    targetLiteralRef,
+    targetSimplifiedRef,
     contextRef,
     contextRefExplicit,
     writeContextBack: opts.writeContextBack === true ? true
@@ -294,11 +303,26 @@ async function translateChapters(params, { workDir, onProgress, runBatchImpl, ma
   const batches = core.buildBatches(rows, { sizeOf: resource.sizeOf });
   progress(`translating ${params.resourceType} in ${batches.length} batch(es)`);
 
+  let scripture = null;
+  try {
+    scripture = await scriptureVerses.buildScripturePack({
+      book: params.book, rows,
+      sourceLiteralRef: params.sourceLiteralRef,
+      sourceSimplifiedRef: params.sourceSimplifiedRef,
+      targetLiteralRef: params.targetLiteralRef,
+      targetSimplifiedRef: params.targetSimplifiedRef,
+    });
+    progress(`scripture: target literal ${scripture.targetLiteralFound ? 'found' : 'MISSING'} (${params.targetLiteralRef}), simplified ${scripture.targetSimplifiedFound ? 'found' : 'MISSING'} (${params.targetSimplifiedRef})`);
+  } catch (e) {
+    progress(`scripture: skipped (${e.message})`);
+    scripture = null;
+  }
+
   const batchMeta = [];
   const targetRows = [];
   for (let i = 0; i < batches.length; i++) {
     const batchRows = batches[i];
-    const rendered = core.renderBatchPack({ batchRows, pack, ...params });
+    const rendered = core.renderBatchPack({ batchRows, pack, scripture, ...params });
     const files = core.writeBatchFiles(workDir, i, {
       batchRows,
       packMarkdown: rendered.markdown,

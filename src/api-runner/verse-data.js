@@ -389,4 +389,6 @@ module.exports = {
   loadCache,
   cache,
   BOOK_NUMBERS,
+  extractChapterVerse,
+  stripMarkup,
 };
