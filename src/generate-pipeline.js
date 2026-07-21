@@ -114,6 +114,43 @@ function cleanupGenerateArtifacts({ book, chapter, verseStart, verseEnd }) {
       }
     }
   }
+
+  // Leftover per-verse mapping JSON in tmp/alignments/ and prior salvage output
+  // in tmp/aligned/salvage/. Without this sweep, a --fresh run keeps stale JSON
+  // from a prior source generation: if the coordinator later fails and salvage
+  // runs, salvage matches those JSONs against the freshly regenerated source
+  // and rejects most verses via the 0.85 similarity guard (observed: EZK 16,
+  // 2026-07-21 — a fresh run recovered only 24/63 ULT + 2/63 UST verses after
+  // both align attempts returned "no aligned output found", because
+  // tmp/alignments/ still held mapping JSON from the previous 63-verse attempt).
+  // Filenames use padding-agnostic chapter/verse widths and both the older
+  // BOOK-CHAPTER-VERSE.json and newer BOOK-CHAPTER-vVERSE-TYPE.json shapes, so
+  // walk the directories and match by prefix. Verse-range runs (--fresh with
+  // an explicit vN-M) still clear the whole chapter's leftovers — mapping JSON
+  // isn't verse-range-scoped and a re-run of the range shouldn't fall back on
+  // stale JSON for verses outside the range either.
+  const chapterPrefixes = new Set();
+  for (const w of [1, 2, 3]) {
+    const paddedCh = String(chapter).padStart(w, '0');
+    chapterPrefixes.add(`${book}-${paddedCh}-`);
+    chapterPrefixes.add(`${book}-${paddedCh}.`);
+  }
+  const matchesChapter = (filename) => {
+    for (const p of chapterPrefixes) if (filename.startsWith(p)) return true;
+    return false;
+  };
+  const sweepDir = (dirRel, extFilter) => {
+    const absDir = path.resolve(CSKILLBP_DIR, dirRel);
+    let entries;
+    try { entries = fs.readdirSync(absDir, { withFileTypes: true }); } catch (_) { return; }
+    for (const e of entries) {
+      if (e.isDirectory()) { sweepDir(`${dirRel}/${e.name}`, extFilter); continue; }
+      if (extFilter && !e.name.toLowerCase().endsWith(extFilter)) continue;
+      if (matchesChapter(e.name)) removeIfExists(path.join(absDir, e.name));
+    }
+  };
+  sweepDir('tmp/alignments', '.json');
+  sweepDir('tmp/aligned/salvage', '.usfm');
 }
 
 function parseGenerateCommand(content) {
