@@ -189,6 +189,28 @@ test('coverage: verse-range runs skip the full-chapter check', () => {
   assert.equal(assessAlignedChapterCoverage(aligned, src, { checkCoverage: false }).ok, true);
 });
 
+// #231: for verse-range runs, the aligned file's verse coverage must equal
+// the requested range's source coverage. A stale batch file that happens to be
+// self-consistent (e.g. EZK-17-v13-v24-aligned.usfm covering 13-24) must fail
+// coverage when the source is the 17-42 range file — otherwise it silently
+// passes through to push and the last-resort push guard is the only thing that
+// catches the mismatch (65 minutes into a run).
+test('coverage: verse-range aligned file with a different range fails (#231)', () => {
+  const srcRange = writeRel('output/AI-ULT/EZK/EZK-17-vv17-42.usfm',
+    batch(17, ['17', '18', '19', '25', '30', '42']));
+  const staleBatch = writeRel('output/AI-ULT/EZK/EZK-17-v13-v24-aligned.usfm',
+    batch(17, ['13', '14', '15', '17', '18', '19', '24']));
+  const now = Date.now();
+  setMtime(srcRange, now - 5000);
+  setMtime(staleBatch, now);
+  const r = assessAlignedChapterCoverage(staleBatch, srcRange, { checkCoverage: true });
+  assert.equal(r.ok, false, 'wrong-range aligned file must fail coverage against verse-range source');
+  assert.equal(r.reason, 'incomplete');
+  // Source covers 17,18,19,25,30,42; aligned covers 17,18,19; missing must
+  // include the 25,30,42 verses the aligned file lacks.
+  assert.deepEqual(r.missing.sort((a, b) => a - b), [25, 30, 42]);
+});
+
 test('formatVerseRanges compacts consecutive runs', () => {
   assert.equal(formatVerseRanges([1, 2, 3, 7]), '1-3, 7');
   assert.equal(formatVerseRanges([5]), '5');
@@ -253,6 +275,22 @@ test('cleanupGenerateArtifacts sweeps leftover mapping JSON and salvage output (
   for (const rel of filesToPreserve) {
     assert.equal(fs.existsSync(path.join(TMP, rel)), true, `${rel} should be preserved`);
   }
+});
+
+// A verse-range run must also sweep stale per-batch files (issue #231).
+// A prior full-chapter run left EZK-17-v13-v24-aligned.usfm behind; without
+// this sweep, a subsequent 17-42 verse-range request re-uses that batch as
+// the "aligned" chapter output and the push guard only catches the mismatch
+// after a ~65-minute alignment step.
+test('cleanupGenerateArtifacts sweeps per-batch aligned files on verse-range runs too (#231)', () => {
+  const d = 'output/AI-ULT/EZK';
+  writeRel(`${d}/EZK-17-v13-v24-aligned.usfm`, batch(17, ['13', '14', '24']));
+  writeRel(`${d}/EZK-17-v01-v12-aligned.usfm`, batch(17, ['1', '2', '12']));
+  cleanupGenerateArtifacts({ book: 'EZK', chapter: 17, verseStart: 17, verseEnd: 42 });
+  assert.equal(fs.existsSync(path.join(TMP, d, 'EZK-17-v13-v24-aligned.usfm')), false,
+    'stale batch file must be removed even on verse-range runs');
+  assert.equal(fs.existsSync(path.join(TMP, d, 'EZK-17-v01-v12-aligned.usfm')), false,
+    'stale batch file must be removed even on verse-range runs');
 });
 
 // --- deleteStaleBatches: clear source-predating batches so the skill re-aligns them

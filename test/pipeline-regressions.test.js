@@ -219,6 +219,47 @@ test('output discovery falls back to flat notes files when expected path include
   }
 });
 
+// #231: resolveOutputFile with verseSuffix must NOT accept a bare (non-suffixed)
+// file — otherwise a leftover full-chapter output silently satisfies a
+// verse-range completeness check and the pipeline believes the current run's
+// scoped source was already produced.
+test('resolveOutputFile with verseSuffix rejects bare non-suffixed matches (#231)', () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pipeline-utils-verse-'));
+  const oldBaseDir = process.env.CSKILLBP_DIR;
+  process.env.CSKILLBP_DIR = tempDir;
+
+  const modulePath = require.resolve('../src/pipeline-utils');
+  delete require.cache[modulePath];
+  const { resolveOutputFile } = require('../src/pipeline-utils');
+
+  try {
+    const ultDir = path.join(tempDir, 'output', 'AI-ULT', 'EZK');
+    fs.mkdirSync(ultDir, { recursive: true });
+    // Stale full-chapter file from a prior run — must NOT match a vv17-42 request
+    fs.writeFileSync(path.join(ultDir, 'EZK-17.usfm'), '\\id EZK\n\\c 17\n\\v 1 stale\n');
+    const bareResult = resolveOutputFile('output/AI-ULT/EZK-17.usfm', 'EZK', '-vv17-42');
+    assert.equal(bareResult, null,
+      'a bare EZK-17.usfm must not satisfy a verse-range request for vv17-42');
+
+    // A wrongly-scoped verse-suffixed file (vv1-12) also must not match a vv17-42 request
+    fs.writeFileSync(path.join(ultDir, 'EZK-17-vv1-12.usfm'), '\\id EZK\n\\c 17\n\\v 1 stale\n');
+    const wrongRange = resolveOutputFile('output/AI-ULT/EZK-17.usfm', 'EZK', '-vv17-42');
+    assert.equal(wrongRange, null,
+      'a differently-scoped verse-suffixed file must not satisfy a vv17-42 request');
+
+    // The correctly scoped file DOES match
+    fs.writeFileSync(path.join(ultDir, 'EZK-17-vv17-42.usfm'), '\\id EZK\n\\c 17\n\\v 17 fresh\n');
+    const matched = resolveOutputFile('output/AI-ULT/EZK-17.usfm', 'EZK', '-vv17-42');
+    assert.equal(matched, path.join('output/AI-ULT/EZK', 'EZK-17-vv17-42.usfm'),
+      'the vv17-42-suffixed file satisfies a vv17-42 request');
+  } finally {
+    if (oldBaseDir == null) delete process.env.CSKILLBP_DIR;
+    else process.env.CSKILLBP_DIR = oldBaseDir;
+    delete require.cache[modulePath];
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
 test('checkUltEdits finds flat aligned ULT outputs', async () => {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'check-ult-edits-'));
   const alignedDir = path.join(tempDir, 'output', 'AI-ULT');

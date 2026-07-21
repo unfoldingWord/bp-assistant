@@ -92,33 +92,38 @@ async function checkExistingBranch(username, repo = 'en_tn', branchPattern = '{u
 
 // --- Resolve an output file that may live in either output/X/ or output/X/BOOK/ ---
 // Tries all combos: {unpadded, 2-digit, 3-digit} × {flat, subdirectory}
-// When verseSuffix is provided (e.g. "-v3-4"), only match that specific suffix
-// in the verse-range fallback — prevents returning a v1-2 file for a v3-4 request.
+// When verseSuffix is provided (e.g. "-v3-4"), a bare (non-suffixed) file is
+// NOT accepted — only files whose numeric verse suffix equals the requested
+// range match. Without this a stale full-chapter file (e.g. EZK-17.usfm) would
+// satisfy a verse-range check, hiding the fact that the current range's source
+// was never actually produced (#231).
 function resolveOutputFile(relPath, book, verseSuffix) {
-  const direct = path.join(CSKILLBP_DIR, relPath);
-  if (fs.existsSync(direct)) return relPath;
-
   const parts = relPath.split('/');
   const filename = parts.pop();
   const searchDirs = buildOutputSearchDirs(parts.join('/'), book);
 
-  for (const dir of searchDirs) {
-    const candidate = dir && dir !== '.'
-      ? path.posix.join(dir, filename)
-      : filename;
-    if (fs.existsSync(path.join(CSKILLBP_DIR, candidate))) return candidate;
-  }
-
-  // Try zero-padded chapter numbers — 2-digit and 3-digit
-  for (const width of [2, 3]) {
-    const padded = filename.replace(/-(\d+)([-.])/, (_, n, sep) => `-${n.padStart(width, '0')}${sep}`);
-    if (padded === filename) continue;
+  if (!verseSuffix) {
+    const direct = path.join(CSKILLBP_DIR, relPath);
+    if (fs.existsSync(direct)) return relPath;
 
     for (const dir of searchDirs) {
-      const paddedCandidate = dir && dir !== '.'
-        ? path.posix.join(dir, padded)
-        : padded;
-      if (fs.existsSync(path.join(CSKILLBP_DIR, paddedCandidate))) return paddedCandidate;
+      const candidate = dir && dir !== '.'
+        ? path.posix.join(dir, filename)
+        : filename;
+      if (fs.existsSync(path.join(CSKILLBP_DIR, candidate))) return candidate;
+    }
+
+    // Try zero-padded chapter numbers — 2-digit and 3-digit
+    for (const width of [2, 3]) {
+      const padded = filename.replace(/-(\d+)([-.])/, (_, n, sep) => `-${n.padStart(width, '0')}${sep}`);
+      if (padded === filename) continue;
+
+      for (const dir of searchDirs) {
+        const paddedCandidate = dir && dir !== '.'
+          ? path.posix.join(dir, padded)
+          : padded;
+        if (fs.existsSync(path.join(CSKILLBP_DIR, paddedCandidate))) return paddedCandidate;
+      }
     }
   }
 

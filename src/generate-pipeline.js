@@ -103,15 +103,21 @@ function cleanupGenerateArtifacts({ book, chapter, verseStart, verseEnd }) {
   // suffixes, so sweep them by pattern. A --fresh run MUST clear these — the
   // pipeline now banks source-consistent batches across runs, so a leftover
   // batch here would otherwise be silently reused by a "fresh" run.
-  if (!hasVerseRange) {
-    const batchRe = new RegExp(`^${tag}-v\\d+-v\\d+-aligned\\.usfm$`);
-    for (const dirRel of [`output/AI-ULT`, `output/AI-UST`, `output/AI-ULT/${book}`, `output/AI-UST/${book}`]) {
-      const absDir = path.resolve(CSKILLBP_DIR, dirRel);
-      let entries;
-      try { entries = fs.readdirSync(absDir); } catch (_) { continue; }
-      for (const entry of entries) {
-        if (batchRe.test(entry)) removeIfExists(path.join(absDir, entry));
-      }
+  //
+  // Verse-range runs also sweep them: a verse-range run never produces per-batch
+  // files (batch merging is skipped for verse-range runs, see
+  // resolveMergedChapterAligned callers), so any surviving batch file for the
+  // same chapter is a stale artifact from a prior full-chapter run and would
+  // otherwise get picked up by the alignment-discovery glob (see #231, where a
+  // stale EZK-17-v13-v24-aligned.usfm survived into a 17-42 verse-range run and
+  // was silently trusted as the aligned output).
+  const batchRe = new RegExp(`^${tag}-v\\d+-v\\d+-aligned\\.usfm$`);
+  for (const dirRel of [`output/AI-ULT`, `output/AI-UST`, `output/AI-ULT/${book}`, `output/AI-UST/${book}`]) {
+    const absDir = path.resolve(CSKILLBP_DIR, dirRel);
+    let entries;
+    try { entries = fs.readdirSync(absDir); } catch (_) { continue; }
+    for (const entry of entries) {
+      if (batchRe.test(entry)) removeIfExists(path.join(absDir, entry));
     }
   }
 
@@ -266,10 +272,17 @@ function buildChapterTag(book, chapter) {
 function getInitialPipelineOutputStatus({ book, chapter, verseStart, verseEnd }) {
   const chapterTag = buildChapterTag(book, chapter);
   const verseSuffix = verseStart != null && verseEnd != null ? `-vv${verseStart}-${verseEnd}` : null;
+  // Scope the ULT/UST completeness check to the requested verse range: without
+  // this a leftover full-chapter or wrong-range file (e.g. a stale
+  // EZK-17.usfm or EZK-17-vv1-16.usfm) satisfies the "found" condition for a
+  // 17-42 run, and the pipeline proceeds through generation and a costly
+  // alignment step believing initial-pipeline had produced a valid source
+  // (#231). Passing a verseSuffix routes resolveOutputFile into its verse-
+  // range branch, which requires the numeric suffix to equal verseStart-verseEnd.
   const required = [
-    { label: 'ULT', path: `output/AI-ULT/${chapterTag}.usfm` },
+    { label: 'ULT', path: `output/AI-ULT/${chapterTag}.usfm`, verseSuffix },
     { label: 'issues TSV', path: `output/issues/${chapterTag}.tsv`, verseSuffix },
-    { label: 'UST', path: `output/AI-UST/${chapterTag}.usfm` },
+    { label: 'UST', path: `output/AI-UST/${chapterTag}.usfm`, verseSuffix },
   ];
 
   const found = {};
@@ -1329,12 +1342,16 @@ async function generatePipeline(route, message) {
       const needUstCheck = contentTypes.includes('ust');
       // Only skip re-alignment when the merged file is genuinely complete:
       // present, source-consistent (not left over from before a regeneration),
-      // and — for full-chapter runs — covering every source verse. A bare
-      // size>1000 check would wrongly skip on a stale or truncated merge.
+      // and covering every source verse. A bare size>1000 check would wrongly
+      // skip on a stale or truncated merge. For verse-range runs, `ultRel`
+      // is itself scoped to the requested verses (the vv-suffixed source),
+      // so the same coverage compare correctly requires the aligned file to
+      // match the requested range — a stale-batch file (e.g. v13-v24) will
+      // fail this gate instead of being silently accepted (#231).
       const ultMergedRel = needUltCheck ? resolveOutputFile(`output/AI-ULT/${vAlign}-aligned.usfm`, book) : null;
       const ustMergedRel = needUstCheck ? resolveOutputFile(`output/AI-UST/${vAlign}-aligned.usfm`, book) : null;
-      const ultAlreadyDone = !needUltCheck || assessAlignedChapterCoverage(ultMergedRel, ultRel, { checkCoverage: !hasVerseRange }).ok;
-      const ustAlreadyDone = !needUstCheck || assessAlignedChapterCoverage(ustMergedRel, ustRel, { checkCoverage: !hasVerseRange }).ok;
+      const ultAlreadyDone = !needUltCheck || assessAlignedChapterCoverage(ultMergedRel, ultRel, { checkCoverage: true }).ok;
+      const ustAlreadyDone = !needUstCheck || assessAlignedChapterCoverage(ustMergedRel, ustRel, { checkCoverage: true }).ok;
       if (ultAlreadyDone && ustAlreadyDone) {
         await status(`Aligned outputs already complete for ${book} ${ch} — skipping alignment re-run.`);
         const alignedUltRel = ultMergedRel;
@@ -1491,7 +1508,17 @@ async function generatePipeline(route, message) {
         // and full-chapter coverage are enforced below — this replaces the old
         // "written since this run started" freshness gate so a resume can bank
         // valid batches from an earlier run instead of restarting every batch.
-        const alignPat = new RegExp(`^${book}-0*${ch}(-.*)?-aligned\\.usfm$`);
+        //
+        // Verse-range runs tighten the pattern to the exact expected suffix
+        // (…-vv<start>-<end>-aligned.usfm). Without this, a stale per-batch file
+        // (…-vNN-vMM-aligned.usfm) or a stale full-chapter aligned file for the
+        // same chapter would satisfy the generic glob and — because the coverage
+        // gate below runs with checkCoverage:!hasVerseRange — silently pass
+        // through to the push step (see #231, EZK 17:17-42 picking up a stale
+        // EZK-17-v13-v24-aligned.usfm).
+        const alignPat = hasVerseRange
+          ? new RegExp(`^${book}-0*${ch}-vv${verseStart}-${verseEnd}-aligned\\.usfm$`)
+          : new RegExp(`^${book}-0*${ch}(-.*)?-aligned\\.usfm$`);
         alignedUltRel = needUlt ? discoverFreshOutput('output/AI-ULT', book, alignPat, null) : null;
         alignedUstRel = needUst ? discoverFreshOutput('output/AI-UST', book, alignPat, null) : null;
 
@@ -1504,10 +1531,14 @@ async function generatePipeline(route, message) {
         }
 
         // Coverage gate: the (merged) output must exist, be source-consistent,
-        // and — for full-chapter runs — cover every verse in its source. This is
-        // what catches a truncated push (e.g. only 2 of 3 batches merged).
-        ultCov = needUlt ? assessAlignedChapterCoverage(alignedUltRel, ultRel, { checkCoverage: !hasVerseRange }) : { ok: true, reason: null };
-        ustCov = needUst ? assessAlignedChapterCoverage(alignedUstRel, ustRel, { checkCoverage: !hasVerseRange }) : { ok: true, reason: null };
+        // and cover every verse in its source. This catches a truncated push
+        // (e.g. only 2 of 3 batches merged) for full-chapter runs, and for
+        // verse-range runs it catches a wrong-range or stale aligned file
+        // slipping through the tightened alignPat above (the source here is
+        // the vv-suffixed subset, so the compare correctly requires the
+        // aligned file to cover the requested range — see #231).
+        ultCov = needUlt ? assessAlignedChapterCoverage(alignedUltRel, ultRel, { checkCoverage: true }) : { ok: true, reason: null };
+        ustCov = needUst ? assessAlignedChapterCoverage(alignedUstRel, ustRel, { checkCoverage: true }) : { ok: true, reason: null };
 
         if (!ultCov.ok || !ustCov.ok) {
           const covParts = [needUlt && !ultCov.ok && `ULT: ${ultCov.summary}`, needUst && !ustCov.ok && `UST: ${ustCov.summary}`].filter(Boolean).join(' || ');
