@@ -25,6 +25,7 @@ const {
 } = require('./check-ult-edits');
 const { prepareCompareTn } = require('./workspace-tools/tsv-tools');
 const state = require('./overnight-review-state');
+const { readSecret } = require('./secrets');
 
 const ORG = 'unfoldingWord';
 const WATCHED = [
@@ -294,7 +295,7 @@ function dateStamp(now) { return now.toISOString().slice(0, 10); }
 
 async function runOvernightReview({
   skillsRepo,
-  token = process.env.DCS_TOKEN || process.env.DOOR43_TOKEN || '',
+  token = readSecret('door43_token', 'DOOR43_TOKEN') || readSecret('gitea_token', 'GITEA_TOKEN') || '',
   now = new Date(),
   dryRun = false,
   deps = {},
