@@ -102,6 +102,8 @@ function createHarness({ runClaudeImpl, initialCheckpoint = null, door43PushImpl
   installStub(claudeRunnerPath, {
     DEFAULT_RESTRICTED_TOOLS: [],
     isTransientOutageError: () => false,
+    // Mirrors the real helper so align tests can exercise permission-stall shapes.
+    resultIndicatesPermissionStall: (r) => !!r && (r.subtype === 'permission_stall' || r.permissionStallDetected === true),
     runClaude: async (options) => {
       runClaudeCalls.push(options);
       return runClaudeImpl({ options, tempDir });
@@ -648,6 +650,54 @@ test('generatePipeline reruns align-all-parallel when first post-align validatio
     assert.equal(alignCalls, 2);
     assert.ok(harness.readStatusTexts().some((text) => text.includes('Alignment validation failed for ISA 52 (attempt 1/2)')));
     assert.ok(harness.readStatusTexts().some((text) => text.includes('Retrying **align-all-parallel** for ISA 52')));
+  } finally {
+    harness.cleanup();
+  }
+});
+
+test('align permission stall on a success-shaped result wins over the coverage-derived errorKind (#238)', async () => {
+  // #238 regression: the stall fired after the SDK had already emitted a result
+  // message, so the runner returned subtype 'success' annotated
+  // permissionStallDetected. With partial aligned coverage on disk the failure
+  // used to be classified incomplete_coverage; the stall classification must win.
+  const harness = createHarness({
+    runClaudeImpl: async ({ options, tempDir }) => {
+      if (options.skill === 'initial-pipeline') {
+        fs.mkdirSync(path.join(tempDir, 'output', 'AI-ULT', 'ISA'), { recursive: true });
+        fs.mkdirSync(path.join(tempDir, 'output', 'AI-UST', 'ISA'), { recursive: true });
+        fs.mkdirSync(path.join(tempDir, 'output', 'issues', 'ISA'), { recursive: true });
+        fs.writeFileSync(path.join(tempDir, 'output', 'AI-ULT', 'ISA', 'ISA-52.usfm'), '\\id ISA\n\\c 52\n\\v 1 ult one\n\\v 2 ult two\n');
+        fs.writeFileSync(path.join(tempDir, 'output', 'AI-UST', 'ISA', 'ISA-52.usfm'), '\\id ISA\n\\c 52\n\\v 1 ust one\n\\v 2 ust two\n');
+        fs.writeFileSync(path.join(tempDir, 'output', 'issues', 'ISA', 'ISA-52.tsv'), 'Reference\tID\nISA 52:1\ta1b2\n');
+        return { subtype: 'success', usage: {}, total_cost_usd: 0 };
+      }
+      if (options.skill === 'align-all-parallel') {
+        // Partial output: verse 1 aligned, verse 2 missing → coverage 'incomplete'.
+        fs.mkdirSync(path.join(tempDir, 'output', 'AI-ULT', 'ISA'), { recursive: true });
+        fs.mkdirSync(path.join(tempDir, 'output', 'AI-UST', 'ISA'), { recursive: true });
+        const partial = '\\id ISA\n\\c 52\n\\v 1 \\zaln-s |x-strong="H1" x-content="א"\\*\\w Joshua|x-occurrence="1" x-occurrences="1"\\w*\\zaln-e\\*\n';
+        fs.writeFileSync(path.join(tempDir, 'output', 'AI-ULT', 'ISA', 'ISA-52-aligned.usfm'), partial);
+        fs.writeFileSync(path.join(tempDir, 'output', 'AI-UST', 'ISA', 'ISA-52-aligned.usfm'), partial);
+        // Success-shaped result carrying the stall annotation (see claude-runner).
+        return { subtype: 'success', usage: {}, total_cost_usd: 0, permissionStallDetected: true };
+      }
+      return { subtype: 'success', usage: {}, total_cost_usd: 0 };
+    },
+  });
+
+  try {
+    await harness.generatePipeline(
+      { _synthetic: true, _book: 'ISA', _startChapter: 52, _endChapter: 52, skill: 'initial-pipeline', operations: 6 },
+      buildMessage('generate isa 52', { sender_id: 7 })
+    );
+
+    const failure = harness.checkpoints.find((patch) => patch.current?.status === 'failed');
+    assert.ok(failure, 'align failure checkpoint expected');
+    assert.equal(failure.current.errorKind, 'permission_stall', 'stall must beat the coverage-derived errorKind');
+    assert.match(failure.current.validationSummary, /permission stall|auto-denied/i);
+    assert.equal(harness.diagnosisCalls.length, 1);
+    assert.equal(harness.diagnosisCalls[0].checkpoint.current.errorKind, 'permission_stall');
+    assert.ok(harness.readStatusTexts().some((text) => text.includes('attempting salvage from any banked mapping JSON')));
   } finally {
     harness.cleanup();
   }
