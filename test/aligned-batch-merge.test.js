@@ -210,6 +210,51 @@ test('cleanupGenerateArtifacts removes per-batch aligned files (D3)', () => {
   }
 });
 
+test('cleanupGenerateArtifacts sweeps leftover mapping JSON and salvage output (issue #235)', () => {
+  // Regression: fresh mode used to leave tmp/alignments/ and tmp/aligned/salvage/
+  // untouched. When the coordinator then failed outright, salvage fell back on
+  // stale mapping JSON from a prior source generation and rejected most verses
+  // via the 0.85 similarity guard (EZK 16, 2026-07-21: 24/63 ULT + 2/63 UST).
+  const filesToClear = [
+    // Older per-verse mapping JSON (BOOK-CHAPTER-VERSE.json), various padding.
+    'tmp/alignments/EZK/EZK-16-001.json',
+    'tmp/alignments/EZK/EZK-16-063.json',
+    'tmp/alignments/EZK/EZK-016-020.json',
+    // Newer per-verse mapping JSON (BOOK-CHAPTER-vVERSE-TYPE.json).
+    'tmp/alignments/EZK/EZK-16-v3-ult.json',
+    'tmp/alignments/EZK/EZK-16-v45-ust.json',
+    // Whole-chapter mapping JSON variants used by the pipeline.
+    'tmp/alignments/EZK/EZK-16-mapping.json',
+    'tmp/alignments/EZK/EZK-16-ult.json',
+    'tmp/alignments/EZK/EZK-16-ust.json',
+    'tmp/alignments/EZK/EZK-16-ult-fixed.json',
+    // Prior salvage output.
+    'tmp/aligned/salvage/EZK-16-001-ult-aligned.usfm',
+    'tmp/aligned/salvage/EZK-16-042-ust-aligned.usfm',
+  ];
+  for (const rel of filesToClear) writeRel(rel, '{}');
+
+  // Sibling chapter/book artifacts must survive — the sweep is scoped by
+  // BOOK-CHAPTER prefix, not blanket "tmp/alignments/**".
+  const filesToPreserve = [
+    'tmp/alignments/EZK/EZK-17-001.json',       // different chapter
+    'tmp/alignments/EZK/EZK-160-001.json',      // different chapter (padded to 3)
+    'tmp/alignments/JER/JER-16-001.json',       // different book
+    'tmp/aligned/salvage/EZK-17-001-ult-aligned.usfm',
+    'tmp/aligned/salvage/JER-16-001-ult-aligned.usfm',
+  ];
+  for (const rel of filesToPreserve) writeRel(rel, '{}');
+
+  cleanupGenerateArtifacts({ book: 'EZK', chapter: 16 });
+
+  for (const rel of filesToClear) {
+    assert.equal(fs.existsSync(path.join(TMP, rel)), false, `${rel} should be swept`);
+  }
+  for (const rel of filesToPreserve) {
+    assert.equal(fs.existsSync(path.join(TMP, rel)), true, `${rel} should be preserved`);
+  }
+});
+
 // --- deleteStaleBatches: clear source-predating batches so the skill re-aligns them
 
 test('deleteStaleBatches removes only batches older than the source', () => {
