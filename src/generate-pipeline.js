@@ -1495,12 +1495,31 @@ async function generatePipeline(route, message) {
         // same verses (observed on EZK 16 tail verses 61-63, see #230) produces
         // the same gap twice. Density-only failures leave `missing` empty, so
         // the hint is omitted and the retry falls back to the original prompt.
+        // When the previous attempt produced no aligned output at all (reason
+        // 'missing'), `cov.missing` is `[]` even though every verse in the
+        // chapter still needs alignment — enumerate the source verse set so
+        // the retry prompt still differs from attempt 1 and names concrete
+        // verses (observed on EZK 16, see #238: both attempts returned success
+        // but produced no merged aligned USFM; without a populated hint the
+        // retry ran the same prompt and reproduced the same empty result).
+        const enumerateFullChapterMissing = (sourceRel) => {
+          const set = parseVerseSetFromFile(sourceRel);
+          return [...set].sort((a, b) => a - b);
+        };
+        const missingFor = (needType, cov, sourceRel) => {
+          if (!needType || !cov || cov.ok) return [];
+          if (cov.missing && cov.missing.length) return cov.missing;
+          if (cov.reason === 'missing') return enumerateFullChapterMissing(sourceRel);
+          return [];
+        };
         const retryHintParts = [];
-        if (needUlt && ultCov && !ultCov.ok && ultCov.missing && ultCov.missing.length) {
-          retryHintParts.push(`ULT verses ${formatVerseRanges(ultCov.missing)}`);
+        const ultMissingForHint = missingFor(needUlt, ultCov, ultRel);
+        if (ultMissingForHint.length) {
+          retryHintParts.push(`ULT verses ${formatVerseRanges(ultMissingForHint)}`);
         }
-        if (needUst && ustCov && !ustCov.ok && ustCov.missing && ustCov.missing.length) {
-          retryHintParts.push(`UST verses ${formatVerseRanges(ustCov.missing)}`);
+        const ustMissingForHint = missingFor(needUst, ustCov, ustRel);
+        if (ustMissingForHint.length) {
+          retryHintParts.push(`UST verses ${formatVerseRanges(ustMissingForHint)}`);
         }
         const retryHint = retryHintParts.length
           ? ` (previous attempt did not align: ${retryHintParts.join('; ')} — please focus on these missing verses)`

@@ -534,6 +534,66 @@ test('generatePipeline retry prompt lists missing verses so the coordinator targ
   }
 });
 
+test('generatePipeline retry prompt enumerates the full source when the previous attempt produced no aligned output (#238)', async () => {
+  // ISA 52 has 15 verses in the source; every align call returns success but
+  // writes no aligned USFM at all — the coverage check reports reason:'missing'
+  // with missing:[] (there was no file to diff against the source). Before
+  // #238 the retry hint only fired when cov.missing was non-empty, so the
+  // retry prompt was identical to attempt 1 and reproduced the empty result.
+  // After the fix, the retry must enumerate the source verse set (1-15) so
+  // the coordinator gets a concrete target list.
+  let alignCalls = 0;
+  const fullSource = [
+    '\\id ISA',
+    '\\c 52',
+    ...Array.from({ length: 15 }, (_, i) => `\\v ${i + 1} source verse ${i + 1}`),
+    '',
+  ].join('\n');
+  const harness = createHarness({
+    runClaudeImpl: async ({ options, tempDir }) => {
+      if (options.skill === 'initial-pipeline') {
+        fs.mkdirSync(path.join(tempDir, 'output', 'AI-ULT', 'ISA'), { recursive: true });
+        fs.mkdirSync(path.join(tempDir, 'output', 'AI-UST', 'ISA'), { recursive: true });
+        fs.mkdirSync(path.join(tempDir, 'output', 'issues', 'ISA'), { recursive: true });
+        fs.writeFileSync(path.join(tempDir, 'output', 'AI-ULT', 'ISA', 'ISA-52.usfm'), fullSource);
+        fs.writeFileSync(path.join(tempDir, 'output', 'AI-UST', 'ISA', 'ISA-52.usfm'), fullSource);
+        fs.writeFileSync(path.join(tempDir, 'output', 'issues', 'ISA', 'ISA-52.tsv'), 'Reference\tID\nISA 52:1\ta1b2\n');
+        return { subtype: 'success', usage: {}, total_cost_usd: 0 };
+      }
+      if (options.skill === 'align-all-parallel') {
+        alignCalls++;
+        // Return success but write nothing — mirrors the EZK 16 signature.
+        return { subtype: 'success', usage: {}, total_cost_usd: 0 };
+      }
+      return { subtype: 'success', usage: {}, total_cost_usd: 0 };
+    },
+  });
+
+  try {
+    await harness.generatePipeline(
+      { _synthetic: true, _book: 'ISA', _startChapter: 52, _endChapter: 52, skill: 'initial-pipeline', operations: 6 },
+      buildMessage('generate isa 52', { sender_id: 7 })
+    );
+
+    assert.equal(alignCalls, 2);
+    const alignPrompts = harness.runClaudeCalls
+      .filter((call) => call.skill === 'align-all-parallel')
+      .map((call) => call.prompt);
+    assert.equal(alignPrompts.length, 2);
+    // Attempt 1 is the vanilla prompt — no retry hint.
+    assert.doesNotMatch(alignPrompts[0], /previous attempt/i);
+    // Attempt 2 must name the full source range (1-15) for both ULT and UST,
+    // even though cov.missing was empty because no aligned file existed.
+    assert.match(alignPrompts[1], /previous attempt/i);
+    assert.match(alignPrompts[1], /ULT verses 1-15/);
+    assert.match(alignPrompts[1], /UST verses 1-15/);
+    // Operator status message should surface the enumerated targets.
+    assert.ok(harness.readStatusTexts().some((text) => /Retrying \*\*align-all-parallel\*\*.*targeting.*ULT verses 1-15/.test(text)));
+  } finally {
+    harness.cleanup();
+  }
+});
+
 test('generatePipeline fires self-diagnosis when door43-push fails', async () => {
   const harness = createHarness({
     door43PushImpl: async ({ type }) => ({ success: false, details: `Verse 1 not found in chapter 52 (${type})` }),
