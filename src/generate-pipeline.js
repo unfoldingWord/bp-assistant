@@ -1476,9 +1476,26 @@ async function generatePipeline(route, message) {
         // files — so banked batch progress survives and the align skill only has
         // to (re)produce the missing/degraded batches.
         deleteMergedAligned(book, ch);
-        await status(`Retrying **align-all-parallel** for ${book} ${ch} to fill missing/degraded verses...`);
+        // Tell the coordinator which specific verses were missing on attempt 1
+        // so it can target them. Without this hint the retry prompt is identical
+        // to the first attempt, and a coordinator that consistently drops the
+        // same verses (observed on EZK 16 tail verses 61-63, see #230) produces
+        // the same gap twice. Density-only failures leave `missing` empty, so
+        // the hint is omitted and the retry falls back to the original prompt.
+        const retryHintParts = [];
+        if (needUlt && ultCov && !ultCov.ok && ultCov.missing && ultCov.missing.length) {
+          retryHintParts.push(`ULT verses ${formatVerseRanges(ultCov.missing)}`);
+        }
+        if (needUst && ustCov && !ustCov.ok && ustCov.missing && ustCov.missing.length) {
+          retryHintParts.push(`UST verses ${formatVerseRanges(ustCov.missing)}`);
+        }
+        const retryHint = retryHintParts.length
+          ? ` (previous attempt did not align: ${retryHintParts.join('; ')} — please focus on these missing verses)`
+          : '';
+        const retryStatusSuffix = retryHintParts.length ? ` (targeting ${retryHintParts.join('; ')})` : '';
+        await status(`Retrying **align-all-parallel** for ${book} ${ch} to fill missing/degraded verses${retryStatusSuffix}...`);
         const retryResult = await runClaude({
-          prompt: `${alignRef} ${alignTypeFlags}${genCtxFlag}`,
+          prompt: `${alignRef} ${alignTypeFlags}${genCtxFlag}${retryHint}`,
           label: `${alignRef} align-all-parallel (retry)`,
           cwd: CSKILLBP_DIR,
           model: model || 'medium',

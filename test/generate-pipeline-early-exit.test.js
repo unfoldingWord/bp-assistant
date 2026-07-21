@@ -467,6 +467,73 @@ test('generatePipeline retries alignment once and fails with degraded_alignment 
   }
 });
 
+test('generatePipeline retry prompt lists missing verses so the coordinator targets the gap (#230)', async () => {
+  // ISA 52 has 15 verses in the source; every align call writes an aligned
+  // file that covers only verses 1-12, leaving 13-15 missing. Attempt 1 is
+  // the vanilla align call; attempt 2 is the retry. The retry prompt must
+  // explicitly name the missing verses so a coordinator that consistently
+  // drops the same tail verses (see EZK 16:61-63 in issue #230) gets a
+  // targeted second chance instead of an identical prompt.
+  let alignCalls = 0;
+  const partialAligned = [
+    '\\id ISA',
+    '\\c 52',
+    ...Array.from({ length: 12 }, (_, i) => `\\v ${i + 1} \\zaln-s |x-strong="H1" x-content="א"\\*\\w Joshua|x-occurrence="1" x-occurrences="1"\\w*\\zaln-e\\*`),
+    '',
+  ].join('\n');
+  const fullSource = [
+    '\\id ISA',
+    '\\c 52',
+    ...Array.from({ length: 15 }, (_, i) => `\\v ${i + 1} source verse ${i + 1}`),
+    '',
+  ].join('\n');
+  const harness = createHarness({
+    runClaudeImpl: async ({ options, tempDir }) => {
+      if (options.skill === 'initial-pipeline') {
+        fs.mkdirSync(path.join(tempDir, 'output', 'AI-ULT', 'ISA'), { recursive: true });
+        fs.mkdirSync(path.join(tempDir, 'output', 'AI-UST', 'ISA'), { recursive: true });
+        fs.mkdirSync(path.join(tempDir, 'output', 'issues', 'ISA'), { recursive: true });
+        fs.writeFileSync(path.join(tempDir, 'output', 'AI-ULT', 'ISA', 'ISA-52.usfm'), fullSource);
+        fs.writeFileSync(path.join(tempDir, 'output', 'AI-UST', 'ISA', 'ISA-52.usfm'), fullSource);
+        fs.writeFileSync(path.join(tempDir, 'output', 'issues', 'ISA', 'ISA-52.tsv'), 'Reference\tID\nISA 52:1\ta1b2\n');
+        return { subtype: 'success', usage: {}, total_cost_usd: 0 };
+      }
+      if (options.skill === 'align-all-parallel') {
+        alignCalls++;
+        fs.mkdirSync(path.join(tempDir, 'output', 'AI-ULT', 'ISA'), { recursive: true });
+        fs.mkdirSync(path.join(tempDir, 'output', 'AI-UST', 'ISA'), { recursive: true });
+        fs.writeFileSync(path.join(tempDir, 'output', 'AI-ULT', 'ISA', 'ISA-52-aligned.usfm'), partialAligned);
+        fs.writeFileSync(path.join(tempDir, 'output', 'AI-UST', 'ISA', 'ISA-52-aligned.usfm'), partialAligned);
+        return { subtype: 'success', usage: {}, total_cost_usd: 0 };
+      }
+      return { subtype: 'success', usage: {}, total_cost_usd: 0 };
+    },
+  });
+
+  try {
+    await harness.generatePipeline(
+      { _synthetic: true, _book: 'ISA', _startChapter: 52, _endChapter: 52, skill: 'initial-pipeline', operations: 6 },
+      buildMessage('generate isa 52', { sender_id: 7 })
+    );
+
+    assert.equal(alignCalls, 2);
+    const alignPrompts = harness.runClaudeCalls
+      .filter((call) => call.skill === 'align-all-parallel')
+      .map((call) => call.prompt);
+    assert.equal(alignPrompts.length, 2);
+    // Attempt 1 is the vanilla prompt — no retry hint.
+    assert.doesNotMatch(alignPrompts[0], /previous attempt/i);
+    // Attempt 2 must name the missing verses (13-15) for both ULT and UST.
+    assert.match(alignPrompts[1], /previous attempt/i);
+    assert.match(alignPrompts[1], /ULT verses 13-15/);
+    assert.match(alignPrompts[1], /UST verses 13-15/);
+    // The operator-visible status message should surface the targeted verses too.
+    assert.ok(harness.readStatusTexts().some((text) => /Retrying \*\*align-all-parallel\*\*.*targeting.*ULT verses 13-15/.test(text)));
+  } finally {
+    harness.cleanup();
+  }
+});
+
 test('generatePipeline fires self-diagnosis when door43-push fails', async () => {
   const harness = createHarness({
     door43PushImpl: async ({ type }) => ({ success: false, details: `Verse 1 not found in chapter 52 (${type})` }),
