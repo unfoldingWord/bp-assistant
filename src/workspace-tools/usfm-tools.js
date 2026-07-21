@@ -250,6 +250,108 @@ function checkUstPassives({ file }) {
 }
 
 /**
+ * Deterministically plan the batch verse-ranges for align-all-parallel.
+ *
+ * Batch boundaries used to be computed by the LLM coordinator in the
+ * align-all-parallel SKILL.md prompt. On long chapters that arithmetic went
+ * wrong: EZK 16 (63 verses, 2026-07-21, issue #233) was split into
+ * 1-16 / 16-30 / 31-45 / 46-60 — 15-verse, overlapping at v16, and dropping
+ * the tail (61-63 were never batched, so no subagent produced mapping JSON for
+ * them and the deterministic salvage had nothing to recover). This ports the
+ * boundary computation into Node so every chapter is covered exactly once,
+ * contiguously, with the final batch always reaching the last verse.
+ *
+ * Mirrors the documented algorithm (SKILL.md Step 2b): numBatches = ceil(N/max),
+ * then distribute evenly with size = ceil(N / numBatches); the last batch gets
+ * the remainder. Returns `[{ index, start, end }]` (1-based, inclusive).
+ */
+function planAlignmentBatches(verseCount, { maxBatchSize = 18 } = {}) {
+  const n = parseInt(verseCount, 10);
+  if (!Number.isInteger(n) || n < 1) {
+    throw new Error(`planAlignmentBatches: verseCount must be a positive integer, got ${verseCount}`);
+  }
+  const max = parseInt(maxBatchSize, 10) > 0 ? parseInt(maxBatchSize, 10) : 18;
+  const numBatches = Math.max(1, Math.ceil(n / max));
+  const size = Math.ceil(n / numBatches);
+  const batches = [];
+  let start = 1;
+  for (let i = 0; i < numBatches && start <= n; i += 1) {
+    const end = Math.min(start + size - 1, n);
+    batches.push({ index: batches.length + 1, start, end });
+    start = end + 1;
+  }
+  // Defensive: the loop clamps each end to n, so the final batch already reaches
+  // the last verse — force it regardless so no rounding path can drop the tail.
+  if (batches.length) batches[batches.length - 1].end = n;
+  return batches;
+}
+
+/**
+ * Validate that a set of batch ranges covers verses 1..verseCount exactly once —
+ * no gaps, no overlaps, and (the failure mode from #233) the last verse batched.
+ * Returns `{ ok, missing, reachesLast, problems }`. This is the deterministic
+ * guard: even if a coordinator computes its own boundaries, the pipeline/skill
+ * can assert the plan reaches the chapter tail before spawning subagents.
+ */
+function assertBatchPlanCoversChapter(batches, verseCount) {
+  const n = parseInt(verseCount, 10);
+  const problems = [];
+  const covered = new Set();
+  const sorted = [...(batches || [])]
+    .map((b) => ({ start: parseInt(b.start, 10), end: parseInt(b.end, 10) }))
+    .sort((a, b) => a.start - b.start);
+  let prevEnd = 0;
+  for (const b of sorted) {
+    if (!Number.isInteger(b.start) || !Number.isInteger(b.end) || b.start > b.end) {
+      problems.push(`invalid range ${b.start}-${b.end}`);
+      continue;
+    }
+    if (b.start <= prevEnd) problems.push(`overlap at verse ${b.start}`);
+    else if (b.start > prevEnd + 1) problems.push(`gap before verse ${b.start}`);
+    for (let v = b.start; v <= b.end; v += 1) covered.add(v);
+    prevEnd = Math.max(prevEnd, b.end);
+  }
+  const missing = [];
+  if (Number.isInteger(n) && n >= 1) {
+    for (let v = 1; v <= n; v += 1) if (!covered.has(v)) missing.push(v);
+  }
+  const reachesLast = Number.isInteger(n) && covered.has(n);
+  if (!reachesLast && Number.isInteger(n)) problems.push(`last verse ${n} not batched`);
+  return { ok: problems.length === 0 && missing.length === 0, missing, reachesLast, problems };
+}
+
+/**
+ * Tool wrapper for `plan_alignment_batches` — the align-all-parallel coordinator
+ * calls this (via the CLI wrapper / MCP) instead of computing batch boundaries
+ * itself. Accepts either an explicit `verseCount`, or a `file` + `chapter` to
+ * count `\v` markers from the chapter (matching SKILL.md Step 1). Returns the
+ * plan plus a `coversChapter` assertion so a mis-plan surfaces immediately.
+ */
+function planAlignmentBatchesTool({ verseCount, book, chapter, file, maxBatchSize } = {}) {
+  let n = verseCount != null ? parseInt(verseCount, 10) : NaN;
+  if ((!Number.isInteger(n) || n < 1) && file && chapter != null) {
+    const content = readUsfmChapter({ file, chapter });
+    if (typeof content === 'string' && content.startsWith('Error')) return content;
+    n = (String(content).match(/\\v\s+\d+/g) || []).length;
+  }
+  if (!Number.isInteger(n) || n < 1) {
+    return `Error: could not determine verse count — pass verseCount, or file+chapter (got verseCount=${verseCount}, file=${file}, chapter=${chapter})`;
+  }
+  const batches = planAlignmentBatches(n, { maxBatchSize });
+  const check = assertBatchPlanCoversChapter(batches, n);
+  return {
+    book: book ? String(book).toUpperCase() : undefined,
+    chapter: chapter != null ? parseInt(chapter, 10) : undefined,
+    verseCount: n,
+    numBatches: batches.length,
+    singleBatch: batches.length <= 1,
+    batches: batches.map((b) => ({ index: b.index, start: b.start, end: b.end, verses: `${b.start}-${b.end}` })),
+    coversChapter: check.ok,
+    problems: check.problems,
+  };
+}
+
+/**
  * Convert alignment mapping JSON to aligned USFM3.
  * Wraps the existing create_aligned_usfm.js script via execFileSync (no shell needed).
  */
@@ -1451,6 +1553,9 @@ module.exports = {
   repairAlignmentXContent,
   readUsfmChapter,
   mergeAlignedUsfm,
+  planAlignmentBatches,
+  assertBatchPlanCoversChapter,
+  planAlignmentBatchesTool,
   salvageAlignedFromMappingJson,
   salvageDroppedVerses,
   summarizeSalvageMissingReasons,
