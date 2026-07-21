@@ -1372,7 +1372,16 @@ async function generatePipeline(route, message) {
       // agent would hit the same dead transport).
       let transportClosed = !!(alignResult && alignResult.subtype === 'mcp_transport_closed');
 
-      if ((!alignResult || alignResult.subtype !== 'success') && !transportClosed) {
+      // The runner bails with `permission_stall` when the align sub-agents' out-of-
+      // allowlist tool calls are auto-denied in headless auto mode and they obey the
+      // "STOP and wait" text literally, producing no output (EZK 16, 2026-07-21 —
+      // issue #235). Treat it like transportClosed: don't fail-and-continue on the
+      // generic path — attempt deterministic salvage from any banked mapping JSON, then
+      // route to a DISTINCT clean failure (never the timeout+salvage-garbage path) whose
+      // errorKind lets self-diagnosis short-circuit (a fresh agent hits the same wall).
+      let permissionStall = !!(alignResult && alignResult.subtype === 'permission_stall');
+
+      if ((!alignResult || alignResult.subtype !== 'success') && !transportClosed && !permissionStall) {
         const errText = !alignResult
           ? 'timed out or was aborted (no result returned)'
           : (alignResult.error || alignResult.result || `non-success subtype: "${alignResult.subtype}"`);
@@ -1404,6 +1413,10 @@ async function generatePipeline(route, message) {
 
       if (transportClosed) {
         await status(`**align-all-parallel** hit an MCP transport outage (Stream closed) for ${book} ${ch} on the first pass — attempting salvage from any banked mapping JSON before failing.`);
+      }
+
+      if (permissionStall) {
+        await status(`**align-all-parallel** stalled for ${book} ${ch}: align sub-agent tool calls were auto-denied in headless mode ("STOP and wait") and it halted — attempting salvage from any banked mapping JSON before failing.`);
       }
 
       // Record metrics for align-all-parallel
@@ -1513,6 +1526,7 @@ async function generatePipeline(route, message) {
         });
         if (!retryResult || retryResult.subtype !== 'success') {
           if (retryResult && retryResult.subtype === 'mcp_transport_closed') transportClosed = true;
+          if (retryResult && retryResult.subtype === 'permission_stall') permissionStall = true;
           finalValidationSummary = !retryResult
             ? 'retry timed out or was aborted (no result returned)'
             : (retryResult.error || retryResult.result || `retry non-success subtype: "${retryResult.subtype}"`);
@@ -1616,6 +1630,19 @@ async function generatePipeline(route, message) {
           if (outputStatus === 'degraded') outputStatus = 'missing';
           if (!/transport closed|stream closed/i.test(finalValidationSummary || '')) {
             finalValidationSummary = `${book} ${ch} — align-all-parallel aborted: workspace-tools MCP transport closed (Stream closed) before aligned USFM was produced${finalValidationSummary ? `; ${finalValidationSummary}` : ''}`;
+          }
+        }
+        if (permissionStall && !transportClosed) {
+          // The align sub-agents' out-of-allowlist tool calls were auto-denied in headless
+          // auto mode and they halted on the "STOP and wait" text, so no aligned USFM was
+          // produced and salvage found nothing to recover. Record a distinct kind (overriding
+          // the coverage-derived one) so self-diagnosis short-circuits to a templated issue —
+          // a fresh LLM diagnosis agent would hit the same auto-denial wall — and enrich the
+          // summary so that short-circuit's text match fires.
+          errorKind = 'permission_stall';
+          if (outputStatus === 'degraded') outputStatus = 'missing';
+          if (!/permission[- ]?stall|auto-denied|doesn't want to take this action|stop what you are doing and wait/i.test(finalValidationSummary || '')) {
+            finalValidationSummary = `${book} ${ch} — align-all-parallel aborted: sub-agent tool calls were auto-denied in headless mode (permission stall, "STOP what you are doing and wait") before aligned USFM was produced${finalValidationSummary ? `; ${finalValidationSummary}` : ''}`;
           }
         }
         const failEvent = await status(`**align-all-parallel** failed for ${book} ${ch} at ${new Date().toISOString()} — ${finalValidationSummary}`);

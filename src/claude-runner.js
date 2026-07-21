@@ -291,6 +291,88 @@ function buildOptions({
   return options;
 }
 
+// Pure classifier for an SDK `user` message body. Extracted (with the reducer
+// below) so the runner's error-tracking state machine can be unit-tested without
+// driving a live query() stream. `text` is the stringified message content.
+function classifyRunnerUserMessage(text) {
+  const lower = String(text || '').toLowerCase();
+  // Transport-level teardown of the in-process workspace-tools MCP surfaces as an
+  // is_error tool_result whose content is "Stream closed" (NOT a tool_use_error).
+  const isTransportClosed = lower.includes('stream closed') && lower.includes('is_error');
+  // Headless permissionMode:'auto' with no approval callback auto-denies out-of-
+  // allowlist tool calls with this text; sub-agents obey it literally and stall.
+  // Matches neither the transport nor tool_use_error signature (issue #235, EZK 16).
+  // Require the is_error marker (like isTransportClosed above): the denial arrives
+  // ONLY as an is_error tool_result. Without this guard a *successful* Read/Grep of
+  // a log, issue, or test file that merely QUOTES the denial phrase would be
+  // miscounted as a stall and could false-abort a healthy run after 3 such reads.
+  const isPermissionDenied = lower.includes('is_error')
+    && (lower.includes("doesn't want to take this action")
+      || lower.includes('stop what you are doing and wait for the user'));
+  const isToolError = lower.includes('tool_use_error');
+  const isToolResult = lower.includes('tool_result');
+  let toolErrorSig = null;
+  if (isToolError) {
+    toolErrorSig = lower.includes('string to replace not found')
+      ? 'string_not_found'
+      : lower.includes('no changes to make')
+        ? 'no_op_edit'
+        : lower.includes('file has been modified since read')
+          ? 'stale_edit'
+          : 'other_tool_error';
+  }
+  return { isTransportClosed, isPermissionDenied, isToolError, isToolResult, toolErrorSig };
+}
+
+// Pure reducer: applies one classified message to the mutable `state` and returns
+// an `action` telling the loop whether to bail. Precedence (top-down): transport-
+// closed > permission-denial-stall > tool_use_error > tool_result. `state` fields:
+// consecutiveToolErrors, consecutiveTransportErrors, consecutivePermissionDenials,
+// toolErrorSigs (Map). `limits` = { transportLimit, permissionLimit }.
+function applyRunnerUserMessage(state, sig, limits, guardrails) {
+  if (sig.isTransportClosed) {
+    state.consecutiveTransportErrors += 1;
+    return state.consecutiveTransportErrors >= limits.transportLimit
+      ? { type: 'abort_transport' }
+      : { type: 'transport_error' };
+  }
+  if (sig.isPermissionDenied) {
+    // Counted independently of tool/transport errors and deliberately NOT reset by
+    // the tool_result branch below — an interleaved successful tool_result must not
+    // mask an ongoing stall (the sub-agent alternates denied calls with reads).
+    state.consecutivePermissionDenials += 1;
+    return state.consecutivePermissionDenials >= limits.permissionLimit
+      ? { type: 'abort_permission' }
+      : { type: 'permission_denied' };
+  }
+  if (sig.isToolError) {
+    // A live tool-level error means the MCP transport is up again.
+    state.consecutiveTransportErrors = 0;
+    state.consecutiveToolErrors += 1;
+    state.toolErrorSigs.set(sig.toolErrorSig, (state.toolErrorSigs.get(sig.toolErrorSig) || 0) + 1);
+    if (guardrails) {
+      const maxConsecutive = Number(guardrails.maxConsecutiveToolErrors || 0);
+      const maxSigRepeats = Number(guardrails.maxRepeatedToolErrorSignature || 0);
+      const sigRepeats = Number(state.toolErrorSigs.get(sig.toolErrorSig) || 0);
+      const stopForConsecutive = maxConsecutive > 0 && state.consecutiveToolErrors >= maxConsecutive;
+      const stopForRepeats = maxSigRepeats > 0 && sigRepeats >= maxSigRepeats && sig.toolErrorSig !== 'other_tool_error';
+      if (stopForConsecutive || stopForRepeats) {
+        return { type: 'guardrail_stop', sig: sig.toolErrorSig, consecutive: state.consecutiveToolErrors, repeats: sigRepeats };
+      }
+    }
+    return { type: 'tool_error', sig: sig.toolErrorSig };
+  }
+  if (sig.isToolResult) {
+    // Only reset on non-error tool results to avoid false positives during
+    // legitimate read/validation sequences. Note: consecutivePermissionDenials is
+    // intentionally left untouched here (see permission branch above).
+    state.consecutiveToolErrors = 0;
+    state.consecutiveTransportErrors = 0;
+    return { type: 'tool_result_reset' };
+  }
+  return { type: 'none' };
+}
+
 async function runClaudeOnce({
   prompt,
   label,
@@ -336,8 +418,17 @@ async function runClaudeOnce({
   const runnerPrefix = `[claude-runner ${idTag}]`;
   const claudePrefix = `[claude ${idTag}]`;
   let localTimeoutFired = false;
-  const toolErrorSigs = new Map();
-  let consecutiveToolErrors = 0;
+  // Mutable error-tracking state, owned by the SDK user-message classifier
+  // (classifyRunnerUserMessage / applyRunnerUserMessage). Kept as one object so the
+  // reducer that decides when to bail is a pure, unit-testable function.
+  const errorState = {
+    consecutiveToolErrors: 0,
+    consecutiveTransportErrors: 0,
+    // Permission denials are counted independently and — unlike the tool/transport
+    // counters — are NOT reset by an interleaved successful tool_result (see reducer).
+    consecutivePermissionDenials: 0,
+    toolErrorSigs: new Map(),
+  };
   // Repeated "Stream closed" tool_results mean the in-process workspace-tools MCP
   // transport has been torn down (typically an align sub-agent outliving the parent
   // query's message stream — JER 33, 2026-07-02). It is transport-level, not a tool
@@ -345,8 +436,16 @@ async function runClaudeOnce({
   // (observed: 15+ min looping to the skill timeout). Bail after a few and return a
   // distinct outcome so the caller can salvage from banked mapping JSON / short-circuit.
   const MCP_TRANSPORT_ERROR_LIMIT = 3;
-  let consecutiveTransportErrors = 0;
   let transportClosedFired = false;
+  // Headless pipeline runs use permissionMode:'auto' with NO approval callback, so any
+  // tool call outside the narrow allow-rules is auto-denied with "The user doesn't want
+  // to take this action right now. STOP what you are doing and wait for the user...".
+  // Sub-agents obey that literally and halt, producing no output while the run burns to
+  // the timeout (EZK 16, 2026-07-21 — issue #235). This matches NEITHER the transport
+  // nor the tool_use_error signature, so it tripped no counter and could even hit the
+  // tool_result reset. Track it separately and bail fast to a clean failure.
+  const PERMISSION_DENIAL_LIMIT = 3;
+  let permissionStallFired = false;
 
   const timer = setTimeout(() => {
     localTimeoutFired = true;
@@ -422,60 +521,57 @@ async function runClaudeOnce({
         const text = typeof message.message?.content === 'string'
           ? message.message.content
           : JSON.stringify(message.message?.content || '');
-        const lower = text.toLowerCase();
-        // Transport-level teardown of the in-process workspace-tools MCP surfaces as an
-        // is_error tool_result whose content is "Stream closed" (NOT a tool_use_error):
-        // the channel is gone, so every subsequent MCP call fails identically until the
-        // query ends. Retrying can't help — bail fast after a few.
-        const isTransportClosed = lower.includes('stream closed') && lower.includes('is_error');
-        const isToolError = lower.includes('tool_use_error');
-        if (isTransportClosed) {
-          consecutiveTransportErrors += 1;
+        // Classify the SDK user-message and advance the error-tracking state machine.
+        // Both are pure functions (exported for unit tests). Precedence, top-down:
+        // transport-closed > permission-denial-stall > tool_use_error > tool_result.
+        const sig = classifyRunnerUserMessage(text);
+        const action = applyRunnerUserMessage(
+          errorState,
+          sig,
+          { transportLimit: MCP_TRANSPORT_ERROR_LIMIT, permissionLimit: PERMISSION_DENIAL_LIMIT },
+          guardrails
+        );
+        if (action.type === 'transport_error' || action.type === 'abort_transport') {
           console.warn(
             `${runnerPrefix} MCP transport error ("Stream closed") ` +
-            `${consecutiveTransportErrors}/${MCP_TRANSPORT_ERROR_LIMIT} — ` +
+            `${errorState.consecutiveTransportErrors}/${MCP_TRANSPORT_ERROR_LIMIT} — ` +
             `workspace-tools stream is closed; retrying is futile within this session`
           );
-          if (consecutiveTransportErrors >= MCP_TRANSPORT_ERROR_LIMIT) {
+          if (action.type === 'abort_transport') {
             transportClosedFired = true;
             console.error(
               `${runnerPrefix} Aborting query — workspace-tools MCP transport closed ` +
-              `(${consecutiveTransportErrors} consecutive "Stream closed"). The in-process ` +
+              `(${errorState.consecutiveTransportErrors} consecutive "Stream closed"). The in-process ` +
               `SDK MCP transport does not recover within a session; bailing to salvage / ` +
               `short-circuit instead of looping to the ${timeout / 1000}s timeout.`
             );
             abortController.abort();
             break;
           }
-        } else if (isToolError) {
-          // A live tool-level error means the MCP transport is up again.
-          consecutiveTransportErrors = 0;
-          const sig = lower.includes('string to replace not found')
-            ? 'string_not_found'
-            : lower.includes('no changes to make')
-              ? 'no_op_edit'
-              : lower.includes('file has been modified since read')
-                ? 'stale_edit'
-                : 'other_tool_error';
-          consecutiveToolErrors += 1;
-          toolErrorSigs.set(sig, (toolErrorSigs.get(sig) || 0) + 1);
-          if (guardrails) {
-            const maxConsecutive = Number(guardrails.maxConsecutiveToolErrors || 0);
-            const maxSigRepeats = Number(guardrails.maxRepeatedToolErrorSignature || 0);
-            const sigRepeats = Number(toolErrorSigs.get(sig) || 0);
-            const stopForConsecutive = maxConsecutive > 0 && consecutiveToolErrors >= maxConsecutive;
-            const stopForRepeats = maxSigRepeats > 0 && sigRepeats >= maxSigRepeats && sig !== 'other_tool_error';
-            if (stopForConsecutive || stopForRepeats) {
-              throw new Error(
-                `Guardrail stop: repeated tool errors (${sig}, consecutive=${consecutiveToolErrors}, repeats=${sigRepeats})`
-              );
-            }
+        } else if (action.type === 'permission_denied' || action.type === 'abort_permission') {
+          console.warn(
+            `${runnerPrefix} Permission-denial stall ` +
+            `${errorState.consecutivePermissionDenials}/${PERMISSION_DENIAL_LIMIT} — ` +
+            `a tool call was auto-denied ("STOP and wait") in headless auto mode; the sub-agent ` +
+            `is obeying the denial text literally instead of switching tools`
+          );
+          if (action.type === 'abort_permission') {
+            permissionStallFired = true;
+            console.error(
+              `${runnerPrefix} Aborting query — permission-denial stall ` +
+              `(${errorState.consecutivePermissionDenials} consecutive auto-denials). Headless ` +
+              `permissionMode:'auto' with no approval callback auto-denies out-of-allowlist tool ` +
+              `calls; the agent halts on the "STOP what you are doing and wait" text rather than ` +
+              `switching to an allowed tool. Bailing to a clean failure instead of looping to the ` +
+              `${timeout / 1000}s timeout.`
+            );
+            abortController.abort();
+            break;
           }
-        } else if (lower.includes('tool_result')) {
-          // Only reset on non-error tool results to avoid false positives during
-          // legitimate read/validation sequences.
-          consecutiveToolErrors = 0;
-          consecutiveTransportErrors = 0;
+        } else if (action.type === 'guardrail_stop') {
+          throw new Error(
+            `Guardrail stop: repeated tool errors (${action.sig}, consecutive=${action.consecutive}, repeats=${action.repeats})`
+          );
         }
         if (text.includes('command-stderr') || text.includes('Error')) {
           console.error(`${runnerPrefix} SDK user message (error): ${text.slice(0, 500)}`);
@@ -550,7 +646,7 @@ async function runClaudeOnce({
   if (transportClosedFired) {
     console.warn(
       `${runnerPrefix} Returning mcp_transport_closed outcome — ` +
-      `reason=mcp_transport_closed consecutive=${consecutiveTransportErrors} elapsed=${elapsedMs}ms`
+      `reason=mcp_transport_closed consecutive=${errorState.consecutiveTransportErrors} elapsed=${elapsedMs}ms`
     );
     return {
       subtype: 'mcp_transport_closed',
@@ -561,7 +657,27 @@ async function runClaudeOnce({
       configuredTimeoutMs: timeout,
       turnCount,
       lastTool,
-      consecutiveTransportErrors,
+      consecutiveTransportErrors: errorState.consecutiveTransportErrors,
+    };
+  }
+  // A permission-denial stall was detected and we abort()ed to bail — take precedence
+  // over the abort→timeout classification below, mirroring mcp_transport_closed. A
+  // fresh query would hit the same auto-denial wall, so this routes to a clean failure.
+  if (permissionStallFired) {
+    console.warn(
+      `${runnerPrefix} Returning permission_stall outcome — ` +
+      `reason=permission_stall consecutive=${errorState.consecutivePermissionDenials} elapsedMs=${elapsedMs}ms`
+    );
+    return {
+      subtype: 'permission_stall',
+      timedOut: false,
+      reason: 'permission_stall',
+      queryId,
+      elapsedMs,
+      configuredTimeoutMs: timeout,
+      turnCount,
+      lastTool,
+      consecutivePermissionDenials: errorState.consecutivePermissionDenials,
     };
   }
   if (localTimeoutFired || abortController.signal.aborted) {
@@ -832,4 +948,6 @@ module.exports = {
   isTransientOutageError,
   isGuardrailStop,
   resolveReasoning,
+  classifyRunnerUserMessage,
+  applyRunnerUserMessage,
 };
