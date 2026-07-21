@@ -131,6 +131,22 @@ function bashEnabled(enableBash) {
   return Boolean(enableBash) && process.env.BP_DISABLE_BASH !== '1';
 }
 
+// Permission-denial stall detection (issues #235 / #238). Headless pipeline runs
+// use permissionMode:'auto' with NO approval callback, so any tool call outside the
+// narrow allow-rules is auto-denied with "The user doesn't want to take this action
+// right now. STOP what you are doing and wait for the user...". A sub-agent that
+// obeys that literally halts and the run burns silently to the timeout (#235). But
+// denials are NOT inherently fatal: parallel batch sub-agents routinely burn a few
+// improvised probes at startup and then carry on with allowed tools — a cumulative
+// count of 3 aborted a healthy 8-agent run in its first seconds (#238). So the
+// fail-safe is time-based, not count-based: abort only when a denial is followed by
+// NO productive tool result for the whole stall window. A true stall goes silent
+// (or loops on denials); a healthy run keeps producing results that clear the window.
+const PERMISSION_STALL_WINDOW_MS = Number(process.env.BP_PERMISSION_STALL_WINDOW_MS) > 0
+  ? Number(process.env.BP_PERMISSION_STALL_WINDOW_MS)
+  : 5 * 60 * 1000;
+const PERMISSION_STALL_POLL_MS = 30 * 1000;
+
 const TRANSIENT_RETRY_WINDOW_MS = 10 * 60 * 1000;
 const RETRY_BASE_DELAY_MS = 5000;
 const RETRY_MAX_DELAY_MS = 60000;
@@ -326,10 +342,11 @@ function classifyRunnerUserMessage(text) {
 
 // Pure reducer: applies one classified message to the mutable `state` and returns
 // an `action` telling the loop whether to bail. Precedence (top-down): transport-
-// closed > permission-denial-stall > tool_use_error > tool_result. `state` fields:
+// closed > permission-denial > tool_use_error > tool_result. `state` fields:
 // consecutiveToolErrors, consecutiveTransportErrors, consecutivePermissionDenials,
-// toolErrorSigs (Map). `limits` = { transportLimit, permissionLimit }.
-function applyRunnerUserMessage(state, sig, limits, guardrails) {
+// totalPermissionDenials, stallStartAt, toolErrorSigs (Map).
+// `limits` = { transportLimit }.
+function applyRunnerUserMessage(state, sig, limits, guardrails, now = Date.now()) {
   if (sig.isTransportClosed) {
     state.consecutiveTransportErrors += 1;
     return state.consecutiveTransportErrors >= limits.transportLimit
@@ -337,17 +354,26 @@ function applyRunnerUserMessage(state, sig, limits, guardrails) {
       : { type: 'transport_error' };
   }
   if (sig.isPermissionDenied) {
-    // Counted independently of tool/transport errors and deliberately NOT reset by
-    // the tool_result branch below — an interleaved successful tool_result must not
-    // mask an ongoing stall (the sub-agent alternates denied calls with reads).
+    // Denials never abort by count alone: benign improvised probes at sub-agent
+    // startup arrive in bursts that scale with fan-out (8+ parallel batch agents),
+    // and agents routinely recover by switching to an allowed tool (#238). Instead,
+    // anchor a stall window at the FIRST denial after the last productive result;
+    // assessPermissionStall() flags a stall only if nothing productive follows
+    // within the window (#235). Later denials do NOT re-anchor the window — a
+    // denial loop with no interleaved progress must still age out against the
+    // first denial.
+    state.totalPermissionDenials += 1;
     state.consecutivePermissionDenials += 1;
-    return state.consecutivePermissionDenials >= limits.permissionLimit
-      ? { type: 'abort_permission' }
-      : { type: 'permission_denied' };
+    if (state.stallStartAt == null) state.stallStartAt = now;
+    return { type: 'permission_denied' };
   }
   if (sig.isToolError) {
-    // A live tool-level error means the MCP transport is up again.
+    // A live tool-level error means the MCP transport is up again — and the agent
+    // is still receiving real (non-denial) tool responses, so it is not
+    // permission-stalled either.
     state.consecutiveTransportErrors = 0;
+    state.consecutivePermissionDenials = 0;
+    state.stallStartAt = null;
     state.consecutiveToolErrors += 1;
     state.toolErrorSigs.set(sig.toolErrorSig, (state.toolErrorSigs.get(sig.toolErrorSig) || 0) + 1);
     if (guardrails) {
@@ -363,14 +389,37 @@ function applyRunnerUserMessage(state, sig, limits, guardrails) {
     return { type: 'tool_error', sig: sig.toolErrorSig };
   }
   if (sig.isToolResult) {
-    // Only reset on non-error tool results to avoid false positives during
-    // legitimate read/validation sequences. Note: consecutivePermissionDenials is
-    // intentionally left untouched here (see permission branch above).
+    // Productive progress: clears the tool/transport counters AND the
+    // permission-stall window. The denial count resets too — it is only for
+    // logging; the abort decision is the time-based window below.
     state.consecutiveToolErrors = 0;
     state.consecutiveTransportErrors = 0;
+    state.consecutivePermissionDenials = 0;
+    state.stallStartAt = null;
     return { type: 'tool_result_reset' };
   }
   return { type: 'none' };
+}
+
+// Time-based permission-stall assessment (issue #235 vs #238). `state.stallStartAt`
+// anchors at the first auto-denial after the last productive tool result. The run is
+// stalled only when that anchor has aged past windowMs with nothing productive since:
+// a genuinely halted agent goes silent (or loops on denials), while a healthy run —
+// even one that burned several denied probes at startup — keeps producing results
+// that clear the anchor. Pure so the abort decision is unit-testable with fake clocks.
+function assessPermissionStall(state, now, windowMs) {
+  if (state.stallStartAt == null) return { stalled: false, idleMs: 0 };
+  const idleMs = now - state.stallStartAt;
+  return { stalled: idleMs >= windowMs, idleMs };
+}
+
+// True when a runner outcome indicates a permission-denial stall — either the runner
+// bailed before any result message (subtype 'permission_stall'), or the stall fired
+// after a result message had already been consumed (the SDK can emit the result while
+// trailing sub-agent messages are still streaming — observed 2026-07-21, #238 — in
+// which case the result is returned annotated with `permissionStallDetected`).
+function resultIndicatesPermissionStall(result) {
+  return !!result && (result.subtype === 'permission_stall' || result.permissionStallDetected === true);
 }
 
 async function runClaudeOnce({
@@ -424,9 +473,11 @@ async function runClaudeOnce({
   const errorState = {
     consecutiveToolErrors: 0,
     consecutiveTransportErrors: 0,
-    // Permission denials are counted independently and — unlike the tool/transport
-    // counters — are NOT reset by an interleaved successful tool_result (see reducer).
+    // Permission-denial tracking: counts are for logging/outcome reporting only;
+    // stallStartAt anchors the time-based stall window (see assessPermissionStall).
     consecutivePermissionDenials: 0,
+    totalPermissionDenials: 0,
+    stallStartAt: null,
     toolErrorSigs: new Map(),
   };
   // Repeated "Stream closed" tool_results mean the in-process workspace-tools MCP
@@ -437,14 +488,9 @@ async function runClaudeOnce({
   // distinct outcome so the caller can salvage from banked mapping JSON / short-circuit.
   const MCP_TRANSPORT_ERROR_LIMIT = 3;
   let transportClosedFired = false;
-  // Headless pipeline runs use permissionMode:'auto' with NO approval callback, so any
-  // tool call outside the narrow allow-rules is auto-denied with "The user doesn't want
-  // to take this action right now. STOP what you are doing and wait for the user...".
-  // Sub-agents obey that literally and halt, producing no output while the run burns to
-  // the timeout (EZK 16, 2026-07-21 — issue #235). This matches NEITHER the transport
-  // nor the tool_use_error signature, so it tripped no counter and could even hit the
-  // tool_result reset. Track it separately and bail fast to a clean failure.
-  const PERMISSION_DENIAL_LIMIT = 3;
+  // Permission-denial stall detection is time-based (see PERMISSION_STALL_WINDOW_MS
+  // and assessPermissionStall above): denials are benign unless followed by a whole
+  // window with no productive tool result.
   let permissionStallFired = false;
 
   const timer = setTimeout(() => {
@@ -474,6 +520,26 @@ async function runClaudeOnce({
       if (p && typeof p.catch === 'function') p.catch(() => {});
     } catch (_) {}
   }, HEARTBEAT_MS) : null;
+
+  // Permission-stall watchdog. A truly stalled run (agents obeying the "STOP and
+  // wait" denial text) goes SILENT — no further stream messages — so a per-message
+  // check alone would never fire. Poll the pure assessment on a timer and abort once
+  // a denial has gone PERMISSION_STALL_WINDOW_MS with no productive tool result.
+  const stallTimer = setInterval(() => {
+    if (permissionStallFired) return;
+    const stall = assessPermissionStall(errorState, Date.now(), PERMISSION_STALL_WINDOW_MS);
+    if (!stall.stalled) return;
+    permissionStallFired = true;
+    console.error(
+      `${runnerPrefix} Aborting query — permission-denial stall: ` +
+      `${errorState.totalPermissionDenials} auto-denial(s) this run and no productive tool result for ` +
+      `${Math.round(stall.idleMs / 1000)}s (window ${PERMISSION_STALL_WINDOW_MS / 1000}s). Headless ` +
+      `permissionMode:'auto' auto-denies out-of-allowlist tool calls; the agent appears to have halted ` +
+      `on the "STOP what you are doing and wait" text instead of switching to an allowed tool. ` +
+      `Bailing to a clean failure instead of burning to the ${timeout / 1000}s timeout.`
+    );
+    abortController.abort();
+  }, PERMISSION_STALL_POLL_MS);
 
   const options = buildOptions({
     cwd,
@@ -528,7 +594,7 @@ async function runClaudeOnce({
         const action = applyRunnerUserMessage(
           errorState,
           sig,
-          { transportLimit: MCP_TRANSPORT_ERROR_LIMIT, permissionLimit: PERMISSION_DENIAL_LIMIT },
+          { transportLimit: MCP_TRANSPORT_ERROR_LIMIT },
           guardrails
         );
         if (action.type === 'transport_error' || action.type === 'abort_transport') {
@@ -548,26 +614,13 @@ async function runClaudeOnce({
             abortController.abort();
             break;
           }
-        } else if (action.type === 'permission_denied' || action.type === 'abort_permission') {
+        } else if (action.type === 'permission_denied') {
           console.warn(
-            `${runnerPrefix} Permission-denial stall ` +
-            `${errorState.consecutivePermissionDenials}/${PERMISSION_DENIAL_LIMIT} — ` +
-            `a tool call was auto-denied ("STOP and wait") in headless auto mode; the sub-agent ` +
-            `is obeying the denial text literally instead of switching tools`
+            `${runnerPrefix} Tool call auto-denied ("STOP and wait") in headless auto mode ` +
+            `(${errorState.totalPermissionDenials} total this run) — benign if the agent switches to ` +
+            `an allowed tool; aborts as a stall only after ${PERMISSION_STALL_WINDOW_MS / 1000}s ` +
+            `with no productive tool result`
           );
-          if (action.type === 'abort_permission') {
-            permissionStallFired = true;
-            console.error(
-              `${runnerPrefix} Aborting query — permission-denial stall ` +
-              `(${errorState.consecutivePermissionDenials} consecutive auto-denials). Headless ` +
-              `permissionMode:'auto' with no approval callback auto-denies out-of-allowlist tool ` +
-              `calls; the agent halts on the "STOP what you are doing and wait" text rather than ` +
-              `switching to an allowed tool. Bailing to a clean failure instead of looping to the ` +
-              `${timeout / 1000}s timeout.`
-            );
-            abortController.abort();
-            break;
-          }
         } else if (action.type === 'guardrail_stop') {
           throw new Error(
             `Guardrail stop: repeated tool errors (${action.sig}, consecutive=${action.consecutive}, repeats=${action.repeats})`
@@ -616,10 +669,19 @@ async function runClaudeOnce({
   } finally {
     clearTimeout(timer);
     if (heartbeatTimer) clearInterval(heartbeatTimer);
+    clearInterval(stallTimer);
     try { conversation.close(); } catch (_) {}
   }
 
   if (result) {
+    if (permissionStallFired) {
+      // The stall fired after a result message had already been consumed (the SDK can
+      // emit the result while trailing sub-agent messages are still streaming —
+      // observed 2026-07-21, #238). Surface it on the result so callers classify the
+      // failure as a permission stall instead of a generic coverage gap.
+      result.permissionStallDetected = true;
+      console.warn(`${runnerPrefix} Result already received when the permission stall fired — returning result annotated permissionStallDetected=true`);
+    }
     console.log(`${runnerPrefix} Finished — subtype: ${result.subtype}, turns: ${result.num_turns}, cost: $${result.total_cost_usd?.toFixed(4) || '?'}, duration: ${(result.duration_ms / 1000).toFixed(1)}s`);
     if (result.subtype !== 'success' && result.result) {
       console.error(`${runnerPrefix} Result text: ${result.result.slice(0, 500)}`);
@@ -662,11 +724,11 @@ async function runClaudeOnce({
   }
   // A permission-denial stall was detected and we abort()ed to bail — take precedence
   // over the abort→timeout classification below, mirroring mcp_transport_closed. A
-  // fresh query would hit the same auto-denial wall, so this routes to a clean failure.
+  // fresh query would likely hit the same auto-denial wall, so route to a clean failure.
   if (permissionStallFired) {
     console.warn(
       `${runnerPrefix} Returning permission_stall outcome — ` +
-      `reason=permission_stall consecutive=${errorState.consecutivePermissionDenials} elapsedMs=${elapsedMs}ms`
+      `reason=permission_stall denials=${errorState.totalPermissionDenials} elapsedMs=${elapsedMs}ms`
     );
     return {
       subtype: 'permission_stall',
@@ -677,7 +739,7 @@ async function runClaudeOnce({
       configuredTimeoutMs: timeout,
       turnCount,
       lastTool,
-      consecutivePermissionDenials: errorState.consecutivePermissionDenials,
+      totalPermissionDenials: errorState.totalPermissionDenials,
     };
   }
   if (localTimeoutFired || abortController.signal.aborted) {
@@ -950,4 +1012,7 @@ module.exports = {
   resolveReasoning,
   classifyRunnerUserMessage,
   applyRunnerUserMessage,
+  assessPermissionStall,
+  resultIndicatesPermissionStall,
+  PERMISSION_STALL_WINDOW_MS,
 };

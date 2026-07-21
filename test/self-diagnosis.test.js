@@ -706,6 +706,38 @@ test('dispatchSelfDiagnosis short-circuits an align permission-denial stall with
   assert.match(calls.lastCreateBody.body, /pipeline-failure-fingerprint:/);
 });
 
+test('permission stall with PARTIAL salvage coverage still routes to the permission-stall template (#238)', async () => {
+  // #238 regression shape: the align run permission-stalled, then salvage recovered
+  // partial coverage, so the summary text is coverage-shaped ("covers N/M verses")
+  // with no permission wording. The checkpoint errorKind must make the
+  // permission-stall branch win over the generic align-missing-output one.
+  const event = makePsa1Event({
+    pipelineType: 'generate',
+    scope: 'EZK 16',
+    phase: 'align',
+    message: '**align-all-parallel** failed for EZK 16 — EZK 16 — ULT: covers 24/63 verses, missing 4-6, 9-10 || UST: covers 2/63 verses, missing 2-8, 10-63',
+  });
+  const calls = {};
+  const fetchImpl = createGithubFetchStub({ captureCalls: calls });
+  let claudeWasCalled = false;
+  const runClaudeImpl = async () => { claudeWasCalled = true; return { subtype: 'success', result: VALID_AGENT_OUTPUT }; };
+
+  const result = await dispatchSelfDiagnosis({
+    event,
+    errorText: 'Phase: align-all-parallel\nChapter: EZK 16\nEZK 16 — ULT: covers 24/63 verses, missing 4-6, 9-10',
+    checkpoint: { state: 'failed', current: { errorKind: 'permission_stall', skill: 'align-all-parallel', validationSummary: 'EZK 16 — ULT: covers 24/63 verses' }, resume: { chapter: 16, skill: 'align-all-parallel' } },
+    runClaudeImpl,
+    fetchImpl,
+    readSecretImpl: () => 'fake-token',
+    readAdminStatusImpl: () => [event],
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.action, 'created-align-permission-stall', 'permission_stall errorKind must beat the coverage-derived signature');
+  assert.equal(claudeWasCalled, false);
+  assert.match(calls.lastCreateBody.title, /align: permission-denial stall/);
+});
+
 test('dispatchSelfDiagnosis short-circuits a partial-salvage incomplete_coverage without invoking the agent', async () => {
   // Partial salvage: message text lacks "no aligned output found", so this can
   // only be caught via the checkpoint errorKind (the #179 follow-up gap).

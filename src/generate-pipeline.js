@@ -10,7 +10,7 @@ const fs = require('fs');
 const path = require('path');
 const config = require('./config');
 const { sendMessage, sendDM, addReaction, removeReaction, uploadFile } = require('./zulip-client');
-const { runClaude, DEFAULT_BASH_TOOLS, isTransientOutageError } = require('./claude-runner');
+const { runClaude, DEFAULT_BASH_TOOLS, isTransientOutageError, resultIndicatesPermissionStall } = require('./claude-runner');
 const { extractContentTypes } = require('./router');
 const { getDoor43Username, emailToFallbackUsername, buildBranchName, resolveOutputFile, discoverFreshOutput, calcSkillTimeout, normalizeBookName, resolveConflictMention, isUsageLimitError, CSKILLBP_DIR } = require('./pipeline-utils');
 const { verifyRepoPush, verifyDcsToken } = require('./repo-verify');
@@ -1409,14 +1409,16 @@ async function generatePipeline(route, message) {
       // agent would hit the same dead transport).
       let transportClosed = !!(alignResult && alignResult.subtype === 'mcp_transport_closed');
 
-      // The runner bails with `permission_stall` when the align sub-agents' out-of-
-      // allowlist tool calls are auto-denied in headless auto mode and they obey the
-      // "STOP and wait" text literally, producing no output (EZK 16, 2026-07-21 —
-      // issue #235). Treat it like transportClosed: don't fail-and-continue on the
-      // generic path — attempt deterministic salvage from any banked mapping JSON, then
-      // route to a DISTINCT clean failure (never the timeout+salvage-garbage path) whose
-      // errorKind lets self-diagnosis short-circuit (a fresh agent hits the same wall).
-      let permissionStall = !!(alignResult && alignResult.subtype === 'permission_stall');
+      // The runner flags a permission stall when the align agents' out-of-allowlist
+      // tool calls are auto-denied in headless auto mode and nothing productive follows
+      // for the whole stall window (EZK 16, 2026-07-21 — issue #235). That surfaces as
+      // subtype 'permission_stall' OR as a success-shaped result annotated
+      // `permissionStallDetected` (the SDK can emit the result before trailing denial
+      // messages — #238 was misfiled as incomplete_coverage because only the subtype was
+      // checked). Treat it like transportClosed: don't fail-and-continue on the generic
+      // path — attempt deterministic salvage from any banked mapping JSON, then route to
+      // a DISTINCT clean failure whose errorKind lets self-diagnosis short-circuit.
+      let permissionStall = resultIndicatesPermissionStall(alignResult);
 
       if ((!alignResult || alignResult.subtype !== 'success') && !transportClosed && !permissionStall) {
         const errText = !alignResult
@@ -1580,9 +1582,12 @@ async function generatePipeline(route, message) {
             return status(`Still aligning **${book} ${ch}** retry — ${elapsed}min, ${turnCount} tool calls${lastTool ? `, last: \`${lastTool}\`` : ''}${suffix}`);
           },
         });
+        // Checked outside the non-success gate below: a stall detected after the SDK
+        // already emitted a success-shaped result must still win over the
+        // coverage-derived errorKind (#238).
+        if (resultIndicatesPermissionStall(retryResult)) permissionStall = true;
         if (!retryResult || retryResult.subtype !== 'success') {
           if (retryResult && retryResult.subtype === 'mcp_transport_closed') transportClosed = true;
-          if (retryResult && retryResult.subtype === 'permission_stall') permissionStall = true;
           finalValidationSummary = !retryResult
             ? 'retry timed out or was aborted (no result returned)'
             : (retryResult.error || retryResult.result || `retry non-success subtype: "${retryResult.subtype}"`);
@@ -1689,12 +1694,12 @@ async function generatePipeline(route, message) {
           }
         }
         if (permissionStall && !transportClosed) {
-          // The align sub-agents' out-of-allowlist tool calls were auto-denied in headless
-          // auto mode and they halted on the "STOP and wait" text, so no aligned USFM was
-          // produced and salvage found nothing to recover. Record a distinct kind (overriding
-          // the coverage-derived one) so self-diagnosis short-circuits to a templated issue —
-          // a fresh LLM diagnosis agent would hit the same auto-denial wall — and enrich the
-          // summary so that short-circuit's text match fires.
+          // The align agents permission-stalled (sustained auto-denials with no productive
+          // work), so the chapter is missing or only partially recovered by salvage. The
+          // stall classification wins over the coverage-derived kind — even when salvage
+          // recovered partial coverage (#238 was misfiled as incomplete_coverage) — so
+          // self-diagnosis short-circuits to the permission-stall templated issue instead
+          // of the generic coverage one. Enrich the summary so its text match fires too.
           errorKind = 'permission_stall';
           if (outputStatus === 'degraded') outputStatus = 'missing';
           if (!/permission[- ]?stall|auto-denied|doesn't want to take this action|stop what you are doing and wait/i.test(finalValidationSummary || '')) {
