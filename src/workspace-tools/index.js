@@ -8,7 +8,7 @@ const {
   fetchGlossary, fetchIssuesResolved, fetchTemplates,
 } = require('./fetch-tools');
 const { splitTsv, mergeTsvs, fixTrailingNewlines } = require('./tsv-tools');
-const { extractUltEnglish, filterPsalms, curlyQuotes, checkUstPassives, createAlignedUsfm, repairAlignmentXContent, readUsfmChapter, mergeAlignedUsfm, validateAlignmentJson, validateUltBrackets, checkUltVoiceMismatch } = require('./usfm-tools');
+const { extractUltEnglish, filterPsalms, curlyQuotes, checkUstPassives, createAlignedUsfm, repairAlignmentXContent, readUsfmChapter, mergeAlignedUsfm, planAlignmentBatchesTool, validateAlignmentJson, validateUltBrackets, checkUltVoiceMismatch } = require('./usfm-tools');
 const { buildStrongsIndex, buildTnIndex, buildUstIndex } = require('./index-tools');
 const { checkTwHeadwords, compareUltUst, detectAbstractNouns } = require('./issue-tools');
 const { extractAlignmentData, fixHebrewQuotes, flagNarrowQuotes, generateIds, resolveGlQuotes, verifyAtFit, assembleNotes, updateNoteText, updatePreparedQuote, removeNote, prepareNotes, prepareAndValidate, fixUnicodeQuotes, verifyBoldMatches, fillTsvIds, fillOrigQuotes, prepareATContext, readPreparedNotes } = require('./tn-tools');
@@ -282,6 +282,21 @@ function createWorkspaceTools(createSdkMcpServer, tool, z) {
         },
         async (args) => ({
           content: [{ type: 'text', text: mergeAlignedUsfm(args) }],
+        })
+      ),
+
+      tool(
+        'plan_alignment_batches',
+        'Deterministically compute the batch verse-ranges for align-all-parallel (contiguous, non-overlapping, last batch always reaches the final verse). Use instead of computing batch boundaries by hand — prevents dropping the chapter tail on long chapters (see #233).',
+        {
+          verseCount: z.number().int().optional().describe('Number of verses in the chapter. Provide this OR file+chapter.'),
+          file: z.string().optional().describe('USFM file path relative to workspace to count \\v markers from (e.g. data/hebrew_bible/26-EZK.usfm)'),
+          chapter: z.number().int().optional().describe('Chapter number (required when using file to count verses)'),
+          book: z.string().optional().describe('Book code, for labeling the returned plan (e.g. EZK)'),
+          maxBatchSize: z.number().int().optional().describe('Maximum verses per batch (default 18)'),
+        },
+        async (args) => ({
+          content: [{ type: 'text', text: JSON.stringify(planAlignmentBatchesTool(args), null, 2) }],
         })
       ),
 

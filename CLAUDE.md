@@ -46,5 +46,11 @@ At the start of a session, run `git branch` to check the current branch. If not 
 - When manually editing checkpoint JSON to set a resume point, use `"state": "failed"` — other values like `"resumable"` are silently ignored
 
 ### Alignment batching
-- `align-all-parallel` splits chapters > 18 verses into N batches of 18
+- `align-all-parallel` splits chapters > 18 verses into `ceil(N/18)` contiguous
+  batches of `ceil(N/numBatches)` verses each (evenly distributed; last batch
+  takes the remainder). Batch boundaries are computed deterministically by the
+  `plan_alignment_batches` workspace tool (`planAlignmentBatches` in
+  `src/workspace-tools/usfm-tools.js`) — not by the LLM coordinator — so the
+  final batch always reaches the last verse (regression guard for #233, where a
+  hand-computed split dropped the chapter tail).
 - Merge step uses `mcp__workspace-tools__merge_aligned_usfm` MCP tool — never Bash or sub-agents (they don't have Bash access in the SDK pipeline)

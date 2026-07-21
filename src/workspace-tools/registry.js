@@ -29,8 +29,8 @@ const {
 const { splitTsv, mergeTsvs, fixTrailingNewlines } = require('./tsv-tools');
 const {
   extractUltEnglish, filterPsalms, curlyQuotes, checkUstPassives, createAlignedUsfm,
-  repairAlignmentXContent, readUsfmChapter, mergeAlignedUsfm, validateAlignmentJson,
-  validateUltBrackets, checkUltVoiceMismatch,
+  repairAlignmentXContent, readUsfmChapter, mergeAlignedUsfm, planAlignmentBatchesTool,
+  validateAlignmentJson, validateUltBrackets, checkUltVoiceMismatch,
 } = require('./usfm-tools');
 const { buildStrongsIndex, buildTnIndex, buildUstIndex } = require('./index-tools');
 const { checkTwHeadwords, compareUltUst, detectAbstractNouns } = require('./issue-tools');
@@ -74,6 +74,7 @@ const TOOLS = {
   repair_alignment_x_content: { handler: repairAlignmentXContent },
   read_usfm_chapter: { handler: readUsfmChapter },
   merge_aligned_usfm: { handler: mergeAlignedUsfm },
+  plan_alignment_batches: { handler: planAlignmentBatchesTool },
   validate_alignment_json: { handler: validateAlignmentJson },
   validate_ult_brackets: { handler: validateUltBrackets },
   check_ult_voice_mismatch: { handler: checkUltVoiceMismatch },
