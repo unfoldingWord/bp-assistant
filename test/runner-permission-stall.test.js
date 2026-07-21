@@ -47,16 +47,35 @@ test('classifyRunnerUserMessage recognizes the permission-denial signature', () 
   assert.equal(sig.isToolError, false);
 });
 
-test('classifyRunnerUserMessage matches either half of the denial text', () => {
+test('classifyRunnerUserMessage matches either half of the denial text (in an is_error result)', () => {
   assert.equal(
-    classifyRunnerUserMessage("The user doesn't want to take this action right now.").isPermissionDenied,
+    classifyRunnerUserMessage('{"is_error":true,"content":"The user doesn\'t want to take this action right now."}').isPermissionDenied,
     true,
   );
   assert.equal(
-    classifyRunnerUserMessage('STOP what you are doing and wait for the user to tell you how to proceed.').isPermissionDenied,
+    classifyRunnerUserMessage('{"is_error":true,"content":"STOP what you are doing and wait for the user to tell you how to proceed."}').isPermissionDenied,
     true,
   );
   assert.equal(classifyRunnerUserMessage(NORMAL_TOOL_RESULT).isPermissionDenied, false);
+});
+
+test('a SUCCESSFUL tool_result that merely QUOTES the denial phrase is NOT a permission denial (no is_error)', () => {
+  // Regression guard: the denial arrives only as an is_error tool_result. A healthy
+  // Read/Grep/cat of a log, issue (#235), or this very test file that echoes the
+  // denial wording must not be miscounted as a stall — otherwise 3 such reads would
+  // false-abort a healthy run as permission_stall.
+  const quotedInSuccessfulRead =
+    '{"type":"tool_result","content":"issue #235 says: The user doesn\'t want to take '
+    + 'this action right now. STOP what you are doing and wait for the user to proceed."}';
+  const sig = classifyRunnerUserMessage(quotedInSuccessfulRead);
+  assert.equal(sig.isPermissionDenied, false);
+  assert.equal(sig.isToolResult, true);
+  // And it must not accumulate the stall counter across three such benign reads.
+  const state = freshState();
+  assert.equal(step(state, quotedInSuccessfulRead).type, 'tool_result_reset');
+  assert.equal(step(state, quotedInSuccessfulRead).type, 'tool_result_reset');
+  assert.equal(step(state, quotedInSuccessfulRead).type, 'tool_result_reset');
+  assert.equal(state.consecutivePermissionDenials, 0);
 });
 
 test('(a) permission denials are counted', () => {

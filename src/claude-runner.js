@@ -302,8 +302,13 @@ function classifyRunnerUserMessage(text) {
   // Headless permissionMode:'auto' with no approval callback auto-denies out-of-
   // allowlist tool calls with this text; sub-agents obey it literally and stall.
   // Matches neither the transport nor tool_use_error signature (issue #235, EZK 16).
-  const isPermissionDenied = lower.includes("doesn't want to take this action")
-    || lower.includes('stop what you are doing and wait for the user');
+  // Require the is_error marker (like isTransportClosed above): the denial arrives
+  // ONLY as an is_error tool_result. Without this guard a *successful* Read/Grep of
+  // a log, issue, or test file that merely QUOTES the denial phrase would be
+  // miscounted as a stall and could false-abort a healthy run after 3 such reads.
+  const isPermissionDenied = lower.includes('is_error')
+    && (lower.includes("doesn't want to take this action")
+      || lower.includes('stop what you are doing and wait for the user'));
   const isToolError = lower.includes('tool_use_error');
   const isToolResult = lower.includes('tool_result');
   let toolErrorSig = null;
