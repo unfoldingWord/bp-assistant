@@ -24,6 +24,8 @@ const {
   isAlignMissingOutput,
   buildAlignTransportClosedDiagnosis,
   isAlignTransportClosed,
+  buildAlignPermissionStallDiagnosis,
+  isAlignPermissionStall,
   FINGERPRINT_PREFIX,
 } = require('../src/self-diagnosis');
 
@@ -625,6 +627,82 @@ test('dispatchSelfDiagnosis short-circuits an align "Stream closed" transport fa
   assert.equal(calls.createCount, 1);
   assert.ok(calls.lastCreateBody.labels.includes('align-transport-closed'));
   assert.match(calls.lastCreateBody.title, /align: MCP transport closed/);
+  assert.match(calls.lastCreateBody.body, /pipeline-failure-fingerprint:/);
+});
+
+test('isAlignPermissionStall matches the align-all-parallel permission-denial-stall signature', () => {
+  // errorKind on an align-phase checkpoint is enough (message text may be absent).
+  assert.equal(
+    isAlignPermissionStall('', { current: { errorKind: 'permission_stall', skill: 'align-all-parallel' } }),
+    true,
+  );
+  // Enriched summary text is enough on its own.
+  assert.equal(
+    isAlignPermissionStall('**align-all-parallel** failed for EZK 16 — EZK 16 — align-all-parallel aborted: sub-agent tool calls were auto-denied in headless mode (permission stall, "STOP what you are doing and wait")'),
+    true,
+  );
+  assert.equal(
+    isAlignPermissionStall("Phase: align-all-parallel\nChapter: EZK 16\nThe user doesn't want to take this action"),
+    true,
+  );
+  // A missing-output summary without a permission signal must NOT match this one.
+  assert.equal(isAlignPermissionStall('AMO 5 — ULT: no aligned output found'), false);
+  // permission_stall errorKind on a NON-align skill must not be stolen by this one.
+  assert.equal(
+    isAlignPermissionStall('', { current: { errorKind: 'permission_stall', skill: 'tn-writer' } }),
+    false,
+  );
+  // A permission signal outside an align context doesn't match.
+  assert.equal(isAlignPermissionStall('tn-writer failed: STOP what you are doing and wait for the user'), false);
+  assert.equal(isAlignPermissionStall(''), false);
+  assert.equal(isAlignPermissionStall(null), false);
+  assert.equal(isAlignPermissionStall(undefined), false);
+});
+
+test('buildAlignPermissionStallDiagnosis returns a templated issue tagged align-permission-stall', () => {
+  const event = makePsa1Event({
+    pipelineType: 'generate',
+    scope: 'EZK 16',
+    phase: 'align',
+    message: '**align-all-parallel** failed for EZK 16 — permission stall (auto-denied, "STOP and wait")',
+  });
+  const d = buildAlignPermissionStallDiagnosis(event, 'some context');
+  assert.ok(d.title.length <= 120);
+  assert.match(d.title, /align: permission-denial stall/);
+  assert.ok(d.labels.includes('align-permission-stall'));
+  assert.equal(d.classification, 'align-permission-stall');
+  assert.match(d.body, /allowed-tools/);
+  assert.match(d.body, /workspace-tools-cli\.js/);
+});
+
+test('dispatchSelfDiagnosis short-circuits an align permission-denial stall without invoking the agent', async () => {
+  const event = makePsa1Event({
+    pipelineType: 'generate',
+    scope: 'EZK 16',
+    phase: 'align',
+    message: '**align-all-parallel** failed for EZK 16 at 2026-07-21T12:00:00.000Z — EZK 16 — align-all-parallel aborted: sub-agent tool calls were auto-denied in headless mode (permission stall, "STOP what you are doing and wait")',
+  });
+  const calls = {};
+  const fetchImpl = createGithubFetchStub({ captureCalls: calls });
+  let claudeWasCalled = false;
+  const runClaudeImpl = async () => { claudeWasCalled = true; return { subtype: 'success', result: VALID_AGENT_OUTPUT }; };
+
+  const result = await dispatchSelfDiagnosis({
+    event,
+    errorText: 'Phase: align-all-parallel\nChapter: EZK 16\npermission stall (auto-denied)',
+    checkpoint: { state: 'failed', current: { errorKind: 'permission_stall', skill: 'align-all-parallel' }, resume: { chapter: 16, skill: 'align-all-parallel' } },
+    runClaudeImpl,
+    fetchImpl,
+    readSecretImpl: () => 'fake-token',
+    readAdminStatusImpl: () => [event],
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.action, 'created-align-permission-stall');
+  assert.equal(claudeWasCalled, false, 'a known permission-denial stall must not invoke the diagnosis agent');
+  assert.equal(calls.createCount, 1);
+  assert.ok(calls.lastCreateBody.labels.includes('align-permission-stall'));
+  assert.match(calls.lastCreateBody.title, /align: permission-denial stall/);
   assert.match(calls.lastCreateBody.body, /pipeline-failure-fingerprint:/);
 });
 

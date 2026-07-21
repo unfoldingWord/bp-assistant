@@ -429,6 +429,26 @@ function isAlignTransportClosed(text) {
   return /(stream closed|mcp transport closed)/i.test(msg) && /align/i.test(msg);
 }
 
+// True when the align failure is a permission-denial stall: in a headless run
+// (permissionMode:'auto', no approval callback) the align sub-agents' out-of-
+// allowlist tool calls are auto-denied with "STOP what you are doing and wait" and
+// they halt, producing no aligned USFM (EZK 16, 2026-07-21 — issue #235). The runner
+// now bails fast (`permission_stall`) and the pipeline records errorKind
+// `permission_stall`. A fresh LLM diagnosis agent would hit the same auto-denial
+// wall, so short-circuit to a templated issue.
+function isAlignPermissionStall(text, checkpoint) {
+  const current = checkpoint && checkpoint.current;
+  const errorKind = current && current.errorKind;
+  if (errorKind === 'permission_stall') {
+    const skill = String((current && current.skill) || '');
+    if (!skill || /align/i.test(skill)) return true;
+  }
+  const msg = typeof text === 'string' ? text : String((text && text.message) || text || '');
+  if (!msg) return false;
+  return /(permission[- ]?stall|auto-denied|doesn't want to take this action|stop what you are doing and wait)/i.test(msg)
+    && /align/i.test(msg);
+}
+
 // Templated diagnosis for the "align-all-parallel: no (or only partial) aligned
 // output" signature. Skips the LLM investigation (which was timing out on real
 // runs — AMO 5, 2026-07-01) and files a concise, actionable issue that points at
@@ -541,6 +561,60 @@ function buildAlignTransportClosedDiagnosis(event, contextSummary) {
     body,
     labels: ['bug', 'pipeline-failure', 'align-transport-closed'],
     classification: 'align-transport-closed',
+  };
+}
+
+// Templated diagnosis for the "align-all-parallel: permission-denial stall" signature.
+// Skips the LLM investigation (a fresh agent in the same headless auto mode would hit
+// the same auto-denial wall) and files a concise, actionable issue pointing at the
+// runner bail, the skill body/allow-list mismatch as the root cause, and the tool
+// equivalents the sub-agents should use instead of raw shell.
+function buildAlignPermissionStallDiagnosis(event, contextSummary) {
+  const targetRepo = classifyRepo(event);
+  const scopeLabel = event.scope || event.pipelineType || 'event';
+  const title = `Pipeline failure: ${event.pipelineType || 'generate'} ${scopeLabel} — align: permission-denial stall`
+    .slice(0, 120);
+  const body = [
+    '## Summary',
+    'The `align-all-parallel` sub-agents issued tool calls outside their narrow Bash',
+    'allow-rules (e.g. raw `mkdir -p`/`ls`/`grep`/`sed` pipelines). The pipeline runs',
+    "headless with `permissionMode:'auto'` and NO approval callback, so the SDK auto-denies",
+    'those calls with "The user doesn\'t want to take this action right now. STOP what you',
+    'are doing and wait for the user...". The sub-agents obeyed that text literally and',
+    'halted, producing no aligned USFM (observed: EZK 16, 2026-07-21 — issue #235). The',
+    'runner now detects a run of these auto-denials and bails fast (`permission_stall`)',
+    'instead of looping to the skill timeout and banking garbage JSON.',
+    '',
+    '## Failure event',
+    `- pipelineType: ${event.pipelineType || '(unknown)'}`,
+    `- scope: ${event.scope || '(none)'}`,
+    `- phase: ${event.phase || '(none)'}`,
+    `- severity: ${event.severity || '(unknown)'}`,
+    `- message: ${event.message || '(none)'}`,
+    '',
+    '## Next steps',
+    '- Root cause is a skill body vs. `allowed-tools` mismatch: the ULT/UST-alignment',
+    '  `SKILL.md` bodies teach raw shell the frontmatter allow-list forbids. Ensure every',
+    '  step uses the workspace-tools (`node /app/src/workspace-tools-cli.js <tool>` first,',
+    '  `mcp__workspace-tools__<tool>` alternate) instead of raw `grep`/`sed`/`mkdir` shell.',
+    '- The skill should instruct sub-agents: if a tool call is denied, switch to the',
+    '  workspace-tools equivalent and continue — never stop and wait.',
+    '- Re-run the chapter once the skill body no longer reaches for out-of-allowlist shell.',
+    '',
+    '## Diagnosis context',
+    '<details><summary>Click to expand</summary>',
+    '',
+    '```',
+    String(contextSummary || '').slice(0, 8000),
+    '```',
+    '</details>',
+  ].join('\n');
+  return {
+    repo: targetRepo,
+    title,
+    body,
+    labels: ['bug', 'pipeline-failure', 'align-permission-stall'],
+    classification: 'align-permission-stall',
   };
 }
 
@@ -703,6 +777,14 @@ async function dispatchSelfDiagnosis({
       diagnosis = buildAlignTransportClosedDiagnosis(event, contextSummary);
       shortCircuited = true;
       shortCircuitTag = 'align-transport-closed';
+    } else if (isAlignPermissionStall(errorText, checkpoint) || isAlignPermissionStall(event.message, checkpoint)) {
+      // Known signature — the align sub-agents' out-of-allowlist tool calls were
+      // auto-denied in headless auto mode ("STOP and wait") and they halted. A fresh
+      // diagnosis agent would hit the same wall, so short-circuit to a templated issue.
+      console.log('[self-diagnosis] Align permission-denial-stall signature recognized; filing templated issue without running the agent.');
+      diagnosis = buildAlignPermissionStallDiagnosis(event, contextSummary);
+      shortCircuited = true;
+      shortCircuitTag = 'align-permission-stall';
     } else if (isAlignMissingOutput(errorText, checkpoint) || isAlignMissingOutput(event.message, checkpoint)) {
       // Known signature — align-all-parallel produced no (or only partial) aligned
       // output. The LLM diagnosis agent times out on this signature (issue #174),
@@ -820,6 +902,8 @@ module.exports = {
   isAlignMissingOutput,
   buildAlignTransportClosedDiagnosis,
   isAlignTransportClosed,
+  buildAlignPermissionStallDiagnosis,
+  isAlignPermissionStall,
   buildIncompleteDiagnosis,
   buildContextSummary,
   appendFingerprintMarker,
