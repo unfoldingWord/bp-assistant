@@ -164,23 +164,37 @@ const BASH_EXEC_PREFIXES = [
 ];
 const BASH_READONLY_CMDS = ['grep', 'head', 'tail', 'wc', 'ls', 'cat'];
 const BASH_CHAIN_RE = /(\$\(|`|&&|\|\||;)/;
+// Pipes, redirection, and newline-separated commands are chaining too: without
+// this, "ls output | xargs rm -rf output" or "cat a > b" would ride a
+// read-only prefix (review finding on #243).
+const BASH_PIPE_REDIRECT_RE = /[|<>\n]/;
+// The one sanctioned use of redirection: the CLI wrapper's documented stdin
+// form (`node …-cli.js <tool> - <<'EOF' … EOF`). The heredoc must consume the
+// remainder of the command — body content is literal text (JSON payloads may
+// legitimately contain |, >, quotes), but nothing may follow the delimiter.
+const BASH_HEREDOC_RE = /^<<-?\s*(['"]?)(\w+)\1\n[\s\S]*\n\2\s*$/;
 
 function decideBashPermission(input) {
   const cmd = String((input && input.command) || '').trim();
-  if (!BASH_CHAIN_RE.test(cmd)) {
+  const heredocAt = cmd.indexOf('<<');
+  const head = heredocAt >= 0 ? cmd.slice(0, heredocAt) : cmd;
+  const headUnsafe = BASH_CHAIN_RE.test(head) || BASH_PIPE_REDIRECT_RE.test(head);
+  if (!headUnsafe) {
     if (BASH_EXEC_PREFIXES.some((p) => cmd.startsWith(p))) {
-      return { behavior: 'allow', updatedInput: input };
-    }
-    if (BASH_READONLY_CMDS.some((c) => cmd === c || cmd.startsWith(`${c} `))) {
+      if (heredocAt < 0 || BASH_HEREDOC_RE.test(cmd.slice(heredocAt))) {
+        return { behavior: 'allow', updatedInput: input };
+      }
+    } else if (heredocAt < 0 && BASH_READONLY_CMDS.some((c) => cmd === c || cmd.startsWith(`${c} `))) {
       return { behavior: 'allow', updatedInput: input };
     }
   }
   return {
     behavior: 'deny',
     message:
-      'This Bash command is outside the headless allow-list (no compound commands; only the ' +
-      "workspace-tools CLI wrapper and simple read-only commands). Use node /app/src/workspace-tools-cli.js " +
-      "<tool> '<json>', or the Read/Glob/Grep tools for file checks, and continue with the task.",
+      'This Bash command is outside the headless allow-list (no pipes, redirection, or compound ' +
+      "commands; only the workspace-tools CLI wrapper and simple read-only commands). Use " +
+      "node /app/src/workspace-tools-cli.js <tool> '<json>' (heredoc stdin form is fine), or the " +
+      'Read/Glob/Grep tools for file checks, and continue with the task.',
   };
 }
 

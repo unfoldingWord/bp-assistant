@@ -80,6 +80,33 @@ test('Bash: compound commands and substitution are denied with guidance', () => 
   }
 });
 
+test('Bash: pipes, redirection, and newline chaining are denied (#243 review finding)', () => {
+  for (const command of [
+    'ls output | xargs rm -rf output',
+    'cat source.usfm > output/target.usfm',
+    'grep -c zaln file.usfm >> log.txt',
+    'grep pattern < input.txt',
+    'ls output\nrm -rf output',
+    'node /app/src/workspace-tools-cli.js x | tee /etc/passwd',
+  ]) {
+    assert.equal(decideBashPermission({ command }).behavior, 'deny', `must deny: ${command}`);
+  }
+});
+
+test('Bash: the CLI wrapper heredoc stdin form is allowed, including shell chars in the JSON body', () => {
+  const heredoc = "node /app/src/workspace-tools-cli.js merge_aligned_usfm - <<'EOF'\n" +
+    '{"parts":["a>b","c|d && e"],"note":"contains `ticks` and $(subst) as literal text"}\n' +
+    'EOF';
+  assert.equal(decideBashPermission({ command: heredoc }).behavior, 'allow');
+});
+
+test('Bash: post-heredoc chaining is denied', () => {
+  const sneaky = "node /app/src/workspace-tools-cli.js x - <<'EOF'\n{}\nEOF\nrm -rf output";
+  assert.equal(decideBashPermission({ command: sneaky }).behavior, 'deny');
+  // Heredoc on a read-only command is not a sanctioned form either.
+  assert.equal(decideBashPermission({ command: "cat <<'EOF'\nhi\nEOF" }).behavior, 'deny');
+});
+
 test('Bash: uncovered verbs (mkdir, rm, curl) are denied', () => {
   for (const command of ['mkdir -p tmp/alignments/x', 'rm tmp/a.json', 'curl http://example.com']) {
     assert.equal(decideBashPermission({ command }).behavior, 'deny', `must deny: ${command}`);
