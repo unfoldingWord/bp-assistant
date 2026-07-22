@@ -494,6 +494,48 @@ function readUsfmChapter({ file, chapter, verseStart, verseEnd, plain }) {
  * Takes the header + verses from part[0], then appends only the verse content from parts[1..N]
  * (stripping each subsequent file's header up to and including the \c line).
  */
+// Ensure every `\v N` marker begins a line. Batch sub-agents occasionally emit
+// a verse marker mid-line — appended to the previous verse's alignment text
+// (e.g. `...\zaln-e\*, \v 2 "\zaln-s ...`) instead of at line start. The align
+// coverage gate (validateAlignedUsfmCompleteness) matches `\v` anywhere and so
+// reports full coverage, but the push guard (collectCoveredVerses in
+// insert-usfm-verses.js) only detects line-start `\v` and would falsely reject
+// the chapter as partial (EZK 16, #245: missing 2-5, 7-14, 16).
+//
+// The transform inserts newlines ONLY — it never adds or removes any
+// non-newline byte — so the verse text is preserved exactly. (Proof: stripping
+// every newline from the input and from the output yields identical bytes;
+// asserted in the regression test.) A `\v` is left in place when it already
+// begins its line, optionally after a single paragraph/poetry marker
+// (`\p`/`\q`/`\m`/`\s`/`\d`), mirroring the prefix convention used by
+// collectCoveredVerses and countVerseMarkers.
+function normalizeVerseLineStarts(usfm) {
+  const result = [];
+  for (const line of usfm.split('\n')) {
+    const idxs = [];
+    const re = /\\v\s+\d+/g;
+    let m;
+    while ((m = re.exec(line)) !== null) idxs.push(m.index);
+    if (idxs.length === 0) {
+      result.push(line);
+      continue;
+    }
+    // The first `\v` may stay on this line only if everything before it is a
+    // valid line-start prefix (whitespace and/or one paragraph marker). Any
+    // other content before it means it is a mid-line marker that must be split.
+    const head = line.slice(0, idxs[0]);
+    const headIsPrefix = /^\s*(?:\\[pqmsd]\d?\s+)?$/.test(head);
+    let start = 0;
+    for (let k = 0; k < idxs.length; k++) {
+      if (k === 0 && headIsPrefix) continue; // leave a legitimate line-start \v attached
+      result.push(line.slice(start, idxs[k]));
+      start = idxs[k];
+    }
+    result.push(line.slice(start));
+  }
+  return result.join('\n');
+}
+
 function mergeAlignedUsfm({ parts, output }) {
   if (!parts || parts.length === 0) return 'Error: no parts provided';
   if (!output) return 'Error: no output path provided';
@@ -524,6 +566,10 @@ function mergeAlignedUsfm({ parts, output }) {
     const body = lines.slice(bodyStart).join('\n').trimStart();
     if (body) merged += '\n' + body;
   }
+
+  // Guarantee every \v marker starts a line so the on-disk artifact is always
+  // clean for the downstream push guard (#245). Whitespace-only transform.
+  merged = normalizeVerseLineStarts(merged);
 
   // Write output
   const outFull = resolve(output);
@@ -1553,6 +1599,7 @@ module.exports = {
   repairAlignmentXContent,
   readUsfmChapter,
   mergeAlignedUsfm,
+  normalizeVerseLineStarts,
   planAlignmentBatches,
   assertBatchPlanCoversChapter,
   planAlignmentBatchesTool,
