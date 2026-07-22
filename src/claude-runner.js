@@ -131,6 +131,90 @@ function bashEnabled(enableBash) {
   return Boolean(enableBash) && process.env.BP_DISABLE_BASH !== '1';
 }
 
+// Deterministic permission policy for tool calls the CLI's rule layer does not
+// resolve on its own — which in practice is EVERY sub-agent tool call: the
+// top-level `allowedTools` auto-approval does not extend into Task/Agent
+// children, so their calls fall to the 'auto'-mode model classifier. That
+// classifier degrades under parallel load (an 8-way opus batch fan-out) and
+// then denies allowlisted tools nondeterministically — the same child that just
+// Read a skill file gets its next Read denied with "The user doesn't want to
+// take this action right now. STOP..." and align batches produce nothing
+// (issues #195/#235/#238/#242; isolated 2026-07-21 via live repros: identical
+// parallel Read-only children pass under light load and mass-deny under the
+// production fan-out). Registered as the SDK `canUseTool` callback, this
+// replaces the classifier with a pure allowlist so child permissions are
+// deterministic. Deny messages carry redirect guidance and never the CLI's
+// canned "STOP and wait" text that halts agents.
+const SUBAGENT_TOOL_ALLOWLIST = new Set([
+  'Read', 'Write', 'Edit', 'Glob', 'Grep',
+  'Task', 'TaskOutput', 'TaskCreate', 'TaskUpdate', 'TaskList', 'TaskGet',
+  'Agent', 'Skill', 'SendMessage', 'TeamCreate', 'TeamDelete',
+  'NotebookEdit', 'WebFetch', 'WebSearch',
+]);
+
+// Bash policy mirroring BASH_ALLOW_RULES (kept in sync by the test suite):
+// blessed executables by path prefix, plus bounded read-only inspection
+// commands. Command chaining/substitution is refused outright — the same
+// conservatism the CLI's own prefix rules apply — so a matching prefix can't
+// smuggle a second command.
+const BASH_EXEC_PREFIXES = [
+  'node /app/src/workspace-tools-cli.js',
+  'node /app/src/door43-push-cli.js',
+  'node .claude/skills/utilities/scripts/',
+];
+const BASH_READONLY_CMDS = ['grep', 'head', 'tail', 'wc', 'ls', 'cat'];
+const BASH_CHAIN_RE = /(\$\(|`|&&|\|\||;)/;
+// Pipes, redirection, and newline-separated commands are chaining too: without
+// this, "ls output | xargs rm -rf output" or "cat a > b" would ride a
+// read-only prefix (review finding on #243).
+const BASH_PIPE_REDIRECT_RE = /[|<>\n]/;
+// The one sanctioned use of redirection: the CLI wrapper's documented stdin
+// form (`node …-cli.js <tool> - <<'EOF' … EOF`). The heredoc must consume the
+// remainder of the command — body content is literal text (JSON payloads may
+// legitimately contain |, >, quotes), but nothing may follow the delimiter.
+const BASH_HEREDOC_RE = /^<<-?\s*(['"]?)(\w+)\1\n[\s\S]*\n\2\s*$/;
+
+function decideBashPermission(input) {
+  const cmd = String((input && input.command) || '').trim();
+  const heredocAt = cmd.indexOf('<<');
+  const head = heredocAt >= 0 ? cmd.slice(0, heredocAt) : cmd;
+  const headUnsafe = BASH_CHAIN_RE.test(head) || BASH_PIPE_REDIRECT_RE.test(head);
+  if (!headUnsafe) {
+    if (BASH_EXEC_PREFIXES.some((p) => cmd.startsWith(p))) {
+      if (heredocAt < 0 || BASH_HEREDOC_RE.test(cmd.slice(heredocAt))) {
+        return { behavior: 'allow', updatedInput: input };
+      }
+    } else if (heredocAt < 0 && BASH_READONLY_CMDS.some((c) => cmd === c || cmd.startsWith(`${c} `))) {
+      return { behavior: 'allow', updatedInput: input };
+    }
+  }
+  return {
+    behavior: 'deny',
+    message:
+      'This Bash command is outside the headless allow-list (no pipes, redirection, or compound ' +
+      "commands; only the workspace-tools CLI wrapper and simple read-only commands). Use " +
+      "node /app/src/workspace-tools-cli.js <tool> '<json>' (heredoc stdin form is fine), or the " +
+      'Read/Glob/Grep tools for file checks, and continue with the task.',
+  };
+}
+
+function decideToolPermission(toolName, input) {
+  const name = String(toolName || '');
+  if (name.startsWith('mcp__workspace-tools__')) {
+    return { behavior: 'allow', updatedInput: input };
+  }
+  if (name === 'Bash') {
+    return decideBashPermission(input);
+  }
+  if (SUBAGENT_TOOL_ALLOWLIST.has(name)) {
+    return { behavior: 'allow', updatedInput: input };
+  }
+  return {
+    behavior: 'deny',
+    message: `The ${name} tool is not available in this headless run. Switch to an allowed tool (Read, Write, Glob, Grep, or the workspace-tools CLI wrapper) and continue with the task.`,
+  };
+}
+
 // Permission-denial stall detection (issues #235 / #238). Headless pipeline runs
 // use permissionMode:'auto' with NO approval callback, so any tool call outside the
 // narrow allow-rules is auto-denied with "The user doesn't want to take this action
@@ -170,6 +254,7 @@ function buildOptions({
   disableLocalSettings,
   forceNoAutoBashSandbox,
   enableBash,
+  bypassPermissions,
   maxTurns,
   timeoutMs,
   appendSystemPrompt,
@@ -188,6 +273,28 @@ function buildOptions({
     settingSources: disableLocalSettings ? ['user', 'project'] : ['user', 'project', 'local'],
     persistSession: true,
   };
+  // Permission strategy. The 'auto' mode routes every non-read-only tool call
+  // (Write, Bash, Skill, mutating MCP calls) through a live safety-classifier
+  // model; when that model is unavailable or throttled — which is exactly what
+  // happens while an 8-sub-agent align fan-out saturates the account — the call
+  // is denied with "The user doesn't want to take this action right now.
+  // STOP..." and batch agents produce nothing (#195/#235/#238/#242; the
+  // verbose form of the denial names the mechanism outright: "claude-sonnet-5
+  // is temporarily unavailable, so auto mode cannot determine the safety of
+  // Bash right now"). Pipeline runs that opt in via `bypassPermissions` skip
+  // that classifier entirely: the pipeline is a trusted headless system
+  // driving its own bounded tools on its own machine, its tool universe stays
+  // restricted via `tools:`, and the skills enforce CLI-wrapper Bash
+  // discipline. Kill switch: `fly secrets set BP_NO_BYPASS=1` reverts opted-in
+  // runs to classifier-mediated 'auto' on the next restart. Non-bypass runs
+  // register decideToolPermission as canUseTool — a pure, never-prompting
+  // fallback decider for calls the rule layer routes to a custom handler.
+  if (bypassPermissions && process.env.BP_NO_BYPASS !== '1') {
+    options.permissionMode = 'bypassPermissions';
+    options.allowDangerouslySkipPermissions = true;
+  } else {
+    options.canUseTool = async (toolName, input) => decideToolPermission(toolName, input);
+  }
   if (tools) {
     options.tools = tools;
   }
@@ -435,6 +542,7 @@ async function runClaudeOnce({
   disableLocalSettings,
   forceNoAutoBashSandbox,
   enableBash,
+  bypassPermissions,
   skill,
   maxTurns,
   timeoutMs,
@@ -552,6 +660,7 @@ async function runClaudeOnce({
     disableLocalSettings,
     forceNoAutoBashSandbox,
     enableBash,
+    bypassPermissions,
     maxTurns,
     appendSystemPrompt,
     abortController,
@@ -561,7 +670,7 @@ async function runClaudeOnce({
     compaction,
   });
 
-  console.log(`${runnerPrefix} Starting query in ${cwd}`);
+  console.log(`${runnerPrefix} Starting query in ${cwd}${options.permissionMode === 'bypassPermissions' ? ' (permissions: bypass)' : ''}`);
   console.log(`${runnerPrefix} Prompt: ${fullPrompt.slice(0, 200)}`);
   console.log(`${runnerPrefix} maxTurns: ${options.maxTurns}, timeout: ${timeout / 1000}s, deadline: ${new Date(queryDeadline).toISOString()}`);
 
@@ -949,6 +1058,7 @@ async function runClaudeStream({
   disableLocalSettings,
   forceNoAutoBashSandbox,
   enableBash,
+  bypassPermissions,
   maxTurns,
   timeoutMs,
   appendSystemPrompt,
@@ -978,6 +1088,7 @@ async function runClaudeStream({
     disableLocalSettings,
     forceNoAutoBashSandbox,
     enableBash,
+    bypassPermissions,
     maxTurns,
     appendSystemPrompt,
     abortController,
@@ -1015,4 +1126,9 @@ module.exports = {
   assessPermissionStall,
   resultIndicatesPermissionStall,
   PERMISSION_STALL_WINDOW_MS,
+  decideToolPermission,
+  decideBashPermission,
+  SUBAGENT_TOOL_ALLOWLIST,
+  BASH_EXEC_PREFIXES,
+  BASH_READONLY_CMDS,
 };
