@@ -20,18 +20,26 @@ function parseVerseRange(spec) {
 }
 
 // Collect every verse number covered by the source content, expanding verse
-// bridges (\v 1-2 covers both 1 and 2). Only matches \v at the start of a line
-// (optionally after a paragraph/poetry marker) so it never picks up a stray
-// \v inside alignment attribute data.
+// bridges (\v 1-2 covers both 1 and 2). Scans for \v markers anywhere in each
+// line — aligned USFM (e.g. from word-alignment tools) commonly places a \v
+// marker mid-line, immediately after the previous verse's closing \zaln-e\*
+// or \w*, when the flowing text of one verse leads into the next without a
+// line break. A previous line-start-anchored regex silently dropped those
+// verses and made valid, fully-aligned chapters look partial. \v inside
+// alignment attribute payloads is not a real concern: attributes are the
+// pipe-delimited region of \zaln-s / \w and never contain a literal `\v `
+// sequence.
 function collectCoveredVerses(lines) {
   const covered = new Set();
-  const pat = /^(?:\\[pqmsd]\d?\s+)?\\v\s+(\d+)(?:-(\d+))?/;
+  const pat = /\\v\s+(\d+)(?:-(\d+))?/g;
   for (const line of lines) {
-    const m = line.trim().match(pat);
-    if (!m) continue;
-    const lo = parseInt(m[1], 10);
-    const hi = m[2] ? parseInt(m[2], 10) : lo;
-    for (let v = lo; v <= hi; v++) covered.add(v);
+    let m;
+    pat.lastIndex = 0;
+    while ((m = pat.exec(line)) !== null) {
+      const lo = parseInt(m[1], 10);
+      const hi = m[2] ? parseInt(m[2], 10) : lo;
+      for (let v = lo; v <= hi; v++) covered.add(v);
+    }
   }
   return covered;
 }

@@ -168,6 +168,45 @@ test('verse-range (subset) push only replaces the requested verses', () => {
   }
 });
 
+// ---------------------------------------------------------------------------
+// Mid-line \v marker — the EZK 16 regression (issue #245).
+// Aligned USFM often places the next verse's marker on the same line as the
+// previous verse's closing \zaln-e\* / \w*, e.g.:
+//   \w foo|x-occurrence="1" x-occurrences="1"\w*\zaln-e\*, \v 2 "\zaln-s ...
+// The old line-start-anchored regex missed those \v markers and reported a
+// fully-aligned chapter as partial. All mid-line \v markers must be counted.
+// ---------------------------------------------------------------------------
+
+test('counts \\v markers that appear mid-line in aligned source (EZK 16 regression)', () => {
+  const dir = makeTempDir();
+  try {
+    const book = write(dir, '26-EZK.usfm', bookFile([
+      '\\v 1 old one', '\\v 2 old two', '\\v 3 old three',
+    ]));
+    // Source mimics real aligned output: \v 2 and \v 3 land mid-line, right
+    // after the previous verse's closing \zaln-e\* — no line break between
+    // verses. If collectCoveredVerses only matches at line start, verses 2
+    // and 3 are treated as missing and the push is refused.
+    const source = write(dir, 'src.usfm', [
+      '\\id EZK EN_ULT - Aligned',
+      '\\c 29',
+      '\\p',
+      '\\v 1 \\zaln-s |x-strong="H1234"\\*\\w new-one|x-occurrence="1"\\w*\\zaln-e\\*, \\v 2 "\\zaln-s |x-strong="H5678"\\*\\w new-two|x-occurrence="1"\\w*\\zaln-e\\*. \\v 3 \\zaln-s |x-strong="H9012"\\*\\w new-three|x-occurrence="1"\\w*\\zaln-e\\*.',
+      '',
+    ].join('\n'));
+
+    // Must NOT throw — every verse is present, just mid-line.
+    insertUsfmVerses({ bookFile: book, sourceFile: source, chapter: 29, verses: '1-3' });
+    const out = fs.readFileSync(book, 'utf8');
+    assert.match(out, /new-one/);
+    assert.match(out, /new-two/);
+    assert.match(out, /new-three/);
+    assert.doesNotMatch(out, /old one/);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('multi-digit start verse anchors exactly (\\v 10 boundary)', () => {
   const dir = makeTempDir();
   try {
