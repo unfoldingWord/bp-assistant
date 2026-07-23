@@ -685,8 +685,9 @@ test('generatePipeline fires self-diagnosis when door43-push fails', async () =>
     assert.equal(pushDiag.event.severity, 'error');
     assert.match(pushDiag.errorText, /Verse 1 not found/);
     // Generation succeeded (completedChapters is non-empty) but push failed for
-    // every chapter — this must NOT be reported as a generation failure.
-    assert.ok(harness.sent.stream.some(({ text }) => text.includes('Generation succeeded for **ISA 52** but nothing was pushed to Door43')));
+    // every chapter — this must NOT be reported as a generation failure, and the
+    // count must be attributed to push/verify, not blended with generation fails.
+    assert.ok(harness.sent.stream.some(({ text }) => text.includes('1 chapter(s) generated content but all failed to push to Door43') && !text.includes('failed generation entirely')));
   } finally {
     harness.cleanup();
   }

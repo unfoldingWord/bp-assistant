@@ -2261,7 +2261,14 @@ async function generatePipeline(route, message) {
   } else if (fail > 0 && completedChapters.length === 0) {
     await reply(`Generation failed for **${rangeLabel}** \u2014 no chapters completed (${fail} chapter(s) had errors).`);
   } else if (fail > 0 && success === 0 && completedChapters.length > 0 && !dcsTokenInvalid) {
-    await reply(`Generation succeeded for **${rangeLabel}** but nothing was pushed to Door43 \u2014 all ${fail} chapter(s) failed at push/verify. Content is in output/ but not pushed.`);
+    // completedChapters only grows in Phase 1 and success only shrinks in Phase 2,
+    // so success === 0 here means every completed chapter failed push/verify \u2014
+    // but `fail` can also include chapters that failed generation outright
+    // (never reached completedChapters), so don't attribute the whole `fail`
+    // count to push/verify.
+    const genOnlyFails = fail - completedChapters.length;
+    const genNote = genOnlyFails > 0 ? ` and ${genOnlyFails} chapter(s) failed generation entirely` : '';
+    await reply(`Generation for **${rangeLabel}** did not complete \u2014 ${completedChapters.length} chapter(s) generated content but all failed to push to Door43${genNote}. Content for those is in output/ but not pushed.`);
   }
 
   recordRunSummary({
