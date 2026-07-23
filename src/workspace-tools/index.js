@@ -45,9 +45,9 @@ function createWorkspaceTools(createSdkMcpServer, tool, z) {
       ),
       tool(
         'fetch_ult',
-        'Fetch published ULT (Literal Text — word-for-word, form-preserving rendering) USFM files from Door43 into data/published_ult/. Use this for the v88 published books when you need the literal rendering; use fetch_ust instead for the simplified/meaning-based rendering. For non-published books use fetch_master_ult.',
+        'Fetch published ULT (Literal Text — word-for-word, form-preserving rendering) USFM files from Door43 into data/published_ult/. Use this for the v89 published books when you need the literal rendering; use fetch_ust instead for the simplified/meaning-based rendering. For non-published books use fetch_master_ult.',
         {
-          books: z.array(z.string()).optional().describe('Specific book codes (must be v88 published). Omit for all v88 published books.'),
+          books: z.array(z.string()).optional().describe('Specific book codes (must be v89 published). Omit for all v89 published books.'),
           force: z.boolean().optional().describe('Force re-fetch even if cached today'),
         },
         async (args) => ({
@@ -56,9 +56,9 @@ function createWorkspaceTools(createSdkMcpServer, tool, z) {
       ),
       tool(
         'fetch_ust',
-        'Fetch published UST (Simplified Text — meaning-based, natural-English rendering) USFM files from Door43 into data/published_ust/. Use this for the v88 published books when you need the simplified rendering; use fetch_ult instead for the literal/word-for-word rendering. For non-published books use fetch_master_ust.',
+        'Fetch published UST (Simplified Text — meaning-based, natural-English rendering) USFM files from Door43 into data/published_ust/. Use this for the v89 published books when you need the simplified rendering; use fetch_ult instead for the literal/word-for-word rendering. For non-published books use fetch_master_ust.',
         {
-          books: z.array(z.string()).optional().describe('Specific book codes (must be v88 published). Omit for all v88 published books.'),
+          books: z.array(z.string()).optional().describe('Specific book codes (must be v89 published). Omit for all v89 published books.'),
           force: z.boolean().optional().describe('Force re-fetch even if cached today'),
         },
         async (args) => ({

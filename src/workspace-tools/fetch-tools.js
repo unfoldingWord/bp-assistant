@@ -30,10 +30,11 @@ const BOOK_NUMBERS = {};
 OT_BOOKS.forEach((b, i) => { BOOK_NUMBERS[b] = String(i + 1).padStart(2, '0'); });
 NT_BOOKS.forEach((b, i) => { BOOK_NUMBERS[b] = String(i + 41).padStart(2, '0'); });
 
-const V88_PUBLISHED = [
+// v89 (released 2026-06-23) added PSA, LAM, HAB to the v88 set of 24 OT books.
+const V89_PUBLISHED = [
   'GEN', 'EXO', 'LEV', 'DEU', 'JOS', 'JDG', 'RUT', '1SA', '2SA',
-  '1KI', '2KI', 'EZR', 'NEH', 'EST', 'JOB', 'PRO', 'SNG',
-  'JOL', 'OBA', 'JON', 'NAM', 'ZEP', 'HAG', 'MAL',
+  '1KI', '2KI', 'EZR', 'NEH', 'EST', 'JOB', 'PSA', 'PRO', 'SNG',
+  'LAM', 'JOL', 'OBA', 'JON', 'NAM', 'HAB', 'ZEP', 'HAG', 'MAL',
 ];
 
 const BOOK_ALIASES = {
@@ -163,19 +164,19 @@ async function fetchHebrewBible({ books, force }) {
 }
 
 async function fetchUlt({ books, force }) {
-  const bookList = books && books.length ? books.map(normalizeBook) : V88_PUBLISHED;
-  const notPublished = bookList.filter(b => !V88_PUBLISHED.includes(b));
+  const bookList = books && books.length ? books.map(normalizeBook) : V89_PUBLISHED;
+  const notPublished = bookList.filter(b => !V89_PUBLISHED.includes(b));
   if (notPublished.length) {
-    return `Error: ${notPublished.join(', ')} not in the v88 published list. Use fetch_master_ult for master-branch content on non-published books.`;
+    return `Error: ${notPublished.join(', ')} not in the v89 published list. Use fetch_master_ult for master-branch content on non-published books.`;
   }
   return fetchDoor43Batch('en_ult', bookList, 'data/published_ult', force || false);
 }
 
 async function fetchUst({ books, force }) {
-  const bookList = books && books.length ? books.map(normalizeBook) : V88_PUBLISHED;
-  const notPublished = bookList.filter(b => !V88_PUBLISHED.includes(b));
+  const bookList = books && books.length ? books.map(normalizeBook) : V89_PUBLISHED;
+  const notPublished = bookList.filter(b => !V89_PUBLISHED.includes(b));
   if (notPublished.length) {
-    return `Error: ${notPublished.join(', ')} not in the v88 published list. Use fetch_master_ust for master-branch content on non-published books.`;
+    return `Error: ${notPublished.join(', ')} not in the v89 published list. Use fetch_master_ust for master-branch content on non-published books.`;
   }
   return fetchDoor43Batch('en_ust', bookList, 'data/published_ust', force || false);
 }
