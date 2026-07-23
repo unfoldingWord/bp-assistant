@@ -294,6 +294,10 @@ test('generatePipeline preserves failed checkpoint when initial-pipeline continu
     assert.match(harness.diagnosisCalls[0].errorText, /issues TSV, UST/);
     assert.match(harness.diagnosisCalls[0].errorText, /wave2_structure\.tsv/);
     assert.match(harness.diagnosisCalls[0].errorText, /Claude returned subtype=success/);
+    // No-progress continuation: exactly one attempt recorded, with per-attempt diagnostics.
+    assert.match(harness.diagnosisCalls[0].errorText, /Continuation attempt 1:/);
+    assert.equal(failure.current.continuationAttempts.length, 1);
+    assert.equal(failure.current.continuationAttempts[0].progressed, false);
     assert.deepEqual(harness.runSummaries.at(-1), {
       pipeline: 'generate',
       book: 'ISA',
@@ -303,6 +307,50 @@ test('generatePipeline preserves failed checkpoint when initial-pipeline continu
       success: false,
       userId: 42,
     });
+  } finally {
+    harness.cleanup();
+  }
+});
+
+test('generatePipeline retries the continuation when an attempt progresses but stays incomplete (#260)', async () => {
+  let continuationCalls = 0;
+  const harness = createHarness({
+    runClaudeImpl: async ({ options, tempDir }) => {
+      if (options.resume === 'session-isa-52') {
+        continuationCalls++;
+        assert.match(options.prompt, /Continue the existing initial-pipeline run/);
+        assert.match(options.prompt, /test -s|MISS/);
+        if (continuationCalls === 1) {
+          // Attempt 1: progresses (writes issues TSV) but early-exits before UST.
+          fs.mkdirSync(path.join(tempDir, 'output', 'issues', 'ISA'), { recursive: true });
+          fs.writeFileSync(path.join(tempDir, 'output', 'issues', 'ISA', 'ISA-52.tsv'), 'isa\t52:1\tfigs-activepassive\tYou were sold\n');
+        } else {
+          // Attempt 2: finishes the UST.
+          fs.mkdirSync(path.join(tempDir, 'output', 'AI-UST', 'ISA'), { recursive: true });
+          fs.writeFileSync(path.join(tempDir, 'output', 'AI-UST', 'ISA', 'ISA-52.usfm'), '\\id ISA\n\\c 52\n\\v 1 ust\n');
+        }
+        return { subtype: 'success', usage: {}, total_cost_usd: 0, session_id: 'session-isa-52', num_turns: 5, duration_ms: 9000 };
+      }
+      fs.mkdirSync(path.join(tempDir, 'output', 'AI-ULT', 'ISA'), { recursive: true });
+      fs.writeFileSync(path.join(tempDir, 'output', 'AI-ULT', 'ISA', 'ISA-52.usfm'), '\\id ISA\n\\c 52\n\\v 1 test\n');
+      return { subtype: 'success', usage: {}, total_cost_usd: 0, session_id: 'session-isa-52' };
+    },
+  });
+
+  try {
+    await harness.generatePipeline(
+      { _synthetic: true, _book: 'ISA', _startChapter: 52, _endChapter: 52, skill: 'initial-pipeline', operations: 6 },
+      buildMessage('generate isa 52')
+    );
+
+    assert.equal(harness.runClaudeCalls.length, 3);
+    assert.equal(continuationCalls, 2);
+    const statusTexts = harness.readStatusTexts();
+    assert.ok(statusTexts.some((text) => text.includes('attempt 2/3')));
+    assert.ok(statusTexts.some((text) => text.includes('continuation completed required outputs')));
+    assert.equal(harness.checkpoints.some((patch) => patch.current?.errorKind === 'initial_pipeline_early_exit'), false);
+    assert.equal(harness.diagnosisCalls.length, 0);
+    assert.equal(harness.runSummaries.at(-1).success, true);
   } finally {
     harness.cleanup();
   }
