@@ -1093,7 +1093,10 @@ async function generatePipeline(route, message) {
         // get continuations now — previously they failed straight to
         // diagnosis after a single early exit.
         const continuationAttempts = [];
-        let resumeTargetSessionId = claudeResult?.session_id || resumeSessionId || null;
+        // In --align-only mode claudeResult is a stub with no session_id and
+        // generation is intentionally skipped — don't let the checkpoint's
+        // resumeSessionId re-launch generation continuations here.
+        let resumeTargetSessionId = alignOnly ? null : (claudeResult?.session_id || resumeSessionId || null);
         while (
           initialPipelineStatus.missing.length > 0 &&
           !continuationErrorText &&
