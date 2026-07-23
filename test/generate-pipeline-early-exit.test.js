@@ -850,3 +850,80 @@ test('generatePipeline reruns initial-pipeline when align-all-parallel resume la
     harness.cleanup();
   }
 });
+
+// Issue #251: EZK 18 initial-pipeline returned subtype=success after ~6min but
+// wrote no artifacts at all — not even Wave 1 ULT or a tmp/pipeline-EZK-18
+// directory. The ISA-52 hardening's resume-and-continue-from-disk recovery
+// then resumed the same session with a continuation prompt that forbids
+// re-invoking the slash command; that resume returned "success" in ~9s
+// (implausible for Waves 3-6) and the chapter was hard-failed. When there is
+// no prior progress on disk, the correct retry is a fresh slash-command
+// invocation, not a resume — otherwise the recovery is a guaranteed dead end.
+test('generatePipeline restarts initial-pipeline via slash command when the early-exit produced zero artifacts (#251)', async () => {
+  const invocations = [];
+  const harness = createHarness({
+    runClaudeImpl: async ({ options, tempDir }) => {
+      invocations.push({
+        skill: options.skill,
+        resume: options.resume,
+        prompt: options.prompt,
+        label: options.label,
+      });
+      // First invocation (the original initial-pipeline slash command) returns
+      // success but writes NOTHING — mirrors the EZK 18 signature: no ULT, no
+      // issues TSV, no UST, no tmp/pipeline-EZK-18 directory.
+      if (options.skill === 'initial-pipeline' && !options.resume && invocations.length === 1) {
+        return { subtype: 'success', usage: {}, total_cost_usd: 0, session_id: 'session-ezk-18', num_turns: 40, duration_ms: 360000 };
+      }
+      // The retry must be a fresh slash-command invocation (skill set, no resume)
+      // — NOT a session resume with the continuation prompt (which would forbid
+      // re-invoking the pipeline and return in seconds).
+      if (options.skill === 'initial-pipeline' && !options.resume) {
+        fs.mkdirSync(path.join(tempDir, 'output', 'AI-ULT', 'EZK'), { recursive: true });
+        fs.mkdirSync(path.join(tempDir, 'output', 'AI-UST', 'EZK'), { recursive: true });
+        fs.mkdirSync(path.join(tempDir, 'output', 'issues', 'EZK'), { recursive: true });
+        fs.writeFileSync(path.join(tempDir, 'output', 'AI-ULT', 'EZK', 'EZK-18.usfm'), '\\id EZK\n\\c 18\n\\v 1 ult\n');
+        fs.writeFileSync(path.join(tempDir, 'output', 'AI-UST', 'EZK', 'EZK-18.usfm'), '\\id EZK\n\\c 18\n\\v 1 ust\n');
+        fs.writeFileSync(path.join(tempDir, 'output', 'issues', 'EZK', 'EZK-18.tsv'), 'ezk\t18:1\tfigs-metaphor\tSour grapes\n');
+        return { subtype: 'success', usage: {}, total_cost_usd: 0, session_id: 'session-ezk-18-b', num_turns: 45, duration_ms: 400000 };
+      }
+      return { subtype: 'success', usage: {}, total_cost_usd: 0 };
+    },
+  });
+
+  try {
+    await harness.generatePipeline(
+      { _synthetic: true, _book: 'EZK', _startChapter: 18, _endChapter: 18, skill: 'initial-pipeline', operations: 6 },
+      buildMessage('generate ezk 18', { subject: 'EZK 18' })
+    );
+
+    assert.equal(invocations.length, 2, 'expected initial call plus one restart');
+    // First call is the original slash-command invocation.
+    assert.equal(invocations[0].skill, 'initial-pipeline');
+    assert.ok(!invocations[0].resume, 'first call must not carry a resume session');
+    // Second call MUST be a fresh slash-command invocation, not a resume.
+    // Before the fix, this would be `{skill: undefined, resume: 'session-ezk-18'}`
+    // with the "Continue the existing initial-pipeline run" prompt — a dead end
+    // when no prior artifacts exist on disk.
+    assert.equal(invocations[1].skill, 'initial-pipeline', 'restart must use the slash command');
+    assert.ok(!invocations[1].resume, 'restart must not resume the empty session');
+    assert.doesNotMatch(invocations[1].prompt, /Continue the existing initial-pipeline run/);
+    assert.match(invocations[1].label, /\(restart\)/);
+    // The operator-visible status must explain we restarted rather than resumed.
+    const statusTexts = harness.readStatusTexts();
+    assert.ok(
+      statusTexts.some((text) => text.includes('wrote no artifacts') && text.includes('restarting initial-pipeline from scratch')),
+      'expected a status message noting the zero-artifact restart path'
+    );
+    // The successful restart should not leave an early-exit failure checkpoint.
+    assert.equal(
+      harness.checkpoints.some((patch) => patch.current?.errorKind === 'initial_pipeline_early_exit'),
+      false,
+      'a successful restart must not leave an early-exit checkpoint'
+    );
+    assert.equal(harness.diagnosisCalls.length, 0);
+    assert.equal(harness.runSummaries.at(-1).success, true);
+  } finally {
+    harness.cleanup();
+  }
+});

@@ -1071,35 +1071,75 @@ async function generatePipeline(route, message) {
         ];
         let continuationErrorText = null;
         if (!resumeInitialPipelineEarlyExit && claudeResult?.session_id) {
-          await status(
-            `initial-pipeline returned success before final outputs for **${book} ${ch}**; ` +
-            `resuming the same session to finish missing outputs (${initialPipelineStatus.missing.join(', ')}).`
-          );
+          // Branch on whether prior progress exists. The ISA-52 hardening's
+          // resume-and-continue-from-disk strategy assumes Wave 1/2 artifacts
+          // are already banked; its continuation prompt explicitly forbids
+          // re-invoking the slash command. When observedArtifacts is empty —
+          // no ULT, no issues TSV, no UST, no tmp/pipeline-* contents — the
+          // resumed session has nothing to build on and reliably returns
+          // early in seconds (EZK 18, #251: ~9s resume returning success).
+          // In that zero-progress case the only sensible retry is a fresh
+          // initial-pipeline invocation via the slash command, matching the
+          // original non-resume path. When any prior artifact exists, keep
+          // the continuation-from-disk strategy that the hardening was
+          // designed for.
+          const hasPriorProgress = observedArtifacts.length > 0;
+          const retryLabel = hasPriorProgress ? 'cont' : 'restart';
+          const timeoutMs = calcSkillTimeout(book, ch, route.operations || 6);
+          const commonOptions = {
+            label: `${book} ${ch} ${skill} (${retryLabel})`,
+            cwd: CSKILLBP_DIR,
+            // Generation continuation/restart — same `high` (Opus) default as the initial call.
+            model: model || 'high',
+            betas,
+            appendSystemPrompt: INITIAL_PIPELINE_COMPLETION_GUARDRAIL,
+            tools: DEFAULT_BASH_TOOLS,
+            enableBash: true,
+            disableLocalSettings: true,
+            timeoutMs,
+            onProgress: ({ turnCount, lastTool, elapsedMs, timedOut }) => {
+              const elapsed = Math.round(elapsedMs / 60000);
+              const suffix = timedOut ? ' — **timed out**, aborting' : '';
+              const verb = hasPriorProgress ? 'continuing' : 'restarting';
+              return status(`Still ${verb} **${book} ${ch}** (initial-pipeline) — ${elapsed}min, ${turnCount} tool calls${lastTool ? `, last: \`${lastTool}\`` : ''}${suffix}`);
+            },
+          };
+          if (hasPriorProgress) {
+            await status(
+              `initial-pipeline returned success before final outputs for **${book} ${ch}**; ` +
+              `resuming the same session to finish missing outputs (${initialPipelineStatus.missing.join(', ')}).`
+            );
+          } else {
+            await status(
+              `initial-pipeline returned success but wrote no artifacts for **${book} ${ch}**; ` +
+              `restarting initial-pipeline from scratch (nothing on disk to resume from).`
+            );
+          }
           try {
-            const continuationResult = await runClaude({
-              prompt: buildInitialPipelineContinuationPrompt({
-                book,
-                chapter: ch,
-                missing: initialPipelineStatus.missing,
-                observed: observedArtifacts,
-              }),
-              label: `${book} ${ch} ${skill} (cont)`,
-              cwd: CSKILLBP_DIR,
-              // Generation continuation — same `high` (Opus) default as the initial call.
-              model: model || 'high',
-              betas,
-              resume: claudeResult.session_id,
-              appendSystemPrompt: INITIAL_PIPELINE_COMPLETION_GUARDRAIL,
-              tools: DEFAULT_BASH_TOOLS,
-              enableBash: true,
-              disableLocalSettings: true,
-              timeoutMs: calcSkillTimeout(book, ch, route.operations || 6),
-              onProgress: ({ turnCount, lastTool, elapsedMs, timedOut }) => {
-                const elapsed = Math.round(elapsedMs / 60000);
-                const suffix = timedOut ? ' — **timed out**, aborting' : '';
-                return status(`Still continuing **${book} ${ch}** (initial-pipeline) — ${elapsed}min, ${turnCount} tool calls${lastTool ? `, last: \`${lastTool}\`` : ''}${suffix}`);
-              },
-            });
+            let continuationResult;
+            if (hasPriorProgress) {
+              continuationResult = await runClaude({
+                ...commonOptions,
+                prompt: buildInitialPipelineContinuationPrompt({
+                  book,
+                  chapter: ch,
+                  missing: initialPipelineStatus.missing,
+                  observed: observedArtifacts,
+                }),
+                resume: claudeResult.session_id,
+              });
+            } else {
+              // Fresh slash-command re-invocation. The continuation prompt
+              // forbids re-invoking a slash command, so an empty-progress
+              // resume is a guaranteed dead end (#251); use a first-run-shaped
+              // call instead so the pipeline actually restarts Wave 1.
+              const restartPrompt = hasVerseRange ? `${book} ${ch}:${verseStart}-${verseEnd}` : `${book} ${ch}`;
+              continuationResult = await runClaude({
+                ...commonOptions,
+                prompt: restartPrompt,
+                skill: 'initial-pipeline',
+              });
+            }
             if (!continuationResult || continuationResult.subtype !== 'success') {
               continuationErrorText = continuationResult
                 ? (continuationResult.error || continuationResult.result || `non-success subtype: "${continuationResult.subtype}"`)
@@ -1120,6 +1160,21 @@ async function generatePipeline(route, message) {
               ustRel = discoverFreshOutput('output/AI-UST', book, chPat, freshnessMs);
               hasUlt = !!ultRel;
               hasUst = !!ustRel;
+              // Log the retry call's turn/duration signature when required outputs
+              // are STILL missing. A 9s / <5-turn "success" is diagnostic of the
+              // agent immediately concluding it had nothing to do — the pattern
+              // that motivated the fresh-restart branch above (#251). Logging
+              // this at the wrapper avoids cross-referencing admin-status
+              // timestamps to figure out what happened.
+              if (initialPipelineStatus.missing.length > 0) {
+                const durSec = continuationResult.duration_ms != null
+                  ? (continuationResult.duration_ms / 1000).toFixed(1)
+                  : '?';
+                console.error(
+                  `[generate] initial-pipeline ${retryLabel} for ${book} ${ch} returned success but final outputs still missing ` +
+                  `(missing=${initialPipelineStatus.missing.join(', ')}; num_turns=${continuationResult.num_turns ?? '?'}; duration=${durSec}s)`
+                );
+              }
             }
           } catch (err) {
             continuationErrorText = err.message || String(err);
