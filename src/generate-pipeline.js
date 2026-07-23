@@ -41,7 +41,15 @@ const INITIAL_PIPELINE_COMPLETION_GUARDRAIL = [
   'Completion is only valid after the final required outputs exist on disk for this chapter:',
   'output/AI-ULT/<BOOK>/<BOOK>-<CH>.usfm, output/issues/<BOOK>/<BOOK>-<CH>.tsv, and output/AI-UST/<BOOK>/<BOOK>-<CH>.usfm.',
   'If any of those required outputs are missing, continue the pipeline or return a failure instead of success.',
+  'Your last tool call before returning success must be a Bash check that each of those three files exists and is non-empty (test -s), with the OK/MISS output included in your final message.',
+  'A success return whose final tool call was not that file-existence check is invalid.',
 ].join(' ');
+
+// Maximum in-process continuation attempts after initial-pipeline returns
+// success with required outputs still missing. One attempt proved insufficient
+// (see #251/#260: the same session early-exited twice in a row); each attempt
+// resumes the same session, so retries are cheap relative to a full restart.
+const MAX_INITIAL_PIPELINE_CONTINUATIONS = 3;
 
 function buildInitialPipelineContinuationPrompt({ book, chapter, missing = [], observed = [] }) {
   const chapterTag = buildChapterTag(book, chapter);
@@ -56,6 +64,9 @@ function buildInitialPipelineContinuationPrompt({ book, chapter, missing = [], o
     `output/AI-ULT/${book}/${chapterTag}.usfm`,
     `output/issues/${book}/${chapterTag}.tsv`,
     `output/AI-UST/${book}/${chapterTag}.usfm`,
+    'Your last tool call before returning must be a Bash check of those three paths, e.g.:',
+    `for f in output/AI-ULT/${book}/${chapterTag}.usfm output/issues/${book}/${chapterTag}.tsv output/AI-UST/${book}/${chapterTag}.usfm; do if [ -s "$f" ]; then echo "OK $f"; else echo "MISS $f"; fi; done`,
+    'Include its output in your final message. If any line says MISS, keep working — do not return success.',
   ].join('\n');
 }
 
@@ -1071,25 +1082,46 @@ async function generatePipeline(route, message) {
         ];
         let continuationErrorText = null;
         let continuationPermissionStall = false;
-        if (!resumeInitialPipelineEarlyExit && claudeResult?.session_id) {
+        // Bounded continuation loop (#260): one attempt proved insufficient —
+        // the agent can early-exit again on the continuation itself. Retry up
+        // to MAX_INITIAL_PIPELINE_CONTINUATIONS times, resuming the same
+        // session, as long as each attempt makes observable progress (new
+        // artifacts on disk or fewer missing outputs). A no-progress attempt
+        // stops the loop early: with nothing new on disk, re-sending the same
+        // continuation prompt would just repeat it (#251's 9-second no-op).
+        // Checkpoint-resumed attempts (resumeInitialPipelineEarlyExit) also
+        // get continuations now — previously they failed straight to
+        // diagnosis after a single early exit.
+        const continuationAttempts = [];
+        let resumeTargetSessionId = claudeResult?.session_id || resumeSessionId || null;
+        while (
+          initialPipelineStatus.missing.length > 0 &&
+          !continuationErrorText &&
+          !continuationPermissionStall &&
+          resumeTargetSessionId &&
+          continuationAttempts.length < MAX_INITIAL_PIPELINE_CONTINUATIONS
+        ) {
+          const attemptNo = continuationAttempts.length + 1;
+          const missingBefore = [...initialPipelineStatus.missing];
+          const artifactsBefore = [...observedArtifacts];
           await status(
             `initial-pipeline returned success before final outputs for **${book} ${ch}**; ` +
-            `resuming the same session to finish missing outputs (${initialPipelineStatus.missing.join(', ')}).`
+            `resuming the same session (attempt ${attemptNo}/${MAX_INITIAL_PIPELINE_CONTINUATIONS}) to finish missing outputs (${missingBefore.join(', ')}).`
           );
           try {
             const continuationResult = await runClaude({
               prompt: buildInitialPipelineContinuationPrompt({
                 book,
                 chapter: ch,
-                missing: initialPipelineStatus.missing,
-                observed: observedArtifacts,
+                missing: missingBefore,
+                observed: artifactsBefore,
               }),
-              label: `${book} ${ch} ${skill} (cont)`,
+              label: `${book} ${ch} ${skill} (cont ${attemptNo})`,
               cwd: CSKILLBP_DIR,
               // Generation continuation — same `high` (Opus) default as the initial call.
               model: model || 'high',
               betas,
-              resume: claudeResult.session_id,
+              resume: resumeTargetSessionId,
               appendSystemPrompt: INITIAL_PIPELINE_COMPLETION_GUARDRAIL,
               tools: DEFAULT_BASH_TOOLS,
               enableBash: true,
@@ -1109,7 +1141,7 @@ async function generatePipeline(route, message) {
               onProgress: ({ turnCount, lastTool, elapsedMs, timedOut }) => {
                 const elapsed = Math.round(elapsedMs / 60000);
                 const suffix = timedOut ? ' — **timed out**, aborting' : '';
-                return status(`Still continuing **${book} ${ch}** (initial-pipeline) — ${elapsed}min, ${turnCount} tool calls${lastTool ? `, last: \`${lastTool}\`` : ''}${suffix}`);
+                return status(`Still continuing **${book} ${ch}** (initial-pipeline, attempt ${attemptNo}) — ${elapsed}min, ${turnCount} tool calls${lastTool ? `, last: \`${lastTool}\`` : ''}${suffix}`);
               },
             });
             // A same-session continuation that surfaces a permission stall
@@ -1125,22 +1157,43 @@ async function generatePipeline(route, message) {
               continuationErrorText = continuationResult
                 ? (continuationResult.error || continuationResult.result || `non-success subtype: "${continuationResult.subtype}"`)
                 : 'continuation returned no result';
-            } else {
-              claudeResult = continuationResult;
-              initialPipelineStatus = getInitialPipelineOutputStatus({
-                book,
-                chapter: ch,
-                verseStart: hasVerseRange ? verseStart : null,
-                verseEnd: hasVerseRange ? verseEnd : null,
-              });
-              observedArtifacts = [
-                ...Object.values(initialPipelineStatus.found),
-                ...initialPipelineStatus.observedTempArtifacts,
-              ];
-              ultRel = discoverFreshOutput('output/AI-ULT', book, chPat, freshnessMs);
-              ustRel = discoverFreshOutput('output/AI-UST', book, chPat, freshnessMs);
-              hasUlt = !!ultRel;
-              hasUst = !!ustRel;
+              break;
+            }
+            claudeResult = continuationResult;
+            resumeTargetSessionId = continuationResult.session_id || resumeTargetSessionId;
+            initialPipelineStatus = getInitialPipelineOutputStatus({
+              book,
+              chapter: ch,
+              verseStart: hasVerseRange ? verseStart : null,
+              verseEnd: hasVerseRange ? verseEnd : null,
+            });
+            observedArtifacts = [
+              ...Object.values(initialPipelineStatus.found),
+              ...initialPipelineStatus.observedTempArtifacts,
+            ];
+            ultRel = discoverFreshOutput('output/AI-ULT', book, chPat, freshnessMs);
+            ustRel = discoverFreshOutput('output/AI-UST', book, chPat, freshnessMs);
+            hasUlt = !!ultRel;
+            hasUst = !!ustRel;
+            const newArtifacts = observedArtifacts.filter((a) => !artifactsBefore.includes(a));
+            const progressed = initialPipelineStatus.missing.length < missingBefore.length || newArtifacts.length > 0;
+            const attemptSummary = {
+              attempt: attemptNo,
+              numTurns: continuationResult.num_turns ?? null,
+              durationMs: continuationResult.duration_ms ?? null,
+              newArtifacts,
+              missingAfter: [...initialPipelineStatus.missing],
+              progressed,
+            };
+            continuationAttempts.push(attemptSummary);
+            console.log(
+              `[generate] initial-pipeline continuation ${attemptNo} for ${book} ${ch}: ` +
+              `turns=${attemptSummary.numTurns}, duration=${attemptSummary.durationMs != null ? Math.round(attemptSummary.durationMs / 1000) + 's' : '?'}, ` +
+              `newArtifacts=${newArtifacts.length ? newArtifacts.join(', ') : '(none)'}, stillMissing=${initialPipelineStatus.missing.join(', ') || '(none)'}`
+            );
+            if (!progressed) {
+              console.error(`[generate] initial-pipeline continuation ${attemptNo} for ${book} ${ch} made no progress — stopping retries.`);
+              break;
             }
           } catch (err) {
             continuationErrorText = err.message || String(err);
@@ -1185,6 +1238,7 @@ async function generatePipeline(route, message) {
               observedArtifacts,
               continuationError: continuationErrorText || undefined,
               continuationPermissionStall: continuationPermissionStall || undefined,
+              continuationAttempts: continuationAttempts.length ? continuationAttempts : undefined,
             },
             resume: {
               chapter: ch,
@@ -1204,6 +1258,10 @@ async function generatePipeline(route, message) {
               `Missing outputs: ${initialPipelineStatus.missing.join(', ')}`,
               `Observed artifacts: ${observedArtifacts.length > 0 ? observedArtifacts.join(', ') : '(none)'}`,
               continuationErrorText ? `Continuation error: ${continuationErrorText}` : null,
+              ...continuationAttempts.map((a) =>
+                `Continuation attempt ${a.attempt}: turns=${a.numTurns ?? '?'}, duration=${a.durationMs != null ? Math.round(a.durationMs / 1000) + 's' : '?'}, ` +
+                `new artifacts=${a.newArtifacts.length ? a.newArtifacts.join(', ') : '(none)'}, still missing=${a.missingAfter.join(', ') || '(none)'}`
+              ),
             ].filter(Boolean).join('\n'),
           });
           continue;
