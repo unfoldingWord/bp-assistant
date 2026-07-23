@@ -2244,18 +2244,20 @@ async function generatePipeline(route, message) {
   }
 
   // Final message
+  const rangeLabel = hasVerseRange
+    ? `${book} ${start}:${verseStart}-${verseEnd}`
+    : (start === end ? `${book} ${start}` : `${book} ${start}\u2013${end}`);
   if (shouldPushToDoor43({ useFileResponseMode, textOnly }) && success > 0) {
-    const rangeLabel = hasVerseRange
-      ? `${book} ${start}:${verseStart}-${verseEnd}`
-      : (start === end ? `${book} ${start}` : `${book} ${start}\u2013${end}`);
     const repoList = [contentTypes.includes('ult') && 'en_ult', contentTypes.includes('ust') && 'en_ust'].filter(Boolean).join(' and ');
     await reply(
       (noPush
         ? `Content for **${rangeLabel}** generated in ${repoList} (Door43 push skipped via --no-push).`
         : `Content for **${rangeLabel}** pushed to master in ${repoList}.`) +
-      (fail > 0 ? `\n(${fail} chapter(s) had errors \u2014 check admin DMs for details.)` : '') +
+      (fail > 0 ? `\n(${fail} chapter(s) had errors \u2014 check admin status for details.)` : '') +
       `\nYou may need to refresh the tcCreate or gatewayEdit page to see the new content.`
     );
+  } else if (fail > 0 && success === 0) {
+    await reply(`Generation failed for **${rangeLabel}** \u2014 no chapters completed (${fail} chapter(s) had errors). Nothing was pushed to Door43.`);
   }
 
   recordRunSummary({
