@@ -453,7 +453,7 @@ function createWorkspaceTools(createSdkMcpServer, tool, z) {
         preparedJson: z.string().optional().describe('Prepared notes JSON path relative to workspace, used to cross-reference each note against its source item'),
         ultUsfm: z.string().optional().describe('ULT USFM path relative to workspace, used to look up verse text for the checks'),
         ustUsfm: z.string().optional().describe('UST USFM path relative to workspace, used to look up verse text for the checks'),
-        book: z.string().optional().describe('Book code, e.g. "HAB"; when given, upstream published TN IDs are fetched to check for ID collisions'),
+        book: z.string().optional().describe('Book code, e.g. "HAB"; when given, upstream published TN IDs are fetched to check for ID collisions, and book-specific style checks apply (e.g. "the psalmist" for PSA)'),
         hebrewUsfm: z.string().optional().describe('Hebrew USFM path relative to workspace, used for the Hebrew-word cross-check'),
         output: z.string().optional().describe('Output path for findings JSON relative to workspace (default: /tmp/claude/tn_quality_findings.json)'),
       }, async (args) => asTextToolResult(await checkTnQuality(args))),
