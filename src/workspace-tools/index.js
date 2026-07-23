@@ -45,7 +45,7 @@ function createWorkspaceTools(createSdkMcpServer, tool, z) {
       ),
       tool(
         'fetch_ult',
-        'Fetch published ULT USFM files from Door43 into data/published_ult/. Only accepts the 25 v88 published books — for non-published books use fetch_master_ult.',
+        'Fetch published ULT (Literal Text — word-for-word, form-preserving rendering) USFM files from Door43 into data/published_ult/. Use this for the 25 v88 published books when you need the literal rendering; use fetch_ust instead for the simplified/meaning-based rendering. For non-published books use fetch_master_ult.',
         {
           books: z.array(z.string()).optional().describe('Specific book codes (must be v88 published). Omit for all 25 v88 published books.'),
           force: z.boolean().optional().describe('Force re-fetch even if cached today'),
@@ -56,7 +56,7 @@ function createWorkspaceTools(createSdkMcpServer, tool, z) {
       ),
       tool(
         'fetch_ust',
-        'Fetch published UST USFM files from Door43 into data/published_ust/. Only accepts the 25 v88 published books — for non-published books use fetch_master_ust.',
+        'Fetch published UST (Simplified Text — meaning-based, natural-English rendering) USFM files from Door43 into data/published_ust/. Use this for the 25 v88 published books when you need the simplified rendering; use fetch_ult instead for the literal/word-for-word rendering. For non-published books use fetch_master_ust.',
         {
           books: z.array(z.string()).optional().describe('Specific book codes (must be v88 published). Omit for all 25 v88 published books.'),
           force: z.boolean().optional().describe('Force re-fetch even if cached today'),
@@ -67,7 +67,7 @@ function createWorkspaceTools(createSdkMcpServer, tool, z) {
       ),
       tool(
         'fetch_master_ult',
-        'Fetch ULT from Door43 master branch for working reference on non-published books. Always fetches fresh. Stores to data/master_ult/ — not authoritative, not indexed.',
+        'Fetch ULT (Literal Text — word-for-word, form-preserving rendering) from Door43 master branch for working reference on non-published books. Use this for the literal rendering of a non-published book; use fetch_master_ust instead for the simplified rendering. Always fetches fresh. Stores to data/master_ult/ — not authoritative, not indexed.',
         {
           books: z.array(z.string()).describe('Book codes to fetch (e.g. ["ISA", "JER"]). Required.'),
         },
@@ -77,7 +77,7 @@ function createWorkspaceTools(createSdkMcpServer, tool, z) {
       ),
       tool(
         'fetch_master_ust',
-        'Fetch UST from Door43 master branch for working reference on non-published books. Always fetches fresh. Stores to data/master_ust/ — not authoritative, not indexed.',
+        'Fetch UST (Simplified Text — meaning-based, natural-English rendering) from Door43 master branch for working reference on non-published books. Use this for the simplified rendering of a non-published book; use fetch_master_ult instead for the literal rendering. Always fetches fresh. Stores to data/master_ust/ — not authoritative, not indexed.',
         {
           books: z.array(z.string()).describe('Book codes to fetch (e.g. ["ISA", "JER"]). Required.'),
         },
@@ -335,14 +335,21 @@ function createWorkspaceTools(createSdkMcpServer, tool, z) {
       ),
 
       // --- Index builders ---
-      tool('build_strongs_index', "Build Strong's concordance index from aligned ULT USFM", {
-        force: z.boolean().optional(), lookup: z.string().optional().describe("Strong's number to look up"), stats: z.boolean().optional(),
+      tool('build_strongs_index', "Build Strong's concordance index from aligned ULT USFM. Use this (not build_ust_index) for ULT/Hebrew word-lookup by Strong's number.", {
+        force: z.boolean().optional().describe('Rebuild even if the cached index was already built today'),
+        lookup: z.string().optional().describe("Strong's number to look up"),
+        stats: z.boolean().optional().describe('Return index build metadata (built date, file/alignment/Strong\'s counts) instead of rebuilding'),
       }, async (args) => ({ content: [{ type: 'text', text: await buildStrongsIndex(args) }] })),
       tool('build_tn_index', 'Build translation notes index from published TN TSV files', {
-        force: z.boolean().optional(), lookup: z.string().optional().describe('Keyword to search'), issue: z.string().optional().describe('Issue type to query'), stats: z.boolean().optional(),
+        force: z.boolean().optional().describe('Rebuild even if the cached index was already built today'),
+        lookup: z.string().optional().describe('Keyword to search'),
+        issue: z.string().optional().describe('Issue type to query'),
+        stats: z.boolean().optional().describe('Return index build metadata (built date, file/note/issue/keyword counts) instead of rebuilding'),
       }, async (args) => ({ content: [{ type: 'text', text: await buildTnIndex(args) }] })),
-      tool('build_ust_index', 'Build UST concordance index from aligned UST USFM', {
-        force: z.boolean().optional(), lookup: z.string().optional(), stats: z.boolean().optional(),
+      tool('build_ust_index', 'Build UST concordance index from aligned UST USFM. Use this (not build_strongs_index) for UST word-lookup by Strong\'s number.', {
+        force: z.boolean().optional().describe('Rebuild even if the cached index was already built today'),
+        lookup: z.string().optional().describe("Strong's number to look up"),
+        stats: z.boolean().optional().describe('Return index build metadata (built date, file/alignment/Strong\'s counts) instead of rebuilding'),
       }, async (args) => ({ content: [{ type: 'text', text: await buildUstIndex(args) }] })),
 
       // --- Issue identification ---
@@ -351,7 +358,8 @@ function createWorkspaceTools(createSdkMcpServer, tool, z) {
       }, async (args) => ({ content: [{ type: 'text', text: checkTwHeadwords(args) }] })),
       tool('compare_ult_ust', 'Compare ULT and UST verse-by-verse to identify translation differences', {
         ultFile: z.string().describe('ULT USFM path'), ustFile: z.string().describe('UST USFM path'),
-        chapter: z.number().int().optional(), format: z.enum(['tsv', 'json']).optional(),
+        chapter: z.number().int().optional().describe('Restrict comparison to this chapter number, e.g. 3; omit to compare the whole book'),
+        format: z.enum(['tsv', 'json']).optional(),
       }, async (args) => ({ content: [{ type: 'text', text: compareUltUst(args) }] })),
       tool('detect_abstract_nouns', 'Detect abstract nouns in alignment data or text', {
         alignmentJson: z.string().optional().describe('Alignment JSON path'), text: z.string().optional().describe('Text to check'),
@@ -363,7 +371,8 @@ function createWorkspaceTools(createSdkMcpServer, tool, z) {
         alignedUsfm: z.string().describe('Aligned USFM file path'), output: z.string().optional().describe('Output JSON path'),
       }, async (args) => ({ content: [{ type: 'text', text: extractAlignmentData(args) }] })),
       tool('fix_hebrew_quotes', 'Extract Hebrew superscription words for a chapter', {
-        book: z.string().describe('Book code'), chapter: z.string().describe('Chapter number'), hebrewUsfm: z.string().optional(),
+        book: z.string().describe('Book code'), chapter: z.string().describe('Chapter number'),
+        hebrewUsfm: z.string().optional().describe('Hebrew USFM path relative to workspace (auto-detected from data/hebrew_bible/ by book code if omitted)'),
         output: z.string().optional().describe('Output JSON path. Omit to return content.'),
       }, async (args) => ({ content: [{ type: 'text', text: fixHebrewQuotes(args) }] })),
       tool('flag_narrow_quotes', 'Flag gl_quotes that are too narrow for AT substitution', {
@@ -374,7 +383,7 @@ function createWorkspaceTools(createSdkMcpServer, tool, z) {
       }, async (args) => ({ content: [{ type: 'text', text: await generateIds(args) }] })),
       tool('resolve_gl_quotes', 'Resolve gl_quotes using alignment data to find ULT spans', {
         preparedJson: z.string().describe('Prepared notes JSON path'), alignmentJson: z.string().describe('Alignment data JSON path'),
-        dryRun: z.boolean().optional(),
+        dryRun: z.boolean().optional().describe('Compute and log the resolved spans without writing them back into prepared_notes.json'),
       }, async (args) => ({ content: [{ type: 'text', text: resolveGlQuotes(args) }] })),
       tool('verify_at_fit', 'Verify AT substitutions fit correctly in ULT verses', {
         preparedJson: z.string().describe('Prepared notes JSON'), generatedJson: z.string().describe('Generated notes JSON'),
@@ -394,13 +403,20 @@ function createWorkspaceTools(createSdkMcpServer, tool, z) {
         masterUltUsfm: z.string().optional().describe('Master ULT USFM with \\zaln-s alignment markers (auto-detected from door43-repos/en_ult/ if omitted)'),
       }, async (args) => ({ content: [{ type: 'text', text: fillOrigQuotes(args) }] })),
       tool('prepare_notes', 'Prepare issue TSV into structured JSON for note generation', {
-        inputTsv: z.string().describe('Issue TSV path'), ultUsfm: z.string().optional(), ustUsfm: z.string().optional(),
-        output: z.string().optional(), alignedUsfm: z.string().optional(), alignmentJson: z.string().optional(),
+        inputTsv: z.string().describe('Issue TSV path'),
+        ultUsfm: z.string().optional().describe('ULT USFM path relative to workspace, used to look up each item\'s verse text'),
+        ustUsfm: z.string().optional().describe('UST USFM path relative to workspace, used to look up each item\'s verse text'),
+        output: z.string().optional().describe('Output path for prepared_notes.json relative to workspace (default: /tmp/claude/prepared_notes.json)'),
+        alignedUsfm: z.string().optional().describe('Aligned USFM path relative to workspace; accepted for signature parity with prepare_and_validate but not read directly by this tool'),
+        alignmentJson: z.string().optional().describe('Alignment data JSON path relative to workspace, used to filter alignment entries down to the target verses'),
       }, async (args) => ({ content: [{ type: 'text', text: prepareNotes(args) }] })),
 
       tool('prepare_and_validate', 'Combo: prepare notes + extract alignment + resolve gl_quotes + flag narrow quotes + verify AT fit in one call', {
-        inputTsv: z.string().describe('Issue TSV path'), ultUsfm: z.string().optional(), ustUsfm: z.string().optional(),
-        alignedUsfm: z.string().optional(), output: z.string().optional().describe('Output path for prepared JSON'),
+        inputTsv: z.string().describe('Issue TSV path'),
+        ultUsfm: z.string().optional().describe('ULT USFM path relative to workspace, used to look up each item\'s verse text'),
+        ustUsfm: z.string().optional().describe('UST USFM path relative to workspace, used to look up each item\'s verse text'),
+        alignedUsfm: z.string().optional().describe('Aligned USFM path relative to workspace; when given, alignment data is extracted and gl_quotes are resolved against it'),
+        output: z.string().optional().describe('Output path for prepared JSON'),
       }, async (args) => ({ content: [{ type: 'text', text: prepareAndValidate(args) }] })),
       tool('fix_unicode_quotes', 'Fix Hebrew quote Unicode to exactly match UHB source byte order (post-assembly)', {
         tsvFile: z.string().describe('TN TSV file path'),
@@ -430,31 +446,46 @@ function createWorkspaceTools(createSdkMcpServer, tool, z) {
       // --- Quality checks ---
       tool('validate_tn_tsv', 'Validate TN TSV against Door43 CI rules (checks 3-13)', {
         file: z.string().describe('TSV file path'), checks: z.array(z.number()).optional().describe('Check numbers to run'),
-        maxErrors: z.number().optional(),
+        maxErrors: z.number().optional().describe('Stop collecting errors once this many are found, e.g. 200 (default: 200)'),
       }, async (args) => ({ content: [{ type: 'text', text: validateTnTsv(args) }] })),
       tool('check_tn_quality', 'Run semantic quality checks on generated translation notes', {
-        tsvPath: z.string().describe('Notes TSV path'), preparedJson: z.string().optional(), ultUsfm: z.string().optional(),
-        ustUsfm: z.string().optional(), book: z.string().optional(), hebrewUsfm: z.string().optional(), output: z.string().optional(),
+        tsvPath: z.string().describe('Notes TSV path'),
+        preparedJson: z.string().optional().describe('Prepared notes JSON path relative to workspace, used to cross-reference each note against its source item'),
+        ultUsfm: z.string().optional().describe('ULT USFM path relative to workspace, used to look up verse text for the checks'),
+        ustUsfm: z.string().optional().describe('UST USFM path relative to workspace, used to look up verse text for the checks'),
+        book: z.string().optional().describe('Book code, e.g. "HAB"; when given, upstream published TN IDs are fetched to check for ID collisions'),
+        hebrewUsfm: z.string().optional().describe('Hebrew USFM path relative to workspace, used for the Hebrew-word cross-check'),
+        output: z.string().optional().describe('Output path for findings JSON relative to workspace (default: /tmp/claude/tn_quality_findings.json)'),
       }, async (args) => asTextToolResult(await checkTnQuality(args))),
 
       // --- Misc tools ---
       tool('gitea_pr', 'Create (and optionally merge) a PR on Door43 Gitea', {
         repo: z.string().describe('Repo name (en_tn, en_ult, en_ust)'), head: z.string().describe('Source branch'),
         base: z.string().describe('Target branch'), title: z.string().describe('PR title'),
-        body: z.string().optional(), merge: z.boolean().optional(), noDelete: z.boolean().optional(), ensureBase: z.boolean().optional(),
+        body: z.string().optional().describe('PR description body (default: empty)'),
+        merge: z.boolean().optional().describe('Merge the PR immediately after creating (or finding) it'),
+        noDelete: z.boolean().optional().describe('Keep the head branch after a successful merge instead of deleting it (only applies when merge is true)'),
+        ensureBase: z.boolean().optional().describe('Create the base branch from master first if it does not already exist'),
       }, async (args) => ({ content: [{ type: 'text', text: await giteaPr(args) }] })),
       tool('prepare_compare', 'Prepare AI vs editor verse-by-verse comparison data', {
         book: z.string().describe('Book code'), chapter: z.number().int().describe('Chapter number'),
         type: z.enum(['ult', 'ust']).optional(),
         verses: z.string().optional().describe('Optional verse scope within chapter, e.g. "1-6" or "1,3,5-7"'),
-        editorUsfm: z.string().optional(), output: z.string().optional(),
+        editorUsfm: z.string().optional().describe('Editor-edited USFM path relative to workspace, compared verse-by-verse against the AI output'),
+        output: z.string().optional().describe('Output path for comparison JSON relative to workspace. Omit to return content.'),
       }, async (args) => ({ content: [{ type: 'text', text: prepareCompare(args) }] })),
       tool('prepare_tq', 'Prepare translation questions data for a book/chapter', {
-        book: z.string().describe('Book code'), chapter: z.number().int().optional(), wholeBook: z.boolean().optional(),
-        tqRepo: z.string().optional(), ultPath: z.string().optional(), ustPath: z.string().optional(), output: z.string().optional(),
+        book: z.string().describe('Book code'),
+        chapter: z.number().int().optional().describe('Chapter number to scope the prepared data to. Omit (or set wholeBook) for all chapters.'),
+        wholeBook: z.boolean().optional().describe('Prepare all chapters in the book instead of a single chapter'),
+        tqRepo: z.string().optional().describe('Directory containing published TQ TSVs (default: data/published-tqs)'),
+        ultPath: z.string().optional().describe('Override ULT USFM path relative to workspace instead of fetching current Door43 master'),
+        ustPath: z.string().optional().describe('Override UST USFM path relative to workspace instead of fetching current Door43 master'),
+        output: z.string().optional().describe('Output path for prepared_tq.json relative to workspace (default: /tmp/claude/prepared_tq.json)'),
       }, async (args) => ({ content: [{ type: 'text', text: await prepareTq(args) }] })),
       tool('verify_tq', 'Verify translation questions TSV format and content', {
-        tsvFile: z.string().describe('TQ TSV file path'), inputJson: z.string().optional(),
+        tsvFile: z.string().describe('TQ TSV file path'),
+        inputJson: z.string().optional().describe('prepared_tq.json path relative to workspace, used to check the output row count against the expected row count'),
       }, async (args) => ({ content: [{ type: 'text', text: verifyTq(args) }] })),
 
       // --- Quick-ref tools ---
