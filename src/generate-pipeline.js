@@ -737,6 +737,7 @@ async function generatePipeline(route, message) {
   const completedChapters = Array.isArray(existingCheckpoint?.completedChapters) ? [...existingCheckpoint.completedChapters] : []; // Phase 1 results for non-file-response users
   let abortForUsageLimit = false;
   let abortForOutage = false;
+  let dcsTokenInvalid = false;
   let usageLimitTag = null;
   let resumeChapter = Number(existingCheckpoint?.resume?.chapter || start);
   let resumeSkill = existingCheckpoint?.resume?.skill || null;
@@ -1960,6 +1961,7 @@ async function generatePipeline(route, message) {
     if (!dcsCheck.valid) {
       await status(`**ABORTING repo-insert phase**: ${dcsCheck.details}`);
       await reply(`Generation complete but repo-insert skipped — DCS token invalid. Content is in output/ but not pushed.`);
+      dcsTokenInvalid = true;
       fail += completedChapters.length;
       success -= completedChapters.length;
     } else {
@@ -2244,18 +2246,29 @@ async function generatePipeline(route, message) {
   }
 
   // Final message
+  const rangeLabel = hasVerseRange
+    ? `${book} ${start}:${verseStart}-${verseEnd}`
+    : (start === end ? `${book} ${start}` : `${book} ${start}\u2013${end}`);
   if (shouldPushToDoor43({ useFileResponseMode, textOnly }) && success > 0) {
-    const rangeLabel = hasVerseRange
-      ? `${book} ${start}:${verseStart}-${verseEnd}`
-      : (start === end ? `${book} ${start}` : `${book} ${start}\u2013${end}`);
     const repoList = [contentTypes.includes('ult') && 'en_ult', contentTypes.includes('ust') && 'en_ust'].filter(Boolean).join(' and ');
     await reply(
       (noPush
         ? `Content for **${rangeLabel}** generated in ${repoList} (Door43 push skipped via --no-push).`
         : `Content for **${rangeLabel}** pushed to master in ${repoList}.`) +
-      (fail > 0 ? `\n(${fail} chapter(s) had errors \u2014 check admin DMs for details.)` : '') +
+      (fail > 0 ? `\n(${fail} chapter(s) had errors \u2014 check admin status for details.)` : '') +
       `\nYou may need to refresh the tcCreate or gatewayEdit page to see the new content.`
     );
+  } else if (fail > 0 && completedChapters.length === 0) {
+    await reply(`Generation failed for **${rangeLabel}** \u2014 no chapters completed (${fail} chapter(s) had errors).`);
+  } else if (fail > 0 && success === 0 && completedChapters.length > 0 && !dcsTokenInvalid) {
+    // completedChapters only grows in Phase 1 and success only shrinks in Phase 2,
+    // so success === 0 here means every completed chapter failed push/verify \u2014
+    // but `fail` can also include chapters that failed generation outright
+    // (never reached completedChapters), so don't attribute the whole `fail`
+    // count to push/verify.
+    const genOnlyFails = fail - completedChapters.length;
+    const genNote = genOnlyFails > 0 ? ` and ${genOnlyFails} chapter(s) failed generation entirely` : '';
+    await reply(`Generation for **${rangeLabel}** did not complete \u2014 ${completedChapters.length} chapter(s) generated content but all failed to push to Door43${genNote}. Content for those is in output/ but not pushed.`);
   }
 
   recordRunSummary({
