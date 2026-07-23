@@ -737,6 +737,7 @@ async function generatePipeline(route, message) {
   const completedChapters = Array.isArray(existingCheckpoint?.completedChapters) ? [...existingCheckpoint.completedChapters] : []; // Phase 1 results for non-file-response users
   let abortForUsageLimit = false;
   let abortForOutage = false;
+  let dcsTokenInvalid = false;
   let usageLimitTag = null;
   let resumeChapter = Number(existingCheckpoint?.resume?.chapter || start);
   let resumeSkill = existingCheckpoint?.resume?.skill || null;
@@ -1960,6 +1961,7 @@ async function generatePipeline(route, message) {
     if (!dcsCheck.valid) {
       await status(`**ABORTING repo-insert phase**: ${dcsCheck.details}`);
       await reply(`Generation complete but repo-insert skipped — DCS token invalid. Content is in output/ but not pushed.`);
+      dcsTokenInvalid = true;
       fail += completedChapters.length;
       success -= completedChapters.length;
     } else {
@@ -2256,8 +2258,8 @@ async function generatePipeline(route, message) {
       (fail > 0 ? `\n(${fail} chapter(s) had errors \u2014 check admin status for details.)` : '') +
       `\nYou may need to refresh the tcCreate or gatewayEdit page to see the new content.`
     );
-  } else if (fail > 0 && success === 0) {
-    await reply(`Generation failed for **${rangeLabel}** \u2014 no chapters completed (${fail} chapter(s) had errors). Nothing was pushed to Door43.`);
+  } else if (fail > 0 && success === 0 && !dcsTokenInvalid) {
+    await reply(`Generation failed for **${rangeLabel}** \u2014 nothing was pushed to Door43 (${fail} chapter(s) had errors).`);
   }
 
   recordRunSummary({
