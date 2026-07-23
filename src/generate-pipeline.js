@@ -2258,8 +2258,10 @@ async function generatePipeline(route, message) {
       (fail > 0 ? `\n(${fail} chapter(s) had errors \u2014 check admin status for details.)` : '') +
       `\nYou may need to refresh the tcCreate or gatewayEdit page to see the new content.`
     );
-  } else if (fail > 0 && success === 0 && !dcsTokenInvalid) {
-    await reply(`Generation failed for **${rangeLabel}** \u2014 nothing was pushed to Door43 (${fail} chapter(s) had errors).`);
+  } else if (fail > 0 && completedChapters.length === 0) {
+    await reply(`Generation failed for **${rangeLabel}** \u2014 no chapters completed (${fail} chapter(s) had errors).`);
+  } else if (fail > 0 && success === 0 && completedChapters.length > 0 && !dcsTokenInvalid) {
+    await reply(`Generation succeeded for **${rangeLabel}** but nothing was pushed to Door43 \u2014 all ${fail} chapter(s) failed at push/verify. Content is in output/ but not pushed.`);
   }
 
   recordRunSummary({

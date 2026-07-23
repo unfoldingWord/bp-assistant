@@ -512,6 +512,9 @@ test('generatePipeline retries alignment once and fails with degraded_alignment 
     assert.equal(harness.diagnosisCalls[0].event.severity, 'error');
     assert.equal(harness.diagnosisCalls[0].checkpoint.current.errorKind, 'degraded_alignment');
     assert.match(harness.diagnosisCalls[0].errorText, /align-all-parallel/);
+    // No chapter ever reached completedChapters, so the run gets an explicit
+    // Zulip failure reply instead of only a silent :warning: reaction.
+    assert.ok(harness.sent.stream.some(({ text }) => text.includes('Generation failed for **ISA 52** — no chapters completed (1 chapter(s) had errors).')));
   } finally {
     harness.cleanup();
   }
@@ -681,6 +684,9 @@ test('generatePipeline fires self-diagnosis when door43-push fails', async () =>
     assert.ok(pushDiag, 'expected a door43-push self-diagnosis dispatch');
     assert.equal(pushDiag.event.severity, 'error');
     assert.match(pushDiag.errorText, /Verse 1 not found/);
+    // Generation succeeded (completedChapters is non-empty) but push failed for
+    // every chapter — this must NOT be reported as a generation failure.
+    assert.ok(harness.sent.stream.some(({ text }) => text.includes('Generation succeeded for **ISA 52** but nothing was pushed to Door43')));
   } finally {
     harness.cleanup();
   }
