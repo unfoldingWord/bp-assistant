@@ -850,3 +850,106 @@ test('generatePipeline reruns initial-pipeline when align-all-parallel resume la
     harness.cleanup();
   }
 });
+
+// Issue #258: JER 35 continuation session had every sub-agent tool call
+// auto-denied by the permission classifier and returned end_turn with zero
+// artifacts. The wrapper's early-exit check correctly failed the chapter but
+// folded the failure into a generic initial_pipeline_early_exit with no signal
+// that permission denials were the real cause. After the fix, the continuation
+// call passes bypassPermissions to prevent the denial in the first place, and
+// when the runner still surfaces a permission stall the checkpoint records a
+// distinct errorKind ('initial_pipeline_permission_denied') so admin
+// diagnosis names the real cause.
+test('generatePipeline passes bypassPermissions to the initial-pipeline continuation call (#258)', async () => {
+  const harness = createHarness({
+    runClaudeImpl: async ({ options, tempDir }) => {
+      // Initial call produces partial output (ULT only), triggering the
+      // continuation attempt to finish Wave 2/3.
+      if (options.resume === 'session-jer-35') {
+        // The regression guard: the continuation MUST be invoked with
+        // bypassPermissions so a resumed session can't fall back to the
+        // classifier and auto-deny sub-agent tool calls (JER 35, #258).
+        assert.equal(options.bypassPermissions, true, 'continuation must pass bypassPermissions to avoid classifier-based auto-denies');
+        fs.mkdirSync(path.join(tempDir, 'output', 'AI-UST', 'JER'), { recursive: true });
+        fs.mkdirSync(path.join(tempDir, 'output', 'issues', 'JER'), { recursive: true });
+        fs.writeFileSync(path.join(tempDir, 'output', 'AI-UST', 'JER', 'JER-35.usfm'), '\\id JER\n\\c 35\n\\v 1 ust\n');
+        fs.writeFileSync(path.join(tempDir, 'output', 'issues', 'JER', 'JER-35.tsv'), 'jer\t35:1\tfigs-x\tsample\n');
+        return { subtype: 'success', usage: {}, total_cost_usd: 0, session_id: 'session-jer-35' };
+      }
+      fs.mkdirSync(path.join(tempDir, 'output', 'AI-ULT', 'JER'), { recursive: true });
+      fs.mkdirSync(path.join(tempDir, 'tmp', 'pipeline-JER-35'), { recursive: true });
+      fs.writeFileSync(path.join(tempDir, 'output', 'AI-ULT', 'JER', 'JER-35.usfm'), '\\id JER\n\\c 35\n\\v 1 test\n');
+      fs.writeFileSync(path.join(tempDir, 'tmp', 'pipeline-JER-35', 'wave2_structure.tsv'), 'jer\t35:1\tfigs-x\tsample\n');
+      return { subtype: 'success', usage: {}, total_cost_usd: 0, session_id: 'session-jer-35' };
+    },
+  });
+
+  try {
+    await harness.generatePipeline(
+      { _synthetic: true, _book: 'JER', _startChapter: 35, _endChapter: 35, skill: 'initial-pipeline', operations: 6 },
+      buildMessage('generate jer 35', { subject: 'JER 35' })
+    );
+    assert.equal(harness.runClaudeCalls.length, 2);
+    assert.equal(harness.runClaudeCalls[1].resume, 'session-jer-35');
+    assert.equal(harness.runClaudeCalls[1].bypassPermissions, true);
+  } finally {
+    harness.cleanup();
+  }
+});
+
+test('generatePipeline classifies permission-stalled continuation as initial_pipeline_permission_denied (#258)', async () => {
+  const harness = createHarness({
+    runClaudeImpl: async ({ options, tempDir }) => {
+      if (options.resume === 'session-jer-35') {
+        // Continuation returns success-shaped result BUT annotated
+        // permissionStallDetected — mirroring the shape claude-runner
+        // emits when the stall watchdog fires after the SDK has already
+        // returned a result message (issue #238). No artifacts are
+        // produced because every tool call was auto-denied.
+        return {
+          subtype: 'success',
+          usage: {},
+          total_cost_usd: 0,
+          session_id: 'session-jer-35',
+          permissionStallDetected: true,
+        };
+      }
+      fs.mkdirSync(path.join(tempDir, 'output', 'AI-ULT', 'JER'), { recursive: true });
+      fs.mkdirSync(path.join(tempDir, 'tmp', 'pipeline-JER-35'), { recursive: true });
+      fs.writeFileSync(path.join(tempDir, 'output', 'AI-ULT', 'JER', 'JER-35.usfm'), '\\id JER\n\\c 35\n\\v 1 test\n');
+      fs.writeFileSync(path.join(tempDir, 'tmp', 'pipeline-JER-35', 'wave2_structure.tsv'), 'jer\t35:1\tfigs-x\tsample\n');
+      return { subtype: 'success', usage: {}, total_cost_usd: 0, session_id: 'session-jer-35' };
+    },
+  });
+
+  try {
+    await harness.generatePipeline(
+      { _synthetic: true, _book: 'JER', _startChapter: 35, _endChapter: 35, skill: 'initial-pipeline', operations: 6 },
+      buildMessage('generate jer 35', { subject: 'JER 35' })
+    );
+    // The continuation ran, artifacts are still missing, and the
+    // checkpoint uses the distinct permission-denied errorKind so
+    // diagnosis names the real cause instead of the generic early exit.
+    const failure = harness.checkpoints.find((patch) => patch.current?.errorKind === 'initial_pipeline_permission_denied');
+    assert.ok(failure, 'expected initial_pipeline_permission_denied checkpoint');
+    assert.equal(failure.current.continuationPermissionStall, true);
+    assert.deepEqual(failure.current.missingOutputs.sort(), ['UST', 'issues TSV']);
+    // Generic early-exit kind must NOT be used when the stall is detected.
+    assert.equal(
+      harness.checkpoints.some((patch) => patch.current?.errorKind === 'initial_pipeline_early_exit'),
+      false,
+      'permission-stall classification must beat the generic early-exit fallback'
+    );
+    // Status text names the real cause.
+    assert.ok(
+      harness.readStatusTexts().some((text) => /blocked by auto-denied tool calls/i.test(text)),
+      'expected status text to name the permission-denial cause'
+    );
+    // Self-diagnosis payload carries the distinct errorKind.
+    assert.equal(harness.diagnosisCalls.length, 1);
+    assert.equal(harness.diagnosisCalls[0].checkpoint.current.errorKind, 'initial_pipeline_permission_denied');
+    assert.match(harness.diagnosisCalls[0].errorText, /permission-stalled|auto-denied/i);
+  } finally {
+    harness.cleanup();
+  }
+});

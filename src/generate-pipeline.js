@@ -1070,6 +1070,7 @@ async function generatePipeline(route, message) {
           ...initialPipelineStatus.observedTempArtifacts,
         ];
         let continuationErrorText = null;
+        let continuationPermissionStall = false;
         if (!resumeInitialPipelineEarlyExit && claudeResult?.session_id) {
           await status(
             `initial-pipeline returned success before final outputs for **${book} ${ch}**; ` +
@@ -1092,6 +1093,17 @@ async function generatePipeline(route, message) {
               appendSystemPrompt: INITIAL_PIPELINE_COMPLETION_GUARDRAIL,
               tools: DEFAULT_BASH_TOOLS,
               enableBash: true,
+              // Skip the 'auto'-mode safety classifier: on a resumed session the
+              // Wave-1 sub-agents' Read/Write/Skill calls were auto-denied with
+              // "STOP what you are doing and wait..." and the continuation
+              // returned end_turn with zero artifacts and no productive tool
+              // results (JER 35, 2026-07-23 — issue #258). The same pattern
+              // that align-all-parallel adopted at #195/#235/#238/#242 applies
+              // here: this is a trusted headless run with a bounded tool
+              // universe (DEFAULT_BASH_TOOLS) and Bash allow-rules registered
+              // by enableBash, so the classifier adds nothing but a denial
+              // vector. Kill switch: `fly secrets set BP_NO_BYPASS=1` reverts.
+              bypassPermissions: true,
               disableLocalSettings: true,
               timeoutMs: calcSkillTimeout(book, ch, route.operations || 6),
               onProgress: ({ turnCount, lastTool, elapsedMs, timedOut }) => {
@@ -1100,6 +1112,15 @@ async function generatePipeline(route, message) {
                 return status(`Still continuing **${book} ${ch}** (initial-pipeline) — ${elapsed}min, ${turnCount} tool calls${lastTool ? `, last: \`${lastTool}\`` : ''}${suffix}`);
               },
             });
+            // A same-session continuation that surfaces a permission stall
+            // (either subtype='permission_stall' or a success-shaped result
+            // annotated permissionStallDetected — see runClaudeOnce in
+            // claude-runner.js) is a distinct failure mode from a generic
+            // "success before final outputs" early exit: the agent was
+            // BLOCKED from writing, not merely lazy. Route it into a distinct
+            // errorKind below so diagnosis surfaces the real cause instead of
+            // an opaque "outputs missing" message.
+            continuationPermissionStall = resultIndicatesPermissionStall(continuationResult);
             if (!continuationResult || continuationResult.subtype !== 'success') {
               continuationErrorText = continuationResult
                 ? (continuationResult.error || continuationResult.result || `non-success subtype: "${continuationResult.subtype}"`)
@@ -1132,13 +1153,22 @@ async function generatePipeline(route, message) {
           const observedLabel = observedArtifacts.length > 0
             ? ` Observed artifacts: ${observedArtifacts.join(', ')}.`
             : '';
+          // A permission-stall continuation is a distinct failure: the agent
+          // was blocked from writing (auto-denied tool calls), not merely
+          // early-exiting. Surface a distinct errorKind + status text so
+          // admin diagnosis names the real cause instead of "outputs missing".
+          const errorKind = continuationPermissionStall
+            ? 'initial_pipeline_permission_denied'
+            : 'initial_pipeline_early_exit';
           console.error(
-            `[generate] initial-pipeline exited before final outputs for ${book} ${ch}; missing=${initialPipelineStatus.missing.join(', ')}; observed=${observedArtifacts.join(', ')}`
+            `[generate] initial-pipeline ${continuationPermissionStall ? 'continuation was permission-stalled' : 'exited before final outputs'} for ${book} ${ch}; missing=${initialPipelineStatus.missing.join(', ')}; observed=${observedArtifacts.join(', ')}`
           );
-          const earlyExitEvent = await status(
-            `Failed to generate **${book} ${ch}**: initial-pipeline exited before writing required outputs ` +
-            `(missing: ${initialPipelineStatus.missing.join(', ')}).${observedLabel}`
-          );
+          const statusText = continuationPermissionStall
+            ? `Failed to generate **${book} ${ch}**: initial-pipeline continuation blocked by auto-denied tool calls ` +
+              `(missing: ${initialPipelineStatus.missing.join(', ')}).${observedLabel}`
+            : `Failed to generate **${book} ${ch}**: initial-pipeline exited before writing required outputs ` +
+              `(missing: ${initialPipelineStatus.missing.join(', ')}).${observedLabel}`;
+          const earlyExitEvent = await status(statusText);
           fail++;
           setCheckpoint(checkpointRef, {
             state: 'failed',
@@ -1149,11 +1179,12 @@ async function generatePipeline(route, message) {
               chapter: ch,
               skill,
               status: 'failed',
-              errorKind: 'initial_pipeline_early_exit',
+              errorKind,
               outputStatus: 'incomplete',
               missingOutputs: initialPipelineStatus.missing,
               observedArtifacts,
               continuationError: continuationErrorText || undefined,
+              continuationPermissionStall: continuationPermissionStall || undefined,
             },
             resume: {
               chapter: ch,
@@ -1167,7 +1198,9 @@ async function generatePipeline(route, message) {
             errorText: [
               `Skill: ${skill}`,
               `Chapter: ${book} ${ch}`,
-              'Claude returned subtype=success before final required outputs existed.',
+              continuationPermissionStall
+                ? 'Continuation session was permission-stalled: sub-agent tool calls were auto-denied and no productive tool result followed. This is the "STOP what you are doing and wait" auto-denial path, not a genuine early exit.'
+                : 'Claude returned subtype=success before final required outputs existed.',
               `Missing outputs: ${initialPipelineStatus.missing.join(', ')}`,
               `Observed artifacts: ${observedArtifacts.length > 0 ? observedArtifacts.join(', ') : '(none)'}`,
               continuationErrorText ? `Continuation error: ${continuationErrorText}` : null,
