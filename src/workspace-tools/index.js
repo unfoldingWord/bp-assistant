@@ -45,9 +45,9 @@ function createWorkspaceTools(createSdkMcpServer, tool, z) {
       ),
       tool(
         'fetch_ult',
-        'Fetch published ULT (Literal Text — word-for-word, form-preserving rendering) USFM files from Door43 into data/published_ult/. Use this for the 25 v88 published books when you need the literal rendering; use fetch_ust instead for the simplified/meaning-based rendering. For non-published books use fetch_master_ult.',
+        'Fetch published ULT (Literal Text — word-for-word, form-preserving rendering) USFM files from Door43 into data/published_ult/. Use this for the v88 published books when you need the literal rendering; use fetch_ust instead for the simplified/meaning-based rendering. For non-published books use fetch_master_ult.',
         {
-          books: z.array(z.string()).optional().describe('Specific book codes (must be v88 published). Omit for all 25 v88 published books.'),
+          books: z.array(z.string()).optional().describe('Specific book codes (must be v88 published). Omit for all v88 published books.'),
           force: z.boolean().optional().describe('Force re-fetch even if cached today'),
         },
         async (args) => ({
@@ -56,9 +56,9 @@ function createWorkspaceTools(createSdkMcpServer, tool, z) {
       ),
       tool(
         'fetch_ust',
-        'Fetch published UST (Simplified Text — meaning-based, natural-English rendering) USFM files from Door43 into data/published_ust/. Use this for the 25 v88 published books when you need the simplified rendering; use fetch_ult instead for the literal/word-for-word rendering. For non-published books use fetch_master_ust.',
+        'Fetch published UST (Simplified Text — meaning-based, natural-English rendering) USFM files from Door43 into data/published_ust/. Use this for the v88 published books when you need the simplified rendering; use fetch_ult instead for the literal/word-for-word rendering. For non-published books use fetch_master_ust.',
         {
-          books: z.array(z.string()).optional().describe('Specific book codes (must be v88 published). Omit for all 25 v88 published books.'),
+          books: z.array(z.string()).optional().describe('Specific book codes (must be v88 published). Omit for all v88 published books.'),
           force: z.boolean().optional().describe('Force re-fetch even if cached today'),
         },
         async (args) => ({
@@ -338,18 +338,18 @@ function createWorkspaceTools(createSdkMcpServer, tool, z) {
       tool('build_strongs_index', "Build Strong's concordance index from aligned ULT USFM. Use this (not build_ust_index) for ULT/Hebrew word-lookup by Strong's number.", {
         force: z.boolean().optional().describe('Rebuild even if the cached index was already built today'),
         lookup: z.string().optional().describe("Strong's number to look up"),
-        stats: z.boolean().optional().describe('Return index build metadata (built date, file/alignment/Strong\'s counts) instead of rebuilding'),
+        stats: z.boolean().optional().describe('Return index build metadata (built date, file/alignment/Strong\'s counts) from the existing cache; if no cache exists yet the index is built first'),
       }, async (args) => ({ content: [{ type: 'text', text: await buildStrongsIndex(args) }] })),
       tool('build_tn_index', 'Build translation notes index from published TN TSV files', {
         force: z.boolean().optional().describe('Rebuild even if the cached index was already built today'),
         lookup: z.string().optional().describe('Keyword to search'),
         issue: z.string().optional().describe('Issue type to query'),
-        stats: z.boolean().optional().describe('Return index build metadata (built date, file/note/issue/keyword counts) instead of rebuilding'),
+        stats: z.boolean().optional().describe('Return index build metadata (built date, file/note/issue/keyword counts) from the existing cache; if no cache exists yet the index is built first'),
       }, async (args) => ({ content: [{ type: 'text', text: await buildTnIndex(args) }] })),
       tool('build_ust_index', 'Build UST concordance index from aligned UST USFM. Use this (not build_strongs_index) for UST word-lookup by Strong\'s number.', {
         force: z.boolean().optional().describe('Rebuild even if the cached index was already built today'),
         lookup: z.string().optional().describe("Strong's number to look up"),
-        stats: z.boolean().optional().describe('Return index build metadata (built date, file/alignment/Strong\'s counts) instead of rebuilding'),
+        stats: z.boolean().optional().describe('Return index build metadata (built date, file/alignment/Strong\'s counts) from the existing cache; if no cache exists yet the index is built first'),
       }, async (args) => ({ content: [{ type: 'text', text: await buildUstIndex(args) }] })),
 
       // --- Issue identification ---
@@ -476,8 +476,8 @@ function createWorkspaceTools(createSdkMcpServer, tool, z) {
       }, async (args) => ({ content: [{ type: 'text', text: prepareCompare(args) }] })),
       tool('prepare_tq', 'Prepare translation questions data for a book/chapter', {
         book: z.string().describe('Book code'),
-        chapter: z.number().int().optional().describe('Chapter number to scope the prepared data to. Omit (or set wholeBook) for all chapters.'),
-        wholeBook: z.boolean().optional().describe('Prepare all chapters in the book instead of a single chapter'),
+        chapter: z.number().int().optional().describe('Chapter number to scope the prepared data to. Omit for all chapters (whole book).'),
+        wholeBook: z.boolean().optional().describe('Accepted for backward compatibility but not read: whole-book scope is selected by omitting chapter'),
         tqRepo: z.string().optional().describe('Directory containing published TQ TSVs (default: data/published-tqs)'),
         ultPath: z.string().optional().describe('Override ULT USFM path relative to workspace instead of fetching current Door43 master'),
         ustPath: z.string().optional().describe('Override UST USFM path relative to workspace instead of fetching current Door43 master'),
