@@ -152,6 +152,43 @@ const SUBAGENT_TOOL_ALLOWLIST = new Set([
   'NotebookEdit', 'WebFetch', 'WebSearch',
 ]);
 
+// Sub-agent denial-fallback instruction (issue #249). Task/Agent sub-agents run
+// under their own SDK query and do NOT inherit the parent's `bypassPermissions`,
+// `canUseTool`, or PreToolUse hooks — their tool calls fall to the SDK's
+// 'auto'-mode safety classifier, which auto-denies out-of-allowlist calls with a
+// canned text ending "STOP what you are doing and wait for the user...". A
+// sub-agent that obeys that literally halts, and a whole align fan-out banks no
+// JSON (NUM 34, 2026-07-22; EZK 16, 2026-07-21). The parent has no way to
+// reconfigure a sub-agent's permission stack after spawn, but it CAN prepend an
+// instruction to the sub-agent's PROMPT via a PreToolUse hook on Task/Agent —
+// telling the sub-agent up front to switch to an allowed equivalent (workspace-
+// tools MCP call, workspace-tools-cli.js wrapper, Read/Glob/Grep, etc.) instead
+// of stopping. The marker keeps re-invocations (nested Task chains) idempotent.
+const SUBAGENT_DENIAL_FALLBACK_MARKER = '[bp-denial-fallback-v1]';
+const SUBAGENT_DENIAL_FALLBACK_INSTRUCTION = [
+  `PERMISSION-DENIAL FALLBACK ${SUBAGENT_DENIAL_FALLBACK_MARKER}:`,
+  'This is a headless, unattended run. If any tool call is auto-denied with text such as',
+  '"The user doesn\'t want to take this action right now. STOP what you are doing and wait',
+  'for the user..." — DO NOT stop and DO NOT wait. There is no interactive user to consult.',
+  'Instead, immediately switch to an allowed equivalent and continue the task.',
+  'Allowed equivalents (in order of preference):',
+  '  1. mcp__workspace-tools__<tool> MCP calls (in-process, fastest);',
+  "  2. node /app/src/workspace-tools-cli.js <tool> '<json-args>' (heredoc stdin form for large payloads);",
+  '  3. Read / Write / Edit / Glob / Grep for file operations;',
+  '  4. simple bounded Bash: grep, head, tail, wc, ls, cat (no pipes, redirection, or compound commands).',
+  'If none of the allowed equivalents fit, report the specific tool + input you tried in your',
+  'result text and continue with any remaining work — never sit idle waiting.',
+].join(' ');
+
+// Prepend the denial-fallback instruction to a Task/Agent sub-agent prompt.
+// Idempotent (marker-guarded) and no-op when the sub-agent's prompt already
+// includes the instruction (e.g. nested Task spawns). Pure so it is unit-testable.
+function injectSubagentDenialFallback(prompt) {
+  const p = typeof prompt === 'string' ? prompt : '';
+  if (p.includes(SUBAGENT_DENIAL_FALLBACK_MARKER)) return p;
+  return `${SUBAGENT_DENIAL_FALLBACK_INSTRUCTION}\n\n${p}`;
+}
+
 // Bash policy mirroring BASH_ALLOW_RULES (kept in sync by the test suite):
 // blessed executables by path prefix, plus bounded read-only inspection
 // commands. Command chaining/substitution is refused outright — the same
@@ -336,33 +373,70 @@ function buildOptions({
   if (hooks) {
     options.hooks = hooks;
   }
-  // Difficulty-based model control for sub-agents. Skills spawn Task/Agent workers
-  // with a difficulty tier (low/medium/high) or alias; this hook resolves that to a
-  // concrete model and applies any per-run override (BP_FORCE_MODEL / BP_MODEL_*)
-  // before the sub-agent runs — the missing link that makes a run-level model force
-  // reach orchestrator-spawned workers, not just the top-level query. It only mutates
-  // input (no permissionDecision), so it composes with the guard hooks above; it is a
-  // no-op when the spawn's model is already concrete and no override is set.
+  // Sub-agent PreToolUse matcher. Fires when the parent's assistant calls
+  // Task/Agent (the only choke point available before a sub-agent spawns — its
+  // internal tool calls do NOT trigger the parent's hooks). Does two things:
+  //
+  // 1. Difficulty-based model control (existing, #~100+): skills spawn workers
+  //    with a difficulty tier (low/medium/high) or alias; resolve to a concrete
+  //    model + apply any per-run override (BP_FORCE_MODEL / BP_MODEL_*) — the
+  //    missing link that reaches orchestrator-spawned workers, not just the
+  //    top-level query.
+  //
+  // 2. Denial-fallback prompt injection (issue #249): sub-agents don't inherit
+  //    the parent's bypassPermissions / canUseTool / hooks, so their tool calls
+  //    fall to the SDK's 'auto'-mode classifier and get auto-denied with a
+  //    canned "STOP what you are doing and wait" text they obey literally (NUM
+  //    34, 2026-07-22; EZK 16, 2026-07-21 — issue #235). Prepend an instruction
+  //    to the sub-agent's prompt telling it to switch to an allowed equivalent
+  //    (workspace-tools MCP / workspace-tools-cli.js / Read+Glob+Grep) and
+  //    continue instead of stopping. Marker-guarded so nested spawns are idempotent.
+  //    Kill switch: `BP_DISABLE_SUBAGENT_DENIAL_FALLBACK=1` reverts to prior
+  //    (no-injection) behavior without a code change.
+  //
+  // Only mutates input (no permissionDecision), so it composes with the guard
+  // hooks above. When neither model, effort, nor prompt need changing, the hook
+  // is a no-op.
   const modelResolverMatcher = {
     hooks: [async (input) => {
       try {
         const tool = input && input.tool_name;
         if (tool !== 'Task' && tool !== 'Agent') return {};
         const ti = input.tool_input;
-        if (!ti || typeof ti !== 'object' || typeof ti.model !== 'string') return {};
-        const resolved = resolveDifficultyModel('claude', ti.model);
-        const tierEffort = resolveDifficultyEffort(ti.model); // set effort only when spawn used a tier and caller didn't specify one
-        const modelChanged = resolved && resolved !== ti.model;
-        const effortChanged = tierEffort && ti.effort == null && ti.effort !== tierEffort;
-        if (!modelChanged && !effortChanged) return {};
-        const updatedInput = { ...ti };
-        if (modelChanged) updatedInput.model = resolved;
-        if (effortChanged) updatedInput.effort = tierEffort;
-        // Auditable: makes a per-run force/override + difficulty->effort observable in run logs.
-        console.log(`[model-select] ${tool} sub-agent ${ti.model}${modelChanged ? ` model->${resolved}` : ''}${effortChanged ? ` effort->${tierEffort}` : ''}${process.env.BP_FORCE_MODEL ? ' (forced)' : ''}`);
+        if (!ti || typeof ti !== 'object') return {};
+
+        let updatedInput = null;
+        const logParts = [];
+
+        // (1) Model / effort resolution.
+        if (typeof ti.model === 'string') {
+          const resolved = resolveDifficultyModel('claude', ti.model);
+          const tierEffort = resolveDifficultyEffort(ti.model);
+          const modelChanged = resolved && resolved !== ti.model;
+          const effortChanged = tierEffort && ti.effort == null && ti.effort !== tierEffort;
+          if (modelChanged || effortChanged) {
+            updatedInput = updatedInput || { ...ti };
+            if (modelChanged) { updatedInput.model = resolved; logParts.push(`model->${resolved}`); }
+            if (effortChanged) { updatedInput.effort = tierEffort; logParts.push(`effort->${tierEffort}`); }
+          }
+        }
+
+        // (2) Denial-fallback prompt injection (issue #249). Only mutate a
+        // string prompt; skip if the marker is already present (nested spawns).
+        if (process.env.BP_DISABLE_SUBAGENT_DENIAL_FALLBACK !== '1'
+          && typeof ti.prompt === 'string'
+          && !ti.prompt.includes(SUBAGENT_DENIAL_FALLBACK_MARKER)) {
+          updatedInput = updatedInput || { ...ti };
+          updatedInput.prompt = injectSubagentDenialFallback(ti.prompt);
+          logParts.push('prompt+=denial-fallback');
+        }
+
+        if (!updatedInput) return {};
+        // Auditable: run-level force/override, difficulty->effort, and denial-fallback all observable in logs.
+        console.log(`[sub-agent] ${tool} spawn ${ti.model || '<no-model>'} ${logParts.join(' ')}${process.env.BP_FORCE_MODEL ? ' (forced)' : ''}`);
         return { hookSpecificOutput: { hookEventName: 'PreToolUse', updatedInput } };
       } catch (err) {
-        console.warn(`[claude-runner] model-resolver hook error: ${err.message}`);
+        console.warn(`[claude-runner] sub-agent pre-tool-use hook error: ${err.message}`);
         return {};
       }
     }],
@@ -1131,4 +1205,7 @@ module.exports = {
   SUBAGENT_TOOL_ALLOWLIST,
   BASH_EXEC_PREFIXES,
   BASH_READONLY_CMDS,
+  injectSubagentDenialFallback,
+  SUBAGENT_DENIAL_FALLBACK_MARKER,
+  SUBAGENT_DENIAL_FALLBACK_INSTRUCTION,
 };

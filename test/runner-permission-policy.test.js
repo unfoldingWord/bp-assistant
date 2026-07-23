@@ -20,6 +20,8 @@ const {
   BASH_READONLY_CMDS,
   SUBAGENT_TOOL_ALLOWLIST,
   DEFAULT_BASH_TOOLS,
+  injectSubagentDenialFallback,
+  SUBAGENT_DENIAL_FALLBACK_MARKER,
 } = require('../src/claude-runner');
 
 test('core file/orchestration tools are allowed', () => {
@@ -169,4 +171,80 @@ test('the canUseTool fallback resolves like the policy (allow Read, deny compoun
   assert.equal(allow.behavior, 'allow');
   const deny = await o.canUseTool('Bash', { command: 'ls a && echo b' });
   assert.equal(deny.behavior, 'deny');
+});
+
+// --- Sub-agent denial-fallback injection (issue #249) ---
+
+test('injectSubagentDenialFallback prepends the STOP-and-wait fallback instruction', () => {
+  const original = 'Align verses 1-14 of NUM 34.';
+  const injected = injectSubagentDenialFallback(original);
+  assert.ok(injected.includes(SUBAGENT_DENIAL_FALLBACK_MARKER), 'marker present');
+  assert.ok(injected.includes('DO NOT stop'), 'tells sub-agent not to stop');
+  assert.ok(injected.includes('mcp__workspace-tools__'), 'names workspace-tools MCP fallback');
+  assert.ok(injected.includes('workspace-tools-cli.js'), 'names CLI wrapper fallback');
+  assert.ok(injected.endsWith(original), 'original prompt is preserved at the end');
+});
+
+test('injectSubagentDenialFallback is idempotent (does not re-inject when marker present)', () => {
+  const original = 'Align verses 15-29 of NUM 34.';
+  const once = injectSubagentDenialFallback(original);
+  const twice = injectSubagentDenialFallback(once);
+  assert.equal(once, twice, 'second injection is a no-op');
+  const markerCount = twice.split(SUBAGENT_DENIAL_FALLBACK_MARKER).length - 1;
+  assert.equal(markerCount, 1, 'exactly one marker after double-inject');
+});
+
+test('injectSubagentDenialFallback handles empty / non-string prompts safely', () => {
+  const emptyInjected = injectSubagentDenialFallback('');
+  assert.ok(emptyInjected.includes(SUBAGENT_DENIAL_FALLBACK_MARKER));
+  const nullInjected = injectSubagentDenialFallback(null);
+  assert.ok(nullInjected.includes(SUBAGENT_DENIAL_FALLBACK_MARKER));
+});
+
+test('buildOptions wires a PreToolUse hook that injects the denial-fallback into Task spawns', async () => {
+  const o = buildOptions({});
+  const matcher = o.hooks.PreToolUse[o.hooks.PreToolUse.length - 1];
+  const hook = matcher.hooks[0];
+  const out = await hook({ tool_name: 'Task', tool_input: { prompt: 'do the thing', model: 'sonnet' } });
+  assert.ok(out.hookSpecificOutput, 'hook returns an update');
+  assert.ok(
+    out.hookSpecificOutput.updatedInput.prompt.includes(SUBAGENT_DENIAL_FALLBACK_MARKER),
+    'sub-agent prompt is prefixed with the denial-fallback marker'
+  );
+  assert.ok(
+    out.hookSpecificOutput.updatedInput.prompt.endsWith('do the thing'),
+    'original prompt content is preserved'
+  );
+});
+
+test('buildOptions PreToolUse hook is a no-op for non-Task tool calls', async () => {
+  const o = buildOptions({});
+  const matcher = o.hooks.PreToolUse[o.hooks.PreToolUse.length - 1];
+  const hook = matcher.hooks[0];
+  const out = await hook({ tool_name: 'Read', tool_input: { file_path: '/x' } });
+  assert.deepEqual(out, {}, 'no update for non-Task/Agent tool calls');
+});
+
+test('buildOptions PreToolUse hook skips injection when kill-switch is set', async () => {
+  process.env.BP_DISABLE_SUBAGENT_DENIAL_FALLBACK = '1';
+  try {
+    const o = buildOptions({});
+    const matcher = o.hooks.PreToolUse[o.hooks.PreToolUse.length - 1];
+    const hook = matcher.hooks[0];
+    // prompt is present but must NOT be mutated when the kill-switch is on.
+    // (Model resolution can still fire if a difficulty tier was used.)
+    const out = await hook({ tool_name: 'Task', tool_input: { prompt: 'do the thing' } });
+    assert.deepEqual(out, {}, 'kill switch prevents denial-fallback injection');
+  } finally {
+    delete process.env.BP_DISABLE_SUBAGENT_DENIAL_FALLBACK;
+  }
+});
+
+test('buildOptions PreToolUse hook does not double-inject on nested Task spawns', async () => {
+  const o = buildOptions({});
+  const matcher = o.hooks.PreToolUse[o.hooks.PreToolUse.length - 1];
+  const hook = matcher.hooks[0];
+  const alreadyInjected = injectSubagentDenialFallback('nested work');
+  const out = await hook({ tool_name: 'Task', tool_input: { prompt: alreadyInjected } });
+  assert.deepEqual(out, {}, 'already-injected prompts are left alone');
 });
