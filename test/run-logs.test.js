@@ -325,14 +325,21 @@ test('close still settles when the log stream failed to open', async () => {
     };
   });
 
+  // Every wait here has a ceiling: a test written to prove the suite cannot hang
+  // must not be able to hang it either. `unref` so the loser of the race can
+  // never hold the process open after the assertion is already decided.
+  const bounded = (promise, onTimeout) => Promise.race([
+    promise,
+    new Promise((resolve) => setTimeout(() => resolve(onTimeout), 2000).unref()),
+  ]);
+
   try {
     const log = createRunLog({ queryId: 'q-eisdir', label: 'x', cwd: '/data/workspace' });
     assert.ok(log.enabled, 'the handle opens — the stream fails asynchronously');
-    await errored;
-    const outcome = await Promise.race([
-      log.close({ subtype: 'threw' }).then(() => 'settled'),
-      new Promise((resolve) => setTimeout(() => resolve('hung'), 2000)),
-    ]);
+    // If the error report never arrives, fall through rather than wait forever:
+    // close() is still exercised, just possibly before the stream died.
+    await bounded(errored, null);
+    const outcome = await bounded(log.close({ subtype: 'threw' }).then(() => 'settled'), 'hung');
     assert.equal(outcome, 'settled', 'close() must settle even on a dead stream');
   } finally {
     console.warn = warn;
