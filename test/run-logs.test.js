@@ -315,6 +315,35 @@ test('redaction applies to free-text passed straight to event()', async () => {
   }
 });
 
+// Redaction runs on raw values, before JSON escaping. Both halves matter: a
+// secret containing a quote or newline is unrecognizable in its escaped form,
+// and scrubbing the escaped form can eat the backslash and leave a bare quote
+// that makes the line unparseable.
+test('event() redacts secrets containing JSON-escapable characters, and stays parseable', async () => {
+  process.env.BP_TEST_FAKE_TOKEN3 = 'quo"tedsecret12345';
+  process.env.BP_TEST_FAKE_KEY3 = 'lineone12345\nlinetwo12345';
+  try {
+    const log = createRunLog({ queryId: 'q-escape', label: 'x', cwd: '/data/workspace' });
+    log.event('end', {
+      error: 'failed with quo"tedsecret12345 and lineone12345\nlinetwo12345',
+      note: 'MY_TOKEN=abcdefgh\\"more text" tail',
+    });
+    log.close();
+    await flush();
+
+    const raw = fs.readFileSync(log.file, 'utf8');
+    assert.ok(!raw.includes('quo\\"tedsecret12345'), 'quote-bearing secret never reaches disk');
+    assert.ok(!raw.includes('lineone12345'), 'newline-bearing secret never reaches disk');
+    assert.match(raw, /\[redacted:BP_TEST_FAKE_TOKEN3\]/);
+    assert.match(raw, /\[redacted:BP_TEST_FAKE_KEY3\]/);
+    // readEvents JSON.parses every line — proves redaction did not corrupt them.
+    assert.ok(readEvents(log.file).some((e) => e.type === 'end'), 'lines remain valid JSON');
+  } finally {
+    delete process.env.BP_TEST_FAKE_TOKEN3;
+    delete process.env.BP_TEST_FAKE_KEY3;
+  }
+});
+
 test('close is idempotent — a second close writes no second end event', async () => {
   const log = createRunLog({ queryId: 'q-close', label: 'x', cwd: '/data/workspace' });
   log.close({ subtype: 'success' });
