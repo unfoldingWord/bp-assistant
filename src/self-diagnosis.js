@@ -317,7 +317,7 @@ async function runDiagnosisAgent({ contextSummary, runClaudeImpl }) {
     label: 'self-diagnosis',
     cwd: process.cwd(),
     model: 'sonnet',
-    allowedTools: ['Read', 'Grep'],
+    allowedTools: ['Read', 'Grep', 'Glob'],
     // Explicitly deny Bash so a stray shell attempt is rejected fast instead of
     // burning turns against the time budget (observed timeouts had lastTool=Bash).
     disallowedTools: ['Bash'],
@@ -329,10 +329,13 @@ async function runDiagnosisAgent({ contextSummary, runClaudeImpl }) {
     guardrails: { maxToolCalls: 40, tokenBudget: 200000 },
     // Declarative defense-in-depth (opt-in, BP_GUARD_HOOKS=1): the diagnosis
     // sub-agent is read-only, so a PreToolUse guard denies anything outside
-    // Read/Grep and publishes any anomalous attempt to admin-status. Default
+    // the read-only trio (Read/Grep/Glob) and publishes any anomalous attempt
+    // to admin-status. Glob is included because the agent routinely globs to
+    // locate output/log files while diagnosing a failure; omitting it made the
+    // guard block Glob mid-diagnosis and degraded the investigation. Default
     // OFF so options stay byte-identical until the hook layer is validated.
     hooks: process.env.BP_GUARD_HOOKS === '1'
-      ? createGuardHooks({ allowedTools: ['Read', 'Grep'], pipelineType: 'system', publish: true })
+      ? createGuardHooks({ allowedTools: ['Read', 'Grep', 'Glob'], pipelineType: 'system', publish: true })
       : undefined,
   });
   return {
