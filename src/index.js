@@ -100,7 +100,9 @@ function startRunLogPruning() {
       console.warn(`[run-logs] prune failed: ${err.message}`);
     }
   };
-  prune();
+  // Off the boot path: prune walks up to 30 day-directories with sync fs calls,
+  // and `flyctl deploy --strategy immediate` wants the bot answering quickly.
+  setImmediate(prune);
   const timer = setInterval(prune, 24 * 60 * 60 * 1000);
   if (timer.unref) timer.unref();
 }

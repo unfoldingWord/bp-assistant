@@ -146,6 +146,12 @@ function buildEvidenceSection(evidence) {
   lines.push('- Read these before reasoning from timings alone. In the run log, '
     + '`"type":"tool_use"` lines carry the full tool input and `"denied":true` marks '
     + 'an auto-denied call — a run of those means a permission lockout, not a model flake.');
+  // The issue body this agent produces is posted to a PUBLIC repo. Run logs are
+  // scrubbed on write (see redact() in src/run-logs.js), but the SDK transcripts
+  // are written by the CLI and are not — so bound what may be quoted from them.
+  lines.push('- The issue you write is PUBLIC. Summarize from these files — report tool '
+    + 'names, counts, timings and denial patterns. Do not paste raw file contents, '
+    + 'environment values, headers, or any token/key/password-shaped string into the issue body.');
   lines.push('');
   return lines;
 }

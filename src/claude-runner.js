@@ -691,6 +691,26 @@ async function runClaudeOnce({
 
   let result = null;
 
+  // Close the run log exactly once, whatever the exit path. Defined before the
+  // try because three paths LEAVE this function by throwing — the two guardrail
+  // stops and the catch block's re-throw of a non-abort error — and a run log
+  // abandoned mid-write leaks its file descriptor for the life of the process.
+  // Those are also precisely the failures whose evidence is most worth keeping.
+  let runLogClosed = false;
+  const closeRunLog = (summary) => {
+    if (runLogClosed) return;
+    runLogClosed = true;
+    try {
+      runLog.close({
+        turnCount,
+        lastTool,
+        elapsedMs: Date.now() - queryStart,
+        totalPermissionDenials: errorState.totalPermissionDenials,
+        ...summary,
+      });
+    } catch (_) { /* logging must never break a run */ }
+  };
+
   try {
     for await (const message of conversation) {
       if (message.type === 'assistant' && message.message?.content) {
@@ -799,6 +819,7 @@ async function runClaudeOnce({
           recordRateLimit({ windowUsed: room.used, source: 'claude-runner-error' });
         } catch { /* non-fatal */ }
       }
+      closeRunLog({ subtype: 'threw', error: err && err.message });
       throw err;
     }
   } finally {
@@ -813,15 +834,7 @@ async function runClaudeOnce({
   // failure so triage starts from the transcript instead of guessing at timing.
   const finish = (outcome) => {
     const paths = runLog.paths();
-    try {
-      runLog.close({
-        subtype: outcome && outcome.subtype,
-        turnCount,
-        lastTool,
-        elapsedMs: Date.now() - queryStart,
-        totalPermissionDenials: errorState.totalPermissionDenials,
-      });
-    } catch (_) { /* logging must never break a run */ }
+    closeRunLog({ subtype: outcome && outcome.subtype });
     if (outcome && typeof outcome === 'object') {
       outcome.runLogPath = paths.runLog;
       outcome.transcriptPath = paths.transcript;

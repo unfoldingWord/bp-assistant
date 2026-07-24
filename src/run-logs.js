@@ -49,12 +49,87 @@ const MAX_TEXT = 8 * 1024;
 const MAX_TOOL_INPUT = 8 * 1024;
 const MAX_TOOL_RESULT = 4 * 1024;
 
+// --- redaction ---------------------------------------------------------------
+// Run logs persist tool inputs and agent text to disk for 30 days, and the
+// self-diagnosis agent is pointed at them when drafting a PUBLIC GitHub issue.
+// Pipelines run with `enableBash: true`, so an agent that shells out (or reads
+// an env dump) could surface credential material in a tool result. Previously
+// that was ephemeral, console-only and truncated at 150 chars; persisting it
+// creates a real path from "secret appears in agent output" to "secret quoted
+// into a public issue". Scrub on the way to disk, so nothing downstream — issue
+// bodies included — can leak what was never written.
+//
+// Two layers: exact values of secret-ish env vars (precise, catches anything
+// this process actually holds), then shape-based patterns (catches secrets that
+// never passed through our env, e.g. one printed by a remote command).
+
+const SECRET_ENV_RE = /(TOKEN|KEY|SECRET|PASSWORD|PASSWD|CREDENTIAL|API_KEY)/i;
+const MIN_SECRET_LEN = 8;
+
+// Cached, but invalidated on a signature of the secret-named keys and their
+// value lengths — NOT on the env key count, which is unchanged by a set
+// followed by a delete and would serve a stale (unredacting) list. Ordinary env
+// churn on non-secret names never triggers a rebuild. Scanning the key names is
+// cheap next to the file write this feeds.
+let _secretCache = { sig: null, entries: [] };
+
+function secretEnvValues() {
+  const names = [];
+  for (const name of Object.keys(process.env)) {
+    if (SECRET_ENV_RE.test(name)) names.push(name);
+  }
+  names.sort();
+  const sig = names.map((n) => `${n}:${(process.env[n] || '').length}`).join('|');
+  if (_secretCache.sig === sig) return _secretCache.entries;
+
+  const entries = [];
+  for (const name of names) {
+    const value = process.env[name];
+    if (typeof value !== 'string' || value.length < MIN_SECRET_LEN) continue;
+    // Skip values that are obviously not credentials (flags the config
+    // legitimately logs) so we don't redact harmless text.
+    if (/^(0|1|true|false)$/i.test(value)) continue;
+    entries.push([value, `[redacted:${name}]`]);
+  }
+  // Longest first so an overlapping shorter value can't partially mask a longer one.
+  entries.sort((a, b) => b[0].length - a[0].length);
+  _secretCache = { sig, entries };
+  return entries;
+}
+
+const SECRET_PATTERNS = [
+  [/sk-ant-[A-Za-z0-9_-]{16,}/g, '[redacted:anthropic-key]'],
+  [/sk-[A-Za-z0-9]{32,}/g, '[redacted:api-key]'],
+  [/gh[pousr]_[A-Za-z0-9]{16,}/g, '[redacted:github-token]'],
+  [/github_pat_[A-Za-z0-9_]{20,}/g, '[redacted:github-pat]'],
+  [/xai-[A-Za-z0-9]{16,}/g, '[redacted:xai-key]'],
+  [/AIza[A-Za-z0-9_-]{20,}/g, '[redacted:google-key]'],
+  [/\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}/g, '[redacted:jwt]'],
+  [/\b(?:Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{16,}/gi, '[redacted:auth-header]'],
+  // KEY=value / "token": "value" style assignments of credential-named fields.
+  [/\b([A-Za-z_][A-Za-z0-9_]*(?:TOKEN|KEY|SECRET|PASSWORD|CREDENTIAL))\b(\s*[:=]\s*"?)([^\s"',;]{8,})/gi,
+    (_m, name, sep) => `${name}${sep}[redacted]`],
+];
+
+function redact(text) {
+  if (typeof text !== 'string' || !text) return text;
+  let out = text;
+  for (const [value, replacement] of secretEnvValues()) {
+    if (out.includes(value)) out = out.split(value).join(replacement);
+  }
+  for (const [re, replacement] of SECRET_PATTERNS) {
+    out = out.replace(re, replacement);
+  }
+  return out;
+}
+
 function truncate(value, max) {
   if (value == null) return value;
   const s = typeof value === 'string' ? value : JSON.stringify(value);
   if (typeof s !== 'string') return s;
-  if (s.length <= max) return s;
-  return `${s.slice(0, max)}…[+${s.length - max} chars]`;
+  const scrubbed = redact(s);
+  if (scrubbed.length <= max) return scrubbed;
+  return `${scrubbed.slice(0, max)}…[+${scrubbed.length - max} chars]`;
 }
 
 // The Claude CLI stores transcripts under
@@ -260,8 +335,14 @@ function pruneRunLogs({ dir = RUN_LOG_DIR, maxAgeDays = MAX_AGE_DAYS, maxTotalBy
 
   const sizes = new Map(keep.map((day) => [day, sizeOf(day)]));
   let total = [...sizes.values()].reduce((a, b) => a + b, 0);
+  // Never evict the current day: a query in flight holds an open stream into it,
+  // and on Linux the unlinked file keeps receiving writes while becoming
+  // invisible to triage — silently defeating the durability this module exists
+  // for. Better to sit over the byte bound for a day than to lose live evidence.
+  const today = new Date().toISOString().slice(0, 10);
   for (const day of keep) {
     if (total <= maxTotalBytes) break;
+    if (day === today) continue;
     try {
       fs.rmSync(path.join(dir, day), { recursive: true, force: true });
       total -= sizes.get(day) || 0;

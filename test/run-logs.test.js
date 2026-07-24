@@ -212,6 +212,99 @@ test('pruneRunLogs is a no-op on a missing directory', () => {
   assert.doesNotThrow(() => pruneRunLogs({ dir: path.join(tmpRoot, 'does-not-exist') }));
 });
 
+test('pruneRunLogs never evicts the current day, even over the byte bound', () => {
+  const dir = path.join(tmpRoot, 'prune-today');
+  const today = new Date().toISOString().slice(0, 10);
+  const older = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+  for (const day of [older, today]) {
+    fs.mkdirSync(path.join(dir, day), { recursive: true });
+    fs.writeFileSync(path.join(dir, day, 'run.jsonl'), 'z'.repeat(1000));
+  }
+  // Bound below a single day's size: without the guard both days would go.
+  const { removed } = pruneRunLogs({ dir, maxAgeDays: 3650, maxTotalBytes: 10 });
+  assert.ok(!removed.includes(today), 'current day is never evicted');
+  assert.ok(fs.existsSync(path.join(dir, today)), 'a live run keeps its log file');
+  assert.deepEqual(removed, [older]);
+});
+
+// --- redaction --------------------------------------------------------------
+// Run logs are durable and the self-diagnosis agent reads them while drafting a
+// PUBLIC issue, so anything credential-shaped must never reach disk.
+
+test('redacts exact values of secret-named env vars', () => {
+  process.env.BP_TEST_FAKE_TOKEN = 'supersecretvalue12345';
+  try {
+    const out = truncate('pushing with token supersecretvalue12345 to door43', 10000);
+    assert.ok(!out.includes('supersecretvalue12345'), 'raw secret is gone');
+    assert.match(out, /\[redacted:BP_TEST_FAKE_TOKEN\]/);
+  } finally {
+    delete process.env.BP_TEST_FAKE_TOKEN;
+  }
+});
+
+test('redacts credential shapes that never passed through our env', () => {
+  const cases = [
+    ['sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAA', /\[redacted:anthropic-key\]/],
+    ['ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAA', /\[redacted:github-token\]/],
+    ['github_pat_AAAAAAAAAAAAAAAAAAAAAAAAAA', /\[redacted:github-pat\]/],
+    ['xai-AAAAAAAAAAAAAAAAAAAA', /\[redacted:xai-key\]/],
+    ['AIzaAAAAAAAAAAAAAAAAAAAAAAAAAA', /\[redacted:google-key\]/],
+    ['Authorization: Bearer abcdefghijklmnopqrstuvwxyz', /\[redacted:auth-header\]/],
+  ];
+  for (const [raw, expected] of cases) {
+    const out = truncate(`value is ${raw} end`, 10000);
+    assert.match(out, expected, `redacted: ${raw.slice(0, 12)}`);
+    assert.ok(!out.includes(raw), `raw value absent: ${raw.slice(0, 12)}`);
+  }
+});
+
+test('redacts KEY=value assignments of credential-named fields', () => {
+  const out = truncate('env dump: DOOR43_TOKEN=abcdef1234567890 PATH=/usr/bin', 10000);
+  assert.ok(!out.includes('abcdef1234567890'), 'assigned secret is gone');
+  assert.match(out, /DOOR43_TOKEN=\[redacted\]/);
+  assert.match(out, /PATH=\/usr\/bin/, 'non-credential values are untouched');
+});
+
+test('redaction runs before truncation so a secret cannot survive at the boundary', () => {
+  process.env.BP_TEST_FAKE_KEY = 'zzzzzzzzzzzzzzzzzzzz';
+  try {
+    const out = truncate(`${'a'.repeat(20)}zzzzzzzzzzzzzzzzzzzz${'b'.repeat(200)}`, 60);
+    assert.ok(!out.includes('zzzzzzzzzzzzzzzzzzzz'), 'secret not left in the kept prefix');
+  } finally {
+    delete process.env.BP_TEST_FAKE_KEY;
+  }
+});
+
+test('redaction applies to recorded tool inputs, not just free text', async () => {
+  process.env.BP_TEST_FAKE_SECRET = 'hunter2hunter2hunter2';
+  try {
+    const log = createRunLog({ queryId: 'q-redact', label: 'x', cwd: '/data/workspace' });
+    recordAssistantMessage(log, {
+      type: 'assistant',
+      message: {
+        content: [{ type: 'tool_use', name: 'Bash', id: 't1', input: { command: 'curl -H "x: hunter2hunter2hunter2"' } }],
+      },
+    });
+    recordUserMessage(log, 'result contains hunter2hunter2hunter2 too');
+    log.close();
+    await flush();
+
+    const raw = fs.readFileSync(log.file, 'utf8');
+    assert.ok(!raw.includes('hunter2hunter2hunter2'), 'secret never reaches disk');
+    assert.match(raw, /\[redacted:BP_TEST_FAKE_SECRET\]/);
+  } finally {
+    delete process.env.BP_TEST_FAKE_SECRET;
+  }
+});
+
+test('close is idempotent — a second close writes no second end event', async () => {
+  const log = createRunLog({ queryId: 'q-close', label: 'x', cwd: '/data/workspace' });
+  log.close({ subtype: 'success' });
+  log.close({ subtype: 'threw' });
+  await flush();
+  assert.equal(readEvents(log.file).filter((e) => e.type === 'end').length, 1);
+});
+
 test.after(() => {
   try { fs.rmSync(tmpRoot, { recursive: true, force: true }); } catch { /* best effort */ }
 });
