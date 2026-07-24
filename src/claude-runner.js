@@ -333,34 +333,46 @@ function buildOptions({
   // runs to classifier-mediated 'auto' on the next restart. Non-bypass runs
   // register decideToolPermission as canUseTool — a pure, never-prompting
   // fallback decider for calls the rule layer routes to a custom handler.
+  // A permission callback is now registered in BOTH branches (issue #271, EZK 19) —
+  // but a DIFFERENT one, because the two kinds of run want opposite things.
+  //
+  // Why any callback is needed on bypass runs: `permissionMode` is per-agent (see the
+  // SDK's AgentDefinition.permissionMode), so setting it here bypasses the classifier
+  // for the TOP-LEVEL query only. Spawned Task/Agent children carry their own mode and
+  // fall back to the load-degraded 'auto' classifier documented above, which
+  // mass-denies even allowlisted tools under an opus fan-out (#195/#235/#238/#242).
+  // EZK 19 is the clean demonstration: the align coordinator's own calls succeeded for
+  // 19s (parent honoured the bypass), then 6.3s after the second sub-agent spawn the
+  // CHILDREN's calls began being denied with the CLI's canned "STOP and wait" text —
+  // 16 in a row, Read/Glob/TaskOutput/Agent/mcp__workspace-tools__* and the CLI
+  // wrapper alike — and the chapter banked nothing. `canUseTool` is a session-level
+  // callback and is the mechanism #243 already relies on to make child permissions
+  // deterministic; it was simply never installed on the runs that needed it most.
+  //
+  // Why bypass runs get ALLOW-ALL rather than decideToolPermission: a bypass run has
+  // explicitly declared itself trusted (allowDangerouslySkipPermissions) and bounds
+  // its own tool universe via `tools:`. Its goal is not to restrict anything — it is
+  // to guarantee nothing is spuriously DENIED. Handing it the restrictive allowlist
+  // would be a severe regression rather than a fix: replaying the 50 distinct Bash
+  // commands from EZK 19's SUCCESSFUL initial-pipeline run through
+  // decideToolPermission denies 45 of them (mkdir -p, awk, sed, cp, python3,
+  // for/until polling loops, pipes, &&) — all of which are legitimate today and work
+  // precisely because bypass runs carry no decider. So allow-all is the faithful
+  // enforcement of what the caller already asked for, made deterministic so a
+  // degraded classifier can no longer overrule it for children.
+  //
+  // Non-bypass runs keep the restrictive decider: they never opted into trust, so the
+  // allowlist is what bounds them, and it never emits the canned "STOP and wait" text
+  // that halts sub-agents.
+  //
+  // Kill switch: BP_NO_BYPASS=1 sends opted-in runs down the restrictive branch.
   if (bypassPermissions && process.env.BP_NO_BYPASS !== '1') {
     options.permissionMode = 'bypassPermissions';
     options.allowDangerouslySkipPermissions = true;
+    options.canUseTool = async (_toolName, input) => ({ behavior: 'allow', updatedInput: input });
+  } else {
+    options.canUseTool = async (toolName, input) => decideToolPermission(toolName, input);
   }
-  // Register the deterministic decider UNCONDITIONALLY — including alongside
-  // bypassPermissions (issue #271, EZK 19).
-  //
-  // This used to be the `else` of the branch above, which made the two protections
-  // mutually exclusive and left align runs — the very runs that need child-level
-  // determinism most — with neither. `permissionMode` is per-agent (see the SDK's
-  // AgentDefinition.permissionMode): setting it here bypasses the classifier for the
-  // TOP-LEVEL query only. Spawned Task/Agent children carry their own mode and fall
-  // back to the load-degraded 'auto' classifier, which is documented above to
-  // mass-deny allowlisted tools under an opus fan-out (#195/#235/#238/#242).
-  //
-  // EZK 19 is the clean demonstration. The align coordinator's own calls succeeded
-  // for 19s (parent honoured the bypass); 6.3s after the second sub-agent spawn the
-  // CHILDREN's calls began being denied with the CLI's canned "STOP and wait" text —
-  // 16 in a row, Read, Glob, TaskOutput, Agent, mcp__workspace-tools__* and the
-  // workspace-tools CLI wrapper alike — and the chapter banked nothing. Every one of
-  // those calls is an `allow` under decideToolPermission; the decider simply was not
-  // installed. The canned text is also proof of origin: our deny messages carry
-  // redirect guidance and never that phrase.
-  //
-  // Registering both is safe and cannot widen privilege: decideToolPermission is a
-  // pure, never-prompting allowlist that only ever returns allow/deny, and the
-  // bypass mode above is already an auto-allow for the parent.
-  options.canUseTool = async (toolName, input) => decideToolPermission(toolName, input);
   if (tools) {
     options.tools = tools;
   }

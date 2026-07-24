@@ -147,8 +147,11 @@ test('bypassPermissions opts the run out of the auto-mode classifier but KEEPS t
   // so the bypass covers the top-level query only, and spawned Task/Agent children
   // fall back to the load-degraded 'auto' classifier that #243 was written to escape.
   // EZK 19 lost a whole chapter to it — the coordinator's own calls succeeded while
-  // all 16 of its children's calls were denied. Both must be installed.
-  assert.equal(typeof o.canUseTool, 'function', 'children do not inherit the bypass — keep the decider');
+  // all 16 of its children's calls were denied. A callback must be installed so the
+  // children's decisions are deterministic; on a bypass run it is allow-all (see
+  // buildOptions), NOT the restrictive allowlist, which would refuse 45 of the 50
+  // Bash commands initial-pipeline legitimately runs today.
+  assert.equal(typeof o.canUseTool, 'function', 'children do not inherit the bypass — install a callback');
 });
 
 test('non-bypass runs stay on auto mode with the deterministic canUseTool fallback', () => {

@@ -54,8 +54,39 @@ test('canUseTool is registered even when bypassPermissions is set (#271)', () =>
   assert.equal(
     typeof options.canUseTool,
     'function',
-    'the decider must ALSO be installed — permissionMode does not reach spawned children'
+    'a callback must ALSO be installed — permissionMode does not reach spawned children'
   );
+});
+
+// The regression guard that matters most. The first attempt at #271 handed bypass runs
+// the RESTRICTIVE decideToolPermission allowlist. Replaying the 50 distinct Bash
+// commands from EZK 19's SUCCESSFUL initial-pipeline run through it denies 45 —
+// mkdir -p, awk, sed, cp, python3, for/until polling loops, pipes, && — every one of
+// which is legitimate today and works precisely because bypass runs carry no decider.
+// That would have broken initial-pipeline far worse than the align bug being fixed.
+// A bypass run's goal is not to restrict anything; it is to guarantee nothing is
+// spuriously DENIED. So its callback must allow unconditionally.
+test('bypass runs allow-all — they must NOT inherit the restrictive Bash allowlist (#271)', async () => {
+  const options = buildOptions({ cwd: '/data/workspace', bypassPermissions: true, enableBash: true });
+  const REAL_INITIAL_PIPELINE_COMMANDS = [
+    'mkdir -p tmp/pipeline-EZK-19 output/AI-ULT/EZK && echo "dirs created"',
+    "awk '/^\\\\c 19$/{f=1} /^\\\\c 20$/{f=0} f' data/hebrew_bible/26-EZK.usfm",
+    'cp output/issues/EZK/EZK-19.tsv tmp/pipeline-EZK-19/merged_issues.tsv',
+    'i=0; until [ -s tmp/pipeline-EZK-19/wave3_challenges.tsv ] || [ $i -ge 30 ]; do sleep 10; i=$((i+1)); done',
+    'python3 -c "import json; json.load(open(\'output/AI-UST/hints/EZK/EZK-19.json\'))"',
+    "cd /data/workspace; sed -n '95,135p' .claude/skills/issue-identification/figs-metonymy.md",
+    'ls output/issues/*/ 2>/dev/null | head',
+  ];
+  for (const command of REAL_INITIAL_PIPELINE_COMMANDS) {
+    const decision = await options.canUseTool('Bash', { command });
+    assert.equal(
+      decision.behavior,
+      'allow',
+      `bypass runs must not refuse a command that works today: ${command.slice(0, 60)}`
+    );
+  }
+  // Non-Bash tools too — nothing is restricted on a run that declared itself trusted.
+  assert.equal((await options.canUseTool('Write', { file_path: '/data/workspace/x' })).behavior, 'allow');
 });
 
 test('canUseTool is still registered on non-bypass runs', () => {
@@ -77,8 +108,8 @@ test('the BP_NO_BYPASS kill switch drops the bypass but keeps the decider', () =
   }
 });
 
-test('the registered decider actually routes through decideToolPermission', async () => {
-  const options = buildOptions({ cwd: '/data/workspace', bypassPermissions: true, enableBash: true });
+test('non-bypass runs route through the restrictive decideToolPermission', async () => {
+  const options = buildOptions({ cwd: '/data/workspace', bypassPermissions: false, enableBash: true });
   // Allowed: a wholesale-granted tool.
   const allowed = await options.canUseTool('Read', { file_path: '/data/workspace/output/AI-ULT/EZK/EZK-19.usfm' });
   assert.equal(allowed.behavior, 'allow');
