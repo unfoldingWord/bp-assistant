@@ -679,7 +679,8 @@ function resultIndicatesPermissionStall(result) {
 // stall this is transient and not caused by anything in our config, so callers should
 // back off and retry the same work rather than fail the unit.
 function resultIndicatesPermissionWall(result) {
-  return !!result && result.subtype === 'permission_wall';
+  return !!result
+    && (result.subtype === 'permission_wall' || result.permissionWallDetected === true);
 }
 
 async function runClaudeOnce({
@@ -1028,7 +1029,26 @@ async function runClaudeOnce({
   };
 
   if (result) {
-    if (permissionStallFired) {
+    if (permissionWallFired) {
+      // The wall fired after a result message had already been consumed. Same stream
+      // ordering the stall branch below handles (#238/#268: the SDK can emit the
+      // result while trailing sub-agent messages are still streaming), and it must be
+      // handled here too or the wall is silently dropped — the post-loop
+      // permissionWallFired branch only runs when NO result was captured, so the
+      // backoff in runClaude() would never engage and generate-pipeline would
+      // misclassify a walled run as missing/degraded output and retry straight into it.
+      //
+      // Checked BEFORE the stall branches deliberately: a walled run also has an
+      // active denial anchor, and annotating it as a stall would route it to a hard
+      // failure instead of the retry-and-recover path. Mirrors the same
+      // wall-outranks-stall precedence the align step applies.
+      result.permissionWallDetected = true;
+      console.warn(
+        `${runnerPrefix} Result already received when the permission wall fired — returning result ` +
+        `annotated permissionWallDetected=true (wallDenials=${errorState.wallDenials}, ` +
+        `${errorState.totalPermissionDenials} denial(s) total)`
+      );
+    } else if (permissionStallFired) {
       // The stall fired after a result message had already been consumed (the SDK can
       // emit the result while trailing sub-agent messages are still streaming —
       // observed 2026-07-21, #238). Surface it on the result so callers classify the
@@ -1274,7 +1294,12 @@ async function runClaude(args) {
           };
         }
       }
-      if (result?.subtype === 'success') return result;
+      // A wall-annotated result must NOT take the success short-circuit. When the wall
+      // fires we abort the query mid-flight, so any result already captured describes
+      // an interrupted run — EZK 19's align coordinator returned a success-shaped
+      // result having produced no aligned USFM at all. Falling through lets the
+      // permission-wall backoff below re-run it.
+      if (result?.subtype === 'success' && !resultIndicatesPermissionWall(result)) return result;
 
       const resultMsg = `${result?.subtype || ''} ${result?.error || ''} ${result?.result || ''}`.trim();
       const elapsed = Date.now() - startedAt;

@@ -177,6 +177,27 @@ test('permission_wall and permission_stall outcomes are distinguishable', () => 
   assert.equal(resultIndicatesPermissionStall({ subtype: 'permission_wall' }), false);
 });
 
+// Review finding on #273. The SDK can emit the terminal `result` while trailing
+// sub-agent messages are still streaming (#238/#268), so the wall can fire AFTER a
+// result has been captured. In that ordering runClaudeOnce returns the captured result
+// and never reaches the post-loop permissionWallFired branch, so the wall must ride out
+// on the result as an annotation — otherwise the backoff never engages and the align
+// step misclassifies a walled run as missing output and retries straight into it.
+test('a wall detected after the result is captured rides out as an annotation', () => {
+  assert.equal(resultIndicatesPermissionWall({ subtype: 'success', permissionWallDetected: true }), true);
+  assert.equal(resultIndicatesPermissionWall({ subtype: 'error', permissionWallDetected: true }), true);
+  // Absent or false annotation must not read as a wall.
+  assert.equal(resultIndicatesPermissionWall({ subtype: 'success', permissionWallDetected: false }), false);
+});
+
+test('a wall-annotated result does not also read as a stall (wall outranks)', () => {
+  // Both flags present would be contradictory routing: stall means hard failure, wall
+  // means retry. runClaudeOnce checks the wall first so only the wall flag is set.
+  const walled = { subtype: 'success', permissionWallDetected: true };
+  assert.equal(resultIndicatesPermissionWall(walled), true);
+  assert.equal(resultIndicatesPermissionStall(walled), false);
+});
+
 test('the default wall limit is small — the wall is unambiguous once it appears', () => {
   assert.ok(PERMISSION_WALL_DENIAL_LIMIT >= 2 && PERMISSION_WALL_DENIAL_LIMIT <= 4,
     `expected a tight default, got ${PERMISSION_WALL_DENIAL_LIMIT}`);
