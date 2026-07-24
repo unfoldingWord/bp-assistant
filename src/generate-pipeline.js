@@ -10,7 +10,7 @@ const fs = require('fs');
 const path = require('path');
 const config = require('./config');
 const { sendMessage, sendDM, addReaction, removeReaction, uploadFile } = require('./zulip-client');
-const { runClaude, DEFAULT_BASH_TOOLS, isTransientOutageError, resultIndicatesPermissionStall } = require('./claude-runner');
+const { runClaude, DEFAULT_BASH_TOOLS, isTransientOutageError, resultIndicatesPermissionStall, resultIndicatesPermissionWall } = require('./claude-runner');
 const { extractContentTypes } = require('./router');
 const { getDoor43Username, emailToFallbackUsername, buildBranchName, resolveOutputFile, discoverFreshOutput, calcSkillTimeout, normalizeBookName, resolveConflictMention, isUsageLimitError, CSKILLBP_DIR } = require('./pipeline-utils');
 const { verifyRepoPush, verifyDcsToken } = require('./repo-verify');
@@ -1558,7 +1558,19 @@ async function generatePipeline(route, message) {
       // a DISTINCT clean failure whose errorKind lets self-diagnosis short-circuit.
       let permissionStall = resultIndicatesPermissionStall(alignResult);
 
-      if ((!alignResult || alignResult.subtype !== 'success') && !transportClosed && !permissionStall) {
+      // An EXTERNAL permission wall (#271, EZK 19): every tool call in the align
+      // session tree was refused from above this process's permission config — plain
+      // `Read`, `Glob`, `TaskOutput`, `Agent`, the workspace-tools CLI wrapper and the
+      // MCP alternate alike — even though the run passes bypassPermissions:true. The
+      // runner has already spent its backoff window (PERMISSION_WALL_RETRY_WINDOW_MS)
+      // re-running the query, so reaching here means the wall outlasted it. Distinct
+      // from permissionStall: nothing in our skills or allowlists caused it and no
+      // local change fixes it, so it must not be filed as a skill/allowlist problem —
+      // and distinct from the coverage-derived kinds, which sent #271 out advising
+      // "investigate the coordinator prompt / model or simply re-run".
+      let permissionWall = resultIndicatesPermissionWall(alignResult);
+
+      if ((!alignResult || alignResult.subtype !== 'success') && !transportClosed && !permissionStall && !permissionWall) {
         const errText = !alignResult
           ? 'timed out or was aborted (no result returned)'
           : (alignResult.error || alignResult.result || `non-success subtype: "${alignResult.subtype}"`);
@@ -1594,6 +1606,10 @@ async function generatePipeline(route, message) {
 
       if (permissionStall) {
         await status(`**align-all-parallel** stalled for ${book} ${ch}: align sub-agent tool calls were auto-denied in headless mode ("STOP and wait") and it halted — attempting salvage from any banked mapping JSON before failing.`);
+      }
+
+      if (permissionWall) {
+        await status(`**align-all-parallel** hit an external permission wall for ${book} ${ch}: every tool call — including wholesale-granted ones — was auto-denied from outside this process, and the wall did not clear within the runner's retry window. This is not a skill or allowlist problem. Attempting salvage from any banked mapping JSON before failing.`);
       }
 
       // Record metrics for align-all-parallel
@@ -1679,6 +1695,16 @@ async function generatePipeline(route, message) {
         await status(`Alignment ${attemptLabel} for ${book} ${ch} (attempt ${alignAttempt}/2): ${finalValidationSummary}`);
         if (alignAttempt === 2) break;
 
+        // Don't spend attempt 2 on a wall that is demonstrably still up. The runner
+        // already backed off across PERMISSION_WALL_RETRY_WINDOW_MS and every query
+        // was still refused, so an immediate re-run just collects another round of
+        // denials — exactly what EZK 19 did, burning attempt 2 in 88s (19:37:16 ->
+        // 19:38:44) before failing. Break to salvage + a correctly-labelled failure.
+        if (permissionWall) {
+          await status(`Skipping the align retry for ${book} ${ch}: the permission wall is still up, so a re-run would only collect more denials.`);
+          break;
+        }
+
         // Retry once. Drop only the merged full-chapter file — never the per-batch
         // files — so banked batch progress survives and the align skill only has
         // to (re)produce the missing/degraded batches.
@@ -1743,6 +1769,7 @@ async function generatePipeline(route, message) {
         // coverage-derived errorKind (#238).
         lastAlignResult = retryResult || lastAlignResult;
         if (resultIndicatesPermissionStall(retryResult)) permissionStall = true;
+        if (resultIndicatesPermissionWall(retryResult)) permissionWall = true;
         if (!retryResult || retryResult.subtype !== 'success') {
           if (retryResult && retryResult.subtype === 'mcp_transport_closed') transportClosed = true;
           finalValidationSummary = !retryResult
@@ -1850,7 +1877,19 @@ async function generatePipeline(route, message) {
             finalValidationSummary = `${book} ${ch} — align-all-parallel aborted: workspace-tools MCP transport closed (Stream closed) before aligned USFM was produced${finalValidationSummary ? `; ${finalValidationSummary}` : ''}`;
           }
         }
-        if (permissionStall && !transportClosed) {
+        if (permissionWall) {
+          // Outranks every other classification, including permissionStall and the
+          // coverage-derived kinds: a wall refuses everything, so any "missing output"
+          // or "stalled sub-agent" reading of it is a symptom, not the cause. Getting
+          // this label right is the point — #271 shipped `missing_output`, which sent
+          // the operator to "investigate the coordinator prompt / model or simply
+          // re-run" for a failure no prompt change and no re-run could fix.
+          errorKind = 'permission_wall';
+          if (outputStatus === 'degraded') outputStatus = 'missing';
+          if (!/permission wall/i.test(finalValidationSummary || '')) {
+            finalValidationSummary = `${book} ${ch} — align-all-parallel aborted: external permission wall (every tool call auto-denied from outside this process, including wholesale-granted tools, despite bypassPermissions) that did not clear within the runner's retry window${finalValidationSummary ? `; ${finalValidationSummary}` : ''}`;
+          }
+        } else if (permissionStall && !transportClosed) {
           // The align agents permission-stalled (sustained auto-denials with no productive
           // work), so the chapter is missing or only partially recovered by salvage. The
           // stall classification wins over the coverage-derived kind — even when salvage

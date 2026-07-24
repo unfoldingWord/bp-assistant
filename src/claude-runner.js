@@ -237,6 +237,44 @@ const PERMISSION_STALL_WINDOW_MS = Number(process.env.BP_PERMISSION_STALL_WINDOW
   : 5 * 60 * 1000;
 const PERMISSION_STALL_POLL_MS = 30 * 1000;
 
+// Permission WALL detection (EZK 19, 2026-07-24 — issue #271). Distinct from the
+// stall above, and the stall's time-based fail-safe cannot catch it: a wall denies
+// EVERY tool call in the session tree — parent and sub-agents alike — including
+// calls that are unambiguously granted. EZK 19 took 16 straight denials of `Read`,
+// `Glob`, `TaskOutput`, `Agent`, the mandated `node workspace-tools-cli.js` wrapper
+// AND `mcp__workspace-tools__read_usfm_chapter`, then the coordinator returned a
+// normal result at 88s — so the 300s stall window never elapsed, nothing was
+// flagged, and the coverage gate misfiled it as `missing_output` ("re-run the
+// coordinator"). The align run passes bypassPermissions:true, so the refusal comes
+// from ABOVE the SDK's local permission config; nothing in our allowlists can fix
+// it. It is transient, so the correct response is backoff-and-retry, not failure.
+//
+// The discriminator is QUALITATIVE, not a denial count. A count regresses #238,
+// where a healthy 8-agent fan-out burned several improvised raw-shell probes at
+// startup and recovered — a cumulative count of 3 false-aborted it. Instead: Bash
+// is the only tool whose grant is argument-level (BASH_ALLOW_RULES gate individual
+// commands), so a denied Bash call is genuinely ambiguous and is NOT wall evidence.
+// Every other tool is granted (or not) for the whole session, so a denial of one
+// cannot be an allowlist mismatch — it can only be an external refusal. #238's
+// probes were all Bash and would score zero here; EZK 19 scored on its very first
+// denial (a plain `Read` inside cwd).
+const PERMISSION_WALL_DENIAL_LIMIT = Number(process.env.BP_PERMISSION_WALL_DENIALS) > 0
+  ? Number(process.env.BP_PERMISSION_WALL_DENIALS)
+  : 2;
+
+// Wall recovery budget. The wall is transient but not brief: on EZK 19 it was still
+// up 2min8s after it appeared (19:36:36 -> 19:38:44, both align attempts), and had
+// cleared by the time the chapter was triaged. So retries must be patient and widely
+// spaced — a tight loop just re-denies. Sized against the align timeout (150min), so
+// spending up to 20min waiting out a wall is cheap next to losing the chapter and a
+// human triage cycle. Separate from TRANSIENT_RETRY_WINDOW_MS because the SDK-outage
+// window (10min, 5s base) is far too impatient for this failure mode.
+const PERMISSION_WALL_RETRY_WINDOW_MS = Number(process.env.BP_PERMISSION_WALL_WINDOW_MS) > 0
+  ? Number(process.env.BP_PERMISSION_WALL_WINDOW_MS)
+  : 20 * 60 * 1000;
+const PERMISSION_WALL_BASE_DELAY_MS = 60 * 1000;
+const PERMISSION_WALL_MAX_DELAY_MS = 5 * 60 * 1000;
+
 const TRANSIENT_RETRY_WINDOW_MS = 10 * 60 * 1000;
 const RETRY_BASE_DELAY_MS = 5000;
 const RETRY_MAX_DELAY_MS = 60000;
@@ -298,9 +336,31 @@ function buildOptions({
   if (bypassPermissions && process.env.BP_NO_BYPASS !== '1') {
     options.permissionMode = 'bypassPermissions';
     options.allowDangerouslySkipPermissions = true;
-  } else {
-    options.canUseTool = async (toolName, input) => decideToolPermission(toolName, input);
   }
+  // Register the deterministic decider UNCONDITIONALLY — including alongside
+  // bypassPermissions (issue #271, EZK 19).
+  //
+  // This used to be the `else` of the branch above, which made the two protections
+  // mutually exclusive and left align runs — the very runs that need child-level
+  // determinism most — with neither. `permissionMode` is per-agent (see the SDK's
+  // AgentDefinition.permissionMode): setting it here bypasses the classifier for the
+  // TOP-LEVEL query only. Spawned Task/Agent children carry their own mode and fall
+  // back to the load-degraded 'auto' classifier, which is documented above to
+  // mass-deny allowlisted tools under an opus fan-out (#195/#235/#238/#242).
+  //
+  // EZK 19 is the clean demonstration. The align coordinator's own calls succeeded
+  // for 19s (parent honoured the bypass); 6.3s after the second sub-agent spawn the
+  // CHILDREN's calls began being denied with the CLI's canned "STOP and wait" text —
+  // 16 in a row, Read, Glob, TaskOutput, Agent, mcp__workspace-tools__* and the
+  // workspace-tools CLI wrapper alike — and the chapter banked nothing. Every one of
+  // those calls is an `allow` under decideToolPermission; the decider simply was not
+  // installed. The canned text is also proof of origin: our deny messages carry
+  // redirect guidance and never that phrase.
+  //
+  // Registering both is safe and cannot widen privilege: decideToolPermission is a
+  // pure, never-prompting allowlist that only ever returns allow/deny, and the
+  // bypass mode above is already an auto-allow for the parent.
+  options.canUseTool = async (toolName, input) => decideToolPermission(toolName, input);
   if (tools) {
     options.tools = tools;
   }
@@ -349,11 +409,48 @@ function buildOptions({
   // reach orchestrator-spawned workers, not just the top-level query. It only mutates
   // input (no permissionDecision), so it composes with the guard hooks above; it is a
   // no-op when the spawn's model is already concrete and no override is set.
+  // Sub-agent spawn pacing. Closure-scoped, so the gap is enforced per query
+  // rather than globally — concurrent pipelines do not delay each other.
+  //
+  // Every observed align lockout began within seconds of the SECOND sub-agent
+  // spawn, and only when the two spawns were close together: AMO 8 failed three
+  // times at 2.4-3.0s apart (2026-07-23 21:40/21:44, 2026-07-24 01:40), while
+  // initial-pipeline's healthy fan-out the same evening spawned 8s apart and made
+  // 29 tool calls with zero denials. Once the wall goes up, every tool call in
+  // the session tree is denied — parent and children alike — and the run banks
+  // nothing. Pacing the spawns removes the race.
+  //
+  // Enforced here rather than in skill prose deliberately: align-all-parallel
+  // already says "spawn in parallel (single message)" and the model already
+  // ignores the frontmatter's `Task` in favour of `Agent`, so prose is not a
+  // control surface. The hook is the only choke point before a spawn.
+  //
+  // Cost is bounded and small next to the work: a 14-verse chapter pays one gap,
+  // an 8-way EZK-16-scale fan-out pays ~56s against a 30-minute alignment.
+  // Tunable via BP_SUBAGENT_SPAWN_INTERVAL_MS; 0 disables.
+  let lastSpawnAt = 0;
+  const spawnGapMs = process.env.BP_SUBAGENT_SPAWN_INTERVAL_MS != null
+    ? Number(process.env.BP_SUBAGENT_SPAWN_INTERVAL_MS)
+    : 8000;
+
   const modelResolverMatcher = {
     hooks: [async (input) => {
       try {
         const tool = input && input.tool_name;
         if (tool !== 'Task' && tool !== 'Agent') return {};
+
+        // Pace before anything else, so the delay applies even when no model or
+        // effort rewrite is needed and the hook would otherwise return early.
+        if (Number.isFinite(spawnGapMs) && spawnGapMs > 0) {
+          const since = Date.now() - lastSpawnAt;
+          if (lastSpawnAt !== 0 && since < spawnGapMs) {
+            const waitMs = spawnGapMs - since;
+            console.log(`[spawn-pace] holding ${tool} spawn ${waitMs}ms (min gap ${spawnGapMs}ms since last spawn)`);
+            await sleep(waitMs);
+          }
+          lastSpawnAt = Date.now();
+        }
+
         const ti = input.tool_input;
         if (!ti || typeof ti !== 'object' || typeof ti.model !== 'string') return {};
         const resolved = resolveDifficultyModel('claude', ti.model);
@@ -450,7 +547,22 @@ function classifyRunnerUserMessage(text) {
           ? 'stale_edit'
           : 'other_tool_error';
   }
-  return { isTransportClosed, isPermissionDenied, isToolError, isToolResult, toolErrorSig };
+  // The denial arrives as a tool_result carrying the id of the tool_use it refused.
+  // The caller resolves that id back to a tool NAME (see pendingToolUses in the
+  // stream loop) so the wall discriminator can tell "denied Bash" (ambiguous —
+  // could be an allow-rule miss) from "denied Read/Glob/mcp__*" (external refusal).
+  const idMatch = /"tool_use_id"\s*:\s*"([^"]+)"/.exec(String(text || ''));
+  const toolUseId = idMatch ? idMatch[1] : null;
+  return { isTransportClosed, isPermissionDenied, isToolError, isToolResult, toolErrorSig, toolUseId };
+}
+
+// True when a denial of `toolName` is evidence of an external permission wall
+// rather than a local allowlist mismatch. Bash carries argument-level allow-rules,
+// so a denied Bash command is ambiguous; every other tool is granted per-session,
+// so its denial cannot come from our own config. An unresolved name (null) is
+// treated as ambiguous — never as evidence.
+function isPermissionWallEvidence(toolName) {
+  return typeof toolName === 'string' && toolName.length > 0 && toolName !== 'Bash';
 }
 
 // Pure reducer: applies one classified message to the mutable `state` and returns
@@ -478,6 +590,17 @@ function applyRunnerUserMessage(state, sig, limits, guardrails, now = Date.now()
     state.totalPermissionDenials += 1;
     state.consecutivePermissionDenials += 1;
     if (state.stallStartAt == null) state.stallStartAt = now;
+    // Wall evidence accumulates only from denials that CANNOT be an allowlist miss
+    // (see isPermissionWallEvidence / PERMISSION_WALL_DENIAL_LIMIT). Like the stall
+    // anchor, it clears on any productive tool result below, so the limit means
+    // "N such denials with nothing working in between" — a sustained wall, not a
+    // recoverable startup burst.
+    if (isPermissionWallEvidence(sig.deniedToolName)) {
+      state.wallDenials = (state.wallDenials || 0) + 1;
+      if (limits.wallLimit > 0 && state.wallDenials >= limits.wallLimit) {
+        return { type: 'abort_permission_wall', wallDenials: state.wallDenials, tool: sig.deniedToolName };
+      }
+    }
     return { type: 'permission_denied' };
   }
   if (sig.isToolError) {
@@ -487,6 +610,10 @@ function applyRunnerUserMessage(state, sig, limits, guardrails, now = Date.now()
     state.consecutiveTransportErrors = 0;
     state.consecutivePermissionDenials = 0;
     state.stallStartAt = null;
+    // A tool_use_error is a REAL tool response, so tools are reachable — whatever
+    // refused earlier is no longer refusing. Clears wall evidence for the same
+    // reason it clears the stall anchor.
+    state.wallDenials = 0;
     state.consecutiveToolErrors += 1;
     state.toolErrorSigs.set(sig.toolErrorSig, (state.toolErrorSigs.get(sig.toolErrorSig) || 0) + 1);
     if (guardrails) {
@@ -509,6 +636,7 @@ function applyRunnerUserMessage(state, sig, limits, guardrails, now = Date.now()
     state.consecutiveTransportErrors = 0;
     state.consecutivePermissionDenials = 0;
     state.stallStartAt = null;
+    state.wallDenials = 0;
     return { type: 'tool_result_reset' };
   }
   return { type: 'none' };
@@ -533,6 +661,13 @@ function assessPermissionStall(state, now, windowMs) {
 // which case the result is returned annotated with `permissionStallDetected`).
 function resultIndicatesPermissionStall(result) {
   return !!result && (result.subtype === 'permission_stall' || result.permissionStallDetected === true);
+}
+
+// True when a runner outcome indicates an EXTERNAL permission wall (#271). Unlike a
+// stall this is transient and not caused by anything in our config, so callers should
+// back off and retry the same work rather than fail the unit.
+function resultIndicatesPermissionWall(result) {
+  return !!result && result.subtype === 'permission_wall';
 }
 
 async function runClaudeOnce({
@@ -592,8 +727,14 @@ async function runClaudeOnce({
     consecutivePermissionDenials: 0,
     totalPermissionDenials: 0,
     stallStartAt: null,
+    wallDenials: 0,
     toolErrorSigs: new Map(),
   };
+  // tool_use_id -> tool name, so a denial's tool_result can be resolved back to the
+  // tool it refused (the wall discriminator needs the name, and the denial message
+  // itself carries only the id). Bounded: entries are deleted as they resolve, and
+  // the map is cleared wholesale if a run ever leaks past a sane ceiling.
+  const pendingToolUses = new Map();
   // Repeated "Stream closed" tool_results mean the in-process workspace-tools MCP
   // transport has been torn down (typically an align sub-agent outliving the parent
   // query's message stream — JER 33, 2026-07-02). It is transport-level, not a tool
@@ -606,6 +747,10 @@ async function runClaudeOnce({
   // and assessPermissionStall above): denials are benign unless followed by a whole
   // window with no productive tool result.
   let permissionStallFired = false;
+  // An external permission wall was detected (see PERMISSION_WALL_DENIAL_LIMIT).
+  // Bails immediately rather than waiting out the stall window, because the wall
+  // denies everything and the run can bank nothing while it is up.
+  let permissionWallFired = false;
 
   const timer = setTimeout(() => {
     localTimeoutFired = true;
@@ -721,6 +866,12 @@ async function runClaudeOnce({
           } else if ('name' in block) {
             turnCount++;
             lastTool = block.name;
+            if (block.id) {
+              // Guard against unbounded growth if ids never resolve (sub-agent
+              // tool_uses whose results stream to a channel we don't see).
+              if (pendingToolUses.size > 512) pendingToolUses.clear();
+              pendingToolUses.set(block.id, block.name);
+            }
             console.log(`${claudePrefix} Tool: ${block.name}(${JSON.stringify(block.input || {}).slice(0, 150)})`);
           }
         }
@@ -735,10 +886,18 @@ async function runClaudeOnce({
         // Both are pure functions (exported for unit tests). Precedence, top-down:
         // transport-closed > permission-denial-stall > tool_use_error > tool_result.
         const sig = classifyRunnerUserMessage(text);
+        // Resolve the refused tool_use back to its tool name before reducing, so the
+        // permission-wall discriminator can distinguish an argument-level Bash denial
+        // from the denial of a wholesale-granted tool. Consume the entry either way —
+        // a tool_use resolves exactly once.
+        if (sig.toolUseId) {
+          sig.deniedToolName = pendingToolUses.get(sig.toolUseId) || null;
+          pendingToolUses.delete(sig.toolUseId);
+        }
         const action = applyRunnerUserMessage(
           errorState,
           sig,
-          { transportLimit: MCP_TRANSPORT_ERROR_LIMIT },
+          { transportLimit: MCP_TRANSPORT_ERROR_LIMIT, wallLimit: PERMISSION_WALL_DENIAL_LIMIT },
           guardrails
         );
         if (action.type === 'transport_error' || action.type === 'abort_transport') {
@@ -758,12 +917,24 @@ async function runClaudeOnce({
             abortController.abort();
             break;
           }
+        } else if (action.type === 'abort_permission_wall') {
+          permissionWallFired = true;
+          console.error(
+            `${runnerPrefix} Aborting query — external permission wall: ${action.wallDenials} denial(s) of ` +
+            `wholesale-granted tool(s) (latest: ${action.tool}) with no productive tool result in between. ` +
+            `These cannot be allowlist misses, so the refusal originates above this process's permission ` +
+            `config and no local change can clear it (issue #271, EZK 19). Bailing in seconds instead of ` +
+            `waiting out the ${PERMISSION_STALL_WINDOW_MS / 1000}s stall window, so the caller can back off ` +
+            `and retry while the run has banked nothing.`
+          );
+          abortController.abort();
+          break;
         } else if (action.type === 'permission_denied') {
           console.warn(
             `${runnerPrefix} Tool call auto-denied ("STOP and wait") in headless auto mode ` +
-            `(${errorState.totalPermissionDenials} total this run) — benign if the agent switches to ` +
-            `an allowed tool; aborts as a stall only after ${PERMISSION_STALL_WINDOW_MS / 1000}s ` +
-            `with no productive tool result`
+            `(${errorState.totalPermissionDenials} total this run, tool: ${sig.deniedToolName || 'unresolved'}) — ` +
+            `benign if the agent switches to an allowed tool; aborts as a stall only after ` +
+            `${PERMISSION_STALL_WINDOW_MS / 1000}s with no productive tool result`
           );
         } else if (action.type === 'guardrail_stop') {
           throw new Error(
@@ -912,6 +1083,29 @@ async function runClaudeOnce({
       consecutiveTransportErrors: errorState.consecutiveTransportErrors,
     });
   }
+  // An external permission wall was detected and we abort()ed to bail. Checked BEFORE
+  // the stall (and the abort→timeout classification): a wall is the more specific
+  // signal and, unlike a stall, it is transient and worth retrying after a backoff —
+  // so it must not be flattened into permission_stall, which routes to a hard failure.
+  if (permissionWallFired) {
+    console.warn(
+      `${runnerPrefix} Returning permission_wall outcome — ` +
+      `reason=permission_wall wallDenials=${errorState.wallDenials} ` +
+      `totalDenials=${errorState.totalPermissionDenials} elapsedMs=${elapsedMs}ms`
+    );
+    return finish({
+      subtype: 'permission_wall',
+      timedOut: false,
+      reason: 'permission_wall',
+      queryId,
+      elapsedMs,
+      configuredTimeoutMs: timeout,
+      turnCount,
+      lastTool,
+      wallDenials: errorState.wallDenials,
+      totalPermissionDenials: errorState.totalPermissionDenials,
+    });
+  }
   // A permission-denial stall was detected and we abort()ed to bail — take precedence
   // over the abort→timeout classification below, mirroring mcp_transport_closed. A
   // fresh query would likely hit the same auto-denial wall, so route to a clean failure.
@@ -1012,6 +1206,18 @@ function backoffDelayMs(attempt) {
   return exp + jitter;
 }
 
+// Backoff for permission-wall retries. Starts an order of magnitude higher than
+// backoffDelayMs and caps higher: the wall outlasts a 5s retry, and hammering it
+// wastes attempts (EZK 19 burned its entire second attempt 88s after the first).
+function wallBackoffDelayMs(attempt) {
+  const exp = Math.min(
+    PERMISSION_WALL_MAX_DELAY_MS,
+    PERMISSION_WALL_BASE_DELAY_MS * Math.pow(2, Math.max(0, attempt - 1))
+  );
+  const jitter = Math.floor(Math.random() * 5000);
+  return exp + jitter;
+}
+
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -1060,6 +1266,46 @@ async function runClaude(args) {
 
       const resultMsg = `${result?.subtype || ''} ${result?.error || ''} ${result?.result || ''}`.trim();
       const elapsed = Date.now() - startedAt;
+
+      // External permission wall (#271): every tool call was refused from above this
+      // process, so the query banked nothing and a fresh one costs nothing to lose.
+      // Retry here rather than in each pipeline so generate/notes/tqs all inherit the
+      // recovery. Walls clear on their own, so patient backoff usually turns what was
+      // a failed chapter + hand triage into a slower but successful run. On exhaustion
+      // return the wall result (do NOT raise ClaudeTransientOutageError): that maps to
+      // `paused_for_outage`, which nothing auto-resumes, so it would just relocate the
+      // manual step. Returning it lets the caller record a correctly-labelled failure.
+      if (resultIndicatesPermissionWall(result)) {
+        if (elapsed < PERMISSION_WALL_RETRY_WINDOW_MS) {
+          const delay = wallBackoffDelayMs(attempt);
+          if (!firstDowntimeNoticeSent) {
+            firstDowntimeNoticeSent = true;
+            await notifyAdminDowntime(
+              `[claude-runner] External permission wall detected (attempt ${attempt}) — every tool call is ` +
+              `being auto-denied from above this process's permission config. Backing off up to ` +
+              `${Math.round(PERMISSION_WALL_RETRY_WINDOW_MS / 60000)}min and retrying; no action needed unless ` +
+              `this exhausts. Denials this attempt: ${result.wallDenials ?? '?'} (of ${result.totalPermissionDenials ?? '?'} total).`
+            );
+          }
+          console.warn(
+            `${labelPrefix} Permission wall — retrying in ${Math.round(delay / 1000)}s ` +
+            `(attempt ${attempt}, ${Math.round(elapsed / 1000)}s of ` +
+            `${Math.round(PERMISSION_WALL_RETRY_WINDOW_MS / 1000)}s window used)`
+          );
+          await sleep(delay);
+          continue;
+        }
+        await notifyAdminDowntime(
+          `[claude-runner] Permission wall did NOT clear after ${Math.round(elapsed / 60000)}min and ` +
+          `${attempt} attempts. Giving up so the caller can fail cleanly — this is an external permission ` +
+          `refusal, not a pipeline bug; nothing in the allowlists can fix it.`
+        );
+        console.error(
+          `${labelPrefix} Permission wall persisted past the ${Math.round(PERMISSION_WALL_RETRY_WINDOW_MS / 60000)}min ` +
+          `window (${attempt} attempts) — returning permission_wall to the caller`
+        );
+        return result;
+      }
       if (isTransientSdkMessage(resultMsg) && elapsed < TRANSIENT_RETRY_WINDOW_MS) {
         lastTransientMessage = resultMsg;
         if (!firstDowntimeNoticeSent) {
@@ -1206,7 +1452,11 @@ module.exports = {
   applyRunnerUserMessage,
   assessPermissionStall,
   resultIndicatesPermissionStall,
+  resultIndicatesPermissionWall,
+  isPermissionWallEvidence,
   PERMISSION_STALL_WINDOW_MS,
+  PERMISSION_WALL_DENIAL_LIMIT,
+  PERMISSION_WALL_RETRY_WINDOW_MS,
   decideToolPermission,
   decideBashPermission,
   SUBAGENT_TOOL_ALLOWLIST,

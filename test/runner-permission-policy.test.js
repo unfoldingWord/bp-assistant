@@ -137,11 +137,18 @@ test('SUBAGENT_TOOL_ALLOWLIST does not drift below the restricted tool profile',
 
 // --- buildOptions permission strategy ---
 
-test('bypassPermissions opts the run out of the auto-mode classifier', () => {
+test('bypassPermissions opts the run out of the auto-mode classifier but KEEPS the decider', () => {
   const o = buildOptions({ bypassPermissions: true });
   assert.equal(o.permissionMode, 'bypassPermissions');
   assert.equal(o.allowDangerouslySkipPermissions, true);
-  assert.equal(o.canUseTool, undefined, 'bypass runs need no permission callback');
+  // This assertion used to read `canUseTool === undefined` with the rationale
+  // "bypass runs need no permission callback". That was the #271 defect stated as a
+  // requirement: `permissionMode` is per-agent (SDK AgentDefinition.permissionMode),
+  // so the bypass covers the top-level query only, and spawned Task/Agent children
+  // fall back to the load-degraded 'auto' classifier that #243 was written to escape.
+  // EZK 19 lost a whole chapter to it — the coordinator's own calls succeeded while
+  // all 16 of its children's calls were denied. Both must be installed.
+  assert.equal(typeof o.canUseTool, 'function', 'children do not inherit the bypass — keep the decider');
 });
 
 test('non-bypass runs stay on auto mode with the deterministic canUseTool fallback', () => {
