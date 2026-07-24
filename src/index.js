@@ -9,6 +9,7 @@ const { verifyDcsToken } = require('./repo-verify');
 const { startResourceMonitor } = require('./resource-monitor');
 const { ensureClaudeConfig } = require('./claude-config-init');
 const { startWeeklyRefresh } = require('./cron-weekly-refresh');
+const { pruneRunLogs, RUN_LOG_DIR } = require('./run-logs');
 
 // Prepend ISO timestamp to every console line
 ['log', 'warn', 'error'].forEach(method => {
@@ -86,8 +87,30 @@ async function pollLoop(client, queueId, lastEventId) {
   }
 }
 
+// Run-log retention. Cheap (day-directory granularity) and bounded, so it runs
+// at boot and daily thereafter rather than needing its own cron entry.
+function startRunLogPruning() {
+  const prune = () => {
+    try {
+      const { removed } = pruneRunLogs();
+      if (removed.length) {
+        console.log(`[run-logs] pruned ${removed.length} day(s): ${removed.join(', ')}`);
+      }
+    } catch (err) {
+      console.warn(`[run-logs] prune failed: ${err.message}`);
+    }
+  };
+  // Off the boot path: prune walks up to 30 day-directories with sync fs calls,
+  // and `flyctl deploy --strategy immediate` wants the bot answering quickly.
+  setImmediate(prune);
+  const timer = setInterval(prune, 24 * 60 * 60 * 1000);
+  if (timer.unref) timer.unref();
+}
+
 async function main() {
   ensureClaudeConfig();
+  console.log(`[run-logs] writing durable run logs to ${RUN_LOG_DIR}`);
+  startRunLogPruning();
   const client = await getClient();
 
   // Get our own user ID to filter self-messages
