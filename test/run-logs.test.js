@@ -33,8 +33,11 @@ function readEvents(file) {
     .map((l) => JSON.parse(l));
 }
 
-// Give the append stream a tick to flush before reading it back.
-const flush = () => new Promise((r) => setTimeout(r, 50));
+// `log.close()` resolves when the append stream has drained, so every read-back
+// below awaits it. A fixed sleep used to stand in for this and made these tests
+// flaky under `node --test`'s parallel runner: with ~50 test processes competing
+// for 8 cores the flush can take hundreds of milliseconds, and the test read an
+// empty file.
 
 test('escapeProjectDir matches the CLI transcript directory naming', () => {
   // Verified against the live machine: /data/workspace -> -data-workspace
@@ -80,8 +83,7 @@ test('createRunLog writes a start event and records the session pointer', async 
     });
     assert.ok(log.enabled, 'log opened');
     log.setSession('sess-1');
-    log.close({ subtype: 'success' });
-    await flush();
+    await log.close({ subtype: 'success' });
 
     const events = readEvents(log.file);
     assert.equal(events[0].type, 'start');
@@ -103,8 +105,7 @@ test('setSession is idempotent — a second init does not overwrite the pointer'
   const log = createRunLog({ queryId: 'q-idem', label: 'x', cwd: '/data/workspace' });
   log.setSession('first');
   log.setSession('second');
-  log.close();
-  await flush();
+  await log.close();
   assert.equal(log.sessionId, 'first');
   assert.equal(readEvents(log.file).filter((e) => e.type === 'session').length, 1);
 });
@@ -120,8 +121,7 @@ test('assistant text and tool_use are recorded with their inputs intact', async 
       ],
     },
   });
-  log.close();
-  await flush();
+  await log.close();
 
   const events = readEvents(log.file);
   const text = events.find((e) => e.type === 'assistant_text');
@@ -137,8 +137,7 @@ test('auto-denials are flagged so a lockout is greppable', async () => {
   const log = createRunLog({ queryId: 'q3', label: 'x', cwd: '/data/workspace' });
   recordUserMessage(log, "The user doesn't want to take this action right now. STOP what you are doing and wait for the user to tell you how to proceed.");
   recordUserMessage(log, 'ordinary tool result');
-  log.close();
-  await flush();
+  await log.close();
 
   const results = readEvents(log.file).filter((e) => e.type === 'tool_result');
   assert.equal(results[0].denied, true);
@@ -148,8 +147,7 @@ test('auto-denials are flagged so a lockout is greppable', async () => {
 test('recordResult captures subtype, turns and cost', async () => {
   const log = createRunLog({ queryId: 'q4', label: 'x', cwd: '/data/workspace' });
   recordResult(log, { subtype: 'success', num_turns: 12, total_cost_usd: 1.5, duration_ms: 900, result: 'done' });
-  log.close();
-  await flush();
+  await log.close();
 
   const r = readEvents(log.file).find((e) => e.type === 'result');
   assert.equal(r.subtype, 'success');
@@ -286,8 +284,7 @@ test('redaction applies to recorded tool inputs, not just free text', async () =
       },
     });
     recordUserMessage(log, 'result contains hunter2hunter2hunter2 too');
-    log.close();
-    await flush();
+    await log.close();
 
     const raw = fs.readFileSync(log.file, 'utf8');
     assert.ok(!raw.includes('hunter2hunter2hunter2'), 'secret never reaches disk');
@@ -299,9 +296,8 @@ test('redaction applies to recorded tool inputs, not just free text', async () =
 
 test('close is idempotent — a second close writes no second end event', async () => {
   const log = createRunLog({ queryId: 'q-close', label: 'x', cwd: '/data/workspace' });
-  log.close({ subtype: 'success' });
-  log.close({ subtype: 'threw' });
-  await flush();
+  await log.close({ subtype: 'success' });
+  await log.close({ subtype: 'threw' });
   assert.equal(readEvents(log.file).filter((e) => e.type === 'end').length, 1);
 });
 

@@ -173,7 +173,7 @@ function nullHandle() {
     sessionId: null,
     event() {},
     setSession() {},
-    close() {},
+    close() { return Promise.resolve(); },
     paths() { return { runLog: null, transcript: null, subagents: null }; },
   };
 }
@@ -233,10 +233,24 @@ function createRunLog({ queryId, label, skill, cwd, model, timeoutMs, pipelineTy
     return { runLog: handle.file, transcript: handle.transcript, subagents: handle.subagents };
   };
 
+  // Returns a promise that settles once the queued events have actually reached
+  // disk. Callers on the pipeline path ignore it (closing is fire-and-forget
+  // there), but anything that reads the log back needs a real signal rather than
+  // a sleep — `end()` only queues the flush, so a busy machine can leave the
+  // file empty for hundreds of milliseconds. Resolves on error too: a failed
+  // flush is already reported by the stream's error handler, and close() must
+  // never reject into a pipeline.
   handle.close = function close(summary) {
     handle.event('end', summary || {});
-    try { if (stream) stream.end(); } catch (_) { /* already closed */ }
+    const closing = stream;
     stream = null;
+    if (!closing) return handle.flushed;
+    handle.flushed = new Promise((resolve) => {
+      closing.once('close', resolve);
+      closing.once('error', resolve);
+    });
+    try { closing.end(); } catch (_) { /* already closed */ }
+    return handle.flushed;
   };
 
   handle.event('start', {
