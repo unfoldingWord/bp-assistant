@@ -301,6 +301,44 @@ test('close is idempotent — a second close writes no second end event', async 
   assert.equal(readEvents(log.file).filter((e) => e.type === 'end').length, 1);
 });
 
+// A stream that already failed has emitted 'error'/'close' before close() runs,
+// so listening for them would wait forever. That must not happen: `node --test`
+// has no default timeout, so a pending close() hangs the whole suite instead of
+// failing one assertion — worse than the empty-file flake this promise fixes.
+test('close still settles when the log stream failed to open', async () => {
+  // Park a directory where the log file wants to be so open() fails. The name
+  // embeds HH:MM:SS, so block a few seconds ahead to survive a tick-over.
+  const day = new Date().toISOString().slice(0, 10);
+  const dir = path.join(process.env.BP_RUN_LOG_DIR, day);
+  for (const offsetMs of [0, 1000, 2000]) {
+    const stamp = new Date(Date.now() + offsetMs).toISOString().slice(11, 19).replace(/:/g, '');
+    fs.mkdirSync(path.join(dir, `${stamp}-q-eisdir-x.jsonl`), { recursive: true });
+  }
+
+  // Sequence on the module's own error report rather than a sleep, so the stream
+  // is provably destroyed before we close it — the ordering that used to hang.
+  const warn = console.warn;
+  const errored = new Promise((resolve) => {
+    console.warn = (...args) => {
+      if (String(args[0]).includes('write error')) resolve();
+      else warn(...args);
+    };
+  });
+
+  try {
+    const log = createRunLog({ queryId: 'q-eisdir', label: 'x', cwd: '/data/workspace' });
+    assert.ok(log.enabled, 'the handle opens — the stream fails asynchronously');
+    await errored;
+    const outcome = await Promise.race([
+      log.close({ subtype: 'threw' }).then(() => 'settled'),
+      new Promise((resolve) => setTimeout(() => resolve('hung'), 2000)),
+    ]);
+    assert.equal(outcome, 'settled', 'close() must settle even on a dead stream');
+  } finally {
+    console.warn = warn;
+  }
+});
+
 test.after(() => {
   try { fs.rmSync(tmpRoot, { recursive: true, force: true }); } catch { /* best effort */ }
 });
