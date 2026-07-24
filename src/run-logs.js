@@ -209,7 +209,13 @@ function createRunLog({ queryId, label, skill, cwd, model, timeoutMs, pipelineTy
   handle.event = function event(type, payload) {
     if (!stream || stream.destroyed) return;
     try {
-      stream.write(`${JSON.stringify({ t: new Date().toISOString(), type, ...payload })}\n`);
+      // Redact the serialized line, not just the fields the record* helpers
+      // scrub: callers pass free text straight to event() (e.g. claude-runner's
+      // `end` event carries `error: err.message`), and that is the only path to
+      // disk that would otherwise bypass redaction entirely. redact() is
+      // idempotent, so re-scrubbing already-clean fields only costs a scan.
+      const line = JSON.stringify({ t: new Date().toISOString(), type, ...payload });
+      stream.write(`${redact(line)}\n`);
     } catch (err) {
       console.warn(`[run-logs] event write failed: ${err.message}`);
     }

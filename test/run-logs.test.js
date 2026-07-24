@@ -297,6 +297,24 @@ test('redaction applies to recorded tool inputs, not just free text', async () =
   }
 });
 
+test('redaction applies to free-text passed straight to event()', async () => {
+  process.env.BP_TEST_FAKE_TOKEN2 = 'tokentokentoken12345';
+  try {
+    const log = createRunLog({ queryId: 'q-event-redact', label: 'x', cwd: '/data/workspace' });
+    // claude-runner's closeRunLog puts `error: err.message` on the end event —
+    // the one free-text field that never passes through the record* helpers.
+    log.event('end', { error: 'request failed: tokentokentoken12345' });
+    log.close();
+    await flush();
+
+    const raw = fs.readFileSync(log.file, 'utf8');
+    assert.ok(!raw.includes('tokentokentoken12345'), 'secret never reaches disk');
+    assert.match(raw, /\[redacted:BP_TEST_FAKE_TOKEN2\]/);
+  } finally {
+    delete process.env.BP_TEST_FAKE_TOKEN2;
+  }
+});
+
 test('close is idempotent — a second close writes no second end event', async () => {
   const log = createRunLog({ queryId: 'q-close', label: 'x', cwd: '/data/workspace' });
   log.close({ subtype: 'success' });
