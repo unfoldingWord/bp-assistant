@@ -617,10 +617,31 @@ async function generatePipeline(route, message) {
   // text — e.g. a "source file missing" message infers as 'warn', which would
   // otherwise silently suppress the diagnosis. This decouples the dispatch
   // decision from the human-facing wording.
-  function fireDiagnosisFor(event, errorText) {
+  // `evidence` carries the durable pointers stamped onto a runClaude outcome
+  // (run log + SDK transcript + sub-agent transcript dir). Passing it puts the
+  // real artifacts in the issue body instead of leaving a triager to infer a
+  // cause from admin-status timings and an expired fly.io stream.
+  function fireDiagnosisFor(event, errorText, evidence) {
     if (!event) return;
     const errorEvent = event.severity === 'error' ? event : { ...event, severity: 'error' };
-    fireDiagnosis(errorEvent, { checkpoint: getCheckpoint(checkpointRef), errorText });
+    fireDiagnosis(errorEvent, { checkpoint: getCheckpoint(checkpointRef), errorText, evidence });
+  }
+
+  // Pull the evidence pointers off a runClaude result, tolerating null/undefined
+  // (a run can fail before any outcome object exists). First result that carries
+  // them wins — the retry is more relevant than the first pass.
+  function evidenceOf(...results) {
+    for (const r of results) {
+      if (r && (r.runLogPath || r.transcriptPath)) {
+        return {
+          runLogPath: r.runLogPath,
+          transcriptPath: r.transcriptPath,
+          subagentTranscriptDir: r.subagentTranscriptDir,
+          sessionId: r.sessionId,
+        };
+      }
+    }
+    return null;
   }
 
   // Helper: reply to the originating stream
@@ -1597,6 +1618,9 @@ async function generatePipeline(route, message) {
       let ustCov = { ok: true, reason: null };
       let lastFailReason = null; // 'coverage' | 'density'
 
+      // Most recent align run (first pass or retry). The failure path cites its
+      // durable evidence pointers, so it must outlive the retry block's scope.
+      let lastAlignResult = alignResult;
       for (let alignAttempt = 1; alignAttempt <= 2; alignAttempt++) {
         // Discover aligned output files by name (any run). Source-consistency
         // and full-chapter coverage are enforced below — this replaces the old
@@ -1716,6 +1740,7 @@ async function generatePipeline(route, message) {
         // Checked outside the non-success gate below: a stall detected after the SDK
         // already emitted a success-shaped result must still win over the
         // coverage-derived errorKind (#238).
+        lastAlignResult = retryResult || lastAlignResult;
         if (resultIndicatesPermissionStall(retryResult)) permissionStall = true;
         if (!retryResult || retryResult.subtype !== 'success') {
           if (retryResult && retryResult.subtype === 'mcp_transport_closed') transportClosed = true;
@@ -1854,7 +1879,11 @@ async function generatePipeline(route, message) {
           },
           resume: { chapter: ch, skill: 'align-all-parallel' },
         });
-        fireDiagnosisFor(failEvent, `Phase: align-all-parallel\nChapter: ${book} ${ch}\n${finalValidationSummary}`);
+        fireDiagnosisFor(
+          failEvent,
+          `Phase: align-all-parallel\nChapter: ${book} ${ch}\n${finalValidationSummary}`,
+          evidenceOf(lastAlignResult, alignResult)
+        );
         continue;
       }
 

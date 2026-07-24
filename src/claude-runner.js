@@ -6,6 +6,12 @@ const { recordRateLimit, getHeadroom } = require('./usage-tracker');
 const { createWorkspaceTools, createTnWriterTools, createQualityTools, createIssueIdTools } = require('./workspace-tools');
 const { publishAdminStatus } = require('./admin-status');
 const { resolveDifficultyModel, resolveDifficultyEffort } = require('./api-runner/provider-config');
+const {
+  createRunLog,
+  recordAssistantMessage,
+  recordUserMessage,
+  recordResult,
+} = require('./run-logs');
 
 let _query = null;
 let _sdkCreateSdkMcpServer = null;
@@ -670,6 +676,13 @@ async function runClaudeOnce({
     compaction,
   });
 
+  // Durable run log on the volume. The fly.io stream is ephemeral and truncated,
+  // so this (plus the SDK session id it records once init arrives) is what a
+  // post-hoc triage actually reads. Never throws — degrades to a no-op handle.
+  const runLog = createRunLog({
+    queryId, label, skill, cwd, model, timeoutMs: timeout,
+  });
+
   console.log(`${runnerPrefix} Starting query in ${cwd}${options.permissionMode === 'bypassPermissions' ? ' (permissions: bypass)' : ''}`);
   console.log(`${runnerPrefix} Prompt: ${fullPrompt.slice(0, 200)}`);
   console.log(`${runnerPrefix} maxTurns: ${options.maxTurns}, timeout: ${timeout / 1000}s, deadline: ${new Date(queryDeadline).toISOString()}`);
@@ -681,6 +694,7 @@ async function runClaudeOnce({
   try {
     for await (const message of conversation) {
       if (message.type === 'assistant' && message.message?.content) {
+        recordAssistantMessage(runLog, message);
         for (const block of message.message.content) {
           if ('text' in block) {
             console.log(`${claudePrefix} ${block.text.slice(0, 200)}`);
@@ -696,6 +710,7 @@ async function runClaudeOnce({
         const text = typeof message.message?.content === 'string'
           ? message.message.content
           : JSON.stringify(message.message?.content || '');
+        recordUserMessage(runLog, text);
         // Classify the SDK user-message and advance the error-tracking state machine.
         // Both are pure functions (exported for unit tests). Precedence, top-down:
         // transport-closed > permission-denial-stall > tool_use_error > tool_result.
@@ -742,8 +757,19 @@ async function runClaudeOnce({
         }
       } else if (message.type === 'system') {
         console.log(`${runnerPrefix} SDK system: ${message.subtype || 'unknown'} ${JSON.stringify(message).slice(0, 200)}`);
-        if (message.subtype === 'init' && Array.isArray(message.tools)) {
-          console.log(`${runnerPrefix} SDK init tools: ${message.tools.join(', ')}`);
+        if (message.subtype === 'init') {
+          // Capture the SDK session id the moment it exists. This is the pointer
+          // from a pipeline failure to the full transcript (parent AND
+          // sub-agents) the CLI persists under CLAUDE_CONFIG_DIR — the evidence
+          // that was unreachable when #264/#265 were triaged.
+          runLog.setSession(message.session_id);
+          if (runLog.transcript) {
+            console.log(`${runnerPrefix} Transcript: ${runLog.transcript}`);
+          }
+          if (Array.isArray(message.tools)) {
+            console.log(`${runnerPrefix} SDK init tools: ${message.tools.join(', ')}`);
+            runLog.event('init_tools', { tools: message.tools });
+          }
         }
       } else {
         console.log(`${runnerPrefix} SDK event: ${message.type}${message.subtype ? '/' + message.subtype : ''}`);
@@ -782,6 +808,29 @@ async function runClaudeOnce({
     try { conversation.close(); } catch (_) {}
   }
 
+  // Close the run log and stamp the evidence pointers onto whatever outcome the
+  // caller receives. Pipelines surface `runLogPath` / `transcriptPath` on
+  // failure so triage starts from the transcript instead of guessing at timing.
+  const finish = (outcome) => {
+    const paths = runLog.paths();
+    try {
+      runLog.close({
+        subtype: outcome && outcome.subtype,
+        turnCount,
+        lastTool,
+        elapsedMs: Date.now() - queryStart,
+        totalPermissionDenials: errorState.totalPermissionDenials,
+      });
+    } catch (_) { /* logging must never break a run */ }
+    if (outcome && typeof outcome === 'object') {
+      outcome.runLogPath = paths.runLog;
+      outcome.transcriptPath = paths.transcript;
+      outcome.subagentTranscriptDir = paths.subagents;
+      outcome.sessionId = runLog.sessionId;
+    }
+    return outcome;
+  };
+
   if (result) {
     if (permissionStallFired) {
       // The stall fired after a result message had already been consumed (the SDK can
@@ -805,7 +854,8 @@ async function runClaudeOnce({
         recordRateLimit({ windowUsed: room.used, source: 'claude-runner-result' });
       } catch { /* non-fatal */ }
     }
-    return result;
+    recordResult(runLog, result);
+    return finish(result);
   }
 
   // No result message was produced. Distinguish local-timeout from other causes
@@ -819,7 +869,7 @@ async function runClaudeOnce({
       `${runnerPrefix} Returning mcp_transport_closed outcome — ` +
       `reason=mcp_transport_closed consecutive=${errorState.consecutiveTransportErrors} elapsed=${elapsedMs}ms`
     );
-    return {
+    return finish({
       subtype: 'mcp_transport_closed',
       timedOut: false,
       reason: 'mcp_transport_closed',
@@ -829,7 +879,7 @@ async function runClaudeOnce({
       turnCount,
       lastTool,
       consecutiveTransportErrors: errorState.consecutiveTransportErrors,
-    };
+    });
   }
   // A permission-denial stall was detected and we abort()ed to bail — take precedence
   // over the abort→timeout classification below, mirroring mcp_transport_closed. A
@@ -839,7 +889,7 @@ async function runClaudeOnce({
       `${runnerPrefix} Returning permission_stall outcome — ` +
       `reason=permission_stall denials=${errorState.totalPermissionDenials} elapsedMs=${elapsedMs}ms`
     );
-    return {
+    return finish({
       subtype: 'permission_stall',
       timedOut: false,
       reason: 'permission_stall',
@@ -849,7 +899,7 @@ async function runClaudeOnce({
       turnCount,
       lastTool,
       totalPermissionDenials: errorState.totalPermissionDenials,
-    };
+    });
   }
   if (localTimeoutFired || abortController.signal.aborted) {
     const driftMs = elapsedMs - timeout;
@@ -857,7 +907,7 @@ async function runClaudeOnce({
       `${runnerPrefix} Returning timeout outcome — ` +
       `reason=timeout_local_abort elapsed=${elapsedMs}ms configured=${timeout}ms drift=${driftMs}ms`
     );
-    return {
+    return finish({
       subtype: 'timeout',
       timedOut: true,
       reason: 'timeout_local_abort',
@@ -867,10 +917,10 @@ async function runClaudeOnce({
       driftMs,
       turnCount,
       lastTool,
-    };
+    });
   }
   console.warn(`${runnerPrefix} Query ended without a result message (elapsed=${elapsedMs}ms) — reason=no_result_message`);
-  return {
+  return finish({
     subtype: 'no_result',
     reason: 'no_result_message',
     queryId,
@@ -878,7 +928,7 @@ async function runClaudeOnce({
     configuredTimeoutMs: timeout,
     turnCount,
     lastTool,
-  };
+  });
 }
 
 function isUsageCapMessage(text) {

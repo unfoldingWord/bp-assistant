@@ -128,7 +128,29 @@ A concrete, minimal change. If the cause is unclear, list the next debugging ste
 
 The fingerprint marker will be appended automatically — do not include it.`;
 
-function buildContextSummary(event, contextEvents, checkpoint, errorText, workdir) {
+// Durable-evidence pointers for the failing skill run: the volume-backed run
+// log and the SDK transcript (parent + sub-agents). Before these were recorded,
+// triage had only admin-status timings and an already-rolled-off fly.io stream
+// to go on — which is how the AMO 8 align lockout (#264/#265) got closed as an
+// "intermittent LLM flake" when the transcripts showed every sub-agent tool call
+// being auto-denied.
+function buildEvidenceSection(evidence) {
+  if (!evidence || typeof evidence !== 'object') return [];
+  const { runLogPath, transcriptPath, subagentTranscriptDir, sessionId } = evidence;
+  if (!runLogPath && !transcriptPath) return [];
+  const lines = ['## Evidence (durable, on the volume)'];
+  if (sessionId) lines.push(`- SDK session id: \`${sessionId}\``);
+  if (runLogPath) lines.push(`- Run log (JSONL, one event per line): \`${runLogPath}\``);
+  if (transcriptPath) lines.push(`- Full SDK transcript: \`${transcriptPath}\``);
+  if (subagentTranscriptDir) lines.push(`- Sub-agent transcripts: \`${subagentTranscriptDir}\``);
+  lines.push('- Read these before reasoning from timings alone. In the run log, '
+    + '`"type":"tool_use"` lines carry the full tool input and `"denied":true` marks '
+    + 'an auto-denied call — a run of those means a permission lockout, not a model flake.');
+  lines.push('');
+  return lines;
+}
+
+function buildContextSummary(event, contextEvents, checkpoint, errorText, workdir, evidence) {
   const lines = [];
   lines.push('## Failure event');
   lines.push(`- timestamp: ${event.timestamp}`);
@@ -155,6 +177,7 @@ function buildContextSummary(event, contextEvents, checkpoint, errorText, workdi
     lines.push('```');
     lines.push('');
   }
+  for (const line of buildEvidenceSection(evidence)) lines.push(line);
   {
     const wd = workdir || process.env.CSKILLBP_DIR || '';
     const outputs = (checkpoint && checkpoint.skillOutputs) || {};
@@ -710,6 +733,7 @@ async function dispatchSelfDiagnosis({
   event,
   checkpoint = null,
   errorText = null,
+  evidence = null,
   runClaudeImpl,
   fetchImpl,
   readSecretImpl,
@@ -755,7 +779,7 @@ async function dispatchSelfDiagnosis({
     const recentEvents = Array.isArray(recent) ? [...recent].reverse() : [];
 
     const workdir = process.env.CSKILLBP_DIR || process.cwd();
-    const contextSummary = buildContextSummary(event, recentEvents, checkpoint, errorText, workdir);
+    const contextSummary = buildContextSummary(event, recentEvents, checkpoint, errorText, workdir, evidence);
 
     let diagnosis;
     let usedFallback = false;
