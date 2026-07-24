@@ -79,7 +79,7 @@ The user provides:
 - Checkpoint state for the failed run, when available
 - Any error text captured at the failure site
 
-You may use Read and Grep to inspect:
+You may use Read, Grep, and Glob to inspect:
 - bp-assistant source files (src/*.js) to understand the failure path
 - Skill files in bp-assistant-skills (.claude/skills/) when the failure points at a skill
 - The admin-status.jsonl tail for related events
@@ -87,9 +87,9 @@ You may use Read and Grep to inspect:
 
 Constraints:
 - You CANNOT modify files. Read-only investigation.
-- You have ONLY the Read and Grep tools. Bash/shell is NOT available — any Bash
-  call is denied and only wastes your turn budget. Never call Bash; locate files
-  with Grep and read them by path with Read.
+- You have ONLY the Read, Grep, and Glob tools. Bash/shell is NOT available — any
+  Bash call is denied and only wastes your turn budget. Never call Bash; locate
+  files with Grep or Glob and read them by path with Read.
 - You have a HARD time budget of ~5 minutes. After at most ~8 tool calls, STOP
   investigating and output the JSON, even if your analysis is incomplete. A
   partial-but-valid JSON answer is far more useful than running out of time with
