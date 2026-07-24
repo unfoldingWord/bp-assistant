@@ -186,6 +186,26 @@ test('resultIndicatesPermissionStall matches the bail subtype AND the annotated 
   assert.equal(resultIndicatesPermissionStall({ subtype: 'timeout' }), false);
 });
 
+test('#268 regression: annotation catches non-success result arriving inside the stall window', () => {
+  // DAN 1, 2026-07-24: the deep-issue-id orchestrator's own SendMessage was
+  // auto-denied, it obeyed the "STOP and wait" text literally, and the SDK emitted a
+  // synthesized non-success result ~46s later — well before the 5-min stall watchdog
+  // would fire. resultIndicatesPermissionStall must recognize that annotation
+  // pathway (non-success subtype + permissionStallDetected) exactly as it recognizes
+  // the success+annotation and the bail-subtype cases, so callers/self-diagnosis
+  // route the failure as a permission stall instead of "missing_output".
+  const annotatedNonSuccess = { subtype: 'error', permissionStallDetected: true, result: 'stopped as requested' };
+  assert.equal(resultIndicatesPermissionStall(annotatedNonSuccess), true);
+  // The precondition the runner uses to attach that annotation: stallStartAt is set
+  // (an unresolved denial anchor) and the result subtype is non-success. Confirm the
+  // reducer keeps the anchor across a denial with no subsequent productive result.
+  const state = freshState();
+  step(state, DENIAL_TEXT, 1000);
+  assert.notEqual(state.stallStartAt, null, 'denial must anchor the stall window');
+  // A run that ends here (non-success, no clearing tool_result) is exactly the case
+  // the new annotation covers.
+});
+
 // ---------- unrelated counters unaffected ----------
 
 test('precedence: transport-closed and tool_use_error signatures are unaffected', () => {

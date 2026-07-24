@@ -852,6 +852,24 @@ async function runClaudeOnce({
       // failure as a permission stall instead of a generic coverage gap.
       result.permissionStallDetected = true;
       console.warn(`${runnerPrefix} Result already received when the permission stall fired — returning result annotated permissionStallDetected=true`);
+    } else if (result.subtype !== 'success' && errorState.stallStartAt != null) {
+      // A permission-denial anchor is still active — no productive tool result has
+      // cleared it since the last denial — and the result arrived before the stall
+      // watchdog window elapsed (DAN 1, 2026-07-24 — #268: orchestrator's own
+      // SendMessage denied, orchestrator obeyed the canned STOP text literally, and
+      // the SDK synthesized a terminal summary ~46s later that did not match the
+      // orchestrator's actual last message). A run that ends non-success with an
+      // unresolved denial anchor is almost certainly a permission stall short of
+      // the full window, not a generic failure. Surface it distinctly so callers
+      // classify it (and downstream diagnosis) as such.
+      result.permissionStallDetected = true;
+      const idleMs = Date.now() - errorState.stallStartAt;
+      console.warn(
+        `${runnerPrefix} Non-success result with active permission-denial anchor ` +
+        `(${errorState.totalPermissionDenials} denial(s), ${Math.round(idleMs / 1000)}s ` +
+        `since last, window ${PERMISSION_STALL_WINDOW_MS / 1000}s) — annotating result ` +
+        `permissionStallDetected=true so callers route this as a permission stall.`
+      );
     }
     console.log(`${runnerPrefix} Finished — subtype: ${result.subtype}, turns: ${result.num_turns}, cost: $${result.total_cost_usd?.toFixed(4) || '?'}, duration: ${(result.duration_ms / 1000).toFixed(1)}s`);
     if (result.subtype !== 'success' && result.result) {

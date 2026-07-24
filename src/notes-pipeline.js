@@ -1589,6 +1589,11 @@ async function runParallelTnWriter({
         tools: toolConfig.tools,
         disallowedTools: toolConfig.disallowedTools,
         enableBash: toolConfig.enableBash,
+        // Skip the 'auto'-mode safety classifier — matches the standard
+        // skill-invocation path above (see rationale there / #268). Parallel
+        // shards run concurrently under an already loaded classifier, which
+        // is precisely when it denies allowlisted tool calls nondeterministically.
+        bypassPermissions: true,
         disableLocalSettings: true,
         timeoutMs,
         maxTurns: guardrails.maxTurns,
@@ -2416,6 +2421,20 @@ async function notesPipeline(route, message) {
             tools: toolConfig.tools,
             disallowedTools: toolConfig.disallowedTools,
             enableBash: toolConfig.enableBash,
+            // Skip the 'auto'-mode safety classifier: multi-agent skills in
+            // this path (deep-issue-id spawns two Wave-2 analysts via Agent
+            // and coordinates their flush via SendMessage; post-edit-review
+            // and tn-writer can also fan out) hit the same classifier-denial
+            // failure that align-all-parallel and initial-pipeline hit
+            // (#195/#235/#238/#242/#258). Observed here: the orchestrator's
+            // own SendMessage was denied with the canned "STOP what you are
+            // doing and wait" text, the agent obeyed literally, and the run
+            // silently burned to a missing_output failure (#268). This is a
+            // trusted headless system driving a bounded tool universe
+            // (toolConfig.tools + enableBash's scoped Bash allowlist), so
+            // the classifier adds nothing but a denial vector. Kill switch:
+            // `fly secrets set BP_NO_BYPASS=1` reverts on the next restart.
+            bypassPermissions: true,
             disableLocalSettings: true,
             timeoutMs,
             maxTurns,
