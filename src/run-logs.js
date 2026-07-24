@@ -173,7 +173,7 @@ function nullHandle() {
     sessionId: null,
     event() {},
     setSession() {},
-    close() {},
+    close() { return Promise.resolve(); },
     paths() { return { runLog: null, transcript: null, subagents: null }; },
   };
 }
@@ -233,10 +233,33 @@ function createRunLog({ queryId, label, skill, cwd, model, timeoutMs, pipelineTy
     return { runLog: handle.file, transcript: handle.transcript, subagents: handle.subagents };
   };
 
+  // Returns a promise that settles once the queued events have actually reached
+  // disk. Callers on the pipeline path ignore it (closing is fire-and-forget
+  // there), but anything that reads the log back needs a real signal rather than
+  // a sleep — `end()` only queues the flush, so a busy machine can leave the
+  // file empty for hundreds of milliseconds.
+  //
+  // It must always settle, and never reject. A stream that already failed (bad
+  // open, ENOSPC mid-run) has destroyed itself and emitted 'error'/'close'
+  // BEFORE this runs, so waiting on those events would wait forever — hence the
+  // `destroyed` short-circuit. Getting that wrong is worse than the flake this
+  // signal exists to fix: `node --test` has no default timeout, so a pending
+  // promise hangs the suite instead of failing it. Resolving with no value keeps
+  // `await log.close()` from evaluating to an Error; the failure itself is
+  // already reported by the stream's error handler.
+  let flushed;
   handle.close = function close(summary) {
     handle.event('end', summary || {});
-    try { if (stream) stream.end(); } catch (_) { /* already closed */ }
+    const closing = stream;
     stream = null;
+    if (!closing) return flushed;
+    flushed = new Promise((resolve) => {
+      if (closing.destroyed) return resolve();
+      closing.once('close', () => resolve());
+      closing.once('error', () => resolve());
+    });
+    try { closing.end(); } catch (_) { /* already closed */ }
+    return flushed;
   };
 
   handle.event('start', {

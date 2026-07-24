@@ -33,8 +33,11 @@ function readEvents(file) {
     .map((l) => JSON.parse(l));
 }
 
-// Give the append stream a tick to flush before reading it back.
-const flush = () => new Promise((r) => setTimeout(r, 50));
+// `log.close()` resolves when the append stream has drained, so every read-back
+// below awaits it. A fixed sleep used to stand in for this and made these tests
+// flaky under `node --test`'s parallel runner: with ~50 test processes competing
+// for 8 cores the flush can take hundreds of milliseconds, and the test read an
+// empty file.
 
 test('escapeProjectDir matches the CLI transcript directory naming', () => {
   // Verified against the live machine: /data/workspace -> -data-workspace
@@ -80,8 +83,7 @@ test('createRunLog writes a start event and records the session pointer', async 
     });
     assert.ok(log.enabled, 'log opened');
     log.setSession('sess-1');
-    log.close({ subtype: 'success' });
-    await flush();
+    await log.close({ subtype: 'success' });
 
     const events = readEvents(log.file);
     assert.equal(events[0].type, 'start');
@@ -103,8 +105,7 @@ test('setSession is idempotent — a second init does not overwrite the pointer'
   const log = createRunLog({ queryId: 'q-idem', label: 'x', cwd: '/data/workspace' });
   log.setSession('first');
   log.setSession('second');
-  log.close();
-  await flush();
+  await log.close();
   assert.equal(log.sessionId, 'first');
   assert.equal(readEvents(log.file).filter((e) => e.type === 'session').length, 1);
 });
@@ -120,8 +121,7 @@ test('assistant text and tool_use are recorded with their inputs intact', async 
       ],
     },
   });
-  log.close();
-  await flush();
+  await log.close();
 
   const events = readEvents(log.file);
   const text = events.find((e) => e.type === 'assistant_text');
@@ -137,8 +137,7 @@ test('auto-denials are flagged so a lockout is greppable', async () => {
   const log = createRunLog({ queryId: 'q3', label: 'x', cwd: '/data/workspace' });
   recordUserMessage(log, "The user doesn't want to take this action right now. STOP what you are doing and wait for the user to tell you how to proceed.");
   recordUserMessage(log, 'ordinary tool result');
-  log.close();
-  await flush();
+  await log.close();
 
   const results = readEvents(log.file).filter((e) => e.type === 'tool_result');
   assert.equal(results[0].denied, true);
@@ -148,8 +147,7 @@ test('auto-denials are flagged so a lockout is greppable', async () => {
 test('recordResult captures subtype, turns and cost', async () => {
   const log = createRunLog({ queryId: 'q4', label: 'x', cwd: '/data/workspace' });
   recordResult(log, { subtype: 'success', num_turns: 12, total_cost_usd: 1.5, duration_ms: 900, result: 'done' });
-  log.close();
-  await flush();
+  await log.close();
 
   const r = readEvents(log.file).find((e) => e.type === 'result');
   assert.equal(r.subtype, 'success');
@@ -286,8 +284,7 @@ test('redaction applies to recorded tool inputs, not just free text', async () =
       },
     });
     recordUserMessage(log, 'result contains hunter2hunter2hunter2 too');
-    log.close();
-    await flush();
+    await log.close();
 
     const raw = fs.readFileSync(log.file, 'utf8');
     assert.ok(!raw.includes('hunter2hunter2hunter2'), 'secret never reaches disk');
@@ -299,10 +296,54 @@ test('redaction applies to recorded tool inputs, not just free text', async () =
 
 test('close is idempotent — a second close writes no second end event', async () => {
   const log = createRunLog({ queryId: 'q-close', label: 'x', cwd: '/data/workspace' });
-  log.close({ subtype: 'success' });
-  log.close({ subtype: 'threw' });
-  await flush();
+  await log.close({ subtype: 'success' });
+  await log.close({ subtype: 'threw' });
   assert.equal(readEvents(log.file).filter((e) => e.type === 'end').length, 1);
+});
+
+// A stream that already failed has emitted 'error'/'close' before close() runs,
+// so listening for them would wait forever. That must not happen: `node --test`
+// has no default timeout, so a pending close() hangs the whole suite instead of
+// failing one assertion — worse than the empty-file flake this promise fixes.
+test('close still settles when the log stream failed to open', async () => {
+  // Park a directory where the log file wants to be so open() fails. The name
+  // embeds HH:MM:SS, so block a few seconds ahead to survive a tick-over.
+  const day = new Date().toISOString().slice(0, 10);
+  const dir = path.join(process.env.BP_RUN_LOG_DIR, day);
+  for (const offsetMs of [0, 1000, 2000]) {
+    const stamp = new Date(Date.now() + offsetMs).toISOString().slice(11, 19).replace(/:/g, '');
+    fs.mkdirSync(path.join(dir, `${stamp}-q-eisdir-x.jsonl`), { recursive: true });
+  }
+
+  // Sequence on the module's own error report rather than a sleep, so the stream
+  // is provably destroyed before we close it — the ordering that used to hang.
+  const warn = console.warn;
+  const errored = new Promise((resolve) => {
+    console.warn = (...args) => {
+      if (String(args[0]).includes('write error')) resolve();
+      else warn(...args);
+    };
+  });
+
+  // Every wait here has a ceiling: a test written to prove the suite cannot hang
+  // must not be able to hang it either. `unref` so the loser of the race can
+  // never hold the process open after the assertion is already decided.
+  const bounded = (promise, onTimeout) => Promise.race([
+    promise,
+    new Promise((resolve) => setTimeout(() => resolve(onTimeout), 2000).unref()),
+  ]);
+
+  try {
+    const log = createRunLog({ queryId: 'q-eisdir', label: 'x', cwd: '/data/workspace' });
+    assert.ok(log.enabled, 'the handle opens — the stream fails asynchronously');
+    // If the error report never arrives, fall through rather than wait forever:
+    // close() is still exercised, just possibly before the stream died.
+    await bounded(errored, null);
+    const outcome = await bounded(log.close({ subtype: 'threw' }).then(() => 'settled'), 'hung');
+    assert.equal(outcome, 'settled', 'close() must settle even on a dead stream');
+  } finally {
+    console.warn = warn;
+  }
 });
 
 test.after(() => {
