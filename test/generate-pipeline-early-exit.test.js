@@ -104,6 +104,10 @@ function createHarness({ runClaudeImpl, initialCheckpoint = null, door43PushImpl
     isTransientOutageError: () => false,
     // Mirrors the real helper so align tests can exercise permission-stall shapes.
     resultIndicatesPermissionStall: (r) => !!r && (r.subtype === 'permission_stall' || r.permissionStallDetected === true),
+    // Ditto for the external-permission-wall shape (#271). This stub replaces the
+    // whole module, so a helper missing here is `undefined` at the call site and
+    // throws inside the align try/catch — which reads as an unrelated align failure.
+    resultIndicatesPermissionWall: (r) => !!r && r.subtype === 'permission_wall',
     runClaude: async (options) => {
       runClaudeCalls.push(options);
       return runClaudeImpl({ options, tempDir });
@@ -813,6 +817,62 @@ test('align permission stall on a success-shaped result wins over the coverage-d
     assert.equal(harness.diagnosisCalls.length, 1);
     assert.equal(harness.diagnosisCalls[0].checkpoint.current.errorKind, 'permission_stall');
     assert.ok(harness.readStatusTexts().some((text) => text.includes('attempting salvage from any banked mapping JSON')));
+  } finally {
+    harness.cleanup();
+  }
+});
+
+// Issue #271 (EZK 19, 2026-07-24). An EXTERNAL permission wall denied every tool call
+// in the align session tree — plain Read/Glob/TaskOutput/Agent, the workspace-tools
+// CLI wrapper and the MCP alternate — despite bypassPermissions:true, so the refusal
+// came from above this process and nothing local could clear it. Two behaviours must
+// hold once the runner has exhausted its own backoff window and reports the wall:
+//   1. the align retry is SKIPPED. EZK 19 spent attempt 2 re-running straight into the
+//      same wall (19:37:16 -> 19:38:44, 88s, 16 more denials) and banked nothing;
+//   2. the failure is labelled `permission_wall`, NOT the coverage-derived
+//      `missing_output` that #271 actually shipped — that label sent the operator to
+//      "investigate the coordinator prompt / model or simply re-run", advice no prompt
+//      change and no re-run could act on.
+test('align permission wall skips the retry and outranks the coverage-derived errorKind (#271)', async () => {
+  const harness = createHarness({
+    runClaudeImpl: async ({ options, tempDir }) => {
+      if (options.skill === 'initial-pipeline') {
+        fs.mkdirSync(path.join(tempDir, 'output', 'AI-ULT', 'ISA'), { recursive: true });
+        fs.mkdirSync(path.join(tempDir, 'output', 'AI-UST', 'ISA'), { recursive: true });
+        fs.mkdirSync(path.join(tempDir, 'output', 'issues', 'ISA'), { recursive: true });
+        fs.writeFileSync(path.join(tempDir, 'output', 'AI-ULT', 'ISA', 'ISA-52.usfm'), '\\id ISA\n\\c 52\n\\v 1 ult one\n\\v 2 ult two\n');
+        fs.writeFileSync(path.join(tempDir, 'output', 'AI-UST', 'ISA', 'ISA-52.usfm'), '\\id ISA\n\\c 52\n\\v 1 ust one\n\\v 2 ust two\n');
+        fs.writeFileSync(path.join(tempDir, 'output', 'issues', 'ISA', 'ISA-52.tsv'), 'Reference\tID\nISA 52:1\ta1b2\n');
+        return { subtype: 'success', usage: {}, total_cost_usd: 0 };
+      }
+      if (options.skill === 'align-all-parallel') {
+        // The wall denies everything, so the run banks NOTHING — no aligned USFM and
+        // no mapping JSON for salvage to work from. Coverage therefore reads 'missing',
+        // which is exactly the reading that must lose to the wall classification.
+        return { subtype: 'permission_wall', wallDenials: 2, totalPermissionDenials: 16, usage: {}, total_cost_usd: 0 };
+      }
+      return { subtype: 'success', usage: {}, total_cost_usd: 0 };
+    },
+  });
+
+  try {
+    await harness.generatePipeline(
+      { _synthetic: true, _book: 'ISA', _startChapter: 52, _endChapter: 52, skill: 'initial-pipeline', operations: 6 },
+      buildMessage('generate isa 52', { sender_id: 7 })
+    );
+
+    const alignCalls = harness.runClaudeCalls.filter((c) => c.skill === 'align-all-parallel');
+    assert.equal(alignCalls.length, 1, 'the retry must be skipped while the wall is still up');
+
+    const failure = harness.checkpoints.find((patch) => patch.current?.status === 'failed');
+    assert.ok(failure, 'align failure checkpoint expected');
+    assert.equal(failure.current.errorKind, 'permission_wall', 'wall must beat the coverage-derived errorKind');
+    assert.match(failure.current.validationSummary, /permission wall/i);
+    assert.equal(harness.diagnosisCalls[0].checkpoint.current.errorKind, 'permission_wall');
+
+    const texts = harness.readStatusTexts();
+    assert.ok(texts.some((t) => /external permission wall/i.test(t)), 'operator must be told it is external');
+    assert.ok(texts.some((t) => /Skipping the align retry/i.test(t)), 'the skipped retry must be explained');
   } finally {
     harness.cleanup();
   }

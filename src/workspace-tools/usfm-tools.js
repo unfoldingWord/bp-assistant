@@ -395,7 +395,14 @@ function createAlignedUsfm({ hebrew, mapping, source, output, chapter, verse, us
       return `Aligned USFM written to ${output}.\nRepair step failed: ${repairErr.message}`;
     }
 
-    return `Aligned USFM written to ${output}.\nX-content and lemma byte repair completed:\n${repairResult}`;
+    // Normalize AFTER the repair — repairAlignmentXContent rewrites the file, so
+    // normalizing first would be undone. This is the single-batch path's
+    // equivalent of the normalization mergeAlignedUsfm applies on the multi-batch
+    // path (#247); without it, chapters of <= 18 verses ship mid-line `\v`.
+    const normalized = normalizeVerseLineStartsInFile(path.resolve(CSKILLBP_DIR, output));
+
+    return `Aligned USFM written to ${output}.\nX-content and lemma byte repair completed:\n${repairResult}`
+      + (normalized ? '\nVerse-line-start normalization applied (mid-line \\v markers moved to line start).' : '');
 
   } catch (err) {
     const stderr = err.stderr ? err.stderr.toString() : '';
@@ -534,6 +541,38 @@ function normalizeVerseLineStarts(usfm) {
     result.push(line.slice(start));
   }
   return result.join('\n');
+}
+
+// Apply normalizeVerseLineStarts to a file in place. Returns true when the file
+// changed, false when it was already clean or unreadable.
+//
+// Why this exists: #247 wired normalizeVerseLineStarts into mergeAlignedUsfm,
+// which was believed to cover the producer side. It does not. Merge runs only on
+// the MULTI-batch path (chapters > 18 verses). A chapter of <= 18 verses takes
+// the single-batch path, where the sub-agent writes the whole-chapter file
+// directly via create_aligned_usfm and no merge ever happens — so short chapters
+// kept shipping mid-line `\v` and were carried only by #246's push-side
+// tolerance. Observed on AMO 8 (2026-07-24): 11 of 14 ULT verse markers landed
+// mid-line on en_ult master, while the UST for the same chapter was clean.
+//
+// Writing back only on change keeps mtimes stable, which matters because the
+// pipeline's staleness checks compare aligned-file mtimes against sources.
+function normalizeVerseLineStartsInFile(absPath) {
+  let before;
+  try {
+    before = fs.readFileSync(absPath, 'utf8');
+  } catch {
+    return false;
+  }
+  const after = normalizeVerseLineStarts(before);
+  if (after === before) return false;
+  try {
+    fs.writeFileSync(absPath, after);
+  } catch (err) {
+    console.warn(`[usfm-tools] verse-line-start normalization could not write ${absPath}: ${err.message}`);
+    return false;
+  }
+  return true;
 }
 
 function mergeAlignedUsfm({ parts, output }) {
@@ -1585,6 +1624,12 @@ function repairAlignmentXContent({ alignedUsfm, hebrewUsfm }) {
 
   if (repaired > 0) {
     fs.writeFileSync(alignedPath, alignedLines.join('\n'));
+    // Also normalize here, not only via createAlignedUsfm: this function is
+    // exposed as the standalone `repair_alignment_x_content` tool, so a skill
+    // can reach an aligned file through a path that never goes near
+    // createAlignedUsfm or mergeAlignedUsfm. Normalization is newline-only and
+    // idempotent, so applying it on both routes is harmless.
+    normalizeVerseLineStartsInFile(alignedPath);
     return `Repaired ${repaired} x-content byte-order mismatch(es) in ${path.basename(alignedUsfm)} — x-content now byte-identical to UHB`;
   }
   return `No x-content byte-order mismatches found in ${path.basename(alignedUsfm)}`;
@@ -1600,6 +1645,7 @@ module.exports = {
   readUsfmChapter,
   mergeAlignedUsfm,
   normalizeVerseLineStarts,
+  normalizeVerseLineStartsInFile,
   planAlignmentBatches,
   assertBatchPlanCoversChapter,
   planAlignmentBatchesTool,
