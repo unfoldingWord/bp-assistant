@@ -698,7 +698,7 @@ test('readPreparedNotes accepts object-backed prepared_notes packets', () => {
 
 test('difficulty tiers resolve to Opus with tier-as-effort (Opus everywhere)', () => {
   for (const tier of ['low', 'medium', 'high']) {
-    assert.equal(resolveDifficultyModel('claude', tier), 'claude-opus-4-8', `${tier} -> Opus`);
+    assert.equal(resolveDifficultyModel('claude', tier), 'claude-opus-5', `${tier} -> Opus`);
     assert.equal(resolveDifficultyEffort(tier), tier, `${tier} -> effort ${tier}`);
   }
   // Non-tier values pass through unchanged; no effort override.
