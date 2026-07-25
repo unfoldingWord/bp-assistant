@@ -301,8 +301,7 @@ test('redaction applies to free-text passed straight to event()', async () => {
     // claude-runner's closeRunLog puts `error: err.message` on the end event —
     // the one free-text field that never passes through the record* helpers.
     log.event('end', { error: 'request failed: tokentokentoken12345' });
-    log.close();
-    await flush();
+    await log.close();
 
     const raw = fs.readFileSync(log.file, 'utf8');
     assert.ok(!raw.includes('tokentokentoken12345'), 'secret never reaches disk');
@@ -325,8 +324,7 @@ test('event() redacts secrets containing JSON-escapable characters, and stays pa
       error: 'failed with quo"tedsecret12345 and lineone12345\nlinetwo12345',
       note: 'MY_TOKEN=abcdefgh\\"more text" tail',
     });
-    log.close();
-    await flush();
+    await log.close();
 
     const raw = fs.readFileSync(log.file, 'utf8');
     assert.ok(!raw.includes('quo\\"tedsecret12345'), 'quote-bearing secret never reaches disk');
@@ -358,8 +356,7 @@ test('object payloads are redacted field-wise, so escaping cannot hide a secret'
         }],
       },
     });
-    log.close();
-    await flush();
+    await log.close();
 
     const raw = fs.readFileSync(log.file, 'utf8');
     assert.ok(!raw.includes('tedsecret54321'), 'secret never reaches disk in any escaped form');
