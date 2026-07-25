@@ -107,7 +107,10 @@ const SECRET_PATTERNS = [
   [/\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}/g, '[redacted:jwt]'],
   [/\b(?:Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{16,}/gi, '[redacted:auth-header]'],
   // KEY=value / "token": "value" style assignments of credential-named fields.
-  [/\b([A-Za-z_][A-Za-z0-9_]*(?:TOKEN|KEY|SECRET|PASSWORD|CREDENTIAL))\b(\s*[:=]\s*"?)([^\s"',;]{8,})/gi,
+  // The separator allows a quote on either side of the delimiter so the JSON
+  // form (`"api_key": "…"`) matches too, not just the shell form — tool inputs
+  // and results are overwhelmingly JSON-shaped, so that is the common case.
+  [/\b([A-Za-z_][A-Za-z0-9_]*(?:TOKEN|KEY|SECRET|PASSWORD|CREDENTIAL))\b("?\s*[:=]\s*"?)([^\s"',;]{8,})/gi,
     (_m, name, sep) => `${name}${sep}[redacted]`],
 ];
 
@@ -123,9 +126,19 @@ function redact(text) {
   return out;
 }
 
+// Serialize with redaction applied per raw string value, before JSON escaping.
+// Scrubbing the finished text instead would miss any secret containing a
+// character JSON escapes (its escaped form no longer matches the literal env
+// value) and could eat an escaping backslash, leaving an unparseable result.
+function stringifyRedacted(value) {
+  return JSON.stringify(value, (_key, v) => (typeof v === 'string' ? redact(v) : v));
+}
+
 function truncate(value, max) {
   if (value == null) return value;
-  const s = typeof value === 'string' ? value : JSON.stringify(value);
+  // Objects (notably tool_use.input) are redacted field-wise on the way through
+  // stringifyRedacted; a plain string is scrubbed directly below.
+  const s = typeof value === 'string' ? value : stringifyRedacted(value);
   if (typeof s !== 'string') return s;
   const scrubbed = redact(s);
   if (scrubbed.length <= max) return scrubbed;
@@ -209,7 +222,12 @@ function createRunLog({ queryId, label, skill, cwd, model, timeoutMs, pipelineTy
   handle.event = function event(type, payload) {
     if (!stream || stream.destroyed) return;
     try {
-      stream.write(`${JSON.stringify({ t: new Date().toISOString(), type, ...payload })}\n`);
+      // Redact every string value, not just the fields the record* helpers
+      // scrub: callers pass free text straight to event() (e.g. claude-runner's
+      // `end` event carries `error: err.message`), and that is the only path to
+      // disk that would otherwise bypass redaction entirely. redact() is
+      // idempotent, so re-scrubbing already-clean fields only costs a scan.
+      stream.write(`${stringifyRedacted({ t: new Date().toISOString(), type, ...payload })}\n`);
     } catch (err) {
       console.warn(`[run-logs] event write failed: ${err.message}`);
     }

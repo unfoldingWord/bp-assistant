@@ -294,6 +294,91 @@ test('redaction applies to recorded tool inputs, not just free text', async () =
   }
 });
 
+test('redaction applies to free-text passed straight to event()', async () => {
+  process.env.BP_TEST_FAKE_TOKEN2 = 'tokentokentoken12345';
+  try {
+    const log = createRunLog({ queryId: 'q-event-redact', label: 'x', cwd: '/data/workspace' });
+    // claude-runner's closeRunLog puts `error: err.message` on the end event —
+    // the one free-text field that never passes through the record* helpers.
+    log.event('end', { error: 'request failed: tokentokentoken12345' });
+    log.close();
+    await flush();
+
+    const raw = fs.readFileSync(log.file, 'utf8');
+    assert.ok(!raw.includes('tokentokentoken12345'), 'secret never reaches disk');
+    assert.match(raw, /\[redacted:BP_TEST_FAKE_TOKEN2\]/);
+  } finally {
+    delete process.env.BP_TEST_FAKE_TOKEN2;
+  }
+});
+
+// Redaction runs on raw values, before JSON escaping. Both halves matter: a
+// secret containing a quote or newline is unrecognizable in its escaped form,
+// and scrubbing the escaped form can eat the backslash and leave a bare quote
+// that makes the line unparseable.
+test('event() redacts secrets containing JSON-escapable characters, and stays parseable', async () => {
+  process.env.BP_TEST_FAKE_TOKEN3 = 'quo"tedsecret12345';
+  process.env.BP_TEST_FAKE_KEY3 = 'lineone12345\nlinetwo12345';
+  try {
+    const log = createRunLog({ queryId: 'q-escape', label: 'x', cwd: '/data/workspace' });
+    log.event('end', {
+      error: 'failed with quo"tedsecret12345 and lineone12345\nlinetwo12345',
+      note: 'MY_TOKEN=abcdefgh\\"more text" tail',
+    });
+    log.close();
+    await flush();
+
+    const raw = fs.readFileSync(log.file, 'utf8');
+    assert.ok(!raw.includes('quo\\"tedsecret12345'), 'quote-bearing secret never reaches disk');
+    assert.ok(!raw.includes('lineone12345'), 'newline-bearing secret never reaches disk');
+    assert.match(raw, /\[redacted:BP_TEST_FAKE_TOKEN3\]/);
+    assert.match(raw, /\[redacted:BP_TEST_FAKE_KEY3\]/);
+    // readEvents JSON.parses every line — proves redaction did not corrupt them.
+    assert.ok(readEvents(log.file).some((e) => e.type === 'end'), 'lines remain valid JSON');
+  } finally {
+    delete process.env.BP_TEST_FAKE_TOKEN3;
+    delete process.env.BP_TEST_FAKE_KEY3;
+  }
+});
+
+// tool_use.input is an object, so it is serialized before redaction — the same
+// escaping trap as the run-log line, and the highest-risk field in the file.
+test('object payloads are redacted field-wise, so escaping cannot hide a secret', async () => {
+  process.env.BP_TEST_FAKE_TOKEN4 = 'quo"tedsecret54321';
+  try {
+    const log = createRunLog({ queryId: 'q-obj-escape', label: 'x', cwd: '/data/workspace' });
+    recordAssistantMessage(log, {
+      type: 'assistant',
+      message: {
+        content: [{
+          type: 'tool_use',
+          name: 'Bash',
+          id: 't1',
+          input: { command: 'curl -H "Authorization: token quo"tedsecret54321"' },
+        }],
+      },
+    });
+    log.close();
+    await flush();
+
+    const raw = fs.readFileSync(log.file, 'utf8');
+    assert.ok(!raw.includes('tedsecret54321'), 'secret never reaches disk in any escaped form');
+    assert.match(raw, /\[redacted:BP_TEST_FAKE_TOKEN4\]/);
+    const input = readEvents(log.file).find((e) => e.type === 'tool_use').input;
+    // Consumers JSON.parse this field; it must survive redaction as valid JSON.
+    assert.ok(!JSON.stringify(JSON.parse(input)).includes('tedsecret54321'));
+  } finally {
+    delete process.env.BP_TEST_FAKE_TOKEN4;
+  }
+});
+
+test('redacts credential-named fields in JSON form, not just shell form', () => {
+  const out = truncate('{"api_key": "abcdefgh12345678", "path": "/data/workspace"}', 10000);
+  assert.ok(!out.includes('abcdefgh12345678'), 'JSON-shaped credential is redacted');
+  assert.match(out, /api_key/);
+  assert.match(out, /\/data\/workspace/, 'benign neighbouring fields untouched');
+});
+
 test('close is idempotent — a second close writes no second end event', async () => {
   const log = createRunLog({ queryId: 'q-close', label: 'x', cwd: '/data/workspace' });
   await log.close({ subtype: 'success' });
