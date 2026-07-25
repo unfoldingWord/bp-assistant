@@ -344,6 +344,44 @@ test('event() redacts secrets containing JSON-escapable characters, and stays pa
   }
 });
 
+// tool_use.input is an object, so it is serialized before redaction — the same
+// escaping trap as the run-log line, and the highest-risk field in the file.
+test('object payloads are redacted field-wise, so escaping cannot hide a secret', async () => {
+  process.env.BP_TEST_FAKE_TOKEN4 = 'quo"tedsecret54321';
+  try {
+    const log = createRunLog({ queryId: 'q-obj-escape', label: 'x', cwd: '/data/workspace' });
+    recordAssistantMessage(log, {
+      type: 'assistant',
+      message: {
+        content: [{
+          type: 'tool_use',
+          name: 'Bash',
+          id: 't1',
+          input: { command: 'curl -H "Authorization: token quo"tedsecret54321"' },
+        }],
+      },
+    });
+    log.close();
+    await flush();
+
+    const raw = fs.readFileSync(log.file, 'utf8');
+    assert.ok(!raw.includes('tedsecret54321'), 'secret never reaches disk in any escaped form');
+    assert.match(raw, /\[redacted:BP_TEST_FAKE_TOKEN4\]/);
+    const input = readEvents(log.file).find((e) => e.type === 'tool_use').input;
+    // Consumers JSON.parse this field; it must survive redaction as valid JSON.
+    assert.ok(!JSON.stringify(JSON.parse(input)).includes('tedsecret54321'));
+  } finally {
+    delete process.env.BP_TEST_FAKE_TOKEN4;
+  }
+});
+
+test('redacts credential-named fields in JSON form, not just shell form', () => {
+  const out = truncate('{"api_key": "abcdefgh12345678", "path": "/data/workspace"}', 10000);
+  assert.ok(!out.includes('abcdefgh12345678'), 'JSON-shaped credential is redacted');
+  assert.match(out, /api_key/);
+  assert.match(out, /\/data\/workspace/, 'benign neighbouring fields untouched');
+});
+
 test('close is idempotent — a second close writes no second end event', async () => {
   const log = createRunLog({ queryId: 'q-close', label: 'x', cwd: '/data/workspace' });
   log.close({ subtype: 'success' });
