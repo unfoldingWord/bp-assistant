@@ -108,7 +108,12 @@ test('router publishes admin-status event when pipeline dispatch throws', async 
       content: 'write notes for psa 39',
     });
 
-    await new Promise((resolve) => setTimeout(resolve, 25));
+    // routeMessage dispatches the pipeline fire-and-forget, so the failure
+    // handler that publishes the admin-status event runs after routeMessage
+    // resolves. The write itself is synchronous (fs.appendFileSync), so the
+    // only thing to wait for is the microtask chain -- setImmediate is
+    // guaranteed to run after it has fully drained, with no timing guess.
+    await new Promise((resolve) => setImmediate(resolve));
     assert.equal(fs.existsSync(process.env.ADMIN_STATUS_FILE), true);
     const events = fs.readFileSync(process.env.ADMIN_STATUS_FILE, 'utf8')
       .split('\n')
