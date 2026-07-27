@@ -65,11 +65,18 @@ jobs:
     # See "ADVISORY MODE" above. This is the outer guard.
     continue-on-error: true
 
-    # automerge only waits 10 minutes for checks to complete before it gives up
-    # and fails (review-gate-automerge.yml line 60), and it treats a still-
-    # running check as pending (line 91). A hung suite must therefore finish --
-    # one way or another -- well inside that window. The suite takes seconds.
-    timeout-minutes: 8
+    # NOTE: the timeouts live on the STEPS, not here. A job-level
+    # `timeout-minutes` concludes the check as `timed_out`, which is not in
+    # automerge's okConclusions -- and continue-on-error does not rescue it,
+    # because it only prevents a *failed* job from failing the run, not a
+    # cancelled/timed-out one. A step-level timeout instead fails the step,
+    # which fails the job, which continue-on-error then converts to success.
+    #
+    # The budget matters: automerge waits only 10 minutes for checks to
+    # complete (review-gate-automerge.yml line 60) and treats a still-running
+    # check as pending (line 91), so a hang must resolve inside that window.
+    # Step timeouts below sum to ~7 minutes for the two steps that can
+    # realistically hang. The suite itself takes seconds.
 
     # Matches review-gate.yml's guard. Skipped jobs conclude as `skipped`, which
     # automerge tolerates.
@@ -87,8 +94,10 @@ jobs:
           cache: npm
 
       - run: npm ci
+        timeout-minutes: 4
 
       - name: Run tests (advisory -- does not gate)
+        timeout-minutes: 3
         run: |
           set +e
           npm test 2>&1 | tee test-output.log
