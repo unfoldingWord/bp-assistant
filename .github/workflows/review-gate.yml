@@ -275,12 +275,29 @@ jobs:
           # both the success marker (executePrReview's request block) and the
           # failure/fallback markers, and correctly distinguishes re-pushes of
           # the same PR number.
-          deadline=$((SECONDS + 180))
+          #
+          # The window is 10 minutes, not the original 3: back-to-back reviews on
+          # the shared machine were timing out at 180s and failing green PRs with
+          # a red gate (#282). A longer wait costs nothing when the marker lands
+          # early (we break immediately) and each spurious failure costs a full
+          # reviewer pass off the weekly Claude allowance on re-trigger.
+          poll_window=600
+          deadline=$((SECONDS + poll_window))
           marker_line=""
           attempt=0
+          fetch_failures=0
           while [ "$SECONDS" -lt "$deadline" ]; do
             attempt=$((attempt + 1))
-            flyctl logs --app "$FLY_APP_NAME" --no-tail > all-logs.txt 2>&1 || true
+            # Don't swallow the fetch status: a run of failed `flyctl logs` calls
+            # (rate limiting, expired token, Fly API outage) is a different
+            # diagnosis from "the marker has not propagated yet", and the old
+            # `|| true` made the two indistinguishable in the timeout report.
+            if ! flyctl logs --app "$FLY_APP_NAME" --no-tail > all-logs.txt 2>&1; then
+              fetch_failures=$((fetch_failures + 1))
+              echo "flyctl logs fetch failed (attempt ${attempt}); retrying in 10s..."
+              sleep 10
+              continue
+            fi
             marker_line="$(grep -E 'PR_REVIEW_RESULT:[[:space:]]*\{' all-logs.txt \
               | grep "\"headSha\":\"${HEAD_SHA}\"" \
               | tail -1 || true)"
@@ -292,8 +309,33 @@ jobs:
             sleep 10
           done
           if [ -z "$marker_line" ]; then
-            echo "No PR_REVIEW_RESULT marker found for PR #${PR_NUMBER} SHA ${HEAD_SHA} after ${attempt} attempts (~180s); the reviewer machine likely never emitted a result for this commit." >&2
-            tail -100 all-logs.txt >&2 || true
+            # This is a retrieval timeout, NOT a review verdict. Say so plainly:
+            # the previous wording ("the reviewer machine likely never emitted a
+            # result") plus a 100-line dump of whatever was in the shared log
+            # snapshot -- often another PR's review text -- read as though the
+            # gate had reviewed the wrong PR and failed it. It had not, and it
+            # cannot: the match above is scoped on this PR's head SHA.
+            {
+              echo "TIMEOUT reading the review result: no PR_REVIEW_RESULT marker for SHA ${HEAD_SHA} appeared in the Fly log snapshot within ~${poll_window}s (${attempt} attempts, ${fetch_failures} failed log fetches)."
+              echo
+              echo "This is NOT a review verdict. The reviewer did not report FAIL --"
+              echo "no verdict for this commit could be read at all. Re-run this workflow"
+              echo "to retry; the diff itself has not been judged by this run."
+              echo
+              if [ "$fetch_failures" = "$attempt" ]; then
+                echo "Every log fetch failed, so the Fly API (not log propagation) is the"
+                echo "likely cause. Last flyctl output:"
+                tail -20 all-logs.txt >&2 || true
+              else
+                echo "Head SHAs of the review markers that HAD propagated into the snapshot"
+                echo "(listed as propagation evidence only -- these belong to other runs and"
+                echo "have no bearing on this PR's verdict):"
+                grep -E 'PR_REVIEW_RESULT:[[:space:]]*\{' all-logs.txt \
+                  | grep -oE '"headSha":"[0-9a-f]{7,40}"' \
+                  | sort -u \
+                  | sed 's/^/  /' || echo "  (none)"
+              fi
+            } >&2
             exit 1
           fi
           review_json="$(printf '%s\n' "$marker_line" | sed -E 's/^.*PR_REVIEW_RESULT:[[:space:]]*//')"
