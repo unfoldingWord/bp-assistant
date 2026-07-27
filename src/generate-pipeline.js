@@ -1129,24 +1129,49 @@ async function generatePipeline(route, message) {
           const attemptNo = continuationAttempts.length + 1;
           const missingBefore = [...initialPipelineStatus.missing];
           const artifactsBefore = [...observedArtifacts];
+          // #251: the run claimed success but produced NOTHING — not even a
+          // temp artifact. There is no partial work to resume from, and the
+          // continuation prompt's "resume from the artifacts already on disk"
+          // instruction is then a contradiction: the agent has nothing to pick
+          // up, so it returns success again in seconds and the chapter fails.
+          // Restart the skill from scratch instead, once, on the first attempt.
+          // Later attempts still resume, because by then something exists.
+          const restartFromScratch = attemptNo === 1 && artifactsBefore.length === 0;
+          // Rebuilt here rather than reusing the `skillRef` defined for the
+          // initial invocation: that const lives in a sibling block, so
+          // referencing it from this loop throws a ReferenceError that this
+          // loop's own try/catch would swallow into a generic "exited before
+          // writing required outputs" failure.
+          const restartPrompt = hasVerseRange
+            ? `${book} ${ch}:${verseStart}-${verseEnd}`
+            : `${book} ${ch}`;
           await status(
-            `initial-pipeline returned success before final outputs for **${book} ${ch}**; ` +
-            `resuming the same session (attempt ${attemptNo}/${MAX_INITIAL_PIPELINE_CONTINUATIONS}) to finish missing outputs (${missingBefore.join(', ')}).`
+            restartFromScratch
+              ? `initial-pipeline returned success but wrote no output at all for **${book} ${ch}**; ` +
+                `nothing exists to resume from, so restarting the skill from scratch ` +
+                `(attempt ${attemptNo}/${MAX_INITIAL_PIPELINE_CONTINUATIONS}).`
+              : `initial-pipeline returned success before final outputs for **${book} ${ch}**; ` +
+                `resuming the same session (attempt ${attemptNo}/${MAX_INITIAL_PIPELINE_CONTINUATIONS}) to finish missing outputs (${missingBefore.join(', ')}).`
           );
           try {
             const continuationResult = await runClaude({
-              prompt: buildInitialPipelineContinuationPrompt({
+              prompt: restartFromScratch ? restartPrompt : buildInitialPipelineContinuationPrompt({
                 book,
                 chapter: ch,
                 missing: missingBefore,
                 observed: artifactsBefore,
               }),
-              label: `${book} ${ch} ${skill} (cont ${attemptNo})`,
+              // A restart is a fresh skill invocation, so it needs the skill
+              // name and must NOT carry the dead session forward.
+              skill: restartFromScratch ? skill : undefined,
+              label: restartFromScratch
+                ? `${book} ${ch} ${skill} (restart ${attemptNo})`
+                : `${book} ${ch} ${skill} (cont ${attemptNo})`,
               cwd: CSKILLBP_DIR,
               // Generation continuation — same `high` (Opus) default as the initial call.
               model: model || 'high',
               betas,
-              resume: resumeTargetSessionId,
+              resume: restartFromScratch ? null : resumeTargetSessionId,
               appendSystemPrompt: INITIAL_PIPELINE_COMPLETION_GUARDRAIL,
               tools: DEFAULT_BASH_TOOLS,
               enableBash: true,
