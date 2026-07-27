@@ -366,7 +366,21 @@ function buildOptions({
   // that halts sub-agents.
   //
   // Kill switch: BP_NO_BYPASS=1 sends opted-in runs down the restrictive branch.
-  if (bypassPermissions && process.env.BP_NO_BYPASS !== '1') {
+  //
+  // 2026-07-27 correction: on bypass runs the callback above is now a NO-OP. The SDK
+  // shadows it and says so on every bypass query — "[CLAUDE_SDK_CAN_USE_TOOL_SHADOWED]
+  // canUseTool will not be invoked: permissionMode 'bypassPermissions' auto-approves
+  // every tool call (except explicit deny rules) before the callback is consulted. To
+  // gate every tool call, use a PreToolUse hook instead." So #271's fix silently
+  // stopped covering sub-agents, and ZEC 12 reproduced EZK 19 exactly: parent calls
+  // succeeded 20:29:39-20:29:56, then the two align children's Bash and Read were
+  // denied with the canned "STOP and wait" at 20:29:59/20:30:00. Per the SDK's own
+  // instruction the allow-all now rides a PreToolUse hook (registered below with the
+  // other hooks) — the one surface that runs for every tool call, children included.
+  // canUseTool stays registered on bypass runs as a harmless belt-and-braces in case a
+  // future SDK un-shadows it; the hook is what actually enforces.
+  const bypassAllowAll = Boolean(bypassPermissions) && process.env.BP_NO_BYPASS !== '1';
+  if (bypassAllowAll) {
     options.permissionMode = 'bypassPermissions';
     options.allowDangerouslySkipPermissions = true;
     options.canUseTool = async (_toolName, input) => ({ behavior: 'allow', updatedInput: input });
@@ -482,8 +496,29 @@ function buildOptions({
       }
     }],
   };
+  // Allow-all for bypass runs (see the permission-strategy comment above). Ordered
+  // AFTER modelResolverMatcher so the resolver's `updatedInput` rewrite is emitted
+  // first; this matcher returns only a permission decision and never touches input,
+  // so the two compose. Applies to every tool call in the session tree — the whole
+  // point, since sub-agents are what the shadowed canUseTool stopped covering.
+  const bypassAllowAllMatcher = {
+    hooks: [async () => ({
+      hookSpecificOutput: {
+        hookEventName: 'PreToolUse',
+        permissionDecision: 'allow',
+        permissionDecisionReason: 'bypassPermissions run: trusted headless pipeline, tool universe bounded by `tools:`',
+      },
+    })],
+  };
   const existingPreToolUse = (options.hooks && options.hooks.PreToolUse) || [];
-  options.hooks = { ...(options.hooks || {}), PreToolUse: [...existingPreToolUse, modelResolverMatcher] };
+  options.hooks = {
+    ...(options.hooks || {}),
+    PreToolUse: [
+      ...existingPreToolUse,
+      modelResolverMatcher,
+      ...(bypassAllowAll ? [bypassAllowAllMatcher] : []),
+    ],
+  };
   // Phase 3 (pilot): opt-in Agent-SDK auto-compaction, default OFF. This is the
   // Agent SDK's CLI auto-compact (settings.autoCompactEnabled), NOT the raw
   // Messages-API `compact-2026-01-12` beta. Spread-merge so we don't clobber the
@@ -933,10 +968,11 @@ async function runClaudeOnce({
         } else if (action.type === 'abort_permission_wall') {
           permissionWallFired = true;
           console.error(
-            `${runnerPrefix} Aborting query — external permission wall: ${action.wallDenials} denial(s) of ` +
+            `${runnerPrefix} Aborting query — permission wall: ${action.wallDenials} denial(s) of ` +
             `wholesale-granted tool(s) (latest: ${action.tool}) with no productive tool result in between. ` +
-            `These cannot be allowlist misses, so the refusal originates above this process's permission ` +
-            `config and no local change can clear it (issue #271, EZK 19). Bailing in seconds instead of ` +
+            `These cannot be allowlist misses. Usual cause is a sub-agent falling back to the ` +
+            `load-degraded 'auto' classifier (issue #271, EZK 19, ZEC 12); it can also be an account-level ` +
+            `refusal above this process. Either way it is transient. Bailing in seconds instead of ` +
             `waiting out the ${PERMISSION_STALL_WINDOW_MS / 1000}s stall window, so the caller can back off ` +
             `and retry while the run has banked nothing.`
           );
@@ -1318,8 +1354,9 @@ async function runClaude(args) {
           if (!firstDowntimeNoticeSent) {
             firstDowntimeNoticeSent = true;
             await notifyAdminDowntime(
-              `[claude-runner] External permission wall detected (attempt ${attempt}) — every tool call is ` +
-              `being auto-denied from above this process's permission config. Backing off up to ` +
+              `[claude-runner] Permission wall detected (attempt ${attempt}) — tool calls are being ` +
+              `auto-denied, usually a sub-agent hitting the load-degraded 'auto' safety classifier. ` +
+              `Backing off up to ` +
               `${Math.round(PERMISSION_WALL_RETRY_WINDOW_MS / 60000)}min and retrying; no action needed unless ` +
               `this exhausts. Denials this attempt: ${result.wallDenials ?? '?'} (of ${result.totalPermissionDenials ?? '?'} total).`
             );
@@ -1334,8 +1371,9 @@ async function runClaude(args) {
         }
         await notifyAdminDowntime(
           `[claude-runner] Permission wall did NOT clear after ${Math.round(elapsed / 60000)}min and ` +
-          `${attempt} attempts. Giving up so the caller can fail cleanly — this is an external permission ` +
-          `refusal, not a pipeline bug; nothing in the allowlists can fix it.`
+          `${attempt} attempts. Giving up so the caller can fail cleanly — this is a permission refusal, ` +
+          `not a content/pipeline bug; nothing in the allowlists can fix it. Check the run log for ` +
+          `CLAUDE_SDK_CAN_USE_TOOL_SHADOWED and whether the bypass PreToolUse allow-all hook fired.`
         );
         console.error(
           `${labelPrefix} Permission wall persisted past the ${Math.round(PERMISSION_WALL_RETRY_WINDOW_MS / 60000)}min ` +

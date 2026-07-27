@@ -120,3 +120,94 @@ test('non-bypass runs route through the restrictive decideToolPermission', async
   assert.doesNotMatch(denied.message, /STOP what you are doing and wait/i);
   assert.match(denied.message, /workspace-tools CLI wrapper|continue with the task/i);
 });
+
+// 2026-07-27 (ZEC 12): the #271 fix above became a no-op. The SDK now shadows
+// `canUseTool` on bypassPermissions runs and says so on every query —
+// "[CLAUDE_SDK_CAN_USE_TOOL_SHADOWED] ... To gate every tool call, use a PreToolUse
+// hook instead." ZEC 12 then reproduced EZK 19 exactly: the align coordinator's own
+// calls succeeded 20:29:39-20:29:56, then the two children's Bash and Read were denied
+// with the canned "STOP and wait" text at 20:29:59/20:30:00 and the wall fired. So the
+// allow-all must ride a PreToolUse hook, which does run for children.
+function preToolUseHooks(options) {
+  return (options.hooks && options.hooks.PreToolUse) || [];
+}
+
+async function runPreToolUse(options, input) {
+  const outputs = [];
+  for (const matcher of preToolUseHooks(options)) {
+    for (const hook of matcher.hooks) outputs.push(await hook(input));
+  }
+  return outputs;
+}
+
+test('bypass runs install a PreToolUse allow-all hook (canUseTool is shadowed)', async () => {
+  const options = buildOptions({ cwd: '/data/workspace', bypassPermissions: true, enableBash: true });
+  const outputs = await runPreToolUse(options, {
+    tool_name: 'Read',
+    tool_input: { file_path: '/data/workspace/output/AI-UST/ZEC/ZEC-12.usfm' },
+  });
+  const decisions = outputs
+    .map((o) => o && o.hookSpecificOutput && o.hookSpecificOutput.permissionDecision)
+    .filter(Boolean);
+  assert.deepEqual(decisions, ['allow'], 'exactly one hook must decide, and it must allow');
+});
+
+test('the bypass allow-all hook covers every tool the wall denied', async () => {
+  const options = buildOptions({ cwd: '/data/workspace', bypassPermissions: true, enableBash: true });
+  for (const [tool, input] of EZK_19_DENIED_CALLS) {
+    const outputs = await runPreToolUse(options, { tool_name: tool, tool_input: input });
+    const allowed = outputs.some(
+      (o) => o && o.hookSpecificOutput && o.hookSpecificOutput.permissionDecision === 'allow'
+    );
+    assert.ok(allowed, `${tool} must be allowed by the PreToolUse hook`);
+  }
+});
+
+// The allow-all must not swallow the model-resolver's input rewrite: the resolver is
+// ordered first and returns `updatedInput`, the allow-all returns only a decision.
+test('the allow-all hook composes with the model-resolver rewrite', async () => {
+  const prev = process.env.BP_SUBAGENT_SPAWN_INTERVAL_MS;
+  process.env.BP_SUBAGENT_SPAWN_INTERVAL_MS = '0';
+  try {
+    const options = buildOptions({ cwd: '/data/workspace', bypassPermissions: true });
+    const outputs = await runPreToolUse(options, {
+      tool_name: 'Agent',
+      tool_input: { description: 'ULT alignment ZEC 12', model: 'high' },
+    });
+    const rewrite = outputs.find((o) => o && o.hookSpecificOutput && o.hookSpecificOutput.updatedInput);
+    assert.ok(rewrite, 'the model resolver must still emit its updatedInput');
+    assert.notEqual(rewrite.hookSpecificOutput.updatedInput.model, 'high', 'tier should resolve to a model');
+    const allowed = outputs.some(
+      (o) => o && o.hookSpecificOutput && o.hookSpecificOutput.permissionDecision === 'allow'
+    );
+    assert.ok(allowed, 'the allow-all must still decide on the same call');
+  } finally {
+    if (prev === undefined) delete process.env.BP_SUBAGENT_SPAWN_INTERVAL_MS;
+    else process.env.BP_SUBAGENT_SPAWN_INTERVAL_MS = prev;
+  }
+});
+
+test('non-bypass runs get NO allow-all hook — the restrictive decider still bounds them', async () => {
+  const options = buildOptions({ cwd: '/data/workspace', bypassPermissions: false, enableBash: true });
+  const outputs = await runPreToolUse(options, { tool_name: 'Bash', tool_input: { command: 'rm -rf /' } });
+  const decided = outputs.some(
+    (o) => o && o.hookSpecificOutput && o.hookSpecificOutput.permissionDecision
+  );
+  assert.equal(decided, false, 'a non-bypass run must not carry a blanket allow');
+});
+
+test('BP_NO_BYPASS=1 also drops the allow-all hook', async () => {
+  const prev = process.env.BP_NO_BYPASS;
+  process.env.BP_NO_BYPASS = '1';
+  try {
+    const options = buildOptions({ cwd: '/data/workspace', bypassPermissions: true, enableBash: true });
+    const outputs = await runPreToolUse(options, { tool_name: 'Read', tool_input: { file_path: '/data/workspace/x' } });
+    const decided = outputs.some(
+      (o) => o && o.hookSpecificOutput && o.hookSpecificOutput.permissionDecision
+    );
+    assert.equal(decided, false, 'the kill switch must revert to classifier-mediated auto');
+  } finally {
+    if (prev === undefined) delete process.env.BP_NO_BYPASS;
+    else process.env.BP_NO_BYPASS = prev;
+  }
+});
