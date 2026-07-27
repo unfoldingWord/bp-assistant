@@ -1,0 +1,106 @@
+name: Tests
+
+# Runs the unit suite on every PR and on main.
+#
+# ADVISORY MODE (current): this job always exits 0, even when tests fail. The
+# result is published to the run summary, not enforced. Do not "fix" this by
+# removing the `|| true` handling until the suite is actually green on Linux --
+# see the WHY below, it is load-bearing.
+#
+# WHY advisory: review-gate-automerge.yml treats any check run whose conclusion
+# is not success/neutral/skipped as fatal (see its `okConclusions` set and the
+# `checkFailed` branch, which calls core.setFailed). A red check here would
+# therefore abort automerge on every PR and stall the agent pipeline. The suite
+# is known-red on Linux today: ~230 call sites across 10 test files write to
+# hardcoded production paths (/srv/bot/workspace, /data/workspace) that do not
+# exist on a CI runner, so they fail with EACCES.
+#
+# The plan is to migrate those tests to temp dirs, then flip this job to
+# hard-fail and make it a required check. That flip is a deliberate, separate
+# change -- it is the step that starts gating merges and deploys.
+#
+# On `pull_request`, actions/checkout resolves refs/pull/N/merge -- the PR
+# already merged into the base branch -- so this tests the MERGE RESULT, not the
+# branch head. That is the case that matters: PRs #274 and #275 were each green
+# alone and broke main together.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  push:
+    branches:
+      - main
+
+# Distinct from the review-gate groups on purpose. GitHub holds only one pending
+# entry per group, so sharing a group with those workflows would let one evict
+# the other's queued run.
+concurrency:
+  group: tests-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Node 22 matches the build stage in Dockerfile (`FROM node:22-slim`).
+      # Keep these in step: a suite that passes here but not in the image is
+      # worse than no signal at all.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      - run: npm ci
+
+      - name: Run tests (advisory -- does not gate)
+        id: tests
+        run: |
+          set +e
+          npm test 2>&1 | tee test-output.log
+          status=${PIPESTATUS[0]}
+          set -e
+
+          {
+            echo "## Test results"
+            echo
+            if [ "$status" -eq 0 ]; then
+              echo ":white_check_mark: Suite passed."
+              echo
+              echo "The suite is green. It is now worth flipping this job out of"
+              echo "advisory mode and making it a required check -- see the"
+              echo "comment at the top of .github/workflows/test.yml."
+            else
+              echo ":x: Suite failed (exit $status) -- **not blocking**, this job is advisory."
+              echo
+              echo "Advisory mode is intentional while the hardcoded-production-path"
+              echo "migration is in flight. See .github/workflows/test.yml."
+            fi
+            echo
+            echo '```'
+            grep -E '^(# )?(tests|pass|fail|cancelled|skipped) [0-9]+' test-output.log | tail -10 || true
+            echo '```'
+            echo
+            echo "<details><summary>Failing tests</summary>"
+            echo
+            echo '```'
+            grep -E '^not ok' test-output.log | head -40 || echo '(none)'
+            echo '```'
+            echo
+            echo "</details>"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          # Always succeed. See the WHY at the top of this file.
+          exit 0
+
+      - name: Upload test log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-output
+          path: test-output.log
+          retention-days: 14
