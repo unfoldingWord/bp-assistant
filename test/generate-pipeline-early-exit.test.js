@@ -360,6 +360,91 @@ test('generatePipeline retries the continuation when an attempt progresses but s
   }
 });
 
+// #251: initial-pipeline returned success having written nothing at all --
+// not even a Wave-2 temp file. Resuming that session asks the agent to
+// "continue from the artifacts already on disk" when there are none, so it
+// returns success again in seconds and the chapter hard-fails. The first
+// attempt must restart the skill from scratch instead of resuming.
+test('generatePipeline restarts initial-pipeline from scratch when the run produced zero artifacts (#251)', async () => {
+  const calls = [];
+  const harness = createHarness({
+    runClaudeImpl: async ({ options, tempDir }) => {
+      calls.push({ skill: options.skill, resume: options.resume, prompt: options.prompt });
+      // First call: claim success, write absolutely nothing.
+      if (calls.length === 1) {
+        return { subtype: 'success', usage: {}, total_cost_usd: 0, session_id: 'session-isa-52', num_turns: 2, duration_ms: 9000 };
+      }
+      // Second call must be a fresh skill invocation, not a resume.
+      fs.mkdirSync(path.join(tempDir, 'output', 'AI-ULT', 'ISA'), { recursive: true });
+      fs.mkdirSync(path.join(tempDir, 'output', 'AI-UST', 'ISA'), { recursive: true });
+      fs.mkdirSync(path.join(tempDir, 'output', 'issues', 'ISA'), { recursive: true });
+      fs.writeFileSync(path.join(tempDir, 'output', 'AI-ULT', 'ISA', 'ISA-52.usfm'), '\\id ISA\n\\c 52\n\\v 1 ult\n');
+      fs.writeFileSync(path.join(tempDir, 'output', 'AI-UST', 'ISA', 'ISA-52.usfm'), '\\id ISA\n\\c 52\n\\v 1 ust\n');
+      fs.writeFileSync(path.join(tempDir, 'output', 'issues', 'ISA', 'ISA-52.tsv'), 'isa\t52:1\tfigs-activepassive\tYou were sold\n');
+      return { subtype: 'success', usage: {}, total_cost_usd: 0, session_id: 'session-isa-52-restart' };
+    },
+  });
+
+  try {
+    await harness.generatePipeline(
+      { _synthetic: true, _book: 'ISA', _startChapter: 52, _endChapter: 52, skill: 'initial-pipeline', operations: 6 },
+      buildMessage('generate isa 52')
+    );
+
+    assert.equal(calls.length, 2, 'one initial call plus one restart');
+    // The restart is the whole point: fresh skill, no resume, plain chapter ref
+    // rather than the "continue from what is on disk" prompt.
+    assert.equal(calls[1].skill, 'initial-pipeline');
+    assert.equal(calls[1].resume, null);
+    assert.equal(calls[1].prompt, 'ISA 52');
+    assert.doesNotMatch(calls[1].prompt, /Continue the existing initial-pipeline run/);
+
+    const statusTexts = harness.readStatusTexts();
+    assert.ok(statusTexts.some((t) => t.includes('wrote no output at all')), 'operator is told why it restarted');
+    assert.ok(statusTexts.some((t) => t.includes('restarting the skill from scratch')));
+    assert.equal(harness.runSummaries.at(-1).success, true);
+  } finally {
+    harness.cleanup();
+  }
+});
+
+// The counterpart: when SOMETHING exists, resuming is still correct and the
+// restart branch must not fire.
+test('generatePipeline still resumes rather than restarting when partial artifacts exist (#251)', async () => {
+  const calls = [];
+  const harness = createHarness({
+    runClaudeImpl: async ({ options, tempDir }) => {
+      calls.push({ skill: options.skill, resume: options.resume });
+      if (calls.length === 1) {
+        // Partial progress: a ULT exists, so there IS something to resume from.
+        fs.mkdirSync(path.join(tempDir, 'output', 'AI-ULT', 'ISA'), { recursive: true });
+        fs.writeFileSync(path.join(tempDir, 'output', 'AI-ULT', 'ISA', 'ISA-52.usfm'), '\\id ISA\n\\c 52\n\\v 1 ult\n');
+        return { subtype: 'success', usage: {}, total_cost_usd: 0, session_id: 'session-isa-52' };
+      }
+      fs.mkdirSync(path.join(tempDir, 'output', 'AI-UST', 'ISA'), { recursive: true });
+      fs.mkdirSync(path.join(tempDir, 'output', 'issues', 'ISA'), { recursive: true });
+      fs.writeFileSync(path.join(tempDir, 'output', 'AI-UST', 'ISA', 'ISA-52.usfm'), '\\id ISA\n\\c 52\n\\v 1 ust\n');
+      fs.writeFileSync(path.join(tempDir, 'output', 'issues', 'ISA', 'ISA-52.tsv'), 'isa\t52:1\tfigs-activepassive\tYou were sold\n');
+      return { subtype: 'success', usage: {}, total_cost_usd: 0, session_id: 'session-isa-52' };
+    },
+  });
+
+  try {
+    await harness.generatePipeline(
+      { _synthetic: true, _book: 'ISA', _startChapter: 52, _endChapter: 52, skill: 'initial-pipeline', operations: 6 },
+      buildMessage('generate isa 52')
+    );
+
+    assert.equal(calls[1].resume, 'session-isa-52', 'resumed, not restarted');
+    assert.equal(calls[1].skill, undefined);
+    const statusTexts = harness.readStatusTexts();
+    assert.ok(statusTexts.some((t) => t.includes('resuming the same session')));
+    assert.equal(statusTexts.some((t) => t.includes('restarting the skill from scratch')), false);
+  } finally {
+    harness.cleanup();
+  }
+});
+
 test('generatePipeline accepts initial-pipeline success when final ULT, issues, and UST outputs exist', async () => {
   const harness = createHarness({
     runClaudeImpl: async ({ options, tempDir }) => {
