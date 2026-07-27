@@ -7,7 +7,19 @@ const { isAgentTool } = require('./agent-tools');
 const { MAX_DEPTH } = require('./team-manager');
 
 const PROVIDERS = {
-  gemini: () => require('./providers/gemini'),
+  // Gemini is retired -- we no longer run any pipeline through it. Disabled
+  // rather than deleted so it is one line to bring back. Selecting it now
+  // fails fast with a clear message instead of silently falling through to a
+  // provider nobody exercises.
+  //
+  // NOTE: this is the @google/genai npm provider only. It is NOT the "Gemini
+  // review wave" in the initial-pipeline, which shells out to a separate
+  // Python script (gemini_review.py) driving the Gemini CLI. That wave is
+  // untouched by this change.
+  //
+  // To restore: uncomment the line below, and restore the 'gemini' defaults
+  // in runner.js and runtime-config.js that this commit repointed at openai.
+  // gemini: () => require('./providers/gemini'),
   openai: () => require('./providers/openai'),
   groq: () => require('./providers/openai-compat').forGroq(),
   deepseek: () => require('./providers/openai-compat').forDeepSeek(),
@@ -67,6 +79,13 @@ async function runAgentLoop({
   lockProvider = false,
   toolSchemas,
 }) {
+  if (!PROVIDERS[providerName]) {
+    const known = Object.keys(PROVIDERS).join(', ');
+    const retired = providerName === 'gemini'
+      ? ' Gemini was retired; re-enable it in the PROVIDERS map in this file if you need it back.'
+      : '';
+    throw new Error(`Unknown provider "${providerName}". Known providers: ${known}.${retired}`);
+  }
   const providerMod = PROVIDERS[providerName]();
 
   // Determine which tools are available at this depth

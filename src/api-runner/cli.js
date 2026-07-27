@@ -28,7 +28,7 @@ try {
 
 function parseArgs(argv) {
   const args = {
-    provider: 'gemini',
+    provider: 'openai',
     runtime: DEFAULT_RUNTIME,
     model: null,
     thinking: 'medium',
