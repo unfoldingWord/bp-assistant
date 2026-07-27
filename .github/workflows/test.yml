@@ -83,12 +83,18 @@ jobs:
     if: ${{ !github.event.pull_request.draft }}
 
     steps:
+      # Every step that touches the network is bounded, for the reason in the
+      # NOTE above: an unbounded hang anywhere leaves the check pending past
+      # automerge's 10-minute budget, which fails it just as surely as a red
+      # conclusion would.
       - uses: actions/checkout@v4
+        timeout-minutes: 2
 
       # Node 22 matches the Dockerfile build stage (`FROM node:22-slim`). Keep
       # these in step: a suite that passes here but not in the image is worse
       # than no signal at all.
       - uses: actions/setup-node@v4
+        timeout-minutes: 3
         with:
           node-version: '22'
           cache: npm
