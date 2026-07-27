@@ -2,27 +2,37 @@ name: Tests
 
 # Runs the unit suite on every PR and on main.
 #
-# ADVISORY MODE (current): this job always exits 0, even when tests fail. The
-# result is published to the run summary, not enforced. Do not "fix" this by
-# removing the `|| true` handling until the suite is actually green on Linux --
-# see the WHY below, it is load-bearing.
+# ADVISORY MODE (current): this job never reports failure, even when tests fail.
+# Results go to the run summary. Do not remove the advisory machinery until the
+# suite is green on Linux -- it is load-bearing, see WHY below.
 #
-# WHY advisory: review-gate-automerge.yml treats any check run whose conclusion
-# is not success/neutral/skipped as fatal (see its `okConclusions` set and the
-# `checkFailed` branch, which calls core.setFailed). A red check here would
-# therefore abort automerge on every PR and stall the agent pipeline. The suite
-# is known-red on Linux today: ~230 call sites across 10 test files write to
-# hardcoded production paths (/srv/bot/workspace, /data/workspace) that do not
-# exist on a CI runner, so they fail with EACCES.
+# WHY advisory: review-gate-automerge.yml treats any check run on the PR head
+# SHA whose conclusion is not success/neutral/skipped as fatal -- see its
+# `okConclusions` set (line 62) and the `checkFailed` branch (line 92) that
+# calls core.setFailed. Check runs from a pull_request workflow attach to the PR
+# HEAD sha (confirmed via the check-runs API), which is exactly the ref
+# automerge polls. So a red check here stalls automerge on every PR and blocks
+# the agent pipeline. The suite is known-red on Linux today: ~230 call sites
+# across 10 test files write to hardcoded production paths (/srv/bot/workspace,
+# /data/workspace) that do not exist on a runner, failing with EACCES.
 #
-# The plan is to migrate those tests to temp dirs, then flip this job to
-# hard-fail and make it a required check. That flip is a deliberate, separate
-# change -- it is the step that starts gating merges and deploys.
+# Advisory is enforced in TWO independent places, deliberately redundant because
+# each covers a failure the other does not:
+#   1. `continue-on-error: true` on the job -- covers steps outside the test
+#      step. Without it, a transient `npm ci` or setup-node failure concludes
+#      the check as failure and kills automerge. That inversion (infra noise
+#      fatal, real test failures ignored) is the trap this guards.
+#   2. `exit 0` in the test step -- keeps the step itself green so the common
+#      case does not depend on continue-on-error's exact conclusion semantics.
 #
-# On `pull_request`, actions/checkout resolves refs/pull/N/merge -- the PR
-# already merged into the base branch -- so this tests the MERGE RESULT, not the
-# branch head. That is the case that matters: PRs #274 and #275 were each green
-# alone and broke main together.
+# Flipping to hard-fail (remove both, then make this a required check) is a
+# deliberate later step, after the tests move to temp dirs. That flip is what
+# starts gating merges and deploys.
+#
+# On pull_request, actions/checkout resolves refs/pull/N/merge -- the PR already
+# merged into the base -- so this tests the MERGE RESULT, not the branch head.
+# That is the case nothing was checking: #274 and #275 were each green alone and
+# broke main together.
 
 on:
   pull_request:
@@ -31,12 +41,19 @@ on:
     branches:
       - main
 
-# Distinct from the review-gate groups on purpose. GitHub holds only one pending
-# entry per group, so sharing a group with those workflows would let one evict
-# the other's queued run.
+# cancel-in-progress is deliberately FALSE. A cancelled run concludes as
+# `cancelled`, which is not in automerge's okConclusions -- and `reopened` /
+# `ready_for_review` fire WITHOUT changing the head SHA, so a cancelled run
+# would strand a fatal check on the very SHA automerge inspects, with the drift
+# guard unable to excuse it. Letting duplicate runs finish is far cheaper than
+# stalling the merge pipeline.
+#
+# The group is also distinct from the review-gate groups on purpose: GitHub
+# holds only one pending entry per group, so sharing one would let these
+# workflows evict each other's queued runs.
 concurrency:
   group: tests-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 permissions:
   contents: read
@@ -44,12 +61,26 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-latest
+
+    # See "ADVISORY MODE" above. This is the outer guard.
+    continue-on-error: true
+
+    # automerge only waits 10 minutes for checks to complete before it gives up
+    # and fails (review-gate-automerge.yml line 60), and it treats a still-
+    # running check as pending (line 91). A hung suite must therefore finish --
+    # one way or another -- well inside that window. The suite takes seconds.
+    timeout-minutes: 8
+
+    # Matches review-gate.yml's guard. Skipped jobs conclude as `skipped`, which
+    # automerge tolerates.
+    if: ${{ !github.event.pull_request.draft }}
+
     steps:
       - uses: actions/checkout@v4
 
-      # Node 22 matches the build stage in Dockerfile (`FROM node:22-slim`).
-      # Keep these in step: a suite that passes here but not in the image is
-      # worse than no signal at all.
+      # Node 22 matches the Dockerfile build stage (`FROM node:22-slim`). Keep
+      # these in step: a suite that passes here but not in the image is worse
+      # than no signal at all.
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
@@ -58,12 +89,14 @@ jobs:
       - run: npm ci
 
       - name: Run tests (advisory -- does not gate)
-        id: tests
         run: |
           set +e
           npm test 2>&1 | tee test-output.log
           status=${PIPESTATUS[0]}
           set -e
+
+          counts=$(grep -E '^(# )?(tests|pass|fail|cancelled|skipped) [0-9]+' test-output.log | tail -10)
+          failures=$(grep -E '^not ok' test-output.log | head -40)
 
           {
             echo "## Test results"
@@ -71,9 +104,9 @@ jobs:
             if [ "$status" -eq 0 ]; then
               echo ":white_check_mark: Suite passed."
               echo
-              echo "The suite is green. It is now worth flipping this job out of"
-              echo "advisory mode and making it a required check -- see the"
-              echo "comment at the top of .github/workflows/test.yml."
+              echo "The suite is green. It is now worth taking this job out of advisory"
+              echo "mode and making it a required check -- see the header comment in"
+              echo ".github/workflows/test.yml for what that involves."
             else
               echo ":x: Suite failed (exit $status) -- **not blocking**, this job is advisory."
               echo
@@ -82,19 +115,19 @@ jobs:
             fi
             echo
             echo '```'
-            grep -E '^(# )?(tests|pass|fail|cancelled|skipped) [0-9]+' test-output.log | tail -10 || true
+            echo "${counts:-(no test counts found -- did the suite start?)}"
             echo '```'
             echo
             echo "<details><summary>Failing tests</summary>"
             echo
             echo '```'
-            grep -E '^not ok' test-output.log | head -40 || echo '(none)'
+            echo "${failures:-(none)}"
             echo '```'
             echo
             echo "</details>"
           } >> "$GITHUB_STEP_SUMMARY"
 
-          # Always succeed. See the WHY at the top of this file.
+          # Inner guard -- see "ADVISORY MODE" in the header.
           exit 0
 
       - name: Upload test log
