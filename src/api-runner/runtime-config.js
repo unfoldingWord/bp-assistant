@@ -11,7 +11,7 @@ function normalizeRuntime(runtime) {
 }
 
 function resolveRuntime(provider, runtime) {
-  const resolvedProvider = String(provider || 'gemini').trim().toLowerCase();
+  const resolvedProvider = String(provider || 'openai').trim().toLowerCase();
   const resolvedRuntime = normalizeRuntime(runtime);
 
   if (!VALID_RUNTIMES.has(resolvedRuntime)) {

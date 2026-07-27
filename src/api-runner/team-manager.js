@@ -269,7 +269,7 @@ function resolveAgentProvider(opts, parentOpts) {
   if (parentOpts?.lockProvider && parentOpts?.provider) {
     return parentOpts.provider;
   }
-  return opts.provider || parentOpts.provider || 'gemini';
+  return opts.provider || parentOpts.provider || 'openai';
 }
 
 function resolveAgentRuntime(opts, parentOpts) {

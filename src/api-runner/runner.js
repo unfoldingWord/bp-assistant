@@ -30,7 +30,7 @@ const { getProviderConfig } = require('./provider-config');
  */
 async function runSkill(name, prompt, opts = {}) {
   const cwd = opts.cwd || '/srv/bot/workspace';
-  const provider = opts.provider || 'gemini';
+  const provider = opts.provider || 'openai';
   const runtime = resolveRuntime(provider, opts.runtime);
 
   if (provider === 'openai' && runtime === 'openai-native') {
@@ -72,7 +72,7 @@ async function runCustom(systemText, prompt, opts = {}) {
     return dryRun(system, prompt, opts);
   }
 
-  const provider = opts.provider || 'gemini';
+  const provider = opts.provider || 'openai';
   return runWithSystem(system, prompt, {
     ...opts,
     provider,
@@ -80,7 +80,7 @@ async function runCustom(systemText, prompt, opts = {}) {
 }
 
 async function runWithSystem(system, prompt, opts = {}) {
-  const provider = opts.provider || 'gemini';
+  const provider = opts.provider || 'openai';
   const cwd = opts.cwd || '/srv/bot/workspace';
   const runtime = resolveRuntime(provider, opts.runtime);
   const runner = runtime === 'openai-native' ? runOpenAiNative : runAgentLoop;
@@ -135,7 +135,7 @@ function dryRun(system, prompt, opts) {
   console.log('\n--- User Message ---');
   console.log(prompt);
   console.log('\n--- Options ---');
-  console.log(`Provider: ${opts.provider || 'gemini'}`);
+  console.log(`Provider: ${opts.provider || 'openai'}`);
   console.log(`Runtime: ${opts.runtime || DEFAULT_RUNTIME}`);
   console.log(`Model: ${opts.model || '(default)'}`);
   console.log(`Thinking: ${opts.thinking || 'medium'}`);
