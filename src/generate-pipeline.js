@@ -843,6 +843,11 @@ async function generatePipeline(route, message) {
       resumeMode === 'continue_after_early_exit' &&
       !!resumeSessionId
     );
+    // Set when a `continue_after_early_exit` checkpoint resumes a chapter that
+    // has no artifacts at all: the resume is then downgraded to a from-scratch
+    // skill invocation, so downstream logic must treat it as a fresh run rather
+    // than a continuation (#251).
+    let resumeEarlyExitDowngradedToRestart = false;
     let directUstContext = null;
     let directUstUltPath = null;
 
@@ -911,14 +916,32 @@ async function generatePipeline(route, message) {
             ...Object.values(resumeStatus.found),
             ...resumeStatus.observedTempArtifacts,
           ];
-          initialPrompt = buildInitialPipelineContinuationPrompt({
-            book,
-            chapter: ch,
-            missing: resumeStatus.missing,
-            observed: observedArtifacts,
-          });
-          invocationSkill = null;
-          invocationResume = resumeSessionId;
+          // #251: a `continue_after_early_exit` checkpoint can point at a run
+          // that produced NOTHING — no final outputs and no tmp/pipeline-*
+          // artifacts. The continuation prompt tells the agent to "resume from
+          // the artifacts already on disk" and forbids the slash command, so
+          // with an empty disk it is a contradiction: the agent concludes there
+          // is nothing to continue and returns success in seconds. The in-loop
+          // recovery below already restarts from scratch in that situation;
+          // this path must do the same, otherwise a manual/checkpoint resume
+          // burns a full skill timeout on a call that cannot possibly succeed
+          // before reaching that loop.
+          if (observedArtifacts.length === 0) {
+            resumeEarlyExitDowngradedToRestart = true;
+            console.log(
+              `[generate] initial-pipeline early-exit checkpoint for ${book} ${ch} has zero artifacts; ` +
+              'restarting the skill from scratch instead of resuming a session with nothing to continue.'
+            );
+          } else {
+            initialPrompt = buildInitialPipelineContinuationPrompt({
+              book,
+              chapter: ch,
+              missing: resumeStatus.missing,
+              observed: observedArtifacts,
+            });
+            invocationSkill = null;
+            invocationResume = resumeSessionId;
+          }
         }
         if (skill === 'UST-gen') {
           const existingUlt = resolveOutputFile(`output/AI-ULT/${hasVerseRange ? `${book}-${ch}-vv${verseStart}-${verseEnd}` : `${book}-${ch}`}.usfm`, book)
@@ -1014,7 +1037,11 @@ async function generatePipeline(route, message) {
     const chPat = new RegExp(`^${book}-0*${ch}(-(?!.*aligned).*)?\.usfm$`);
     // Single-verse runs may leave the UST unchanged (Claude deems existing content sufficient).
     // In that case freshness is not a useful signal — just check that the file exists.
-    const freshnessMs = (runInitialSkill && !hasVerseRange && !resumeInitialPipelineEarlyExit) ? chapterStart : null;
+    // A zero-artifact early-exit checkpoint was downgraded to a from-scratch
+    // restart above, so it is a fresh run and the freshness filter still
+    // applies — only a genuine continuation should skip it (#251).
+    const resumedAsContinuation = resumeInitialPipelineEarlyExit && !resumeEarlyExitDowngradedToRestart;
+    const freshnessMs = (runInitialSkill && !hasVerseRange && !resumedAsContinuation) ? chapterStart : null;
     let ultRel = discoverFreshOutput('output/AI-ULT', book, chPat, freshnessMs);
     let ustRel = discoverFreshOutput('output/AI-UST', book, chPat, freshnessMs);
     let hasUlt = !!ultRel;

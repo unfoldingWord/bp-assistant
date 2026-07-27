@@ -534,6 +534,64 @@ test('generatePipeline resumes initial-pipeline early-exit checkpoint without de
   }
 });
 
+// #251: the same zero-progress dead end as the in-loop case, but reached via a
+// checkpoint-based manual resume. With nothing on disk there is nothing to
+// "continue from", so the resume must be downgraded to a from-scratch skill
+// invocation rather than burning a full skill timeout on a doomed continuation.
+test('generatePipeline restarts from scratch when an early-exit checkpoint has zero artifacts (#251)', async () => {
+  const initialCheckpoint = {
+    state: 'failed',
+    success: 0,
+    fail: 1,
+    completedChapters: [],
+    current: {
+      chapter: 18,
+      skill: 'initial-pipeline',
+      status: 'failed',
+      errorKind: 'initial_pipeline_early_exit',
+      missingOutputs: ['ULT', 'issues TSV', 'UST'],
+      observedArtifacts: [],
+    },
+    resume: {
+      chapter: 18,
+      skill: 'initial-pipeline',
+      sessionId: 'session-ezk-18',
+      mode: 'continue_after_early_exit',
+    },
+  };
+  const harness = createHarness({
+    initialCheckpoint,
+    runClaudeImpl: async ({ tempDir }) => {
+      fs.mkdirSync(path.join(tempDir, 'output', 'AI-ULT', 'EZK'), { recursive: true });
+      fs.mkdirSync(path.join(tempDir, 'output', 'AI-UST', 'EZK'), { recursive: true });
+      fs.mkdirSync(path.join(tempDir, 'output', 'issues', 'EZK'), { recursive: true });
+      fs.writeFileSync(path.join(tempDir, 'output', 'AI-ULT', 'EZK', 'EZK-18.usfm'), '\\id EZK\n\\c 18\n\\v 1 ult\n');
+      fs.writeFileSync(path.join(tempDir, 'output', 'AI-UST', 'EZK', 'EZK-18.usfm'), '\\id EZK\n\\c 18\n\\v 1 ust\n');
+      fs.writeFileSync(path.join(tempDir, 'output', 'issues', 'EZK', 'EZK-18.tsv'), 'ezk\t18:1\tfigs-idiom\tthe soul who sins\n');
+      return { subtype: 'success', usage: {}, total_cost_usd: 0, session_id: 'session-ezk-18' };
+    },
+  });
+
+  try {
+    await harness.generatePipeline(
+      { _synthetic: true, _book: 'EZK', _startChapter: 18, _endChapter: 18, skill: 'initial-pipeline', operations: 6 },
+      buildMessage('generate ezk 18')
+    );
+
+    const calls = harness.runClaudeCalls;
+    assert.equal(calls.length, 1, 'the restart alone should satisfy the outputs — no continuation needed');
+    // The downgrade is the point: fresh skill invocation, dead session dropped.
+    assert.equal(calls[0].skill, 'initial-pipeline', 'restarted via the skill, not a bare resume');
+    assert.ok(!calls[0].resume, 'the dead session must not be carried forward');
+    assert.equal(calls[0].prompt, 'EZK 18', 'plain chapter ref, not a continuation prompt');
+    assert.doesNotMatch(calls[0].prompt, /Continue the existing initial-pipeline run/);
+    assert.equal(harness.diagnosisCalls.length, 0);
+    assert.equal(harness.runSummaries.at(-1).success, true);
+  } finally {
+    harness.cleanup();
+  }
+});
+
 test('generatePipeline does not apply initial-pipeline guardrails to direct ULT-only runs', async () => {
   const harness = createHarness({
     runClaudeImpl: async ({ options, tempDir }) => {
