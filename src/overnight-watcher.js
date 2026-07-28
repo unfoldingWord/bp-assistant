@@ -3,7 +3,9 @@
 // Detects human edits merged overnight into the `-be-` branches of ULT/UST/TN
 // on Door43 (self-hosted Gitea), attributes them to editors, and emits an
 // attributed, read-only proposal feed that the Dreamer consumes
-// (output/overnight-review/<date>/proposals.jsonl). It does NOT write the
+// (data/overnight-review/<date>/proposals.jsonl — matches the `outDir` below and
+// the Dreamer's own read path; this comment said `output/` until 2026-07-28 and
+// the mismatch briefly read as a real broken-feed bug). It does NOT write the
 // preference store — it only surfaces signal.
 //
 // Detection is robust to overnight branch deletion:
