@@ -216,6 +216,91 @@ test('runOvernightReview defers a unit on transient fetch failure (not marked re
   assert.equal(saved.lastRun, '2026-06-20T00:00:00Z'); // watermark held (not advanced)
 });
 
+// --- dry-run state persistence (#OVERNIGHT-STATE) ---------------------------
+// A dry run must still persist state (watermark + reviewed keys): dry-run
+// means "don't take actions" (don't write the proposal feed), NOT "don't
+// remember anything". Gating state.saveState behind `!dryRun` meant every
+// dry run cold-started forever — 34 consecutive nightly no-ops.
+test('a dry-run cold start still persists state, so a second dry run does not cold-start again', async () => {
+  // A path-agnostic single-slot fake "disk": mirrors the style of the other
+  // tests in this file (which key off a regex on the path, not the literal
+  // string), since path.join produces backslashes on Windows.
+  let stateContent = null;
+  const readFileSync = (p) => {
+    if (/state\.json$/.test(p) && stateContent != null) return stateContent;
+    throw new Error('ENOENT');
+  };
+  const writeFileSync = (p, content) => { if (/state\.json$/.test(p)) stateContent = content; };
+  const prs = { en_tn: [{ number: 5, merged: true, merged_at: '2026-06-23T10:00:00Z', head: { ref: 'PSA-be-pjoakes', sha: 'head5' }, base: { sha: 'base5' }, user: { login: 'pjoakes' } }] };
+
+  const first = await watcher.runOvernightReview({
+    skillsRepo: '/skills', now: new Date('2026-06-24T07:00:00Z'), dryRun: true,
+    deps: {
+      readFileSync, writeFileSync, mkdirSync: () => {},
+      apiGetImpl: fakeApiGet(prs, {}), fetchTextImpl: async () => '', log: () => {},
+    },
+  });
+  assert.equal(first.coldStart, true);
+  assert.equal(first.genuineFirstRun, true); // no prior state file at all
+  assert.equal(first.dryRun, true);
+  assert.equal(first.proposalsPath, null); // dry-run still suppresses the proposal feed
+
+  assert.ok(stateContent, 'dry run must still write state.json');
+  assert.ok(JSON.parse(stateContent).initialized);
+
+  // A second dry run, reading the now-persisted state, must NOT report a cold
+  // start again — this is the exact bug: cold start hid behind "green" forever.
+  const second = await watcher.runOvernightReview({
+    skillsRepo: '/skills', now: new Date('2026-06-25T07:00:00Z'), dryRun: true,
+    deps: {
+      readFileSync, writeFileSync, mkdirSync: () => {},
+      apiGetImpl: fakeApiGet({}, {}), fetchTextImpl: async () => '', log: () => {},
+    },
+  });
+  assert.equal(second.coldStart, false);
+});
+
+test('a dry run advances the reviewed watermark for newly reviewed units without writing the proposal feed', async () => {
+  let stateContent = JSON.stringify({
+    version: 1, initialized: true, lastRun: '2026-06-20T00:00:00Z', reviewed: {}, branchTips: {},
+  });
+  const readFileSync = (p) => { if (/state\.json$/.test(p)) return stateContent; throw new Error('ENOENT'); };
+  const writeFileSync = (p, content) => { if (/state\.json$/.test(p)) stateContent = content; };
+  const prs = { en_tn: [{ number: 9, merged: true, merged_at: '2026-06-23T22:00:00Z', head: { ref: 'PSA-be-pjoakes', sha: 'newhead' }, base: { sha: 'oldbase' }, user: { login: 'pjoakes' } }] };
+
+  const res = await watcher.runOvernightReview({
+    skillsRepo: '/skills', now: new Date('2026-06-24T07:00:00Z'), dryRun: true,
+    deps: {
+      readFileSync, writeFileSync, mkdirSync: () => {},
+      apiGetImpl: fakeApiGet(prs, {}), fetchTextImpl: async () => '', log: () => {},
+    },
+  });
+  assert.equal(res.coldStart, false);
+  assert.equal(res.dryRun, true);
+  assert.equal(res.reviewed, 1);
+  assert.equal(res.proposalsPath, null); // the feed itself stays suppressed on dry-run
+
+  const saved = JSON.parse(stateContent);
+  assert.equal(saved.lastRun, '2026-06-24T07:00:00.000Z'); // watermark advanced despite dry-run
+  assert.ok(Object.keys(saved.reviewed).some((k) => k.startsWith('en_tn#9@')));
+});
+
+test('a genuine first-ever run (no prior state at all) is reported distinctly from an anomalous cold start', async () => {
+  const res = await watcher.runOvernightReview({
+    skillsRepo: '/skills', now: new Date('2026-06-24T07:00:00Z'),
+    deps: {
+      readFileSync: () => { throw new Error('ENOENT'); },
+      writeFileSync: () => {},
+      mkdirSync: () => {},
+      apiGetImpl: fakeApiGet({}, {}),
+      fetchTextImpl: async () => '',
+      log: () => {},
+    },
+  });
+  assert.equal(res.coldStart, true);
+  assert.equal(res.genuineFirstRun, true);
+});
+
 test('runOvernightReview reviews a fresh merged TN PR and emits proposals', async () => {
   const writes = [];
   const initState = JSON.stringify({ version: 1, initialized: true, lastRun: '2026-06-20T00:00:00Z', reviewed: {}, branchTips: {} });

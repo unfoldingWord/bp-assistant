@@ -305,6 +305,15 @@ async function runOvernightReview({
   const mkdir = deps.mkdirSync || ((p) => fs.mkdirSync(p, { recursive: true }));
   const stateFile = path.join(skillsRepo, state.DEFAULT_STATE_REL);
 
+  // #OVERNIGHT-STATE: probe for a pre-existing state file BEFORE loadState
+  // swallows the distinction — this lets a cold start be logged as either a
+  // genuine first-ever run (no file at all) or an anomalous one (a file was
+  // there but came back uninitialized/corrupt), so a persistence regression
+  // can't hide behind an innocuous "cold start" line the way this one did for
+  // 34 consecutive nightly runs.
+  let stateFileExisted = true;
+  try { (deps.readFileSync || fs.readFileSync)(stateFile, 'utf8'); } catch { stateFileExisted = false; }
+
   const st = state.loadState(stateFile, deps.readFileSync);
   const editorMap = deps.editorMap || loadEditorMap();
   // If enumeration throws (e.g. a Gitea auth/5xx error), it propagates here and
@@ -315,9 +324,18 @@ async function runOvernightReview({
 
   if (state.isColdStart(st)) {
     state.primeColdStart(st, allKeys, now);
-    if (!dryRun) state.saveState(stateFile, st, { writeImpl, mkdirImpl: mkdir });
-    log(`[overnight] cold start — ${dryRun ? 'would record' : 'recorded'} ${allKeys.length} current HEAD(s); reviewing nothing tonight.`);
-    return { coldStart: true, dryRun, units: units.length, reviewed: 0, proposals: 0, proposalsPath: null };
+    // #OVERNIGHT-STATE: persist regardless of dryRun. Priming records "these
+    // HEADs are already seen" — that's memory, not an action (dry-run's job is
+    // to skip taking actions like opening PRs, not to skip remembering). The
+    // previous `if (!dryRun)` guard here meant a dry-run cold start was never
+    // saved, so every dry run looked like the very first run, forever.
+    state.saveState(stateFile, st, { writeImpl, mkdirImpl: mkdir });
+    const anomaly = stateFileExisted ? ' [WARNING: a state file existed but was not initialized — check for a persistence bug]' : '';
+    log(`[overnight] cold start (${stateFileExisted ? 'not a genuine first run' : 'genuine first run'})${anomaly} — recorded ${allKeys.length} current HEAD(s); reviewing nothing tonight.${dryRun ? ' (dry-run: state persisted, proposal feed still suppressed)' : ''}`);
+    return {
+      coldStart: true, dryRun, genuineFirstRun: !stateFileExisted,
+      units: units.length, reviewed: 0, proposals: 0, proposalsPath: null,
+    };
   }
 
   const fresh = units.filter((u) => !state.isReviewed(st, unitKeyFor(u)) && !isBotAuthor(u.author));
@@ -351,17 +369,26 @@ async function runOvernightReview({
   let proposalsPath = null;
   let tasksPath = null;
   if (!dryRun) {
+    // The proposal/review-task feed is the "action" side of a run — it's what
+    // downstream automation (the Dreamer, and anything OVERNIGHT_PR_ENABLED
+    // eventually gates) reads to act on. dry-run suppresses it.
     mkdir(outDir);
     proposalsPath = path.join(outDir, 'proposals.jsonl');
     writeImpl(proposalsPath, proposals.map((p) => JSON.stringify(p)).join('\n') + (proposals.length ? '\n' : ''));
     tasksPath = path.join(outDir, 'review-tasks.jsonl');
     writeImpl(tasksPath, reviewTasks.map((t) => JSON.stringify(t)).join('\n') + (reviewTasks.length ? '\n' : ''));
-    // Persist the reviewed-set always (so successful units are never re-reviewed),
-    // but only advance the lastRun watermark on a clean run — otherwise a deferred
-    // unit would fall outside the next window and never be retried.
-    if (failed === 0) st.lastRun = now.toISOString();
-    state.saveState(stateFile, st, { writeImpl, mkdirImpl: mkdir });
   }
+  // #OVERNIGHT-STATE: persist the reviewed-set and lastRun watermark
+  // UNCONDITIONALLY — including on a dry run. Marking a unit reviewed and
+  // advancing lastRun is bookkeeping ("what have I already looked at"), not an
+  // action ("open a PR"); dry-run must only suppress the latter. Gating this
+  // behind `!dryRun` (as it was) meant every dry run started back at the same
+  // watermark, so a dry-run-only Sensor could never make forward progress —
+  // this is the root cause of 34 consecutive no-op nightly runs.
+  // Only advance the lastRun watermark on a clean run — otherwise a deferred
+  // unit would fall outside the next window and never be retried.
+  if (failed === 0) st.lastRun = now.toISOString();
+  state.saveState(stateFile, st, { writeImpl, mkdirImpl: mkdir });
 
   const reviewed = fresh.length - failed;
   log(`[overnight] ${dryRun ? 'would review' : 'reviewed'} ${reviewed} unit(s)${failed ? ` (${failed} deferred on transient failure)` : ''} → ${proposals.length} proposal row(s), ${reviewTasks.length} review task(s).`);
@@ -392,9 +419,10 @@ async function cliMain(argv) {
   const res = await runOvernightReview({ skillsRepo, dryRun: args.dryRun });
   const lines = [];
   if (res.coldStart) {
-    lines.push(`Cold start — recorded current HEADs; reviewed nothing this run${res.dryRun ? ' (dry-run)' : ''}.`);
+    const label = res.genuineFirstRun ? 'genuine first run' : 'NOT a genuine first run — state existed but was uninitialized, check for a persistence bug';
+    lines.push(`Cold start (${label}) — recorded current HEADs; reviewed nothing this run${res.dryRun ? ' (dry-run)' : ''}.`);
   } else {
-    lines.push(`Reviewed ${res.reviewed} new \`-be-\` unit(s) across ${res.units} watched → ${res.proposals} attributed proposal row(s)${res.dryRun ? ' (dry-run, not persisted)' : ''}.`);
+    lines.push(`Reviewed ${res.reviewed} new \`-be-\` unit(s) across ${res.units} watched → ${res.proposals} attributed proposal row(s)${res.dryRun ? ' (dry-run: watermark advanced, proposal feed not written)' : ''}.`);
     for (const t of res.reviewTasks || []) {
       lines.push(`- ${t.repo} ${t.book} (${t.resource}) by ${t.editor}: ${t.changes} change(s)${t.chapters.length ? ` [ch ${t.chapters.join(',')}]` : ''}`);
     }
