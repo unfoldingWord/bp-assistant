@@ -24,6 +24,11 @@
 // before the Sensor could persist state. `--review-cold-start` /
 // `OVERNIGHT_REVIEW_COLD_START=true` opt into reviewing the enumerated units
 // on a cold start instead of priming past them; default is OFF.
+//
+// Work per run is BOUNDED (see #OVERNIGHT-BOUNDED below): at most
+// `maxUnitsPerRun` units are reviewed, the rest are deferred to the next run
+// with the watermark held. This is what makes the cold-start escape hatch
+// usable on a real backlog on a 512 MB machine.
 'use strict';
 
 const fs = require('node:fs');
@@ -38,6 +43,20 @@ const state = require('./overnight-review-state');
 const { readSecret } = require('./secrets');
 
 const ORG = 'unfoldingWord';
+
+// #OVERNIGHT-BOUNDED: the Sensor runs on a 512 MB / 1-shared-vCPU Fly machine,
+// where V8's old-space ceiling lands around 255 MB. Reviewing an unbounded
+// number of units in one process fetches and diffs a full USFM/TSV body per
+// unit, and OOMed at exactly that ceiling the first time the cold-start escape
+// hatch was pointed at a real ~5-week backlog (#304). Cap the units reviewed
+// per run and defer the remainder; successive nightly runs chew through the
+// backlog incrementally. This is safe and resumable for free because the feed
+// write already precedes the state save and the watermark is held below
+// whenever anything was deferred, so no deferred unit can fall outside the
+// next run's window. It also protects the normal (non-cold) path against an
+// unusually busy night.
+const DEFAULT_MAX_UNITS_PER_RUN = 25;
+
 const WATCHED = [
   { repo: 'en_ult', resource: 'ult' },
   { repo: 'en_ust', resource: 'ust' },
@@ -93,11 +112,41 @@ function changedChaptersFromUsfm(oldUsfm, newUsfm) {
   return changed;
 }
 
+// #OVERNIGHT-BOUNDED-MEM: prepareCompareTn parses rows with split()/trim(), and
+// V8 represents those results as SlicedStrings — i.e. *views* into the whole
+// decoded TSV body they came from, not independent copies. So holding on to a
+// single proposal row transitively pins that entire multi-MB HTTP response body
+// in the heap, and the bodies stay unreleasable for the life of the run. That
+// is why the #304 OOM trace bottoms out in StringDecoder::DecodeData /
+// NewStringFromUtf8 (decoded response bodies) rather than in our own objects,
+// and it is what would defeat the per-run cap above: capping units does not
+// help if each surviving unit still retains its whole file. Copy the few short
+// fields we actually keep into standalone flat strings (Buffer round-trip
+// guarantees a fresh allocation) so each unit's response bodies become
+// collectable as soon as its rows are built.
+function detachString(s) {
+  if (typeof s !== 'string' || s.length === 0) return s;
+  return Buffer.from(s, 'utf8').toString('utf8');
+}
+
+function detachSide(side) {
+  if (!side || typeof side !== 'object') return side;
+  return {
+    quote: detachString(side.quote),
+    occurrence: detachString(side.occurrence),
+    note: detachString(side.note),
+  };
+}
+
 // Map a prepareCompareTn result to proposal-feed rows (the shape the Dreamer's
 // select-dream-candidates gatherProposalsFeed reads).
 function tnChangesToProposals(compare, { repo, book, editor, prId, headSha }) {
   return (compare.changes || []).map((c) => {
-    const [chapter, verse] = String(c.reference).split(':');
+    // Detach BEFORE deriving anything from these — chapter/verse below are
+    // sliced off `reference`, so they must slice a detached (short) parent.
+    const reference = detachString(String(c.reference));
+    const supportReference = c.supportReference ? detachString(String(c.supportReference)) : null;
+    const [chapter, verse] = reference.split(':');
     return {
       source: 'overnight-review',
       kind: 'tn-edit',
@@ -105,16 +154,16 @@ function tnChangesToProposals(compare, { repo, book, editor, prId, headSha }) {
       repo, book, editor,
       prId: prId || null,
       headSha: headSha || null,
-      reference: c.reference,
-      supportReference: c.supportReference || null,
-      key: c.supportReference || c.reference,
+      reference,
+      supportReference: supportReference || null,
+      key: supportReference || reference,
       category: c.changeType,
       chapter: chapter || null,
       verse: verse || null,
-      before: c.before,
-      after: c.after,
-      text: `editor ${editor} ${c.changeType} TN note at ${c.reference}`
-        + (c.supportReference ? ` (${c.supportReference})` : ''),
+      before: detachSide(c.before),
+      after: detachSide(c.after),
+      text: `editor ${editor} ${c.changeType} TN note at ${reference}`
+        + (supportReference ? ` (${supportReference})` : ''),
     };
   });
 }
@@ -324,6 +373,9 @@ async function runOvernightReview({
   // module cannot tell apart from a genuine first-ever run — see the long
   // comment below, at the cold-start branch, for why this defaults to false.
   reviewColdStart = false,
+  // #OVERNIGHT-BOUNDED: max units reviewed in a single process. Anything beyond
+  // this is deferred (watermark held) and picked up by the next run.
+  maxUnitsPerRun = DEFAULT_MAX_UNITS_PER_RUN,
   deps = {},
 } = {}) {
   const log = deps.log || ((m) => process.stderr.write(`${m}\n`));
@@ -442,10 +494,20 @@ async function runOvernightReview({
   }
 
   const fresh = units.filter((u) => !state.isReviewed(st, unitKeyFor(u)) && !isBotAuthor(u.author));
+  // #OVERNIGHT-BOUNDED: take at most maxUnitsPerRun this run. A non-positive or
+  // non-finite cap means "no cap" (opt-out for a big-memory host). Order is
+  // enumeration order, which is stable across runs, so successive runs walk
+  // steadily down the same list as earlier units enter the reviewed set.
+  const cap = Number.isFinite(maxUnitsPerRun) && maxUnitsPerRun > 0 ? maxUnitsPerRun : fresh.length;
+  const batch = fresh.slice(0, cap);
+  const deferred = fresh.length - batch.length;
+  if (deferred > 0) {
+    log(`[overnight] BOUNDED RUN — ${fresh.length} fresh unit(s) exceed the per-run cap of ${cap}; reviewing ${batch.length} now and DEFERRING ${deferred} to the next run. The lastRun watermark is held so the deferred units stay in the next run's window; re-run to continue draining the backlog.`);
+  }
   const proposals = [];
   const reviewTasks = [];
   let failed = 0;
-  for (const u of fresh) {
+  for (const u of batch) {
     let rows;
     try {
       rows = await reviewUnit(u, { fetchTextImpl: deps.fetchTextImpl });
@@ -505,26 +567,36 @@ async function runOvernightReview({
   // "fresh" (not in `reviewed`, lastRun unmoved) and get retried next run
   // instead of being silently marked seen with their proposals lost.
   //
-  // Only advance the lastRun watermark on a clean run — otherwise a deferred
-  // unit would fall outside the next window and never be retried.
-  if (failed === 0) st.lastRun = now.toISOString();
+  // Only advance the lastRun watermark on a clean, COMPLETE run — otherwise a
+  // deferred unit would fall outside the next window and never be retried.
+  // "Deferred" now has two causes and both must hold the watermark:
+  //   - a transient fetch failure (`failed`), and
+  //   - the #OVERNIGHT-BOUNDED per-run cap (`deferred`).
+  // Advancing on a capped run is the one way this change could lose work: the
+  // units past the cap would be silently skipped forever, reintroducing exactly
+  // the silent-backlog-loss bug that #303 set out to fix.
+  if (failed === 0 && deferred === 0) st.lastRun = now.toISOString();
   state.saveState(stateFile, st, { writeImpl, mkdirImpl: mkdir });
 
-  const reviewed = fresh.length - failed;
+  const reviewed = batch.length - failed;
   // "reviewed" regardless of dryRun — the feed is always written now (see
   // #OVERNIGHT-FEED above), so there is no "would review" distinction left to
   // draw. dryRun only tags the line for the reader's benefit.
-  log(`[overnight] reviewed ${reviewed} unit(s)${failed ? ` (${failed} deferred on transient failure)` : ''} → ${proposals.length} proposal row(s), ${reviewTasks.length} review task(s).${coldStartReviewed ? ' (this was a cold start, reviewed via OVERNIGHT_REVIEW_COLD_START instead of primed)' : ''}${dryRun ? ' (dry-run)' : ''}`);
+  log(`[overnight] reviewed ${reviewed} unit(s)${failed ? ` (${failed} deferred on transient failure)` : ''}${deferred ? ` (${deferred} deferred by the per-run cap of ${cap})` : ''} → ${proposals.length} proposal row(s), ${reviewTasks.length} review task(s).${coldStartReviewed ? ' (this was a cold start, reviewed via OVERNIGHT_REVIEW_COLD_START instead of primed)' : ''}${dryRun ? ' (dry-run)' : ''}`);
   return {
     coldStart: false, dryRun, units: units.length, reviewed, failed,
     proposals: proposals.length, proposalsPath, tasksPath, reviewTasks,
     sampleProposals: proposals.slice(0, 12),
     coldStartReviewed, skipped: 0,
+    // #OVERNIGHT-BOUNDED: `deferred` > 0 means the backlog is not drained and
+    // the watermark was deliberately held — the caller/digest must say so, or a
+    // partial drain reads as a complete one.
+    deferred, cap, fresh: fresh.length,
   };
 }
 
 // --- CLI ---------------------------------------------------------------------
-// node src/overnight-watcher.js --skills-repo <dir> [--dry-run] [--review-cold-start]
+// node src/overnight-watcher.js --skills-repo <dir> [--dry-run] [--review-cold-start] [--max-units N]
 // Prints a digest between OVERNIGHT_DIGEST markers for the cron wrapper.
 //
 // #OVERNIGHT-COLDSTART-VISIBILITY: --review-cold-start (or env
@@ -544,8 +616,26 @@ function parseArgs(argv) {
     if (a === '--dry-run') out.dryRun = true;
     else if (a === '--review-cold-start') out.reviewColdStart = true;
     else if (a === '--skills-repo') out.skillsRepo = argv[++i];
+    // #OVERNIGHT-BOUNDED: --max-units 0 (or a negative value) disables the cap.
+    // A missing/unparseable operand is IGNORED rather than stored, so a typo
+    // falls back to the default cap instead of silently disabling it (NaN would
+    // read as "no cap" downstream — the exact failure mode this fix removes).
+    else if (a === '--max-units') {
+      const n = Number(argv[++i]);
+      if (Number.isFinite(n)) out.maxUnitsPerRun = n;
+    }
   }
   return out;
+}
+
+// #OVERNIGHT-BOUNDED: env override for the per-run cap. Returns undefined for
+// an unset/unparseable value so the caller falls back to the default rather
+// than silently disabling the cap on a typo.
+function envInt(name) {
+  const raw = String(process.env[name] || '').trim();
+  if (!raw) return undefined;
+  const n = Number(raw);
+  return Number.isFinite(n) ? n : undefined;
 }
 
 function envFlag(name) {
@@ -557,7 +647,10 @@ async function cliMain(argv) {
   const skillsRepo = args.skillsRepo || process.env.BP_SKILLS_REPO;
   if (!skillsRepo) { process.stderr.write('[overnight] BP_SKILLS_REPO not set\n'); process.exit(2); }
   const reviewColdStart = args.reviewColdStart || envFlag('OVERNIGHT_REVIEW_COLD_START');
-  const res = await runOvernightReview({ skillsRepo, dryRun: args.dryRun, reviewColdStart });
+  const maxUnitsPerRun = args.maxUnitsPerRun !== undefined
+    ? args.maxUnitsPerRun
+    : (envInt('OVERNIGHT_MAX_UNITS') !== undefined ? envInt('OVERNIGHT_MAX_UNITS') : DEFAULT_MAX_UNITS_PER_RUN);
+  const res = await runOvernightReview({ skillsRepo, dryRun: args.dryRun, reviewColdStart, maxUnitsPerRun });
   const lines = [];
   if (res.coldStart) {
     const label = res.genuineFirstRun ? 'genuine first run' : 'NOT a genuine first run — state existed but was uninitialized, check for a persistence bug';
@@ -570,6 +663,10 @@ async function cliMain(argv) {
   } else {
     if (res.coldStartReviewed) lines.push('NOTE: this was a cold start; reviewed the enumerated backlog instead of priming past it (OVERNIGHT_REVIEW_COLD_START was set).');
     lines.push(`Reviewed ${res.reviewed} new \`-be-\` unit(s) across ${res.units} watched → ${res.proposals} attributed proposal row(s)${res.dryRun ? ' (dry-run)' : ''}.`);
+    // #OVERNIGHT-BOUNDED: a partial drain must never read as a complete one.
+    if (res.deferred > 0) {
+      lines.push(`BACKLOG NOT DRAINED: ${res.deferred} of ${res.fresh} fresh unit(s) were DEFERRED by the per-run cap of ${res.cap}. The lastRun watermark was held, so they are still queued — re-run (no flag needed; the backlog is picked up automatically) until this line disappears. Raise the cap with OVERNIGHT_MAX_UNITS=<n> or --max-units <n> (0 disables it) only if the host has the memory for it.`);
+    }
     for (const t of res.reviewTasks || []) {
       lines.push(`- ${t.repo} ${t.book} (${t.resource}) by ${t.editor}: ${t.changes} change(s)${t.chapters.length ? ` [ch ${t.chapters.join(',')}]` : ''}`);
     }
@@ -588,6 +685,7 @@ if (require.main === module) {
 module.exports = {
   ORG,
   WATCHED,
+  DEFAULT_MAX_UNITS_PER_RUN,
   parseBeRef,
   isBotAuthor,
   resourceForRepo,
