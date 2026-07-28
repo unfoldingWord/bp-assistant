@@ -34,4 +34,15 @@ bash /app/scripts/boot-guard.sh || true
 timeout 300 bash /app/scripts/refresh-workspace.sh \
   || echo "[entrypoint] workspace refresh skipped (timeout or error) — continuing boot on existing checkout"
 
-exec node src/index.js
+# Persist stdout/stderr to the volume as well as to `fly logs`. Fly only keeps a
+# short live-tail window, so without this every log older than that is gone.
+# Process substitution (not a pipe) keeps node as the exec'd PID 1, so Fly's
+# SIGINT/kill_timeout graceful-shutdown path is unchanged. log-tee.js never
+# fails the process: on any file error it drops to plain pass-through. The
+# `|| true` on mkdir matters under `set -e`: this script must never fail to
+# boot the bot just because the log dir couldn't be created (e.g. a stray file
+# blocking it, or a permissions issue) — log-tee.js retries the mkdir itself
+# and degrades to pass-through internally if it also fails (issue #290).
+BOT_LOG_DIR="${BOT_LOG_DIR:-/data/logs}"
+mkdir -p "$BOT_LOG_DIR" || true
+exec node src/index.js > >(node /app/scripts/log-tee.js "${BOT_LOG_DIR}/app.log") 2>&1
