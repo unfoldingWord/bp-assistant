@@ -258,6 +258,11 @@ const PERMISSION_STALL_POLL_MS = 30 * 1000;
 // cannot be an allowlist mismatch — it can only be an external refusal. #238's
 // probes were all Bash and would score zero here; EZK 19 scored on its very first
 // denial (a plain `Read` inside cwd).
+//
+// The Bash exemption is scoped to NON-bypass runs (issue #291, DAN 5). A bypass run
+// carries no decider and no BASH_ALLOW_RULES, so the ambiguity the exemption exists
+// to respect does not exist there — every denied tool counts. See
+// isPermissionWallEvidence for the full argument.
 const PERMISSION_WALL_DENIAL_LIMIT = Number(process.env.BP_PERMISSION_WALL_DENIALS) > 0
   ? Number(process.env.BP_PERMISSION_WALL_DENIALS)
   : 2;
@@ -688,8 +693,21 @@ function describeDenialAgent(sig) {
 // so a denied Bash command is ambiguous; every other tool is granted per-session,
 // so its denial cannot come from our own config. An unresolved name (null) is
 // treated as ambiguous — never as evidence.
-function isPermissionWallEvidence(toolName) {
-  return typeof toolName === 'string' && toolName.length > 0 && toolName !== 'Bash';
+//
+// The Bash exemption is conditional on the run NOT being a bypass run (issue #291,
+// DAN 5). It exists only because BASH_ALLOW_RULES gate individual commands, so a
+// denied Bash MIGHT be an allowlist miss — that is #238's regression guard. But a
+// bypass run carries NO decider and NO BASH_ALLOW_RULES at all (see the allow-all
+// rationale above: replaying the restrictive decider over a successful run's 50
+// commands denies 45, which is exactly why bypass runs deliberately carry none).
+// With no argument-level rules in play there is nothing local left to blame, so a
+// denied Bash on a bypass run is precisely as strong as a denied Grep. DAN 5's
+// denials were 5×Bash + 1×Grep: it scored 1, stayed under the limit, never fired
+// the wall, and instead aged into the 5-minute time-based stall — a hard failure
+// that lost the chapter after 512s, where a wall would have retried at ~2s in.
+function isPermissionWallEvidence(toolName, { bypassRun = false } = {}) {
+  if (typeof toolName !== 'string' || toolName.length === 0) return false;
+  return bypassRun || toolName !== 'Bash';
 }
 
 // Pure reducer: applies one classified message to the mutable `state` and returns
@@ -697,7 +715,9 @@ function isPermissionWallEvidence(toolName) {
 // closed > permission-denial > tool_use_error > tool_result. `state` fields:
 // consecutiveToolErrors, consecutiveTransportErrors, consecutivePermissionDenials,
 // totalPermissionDenials, stallStartAt, toolErrorSigs (Map).
-// `limits` = { transportLimit }.
+// `limits` = { transportLimit, wallLimit?, bypassRun? }. `bypassRun` defaults to
+// false so existing callers keep the conservative Bash exemption (#238); the runner
+// sets it from the permission mode actually handed to the SDK (#291).
 function applyRunnerUserMessage(state, sig, limits, guardrails, now = Date.now()) {
   if (sig.isTransportClosed) {
     state.consecutiveTransportErrors += 1;
@@ -722,7 +742,7 @@ function applyRunnerUserMessage(state, sig, limits, guardrails, now = Date.now()
     // anchor, it clears on any productive tool result below, so the limit means
     // "N such denials with nothing working in between" — a sustained wall, not a
     // recoverable startup burst.
-    if (isPermissionWallEvidence(sig.deniedToolName)) {
+    if (isPermissionWallEvidence(sig.deniedToolName, { bypassRun: !!limits.bypassRun })) {
       state.wallDenials = (state.wallDenials || 0) + 1;
       if (limits.wallLimit > 0 && state.wallDenials >= limits.wallLimit) {
         return { type: 'abort_permission_wall', wallDenials: state.wallDenials, tool: sig.deniedToolName };
@@ -1099,7 +1119,16 @@ async function runClaudeOnce({
         const action = applyRunnerUserMessage(
           errorState,
           sig,
-          { transportLimit: MCP_TRANSPORT_ERROR_LIMIT, wallLimit: PERMISSION_WALL_DENIAL_LIMIT },
+          {
+            transportLimit: MCP_TRANSPORT_ERROR_LIMIT,
+            wallLimit: PERMISSION_WALL_DENIAL_LIMIT,
+            // #291: read the mode actually sent to the SDK rather than the caller's
+            // `bypassPermissions` argument, so the BP_NO_BYPASS=1 kill switch (which
+            // reverts a run to classifier-mediated 'auto', restoring BASH_ALLOW_RULES)
+            // also restores the Bash exemption. buildOptions sets this field only on
+            // the allow-all branch.
+            bypassRun: options.permissionMode === 'bypassPermissions',
+          },
           guardrails
         );
         if (action.type === 'transport_error' || action.type === 'abort_transport') {

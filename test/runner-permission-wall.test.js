@@ -46,6 +46,9 @@ const NORMAL_TOOL_RESULT = '{"type":"tool_result","content":"ok, read 20 lines"}
 const TOOL_ERROR = '{"type":"tool_result","is_error":true,"content":"tool_use_error: String to replace not found"}';
 
 const LIMITS = { transportLimit: 3, wallLimit: 2 };
+// issue #291: a bypass run carries allow-all and NO BASH_ALLOW_RULES, so a denied
+// Bash there cannot be an allowlist miss and counts like any other tool.
+const BYPASS_LIMITS = { transportLimit: 3, wallLimit: 2, bypassRun: true };
 
 function freshState() {
   return {
@@ -60,10 +63,10 @@ function freshState() {
 }
 
 // Feed one denial whose tool_use resolved to `toolName` (null = unresolved).
-function feedDenial(state, toolName, id = 'toolu_x') {
+function feedDenial(state, toolName, id = 'toolu_x', limits = LIMITS) {
   const sig = classifyRunnerUserMessage(denialText(id));
   sig.deniedToolName = toolName;
-  return applyRunnerUserMessage(state, sig, LIMITS, null);
+  return applyRunnerUserMessage(state, sig, limits, null);
 }
 
 function feed(state, text) {
@@ -196,6 +199,81 @@ test('a wall-annotated result does not also read as a stall (wall outranks)', ()
   const walled = { subtype: 'success', permissionWallDetected: true };
   assert.equal(resultIndicatesPermissionWall(walled), true);
   assert.equal(resultIndicatesPermissionStall(walled), false);
+});
+
+// --- issue #291 (DAN 5, 2026-07-27): the Bash exemption is wrong on bypass runs ---
+//
+// DAN 5 was refused six times — 5×Bash + 1×Grep — on a bypass run. Under the
+// unconditional exemption that scored 1, below the limit of 2, so no wall fired. The
+// time-based stall fired instead after its 5-minute window and returned
+// `permission_stall`, a HARD failure: 0 of 1 chapters, 512.8s burned. The exemption
+// exists because BASH_ALLOW_RULES gate individual commands and a denied Bash might be
+// an allowlist miss — but a bypass run carries no decider and no BASH_ALLOW_RULES at
+// all, so on those runs there is nothing local left to blame.
+
+test('#291: on a bypass run every denied tool is wall evidence, Bash included', () => {
+  assert.equal(isPermissionWallEvidence('Bash', { bypassRun: true }), true);
+  assert.equal(isPermissionWallEvidence('Grep', { bypassRun: true }), true);
+  // Unresolved names stay ambiguous regardless of run type — we cannot attribute
+  // a denial we could not name.
+  assert.equal(isPermissionWallEvidence(null, { bypassRun: true }), false);
+  assert.equal(isPermissionWallEvidence('', { bypassRun: true }), false);
+  assert.equal(isPermissionWallEvidence(undefined, { bypassRun: true }), false);
+});
+
+test('#291: the Bash exemption survives untouched on non-bypass runs', () => {
+  // Explicit false, and the default (no opts) that every pre-#291 caller uses.
+  assert.equal(isPermissionWallEvidence('Bash', { bypassRun: false }), false);
+  assert.equal(isPermissionWallEvidence('Bash', {}), false);
+  assert.equal(isPermissionWallEvidence('Bash'), false);
+});
+
+test('#291: the DAN 5 sequence (5 Bash + 1 Grep) trips the wall on a bypass run', () => {
+  const state = freshState();
+  // 11:24:17 — first denial, a Bash call. Anchors the stall window; not yet a wall.
+  assert.equal(feedDenial(state, 'Bash', 'toolu_d0', BYPASS_LIMITS).type, 'permission_denied');
+  // 11:24:19 — ~2s in. This is where the run should now bail and be retried, instead
+  // of grinding on to the 5-minute stall window and a hard failure at 512.8s.
+  const action = feedDenial(state, 'Bash', 'toolu_d1', BYPASS_LIMITS);
+  assert.equal(action.type, 'abort_permission_wall');
+  assert.equal(action.wallDenials, 2);
+  assert.equal(action.tool, 'Bash');
+});
+
+test('#291: the same DAN 5 sequence does NOT trip the wall on a non-bypass run', () => {
+  const state = freshState();
+  // 5 Bash + 1 Grep under the restrictive decider: only the Grep is unambiguous, so
+  // the score is 1 — below the limit. #238's reasoning still governs here.
+  for (let i = 0; i < 5; i++) {
+    assert.equal(feedDenial(state, 'Bash', `toolu_d${i}`).type, 'permission_denied');
+  }
+  assert.equal(feedDenial(state, 'Grep', 'toolu_d5').type, 'permission_denied');
+  assert.equal(state.wallDenials, 1);
+  assert.equal(state.totalPermissionDenials, 6);
+});
+
+test('#291 vs #238: a bypass fan-out still recovers if a real result lands between probes', () => {
+  // The #238 shape — benign improvised shell probes — is now countable on a bypass
+  // run, so the thing that keeps it safe is the productive-result reset, not the tool
+  // name. An agent that burns a probe and then switches to an allowed tool clears its
+  // evidence and never aborts, however many probes it burns in total.
+  const state = freshState();
+  for (let i = 0; i < 8; i++) {
+    assert.equal(feedDenial(state, 'Bash', `toolu_p${i}`, BYPASS_LIMITS).type, 'permission_denied');
+    assert.equal(feed(state, NORMAL_TOOL_RESULT).type, 'tool_result_reset');
+    assert.equal(state.wallDenials, 0);
+  }
+  assert.equal(state.totalPermissionDenials, 8);
+});
+
+test('#291: bypassRun defaults to false when limits omit it', () => {
+  // Guards every caller that predates #291 and passes only transport/wall limits.
+  const state = freshState();
+  for (let i = 0; i < 6; i++) {
+    assert.equal(feedDenial(state, 'Bash', `toolu_${i}`, { transportLimit: 3, wallLimit: 2 }).type,
+      'permission_denied');
+  }
+  assert.equal(state.wallDenials, 0);
 });
 
 test('the default wall limit is small — the wall is unambiguous once it appears', () => {
