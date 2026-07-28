@@ -480,3 +480,144 @@ test('runOvernightReview reviews a fresh merged TN PR and emits proposals', asyn
   assert.equal(row.editor, 'pjoakes');
   assert.equal(row.book, 'PSA');
 });
+
+// --- #OVERNIGHT-BOUNDED: per-run work cap (#304) -----------------------------
+// The cold-start escape hatch added in #303 OOMed (exit 134, V8 heap limit
+// ~255 MB on the 512 MB Fly machine) the first time it was pointed at a real
+// ~5-week backlog: it reviewed every enumerated unit in one process, fetching
+// and diffing a full USFM/TSV body per unit. The fix bounds units per run and
+// defers the rest, which is only safe if the watermark is HELD whenever
+// anything was deferred — otherwise the deferred units fall outside the next
+// run's window and are lost silently, which is the very bug #303 fixed.
+function manyTnPrs(books) {
+  return books.map((book, i) => ({
+    number: 100 + i,
+    merged: true,
+    merged_at: `2026-06-2${(i % 3) + 1}T10:00:00Z`,
+    head: { ref: `${book}-be-pjoakes`, sha: `head${i}` },
+    base: { sha: `base${i}` },
+    user: { login: 'pjoakes' },
+  }));
+}
+
+const BOUNDED_BOOKS = ['PSA', 'GEN', 'EXO', 'LEV', 'NUM'];
+
+test('the per-run cap bounds units reviewed and HOLDS the watermark for the deferred remainder', async () => {
+  let stateContent = JSON.stringify({
+    version: 1, initialized: true, lastRun: '2026-06-20T00:00:00Z', reviewed: {}, branchTips: {},
+  });
+  const readFileSync = (p) => { if (/state\.json$/.test(p)) return stateContent; throw new Error('ENOENT'); };
+  const writeFileSync = (p, content) => { if (/state\.json$/.test(p)) stateContent = content; };
+
+  const res = await watcher.runOvernightReview({
+    skillsRepo: '/skills', now: new Date('2026-06-24T07:00:00Z'), maxUnitsPerRun: 2,
+    deps: {
+      readFileSync, writeFileSync, mkdirSync: () => {}, editorMap: { pjoakes: 'pjoakes' },
+      apiGetImpl: fakeApiGet({ en_tn: manyTnPrs(BOUNDED_BOOKS) }, {}),
+      fetchTextImpl: async () => '', log: () => {},
+    },
+  });
+
+  assert.equal(res.fresh, 5);
+  assert.equal(res.cap, 2);
+  assert.equal(res.reviewed, 2);
+  assert.equal(res.deferred, 3);
+
+  const saved = JSON.parse(stateContent);
+  assert.equal(Object.keys(saved.reviewed).length, 2, 'only the reviewed batch is recorded');
+  // THE critical assertion: a capped run must not advance lastRun, or the 3
+  // deferred units fall outside the next window and are never reviewed.
+  assert.equal(saved.lastRun, '2026-06-20T00:00:00Z');
+});
+
+test('successive runs drain a cold-start backlog incrementally and only advance the watermark once complete', async () => {
+  let stateContent = null;
+  const readFileSync = (p) => {
+    if (/state\.json$/.test(p) && stateContent != null) return stateContent;
+    throw new Error('ENOENT');
+  };
+  const writeFileSync = (p, content) => { if (/state\.json$/.test(p)) stateContent = content; };
+  const prs = { en_tn: manyTnPrs(BOUNDED_BOOKS) };
+
+  const runOnce = (day, opts = {}) => watcher.runOvernightReview({
+    skillsRepo: '/skills', now: new Date(`2026-06-2${day}T07:00:00Z`), maxUnitsPerRun: 2, ...opts,
+    deps: {
+      readFileSync, writeFileSync, mkdirSync: () => {}, editorMap: { pjoakes: 'pjoakes' },
+      apiGetImpl: fakeApiGet(prs, {}), fetchTextImpl: async () => '', log: () => {},
+    },
+  });
+
+  // Run 1: the operator's opt-in cold-start review. Bounded, not primed.
+  const first = await runOnce(4, { reviewColdStart: true });
+  assert.equal(first.coldStartReviewed, true);
+  assert.equal(first.reviewed, 2);
+  assert.equal(first.deferred, 3);
+  assert.equal(JSON.parse(stateContent).lastRun, null, 'watermark held while the backlog drains');
+
+  // Runs 2 and 3 need NO flag: state is initialized but lastRun is still null,
+  // so enumeration is unwindowed and the unreviewed remainder is still fresh.
+  const second = await runOnce(5);
+  assert.equal(second.coldStart, false);
+  assert.equal(second.reviewed, 2);
+  assert.equal(second.deferred, 1);
+  assert.equal(JSON.parse(stateContent).lastRun, null);
+
+  const third = await runOnce(6);
+  assert.equal(third.reviewed, 1);
+  assert.equal(third.deferred, 0, 'backlog drained');
+
+  const saved = JSON.parse(stateContent);
+  assert.equal(Object.keys(saved.reviewed).length, 5, 'every backlog unit was eventually reviewed, none lost');
+  // Only now, with nothing deferred, may the watermark advance.
+  assert.equal(saved.lastRun, new Date('2026-06-26T07:00:00Z').toISOString());
+});
+
+test('maxUnitsPerRun=0 disables the cap (opt-out for a host with memory to spare)', async () => {
+  let stateContent = JSON.stringify({
+    version: 1, initialized: true, lastRun: '2026-06-20T00:00:00Z', reviewed: {}, branchTips: {},
+  });
+  const readFileSync = (p) => { if (/state\.json$/.test(p)) return stateContent; throw new Error('ENOENT'); };
+  const writeFileSync = (p, content) => { if (/state\.json$/.test(p)) stateContent = content; };
+
+  const res = await watcher.runOvernightReview({
+    skillsRepo: '/skills', now: new Date('2026-06-24T07:00:00Z'), maxUnitsPerRun: 0,
+    deps: {
+      readFileSync, writeFileSync, mkdirSync: () => {}, editorMap: { pjoakes: 'pjoakes' },
+      apiGetImpl: fakeApiGet({ en_tn: manyTnPrs(BOUNDED_BOOKS) }, {}),
+      fetchTextImpl: async () => '', log: () => {},
+    },
+  });
+  assert.equal(res.reviewed, 5);
+  assert.equal(res.deferred, 0);
+  assert.equal(JSON.parse(stateContent).lastRun, new Date('2026-06-24T07:00:00Z').toISOString());
+});
+
+test('the default per-run cap is a sane positive bound (the unbounded default is what OOMed)', () => {
+  assert.ok(Number.isFinite(watcher.DEFAULT_MAX_UNITS_PER_RUN));
+  assert.ok(watcher.DEFAULT_MAX_UNITS_PER_RUN > 0);
+});
+
+// #OVERNIGHT-BOUNDED-MEM: detaching note/quote from the parent TSV buffer must
+// not change the emitted proposal content — capping units is useless if each
+// retained row still pins the whole decoded response body, but the fix is only
+// acceptable if the feed the Dreamer reads is byte-identical.
+test('detaching retained strings preserves proposal content exactly', () => {
+  const compare = prepareCompareTn({
+    oldTsv: [TN_HEADER, '3:2\ta\t\tfigs-metaphor\tthe LORD\t1\told note text'].join('\n'),
+    newTsv: [TN_HEADER, '3:2\ta\t\tfigs-metaphor\tthe LORD\t1\tnew note text'].join('\n'),
+  });
+  const rows = watcher.tnChangesToProposals(compare, {
+    repo: 'en_tn', book: 'PSA', editor: 'pjoakes', prId: 7, headSha: 'abc',
+  });
+  assert.equal(rows.length, 1);
+  const r = rows[0];
+  assert.equal(r.reference, '3:2');
+  assert.equal(r.chapter, '3');
+  assert.equal(r.verse, '2');
+  assert.equal(r.supportReference, 'figs-metaphor');
+  assert.equal(r.key, 'figs-metaphor');
+  assert.equal(r.before.note, 'old note text');
+  assert.equal(r.after.note, 'new note text');
+  assert.equal(r.before.quote, 'the LORD');
+  assert.equal(r.text, 'editor pjoakes reworded TN note at 3:2 (figs-metaphor)');
+});
