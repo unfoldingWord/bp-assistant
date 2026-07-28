@@ -34,4 +34,28 @@ bash /app/scripts/boot-guard.sh || true
 timeout 300 bash /app/scripts/refresh-workspace.sh \
   || echo "[entrypoint] workspace refresh skipped (timeout or error) — continuing boot on existing checkout"
 
+# Durable copy of stdout/stderr to the volume (#290). `fly logs --no-tail` only
+# reaches back ~2.4 minutes and Fly has no retention setting, so SDK-level detail
+# is unrecoverable minutes after a failure — that is what blocked the #289
+# investigation. scripts/log-tee.js appends a size-capped, rotated copy under
+# /data/logs while passing every byte through to the real stdout, so `fly logs`
+# is unchanged.
+#
+# Process substitution, NOT `node src/index.js | log-tee`. A pipe makes this
+# shell PID 1, which would swallow the `kill_signal = "SIGINT"` that fly.toml
+# sends and never let the bot drain in-flight work. With `exec ... > >(...)`,
+# node replaces bash as PID 1 and receives Fly's signal directly.
+#
+# The self-test runs first so an unwritable volume (permissions, disk full)
+# degrades to a plain launch here, while we can still choose — rather than
+# leaving the bot's stdout wired to a writer that cannot function.
+LOG_TEE="/app/scripts/log-tee.js"
+LOG_TEE_FILE="${BP_LOG_TEE_FILE:-/data/logs/app.log}"
+
+if [ -f "$LOG_TEE" ] && BP_LOG_TEE_FILE="$LOG_TEE_FILE" node "$LOG_TEE" --selftest; then
+  echo "[entrypoint] durable log copy -> $LOG_TEE_FILE"
+  exec node src/index.js > >(exec env BP_LOG_TEE_FILE="$LOG_TEE_FILE" node "$LOG_TEE") 2>&1
+fi
+
+echo "[entrypoint] durable log copy unavailable — continuing with stdout only"
 exec node src/index.js

@@ -1,0 +1,16 @@
+# Force LF on the files that the container executes through a shebang.
+#
+# A Windows checkout with the default `core.autocrlf=true` writes these with
+# CRLF. The kernel then reads `#!/bin/bash\r` as an interpreter literally named
+# "bash\r", cannot find it, and the machine dies on boot with exit 127 — which
+# is what killed the first attempt at #290 on the sibling app. CI builds on
+# Linux and never saw it. These rules make the hazard structurally impossible
+# regardless of who builds the image or from which platform.
+#
+# Deliberately NOT `*.js`: those are loaded by node, which handles CRLF fine,
+# and a blanket rule would renormalize several files that are committed with
+# CRLF today — a large diff with real conflict surface and no boot-safety gain.
+*.sh         text eol=lf
+entrypoint.sh text eol=lf
+Dockerfile   text eol=lf
+Dockerfile.* text eol=lf

@@ -10,6 +10,12 @@ const { startResourceMonitor } = require('./resource-monitor');
 const { ensureClaudeConfig } = require('./claude-config-init');
 const { startWeeklyRefresh } = require('./cron-weekly-refresh');
 const { pruneRunLogs, RUN_LOG_DIR } = require('./run-logs');
+const { installStdoutEpipeGuard } = require('./stdout-guard');
+
+// Our stdout is a pipe into the durable log writer (#290). Install this before
+// anything can log, so a killed or torn-away writer degrades to lost output
+// instead of an EPIPE that exits the bot mid-pipeline.
+installStdoutEpipeGuard();
 
 // Prepend ISO timestamp to every console line
 ['log', 'warn', 'error'].forEach(method => {
