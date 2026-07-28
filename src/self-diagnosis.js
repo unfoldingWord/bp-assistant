@@ -481,6 +481,100 @@ function isAlignPermissionStall(text, checkpoint) {
     && /align/i.test(msg);
 }
 
+// The notes-pipeline skills that fan out to sub-agents via the Agent tool and
+// coordinate them via SendMessage (see the dispatch comment at
+// src/notes-pipeline.js:2448-2461). Their orchestrator session is itself a nested
+// agent, so their workers are grandchildren relative to the pipeline's runClaude
+// call — one level deeper than the align-all-parallel case the bypass PreToolUse
+// allow-all hook was validated against (src/claude-runner.js:483-520).
+const MULTI_AGENT_FANOUT_SKILLS = ['deep-issue-id', 'post-edit-review', 'tn-writer'];
+
+// True when a permission-denial stall hit one of the multi-agent fan-out skills
+// above. Same SDK signature as the align stall ("STOP what you are doing and
+// wait") but on a notes-pipeline skill, so `isAlignPermissionStall` — which is
+// deliberately scoped to align only — lets it fall through to the LLM diagnosis
+// agent. That agent fans out tool calls of its own and would hit the very same
+// denial wall, so it must be short-circuited to a templated issue instead
+// (DAN 5, 2026-07-28 — issue #289).
+function matchedFanoutSkill(text, checkpoint) {
+  const current = checkpoint && checkpoint.current;
+  if (current && current.errorKind === 'permission_stall') {
+    const skill = String(current.skill || '');
+    const hit = MULTI_AGENT_FANOUT_SKILLS.find((s) => skill.toLowerCase().includes(s));
+    if (hit) return hit;
+  }
+  const msg = typeof text === 'string' ? text : String((text && text.message) || text || '');
+  if (!msg) return null;
+  const hasPermissionSignal = /(permission[- ]?stall|auto-denied|doesn't want to take this action|stop what you are doing and wait)/i
+    .test(msg);
+  if (!hasPermissionSignal) return null;
+  return MULTI_AGENT_FANOUT_SKILLS.find((s) => msg.toLowerCase().includes(s)) || null;
+}
+
+function isMultiAgentPermissionStall(text, checkpoint) {
+  return matchedFanoutSkill(text, checkpoint) !== null;
+}
+
+// Templated diagnosis for a permission stall on a multi-agent fan-out skill. The
+// root cause is always app-side permission/bypass infrastructure — never skills
+// prose — so this pins the repo to bp-assistant rather than letting classifyRepo
+// route a "tn-writer" mention to the skills repo.
+function buildMultiAgentPermissionStallDiagnosis(event, contextSummary, skillName) {
+  const skill = skillName || 'multi-agent skill';
+  const scopeLabel = event.scope || event.pipelineType || 'event';
+  const title = `Pipeline failure: ${event.pipelineType || 'notes'} ${scopeLabel} — ${skill}: permission-denial stall`
+    .slice(0, 120);
+  const body = [
+    '## Summary',
+    `The \`${skill}\` stage stalled on auto-denied tool calls: the SDK returned its canned`,
+    '"The user doesn\'t want to take this action right now. STOP what you are doing and wait',
+    'for the user..." text, the agents obeyed it literally, and nothing productive followed',
+    'for the whole stall window, so the runner classified the run as `permission_stall`.',
+    '',
+    `\`${skill}\` fans out to sub-agents via the \`Agent\` tool and coordinates them via`,
+    '`SendMessage` (see `src/notes-pipeline.js:2448-2461`). Its orchestrator session is',
+    "itself a nested agent, so those workers are *grandchildren* of the pipeline's",
+    '`runClaude` call — one level deeper than the `align-all-parallel` case the bypass',
+    'allow-all `PreToolUse` hook (`bypassAllowAllMatcher`, `src/claude-runner.js:483-520`)',
+    'was validated against. If the hook does not reach that nesting level, those calls fall',
+    "back to the degraded 'auto'-mode safety classifier and are denied.",
+    '',
+    '## Failure event',
+    `- pipelineType: ${event.pipelineType || '(unknown)'}`,
+    `- scope: ${event.scope || '(none)'}`,
+    `- phase: ${event.phase || '(none)'}`,
+    `- severity: ${event.severity || '(unknown)'}`,
+    `- message: ${event.message || '(none)'}`,
+    '',
+    '## Next steps',
+    '- Confirm `BP_NO_BYPASS=1` is NOT set as a Fly secret on `uw-bt-bot` — it silently',
+    "  reverts opted-in runs to the restrictive classifier path (`src/claude-runner.js:382`).",
+    '  Cheapest check; rule it out first.',
+    '- Confirm the deployed image actually contains the `bypassAllowAllMatcher` hook fix',
+    '  (added 2026-07-27) — a stale image reproduces this exactly.',
+    `- Re-run with logging to confirm whether the \`PreToolUse\` hook fires for \`${skill}\`'s`,
+    "  sub-agents' tool calls, not just the orchestrator's own.",
+    '- If the hook does not propagate to that nesting level, extend the hook registration',
+    '  (or the spawn options for `Agent`-tool-spawned children) so nested grandchildren',
+    '  inherit the allow-all behavior too.',
+    '',
+    '## Diagnosis context',
+    '<details><summary>Click to expand</summary>',
+    '',
+    '```',
+    String(contextSummary || '').slice(0, 8000),
+    '```',
+    '</details>',
+  ].join('\n');
+  return {
+    repo: DEFAULT_REPO,
+    title,
+    body,
+    labels: ['bug', 'pipeline-failure', 'multi-agent-permission-stall'],
+    classification: 'multi-agent-permission-stall',
+  };
+}
+
 // Templated diagnosis for the "align-all-parallel: no (or only partial) aligned
 // output" signature. Skips the LLM investigation (which was timing out on real
 // runs — AMO 5, 2026-07-01) and files a concise, actionable issue that points at
@@ -818,6 +912,17 @@ async function dispatchSelfDiagnosis({
       diagnosis = buildAlignPermissionStallDiagnosis(event, contextSummary);
       shortCircuited = true;
       shortCircuitTag = 'align-permission-stall';
+    } else if (isMultiAgentPermissionStall(errorText, checkpoint) || isMultiAgentPermissionStall(event.message, checkpoint)) {
+      // Same auto-denial signature as the align stall, but on a notes-pipeline skill
+      // that fans out to its own sub-agents (deep-issue-id/post-edit-review/tn-writer).
+      // A fresh diagnosis agent fans out too and would hit the same wall, so file a
+      // templated issue instead of burning that run (#289).
+      const stalledSkill = matchedFanoutSkill(errorText, checkpoint)
+        || matchedFanoutSkill(event.message, checkpoint);
+      console.log(`[self-diagnosis] Multi-agent permission-denial-stall signature recognized (skill=${stalledSkill}); filing templated issue without running the agent.`);
+      diagnosis = buildMultiAgentPermissionStallDiagnosis(event, contextSummary, stalledSkill);
+      shortCircuited = true;
+      shortCircuitTag = 'multi-agent-permission-stall';
     } else if (isAlignMissingOutput(errorText, checkpoint) || isAlignMissingOutput(event.message, checkpoint)) {
       // Known signature — align-all-parallel produced no (or only partial) aligned
       // output. The LLM diagnosis agent times out on this signature (issue #174),
@@ -937,6 +1042,9 @@ module.exports = {
   isAlignTransportClosed,
   buildAlignPermissionStallDiagnosis,
   isAlignPermissionStall,
+  buildMultiAgentPermissionStallDiagnosis,
+  isMultiAgentPermissionStall,
+  MULTI_AGENT_FANOUT_SKILLS,
   buildIncompleteDiagnosis,
   buildContextSummary,
   appendFingerprintMarker,

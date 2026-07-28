@@ -26,6 +26,8 @@ const {
   isAlignTransportClosed,
   buildAlignPermissionStallDiagnosis,
   isAlignPermissionStall,
+  buildMultiAgentPermissionStallDiagnosis,
+  isMultiAgentPermissionStall,
   FINGERPRINT_PREFIX,
 } = require('../src/self-diagnosis');
 
@@ -704,6 +706,125 @@ test('dispatchSelfDiagnosis short-circuits an align permission-denial stall with
   assert.ok(calls.lastCreateBody.labels.includes('align-permission-stall'));
   assert.match(calls.lastCreateBody.title, /align: permission-denial stall/);
   assert.match(calls.lastCreateBody.body, /pipeline-failure-fingerprint:/);
+});
+
+test('isMultiAgentPermissionStall matches a permission stall on the fan-out notes skills (#289)', () => {
+  // errorKind + skill on the checkpoint is enough (message text may lack the skill name).
+  assert.equal(
+    isMultiAgentPermissionStall('', { current: { errorKind: 'permission_stall', skill: 'deep-issue-id' } }),
+    true,
+  );
+  assert.equal(
+    isMultiAgentPermissionStall('', { current: { errorKind: 'permission_stall', skill: 'tn-writer' } }),
+    true,
+  );
+  assert.equal(
+    isMultiAgentPermissionStall('', { current: { errorKind: 'permission_stall', skill: 'post-edit-review' } }),
+    true,
+  );
+  // Enriched summary text alone is enough when it names both the signal and the skill.
+  assert.equal(
+    isMultiAgentPermissionStall('**deep-issue-id** failed for DAN 5: permission-denial stall — tool calls were auto-denied ("STOP what you are doing and wait")'),
+    true,
+  );
+  // A permission signal with no fan-out skill named must NOT match.
+  assert.equal(isMultiAgentPermissionStall('STOP what you are doing and wait for the user'), false);
+  // A fan-out skill named with no permission signal must NOT match.
+  assert.equal(isMultiAgentPermissionStall('deep-issue-id failed for DAN 5: expected output file missing'), false);
+  // A non-fan-out skill permission stall stays with the LLM diagnosis agent.
+  assert.equal(
+    isMultiAgentPermissionStall('', { current: { errorKind: 'permission_stall', skill: 'chapter-intro' } }),
+    false,
+  );
+  // A different errorKind on a fan-out skill must NOT match.
+  assert.equal(
+    isMultiAgentPermissionStall('', { current: { errorKind: 'missing_output', skill: 'deep-issue-id' } }),
+    false,
+  );
+  assert.equal(isMultiAgentPermissionStall(''), false);
+  assert.equal(isMultiAgentPermissionStall(null), false);
+  assert.equal(isMultiAgentPermissionStall(undefined), false);
+});
+
+test('buildMultiAgentPermissionStallDiagnosis pins the repo to bp-assistant and names the skill (#289)', () => {
+  const event = makePsa1Event({
+    pipelineType: 'notes',
+    scope: 'DAN 5',
+    phase: 'status',
+    // Deliberately names tn-writer: classifyRepo would route this to the skills repo,
+    // but a permission stall is always app-side permission/bypass infrastructure.
+    message: '**tn-writer** failed for DAN 5: permission-denial stall (auto-denied, "STOP and wait")',
+  });
+  const d = buildMultiAgentPermissionStallDiagnosis(event, 'some context', 'tn-writer');
+  assert.ok(d.title.length <= 120);
+  assert.match(d.title, /tn-writer: permission-denial stall/);
+  assert.equal(d.repo, 'bp-assistant', 'permission stalls are app-side infra, never skills prose');
+  assert.ok(d.labels.includes('multi-agent-permission-stall'));
+  assert.equal(d.classification, 'multi-agent-permission-stall');
+  assert.match(d.body, /BP_NO_BYPASS/);
+  assert.match(d.body, /bypassAllowAllMatcher/);
+});
+
+test('dispatchSelfDiagnosis short-circuits a deep-issue-id permission stall without invoking the agent (#289)', async () => {
+  // DAN 5, 2026-07-28: the notes pipeline routed to deep-issue-id, whose Wave-2
+  // analysts were auto-denied. The diagnosis agent fans out too and would hit the
+  // same wall, so this must be templated rather than investigated by an LLM.
+  const event = makePsa1Event({
+    pipelineType: 'notes',
+    scope: 'DAN 5',
+    phase: 'status',
+    message: 'Chapter DAN 5 failed at **deep-issue-id** after 512.8s',
+  });
+  const calls = {};
+  const fetchImpl = createGithubFetchStub({ captureCalls: calls });
+  let claudeWasCalled = false;
+  const runClaudeImpl = async () => { claudeWasCalled = true; return { subtype: 'success', result: VALID_AGENT_OUTPUT }; };
+
+  const result = await dispatchSelfDiagnosis({
+    event,
+    errorText: '**deep-issue-id** failed for DAN 5: permission-denial stall — tool calls were auto-denied ("STOP what you are doing and wait") and nothing productive followed for the whole stall window. (512.1s)',
+    checkpoint: { state: 'failed', current: { errorKind: 'permission_stall', skill: 'deep-issue-id' }, resume: { chapter: 5, skill: 'deep-issue-id' } },
+    runClaudeImpl,
+    fetchImpl,
+    readSecretImpl: () => 'fake-token',
+    readAdminStatusImpl: () => [event],
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.action, 'created-multi-agent-permission-stall');
+  assert.equal(claudeWasCalled, false, 'a known permission-denial stall must not invoke the diagnosis agent');
+  assert.equal(calls.createCount, 1);
+  assert.ok(calls.lastCreateBody.labels.includes('multi-agent-permission-stall'));
+  assert.match(calls.lastCreateBody.title, /deep-issue-id: permission-denial stall/);
+  assert.match(calls.lastCreateBody.body, /pipeline-failure-fingerprint:/);
+});
+
+test('an align permission stall still wins over the multi-agent template (#289 keeps #235 intact)', async () => {
+  // align-all-parallel is not in MULTI_AGENT_FANOUT_SKILLS and is checked first, so the
+  // pre-existing align template must keep its dispatch precedence unchanged.
+  const event = makePsa1Event({
+    pipelineType: 'generate',
+    scope: 'EZK 16',
+    phase: 'align',
+    message: '**align-all-parallel** failed for EZK 16 — permission stall (auto-denied, "STOP and wait")',
+  });
+  const calls = {};
+  const fetchImpl = createGithubFetchStub({ captureCalls: calls });
+  let claudeWasCalled = false;
+  const runClaudeImpl = async () => { claudeWasCalled = true; return { subtype: 'success', result: VALID_AGENT_OUTPUT }; };
+
+  const result = await dispatchSelfDiagnosis({
+    event,
+    errorText: 'Phase: align-all-parallel\nChapter: EZK 16\npermission stall (auto-denied)',
+    checkpoint: { state: 'failed', current: { errorKind: 'permission_stall', skill: 'align-all-parallel' }, resume: { chapter: 16, skill: 'align-all-parallel' } },
+    runClaudeImpl,
+    fetchImpl,
+    readSecretImpl: () => 'fake-token',
+    readAdminStatusImpl: () => [event],
+  });
+
+  assert.equal(result.action, 'created-align-permission-stall');
+  assert.equal(claudeWasCalled, false);
 });
 
 test('permission stall with PARTIAL salvage coverage still routes to the permission-stall template (#238)', async () => {
