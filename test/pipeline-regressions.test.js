@@ -22,6 +22,7 @@ const {
   _analyzeIssuesTsvShape,
   _isMalformedIssuesShape,
   _buildAtGenerationCheckpoint,
+  _classifyPermissionFailure,
   _finalCanonicalHebrewQuoteSync,
 } = require('../src/notes-pipeline');
 const { _finalizeNotesBeforePush: apiFinalizeNotesBeforePush } = require('../src/api-runner/api-pipeline');
@@ -570,4 +571,50 @@ test('runMechanicalQualityPrep forwards Hebrew USFM into quality checks', async 
     delete require.cache[notesPipelinePath];
     delete require.cache[qualityToolsPath];
   }
+});
+
+// --- DAN 4, 2026-07-27 (#287): a walled deep-issue-id run was reported as missing_output ---
+// The runner already diagnoses an external permission wall and exhausts its retry
+// window, but notes-pipeline consumed neither the `permission_wall` subtype nor the
+// `permissionWallDetected` annotation (generate-pipeline consumed both). A walled run
+// therefore fell through to the expected-output check and hard-failed the chapter as
+// "expected output not found", sending self-diagnosis after a skill bug that did not
+// exist. classifyPermissionFailure is the branch that must catch it first.
+test('#287 regression: success-shaped walled result classifies as permission_wall, not missing output', () => {
+  // The exact shape of the third DAN 4 attempt: the SDK emitted a normal result while
+  // trailing denial messages were still streaming, so the runner annotated it.
+  const walled = { subtype: 'success', permissionWallDetected: true, num_turns: 39 };
+  const classified = _classifyPermissionFailure(walled);
+  assert.ok(classified, 'a success-shaped walled result must be classified as a permission failure');
+  assert.equal(classified.errorKind, 'permission_wall');
+  assert.match(classified.errText, /external permission wall/i);
+  // The operator advice must be "re-run" — a wall is external and transient, so telling
+  // anyone to go change an allowlist is actively misleading.
+  assert.match(classified.errText, /re-run the chapter/i);
+});
+
+test('#287: the dedicated permission_wall subtype is caught too (runner bailed before any result)', () => {
+  const classified = _classifyPermissionFailure({ subtype: 'permission_wall', wallDenials: 2 });
+  assert.ok(classified);
+  assert.equal(classified.errorKind, 'permission_wall');
+});
+
+test('#287: a permission stall stays a distinct errorKind from a wall', () => {
+  // A stall is OUR headless auto-denial (allowlist-shaped, #235/#238); a wall is
+  // external (#271). Collapsing them would send the wrong fix to the wrong place.
+  const stall = _classifyPermissionFailure({ subtype: 'success', permissionStallDetected: true });
+  assert.ok(stall);
+  assert.equal(stall.errorKind, 'permission_stall');
+  assert.doesNotMatch(stall.errText, /external permission wall/i);
+  // Wall outranks stall when a result carries both anchors, mirroring the runner's own
+  // precedence (claude-runner.js: the wall branch is checked before the stall branch).
+  const both = { subtype: 'success', permissionWallDetected: true, permissionStallDetected: true };
+  assert.equal(_classifyPermissionFailure(both).errorKind, 'permission_wall');
+});
+
+test('#287: ordinary results are not misread as permission failures', () => {
+  assert.equal(_classifyPermissionFailure({ subtype: 'success' }), null);
+  assert.equal(_classifyPermissionFailure({ subtype: 'error', result: 'boom' }), null);
+  assert.equal(_classifyPermissionFailure(null), null);
+  assert.equal(_classifyPermissionFailure(undefined), null);
 });

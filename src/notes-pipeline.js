@@ -13,7 +13,7 @@ const path = require('path');
 const config = require('./config');
 const { spawn } = require("child_process");
 const { sendMessage, sendDM, addReaction, removeReaction } = require('./zulip-client');
-const { runClaude, DEFAULT_RESTRICTED_TOOLS, isTransientOutageError, isGuardrailStop } = require('./claude-runner');
+const { runClaude, DEFAULT_RESTRICTED_TOOLS, isTransientOutageError, isGuardrailStop, resultIndicatesPermissionWall, resultIndicatesPermissionStall } = require('./claude-runner');
 const { createGuardHooks } = require('./guard-hooks');
 const { resolveAutoModel } = require('./api-runner/provider-config');
 const { getDoor43Username, emailToFallbackUsername, buildBranchName, resolveOutputFile, discoverFreshOutput, checkPrerequisites, calcSkillTimeout, normalizeBookName, resolveConflictMention, parsePartialTsv, truncatePartialTsv, parseChunkRange, isUsageLimitError, CSKILLBP_DIR } = require('./pipeline-utils');
@@ -95,6 +95,30 @@ const SKIP_INTRO_RANGES = [
 
 function isIntroAutoExcluded(book, chapter) {
   return SKIP_INTRO_RANGES.some(r => r.book === book && chapter >= r.start && chapter <= r.end);
+}
+
+// Classify a runner outcome that the permission layer — not the skill — killed.
+// Returns null when the result is not a permission failure, otherwise the checkpoint
+// errorKind and the operator-facing explanation. A wall is EXTERNAL and transient (the
+// runner has already exhausted its retry window by the time we see one), so the advice
+// is "re-run"; a stall is our own headless auto-denial and points at the allowlist.
+function classifyPermissionFailure(result) {
+  if (resultIndicatesPermissionWall(result)) {
+    return {
+      errorKind: 'permission_wall',
+      errText: 'external permission wall — tool calls were refused from above this process\'s '
+        + 'permission config and the refusal outlasted the runner\'s retry window. Nothing in our '
+        + 'skills or allowlists caused it; walls clear on their own, so re-run the chapter.',
+    };
+  }
+  if (resultIndicatesPermissionStall(result)) {
+    return {
+      errorKind: 'permission_stall',
+      errText: 'permission-denial stall — tool calls were auto-denied ("STOP what you are doing and '
+        + 'wait") and nothing productive followed for the whole stall window.',
+    };
+  }
+  return null;
 }
 
 function shouldRunIntro(book, chapter, withIntroFlag, hasVerseRange) {
@@ -2535,6 +2559,40 @@ async function notesPipeline(route, message) {
         break;
       }
 
+      // External permission wall (#271, EZK 19) / permission-denial stall (#235, #238).
+      // The runner already diagnosed these and, for a wall, already spent its
+      // PERMISSION_WALL_RETRY_WINDOW_MS re-running the query — reaching here means the
+      // refusal outlasted it. Both surface either as a dedicated subtype or as a
+      // success-shaped result annotated permissionWallDetected/permissionStallDetected
+      // (the SDK can emit the result while trailing denial messages still stream), so a
+      // success-shaped walled run would otherwise fall through to the expected-output
+      // check and be mislabelled `missing_output` — which is what happened to DAN 4 on
+      // 2026-07-27: three walled attempts, then "expected output not found", and
+      // self-diagnosis chased a skill bug that did not exist. Check BEFORE the generic
+      // non-success branch so the wall subtype is not swallowed as `non_success_result`.
+      // No retry here: the runner owns the backoff, and a second in-pipeline loop would
+      // just double the wait.
+      const permissionFailure = classifyPermissionFailure(result);
+      if (permissionFailure) {
+        const { errorKind, errText } = permissionFailure;
+        failedSkill = skill.name;
+        await status(`**${skill.name}** failed for ${ref}: ${errText} (${duration}s)`);
+        setCheckpoint(checkpointRef, {
+          state: 'failed',
+          totalSuccess,
+          totalFail,
+          current: {
+            chapter: ch,
+            skill: skill.name,
+            status: 'failed',
+            errorKind,
+            error: errText,
+          },
+          resume: { chapter: ch, skill: skill.name },
+        });
+        break;
+      }
+
       // Hard fail on non-success result payloads, even if old output files exist.
       if (!result || result.subtype !== 'success') {
         failedSkill = skill.name;
@@ -3181,6 +3239,7 @@ module.exports = {
   _hasPauseBeforeATsFlag: hasPauseBeforeATsFlag,
   _buildAtGenerationCheckpoint: buildAtGenerationCheckpoint,
   _classifyRunClaudeEmpty: classifyRunClaudeEmpty,
+  _classifyPermissionFailure: classifyPermissionFailure,
   _buildAtValidatorSystemPrompt: buildAtValidatorSystemPrompt,
   _AT_TIMEOUTS: {
     generationMs: AT_GENERATION_TIMEOUT_MS,
