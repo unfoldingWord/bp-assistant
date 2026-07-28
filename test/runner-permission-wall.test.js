@@ -95,6 +95,27 @@ test('only wholesale-granted tools are wall evidence; Bash and unknowns are ambi
   assert.equal(isPermissionWallEvidence(''), false);
 });
 
+// issue #291 (DAN 5): on a bypass run, Bash carries NO argument-level allow-rules —
+// buildOptions hands a bypass query allow-all with no decider at all — so a denied
+// Bash there cannot be an allowlist miss either, and counts exactly like any other
+// tool. The `isBypassRun` parameter defaults to false, so every call site above
+// (and every existing caller) is unaffected.
+test('Bash IS wall evidence on a bypass run, and is NOT on a non-bypass run', () => {
+  assert.equal(isPermissionWallEvidence('Bash', true), true);
+  assert.equal(isPermissionWallEvidence('Bash', false), false);
+  assert.equal(isPermissionWallEvidence('Bash'), false); // default unchanged
+});
+
+// An unresolved tool name is ambiguous in EITHER mode — there is nothing to widen,
+// since we don't even know what was denied.
+test('an unresolved tool name is never wall evidence, bypass or not', () => {
+  for (const isBypassRun of [true, false]) {
+    assert.equal(isPermissionWallEvidence(null, isBypassRun), false);
+    assert.equal(isPermissionWallEvidence(undefined, isBypassRun), false);
+    assert.equal(isPermissionWallEvidence('', isBypassRun), false);
+  }
+});
+
 test('EZK 19: two back-to-back Read denials trip the wall', () => {
   const state = freshState();
   // 19:36:36.318 — sub-agent's first call, a Read inside cwd.
@@ -201,4 +222,88 @@ test('a wall-annotated result does not also read as a stall (wall outranks)', ()
 test('the default wall limit is small — the wall is unambiguous once it appears', () => {
   assert.ok(PERMISSION_WALL_DENIAL_LIMIT >= 2 && PERMISSION_WALL_DENIAL_LIMIT <= 4,
     `expected a tight default, got ${PERMISSION_WALL_DENIAL_LIMIT}`);
+});
+
+// issue #291 — reducer regression replaying DAN 5's REAL denial sequence (5 Bash
+// denials, then 1 Grep denial; see #289's transcript table). Under the old
+// unconditional Bash exemption this scored only 1 (the lone Grep), below
+// PERMISSION_WALL_DENIAL_LIMIT (2), so no wall fired and the run hard-failed as a
+// permission_stall instead of getting the wall's 20-minute retry budget. On a
+// bypass run, Bash now counts too, so the wall must fire on the SECOND denial
+// (both Bash) — 2s into the real incident, instead of 512s in. On a non-bypass
+// run the old behavior must hold: Bash stays ambiguous and the sequence never
+// trips the wall at all (only the trailing Grep would ever score).
+test('DAN 5 sequence (5x Bash then 1x Grep) trips the wall by the 2nd denial on a bypass run, not on non-bypass', () => {
+  const bypassState = freshState();
+  const bypassLimits = { transportLimit: 3, wallLimit: 2, isBypassRun: true };
+  const feedBypass = (toolName, id) => {
+    const sig = classifyRunnerUserMessage(denialText(id));
+    sig.deniedToolName = toolName;
+    return applyRunnerUserMessage(bypassState, sig, bypassLimits, null);
+  };
+
+  const first = feedBypass('Bash', 'toolu_dan5_1');
+  assert.equal(first.type, 'permission_denied');
+  const second = feedBypass('Bash', 'toolu_dan5_2');
+  assert.equal(second.type, 'abort_permission_wall');
+  assert.equal(second.wallDenials, 2);
+  assert.equal(second.tool, 'Bash');
+
+  // Same sequence, non-bypass: Bash never counts, so the wall never trips even
+  // after all 5 Bash denials plus the trailing Grep (which alone is only 1).
+  const nonBypassState = freshState();
+  const nonBypassLimits = { transportLimit: 3, wallLimit: 2, isBypassRun: false };
+  const feedNonBypass = (toolName, id) => {
+    const sig = classifyRunnerUserMessage(denialText(id));
+    sig.deniedToolName = toolName;
+    return applyRunnerUserMessage(nonBypassState, sig, nonBypassLimits, null);
+  };
+  const dan5Sequence = ['Bash', 'Bash', 'Bash', 'Bash', 'Bash', 'Grep'];
+  let lastAction = null;
+  dan5Sequence.forEach((toolName, i) => {
+    lastAction = feedNonBypass(toolName, `toolu_nb_${i}`);
+  });
+  assert.notEqual(lastAction.type, 'abort_permission_wall');
+  assert.equal(nonBypassState.wallDenials, 1); // only the trailing Grep scored
+});
+
+// Gate 1 locking test (issue #291). A guard-hook denial (src/guard-hooks.js) must
+// NEVER be able to trip the wall, on a bypass run or otherwise. Widening evidence
+// to Bash raises the stakes: PreToolUse decisions aggregate deny-wins, so guard
+// hooks are live even on bypass runs (BP_GUARD_HOOKS=1 in fly.toml). If a guard
+// hook's own reason text were ever mistaken for the external "STOP and wait"
+// auto-deny text, a run denied by OUR OWN guard could trip a 20-minute external-
+// wall retry — pointless, since retrying our own config never helps. This asserts
+// the guard reason strings do not match `classifyRunnerUserMessage`'s
+// `isPermissionDenied` predicate (so they never even reach the wall-evidence
+// check), and separately confirms they classify as `denialSource: 'guard_hook'`
+// rather than `'external_classifier'`.
+test('Gate 1: a guard-hook denial can never be counted as wall evidence', () => {
+  const guardHookReasons = [
+    "tool 'Bash' is not permitted in this run",
+    "tool 'WebFetch' is not on the allowlist for this run",
+    'write to protected canonical file is not allowed: output/AI-ULT/EZK/EZK-16.usfm',
+  ];
+  for (const reason of guardHookReasons) {
+    const text = JSON.stringify({
+      type: 'tool_result',
+      is_error: true,
+      tool_use_id: 'toolu_guard',
+      content: reason,
+    });
+    const sig = classifyRunnerUserMessage(text);
+    // The wall/stall reducer only ever looks at sig.isPermissionDenied — a guard
+    // denial must read false there, or it would silently become wall evidence
+    // the moment its tool name resolved to something other than Bash.
+    assert.equal(sig.isPermissionDenied, false, `guard reason misclassified as external denial: "${reason}"`);
+    assert.equal(sig.denialSource, 'guard_hook', `expected denialSource 'guard_hook' for: "${reason}"`);
+
+    // Belt-and-braces: even if isPermissionDenied were somehow true, drive it
+    // through the real reducer on a bypass run (the widest-evidence mode) and
+    // confirm a single such denial cannot trip the wall.
+    sig.deniedToolName = 'Bash';
+    const state = freshState();
+    const action = applyRunnerUserMessage(state, sig, { transportLimit: 3, wallLimit: 2, isBypassRun: true }, null);
+    assert.notEqual(action.type, 'abort_permission_wall');
+  }
 });

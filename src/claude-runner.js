@@ -253,11 +253,23 @@ const PERMISSION_STALL_POLL_MS = 30 * 1000;
 // where a healthy 8-agent fan-out burned several improvised raw-shell probes at
 // startup and recovered — a cumulative count of 3 false-aborted it. Instead: Bash
 // is the only tool whose grant is argument-level (BASH_ALLOW_RULES gate individual
-// commands), so a denied Bash call is genuinely ambiguous and is NOT wall evidence.
-// Every other tool is granted (or not) for the whole session, so a denial of one
-// cannot be an allowlist mismatch — it can only be an external refusal. #238's
+// commands), so a denied Bash call is genuinely ambiguous and is NOT wall evidence
+// — every other tool is granted (or not) for the whole session, so a denial of one
+// cannot be an allowlist mismatch and can only be an external refusal. #238's
 // probes were all Bash and would score zero here; EZK 19 scored on its very first
 // denial (a plain `Read` inside cwd).
+//
+// That Bash exemption is conditional on the run actually HAVING argument-level
+// rules to be ambiguous about — true for #238 ('auto'-mode, decideBashPermission /
+// BASH_ALLOW_RULES gate every Bash call), but false for a bypass run, which gets
+// allow-all with NO decider of any kind (see bypassAllowAll in buildOptions). A
+// denied Bash on a bypass run cannot be an allowlist miss either, so
+// isPermissionWallEvidence's `isBypassRun` parameter drops the exemption there:
+// Bash counts exactly like any other tool (issue #291, DAN 5 — 5 Bash + 1 Grep
+// denials scored only 1 under the old unconditional exemption, below this limit,
+// so the run hard-failed as a stall instead of getting the wall's retry budget).
+// #238 itself ran under 'auto' mode, not bypass, so its regression guard is
+// unaffected by this.
 const PERMISSION_WALL_DENIAL_LIMIT = Number(process.env.BP_PERMISSION_WALL_DENIALS) > 0
   ? Number(process.env.BP_PERMISSION_WALL_DENIALS)
   : 2;
@@ -684,12 +696,25 @@ function describeDenialAgent(sig) {
 }
 
 // True when a denial of `toolName` is evidence of an external permission wall
-// rather than a local allowlist mismatch. Bash carries argument-level allow-rules,
-// so a denied Bash command is ambiguous; every other tool is granted per-session,
-// so its denial cannot come from our own config. An unresolved name (null) is
-// treated as ambiguous — never as evidence.
-function isPermissionWallEvidence(toolName) {
-  return typeof toolName === 'string' && toolName.length > 0 && toolName !== 'Bash';
+// rather than a local allowlist mismatch. On a NON-bypass run, Bash carries
+// argument-level allow-rules (BASH_ALLOW_RULES), so a denied Bash command is
+// ambiguous there; every other tool is granted per-session, so its denial
+// cannot come from our own config. On a BYPASS run there is no
+// BASH_ALLOW_RULES decider at all (see the bypassAllowAll comment in
+// buildOptions) — the bypass query gets allow-all, full stop — so a denied
+// Bash there cannot be an allowlist miss either, and is exactly as strong
+// evidence as any other tool (issue #291, DAN 5: 5 Bash + 1 Grep denials
+// scored only 1 under the old unconditional exemption, below
+// PERMISSION_WALL_DENIAL_LIMIT, so no wall fired and the run hard-failed as a
+// stall instead of getting the wall's 20-minute retry budget). `isBypassRun`
+// defaults to false so every existing non-bypass caller, and #238's
+// regression guard (a healthy 8-agent 'auto'-mode fan-out burning benign Bash
+// probes), is unchanged. An unresolved name (null) is treated as ambiguous —
+// never as evidence, in either mode.
+function isPermissionWallEvidence(toolName, isBypassRun = false) {
+  if (typeof toolName !== 'string' || toolName.length === 0) return false;
+  if (toolName !== 'Bash') return true;
+  return isBypassRun;
 }
 
 // Pure reducer: applies one classified message to the mutable `state` and returns
@@ -697,7 +722,7 @@ function isPermissionWallEvidence(toolName) {
 // closed > permission-denial > tool_use_error > tool_result. `state` fields:
 // consecutiveToolErrors, consecutiveTransportErrors, consecutivePermissionDenials,
 // totalPermissionDenials, stallStartAt, toolErrorSigs (Map).
-// `limits` = { transportLimit }.
+// `limits` = { transportLimit, wallLimit, isBypassRun }.
 function applyRunnerUserMessage(state, sig, limits, guardrails, now = Date.now()) {
   if (sig.isTransportClosed) {
     state.consecutiveTransportErrors += 1;
@@ -722,7 +747,7 @@ function applyRunnerUserMessage(state, sig, limits, guardrails, now = Date.now()
     // anchor, it clears on any productive tool result below, so the limit means
     // "N such denials with nothing working in between" — a sustained wall, not a
     // recoverable startup burst.
-    if (isPermissionWallEvidence(sig.deniedToolName)) {
+    if (isPermissionWallEvidence(sig.deniedToolName, limits.isBypassRun)) {
       state.wallDenials = (state.wallDenials || 0) + 1;
       if (limits.wallLimit > 0 && state.wallDenials >= limits.wallLimit) {
         return { type: 'abort_permission_wall', wallDenials: state.wallDenials, tool: sig.deniedToolName };
@@ -1099,7 +1124,17 @@ async function runClaudeOnce({
         const action = applyRunnerUserMessage(
           errorState,
           sig,
-          { transportLimit: MCP_TRANSPORT_ERROR_LIMIT, wallLimit: PERMISSION_WALL_DENIAL_LIMIT },
+          {
+            transportLimit: MCP_TRANSPORT_ERROR_LIMIT,
+            wallLimit: PERMISSION_WALL_DENIAL_LIMIT,
+            // issue #291: same distinction the startup log line above (`options.
+            // permissionMode === 'bypassPermissions'`) already makes — reused
+            // rather than recomputing BP_NO_BYPASS, which buildOptions already
+            // applied when it decided bypassAllowAll. Widens Bash denial
+            // evidence to the wall detector on bypass runs only (see
+            // isPermissionWallEvidence).
+            isBypassRun: options.permissionMode === 'bypassPermissions',
+          },
           guardrails
         );
         if (action.type === 'transport_error' || action.type === 'abort_transport') {
