@@ -3,7 +3,9 @@
 // Detects human edits merged overnight into the `-be-` branches of ULT/UST/TN
 // on Door43 (self-hosted Gitea), attributes them to editors, and emits an
 // attributed, read-only proposal feed that the Dreamer consumes
-// (output/overnight-review/<date>/proposals.jsonl). It does NOT write the
+// (data/overnight-review/<date>/proposals.jsonl — matches the `outDir` below and
+// the Dreamer's own read path; this comment said `output/` until 2026-07-28 and
+// the mismatch briefly read as a real broken-feed bug). It does NOT write the
 // preference store — it only surfaces signal.
 //
 // Detection is robust to overnight branch deletion:
@@ -14,6 +16,14 @@
 //
 // Idempotent (keyed by PR id + headSha) and cold-start-safe via
 // overnight-review-state.js. HTTP is injectable for tests.
+//
+// Cold start (see #OVERNIGHT-COLDSTART-VISIBILITY at the cold-start branch in
+// runOvernightReview) defaults to priming every enumerated unit as
+// already-seen and reviewing none of them — this is correct on a genuine
+// first-ever run, but it is a silent no-op for any backlog that accumulated
+// before the Sensor could persist state. `--review-cold-start` /
+// `OVERNIGHT_REVIEW_COLD_START=true` opt into reviewing the enumerated units
+// on a cold start instead of priming past them; default is OFF.
 'use strict';
 
 const fs = require('node:fs');
@@ -293,17 +303,42 @@ async function reviewUnit(u, { fetchTextImpl }) {
 // --- orchestration -----------------------------------------------------------
 function dateStamp(now) { return now.toISOString().slice(0, 10); }
 
+// #OVERNIGHT-FEED: what `dryRun` means in THIS module, decided here so the next
+// reader doesn't reintroduce a `!dryRun` guard around persistence. This module
+// takes no actions of its own (no PR creation, no door43-push call — see the
+// #OVERNIGHT-FEED comment below the feed write). Both the state file and the
+// proposal/review-task feed are files for other systems to read, not actions,
+// so `dryRun` no longer gates either write. Its only remaining job is LOG /
+// DIGEST WORDING (the `[overnight] reviewed vs would-review` line and the CLI
+// digest text) plus being echoed through in the returned result object, so a
+// caller (e.g. the cron wrapper in bp-assistant-auto-issue-handler, gated on
+// OVERNIGHT_PR_ENABLED) can tell which invocation mode produced a given feed.
+// If a real action is ever added to this module, `dryRun` should gate THAT —
+// not the persistence of state.json or the proposal feed.
 async function runOvernightReview({
   skillsRepo,
   token = readSecret('door43_token', 'DOOR43_TOKEN') || readSecret('gitea_token', 'GITEA_TOKEN') || '',
   now = new Date(),
   dryRun = false,
+  // #OVERNIGHT-COLDSTART-VISIBILITY: opt-in escape hatch for the situation this
+  // module cannot tell apart from a genuine first-ever run — see the long
+  // comment below, at the cold-start branch, for why this defaults to false.
+  reviewColdStart = false,
   deps = {},
 } = {}) {
   const log = deps.log || ((m) => process.stderr.write(`${m}\n`));
   const writeImpl = deps.writeFileSync || fs.writeFileSync;
   const mkdir = deps.mkdirSync || ((p) => fs.mkdirSync(p, { recursive: true }));
   const stateFile = path.join(skillsRepo, state.DEFAULT_STATE_REL);
+
+  // #OVERNIGHT-STATE: probe for a pre-existing state file BEFORE loadState
+  // swallows the distinction — this lets a cold start be logged as either a
+  // genuine first-ever run (no file at all) or an anomalous one (a file was
+  // there but came back uninitialized/corrupt), so a persistence regression
+  // can't hide behind an innocuous "cold start" line the way this one did for
+  // 34 consecutive nightly runs.
+  let stateFileExisted = true;
+  try { (deps.readFileSync || fs.readFileSync)(stateFile, 'utf8'); } catch { stateFileExisted = false; }
 
   const st = state.loadState(stateFile, deps.readFileSync);
   const editorMap = deps.editorMap || loadEditorMap();
@@ -313,11 +348,57 @@ async function runOvernightReview({
   const units = await enumerateUnits({ apiGetImpl: deps.apiGetImpl, token, sinceIso: st.lastRun, editorMap });
   const allKeys = units.map(unitKeyFor);
 
-  if (state.isColdStart(st)) {
+  if (state.isColdStart(st) && !reviewColdStart) {
     state.primeColdStart(st, allKeys, now);
-    if (!dryRun) state.saveState(stateFile, st, { writeImpl, mkdirImpl: mkdir });
-    log(`[overnight] cold start — ${dryRun ? 'would record' : 'recorded'} ${allKeys.length} current HEAD(s); reviewing nothing tonight.`);
-    return { coldStart: true, dryRun, units: units.length, reviewed: 0, proposals: 0, proposalsPath: null };
+    // #OVERNIGHT-STATE: persist regardless of dryRun. Priming records "these
+    // HEADs are already seen" — that's memory, not an action (dry-run's job is
+    // to skip taking actions like opening PRs, not to skip remembering). The
+    // previous `if (!dryRun)` guard here meant a dry-run cold start was never
+    // saved, so every dry run looked like the very first run, forever.
+    state.saveState(stateFile, st, { writeImpl, mkdirImpl: mkdir });
+    const anomaly = stateFileExisted ? ' [WARNING: a state file existed but was not initialized — check for a persistence bug]' : '';
+    // #OVERNIGHT-COLDSTART-VISIBILITY: priming is correct, pre-existing,
+    // intentional design — it stops the Sensor from trying to review all of
+    // history the very first time it ever runs. What was NOT correct is that
+    // it did this SILENTLY: every unit primed here is discarded work — no
+    // proposal is ever produced for it, and the reviewed watermark advances
+    // past it, so it can never be picked up on a later run either. That is
+    // invisible unless someone reads this log line closely, and it is exactly
+    // what will happen to this Sensor's own accumulated backlog: after ~34
+    // nights of dry-run-only operation, state.json was never saved (see
+    // a9b8bea two commits back), so THE FIRST RUN AFTER THIS BRANCH DEPLOYS
+    // WILL COLD-START — and every merged edit from those 34 nights will be
+    // silently primed away unless OVERNIGHT_REVIEW_COLD_START (or
+    // --review-cold-start) is set for that run. Log the count AND enough
+    // identifying detail to act on, and surface both in the digest (see
+    // cliMain below) — not buried in a log stream nobody tails.
+    const sample = allKeys.slice(0, 20);
+    const skippedDetail = sample.length < allKeys.length
+      ? `${sample.join(', ')}, … (+${allKeys.length - sample.length} more)`
+      : sample.join(', ');
+    log(`[overnight] COLD START (${stateFileExisted ? 'not a genuine first run' : 'genuine first run'})${anomaly} — SKIPPING ${allKeys.length} unit(s) as already-seen; NO proposals will be produced for them: ${skippedDetail || '(none)'}. To review these instead of skipping them, set OVERNIGHT_REVIEW_COLD_START=true (or pass --review-cold-start) and re-run.${dryRun ? ' (dry-run)' : ''}`);
+    return {
+      coldStart: true, dryRun, genuineFirstRun: !stateFileExisted,
+      units: units.length, reviewed: 0, proposals: 0, proposalsPath: null,
+      skipped: allKeys.length, skippedSample: sample,
+    };
+  }
+
+  // #OVERNIGHT-COLDSTART-VISIBILITY: reviewColdStart was set on a genuine cold
+  // start — the operator has explicitly opted OUT of priming for this run and
+  // wants the enumerated units reviewed instead. Do NOT call primeColdStart.
+  // Just flip `initialized` so this doesn't cold-start again next run, and
+  // fall through into the exact same review/feed/state-save path used for a
+  // normal (non-cold) run below. That path already treats every unit in
+  // `units` as "fresh" (nothing is in st.reviewed yet), already writes the
+  // proposal feed unconditionally, and already only advances the watermark
+  // when nothing failed — so the invariant in the #OVERNIGHT-FEED comment
+  // below (reviewed-set/watermark never advances past unpersisted proposals)
+  // holds here for free, with no separate code path to keep in sync.
+  const coldStartReviewed = state.isColdStart(st) && reviewColdStart;
+  if (coldStartReviewed) {
+    st.initialized = true;
+    log(`[overnight] COLD START — OVERNIGHT_REVIEW_COLD_START is set: reviewing ${allKeys.length} enumerated unit(s) instead of priming them past. This will attempt to review the entire accumulated backlog.`);
   }
 
   const fresh = units.filter((u) => !state.isReviewed(st, unitKeyFor(u)) && !isBotAuthor(u.author));
@@ -348,53 +429,105 @@ async function runOvernightReview({
   // machine). The feed must persist (committed alongside state.json) so the
   // next Dreamer wake can read it after a fresh clone.
   const outDir = path.join(skillsRepo, 'data/overnight-review', dateStamp(now));
-  let proposalsPath = null;
-  let tasksPath = null;
-  if (!dryRun) {
-    mkdir(outDir);
-    proposalsPath = path.join(outDir, 'proposals.jsonl');
-    writeImpl(proposalsPath, proposals.map((p) => JSON.stringify(p)).join('\n') + (proposals.length ? '\n' : ''));
-    tasksPath = path.join(outDir, 'review-tasks.jsonl');
-    writeImpl(tasksPath, reviewTasks.map((t) => JSON.stringify(t)).join('\n') + (reviewTasks.length ? '\n' : ''));
-    // Persist the reviewed-set always (so successful units are never re-reviewed),
-    // but only advance the lastRun watermark on a clean run — otherwise a deferred
-    // unit would fall outside the next window and never be retried.
-    if (failed === 0) st.lastRun = now.toISOString();
-    state.saveState(stateFile, st, { writeImpl, mkdirImpl: mkdir });
-  }
+  // #OVERNIGHT-FEED (closes the follow-up on #OVERNIGHT-STATE): the proposal
+  // and review-task feed is a FILE for downstream automation/humans to read —
+  // same category as state.json — not an "action" like opening a PR. This
+  // module never opens PRs (grep it: no createPull/door43-push call here), so
+  // there was never an action for dry-run to suppress by gating this write.
+  // Gating it behind `!dryRun` (as it was) combined with the previous fix
+  // (state now persists unconditionally) to make things WORSE than the
+  // original bug: units got marked reviewed and the watermark advanced, but
+  // the proposals describing them were discarded — so the Sensor still
+  // produced nothing, and now permanently forgot the backlog too. Write the
+  // feed unconditionally, and do it BEFORE advancing/saving state (below) —
+  // see the invariant comment there.
+  mkdir(outDir);
+  const proposalsPath = path.join(outDir, 'proposals.jsonl');
+  writeImpl(proposalsPath, proposals.map((p) => JSON.stringify(p)).join('\n') + (proposals.length ? '\n' : ''));
+  const tasksPath = path.join(outDir, 'review-tasks.jsonl');
+  writeImpl(tasksPath, reviewTasks.map((t) => JSON.stringify(t)).join('\n') + (reviewTasks.length ? '\n' : ''));
+  // #OVERNIGHT-STATE: persist the reviewed-set and lastRun watermark
+  // UNCONDITIONALLY — including on a dry run. Marking a unit reviewed and
+  // advancing lastRun is bookkeeping ("what have I already looked at"), not an
+  // action ("open a PR"); dry-run must only suppress the latter. Gating this
+  // behind `!dryRun` (as it was) meant every dry run started back at the same
+  // watermark, so a dry-run-only Sensor could never make forward progress —
+  // this is the root cause of 34 consecutive no-op nightly runs.
+  //
+  // INVARIANT (#OVERNIGHT-FEED): the reviewed-set / lastRun watermark must
+  // NEVER advance past units whose proposals were not successfully persisted.
+  // That's why the feed write above runs first, with nothing catching its
+  // exception here: if writeImpl/mkdir throws, it propagates out of
+  // runOvernightReview before `st.lastRun` is touched or state.saveState is
+  // called, so nothing is persisted this run — the same units are still
+  // "fresh" (not in `reviewed`, lastRun unmoved) and get retried next run
+  // instead of being silently marked seen with their proposals lost.
+  //
+  // Only advance the lastRun watermark on a clean run — otherwise a deferred
+  // unit would fall outside the next window and never be retried.
+  if (failed === 0) st.lastRun = now.toISOString();
+  state.saveState(stateFile, st, { writeImpl, mkdirImpl: mkdir });
 
   const reviewed = fresh.length - failed;
-  log(`[overnight] ${dryRun ? 'would review' : 'reviewed'} ${reviewed} unit(s)${failed ? ` (${failed} deferred on transient failure)` : ''} → ${proposals.length} proposal row(s), ${reviewTasks.length} review task(s).`);
+  // "reviewed" regardless of dryRun — the feed is always written now (see
+  // #OVERNIGHT-FEED above), so there is no "would review" distinction left to
+  // draw. dryRun only tags the line for the reader's benefit.
+  log(`[overnight] reviewed ${reviewed} unit(s)${failed ? ` (${failed} deferred on transient failure)` : ''} → ${proposals.length} proposal row(s), ${reviewTasks.length} review task(s).${coldStartReviewed ? ' (this was a cold start, reviewed via OVERNIGHT_REVIEW_COLD_START instead of primed)' : ''}${dryRun ? ' (dry-run)' : ''}`);
   return {
     coldStart: false, dryRun, units: units.length, reviewed, failed,
     proposals: proposals.length, proposalsPath, tasksPath, reviewTasks,
     sampleProposals: proposals.slice(0, 12),
+    coldStartReviewed, skipped: 0,
   };
 }
 
 // --- CLI ---------------------------------------------------------------------
-// node src/overnight-watcher.js --skills-repo <dir> [--dry-run]
+// node src/overnight-watcher.js --skills-repo <dir> [--dry-run] [--review-cold-start]
 // Prints a digest between OVERNIGHT_DIGEST markers for the cron wrapper.
+//
+// #OVERNIGHT-COLDSTART-VISIBILITY: --review-cold-start (or env
+// OVERNIGHT_REVIEW_COLD_START=true) makes a cold start REVIEW the enumerated
+// units instead of priming past them — i.e. it treats the accumulated backlog
+// as work to do, not as noise to skip. Default is OFF: priming remains the
+// default cold-start behaviour (see the long comment at the cold-start branch
+// in runOvernightReview for why silently reviewing everything on every
+// genuine first run would be wrong). This is an opt-in escape hatch for the
+// one situation where a human knows better than the default — e.g. the first
+// run after this fix deploys, where the Sensor's own dry-run history means
+// it is about to cold-start over a real, non-empty backlog.
 function parseArgs(argv) {
-  const out = { dryRun: false };
+  const out = { dryRun: false, reviewColdStart: false };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--dry-run') out.dryRun = true;
+    else if (a === '--review-cold-start') out.reviewColdStart = true;
     else if (a === '--skills-repo') out.skillsRepo = argv[++i];
   }
   return out;
+}
+
+function envFlag(name) {
+  return /^(1|true|yes)$/i.test(String(process.env[name] || '').trim());
 }
 
 async function cliMain(argv) {
   const args = parseArgs(argv);
   const skillsRepo = args.skillsRepo || process.env.BP_SKILLS_REPO;
   if (!skillsRepo) { process.stderr.write('[overnight] BP_SKILLS_REPO not set\n'); process.exit(2); }
-  const res = await runOvernightReview({ skillsRepo, dryRun: args.dryRun });
+  const reviewColdStart = args.reviewColdStart || envFlag('OVERNIGHT_REVIEW_COLD_START');
+  const res = await runOvernightReview({ skillsRepo, dryRun: args.dryRun, reviewColdStart });
   const lines = [];
   if (res.coldStart) {
-    lines.push(`Cold start — recorded current HEADs; reviewed nothing this run${res.dryRun ? ' (dry-run)' : ''}.`);
+    const label = res.genuineFirstRun ? 'genuine first run' : 'NOT a genuine first run — state existed but was uninitialized, check for a persistence bug';
+    lines.push(`COLD START (${label}) — SKIPPED ${res.skipped} unit(s) as already-seen; NO proposals were produced for them${res.dryRun ? ' (dry-run)' : ''}.`);
+    if (res.skippedSample && res.skippedSample.length) {
+      const more = res.skipped > res.skippedSample.length ? ` (+${res.skipped - res.skippedSample.length} more)` : '';
+      lines.push(`Skipped units: ${res.skippedSample.join(', ')}${more}`);
+    }
+    lines.push('To review these instead of skipping them, set OVERNIGHT_REVIEW_COLD_START=true (or pass --review-cold-start) and re-run.');
   } else {
-    lines.push(`Reviewed ${res.reviewed} new \`-be-\` unit(s) across ${res.units} watched → ${res.proposals} attributed proposal row(s)${res.dryRun ? ' (dry-run, not persisted)' : ''}.`);
+    if (res.coldStartReviewed) lines.push('NOTE: this was a cold start; reviewed the enumerated backlog instead of priming past it (OVERNIGHT_REVIEW_COLD_START was set).');
+    lines.push(`Reviewed ${res.reviewed} new \`-be-\` unit(s) across ${res.units} watched → ${res.proposals} attributed proposal row(s)${res.dryRun ? ' (dry-run)' : ''}.`);
     for (const t of res.reviewTasks || []) {
       lines.push(`- ${t.repo} ${t.book} (${t.resource}) by ${t.editor}: ${t.changes} change(s)${t.chapters.length ? ` [ch ${t.chapters.join(',')}]` : ''}`);
     }

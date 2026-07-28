@@ -216,6 +216,242 @@ test('runOvernightReview defers a unit on transient fetch failure (not marked re
   assert.equal(saved.lastRun, '2026-06-20T00:00:00Z'); // watermark held (not advanced)
 });
 
+// --- dry-run state persistence (#OVERNIGHT-STATE) ---------------------------
+// A dry run must still persist state (watermark + reviewed keys): dry-run
+// means "don't take actions" (don't write the proposal feed), NOT "don't
+// remember anything". Gating state.saveState behind `!dryRun` meant every
+// dry run cold-started forever — 34 consecutive nightly no-ops.
+test('a dry-run cold start still persists state, so a second dry run does not cold-start again', async () => {
+  // A path-agnostic single-slot fake "disk": mirrors the style of the other
+  // tests in this file (which key off a regex on the path, not the literal
+  // string), since path.join produces backslashes on Windows.
+  let stateContent = null;
+  const readFileSync = (p) => {
+    if (/state\.json$/.test(p) && stateContent != null) return stateContent;
+    throw new Error('ENOENT');
+  };
+  const writeFileSync = (p, content) => { if (/state\.json$/.test(p)) stateContent = content; };
+  const prs = { en_tn: [{ number: 5, merged: true, merged_at: '2026-06-23T10:00:00Z', head: { ref: 'PSA-be-pjoakes', sha: 'head5' }, base: { sha: 'base5' }, user: { login: 'pjoakes' } }] };
+
+  const first = await watcher.runOvernightReview({
+    skillsRepo: '/skills', now: new Date('2026-06-24T07:00:00Z'), dryRun: true,
+    deps: {
+      readFileSync, writeFileSync, mkdirSync: () => {},
+      apiGetImpl: fakeApiGet(prs, {}), fetchTextImpl: async () => '', log: () => {},
+    },
+  });
+  assert.equal(first.coldStart, true);
+  assert.equal(first.genuineFirstRun, true); // no prior state file at all
+  assert.equal(first.dryRun, true);
+  assert.equal(first.proposalsPath, null); // dry-run still suppresses the proposal feed
+
+  assert.ok(stateContent, 'dry run must still write state.json');
+  assert.ok(JSON.parse(stateContent).initialized);
+
+  // A second dry run, reading the now-persisted state, must NOT report a cold
+  // start again — this is the exact bug: cold start hid behind "green" forever.
+  const second = await watcher.runOvernightReview({
+    skillsRepo: '/skills', now: new Date('2026-06-25T07:00:00Z'), dryRun: true,
+    deps: {
+      readFileSync, writeFileSync, mkdirSync: () => {},
+      apiGetImpl: fakeApiGet({}, {}), fetchTextImpl: async () => '', log: () => {},
+    },
+  });
+  assert.equal(second.coldStart, false);
+});
+
+// Rewritten for #OVERNIGHT-FEED: the previous version of this test asserted
+// that a dry run advances the watermark WITHOUT writing the proposal feed.
+// That is exactly the bug the finding caught — combined with the watermark
+// now always advancing (the prior fix), suppressing the feed on a dry run
+// meant proposals were computed, the units were marked reviewed, and then the
+// proposals describing them were thrown away, permanently. The feed is a file
+// for downstream automation to read (same category as state.json), not an
+// action, so it is no longer gated on dryRun. This test now asserts the new
+// contract: a dry run writes the feed exactly like a live run.
+test('a dry run writes the proposal feed and advances the reviewed watermark, same as a live run', async () => {
+  let stateContent = JSON.stringify({
+    version: 1, initialized: true, lastRun: '2026-06-20T00:00:00Z', reviewed: {}, branchTips: {},
+  });
+  const writes = [];
+  const readFileSync = (p) => { if (/state\.json$/.test(p)) return stateContent; throw new Error('ENOENT'); };
+  const writeFileSync = (p, content) => {
+    if (/state\.json$/.test(p)) stateContent = content;
+    writes.push({ pth: p, content });
+  };
+  const prs = { en_tn: [{ number: 9, merged: true, merged_at: '2026-06-23T22:00:00Z', head: { ref: 'PSA-be-pjoakes', sha: 'newhead' }, base: { sha: 'oldbase' }, user: { login: 'pjoakes' } }] };
+
+  const res = await watcher.runOvernightReview({
+    skillsRepo: '/skills', now: new Date('2026-06-24T07:00:00Z'), dryRun: true,
+    deps: {
+      readFileSync, writeFileSync, mkdirSync: () => {},
+      apiGetImpl: fakeApiGet(prs, {}), fetchTextImpl: async () => '', log: () => {},
+    },
+  });
+  assert.equal(res.coldStart, false);
+  assert.equal(res.dryRun, true);
+  assert.equal(res.reviewed, 1);
+  assert.ok(res.proposalsPath, 'dry run must still write the proposal feed path'); // no longer suppressed
+  assert.ok(res.tasksPath, 'dry run must still write the review-task feed path');
+
+  const proposalsWrite = writes.find((w) => /proposals\.jsonl$/.test(w.pth));
+  assert.ok(proposalsWrite, 'proposals.jsonl must actually be written on a dry run');
+  const tasksWrite = writes.find((w) => /review-tasks\.jsonl$/.test(w.pth));
+  assert.ok(tasksWrite, 'review-tasks.jsonl must actually be written on a dry run');
+
+  const saved = JSON.parse(stateContent);
+  assert.equal(saved.lastRun, '2026-06-24T07:00:00.000Z'); // watermark advanced
+  assert.ok(Object.keys(saved.reviewed).some((k) => k.startsWith('en_tn#9@')));
+});
+
+// New: the invariant this finding introduced. If persisting the feed fails,
+// the reviewed-set/watermark must NOT advance — otherwise the unit is marked
+// seen while its proposal is lost, with no way to recover it.
+test('if the proposal feed write throws, the reviewed-set/watermark is NOT advanced (unit stays fresh next run)', async () => {
+  const initState = JSON.stringify({
+    version: 1, initialized: true, lastRun: '2026-06-20T00:00:00Z', reviewed: {}, branchTips: {},
+  });
+  let stateContent = initState;
+  const readFileSync = (p) => { if (/state\.json$/.test(p)) return stateContent; throw new Error('ENOENT'); };
+  const writeFileSync = (p, content) => {
+    if (/proposals\.jsonl$/.test(p)) throw new Error('disk full');
+    if (/state\.json$/.test(p)) stateContent = content;
+  };
+  const prs = { en_tn: [{ number: 9, merged: true, merged_at: '2026-06-23T22:00:00Z', head: { ref: 'PSA-be-pjoakes', sha: 'newhead' }, base: { sha: 'oldbase' }, user: { login: 'pjoakes' } }] };
+
+  await assert.rejects(
+    () => watcher.runOvernightReview({
+      skillsRepo: '/skills', now: new Date('2026-06-24T07:00:00Z'),
+      deps: {
+        readFileSync, writeFileSync, mkdirSync: () => {},
+        apiGetImpl: fakeApiGet(prs, {}), fetchTextImpl: async () => '', log: () => {},
+      },
+    }),
+    /disk full/,
+  );
+
+  // state.json must be exactly as it was before the run — not advanced.
+  assert.equal(stateContent, initState);
+  const saved = JSON.parse(stateContent);
+  assert.equal(saved.lastRun, '2026-06-20T00:00:00Z');
+  assert.equal(Object.keys(saved.reviewed).length, 0);
+
+  // A subsequent run (state genuinely unchanged) must still see the unit as fresh.
+  const second = await watcher.runOvernightReview({
+    skillsRepo: '/skills', now: new Date('2026-06-25T07:00:00Z'),
+    deps: {
+      readFileSync: () => stateContent,
+      writeFileSync: (p, content) => { if (/state\.json$/.test(p)) stateContent = content; },
+      mkdirSync: () => {},
+      apiGetImpl: fakeApiGet(prs, {}), fetchTextImpl: async () => '', log: () => {},
+    },
+  });
+  assert.equal(second.reviewed, 1); // still fresh, not silently skipped
+});
+
+test('a genuine first-ever run (no prior state at all) is reported distinctly from an anomalous cold start', async () => {
+  const res = await watcher.runOvernightReview({
+    skillsRepo: '/skills', now: new Date('2026-06-24T07:00:00Z'),
+    deps: {
+      readFileSync: () => { throw new Error('ENOENT'); },
+      writeFileSync: () => {},
+      mkdirSync: () => {},
+      apiGetImpl: fakeApiGet({}, {}),
+      fetchTextImpl: async () => '',
+      log: () => {},
+    },
+  });
+  assert.equal(res.coldStart, true);
+  assert.equal(res.genuineFirstRun, true);
+});
+
+// --- cold-start visibility / escape hatch (#OVERNIGHT-COLDSTART-VISIBILITY) -
+// Priming on cold start is correct by design, but it discards the enumerated
+// units silently. These tests cover: (1) the default (priming) path reports
+// how many units it skipped and logs enough detail to identify them, and (2)
+// the opt-in reviewColdStart flag reviews the units and writes the feed
+// instead of priming, while (3) confirming the default remains priming.
+test('a default cold start reports the skipped count/keys and logs them loudly', async () => {
+  const logs = [];
+  const prs = { en_tn: [{ number: 5, merged: true, merged_at: '2026-06-23T10:00:00Z', head: { ref: 'PSA-be-pjoakes', sha: 'head5' }, base: { sha: 'base5' }, user: { login: 'pjoakes' } }] };
+  const res = await watcher.runOvernightReview({
+    skillsRepo: '/skills', now: new Date('2026-06-24T07:00:00Z'),
+    deps: {
+      readFileSync: () => { throw new Error('no state'); },
+      writeFileSync: () => {},
+      mkdirSync: () => {},
+      apiGetImpl: fakeApiGet(prs, {}),
+      fetchTextImpl: async () => '',
+      log: (m) => logs.push(m),
+    },
+  });
+  assert.equal(res.coldStart, true);
+  assert.equal(res.skipped, 1);
+  assert.ok(Array.isArray(res.skippedSample) && res.skippedSample.length === 1);
+  assert.ok(res.skippedSample[0].startsWith('en_tn#5@'));
+  // The log line itself must carry the count and the identifying key(s) —
+  // this is what makes the digest legible instead of a bare "cold start".
+  const line = logs.find((l) => /COLD START/.test(l));
+  assert.ok(line, 'expected a COLD START log line');
+  assert.match(line, /SKIPPING 1 unit/);
+  assert.match(line, /en_tn#5@/);
+  assert.match(line, /OVERNIGHT_REVIEW_COLD_START/);
+});
+
+test('reviewColdStart=true on a cold start reviews the enumerated units and writes the feed instead of priming', async () => {
+  const writes = [];
+  const prs = { en_tn: [{ number: 9, merged: true, merged_at: '2026-06-23T22:00:00Z', head: { ref: 'PSA-be-pjoakes', sha: 'newhead' }, base: { sha: 'oldbase' }, user: { login: 'pjoakes' } }] };
+  const oldTsv = [TN_HEADER, '1:1\ta\t\tfigs-metaphor\tx\t1\told note'].join('\n');
+  const newTsv = [TN_HEADER, '1:1\tb\t\tfigs-metaphor\tx\t1\trewritten note'].join('\n');
+  const res = await watcher.runOvernightReview({
+    skillsRepo: '/skills', now: new Date('2026-06-24T07:00:00Z'), reviewColdStart: true,
+    deps: {
+      readFileSync: () => { throw new Error('no state'); }, // genuine cold start
+      writeFileSync: (pth, content) => writes.push({ pth, content }),
+      mkdirSync: () => {},
+      apiGetImpl: fakeApiGet(prs, {}),
+      fetchTextImpl: async (url) => (/commit\/oldbase/.test(url) ? oldTsv : (/commit\/newhead/.test(url) ? newTsv : '')),
+      log: () => {},
+    },
+  });
+  // Not reported as a (priming) cold start — it was reviewed instead.
+  assert.equal(res.coldStart, false);
+  assert.equal(res.coldStartReviewed, true);
+  assert.equal(res.reviewed, 1);
+  assert.equal(res.proposals, 1);
+  const proposalsWrite = writes.find((w) => /proposals\.jsonl$/.test(w.pth));
+  assert.ok(proposalsWrite, 'the feed must be written, not skipped, when reviewColdStart is set');
+  const row = JSON.parse(proposalsWrite.content.trim());
+  assert.equal(row.category, 'reworded');
+
+  const stateWrite = writes.find((w) => /state\.json$/.test(w.pth));
+  const saved = JSON.parse(stateWrite.content);
+  assert.equal(saved.initialized, true); // future runs won't cold-start again
+  assert.ok(Object.keys(saved.reviewed).some((k) => k.startsWith('en_tn#9@')));
+  assert.equal(saved.lastRun, '2026-06-24T07:00:00.000Z');
+});
+
+test('the default (reviewColdStart omitted) on a cold start still primes, not reviews', async () => {
+  const writes = [];
+  const prs = { en_tn: [{ number: 5, merged: true, merged_at: '2026-06-23T10:00:00Z', head: { ref: 'PSA-be-pjoakes', sha: 'head5' }, base: { sha: 'base5' }, user: { login: 'pjoakes' } }] };
+  const res = await watcher.runOvernightReview({
+    skillsRepo: '/skills', now: new Date('2026-06-24T07:00:00Z'),
+    deps: {
+      readFileSync: () => { throw new Error('no state'); },
+      writeFileSync: (pth, content) => writes.push({ pth, content }),
+      mkdirSync: () => {},
+      apiGetImpl: fakeApiGet(prs, {}),
+      fetchTextImpl: async () => '',
+      log: () => {},
+    },
+  });
+  assert.equal(res.coldStart, true);
+  assert.equal(res.reviewed, 0);
+  assert.equal(res.proposalsPath, null);
+  const proposalsWrite = writes.find((w) => /proposals\.jsonl$/.test(w.pth));
+  assert.equal(proposalsWrite, undefined, 'no feed should be written when priming (default)');
+});
+
 test('runOvernightReview reviews a fresh merged TN PR and emits proposals', async () => {
   const writes = [];
   const initState = JSON.stringify({ version: 1, initialized: true, lastRun: '2026-06-20T00:00:00Z', reviewed: {}, branchTips: {} });
