@@ -16,8 +16,13 @@
 // This must never take the bot down. Any file error (disk full, bad perms) is
 // reported once to stderr and then swallowed; stdin keeps draining to stdout.
 // Likewise, if stdout itself breaks (EPIPE/EIO — the downstream reader is
-// gone), there is nothing useful left to do, so we exit quietly instead of
-// crashing noisily or taking the parent down.
+// gone), we stop writing to it but keep draining stdin and keep appending to
+// the log file. We deliberately do NOT exit here: this script sits between an
+// upstream producer and this pipe in a shell pipeline (producer | log-tee),
+// and exiting would close the pipe's read end, sending the producer SIGPIPE
+// and corrupting its real exit code (as seen via bash PIPESTATUS). Staying
+// alive and draining stdin keeps the producer's exit code intact and keeps
+// the one surviving copy of the logs — the file — flowing.
 
 const fs = require('fs');
 const path = require('path');
@@ -102,47 +107,46 @@ pruneOldRotated();
 // queuing unbounded data in its own heap while it keeps draining stdin.
 let stdoutBroken = false;
 
-function exitQuietly() {
+// Marks stdout as unusable and makes sure stdin keeps flowing. If stdin was
+// paused waiting for a 'drain' that will now never come (the stream we were
+// waiting on is dead), resume it — otherwise the pipe would stall forever
+// instead of continuing to drain into the log file.
+function markStdoutBroken() {
   if (stdoutBroken) return;
   stdoutBroken = true;
   try {
-    process.stdin.pause();
+    process.stdin.resume();
   } catch {
     /* already gone */
   }
-  try {
-    process.stdin.destroy();
-  } catch {
-    /* already gone */
-  }
-  process.exit(0);
 }
 
 // If stdout itself breaks (EPIPE/EIO — the reader on the other end is gone),
-// there's nothing useful left to do. Without this handler an 'error' event
-// with no listener throws and crashes the process; swallow it and exit
-// quietly instead, so a dead downstream reader can never take the parent down.
+// there's nothing useful left to do with stdout. Without this handler an
+// 'error' event with no listener throws and crashes the process; swallow it
+// and fall back to file-only logging instead of exiting — see the header
+// comment for why exiting here would be actively harmful.
 process.stdout.on('error', (err) => {
   if (err && (err.code === 'EPIPE' || err.code === 'EIO')) {
-    exitQuietly();
+    markStdoutBroken();
   }
 });
 
 // stdin can likewise raise EPIPE/EIO in edge cases; swallow rather than let
-// an unhandled 'error' event throw.
+// an unhandled 'error' event throw. 'end'/'close' handle exit.
 process.stdin.on('error', () => {
-  /* nothing useful to do here; 'end'/'close' (or exitQuietly) handle exit */
+  /* nothing useful to do here; 'end'/'close' handle exit */
 });
 
 process.stdin.on('data', (chunk) => {
-  if (stdoutBroken) return;
-
-  const ok = process.stdout.write(chunk);
-  if (!ok) {
-    process.stdin.pause();
-    process.stdout.once('drain', () => {
-      if (!stdoutBroken) process.stdin.resume();
-    });
+  if (!stdoutBroken) {
+    const ok = process.stdout.write(chunk);
+    if (!ok) {
+      process.stdin.pause();
+      process.stdout.once('drain', () => {
+        if (!stdoutBroken) process.stdin.resume();
+      });
+    }
   }
 
   if (broken) return;

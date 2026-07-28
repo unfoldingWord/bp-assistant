@@ -186,7 +186,7 @@ test('stdout backpressure: pausing/resuming stdin loses no data and does not han
   assert.equal(fs.readFileSync(logFile, 'utf8').length, totalExpected);
 });
 
-test('stdout error tolerance: a downstream reader going away exits quietly instead of crashing', async () => {
+test('stdout error tolerance: a downstream reader going away degrades to file-only logging instead of exiting or crashing', async () => {
   const logFile = tmpLogPath();
   const child = spawn(process.execPath, [SCRIPT, logFile]);
 
@@ -199,13 +199,48 @@ test('stdout error tolerance: a downstream reader going away exits quietly inste
   // broken pipe (EPIPE) instead of a live reader.
   child.stdout.destroy();
 
-  child.stdin.write('x'.repeat(1000) + '\n');
+  const payload = 'x'.repeat(1000) + '\n';
+  child.stdin.write(payload);
+  child.stdin.end();
 
   const [code, signal] = await new Promise((resolve) => {
     child.on('close', (c, s) => resolve([c, s]));
   });
 
+  // A dead stdout must NOT make log-tee exit: in the real pipeline
+  // (producer | log-tee) exiting closes the pipe's read end, which sends the
+  // producer SIGPIPE and corrupts its exit code as seen through
+  // PIPESTATUS[0]. log-tee must keep running, drain stdin to completion, and
+  // let the process end naturally via stdin 'end' (exit 0) instead.
   assert.equal(signal, null, 'must not die from an unhandled error / uncaught exception');
-  assert.equal(code, 0, 'a dead stdout reader must exit quietly (0), not crash');
+  assert.equal(code, 0, 'must exit 0 via normal stdin end, not by tearing itself down on stdout error');
   assert.doesNotMatch(stderr, /Unhandled|Uncaught|EPIPE/, 'the EPIPE must be swallowed, not rethrown to stderr');
+  // The whole point of surviving a dead stdout is that the log file keeps
+  // receiving everything, since it is now the only surviving copy.
+  assert.equal(fs.readFileSync(logFile, 'utf8'), payload, 'the log file must still receive full output after stdout dies');
+});
+
+test('stdout error tolerance: keeps draining stdin and writing to the file across multiple chunks after stdout dies', async () => {
+  const logFile = tmpLogPath();
+  const child = spawn(process.execPath, [SCRIPT, logFile]);
+
+  child.stdout.destroy();
+
+  // Write several chunks *after* stdout is already dead, spaced out so each
+  // is its own 'data' event. This proves log-tee doesn't just finish an
+  // in-flight write and stop -- it keeps consuming stdin indefinitely, which
+  // is what keeps the upstream pipe's read end open in the real pipeline.
+  const chunks = ['first\n', 'second\n', 'third\n'];
+  for (const chunk of chunks) {
+    child.stdin.write(chunk);
+    await new Promise((resolve) => setTimeout(resolve, 30));
+  }
+  child.stdin.end();
+
+  const code = await new Promise((resolve) => {
+    child.on('close', (c) => resolve(c));
+  });
+
+  assert.equal(code, 0, 'must reach normal exit via stdin end, not an early exit on stdout error');
+  assert.equal(fs.readFileSync(logFile, 'utf8'), chunks.join(''), 'every chunk written after stdout died must still land in the file');
 });
