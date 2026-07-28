@@ -312,11 +312,16 @@ function recordAssistantMessage(log, message) {
 // `"denied":true` rather than by matching prose after the fact.
 const DENIAL_RE = /STOP what you are doing and wait/;
 
-function recordUserMessage(log, text) {
+// `extra` (issue #293): denial-only fields the caller resolved from the
+// PreToolUse hook's captured agent identity — deniedToolName, denialSource,
+// agentId, agentType, agentAttributionKind. Omitted for ordinary tool_results
+// so an unrelated run's log lines stay byte-identical to before this issue.
+function recordUserMessage(log, text, extra) {
   if (!log || !log.enabled) return;
   const s = typeof text === 'string' ? text : JSON.stringify(text || '');
   log.event('tool_result', {
     denied: DENIAL_RE.test(s),
+    ...(extra || {}),
     text: truncate(s, MAX_TOOL_RESULT),
   });
 }

@@ -144,6 +144,31 @@ test('auto-denials are flagged so a lockout is greppable', async () => {
   assert.equal(results[1].denied, false);
 });
 
+// issue #293: the caller (claude-runner's stream loop) resolves agent
+// attribution and passes it as `extra` only for denial-shaped messages, so a
+// denial's run-log entry carries who made the call, not just that it happened.
+test('recordUserMessage carries denial-attribution extras when the caller supplies them', async () => {
+  const log = createRunLog({ queryId: 'q-attr', label: 'x', cwd: '/data/workspace' });
+  recordUserMessage(log, "STOP what you are doing and wait for the user to tell you how to proceed.", {
+    deniedToolName: 'Read',
+    denialSource: 'external_classifier',
+    agentId: 'agent-42',
+    agentType: 'general-purpose',
+    agentAttributionKind: 'exact',
+  });
+  recordUserMessage(log, 'ordinary tool result'); // no extra — unaffected shape
+  await log.close();
+
+  const results = readEvents(log.file).filter((e) => e.type === 'tool_result');
+  assert.equal(results[0].denied, true);
+  assert.equal(results[0].deniedToolName, 'Read');
+  assert.equal(results[0].denialSource, 'external_classifier');
+  assert.equal(results[0].agentId, 'agent-42');
+  assert.equal(results[0].agentType, 'general-purpose');
+  assert.equal(results[0].agentAttributionKind, 'exact');
+  assert.equal(results[1].deniedToolName, undefined, 'a plain call without extra stays byte-identical');
+});
+
 test('recordResult captures subtype, turns and cost', async () => {
   const log = createRunLog({ queryId: 'q4', label: 'x', cwd: '/data/workspace' });
   recordResult(log, { subtype: 'success', num_turns: 12, total_cost_usd: 1.5, duration_ms: 900, result: 'done' });

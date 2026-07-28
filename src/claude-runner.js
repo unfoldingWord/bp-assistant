@@ -307,6 +307,14 @@ function buildOptions({
   thinking,
   hooks,
   compaction,
+  // issue #293: an optional shared bag the caller (runClaudeOnce) creates and
+  // reads back from. buildOptions has no other way to hand data out — it
+  // returns only `options` — so the bypass allow-all hook below writes agent
+  // attribution into this object as it fires, and the caller resolves a later
+  // denial's tool_use_id against it. Undefined for callers that don't pass it
+  // (runClaudeStream): the hook then simply skips the capture, unchanged
+  // otherwise. Never affects the permission decision either way.
+  agentAttribution,
 }) {
   const options = {
     cwd: cwd || process.cwd(),
@@ -380,6 +388,13 @@ function buildOptions({
   // canUseTool stays registered on bypass runs as a harmless belt-and-braces in case a
   // future SDK un-shadows it; the hook is what actually enforces.
   const bypassAllowAll = Boolean(bypassPermissions) && process.env.BP_NO_BYPASS !== '1';
+  // issue #293: surface whether the allow-all hook is even registered this run,
+  // since the caller (runClaudeOnce) has no other way to know — buildOptions
+  // returns only `options`. Non-bypass runs never see this hook fire, so their
+  // hookFireCount would misleadingly read 0 (as if it "fired zero times")
+  // instead of "never registered"; this flag lets the run-summary log tell the
+  // two apart.
+  if (agentAttribution) agentAttribution.hookRegistered = bypassAllowAll;
   if (bypassAllowAll) {
     options.permissionMode = 'bypassPermissions';
     options.allowDangerouslySkipPermissions = true;
@@ -502,13 +517,46 @@ function buildOptions({
   // so the two compose. Applies to every tool call in the session tree — the whole
   // point, since sub-agents are what the shadowed canUseTool stopped covering.
   const bypassAllowAllMatcher = {
-    hooks: [async () => ({
-      hookSpecificOutput: {
-        hookEventName: 'PreToolUse',
-        permissionDecision: 'allow',
-        permissionDecisionReason: 'bypassPermissions run: trusted headless pipeline, tool universe bounded by `tools:`',
-      },
-    })],
+    hooks: [async (input) => {
+      // issue #293: this hook is the ONE place in the whole session tree that
+      // sees the SDK's BaseHookInput — it fires for every tool call in a
+      // bypass run (that is the entire point of allow-all), so it is where
+      // `agent_id`/`agent_type` (present only for sub-agent calls; absent for
+      // the main thread — sdk.d.ts:174) and `tool_use_id` are captured
+      // together. Recording them here, keyed by tool_use_id, is what lets a
+      // denial seen later in the `user` message stream (which carries only
+      // the id) be attributed to an exact agent instead of guessed from
+      // narration — the gap #289's triage kept running into. Purely additive:
+      // the decision returned below is byte-identical to before.
+      if (agentAttribution) {
+        agentAttribution.hookFireCount += 1;
+        const agentId = (input && input.agent_id) || null;
+        const agentType = (input && input.agent_type) || null;
+        const toolUseId = input && input.tool_use_id;
+        if (agentId) agentAttribution.hookFireWithAgentCount += 1;
+        if (toolUseId) {
+          // Bounded like pendingToolUses below — a tool_use whose denial we
+          // never see (e.g. it streams to a channel this loop doesn't read)
+          // would otherwise leak for the life of a long run.
+          if (agentAttribution.byToolUseId.size > 2048) agentAttribution.byToolUseId.clear();
+          agentAttribution.byToolUseId.set(toolUseId, { agentId, agentType });
+        }
+        // Best-effort fallback ONLY: per-tool-name "last agent seen", used
+        // solely if a denial's tool_use_id has no entry above (see the
+        // heuristic-vs-exact labeling where this is read). Since this hook
+        // fires for every call, the primary (exact) path should cover the
+        // overwhelming majority; this exists for the case it doesn't.
+        const toolName = input && input.tool_name;
+        if (toolName) agentAttribution.lastByToolName.set(toolName, { agentId, agentType });
+      }
+      return {
+        hookSpecificOutput: {
+          hookEventName: 'PreToolUse',
+          permissionDecision: 'allow',
+          permissionDecisionReason: 'bypassPermissions run: trusted headless pipeline, tool universe bounded by `tools:`',
+        },
+      };
+    }],
   };
   const existingPreToolUse = (options.hooks && options.hooks.PreToolUse) || [];
   options.hooks = {
@@ -582,6 +630,24 @@ function classifyRunnerUserMessage(text) {
   const isPermissionDenied = lower.includes('is_error')
     && (lower.includes("doesn't want to take this action")
       || lower.includes('stop what you are doing and wait for the user'));
+  // issue #293 / #289: which layer produced a denial's reason text. Read-only
+  // classification for logging — deliberately NOT folded into isPermissionDenied
+  // above, so it cannot change the abort/retry state machine (this PR is
+  // observability only). Distinguishes the CLI's canned auto-deny (external,
+  // above this process — matches isPermissionDenied's own phrases) from OUR
+  // OWN guard hooks (src/guard-hooks.js:99,102,108 — literal reason strings
+  // "not permitted in this run" / "not on the allowlist for this run" /
+  // "write to protected canonical file is not allowed"). #289's open question
+  // was whether a denial blamed on an external wall could actually have been a
+  // guard hook; this makes that a grep instead of a guess.
+  const GUARD_HOOK_DENY_RE = /is not permitted in this run|is not on the allowlist for this run|write to protected canonical file is not allowed/;
+  const denialSource = !lower.includes('is_error')
+    ? null
+    : isPermissionDenied
+      ? 'external_classifier'
+      : GUARD_HOOK_DENY_RE.test(lower)
+        ? 'guard_hook'
+        : null;
   const isToolError = lower.includes('tool_use_error');
   const isToolResult = lower.includes('tool_result');
   let toolErrorSig = null;
@@ -600,7 +666,21 @@ function classifyRunnerUserMessage(text) {
   // could be an allow-rule miss) from "denied Read/Glob/mcp__*" (external refusal).
   const idMatch = /"tool_use_id"\s*:\s*"([^"]+)"/.exec(String(text || ''));
   const toolUseId = idMatch ? idMatch[1] : null;
-  return { isTransportClosed, isPermissionDenied, isToolError, isToolResult, toolErrorSig, toolUseId };
+  return { isTransportClosed, isPermissionDenied, isToolError, isToolResult, toolErrorSig, toolUseId, denialSource };
+}
+
+// issue #293: render a denial's agent attribution for a console/log line.
+// `agentAttributionKind` distinguishes an EXACT match (the tool_use_id was
+// seen by our own PreToolUse hook, alongside its agent_id/agent_type, in the
+// same hook-input object) from a HEURISTIC fallback (most-recent agent seen
+// for that tool name) or no data at all (non-bypass run — the hook that
+// captures this is bypass-only). Within an exact/heuristic match, a null
+// agentId means the call came from the main thread — the SDK sets agent_id
+// ONLY for sub-agent calls (sdk.d.ts:174) — not that attribution failed.
+function describeDenialAgent(sig) {
+  if (!sig || !sig.agentAttributionKind) return 'agent: unattributed (no hook data for this call)';
+  const who = sig.agentId ? `sub-agent ${sig.agentType || 'unknown-type'}/${sig.agentId}` : 'main thread';
+  return `agent: ${who} [${sig.agentAttributionKind}]`;
 }
 
 // True when a denial of `toolName` is evidence of an external permission wall
@@ -783,6 +863,22 @@ async function runClaudeOnce({
   // itself carries only the id). Bounded: entries are deleted as they resolve, and
   // the map is cleared wholesale if a run ever leaks past a sane ceiling.
   const pendingToolUses = new Map();
+  // issue #293: agent-identity attribution. Populated by buildOptions'
+  // bypassAllowAllMatcher hook as it fires (see there for why that hook is the
+  // one place agent_id/agent_type and tool_use_id are seen together), read
+  // back here when a denial arrives in the `user` message stream carrying only
+  // the tool_use_id. `hookRegistered` distinguishes "the hook never fired"
+  // (non-bypass run — buildOptions sets this after computing its own
+  // bypassAllowAll) from "it fired zero times" (a bypass run with no tool
+  // calls at all), so the run-summary log below doesn't misreport one as the
+  // other.
+  const agentAttribution = {
+    byToolUseId: new Map(),
+    lastByToolName: new Map(),
+    hookFireCount: 0,
+    hookFireWithAgentCount: 0,
+    hookRegistered: false,
+  };
   // Repeated "Stream closed" tool_results mean the in-process workspace-tools MCP
   // transport has been torn down (typically an align sub-agent outliving the parent
   // query's message stream — JER 33, 2026-07-02). It is transport-level, not a tool
@@ -867,6 +963,7 @@ async function runClaudeOnce({
     thinking,
     hooks,
     compaction,
+    agentAttribution,
   });
 
   // Durable run log on the volume. The fly.io stream is ephemeral and truncated,
@@ -877,6 +974,18 @@ async function runClaudeOnce({
   });
 
   console.log(`${runnerPrefix} Starting query in ${cwd}${options.permissionMode === 'bypassPermissions' ? ' (permissions: bypass)' : ''}`);
+  if (agentAttribution.hookRegistered) {
+    // issue #293: annotate expected noise. The SDK prints
+    // "[CLAUDE_SDK_CAN_USE_TOOL_SHADOWED] canUseTool will not be invoked" on
+    // EVERY bypass query — it is documenting that enforcement moved to the
+    // PreToolUse hook above, not reporting a failure. Without this line the
+    // next reader has no way to tell "expected" from "something broke".
+    console.log(
+      `${runnerPrefix} Note: this is a bypassPermissions run — the SDK will log ` +
+      `"CLAUDE_SDK_CAN_USE_TOOL_SHADOWED" for every tool call. That is expected ` +
+      `(enforcement rides the PreToolUse allow-all hook instead, see #271/#293), not a failure.`
+    );
+  }
   console.log(`${runnerPrefix} Prompt: ${fullPrompt.slice(0, 200)}`);
   console.log(`${runnerPrefix} maxTurns: ${options.maxTurns}, timeout: ${timeout / 1000}s, deadline: ${new Date(queryDeadline).toISOString()}`);
 
@@ -899,6 +1008,14 @@ async function runClaudeOnce({
         lastTool,
         elapsedMs: Date.now() - queryStart,
         totalPermissionDenials: errorState.totalPermissionDenials,
+        // issue #293: the direct empirical answer to "does the bypass allow-all
+        // hook (#286) reach sub-agents at all?" — hookFireWithAgentCount > 0
+        // means yes, a sub-agent's tool call was seen. Only meaningful when
+        // hookRegistered (bypass runs); logged unconditionally so its absence
+        // on a non-bypass run is itself informative rather than a missing field.
+        bypassHookRegistered: agentAttribution.hookRegistered,
+        bypassHookFireCount: agentAttribution.hookFireCount,
+        bypassHookFireWithAgentCount: agentAttribution.hookFireWithAgentCount,
         ...summary,
       });
     } catch (_) { /* logging must never break a run */ }
@@ -929,10 +1046,13 @@ async function runClaudeOnce({
         const text = typeof message.message?.content === 'string'
           ? message.message.content
           : JSON.stringify(message.message?.content || '');
-        recordUserMessage(runLog, text);
-        // Classify the SDK user-message and advance the error-tracking state machine.
-        // Both are pure functions (exported for unit tests). Precedence, top-down:
-        // transport-closed > permission-denial-stall > tool_use_error > tool_result.
+        // Classify BEFORE recording so the durable run-log entry can carry the
+        // resolved tool name, agent attribution, and denial source alongside
+        // the raw text in one write (issue #293) — the JSONL is append-only,
+        // so there is no later chance to enrich an already-written line.
+        // Both classify/apply are pure functions (exported for unit tests).
+        // Precedence, top-down: transport-closed > permission-denial-stall >
+        // tool_use_error > tool_result.
         const sig = classifyRunnerUserMessage(text);
         // Resolve the refused tool_use back to its tool name before reducing, so the
         // permission-wall discriminator can distinguish an argument-level Bash denial
@@ -941,7 +1061,41 @@ async function runClaudeOnce({
         if (sig.toolUseId) {
           sig.deniedToolName = pendingToolUses.get(sig.toolUseId) || null;
           pendingToolUses.delete(sig.toolUseId);
+          // issue #293: attribute the denial to the agent that made the call.
+          // EXACT when the tool_use_id was seen by our own PreToolUse hook
+          // (bypassAllowAllMatcher, wired in buildOptions) — that hook's input
+          // carries agent_id/agent_type and tool_use_id on the SAME object
+          // (sdk.d.ts BaseHookInput + PreToolUseHookInput), so a hit here is a
+          // real match, not a guess. Falls back to a HEURISTIC — the most
+          // recent agent_id seen for this tool name — only when that lookup
+          // misses (e.g. a non-bypass run, where the hook is never installed);
+          // labeled distinctly so a future reader can't mistake one for the
+          // other.
+          const attributed = agentAttribution.byToolUseId.get(sig.toolUseId);
+          agentAttribution.byToolUseId.delete(sig.toolUseId);
+          if (attributed) {
+            sig.agentId = attributed.agentId;
+            sig.agentType = attributed.agentType;
+            sig.agentAttributionKind = 'exact';
+          } else {
+            const fallback = sig.deniedToolName
+              ? agentAttribution.lastByToolName.get(sig.deniedToolName)
+              : null;
+            sig.agentId = fallback ? fallback.agentId : null;
+            sig.agentType = fallback ? fallback.agentType : null;
+            sig.agentAttributionKind = fallback ? 'heuristic_last_seen_for_tool' : null;
+          }
         }
+        // Only the denial-shaped events get the extra attribution fields — an
+        // ordinary tool_result stays byte-identical to before this issue.
+        const isDenialForLog = sig.isPermissionDenied || sig.denialSource != null;
+        recordUserMessage(runLog, text, isDenialForLog ? {
+          deniedToolName: sig.deniedToolName,
+          denialSource: sig.denialSource,
+          agentId: sig.agentId,
+          agentType: sig.agentType,
+          agentAttributionKind: sig.agentAttributionKind,
+        } : undefined);
         const action = applyRunnerUserMessage(
           errorState,
           sig,
@@ -969,19 +1123,20 @@ async function runClaudeOnce({
           permissionWallFired = true;
           console.error(
             `${runnerPrefix} Aborting query — permission wall: ${action.wallDenials} denial(s) of ` +
-            `wholesale-granted tool(s) (latest: ${action.tool}) with no productive tool result in between. ` +
-            `These cannot be allowlist misses. Usual cause is a sub-agent falling back to the ` +
-            `load-degraded 'auto' classifier (issue #271, EZK 19, ZEC 12); it can also be an account-level ` +
-            `refusal above this process. Either way it is transient. Bailing in seconds instead of ` +
-            `waiting out the ${PERMISSION_STALL_WINDOW_MS / 1000}s stall window, so the caller can back off ` +
-            `and retry while the run has banked nothing.`
+            `wholesale-granted tool(s) (latest: ${action.tool}, ${describeDenialAgent(sig)}) with no ` +
+            `productive tool result in between. These cannot be allowlist misses. Usual cause is a ` +
+            `sub-agent falling back to the load-degraded 'auto' classifier (issue #271, EZK 19, ZEC 12); ` +
+            `it can also be an account-level refusal above this process. Either way it is transient. ` +
+            `Bailing in seconds instead of waiting out the ${PERMISSION_STALL_WINDOW_MS / 1000}s stall ` +
+            `window, so the caller can back off and retry while the run has banked nothing.`
           );
           abortController.abort();
           break;
         } else if (action.type === 'permission_denied') {
           console.warn(
             `${runnerPrefix} Tool call auto-denied ("STOP and wait") in headless auto mode ` +
-            `(${errorState.totalPermissionDenials} total this run, tool: ${sig.deniedToolName || 'unresolved'}) — ` +
+            `(${errorState.totalPermissionDenials} total this run, tool: ${sig.deniedToolName || 'unresolved'}, ` +
+            `${describeDenialAgent(sig)}${sig.denialSource ? `, source: ${sig.denialSource}` : ''}) — ` +
             `benign if the agent switches to an allowed tool; aborts as a stall only after ` +
             `${PERMISSION_STALL_WINDOW_MS / 1000}s with no productive tool result`
           );
@@ -1047,6 +1202,19 @@ async function runClaudeOnce({
     if (heartbeatTimer) clearInterval(heartbeatTimer);
     clearInterval(stallTimer);
     try { conversation.close(); } catch (_) {}
+  }
+
+  // issue #293, task 2: log once per run whether the bypass allow-all hook
+  // fired at all, and whether any of those firings carried an agent_id — the
+  // direct empirical test of whether #286's hook reaches sub-agents, which was
+  // previously unverified and load-bearing for #292's root-cause debate.
+  // Gated on hookRegistered so a non-bypass run (where this hook is never
+  // installed) doesn't print a misleading "fired 0 times".
+  if (agentAttribution.hookRegistered) {
+    console.log(
+      `${runnerPrefix} Bypass allow-all hook fired ${agentAttribution.hookFireCount} time(s) this run, ` +
+      `${agentAttribution.hookFireWithAgentCount} with an agent_id present (i.e. a sub-agent's call).`
+    );
   }
 
   // Close the run log and stamp the evidence pointers onto whatever outcome the
@@ -1524,6 +1692,7 @@ module.exports = {
   isGuardrailStop,
   resolveReasoning,
   classifyRunnerUserMessage,
+  describeDenialAgent,
   applyRunnerUserMessage,
   assessPermissionStall,
   resultIndicatesPermissionStall,
