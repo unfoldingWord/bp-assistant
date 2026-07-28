@@ -260,12 +260,25 @@ test('a dry-run cold start still persists state, so a second dry run does not co
   assert.equal(second.coldStart, false);
 });
 
-test('a dry run advances the reviewed watermark for newly reviewed units without writing the proposal feed', async () => {
+// Rewritten for #OVERNIGHT-FEED: the previous version of this test asserted
+// that a dry run advances the watermark WITHOUT writing the proposal feed.
+// That is exactly the bug the finding caught — combined with the watermark
+// now always advancing (the prior fix), suppressing the feed on a dry run
+// meant proposals were computed, the units were marked reviewed, and then the
+// proposals describing them were thrown away, permanently. The feed is a file
+// for downstream automation to read (same category as state.json), not an
+// action, so it is no longer gated on dryRun. This test now asserts the new
+// contract: a dry run writes the feed exactly like a live run.
+test('a dry run writes the proposal feed and advances the reviewed watermark, same as a live run', async () => {
   let stateContent = JSON.stringify({
     version: 1, initialized: true, lastRun: '2026-06-20T00:00:00Z', reviewed: {}, branchTips: {},
   });
+  const writes = [];
   const readFileSync = (p) => { if (/state\.json$/.test(p)) return stateContent; throw new Error('ENOENT'); };
-  const writeFileSync = (p, content) => { if (/state\.json$/.test(p)) stateContent = content; };
+  const writeFileSync = (p, content) => {
+    if (/state\.json$/.test(p)) stateContent = content;
+    writes.push({ pth: p, content });
+  };
   const prs = { en_tn: [{ number: 9, merged: true, merged_at: '2026-06-23T22:00:00Z', head: { ref: 'PSA-be-pjoakes', sha: 'newhead' }, base: { sha: 'oldbase' }, user: { login: 'pjoakes' } }] };
 
   const res = await watcher.runOvernightReview({
@@ -278,11 +291,62 @@ test('a dry run advances the reviewed watermark for newly reviewed units without
   assert.equal(res.coldStart, false);
   assert.equal(res.dryRun, true);
   assert.equal(res.reviewed, 1);
-  assert.equal(res.proposalsPath, null); // the feed itself stays suppressed on dry-run
+  assert.ok(res.proposalsPath, 'dry run must still write the proposal feed path'); // no longer suppressed
+  assert.ok(res.tasksPath, 'dry run must still write the review-task feed path');
+
+  const proposalsWrite = writes.find((w) => /proposals\.jsonl$/.test(w.pth));
+  assert.ok(proposalsWrite, 'proposals.jsonl must actually be written on a dry run');
+  const tasksWrite = writes.find((w) => /review-tasks\.jsonl$/.test(w.pth));
+  assert.ok(tasksWrite, 'review-tasks.jsonl must actually be written on a dry run');
 
   const saved = JSON.parse(stateContent);
-  assert.equal(saved.lastRun, '2026-06-24T07:00:00.000Z'); // watermark advanced despite dry-run
+  assert.equal(saved.lastRun, '2026-06-24T07:00:00.000Z'); // watermark advanced
   assert.ok(Object.keys(saved.reviewed).some((k) => k.startsWith('en_tn#9@')));
+});
+
+// New: the invariant this finding introduced. If persisting the feed fails,
+// the reviewed-set/watermark must NOT advance — otherwise the unit is marked
+// seen while its proposal is lost, with no way to recover it.
+test('if the proposal feed write throws, the reviewed-set/watermark is NOT advanced (unit stays fresh next run)', async () => {
+  const initState = JSON.stringify({
+    version: 1, initialized: true, lastRun: '2026-06-20T00:00:00Z', reviewed: {}, branchTips: {},
+  });
+  let stateContent = initState;
+  const readFileSync = (p) => { if (/state\.json$/.test(p)) return stateContent; throw new Error('ENOENT'); };
+  const writeFileSync = (p, content) => {
+    if (/proposals\.jsonl$/.test(p)) throw new Error('disk full');
+    if (/state\.json$/.test(p)) stateContent = content;
+  };
+  const prs = { en_tn: [{ number: 9, merged: true, merged_at: '2026-06-23T22:00:00Z', head: { ref: 'PSA-be-pjoakes', sha: 'newhead' }, base: { sha: 'oldbase' }, user: { login: 'pjoakes' } }] };
+
+  await assert.rejects(
+    () => watcher.runOvernightReview({
+      skillsRepo: '/skills', now: new Date('2026-06-24T07:00:00Z'),
+      deps: {
+        readFileSync, writeFileSync, mkdirSync: () => {},
+        apiGetImpl: fakeApiGet(prs, {}), fetchTextImpl: async () => '', log: () => {},
+      },
+    }),
+    /disk full/,
+  );
+
+  // state.json must be exactly as it was before the run — not advanced.
+  assert.equal(stateContent, initState);
+  const saved = JSON.parse(stateContent);
+  assert.equal(saved.lastRun, '2026-06-20T00:00:00Z');
+  assert.equal(Object.keys(saved.reviewed).length, 0);
+
+  // A subsequent run (state genuinely unchanged) must still see the unit as fresh.
+  const second = await watcher.runOvernightReview({
+    skillsRepo: '/skills', now: new Date('2026-06-25T07:00:00Z'),
+    deps: {
+      readFileSync: () => stateContent,
+      writeFileSync: (p, content) => { if (/state\.json$/.test(p)) stateContent = content; },
+      mkdirSync: () => {},
+      apiGetImpl: fakeApiGet(prs, {}), fetchTextImpl: async () => '', log: () => {},
+    },
+  });
+  assert.equal(second.reviewed, 1); // still fresh, not silently skipped
 });
 
 test('a genuine first-ever run (no prior state at all) is reported distinctly from an anomalous cold start', async () => {

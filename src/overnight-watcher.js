@@ -293,6 +293,18 @@ async function reviewUnit(u, { fetchTextImpl }) {
 // --- orchestration -----------------------------------------------------------
 function dateStamp(now) { return now.toISOString().slice(0, 10); }
 
+// #OVERNIGHT-FEED: what `dryRun` means in THIS module, decided here so the next
+// reader doesn't reintroduce a `!dryRun` guard around persistence. This module
+// takes no actions of its own (no PR creation, no door43-push call — see the
+// #OVERNIGHT-FEED comment below the feed write). Both the state file and the
+// proposal/review-task feed are files for other systems to read, not actions,
+// so `dryRun` no longer gates either write. Its only remaining job is LOG /
+// DIGEST WORDING (the `[overnight] reviewed vs would-review` line and the CLI
+// digest text) plus being echoed through in the returned result object, so a
+// caller (e.g. the cron wrapper in bp-assistant-auto-issue-handler, gated on
+// OVERNIGHT_PR_ENABLED) can tell which invocation mode produced a given feed.
+// If a real action is ever added to this module, `dryRun` should gate THAT —
+// not the persistence of state.json or the proposal feed.
 async function runOvernightReview({
   skillsRepo,
   token = readSecret('door43_token', 'DOOR43_TOKEN') || readSecret('gitea_token', 'GITEA_TOKEN') || '',
@@ -331,7 +343,10 @@ async function runOvernightReview({
     // saved, so every dry run looked like the very first run, forever.
     state.saveState(stateFile, st, { writeImpl, mkdirImpl: mkdir });
     const anomaly = stateFileExisted ? ' [WARNING: a state file existed but was not initialized — check for a persistence bug]' : '';
-    log(`[overnight] cold start (${stateFileExisted ? 'not a genuine first run' : 'genuine first run'})${anomaly} — recorded ${allKeys.length} current HEAD(s); reviewing nothing tonight.${dryRun ? ' (dry-run: state persisted, proposal feed still suppressed)' : ''}`);
+    // Cold start reviews nothing by design (it only primes the "already seen"
+    // set), so there is no feed content to write either way — this is NOT
+    // dryRun suppressing anything (see the #OVERNIGHT-FEED comment above).
+    log(`[overnight] cold start (${stateFileExisted ? 'not a genuine first run' : 'genuine first run'})${anomaly} — recorded ${allKeys.length} current HEAD(s); reviewing nothing tonight.${dryRun ? ' (dry-run)' : ''}`);
     return {
       coldStart: true, dryRun, genuineFirstRun: !stateFileExisted,
       units: units.length, reviewed: 0, proposals: 0, proposalsPath: null,
@@ -366,18 +381,23 @@ async function runOvernightReview({
   // machine). The feed must persist (committed alongside state.json) so the
   // next Dreamer wake can read it after a fresh clone.
   const outDir = path.join(skillsRepo, 'data/overnight-review', dateStamp(now));
-  let proposalsPath = null;
-  let tasksPath = null;
-  if (!dryRun) {
-    // The proposal/review-task feed is the "action" side of a run — it's what
-    // downstream automation (the Dreamer, and anything OVERNIGHT_PR_ENABLED
-    // eventually gates) reads to act on. dry-run suppresses it.
-    mkdir(outDir);
-    proposalsPath = path.join(outDir, 'proposals.jsonl');
-    writeImpl(proposalsPath, proposals.map((p) => JSON.stringify(p)).join('\n') + (proposals.length ? '\n' : ''));
-    tasksPath = path.join(outDir, 'review-tasks.jsonl');
-    writeImpl(tasksPath, reviewTasks.map((t) => JSON.stringify(t)).join('\n') + (reviewTasks.length ? '\n' : ''));
-  }
+  // #OVERNIGHT-FEED (closes the follow-up on #OVERNIGHT-STATE): the proposal
+  // and review-task feed is a FILE for downstream automation/humans to read —
+  // same category as state.json — not an "action" like opening a PR. This
+  // module never opens PRs (grep it: no createPull/door43-push call here), so
+  // there was never an action for dry-run to suppress by gating this write.
+  // Gating it behind `!dryRun` (as it was) combined with the previous fix
+  // (state now persists unconditionally) to make things WORSE than the
+  // original bug: units got marked reviewed and the watermark advanced, but
+  // the proposals describing them were discarded — so the Sensor still
+  // produced nothing, and now permanently forgot the backlog too. Write the
+  // feed unconditionally, and do it BEFORE advancing/saving state (below) —
+  // see the invariant comment there.
+  mkdir(outDir);
+  const proposalsPath = path.join(outDir, 'proposals.jsonl');
+  writeImpl(proposalsPath, proposals.map((p) => JSON.stringify(p)).join('\n') + (proposals.length ? '\n' : ''));
+  const tasksPath = path.join(outDir, 'review-tasks.jsonl');
+  writeImpl(tasksPath, reviewTasks.map((t) => JSON.stringify(t)).join('\n') + (reviewTasks.length ? '\n' : ''));
   // #OVERNIGHT-STATE: persist the reviewed-set and lastRun watermark
   // UNCONDITIONALLY — including on a dry run. Marking a unit reviewed and
   // advancing lastRun is bookkeeping ("what have I already looked at"), not an
@@ -385,13 +405,26 @@ async function runOvernightReview({
   // behind `!dryRun` (as it was) meant every dry run started back at the same
   // watermark, so a dry-run-only Sensor could never make forward progress —
   // this is the root cause of 34 consecutive no-op nightly runs.
+  //
+  // INVARIANT (#OVERNIGHT-FEED): the reviewed-set / lastRun watermark must
+  // NEVER advance past units whose proposals were not successfully persisted.
+  // That's why the feed write above runs first, with nothing catching its
+  // exception here: if writeImpl/mkdir throws, it propagates out of
+  // runOvernightReview before `st.lastRun` is touched or state.saveState is
+  // called, so nothing is persisted this run — the same units are still
+  // "fresh" (not in `reviewed`, lastRun unmoved) and get retried next run
+  // instead of being silently marked seen with their proposals lost.
+  //
   // Only advance the lastRun watermark on a clean run — otherwise a deferred
   // unit would fall outside the next window and never be retried.
   if (failed === 0) st.lastRun = now.toISOString();
   state.saveState(stateFile, st, { writeImpl, mkdirImpl: mkdir });
 
   const reviewed = fresh.length - failed;
-  log(`[overnight] ${dryRun ? 'would review' : 'reviewed'} ${reviewed} unit(s)${failed ? ` (${failed} deferred on transient failure)` : ''} → ${proposals.length} proposal row(s), ${reviewTasks.length} review task(s).`);
+  // "reviewed" regardless of dryRun — the feed is always written now (see
+  // #OVERNIGHT-FEED above), so there is no "would review" distinction left to
+  // draw. dryRun only tags the line for the reader's benefit.
+  log(`[overnight] reviewed ${reviewed} unit(s)${failed ? ` (${failed} deferred on transient failure)` : ''} → ${proposals.length} proposal row(s), ${reviewTasks.length} review task(s).${dryRun ? ' (dry-run)' : ''}`);
   return {
     coldStart: false, dryRun, units: units.length, reviewed, failed,
     proposals: proposals.length, proposalsPath, tasksPath, reviewTasks,
@@ -422,7 +455,7 @@ async function cliMain(argv) {
     const label = res.genuineFirstRun ? 'genuine first run' : 'NOT a genuine first run — state existed but was uninitialized, check for a persistence bug';
     lines.push(`Cold start (${label}) — recorded current HEADs; reviewed nothing this run${res.dryRun ? ' (dry-run)' : ''}.`);
   } else {
-    lines.push(`Reviewed ${res.reviewed} new \`-be-\` unit(s) across ${res.units} watched → ${res.proposals} attributed proposal row(s)${res.dryRun ? ' (dry-run: watermark advanced, proposal feed not written)' : ''}.`);
+    lines.push(`Reviewed ${res.reviewed} new \`-be-\` unit(s) across ${res.units} watched → ${res.proposals} attributed proposal row(s)${res.dryRun ? ' (dry-run)' : ''}.`);
     for (const t of res.reviewTasks || []) {
       lines.push(`- ${t.repo} ${t.book} (${t.resource}) by ${t.editor}: ${t.changes} change(s)${t.chapters.length ? ` [ch ${t.chapters.join(',')}]` : ''}`);
     }
