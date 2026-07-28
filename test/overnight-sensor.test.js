@@ -365,6 +365,93 @@ test('a genuine first-ever run (no prior state at all) is reported distinctly fr
   assert.equal(res.genuineFirstRun, true);
 });
 
+// --- cold-start visibility / escape hatch (#OVERNIGHT-COLDSTART-VISIBILITY) -
+// Priming on cold start is correct by design, but it discards the enumerated
+// units silently. These tests cover: (1) the default (priming) path reports
+// how many units it skipped and logs enough detail to identify them, and (2)
+// the opt-in reviewColdStart flag reviews the units and writes the feed
+// instead of priming, while (3) confirming the default remains priming.
+test('a default cold start reports the skipped count/keys and logs them loudly', async () => {
+  const logs = [];
+  const prs = { en_tn: [{ number: 5, merged: true, merged_at: '2026-06-23T10:00:00Z', head: { ref: 'PSA-be-pjoakes', sha: 'head5' }, base: { sha: 'base5' }, user: { login: 'pjoakes' } }] };
+  const res = await watcher.runOvernightReview({
+    skillsRepo: '/skills', now: new Date('2026-06-24T07:00:00Z'),
+    deps: {
+      readFileSync: () => { throw new Error('no state'); },
+      writeFileSync: () => {},
+      mkdirSync: () => {},
+      apiGetImpl: fakeApiGet(prs, {}),
+      fetchTextImpl: async () => '',
+      log: (m) => logs.push(m),
+    },
+  });
+  assert.equal(res.coldStart, true);
+  assert.equal(res.skipped, 1);
+  assert.ok(Array.isArray(res.skippedSample) && res.skippedSample.length === 1);
+  assert.ok(res.skippedSample[0].startsWith('en_tn#5@'));
+  // The log line itself must carry the count and the identifying key(s) —
+  // this is what makes the digest legible instead of a bare "cold start".
+  const line = logs.find((l) => /COLD START/.test(l));
+  assert.ok(line, 'expected a COLD START log line');
+  assert.match(line, /SKIPPING 1 unit/);
+  assert.match(line, /en_tn#5@/);
+  assert.match(line, /OVERNIGHT_REVIEW_COLD_START/);
+});
+
+test('reviewColdStart=true on a cold start reviews the enumerated units and writes the feed instead of priming', async () => {
+  const writes = [];
+  const prs = { en_tn: [{ number: 9, merged: true, merged_at: '2026-06-23T22:00:00Z', head: { ref: 'PSA-be-pjoakes', sha: 'newhead' }, base: { sha: 'oldbase' }, user: { login: 'pjoakes' } }] };
+  const oldTsv = [TN_HEADER, '1:1\ta\t\tfigs-metaphor\tx\t1\told note'].join('\n');
+  const newTsv = [TN_HEADER, '1:1\tb\t\tfigs-metaphor\tx\t1\trewritten note'].join('\n');
+  const res = await watcher.runOvernightReview({
+    skillsRepo: '/skills', now: new Date('2026-06-24T07:00:00Z'), reviewColdStart: true,
+    deps: {
+      readFileSync: () => { throw new Error('no state'); }, // genuine cold start
+      writeFileSync: (pth, content) => writes.push({ pth, content }),
+      mkdirSync: () => {},
+      apiGetImpl: fakeApiGet(prs, {}),
+      fetchTextImpl: async (url) => (/commit\/oldbase/.test(url) ? oldTsv : (/commit\/newhead/.test(url) ? newTsv : '')),
+      log: () => {},
+    },
+  });
+  // Not reported as a (priming) cold start — it was reviewed instead.
+  assert.equal(res.coldStart, false);
+  assert.equal(res.coldStartReviewed, true);
+  assert.equal(res.reviewed, 1);
+  assert.equal(res.proposals, 1);
+  const proposalsWrite = writes.find((w) => /proposals\.jsonl$/.test(w.pth));
+  assert.ok(proposalsWrite, 'the feed must be written, not skipped, when reviewColdStart is set');
+  const row = JSON.parse(proposalsWrite.content.trim());
+  assert.equal(row.category, 'reworded');
+
+  const stateWrite = writes.find((w) => /state\.json$/.test(w.pth));
+  const saved = JSON.parse(stateWrite.content);
+  assert.equal(saved.initialized, true); // future runs won't cold-start again
+  assert.ok(Object.keys(saved.reviewed).some((k) => k.startsWith('en_tn#9@')));
+  assert.equal(saved.lastRun, '2026-06-24T07:00:00.000Z');
+});
+
+test('the default (reviewColdStart omitted) on a cold start still primes, not reviews', async () => {
+  const writes = [];
+  const prs = { en_tn: [{ number: 5, merged: true, merged_at: '2026-06-23T10:00:00Z', head: { ref: 'PSA-be-pjoakes', sha: 'head5' }, base: { sha: 'base5' }, user: { login: 'pjoakes' } }] };
+  const res = await watcher.runOvernightReview({
+    skillsRepo: '/skills', now: new Date('2026-06-24T07:00:00Z'),
+    deps: {
+      readFileSync: () => { throw new Error('no state'); },
+      writeFileSync: (pth, content) => writes.push({ pth, content }),
+      mkdirSync: () => {},
+      apiGetImpl: fakeApiGet(prs, {}),
+      fetchTextImpl: async () => '',
+      log: () => {},
+    },
+  });
+  assert.equal(res.coldStart, true);
+  assert.equal(res.reviewed, 0);
+  assert.equal(res.proposalsPath, null);
+  const proposalsWrite = writes.find((w) => /proposals\.jsonl$/.test(w.pth));
+  assert.equal(proposalsWrite, undefined, 'no feed should be written when priming (default)');
+});
+
 test('runOvernightReview reviews a fresh merged TN PR and emits proposals', async () => {
   const writes = [];
   const initState = JSON.stringify({ version: 1, initialized: true, lastRun: '2026-06-20T00:00:00Z', reviewed: {}, branchTips: {} });
