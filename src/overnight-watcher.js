@@ -317,6 +317,11 @@ function dateStamp(now) { return now.toISOString().slice(0, 10); }
 // not the persistence of state.json or the proposal feed.
 async function runOvernightReview({
   skillsRepo,
+  // #OVERNIGHT-STATE-LOCATION: where the watermark is persisted. Defaults to
+  // the volume home, OUTSIDE any git checkout — see the long comment at the top
+  // of overnight-review-state.js for why keeping it inside the skills checkout
+  // jams every hourly `git pull --ff-only` the day PR mode commits it.
+  stateFile: stateFileOpt,
   token = readSecret('door43_token', 'DOOR43_TOKEN') || readSecret('gitea_token', 'GITEA_TOKEN') || '',
   now = new Date(),
   dryRun = false,
@@ -329,18 +334,36 @@ async function runOvernightReview({
   const log = deps.log || ((m) => process.stderr.write(`${m}\n`));
   const writeImpl = deps.writeFileSync || fs.writeFileSync;
   const mkdir = deps.mkdirSync || ((p) => fs.mkdirSync(p, { recursive: true }));
-  const stateFile = path.join(skillsRepo, state.DEFAULT_STATE_REL);
+  const readImpl = deps.readFileSync || fs.readFileSync;
+  const unlinkImpl = deps.unlinkSync || fs.unlinkSync;
+  const stateFile = state.resolveStateFile({
+    skillsRepo, stateFile: stateFileOpt, env: deps.env || process.env,
+  });
+  const legacyStateFile = state.legacyStateFileFor(skillsRepo, stateFile);
 
   // #OVERNIGHT-STATE: probe for a pre-existing state file BEFORE loadState
   // swallows the distinction — this lets a cold start be logged as either a
   // genuine first-ever run (no file at all) or an anomalous one (a file was
   // there but came back uninitialized/corrupt), so a persistence regression
   // can't hide behind an innocuous "cold start" line the way this one did for
-  // 34 consecutive nightly runs.
-  let stateFileExisted = true;
-  try { (deps.readFileSync || fs.readFileSync)(stateFile, 'utf8'); } catch { stateFileExisted = false; }
+  // 34 consecutive nightly runs. The legacy in-checkout file counts as
+  // pre-existing state: migrating off it is not a first run.
+  const loaded = state.loadStateWithMigration(stateFile, legacyStateFile, { readImpl });
+  const stateFileExisted = loaded.source !== 'none';
+  const st = loaded.state;
 
-  const st = state.loadState(stateFile, deps.readFileSync);
+  // #OVERNIGHT-STATE-LOCATION: one-time migration out of the checkout. Carry
+  // the watermark over (a cold start here would silently prime the entire
+  // accumulated backlog away) and then DELETE the in-checkout copy — that
+  // deletion is the actual fix, not housekeeping: an untracked file sitting at
+  // a path that a future merge may deliver as a tracked file is precisely what
+  // makes `git pull --ff-only` fail on every subsequent hourly wake.
+  if (loaded.source === 'legacy' || (loaded.source === 'primary' && loaded.legacyPresent)) {
+    const carried = loaded.source === 'legacy';
+    let removed = true;
+    try { unlinkImpl(legacyStateFile); } catch { removed = false; }
+    log(`[overnight] state file now lives outside the checkout at ${stateFile}. ${carried ? 'Migrated the watermark from' : 'Found a stale copy at'} ${legacyStateFile}; ${removed ? 'removed it' : 'COULD NOT remove it — delete it by hand, it will break `git pull --ff-only` once state.json is ever tracked on main'}.`);
+  }
   const editorMap = deps.editorMap || loadEditorMap();
   // If enumeration throws (e.g. a Gitea auth/5xx error), it propagates here and
   // aborts the run BEFORE any state write — lastRun is not advanced, so the
@@ -378,7 +401,7 @@ async function runOvernightReview({
       : sample.join(', ');
     log(`[overnight] COLD START (${stateFileExisted ? 'not a genuine first run' : 'genuine first run'})${anomaly} — SKIPPING ${allKeys.length} unit(s) as already-seen; NO proposals will be produced for them: ${skippedDetail || '(none)'}. To review these instead of skipping them, set OVERNIGHT_REVIEW_COLD_START=true (or pass --review-cold-start) and re-run.${dryRun ? ' (dry-run)' : ''}`);
     return {
-      coldStart: true, dryRun, genuineFirstRun: !stateFileExisted,
+      coldStart: true, dryRun, genuineFirstRun: !stateFileExisted, stateFile,
       units: units.length, reviewed: 0, proposals: 0, proposalsPath: null,
       skipped: allKeys.length, skippedSample: sample,
     };
@@ -474,7 +497,7 @@ async function runOvernightReview({
   // draw. dryRun only tags the line for the reader's benefit.
   log(`[overnight] reviewed ${reviewed} unit(s)${failed ? ` (${failed} deferred on transient failure)` : ''} → ${proposals.length} proposal row(s), ${reviewTasks.length} review task(s).${coldStartReviewed ? ' (this was a cold start, reviewed via OVERNIGHT_REVIEW_COLD_START instead of primed)' : ''}${dryRun ? ' (dry-run)' : ''}`);
   return {
-    coldStart: false, dryRun, units: units.length, reviewed, failed,
+    coldStart: false, dryRun, units: units.length, reviewed, failed, stateFile,
     proposals: proposals.length, proposalsPath, tasksPath, reviewTasks,
     sampleProposals: proposals.slice(0, 12),
     coldStartReviewed, skipped: 0,
@@ -482,7 +505,7 @@ async function runOvernightReview({
 }
 
 // --- CLI ---------------------------------------------------------------------
-// node src/overnight-watcher.js --skills-repo <dir> [--dry-run] [--review-cold-start]
+// node src/overnight-watcher.js --skills-repo <dir> [--state-file <path>] [--dry-run] [--review-cold-start]
 // Prints a digest between OVERNIGHT_DIGEST markers for the cron wrapper.
 //
 // #OVERNIGHT-COLDSTART-VISIBILITY: --review-cold-start (or env
@@ -502,6 +525,10 @@ function parseArgs(argv) {
     if (a === '--dry-run') out.dryRun = true;
     else if (a === '--review-cold-start') out.reviewColdStart = true;
     else if (a === '--skills-repo') out.skillsRepo = argv[++i];
+    // #OVERNIGHT-STATE-LOCATION: escape hatch for pointing the watermark at an
+    // explicit path. Unset is the normal case — it resolves to
+    // ${BP_BOT_HOME}/overnight-review-state.json, outside any git checkout.
+    else if (a === '--state-file') out.stateFile = argv[++i];
   }
   return out;
 }
@@ -515,7 +542,9 @@ async function cliMain(argv) {
   const skillsRepo = args.skillsRepo || process.env.BP_SKILLS_REPO;
   if (!skillsRepo) { process.stderr.write('[overnight] BP_SKILLS_REPO not set\n'); process.exit(2); }
   const reviewColdStart = args.reviewColdStart || envFlag('OVERNIGHT_REVIEW_COLD_START');
-  const res = await runOvernightReview({ skillsRepo, dryRun: args.dryRun, reviewColdStart });
+  const res = await runOvernightReview({
+    skillsRepo, stateFile: args.stateFile, dryRun: args.dryRun, reviewColdStart,
+  });
   const lines = [];
   if (res.coldStart) {
     const label = res.genuineFirstRun ? 'genuine first run' : 'NOT a genuine first run — state existed but was uninitialized, check for a persistence bug';

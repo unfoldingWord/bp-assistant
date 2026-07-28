@@ -480,3 +480,140 @@ test('runOvernightReview reviews a fresh merged TN PR and emits proposals', asyn
   assert.equal(row.editor, 'pjoakes');
   assert.equal(row.book, 'PSA');
 });
+
+// --- state file location (#OVERNIGHT-STATE-LOCATION) -------------------------
+// The Sensor's two modes write to two checkouts of the SAME repo on the same
+// volume: dry-run writes into the long-lived volume checkout (untracked), PR
+// mode into a fresh worktree whose output dir gets committed to main. If the
+// state file lives inside the checkout, the first `git pull --ff-only` after
+// such a merge dies with "untracked working tree file would be overwritten" —
+// and that sync runs on EVERY hourly wake for EVERY run mode, so it jams the
+// whole automation, not just the nightly loop. Keep state out of git.
+const path = require('node:path');
+
+test('resolveStateFile prefers an explicit path, then env, then the volume home, and only then the legacy in-checkout path', () => {
+  assert.equal(
+    stateLib.resolveStateFile({ skillsRepo: '/skills', stateFile: '/explicit.json', env: { BP_BOT_HOME: '/vol' } }),
+    '/explicit.json',
+  );
+  assert.equal(
+    stateLib.resolveStateFile({ skillsRepo: '/skills', env: { OVERNIGHT_STATE_FILE: '/env.json', BP_BOT_HOME: '/vol' } }),
+    '/env.json',
+  );
+  assert.equal(
+    stateLib.resolveStateFile({ skillsRepo: '/skills', env: { BP_BOT_HOME: '/vol' } }),
+    path.join('/vol', stateLib.DEFAULT_STATE_BASENAME),
+  );
+  // No BP_BOT_HOME (bare unit test / local one-off) — legacy path, unchanged.
+  assert.equal(
+    stateLib.resolveStateFile({ skillsRepo: '/skills', env: {} }),
+    path.join('/skills', stateLib.DEFAULT_STATE_REL),
+  );
+});
+
+test('the resolved state file is never inside the skills checkout when BP_BOT_HOME is set', async () => {
+  const writes = [];
+  const legacy = path.join('/skills', stateLib.DEFAULT_STATE_REL);
+  const initState = JSON.stringify({ version: 1, initialized: true, lastRun: '2026-06-20T00:00:00Z', reviewed: {}, branchTips: {} });
+  const prs = { en_tn: [{ number: 9, merged: true, merged_at: '2026-06-23T22:00:00Z', head: { ref: 'PSA-be-pjoakes', sha: 'newhead' }, base: { sha: 'oldbase' }, user: { login: 'pjoakes' } }] };
+  const oldTsv = [TN_HEADER, '1:1\ta\t\tfigs-metaphor\tx\t1\told note'].join('\n');
+  const newTsv = [TN_HEADER, '1:1\tb\t\tfigs-metaphor\tx\t1\trewritten note'].join('\n');
+
+  const res = await watcher.runOvernightReview({
+    skillsRepo: '/skills', now: new Date('2026-06-24T07:00:00Z'),
+    deps: {
+      env: { BP_BOT_HOME: '/vol' },
+      readFileSync: (p) => { if (p === path.join('/vol', stateLib.DEFAULT_STATE_BASENAME)) return initState; throw new Error('ENOENT'); },
+      writeFileSync: (pth, content) => writes.push({ pth, content }),
+      mkdirSync: () => {}, unlinkSync: () => { throw new Error('should not unlink'); },
+      apiGetImpl: fakeApiGet(prs, {}),
+      fetchTextImpl: async (url) => (/commit\/oldbase/.test(url) ? oldTsv : (/commit\/newhead/.test(url) ? newTsv : '')),
+      log: () => {},
+    },
+  });
+
+  assert.equal(res.stateFile, path.join('/vol', stateLib.DEFAULT_STATE_BASENAME));
+  const stateWrite = writes.find((w) => /state\.json$/.test(w.pth));
+  assert.equal(stateWrite.pth, path.join('/vol', stateLib.DEFAULT_STATE_BASENAME));
+  // Nothing at all may be written to the in-checkout state path — that is the
+  // file that collides with `git pull --ff-only` on the volume.
+  assert.equal(writes.some((w) => w.pth === legacy), false);
+  // The proposal feed still belongs in the checkout: it IS the reviewable
+  // output PR mode commits. Only the watermark moves out.
+  const proposalsWrite = writes.find((w) => /proposals\.jsonl$/.test(w.pth));
+  assert.ok(proposalsWrite.pth.startsWith('/skills'));
+});
+
+test('an existing in-checkout state file is migrated out and deleted, without cold-starting', async () => {
+  const legacy = path.join('/skills', stateLib.DEFAULT_STATE_REL);
+  const primary = path.join('/vol', stateLib.DEFAULT_STATE_BASENAME);
+  const reviewedKey = 'en_tn#5@head5';
+  const disk = { [legacy]: JSON.stringify({ version: 1, initialized: true, lastRun: '2026-06-20T00:00:00Z', reviewed: { [reviewedKey]: '2026-06-20T00:00:00Z' }, branchTips: {} }) };
+  const unlinked = [];
+
+  const res = await watcher.runOvernightReview({
+    skillsRepo: '/skills', now: new Date('2026-06-24T07:00:00Z'), dryRun: true,
+    deps: {
+      env: { BP_BOT_HOME: '/vol' },
+      readFileSync: (p) => { if (disk[p] != null) return disk[p]; throw new Error('ENOENT'); },
+      writeFileSync: (p, content) => { disk[p] = content; },
+      mkdirSync: () => {},
+      unlinkSync: (p) => { unlinked.push(p); delete disk[p]; },
+      apiGetImpl: fakeApiGet({}, {}), fetchTextImpl: async () => '', log: () => {},
+    },
+  });
+
+  // The watermark carried over: NOT a cold start (which would have silently
+  // primed the whole accumulated backlog away).
+  assert.equal(res.coldStart, false);
+  assert.deepEqual(unlinked, [legacy]);
+  assert.equal(disk[legacy], undefined);
+  const migrated = JSON.parse(disk[primary]);
+  assert.equal(migrated.initialized, true);
+  assert.ok(Object.prototype.hasOwnProperty.call(migrated.reviewed, reviewedKey));
+});
+
+test('a stale in-checkout state file is removed even when the out-of-checkout one already exists', async () => {
+  const legacy = path.join('/skills', stateLib.DEFAULT_STATE_REL);
+  const primary = path.join('/vol', stateLib.DEFAULT_STATE_BASENAME);
+  const disk = {
+    [primary]: JSON.stringify({ version: 1, initialized: true, lastRun: '2026-06-23T00:00:00Z', reviewed: {}, branchTips: {} }),
+    [legacy]: JSON.stringify({ version: 1, initialized: true, lastRun: '2026-01-01T00:00:00Z', reviewed: {}, branchTips: {} }),
+  };
+  const unlinked = [];
+  const res = await watcher.runOvernightReview({
+    skillsRepo: '/skills', now: new Date('2026-06-24T07:00:00Z'),
+    deps: {
+      env: { BP_BOT_HOME: '/vol' },
+      readFileSync: (p) => { if (disk[p] != null) return disk[p]; throw new Error('ENOENT'); },
+      writeFileSync: (p, content) => { disk[p] = content; },
+      mkdirSync: () => {},
+      unlinkSync: (p) => { unlinked.push(p); delete disk[p]; },
+      apiGetImpl: fakeApiGet({}, {}), fetchTextImpl: async () => '', log: () => {},
+    },
+  });
+  assert.equal(res.coldStart, false);
+  assert.deepEqual(unlinked, [legacy]);
+  // The newer out-of-checkout watermark wins; the stale copy does not clobber it.
+  assert.equal(JSON.parse(disk[primary]).lastRun, new Date('2026-06-24T07:00:00Z').toISOString());
+});
+
+test('a migration that cannot delete the legacy file still runs, and says so', async () => {
+  const legacy = path.join('/skills', stateLib.DEFAULT_STATE_REL);
+  const disk = { [legacy]: JSON.stringify({ version: 1, initialized: true, lastRun: '2026-06-20T00:00:00Z', reviewed: {}, branchTips: {} }) };
+  const logs = [];
+  const res = await watcher.runOvernightReview({
+    skillsRepo: '/skills', now: new Date('2026-06-24T07:00:00Z'),
+    deps: {
+      env: { BP_BOT_HOME: '/vol' },
+      readFileSync: (p) => { if (disk[p] != null) return disk[p]; throw new Error('ENOENT'); },
+      writeFileSync: (p, content) => { disk[p] = content; },
+      mkdirSync: () => {},
+      unlinkSync: () => { throw new Error('EACCES'); },
+      apiGetImpl: fakeApiGet({}, {}), fetchTextImpl: async () => '',
+      log: (m) => logs.push(m),
+    },
+  });
+  assert.equal(res.coldStart, false);
+  assert.ok(logs.some((m) => /COULD NOT remove it/.test(m)), 'operator must be told to delete it by hand');
+});
