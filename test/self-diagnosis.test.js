@@ -26,6 +26,9 @@ const {
   isAlignTransportClosed,
   buildAlignPermissionStallDiagnosis,
   isAlignPermissionStall,
+  buildPermissionWallDiagnosis,
+  isPermissionWall,
+  buildPermissionStallDiagnosis,
   FINGERPRINT_PREFIX,
 } = require('../src/self-diagnosis');
 
@@ -647,12 +650,16 @@ test('isAlignPermissionStall matches the align-all-parallel permission-denial-st
   );
   // A missing-output summary without a permission signal must NOT match this one.
   assert.equal(isAlignPermissionStall('AMO 5 — ULT: no aligned output found'), false);
-  // permission_stall errorKind on a NON-align skill must not be stolen by this one.
+  // #294: permission_stall errorKind is no longer align-exclusive — notes-pipeline's
+  // classifyPermissionFailure records the same structured errorKind for any skill
+  // (e.g. tn-writer, deep-issue-id), so this now short-circuits regardless of skill.
   assert.equal(
     isAlignPermissionStall('', { current: { errorKind: 'permission_stall', skill: 'tn-writer' } }),
-    false,
+    true,
   );
-  // A permission signal outside an align context doesn't match.
+  // The TEXT-ONLY fallback (no checkpoint errorKind) stays align-scoped — it's a
+  // fuzzier heuristic and every known non-align case already carries the errorKind.
+  // A permission signal outside an align context doesn't match via text alone.
   assert.equal(isAlignPermissionStall('tn-writer failed: STOP what you are doing and wait for the user'), false);
   assert.equal(isAlignPermissionStall(''), false);
   assert.equal(isAlignPermissionStall(null), false);
@@ -766,4 +773,165 @@ test('dispatchSelfDiagnosis short-circuits a partial-salvage incomplete_coverage
   assert.equal(result.action, 'created-align-missing-output');
   assert.equal(claudeWasCalled, false, 'partial-salvage incomplete_coverage must not invoke the diagnosis agent');
   assert.match(calls.lastCreateBody.title, /align: incomplete aligned output/);
+});
+
+// #294: the permission short-circuits were align-scoped, so a NOTES-pipeline
+// permission wall/stall (e.g. `deep-issue-id`) fell through to the LLM diagnosis
+// agent, which hit the same refusal and failed — DAN 4 (2026-07-27T23:19:16Z) and
+// DAN 5 (2026-07-28T11:30:53Z) both paid for exactly this. These tests use the
+// literal DAN 4 / DAN 5 checkpoint shapes to guard against regressing #294.
+
+test('isPermissionWall matches a NOTES-pipeline checkpoint regardless of skill (DAN 4 shape, #294)', () => {
+  assert.equal(
+    isPermissionWall('', { current: { skill: 'deep-issue-id', errorKind: 'permission_wall' } }),
+    true,
+  );
+  // Text fallback also works without "align" in the message, since a wall is
+  // pipeline-agnostic by construction.
+  assert.equal(
+    isPermissionWall('**deep-issue-id** failed for ZEC 6: external permission wall — tool calls were refused'),
+    true,
+  );
+  // Unrelated errorKind on the same skill must not match.
+  assert.equal(
+    isPermissionWall('', { current: { skill: 'deep-issue-id', errorKind: 'non_success_result' } }),
+    false,
+  );
+  assert.equal(isPermissionWall(''), false);
+  assert.equal(isPermissionWall(null), false);
+  assert.equal(isPermissionWall(undefined), false);
+});
+
+test('isAlignPermissionStall matches a NOTES-pipeline checkpoint regardless of skill (DAN 5 shape, #294)', () => {
+  assert.equal(
+    isAlignPermissionStall('', { current: { skill: 'deep-issue-id', errorKind: 'permission_stall' } }),
+    true,
+  );
+});
+
+test('dispatchSelfDiagnosis short-circuits a notes-pipeline permission wall without invoking the agent (DAN 4 shape, #294)', async () => {
+  const event = makePsa1Event({
+    pipelineType: 'notes',
+    scope: 'ZEC 6',
+    phase: 'deep-issue-id',
+    message: "**deep-issue-id** failed for ZEC 6: external permission wall — tool calls were refused from above "
+      + "this process's permission config and the refusal outlasted the runner's retry window. Nothing in our "
+      + 'skills or allowlists caused it; walls clear on their own, so re-run the chapter. (12.3s)',
+  });
+  const calls = {};
+  const fetchImpl = createGithubFetchStub({ captureCalls: calls });
+  let claudeWasCalled = false;
+  const runClaudeImpl = async () => { claudeWasCalled = true; return { subtype: 'success', result: VALID_AGENT_OUTPUT }; };
+
+  const result = await dispatchSelfDiagnosis({
+    event,
+    errorText: event.message,
+    checkpoint: { state: 'failed', current: { chapter: 6, skill: 'deep-issue-id', status: 'failed', errorKind: 'permission_wall' }, resume: { chapter: 6, skill: 'deep-issue-id' } },
+    runClaudeImpl,
+    fetchImpl,
+    readSecretImpl: () => 'fake-token',
+    readAdminStatusImpl: () => [event],
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.action, 'created-permission-wall');
+  assert.equal(claudeWasCalled, false, 'a notes-pipeline permission wall must not invoke the diagnosis agent (#294)');
+  assert.equal(calls.createCount, 1);
+  assert.ok(calls.lastCreateBody.labels.includes('permission-wall'));
+  assert.match(calls.lastCreateBody.title, /external permission wall/);
+  assert.match(calls.lastCreateBody.body, /re-run/i);
+  assert.match(calls.lastCreateBody.body, /pipeline-failure-fingerprint:/);
+});
+
+test('dispatchSelfDiagnosis short-circuits a notes-pipeline permission stall without invoking the agent (DAN 5 shape, #294)', async () => {
+  const event = makePsa1Event({
+    pipelineType: 'notes',
+    scope: 'ZEC 6',
+    phase: 'deep-issue-id',
+    message: '**deep-issue-id** failed for ZEC 6: permission-denial stall — tool calls were auto-denied '
+      + '("STOP what you are doing and wait") and nothing productive followed for the whole stall window. (8.1s)',
+  });
+  const calls = {};
+  const fetchImpl = createGithubFetchStub({ captureCalls: calls });
+  let claudeWasCalled = false;
+  const runClaudeImpl = async () => { claudeWasCalled = true; return { subtype: 'success', result: VALID_AGENT_OUTPUT }; };
+
+  const result = await dispatchSelfDiagnosis({
+    event,
+    errorText: event.message,
+    checkpoint: { state: 'failed', current: { chapter: 6, skill: 'deep-issue-id', status: 'failed', errorKind: 'permission_stall' }, resume: { chapter: 6, skill: 'deep-issue-id' } },
+    runClaudeImpl,
+    fetchImpl,
+    readSecretImpl: () => 'fake-token',
+    readAdminStatusImpl: () => [event],
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.action, 'created-permission-stall');
+  assert.equal(claudeWasCalled, false, 'a notes-pipeline permission stall must not invoke the diagnosis agent (#294)');
+  assert.equal(calls.createCount, 1);
+  assert.ok(calls.lastCreateBody.labels.includes('permission-stall'));
+  assert.match(calls.lastCreateBody.title, /permission-denial stall \(deep-issue-id\)/);
+  assert.match(calls.lastCreateBody.body, /allowed-tools/);
+  assert.match(calls.lastCreateBody.body, /pipeline-failure-fingerprint:/);
+});
+
+test('dispatchSelfDiagnosis still runs the diagnosis agent for an unrelated notes-pipeline errorKind (#294 must not over-widen)', async () => {
+  // Same notes pipeline / same skill as the DAN 4/5 shapes above, but a genuinely
+  // different errorKind (e.g. a plain non-success result) — this must NOT be
+  // swallowed by the widened permission predicates and must still reach the agent.
+  const event = makePsa1Event({
+    pipelineType: 'notes',
+    scope: 'ZEC 6',
+    phase: 'deep-issue-id',
+    message: '**deep-issue-id** failed for ZEC 6: non-success subtype: "error"',
+  });
+  const calls = {};
+  const fetchImpl = createGithubFetchStub({ captureCalls: calls });
+  let claudeWasCalled = false;
+  const runClaudeImpl = async () => { claudeWasCalled = true; return { subtype: 'success', result: VALID_AGENT_OUTPUT }; };
+
+  const result = await dispatchSelfDiagnosis({
+    event,
+    errorText: event.message,
+    checkpoint: { state: 'failed', current: { chapter: 6, skill: 'deep-issue-id', status: 'failed', errorKind: 'non_success_result' }, resume: { chapter: 6, skill: 'deep-issue-id' } },
+    runClaudeImpl,
+    fetchImpl,
+    readSecretImpl: () => 'fake-token',
+    readAdminStatusImpl: () => [event],
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(claudeWasCalled, true, 'an unrelated errorKind must still invoke the diagnosis agent, not short-circuit');
+  assert.equal(result.action, 'created');
+});
+
+test('buildPermissionWallDiagnosis surfaces the run log path when evidence is available (#294)', () => {
+  const event = makePsa1Event({ pipelineType: 'notes', scope: 'ZEC 6', message: 'deep-issue-id permission wall' });
+  const d = buildPermissionWallDiagnosis(
+    event,
+    'some context',
+    { current: { skill: 'deep-issue-id' } },
+    { runLogPath: '/data/logs/notes-ZEC-6.jsonl', transcriptPath: '/data/transcripts/notes-ZEC-6.json' },
+  );
+  assert.ok(d.title.length <= 120);
+  assert.ok(d.labels.includes('permission-wall'));
+  assert.equal(d.classification, 'permission-wall');
+  assert.match(d.body, /\/data\/logs\/notes-ZEC-6\.jsonl/);
+  assert.match(d.body, /re-run/i);
+});
+
+test('buildPermissionStallDiagnosis surfaces the run log path when evidence is available (#294)', () => {
+  const event = makePsa1Event({ pipelineType: 'notes', scope: 'ZEC 6', message: 'deep-issue-id permission stall' });
+  const d = buildPermissionStallDiagnosis(
+    event,
+    'some context',
+    { current: { skill: 'deep-issue-id' } },
+    { runLogPath: '/data/logs/notes-ZEC-6.jsonl' },
+  );
+  assert.ok(d.title.length <= 120);
+  assert.ok(d.labels.includes('permission-stall'));
+  assert.equal(d.classification, 'permission-stall');
+  assert.match(d.body, /\/data\/logs\/notes-ZEC-6\.jsonl/);
+  assert.match(d.body, /allowed-tools/);
 });

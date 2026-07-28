@@ -468,17 +468,43 @@ function isAlignTransportClosed(text) {
 // now bails fast (`permission_stall`) and the pipeline records errorKind
 // `permission_stall`. A fresh LLM diagnosis agent would hit the same auto-denial
 // wall, so short-circuit to a templated issue.
+// #294: this predicate's name is a historical artifact — `permission_stall` is no
+// longer align-exclusive. `classifyPermissionFailure` in `src/notes-pipeline.js`
+// (added by #288) records the identical structured errorKind for ANY skill (e.g.
+// `deep-issue-id` in the notes pipeline), not just `align-all-parallel`. DAN 4
+// (2026-07-27T23:19:16Z) and DAN 5 (2026-07-28T11:30:53Z) both walled/stalled on a
+// notes skill, fell through the old align-only gate, and paid for a diagnosis
+// agent that hit the identical auto-denial and failed. So the errorKind check below
+// no longer restricts on skill — any `permission_stall` errorKind short-circuits.
+// The text-only fallback (used when no checkpoint errorKind is available) stays
+// align-scoped: without a structured errorKind it's a much fuzzier heuristic, and
+// every known non-align case already carries the errorKind, so widening the text
+// match isn't needed to fix the reported bug and would only add false-positive risk.
 function isAlignPermissionStall(text, checkpoint) {
   const current = checkpoint && checkpoint.current;
   const errorKind = current && current.errorKind;
-  if (errorKind === 'permission_stall') {
-    const skill = String((current && current.skill) || '');
-    if (!skill || /align/i.test(skill)) return true;
-  }
+  if (errorKind === 'permission_stall') return true;
   const msg = typeof text === 'string' ? text : String((text && text.message) || text || '');
   if (!msg) return false;
   return /(permission[- ]?stall|auto-denied|doesn't want to take this action|stop what you are doing and wait)/i.test(msg)
     && /align/i.test(msg);
+}
+
+// #294: `permission_wall` is a NEW errorKind (added alongside `permission_stall` by
+// #288's `classifyPermissionFailure` in `src/notes-pipeline.js`) that this file never
+// referenced before. A wall is EXTERNAL and transient — every tool call was refused
+// from outside this process's own permission config (see
+// `resultIndicatesPermissionWall` in `src/claude-runner.js`, #271) — so it is
+// pipeline-agnostic from the start: no align-only gate, on any skill. A fresh
+// diagnosis agent hits the identical external refusal, which is exactly what
+// DAN 4 and DAN 5 paid for before filing a worse issue than a template would.
+function isPermissionWall(text, checkpoint) {
+  const current = checkpoint && checkpoint.current;
+  const errorKind = current && current.errorKind;
+  if (errorKind === 'permission_wall') return true;
+  const msg = typeof text === 'string' ? text : String((text && text.message) || text || '');
+  if (!msg) return false;
+  return /external permission wall/i.test(msg);
 }
 
 // Templated diagnosis for the "align-all-parallel: no (or only partial) aligned
@@ -650,6 +676,135 @@ function buildAlignPermissionStallDiagnosis(event, contextSummary) {
   };
 }
 
+// Templated diagnosis for `errorKind === 'permission_wall'` on any skill/pipeline
+// (issue #294). A wall means every tool call was refused from OUTSIDE this
+// process's own permission config and the refusal outlasted the runner's retry
+// window (`resultIndicatesPermissionWall` in `src/claude-runner.js`, #271;
+// recorded as a structured errorKind by `classifyPermissionFailure` in
+// `src/notes-pipeline.js` as of #288). This is EXTERNAL and TRANSIENT — nothing in
+// our skills, prompts, or allowlists caused it — so unlike the stall template the
+// advice here is simply "re-run", not "fix the allowlist". Filed directly instead
+// of running the LLM diagnosis agent because a fresh agent hits the identical
+// external refusal (DAN 4 2026-07-27T23:19:16Z, DAN 5 2026-07-28T11:30:53Z).
+function buildPermissionWallDiagnosis(event, contextSummary, checkpoint, evidence) {
+  const targetRepo = classifyRepo(event);
+  const scopeLabel = event.scope || event.pipelineType || 'event';
+  const skill = (checkpoint && checkpoint.current && checkpoint.current.skill) || '(unknown)';
+  const title = `Pipeline failure: ${event.pipelineType || 'unknown'} ${scopeLabel} — external permission wall`
+    .slice(0, 120);
+  const body = [
+    '## Summary',
+    `The \`${skill}\` step hit an external permission wall: every tool call was refused from`,
+    "outside this process's own permission config, and the refusal outlasted the runner's",
+    'retry window. This is NOT a skill, prompt, or allowlist problem — nothing in our code',
+    'caused it, and walls clear on their own. This templated issue was filed instead of',
+    'running the LLM diagnosis agent because a fresh agent in the same process would hit',
+    'the identical external refusal (see DAN 4 and DAN 5, 2026-07-27/28 — issue #294).',
+    '',
+    '## Failure event',
+    `- pipelineType: ${event.pipelineType || '(unknown)'}`,
+    `- scope: ${event.scope || '(none)'}`,
+    `- phase: ${event.phase || '(none)'}`,
+    `- severity: ${event.severity || '(unknown)'}`,
+    `- message: ${event.message || '(none)'}`,
+    '',
+  ];
+  if (evidence && (evidence.runLogPath || evidence.transcriptPath)) {
+    body.push('## Evidence');
+    if (evidence.runLogPath) body.push(`- Run log (JSONL): \`${evidence.runLogPath}\``);
+    if (evidence.transcriptPath) body.push(`- SDK transcript: \`${evidence.transcriptPath}\``);
+    body.push('');
+  }
+  body.push(
+    '## Next steps',
+    '- Re-run the affected chapter/scope. The wall is external and transient, so a retry',
+    '  with no code changes is the expected fix — do not chase a local allowlist change.',
+    '- If the same scope walls repeatedly across retries, escalate: a wall that never',
+    '  clears is no longer "transient" and warrants investigating the upstream permission',
+    '  layer (see #292).',
+    '',
+    '## Diagnosis context',
+    '<details><summary>Click to expand</summary>',
+    '',
+    '```',
+    String(contextSummary || '').slice(0, 8000),
+    '```',
+    '</details>',
+  );
+  return {
+    repo: targetRepo,
+    title,
+    body: body.join('\n'),
+    labels: ['bug', 'pipeline-failure', 'permission-wall'],
+    classification: 'permission-wall',
+  };
+}
+
+// Templated diagnosis for a `permission_stall` errorKind on a NON-align skill
+// (issue #294). Structurally the same failure as `buildAlignPermissionStallDiagnosis`
+// — a headless `permissionMode:'auto'` run auto-denied an out-of-allowlist tool call
+// and the sub-agent obeyed "STOP what you are doing and wait" literally instead of
+// switching tools — but the align template's advice (SKILL.md body vs. align's
+// specific workspace-tools allow-list) doesn't generalize to an arbitrary skill, so
+// this stays generic and points at the run log / skill name instead.
+function buildPermissionStallDiagnosis(event, contextSummary, checkpoint, evidence) {
+  const targetRepo = classifyRepo(event);
+  const scopeLabel = event.scope || event.pipelineType || 'event';
+  const skill = (checkpoint && checkpoint.current && checkpoint.current.skill) || '(unknown)';
+  const title = `Pipeline failure: ${event.pipelineType || 'unknown'} ${scopeLabel} — permission-denial stall (${skill})`
+    .slice(0, 120);
+  const body = [
+    '## Summary',
+    `The \`${skill}\` step issued a tool call outside its allow-list. The pipeline runs`,
+    "headless with `permissionMode:'auto'` and no approval callback, so the SDK auto-denied",
+    'the call with "The user doesn\'t want to take this action right now. STOP what you are',
+    'doing and wait for the user...". The sub-agent obeyed that text literally and halted,',
+    'producing no usable output. This templated issue was filed instead of running the LLM',
+    'diagnosis agent because a fresh agent in the same headless auto mode would hit the',
+    'identical auto-denial wall (see DAN 4 and DAN 5, 2026-07-27/28 — issue #294).',
+    '',
+    '## Failure event',
+    `- pipelineType: ${event.pipelineType || '(unknown)'}`,
+    `- scope: ${event.scope || '(none)'}`,
+    `- phase: ${event.phase || '(none)'}`,
+    `- severity: ${event.severity || '(unknown)'}`,
+    `- message: ${event.message || '(none)'}`,
+    '',
+  ];
+  if (evidence && (evidence.runLogPath || evidence.transcriptPath)) {
+    body.push('## Evidence');
+    if (evidence.runLogPath) body.push(`- Run log (JSONL): \`${evidence.runLogPath}\``);
+    if (evidence.transcriptPath) body.push(`- SDK transcript: \`${evidence.transcriptPath}\``);
+    body.push('- Look for `"denied":true` tool_use entries in the run log — a run of these is the');
+    body.push('  auto-denial wall, not a model flake.');
+    body.push('');
+  }
+  body.push(
+    '## Next steps',
+    `- Root cause is very likely a skill body vs. \`allowed-tools\` mismatch: check the`,
+    `  \`${skill}\` SKILL.md against the tools it actually invokes.`,
+    '- The skill should instruct sub-agents: if a tool call is denied, switch to an',
+    '  allowed equivalent and continue — never stop and wait, since no human approval',
+    '  callback exists in this headless run.',
+    '- Re-run once the skill body no longer reaches for an out-of-allowlist tool.',
+    '',
+    '## Diagnosis context',
+    '<details><summary>Click to expand</summary>',
+    '',
+    '```',
+    String(contextSummary || '').slice(0, 8000),
+    '```',
+    '</details>',
+  );
+  return {
+    repo: targetRepo,
+    title,
+    body: body.join('\n'),
+    labels: ['bug', 'pipeline-failure', 'permission-stall'],
+    classification: 'permission-stall',
+  };
+}
+
 // Templated diagnosis for a recognized runner guardrail stop (looping tool errors
 // or budget exhaustion). No LLM investigation is run — the signature is well
 // understood — so we file a concise, actionable issue directly.
@@ -802,6 +957,15 @@ async function dispatchSelfDiagnosis({
       diagnosis = buildGuardrailStopDiagnosis(event, contextSummary);
       shortCircuited = true;
       shortCircuitTag = 'guardrail';
+    } else if (isPermissionWall(errorText, checkpoint) || isPermissionWall(event.message, checkpoint)) {
+      // Known signature (#294, widened off align-only) — every tool call was refused
+      // from OUTSIDE this process's own permission config (external + transient). A
+      // fresh diagnosis agent would hit the identical external refusal, so
+      // short-circuit to a templated issue on any skill/pipeline, not just align.
+      console.log('[self-diagnosis] External permission-wall signature recognized; filing templated issue without running the agent.');
+      diagnosis = buildPermissionWallDiagnosis(event, contextSummary, checkpoint, evidence);
+      shortCircuited = true;
+      shortCircuitTag = 'permission-wall';
     } else if (isAlignTransportClosed(errorText) || isAlignTransportClosed(event.message)) {
       // Known signature — the in-process workspace-tools MCP transport was torn down
       // mid-align ("Stream closed"). A fresh diagnosis agent would hit the same dead
@@ -811,13 +975,20 @@ async function dispatchSelfDiagnosis({
       shortCircuited = true;
       shortCircuitTag = 'align-transport-closed';
     } else if (isAlignPermissionStall(errorText, checkpoint) || isAlignPermissionStall(event.message, checkpoint)) {
-      // Known signature — the align sub-agents' out-of-allowlist tool calls were
-      // auto-denied in headless auto mode ("STOP and wait") and they halted. A fresh
-      // diagnosis agent would hit the same wall, so short-circuit to a templated issue.
-      console.log('[self-diagnosis] Align permission-denial-stall signature recognized; filing templated issue without running the agent.');
-      diagnosis = buildAlignPermissionStallDiagnosis(event, contextSummary);
+      // Known signature — a sub-agent's out-of-allowlist tool calls were auto-denied
+      // in headless auto mode ("STOP and wait") and it halted. A fresh diagnosis agent
+      // would hit the same wall, so short-circuit to a templated issue. #294 widened
+      // this off align-only: pick the align-specific template (which carries genuinely
+      // align-specific advice about its SKILL.md/allow-list) only when the failing
+      // skill actually is align; any other skill gets the generic stall template.
+      const stallSkill = String((checkpoint && checkpoint.current && checkpoint.current.skill) || '');
+      const isAlignStall = !stallSkill || /align/i.test(stallSkill);
+      console.log(`[self-diagnosis] Permission-denial-stall signature recognized (skill=${stallSkill || 'unknown'}); filing templated issue without running the agent.`);
+      diagnosis = isAlignStall
+        ? buildAlignPermissionStallDiagnosis(event, contextSummary)
+        : buildPermissionStallDiagnosis(event, contextSummary, checkpoint, evidence);
       shortCircuited = true;
-      shortCircuitTag = 'align-permission-stall';
+      shortCircuitTag = isAlignStall ? 'align-permission-stall' : 'permission-stall';
     } else if (isAlignMissingOutput(errorText, checkpoint) || isAlignMissingOutput(event.message, checkpoint)) {
       // Known signature — align-all-parallel produced no (or only partial) aligned
       // output. The LLM diagnosis agent times out on this signature (issue #174),
@@ -937,6 +1108,9 @@ module.exports = {
   isAlignTransportClosed,
   buildAlignPermissionStallDiagnosis,
   isAlignPermissionStall,
+  buildPermissionWallDiagnosis,
+  isPermissionWall,
+  buildPermissionStallDiagnosis,
   buildIncompleteDiagnosis,
   buildContextSummary,
   appendFingerprintMarker,
