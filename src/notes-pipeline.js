@@ -935,7 +935,11 @@ function postProcessNotesTsv({ notesPath, ultUsfm, hebrewUsfm, preparedJson }) {
   }
 
   if (ultUsfm && fs.existsSync(path.resolve(CSKILLBP_DIR, ultUsfm))) {
-    steps.push(`verifyBoldMatches: ${verifyBoldMatches({ tsvFile: notesPath, ultUsfm, preparedJson })}`);
+    const boldResult = verifyBoldMatches({ tsvFile: notesPath, ultUsfm, preparedJson });
+    if (boldResult.startsWith('ERROR: ')) {
+      throw new Error(boldResult);
+    }
+    steps.push(`verifyBoldMatches: ${boldResult}`);
   } else {
     steps.push('verifyBoldMatches: skipped (no ULT USFM available)');
   }

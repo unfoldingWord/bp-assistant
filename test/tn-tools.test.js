@@ -8,6 +8,7 @@ const {
   prepareNotes,
   prepareATContext,
   verifyBoldMatches,
+  parsePlainUsfmVersesFromText,
   fillOrigQuotes,
   _resolveGlQuotes,
   _parseExplanationDirectives,
@@ -1710,4 +1711,170 @@ test('bold round-trip: assemble -> curly_quotes -> verify_bold_matches keeps a s
   assert.match(summary, /stripped 0 non-matching bold/);
   // The bold survives with its (now curled) apostrophe intact.
   assert.match(content, /\*\*Yahweh’s anger\*\*/);
+});
+
+// ---------------------------------------------------------------------------
+// parsePlainUsfmVersesFromText: word-per-line aligned USFM regression (bug
+// that destroyed bold in ZEC 13/14 notes — the old line-oriented parser only
+// kept text on the same line as \v, truncating word-per-line verses to a
+// single word).
+// ---------------------------------------------------------------------------
+
+test('parsePlainUsfmVersesFromText accumulates a word-per-line verse into full text', () => {
+  const usfm = [
+    '\\c 13',
+    '\\p',
+    '\\v 1 On',
+    'that',
+    'day',
+    'a',
+    'fountain',
+    'will',
+    'be',
+    'opened',
+    'for',
+    'the',
+    'house',
+    'of',
+    'David',
+    '\\v 2 And',
+    'it',
+    'will',
+    'happen',
+    'in',
+    'that',
+    'day',
+    '\\c 14',
+    '\\v 1 See',
+    'a',
+    'day',
+    'is',
+    'coming',
+  ].join('\n');
+
+  const verses = parsePlainUsfmVersesFromText(usfm);
+
+  assert.equal(verses['13:1'], 'On that day a fountain will be opened for the house of David');
+  assert.equal(verses['13:2'], 'And it will happen in that day');
+  assert.equal(verses['14:1'], 'See a day is coming');
+});
+
+test('parsePlainUsfmVersesFromText still parses conventional single-line-per-verse USFM', () => {
+  const usfm = [
+    '\\c 1',
+    '\\p',
+    '\\v 1 In the beginning God created the heavens and the earth.',
+    '\\v 2 Now the earth was formless and empty.',
+  ].join('\n');
+
+  const verses = parsePlainUsfmVersesFromText(usfm);
+
+  assert.equal(verses['1:1'], 'In the beginning God created the heavens and the earth.');
+  assert.equal(verses['1:2'], 'Now the earth was formless and empty.');
+});
+
+test('parsePlainUsfmVersesFromText keys a verse-range marker by its first number', () => {
+  const usfm = [
+    '\\c 1',
+    '\\p',
+    '\\v 1-2 The king spoke to his people and they rejoiced.',
+    '\\v 3 Then he departed.',
+  ].join('\n');
+
+  const verses = parsePlainUsfmVersesFromText(usfm);
+
+  assert.equal(verses['1:1'], 'The king spoke to his people and they rejoiced.');
+  assert.equal(verses['1:3'], 'Then he departed.');
+  assert.equal(verses['1:2'], undefined);
+});
+
+test('verifyBoldMatches preserves bold when ULT is word-per-line aligned USFM', () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tn-tools-bold-wordperline-'));
+  const relRoot = path.join('tmp', path.basename(tempDir));
+  fs.mkdirSync(path.join('/srv/bot/workspace', relRoot), { recursive: true });
+
+  const tsvRel = path.join(relRoot, 'notes.tsv');
+  const ultRel = path.join(relRoot, 'ult.usfm');
+
+  fs.writeFileSync(path.join('/srv/bot/workspace', tsvRel), [
+    'Reference\tID\tTags\tSupportReference\tQuote\tOccurrence\tNote',
+    '13:1\ta1b2\t\trc://*/ta/man/translate/figs-metonymy\tבֵּ֣ית דָּוִ֗יד\t1\tHere, **the house of David** represents the descendants of David.',
+  ].join('\n'));
+  fs.writeFileSync(path.join('/srv/bot/workspace', ultRel), [
+    '\\c 13',
+    '\\p',
+    '\\v 1 On',
+    'that',
+    'day',
+    'a',
+    'fountain',
+    'will',
+    'be',
+    'opened',
+    'for',
+    'the',
+    'house',
+    'of',
+    'David',
+  ].join('\n'));
+
+  const summary = verifyBoldMatches({ tsvFile: tsvRel, ultUsfm: ultRel });
+  const content = fs.readFileSync(path.join('/srv/bot/workspace', tsvRel), 'utf8');
+
+  assert.match(summary, /stripped 0 non-matching bold/);
+  assert.match(content, /\*\*the house of David\*\*/);
+});
+
+test('verifyBoldMatches skips a verse whose parsed ULT text is implausibly short (<3 words)', () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tn-tools-bold-shortguard-'));
+  const relRoot = path.join('tmp', path.basename(tempDir));
+  fs.mkdirSync(path.join('/srv/bot/workspace', relRoot), { recursive: true });
+
+  const tsvRel = path.join(relRoot, 'notes.tsv');
+  const ultRel = path.join(relRoot, 'ult.usfm');
+
+  fs.writeFileSync(path.join('/srv/bot/workspace', tsvRel), [
+    'Reference\tID\tTags\tSupportReference\tQuote\tOccurrence\tNote',
+    '13:1\ta1b2\t\trc://*/ta/man/translate/figs-metonymy\tבֵּ֣ית דָּוִ֗יד\t1\tHere, **the house of David** represents the descendants of David.',
+  ].join('\n'));
+  // Same broken shape as the original bug: only "On" survives on the \v line.
+  fs.writeFileSync(path.join('/srv/bot/workspace', ultRel), [
+    '\\c 13',
+    '\\v 1 On',
+  ].join('\n'));
+
+  const summary = verifyBoldMatches({ tsvFile: tsvRel, ultUsfm: ultRel });
+  const content = fs.readFileSync(path.join('/srv/bot/workspace', tsvRel), 'utf8');
+
+  assert.match(summary, /skipped 1 verse\(s\) with unusable ULT text/);
+  assert.match(content, /\*\*the house of David\*\*/);
+});
+
+test('verifyBoldMatches refuses to write when more than half of many examined bolds would be stripped', () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tn-tools-bold-massstrip-'));
+  const relRoot = path.join('tmp', path.basename(tempDir));
+  fs.mkdirSync(path.join('/srv/bot/workspace', relRoot), { recursive: true });
+
+  const tsvRel = path.join(relRoot, 'notes.tsv');
+  const ultRel = path.join(relRoot, 'ult.usfm');
+
+  const tsvLines = ['Reference\tID\tTags\tSupportReference\tQuote\tOccurrence\tNote'];
+  const ultLines = ['\\c 1'];
+  // 12 verses: only 5 have bold matching the ULT ("word N"), the other 7
+  // bold something that never appears in that verse's ULT text.
+  for (let n = 1; n <= 12; n++) {
+    ultLines.push(`\\v ${n} This is verse number ${n} in the chapter today.`);
+    const bold = n <= 5 ? `verse number ${n}` : `totally unrelated phrase ${n}`;
+    tsvLines.push(`1:${n}\tid${n}\t\trc://*/ta/man/translate/figs-metonymy\tQ${n}\t1\tHere, **${bold}** means something.`);
+  }
+  fs.writeFileSync(path.join('/srv/bot/workspace', tsvRel), tsvLines.join('\n'));
+  fs.writeFileSync(path.join('/srv/bot/workspace', ultRel), ultLines.join('\n'));
+
+  const before = fs.readFileSync(path.join('/srv/bot/workspace', tsvRel));
+
+  const summary = verifyBoldMatches({ tsvFile: tsvRel, ultUsfm: ultRel });
+  const after = fs.readFileSync(path.join('/srv/bot/workspace', tsvRel));
+
+  assert.match(summary, /^ERROR: /);
+  assert.deepEqual(after, before);
 });
