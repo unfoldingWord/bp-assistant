@@ -448,14 +448,18 @@ function serializeCheckpoint(jobId, cp) {
     : null;
   // Pause time, so callers can apply their own staleness policy (and so the
   // 409 stale_pause from /resume is predictable rather than a surprise).
-  // `updatedAt` is the best available signal: setCheckpoint stamps it on every
-  // write, and the write that sets state to paused_for_* is the moment the run
-  // parked. No dedicated pausedAt field is recorded anywhere in the codebase.
-  // Caveat: any later write to the same checkpoint would move it — nothing
-  // writes to a parked checkpoint today (the pipeline `break`s out of its loop
-  // right after parking), but that is an invariant of the pipeline, not of the
-  // storage layer.
-  if (RESUMABLE_STATES.has(cp.state) && cp.updatedAt) out.pausedAt = cp.updatedAt;
+  //
+  // Reports `pauseAnchorAt` in preference to `updatedAt`, and the difference is
+  // the whole point: setCheckpoint stamps `updatedAt` on every write, and a
+  // resumed run writes state:'running' immediately, so `updatedAt` RESETS on
+  // every resume attempt. A caller applying a staleness policy to it would find
+  // its own gate silently decorative — which is exactly the bug the internal
+  // anchor was added to fix (see classifyResumeRequest). Report the anchor so a
+  // caller's policy binds on the same clock ours does. `updatedAt` remains the
+  // fallback for a checkpoint that has not been resumed yet, where it IS the
+  // moment the run parked.
+  const pausedAt = cp.pauseAnchorAt || cp.updatedAt;
+  if (RESUMABLE_STATES.has(cp.state) && pausedAt) out.pausedAt = pausedAt;
   const updatedMs = Date.parse(cp.updatedAt || '');
   if (Number.isFinite(updatedMs) && cp.state === 'running') {
     // Mirror /health/pipelines' heuristic: a 'running' checkpoint untouched

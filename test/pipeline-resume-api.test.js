@@ -458,3 +458,17 @@ test('resume — force does NOT override unknown options (it overrides age only)
   assert.equal(v.ok, false);
   assert.equal(v.body.error, 'options_unknown');
 });
+
+test('status — pausedAt reports the write-once anchor, not the resetting updatedAt', () => {
+  // A caller (bible-editor) applies its own staleness policy to pausedAt. If we
+  // reported updatedAt, that policy would reset on every resume attempt exactly
+  // as our own gate used to — decorative rather than binding.
+  const cp = pausedCheckpoint({ pauseAnchorAt: agoMinutes(200), updatedAt: agoMinutes(1) });
+  const out = serializeCheckpoint('j', cp);
+  assert.equal(out.pausedAt, cp.pauseAnchorAt);
+});
+
+test('status — pausedAt falls back to updatedAt before any resume has anchored it', () => {
+  const cp = pausedCheckpoint({ updatedAt: agoMinutes(7) });
+  assert.equal(serializeCheckpoint('j', cp).pausedAt, cp.updatedAt);
+});
