@@ -288,6 +288,10 @@ const PERMISSION_WALL_BASE_DELAY_MS = 60 * 1000;
 const PERMISSION_WALL_MAX_DELAY_MS = 5 * 60 * 1000;
 
 const TRANSIENT_RETRY_WINDOW_MS = 10 * 60 * 1000;
+// Floor so a single attempt that itself runs longer than the window (e.g. a hung
+// call taking 686s) can't zero out retries entirely — the window check alone would
+// already be blown before the loop gets a second try.
+const MIN_TRANSIENT_ATTEMPTS = 3;
 const RETRY_BASE_DELAY_MS = 5000;
 const RETRY_MAX_DELAY_MS = 60000;
 
@@ -1584,7 +1588,7 @@ async function runClaude(args) {
         );
         return result;
       }
-      if (isTransientSdkMessage(resultMsg) && elapsed < TRANSIENT_RETRY_WINDOW_MS) {
+      if (isTransientSdkMessage(resultMsg) && (attempt < MIN_TRANSIENT_ATTEMPTS || elapsed < TRANSIENT_RETRY_WINDOW_MS)) {
         lastTransientMessage = resultMsg;
         if (!firstDowntimeNoticeSent) {
           firstDowntimeNoticeSent = true;
@@ -1598,7 +1602,7 @@ async function runClaude(args) {
         await sleep(delay);
         continue;
       }
-      if (isTransientSdkMessage(resultMsg) && elapsed >= TRANSIENT_RETRY_WINDOW_MS) {
+      if (isTransientSdkMessage(resultMsg) && attempt >= MIN_TRANSIENT_ATTEMPTS && elapsed >= TRANSIENT_RETRY_WINDOW_MS) {
         await notifyAdminDowntime(
           `[claude-runner] Retry window exhausted after ${Math.round(elapsed / 1000)}s and ${attempt} attempts. ` +
           `Giving up for now. Last error: ${resultMsg.slice(0, 300)}`
@@ -1613,7 +1617,7 @@ async function runClaude(args) {
     } catch (err) {
       const msg = err?.message || String(err);
       const elapsed = Date.now() - startedAt;
-      if (isTransientSdkMessage(msg) && elapsed < TRANSIENT_RETRY_WINDOW_MS) {
+      if (isTransientSdkMessage(msg) && (attempt < MIN_TRANSIENT_ATTEMPTS || elapsed < TRANSIENT_RETRY_WINDOW_MS)) {
         lastTransientMessage = msg;
         if (!firstDowntimeNoticeSent) {
           firstDowntimeNoticeSent = true;
@@ -1627,7 +1631,7 @@ async function runClaude(args) {
         await sleep(delay);
         continue;
       }
-      if (isTransientSdkMessage(msg) && elapsed >= TRANSIENT_RETRY_WINDOW_MS) {
+      if (isTransientSdkMessage(msg) && attempt >= MIN_TRANSIENT_ATTEMPTS && elapsed >= TRANSIENT_RETRY_WINDOW_MS) {
         await notifyAdminDowntime(
           `[claude-runner] Retry window exhausted after ${Math.round(elapsed / 1000)}s and ${attempt} attempts. ` +
           `Giving up for now. Last error: ${msg.slice(0, 300)}`
