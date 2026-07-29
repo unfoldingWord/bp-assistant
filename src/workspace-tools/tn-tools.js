@@ -2288,7 +2288,9 @@ function verifyBoldMatches({ tsvFile, ultUsfm, preparedJson, output }) {
   let stripped = 0;
   let restored = 0;
   let examined = 0;
-  let skippedUnusable = 0;
+  // Distinct references, not rows: several notes share one verse, so counting
+  // rows would over-report how much of the ULT was unusable.
+  const skippedRefs = new Set();
   const log = [];
   const strippedExamples = [];
 
@@ -2304,7 +2306,7 @@ function verifyBoldMatches({ tsvFile, ultUsfm, preparedJson, output }) {
     // parsed incorrectly (or missing), and trusting it here would strip
     // legitimate bold. Skip rather than treat an unusable parse as ground truth.
     if (!ult || ult.trim().split(/\s+/).filter(Boolean).length < 3) {
-      skippedUnusable++;
+      skippedRefs.add(ref);
       continue;
     }
     const prepItem = id ? preparedItems.get(id) : null;
@@ -2356,7 +2358,7 @@ function verifyBoldMatches({ tsvFile, ultUsfm, preparedJson, output }) {
   fs.mkdirSync(path.dirname(outPath), { recursive: true });
   fs.writeFileSync(outPath, lines.join('\n'));
 
-  const result = [`Bold check: stripped ${stripped} non-matching bold(s), restored ${restored} missing bold(s), skipped ${skippedUnusable} verse(s) with unusable ULT text in ${path.basename(tsvFile)}`];
+  const result = [`Bold check: stripped ${stripped} non-matching bold(s), restored ${restored} missing bold(s), skipped ${skippedRefs.size} verse(s) with unusable ULT text in ${path.basename(tsvFile)}`];
   if (log.length) result.push(log.join('\n'));
   result.push(outPath);
   return result.join('\n');
