@@ -196,6 +196,17 @@ function extractAts(noteText) {
 }
 
 /**
+ * Blank out the content of AT [...] brackets, preserving string length.
+ * Whole-note scans (e.g. the bold check) use this so AT text is inspected only
+ * by the AT-specific checks and the same span is not reported twice under two
+ * different labels.
+ */
+function maskAtBracketContent(noteText) {
+  return String(noteText || '').replace(/Alternate translation:\s*(.*?)(?=\n|$)/g,
+    (atLine) => atLine.replace(/\[([^\]]+)\]/g, (_full, inner) => `[${' '.repeat(inner.length)}]`));
+}
+
+/**
  * Parse Hebrew USFM into a map of { "ch:vs": [wordToken, ...] }.
  * Extracts \w word|...\w* tokens by verse.
  */
@@ -478,6 +489,16 @@ async function checkTnQuality({ tsvPath, preparedJson, ultUsfm, ustUsfm, book, h
     // Extract ATs for this note
     const ats = extractAts(n.note);
 
+    // 5b. AT bracket content must be plain text — an AT is a minimal edit of the
+    // ULT, so bolded ULT wording inside brackets slips past the bold check (8)
+    // silently. Markdown belongs in the explanatory prose, never in the AT.
+    for (const at of ats) {
+      if (at.includes('*')) {
+        addFinding(n.row, n.ref, n.id, 'error', 'at_markdown',
+          `AT text "${at.slice(0, 50)}" contains markdown formatting`);
+      }
+    }
+
     // 6. AT text must NOT appear verbatim in UST verse
     if (ustVerse && ats.length) {
       for (const at of ats) {
@@ -542,7 +563,9 @@ async function checkTnQuality({ tsvPath, preparedJson, ultUsfm, ustUsfm, book, h
     // 8. Bold accuracy — normalized comparison (curly vs straight quotes,
     // whitespace, case): curly_quotes runs on the TSV before this check, so a
     // raw includes() would flag valid spans whose apostrophes were curled.
-    const boldMatches = n.note.match(/\*\*([^*]+)\*\*/g) || [];
+    // AT bracket content is masked out here: check 5b owns markdown-in-AT, so
+    // the same span is not double-reported as "bold text not in ULT".
+    const boldMatches = maskAtBracketContent(n.note).match(/\*\*([^*]+)\*\*/g) || [];
     for (const bold of boldMatches) {
       const text = bold.slice(2, -2);
       if (ultVerse && countCaseInsensitiveOccurrences(ultVerse, text) === 0) {

@@ -482,3 +482,55 @@ test('checkTnQuality bold check tolerates curled quotes introduced by post-proce
     .filter((f) => f.category === 'bold_not_in_ult').map((f) => f.id);
   assert.deepEqual(boldIds, ['a2b3']);
 });
+
+test('checkTnQuality flags markdown inside AT brackets without double-reporting as bold_not_in_ult', async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'quality-at-markdown-'));
+  const relRoot = path.join('tmp', path.basename(tempDir));
+  fs.mkdirSync(path.join('/srv/bot/workspace', relRoot), { recursive: true });
+
+  const tsvRel = path.join(relRoot, 'tn.tsv');
+  const prepRel = path.join(relRoot, 'prepared_notes.json');
+  const ultRel = path.join(relRoot, 'ult.usfm');
+  const ustRel = path.join(relRoot, 'ust.usfm');
+  const findingsRel = path.join(relRoot, 'findings.json');
+
+  fs.writeFileSync(path.join('/srv/bot/workspace', tsvRel), [
+    'Reference\tID\tTags\tSupportReference\tQuote\tOccurrence\tNote',
+    // Bolded ULT wording inside the AT: check 8 stays silent because the text
+    // IS in the ULT, so only the AT-specific check can catch it.
+    '1:1\ta1b2\t\trc://*/ta/man/translate/figs-metaphor\tמֶלֶךְ\t1\tHere the writer speaks of a **king**. Alternate translation: [the **ruler of the land** spoke]',
+    // Bold inside an AT that is absent from the ULT must be reported as
+    // at_markdown only, not also mislabeled as bold_not_in_ult.
+    '1:2\ta2b3\t\trc://*/ta/man/translate/figs-metaphor\tמֶלֶךְ\t1\tHere the writer speaks of a **king**. Alternate translation: [the **chieftain** spoke]',
+    // Clean AT: prose bold absent from the ULT must still be flagged.
+    '1:3\ta3b4\t\trc://*/ta/man/translate/figs-metaphor\tמֶלֶךְ\t1\tHere **the emperor** is a figure. Alternate translation: [the ruler spoke]',
+  ].join('\n'));
+
+  const item = (id, reference) => ({
+    id,
+    reference,
+    gl_quote: 'king',
+    issue_span_gl_quote: 'king',
+    ult_verse: 'The king, ruler of the land, spoke.',
+    ust_verse: 'The one who governed the country made an announcement.',
+  });
+  fs.writeFileSync(path.join('/srv/bot/workspace', prepRel), JSON.stringify({
+    items: [item('a1b2', '1:1'), item('a2b3', '1:2'), item('a3b4', '1:3')],
+  }, null, 2));
+
+  const verse = 'The king, ruler of the land, spoke.\n';
+  fs.writeFileSync(path.join('/srv/bot/workspace', ultRel), `\\c 1\n\\v 1 ${verse}\\v 2 ${verse}\\v 3 ${verse}`);
+  fs.writeFileSync(path.join('/srv/bot/workspace', ustRel), '\\c 1\n\\v 1 They governed.\n\\v 2 They governed.\n\\v 3 They governed.\n');
+
+  await checkTnQuality({ tsvPath: tsvRel, preparedJson: prepRel, ultUsfm: ultRel, ustUsfm: ustRel, output: findingsRel });
+
+  const findings = readFindings(findingsRel);
+  const atMarkdown = findings.filter((f) => f.category === 'at_markdown');
+  assert.deepEqual(atMarkdown.map((f) => f.id), ['a1b2', 'a2b3']);
+  assert.ok(atMarkdown.every((f) => f.severity === 'error'));
+
+  // The AT spans are owned by at_markdown; only the clean row's prose bold
+  // reaches the bold check.
+  const boldIds = findings.filter((f) => f.category === 'bold_not_in_ult').map((f) => f.id);
+  assert.deepEqual(boldIds, ['a3b4']);
+});
