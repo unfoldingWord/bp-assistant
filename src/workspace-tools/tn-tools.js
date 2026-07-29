@@ -1181,20 +1181,28 @@ function parsePlainUsfmVersesFromText(text) {
 
   for (const line of String(text || '').split('\n')) {
     const trimmed = line.trim();
-    const cm = trimmed.match(/^\\c\s+(\d+)/);
-    if (cm) {
+    // A verse start may be preceded by other USFM markers on the same line
+    // (e.g. poetry: `\q1 \v 7 "Sword,`). A leading `\c` in that run still
+    // flushes and sets the chapter, exactly as a standalone `\c` line would.
+    const leadCm = trimmed.match(/^(?:\\[a-z]+\d*\s+)*\\c\s+(\d+)/);
+    if (leadCm) {
       flush();
-      ch = parseInt(cm[1], 10);
+      ch = parseInt(leadCm[1], 10);
       continue;
     }
-    const vm = trimmed.match(/^\\v\s+(\d+[-\d]*)\s*(.*)/);
+    const vm = trimmed.match(/^(?:\\[a-z]+\d*\s+)*\\v\s+(\d+[-\d]*)\s*(.*)/);
     if (vm) {
       flush();
       curKey = `${ch}:${vm[1].split('-')[0]}`;
       if (vm[2]) buffer.push(vm[2]);
       continue;
     }
-    if (curKey !== null && trimmed) {
+    // A line that is purely standalone USFM marker(s) with no verse text
+    // (e.g. a lone `\p` paragraph break between two verses) carries no
+    // content of its own — skip it rather than let the marker leak into the
+    // buffer, where it has no trailing whitespace for the cleaning regexes
+    // to strip.
+    if (curKey !== null && trimmed && !/^(?:\\[a-z]+\d*\s*)+$/.test(trimmed)) {
       buffer.push(trimmed);
     }
   }

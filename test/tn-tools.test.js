@@ -1878,3 +1878,118 @@ test('verifyBoldMatches refuses to write when more than half of many examined bo
   assert.match(summary, /^ERROR: /);
   assert.deepEqual(after, before);
 });
+
+// ---------------------------------------------------------------------------
+// parsePlainUsfmVersesFromText: poetry lines where a paragraph marker (\q1,
+// \q2, etc.) precedes \v on the same line. The original word-per-line fix
+// only handled a bare leading \v, so ZEC 13:7-9 (and most poetry) were never
+// detected at all and silently dropped from the returned map.
+// ---------------------------------------------------------------------------
+
+test('parsePlainUsfmVersesFromText registers a verse whose \\v is preceded by a poetry marker on the same line', () => {
+  const usfm = [
+    '\\c 13',
+    '\\q1 \\v 7 “Sword,',
+    'awake',
+    'against',
+    'my',
+    'shepherd',
+  ].join('\n');
+
+  const verses = parsePlainUsfmVersesFromText(usfm);
+
+  assert.equal(verses['13:7'], '“Sword, awake against my shepherd');
+});
+
+test('parsePlainUsfmVersesFromText yields all 9 verses for a real-shape ZEC 13 poetry fixture', () => {
+  const usfm = [
+    '\\c 13',
+    '\\p',
+    '\\v 1 On',
+    'that',
+    'day',
+    'a',
+    'fountain',
+    'will',
+    'be',
+    'opened',
+    'for',
+    'the',
+    'house',
+    'of',
+    'David',
+    '\\v 2 And',
+    'it',
+    'will',
+    'happen',
+    'in',
+    'that',
+    'day',
+    '\\q1',
+    '\\v 3 And',
+    'it',
+    'will',
+    'happen',
+    '\\q1 \\v 4 And',
+    'it',
+    'will',
+    'happen',
+    '\\q1 \\v 5 “I',
+    'am',
+    'not',
+    '\\q2 \\v 6 And',
+    'one',
+    'will',
+    'say',
+    '\\q1 \\v 7 “Sword,',
+    'awake',
+    'against',
+    'my',
+    'shepherd',
+    '\\q1 \\v 8 And',
+    'it',
+    'will',
+    'happen',
+    '\\q1 \\v 9 And',
+    'I',
+    'will',
+    'bring',
+  ].join('\n');
+
+  const verses = parsePlainUsfmVersesFromText(usfm);
+
+  assert.equal(Object.keys(verses).filter((k) => k.startsWith('13:')).length, 9);
+  assert.equal(verses['13:7'], '“Sword, awake against my shepherd');
+  assert.equal(verses['13:9'], 'And I will bring');
+});
+
+test('parsePlainUsfmVersesFromText registers a verse behind multiple stacked leading markers', () => {
+  const usfm = [
+    '\\c 1',
+    '\\q1 \\q2 \\v 12 Deep',
+    'calls',
+    'to',
+    'deep',
+  ].join('\n');
+
+  const verses = parsePlainUsfmVersesFromText(usfm);
+
+  assert.equal(verses['1:12'], 'Deep calls to deep');
+});
+
+test('parsePlainUsfmVersesFromText regression: plain \\v and \\c lines still behave as before', () => {
+  const usfm = [
+    '\\c 1',
+    '\\p',
+    '\\v 1 In the beginning God created the heavens and the earth.',
+    '\\v 2 Now the earth was formless and empty.',
+    '\\c 2',
+    '\\v 1 Thus the heavens and the earth were finished.',
+  ].join('\n');
+
+  const verses = parsePlainUsfmVersesFromText(usfm);
+
+  assert.equal(verses['1:1'], 'In the beginning God created the heavens and the earth.');
+  assert.equal(verses['1:2'], 'Now the earth was formless and empty.');
+  assert.equal(verses['2:1'], 'Thus the heavens and the earth were finished.');
+});
