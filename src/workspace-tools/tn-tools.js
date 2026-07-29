@@ -1155,34 +1155,69 @@ function normalizeAssembledNoteText(noteText) {
     .trim();
 }
 
-function parsePlainUsfmVerses(usfmPath) {
-  const verses = {};
-  if (!usfmPath) return verses;
-  const resolvedPath = path.resolve(CSKILLBP_DIR, usfmPath);
-  if (!fs.existsSync(resolvedPath)) return verses;
+function cleanPlainUsfmVerseText(rawText) {
+  return String(rawText || '')
+    .replace(/\\zaln-[se][^*]*\*/g, '')
+    .replace(/\\w\s+([^|]*?)\|[^\\]*?\\w\*/g, '$1')
+    .replace(/\\[a-z]+\d?\s+/g, ' ')
+    .replace(/\\[a-z]+\d?\*/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
 
-  const text = fs.readFileSync(resolvedPath, 'utf8');
+function parsePlainUsfmVersesFromText(text) {
+  const verses = {};
   let ch = 0;
-  for (const line of text.split('\n')) {
+  let curKey = null;
+  let buffer = [];
+
+  const flush = () => {
+    if (curKey !== null) {
+      verses[curKey] = cleanPlainUsfmVerseText(buffer.join(' '));
+    }
+    curKey = null;
+    buffer = [];
+  };
+
+  for (const line of String(text || '').split('\n')) {
     const trimmed = line.trim();
-    const cm = trimmed.match(/^\\c\s+(\d+)/);
-    if (cm) {
-      ch = parseInt(cm[1], 10);
+    // A verse start may be preceded by other USFM markers on the same line
+    // (e.g. poetry: `\q1 \v 7 "Sword,`). A leading `\c` in that run still
+    // flushes and sets the chapter, exactly as a standalone `\c` line would.
+    const leadCm = trimmed.match(/^(?:\\[a-z]+\d*\s+)*\\c\s+(\d+)/);
+    if (leadCm) {
+      flush();
+      ch = parseInt(leadCm[1], 10);
       continue;
     }
-    const vm = trimmed.match(/^\\v\s+(\d+[-\d]*)\s*(.*)/);
-    if (!vm) continue;
-    let verseText = vm[2] || '';
-    verseText = verseText
-      .replace(/\\zaln-[se][^*]*\*/g, '')
-      .replace(/\\w\s+([^|]*?)\|[^\\]*?\\w\*/g, '$1')
-      .replace(/\\[a-z]+\d?\s+/g, ' ')
-      .replace(/\\[a-z]+\d?\*/g, '')
-      .replace(/\s+/g, ' ')
-      .trim();
-    verses[`${ch}:${vm[1].split('-')[0]}`] = verseText;
+    const vm = trimmed.match(/^(?:\\[a-z]+\d*\s+)*\\v\s+(\d+[-\d]*)\s*(.*)/);
+    if (vm) {
+      flush();
+      curKey = `${ch}:${vm[1].split('-')[0]}`;
+      if (vm[2]) buffer.push(vm[2]);
+      continue;
+    }
+    // A line that is purely standalone USFM marker(s) with no verse text
+    // (e.g. a lone `\p` paragraph break between two verses) carries no
+    // content of its own — skip it rather than let the marker leak into the
+    // buffer, where it has no trailing whitespace for the cleaning regexes
+    // to strip.
+    if (curKey !== null && trimmed && !/^(?:\\[a-z]+\d*\s*)+$/.test(trimmed)) {
+      buffer.push(trimmed);
+    }
   }
+  flush();
+
   return verses;
+}
+
+function parsePlainUsfmVerses(usfmPath) {
+  if (!usfmPath) return {};
+  const resolvedPath = path.resolve(CSKILLBP_DIR, usfmPath);
+  if (!fs.existsSync(resolvedPath)) return {};
+
+  const text = fs.readFileSync(resolvedPath, 'utf8');
+  return parsePlainUsfmVersesFromText(text);
 }
 
 function stripBoldMarkers(text) {
@@ -2252,7 +2287,12 @@ function verifyBoldMatches({ tsvFile, ultUsfm, preparedJson, output }) {
 
   let stripped = 0;
   let restored = 0;
+  let examined = 0;
+  // Distinct references, not rows: several notes share one verse, so counting
+  // rows would over-report how much of the ULT was unusable.
+  const skippedRefs = new Set();
   const log = [];
+  const strippedExamples = [];
 
   for (let i = 1; i < lines.length; i++) {
     if (!lines[i].trim()) continue;
@@ -2262,13 +2302,20 @@ function verifyBoldMatches({ tsvFile, ultUsfm, preparedJson, output }) {
     const ref = cols[refIdx];
     const id = idIdx >= 0 ? (cols[idIdx] || '') : '';
     const ult = ultVerses[ref] || '';
-    if (!ult) continue;
+    // A real Bible verse is never 1-2 words; fewer means the ULT text was
+    // parsed incorrectly (or missing), and trusting it here would strip
+    // legitimate bold. Skip rather than treat an unusable parse as ground truth.
+    if (!ult || ult.trim().split(/\s+/).filter(Boolean).length < 3) {
+      skippedRefs.add(ref);
+      continue;
+    }
     const prepItem = id ? preparedItems.get(id) : null;
 
     let note = cols[noteIdx];
     let changed = false;
 
     note = note.replace(/\*\*([^*]+)\*\*/g, (match, boldText) => {
+      examined++;
       // Compare against the ULT with quote/whitespace normalization (curly vs
       // straight, case) rather than a raw substring test. By the time this runs,
       // curly_quotes (notes-pipeline) has already curled the note's quotes and
@@ -2279,6 +2326,7 @@ function verifyBoldMatches({ tsvFile, ultUsfm, preparedJson, output }) {
       stripped++;
       changed = true;
       log.push(`${ref}: stripped bold from "${boldText}"`);
+      if (strippedExamples.length < 5) strippedExamples.push(`${ref}: "${boldText}"`);
       return boldText; // remove ** markers
     });
 
@@ -2296,11 +2344,21 @@ function verifyBoldMatches({ tsvFile, ultUsfm, preparedJson, output }) {
     }
   }
 
+  // Refuse to publish a mass-strip: if we examined a meaningful number of bold
+  // spans and stripped more than half of them, the parse (or ULT source) is
+  // more likely broken than the notes are wrong. Leave the TSV untouched.
+  if (examined >= 10 && stripped / examined > 0.5) {
+    return [
+      `ERROR: refusing to write ${path.basename(tsvFile)} — stripped ${stripped}/${examined} bold spans (>50%), which looks like a broken ULT parse rather than genuinely bad notes.`,
+      strippedExamples.length ? `Examples:\n${strippedExamples.join('\n')}` : null,
+    ].filter(Boolean).join('\n');
+  }
+
   const outPath = output ? path.resolve(CSKILLBP_DIR, output) : tsvPath;
   fs.mkdirSync(path.dirname(outPath), { recursive: true });
   fs.writeFileSync(outPath, lines.join('\n'));
 
-  const result = [`Bold check: stripped ${stripped} non-matching bold(s), restored ${restored} missing bold(s) in ${path.basename(tsvFile)}`];
+  const result = [`Bold check: stripped ${stripped} non-matching bold(s), restored ${restored} missing bold(s), skipped ${skippedRefs.size} verse(s) with unusable ULT text in ${path.basename(tsvFile)}`];
   if (log.length) result.push(log.join('\n'));
   result.push(outPath);
   return result.join('\n');
@@ -3272,6 +3330,7 @@ module.exports = {
   syncCanonicalHebrewQuotes,
   fixUnicodeQuotes,
   verifyBoldMatches,
+  parsePlainUsfmVersesFromText,
   fillTsvIds,
   fillOrigQuotes,
   loadTemplateMap,

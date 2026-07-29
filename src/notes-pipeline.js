@@ -935,7 +935,18 @@ function postProcessNotesTsv({ notesPath, ultUsfm, hebrewUsfm, preparedJson }) {
   }
 
   if (ultUsfm && fs.existsSync(path.resolve(CSKILLBP_DIR, ultUsfm))) {
-    steps.push(`verifyBoldMatches: ${verifyBoldMatches({ tsvFile: notesPath, ultUsfm, preparedJson })}`);
+    const boldResult = verifyBoldMatches({ tsvFile: notesPath, ultUsfm, preparedJson });
+    // Deliberately do NOT throw here. verifyBoldMatches has already declined to
+    // write, so the notes are safe, and a later assemble_notes (in
+    // tn-quality-check) rebuilds the TSV from the writer's own output anyway.
+    // Every mass-strip we have on record — DAN 5 (83/84), DAN 6 (32/32),
+    // ZEC 13:3-9 (10/10) — was followed by a run that produced correct output,
+    // so throwing would have failed three good runs and fixed nothing. Shout
+    // instead: the refusal is the protection, this line is the visibility.
+    if (boldResult.startsWith('ERROR: ')) {
+      console.error(`[notes] BOLD CHECK REFUSED TO WRITE — ${boldResult}`);
+    }
+    steps.push(`verifyBoldMatches: ${boldResult}`);
   } else {
     steps.push('verifyBoldMatches: skipped (no ULT USFM available)');
   }

@@ -29,6 +29,46 @@ test('postProcessNotesTsv applies curly quote normalization to final TSV after A
   assert.doesNotMatch(content, /"way/);
 });
 
+test('postProcessNotesTsv reports a mass-strip refusal without throwing, leaving the TSV intact', () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'notes-postprocess-massstrip-'));
+  const relRoot = path.join('tmp', path.basename(tempDir));
+  const absRoot = path.join('/srv/bot/workspace', relRoot);
+  fs.mkdirSync(absRoot, { recursive: true });
+
+  const notesRel = path.join(relRoot, 'notes.tsv');
+  const ultRel = path.join(relRoot, 'ult.usfm');
+
+  // A ULT verse long enough to clear the <3-word guard, but sharing no wording
+  // with the notes, so every bold span fails and the >50% refusal triggers.
+  fs.writeFileSync(path.join('/srv/bot/workspace', ultRel), [
+    '\\c 1',
+    '\\p',
+    '\\v 1 completely unrelated wording that shares nothing with the notes below',
+  ].join('\n'));
+
+  const rows = ['Reference\tID\tTags\tSupportReference\tQuote\tOccurrence\tNote'];
+  for (let i = 0; i < 12; i++) {
+    rows.push(`1:1\tid${String(i).padStart(2, '0')}\t\trc://*/ta/man/translate/figs-metaphor\tאָב\t1\tHere, **phrase number ${i}** means something.`);
+  }
+  fs.writeFileSync(path.join('/srv/bot/workspace', notesRel), rows.join('\n'));
+
+  let summary;
+  assert.doesNotThrow(() => {
+    summary = _postProcessNotesTsv({
+      notesPath: notesRel,
+      ultUsfm: path.join('/srv/bot/workspace', ultRel),
+    });
+  }, 'a mass strip must not abort the pipeline — the refusal is the protection');
+
+  assert.match(summary, /ERROR: refusing to write/);
+  // Every bold span must survive. curlyQuotes legitimately rewrites the file
+  // before the bold check, so assert the bold itself rather than byte-identity.
+  const content = fs.readFileSync(path.join('/srv/bot/workspace', notesRel), 'utf8');
+  for (let i = 0; i < 12; i++) {
+    assert.match(content, new RegExp(`\\*\\*phrase number ${i}\\*\\*`), `bold span ${i} was stripped`);
+  }
+});
+
 test('postProcessNotesTsv performs safe ZEC-style opening bold repair when prepared metadata is available', () => {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'notes-postprocess-zec-'));
   const relRoot = path.join('tmp', path.basename(tempDir));
