@@ -1742,6 +1742,10 @@ module.exports = {
   parseIntentScope,
   triggerPipelineFromApi,
   buildApiJobId,
+  // Exported so the resume endpoint can check that the checkpoint it validated
+  // is the one the trigger will actually address — the session key is DERIVED
+  // here, not taken from the caller, so the two can diverge.
+  buildApiSessionKey,
   buildApiContentFlags,
   API_PIPELINE_ROUTE_NAMES,
 };

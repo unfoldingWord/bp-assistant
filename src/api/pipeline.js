@@ -12,9 +12,14 @@ const fs = require('fs');
 const path = require('path');
 const { z } = require('zod');
 const { readSecret } = require('../secrets');
-const { getCheckpoint } = require('../pipeline-checkpoints');
+const { getCheckpoint, setCheckpoint } = require('../pipeline-checkpoints');
 const { CSKILLBP_DIR } = require('../pipeline-utils');
-const { triggerPipelineFromApi, buildApiJobId, API_PIPELINE_ROUTE_NAMES } = require('../router');
+const {
+  triggerPipelineFromApi,
+  buildApiJobId,
+  buildApiSessionKey,
+  API_PIPELINE_ROUTE_NAMES,
+} = require('../router');
 const { RESOURCE_TYPE_KEYS, isArticleResource } = require('../lib/resource-types');
 const { BOOK_NUMBERS } = require('../api-runner/verse-data');
 const {
@@ -571,13 +576,28 @@ const ResumeBodySchema = z.object({
   // than no resume at all. The caller (bible-editor stores options_json per
   // job) is the authority; `cp.options` is only a fallback for the day
   // checkpoints do record them.
-  options: OptionsSchema.optional(),
+  //
+  // `fresh` is OMITTED, not merely ignored. It is a legitimate /start option, so
+  // a caller replaying a stored options_json could carry it in here — and on the
+  // resume path `fresh` calls clearCheckpoint() AND cleanupNotesArtifacts()
+  // (src/notes-pipeline.js:1801-1806), destroying the very checkpoint and
+  // artifacts this verb exists to reuse, while we have already answered
+  // 202 {status:'resumed'}. A resume that silently wipes the work and reports
+  // success is worse than no resume. Rejecting it as an unrecognized key (the
+  // schema is .strict()) makes the caller fix the call rather than guess.
+  options: OptionsSchema.omit({ fresh: true }).optional(),
 }).strict();
 
 // Pure decision function — every 409 case lives here so it can be tested
 // without an HTTP server (same pattern as the transient-retry classifiers).
 // Returns { ok: true, resume, pausedAgeSeconds } or { ok: false, status, body }.
-function classifyResumeRequest(cp, { force = false, now = Date.now() } = {}) {
+// `derivedSessionKey` is the key triggerPipelineFromApi will actually address.
+// Pass null ONLY to skip that comparison (tests that predate the check); callers
+// in production always pass it.
+function classifyResumeRequest(
+  cp,
+  { force = false, now = Date.now(), derivedSessionKey = null } = {},
+) {
   if (!cp) {
     return { ok: false, status: 404, body: { error: 'not_found' } };
   }
@@ -598,7 +618,39 @@ function classifyResumeRequest(cp, { force = false, now = Date.now() } = {}) {
       },
     };
   }
-  const pausedMs = Date.parse(cp.updatedAt || '');
+  // The checkpoint we validate here is not necessarily the one the trigger will
+  // address: triggerPipelineFromApi DERIVES its session key from the API control
+  // thread and (for translate) from the options, ignoring the key embedded in the
+  // jobId (src/router.js:1609-1621, :1670). For a Zulip-originated run the two
+  // differ, so we would validate a real checkpoint and then launch a run that
+  // finds none — silently restarting from chapter 1 and re-pushing already-
+  // completed chapters to Door43 while reporting `resumed from ch=N`.
+  //
+  // Fails CLOSED when the checkpoint carries no sessionKey at all. setCheckpoint
+  // always writes one, so that means a hand-edited file — a documented practice
+  // (see bp-assistant/CLAUDE.md) and exactly the case where guessing is worst.
+  if (derivedSessionKey !== null && cp.sessionKey !== derivedSessionKey) {
+    return {
+      ok: false,
+      status: 409,
+      body: {
+        error: 'not_resumable',
+        state: cp.state,
+        message:
+          'checkpoint belongs to a different session than this endpoint would resume ' +
+          '(likely a Zulip-originated run) — resume it from Zulip instead',
+      },
+    };
+  }
+  // Age anchor. `updatedAt` is NOT usable on its own: setCheckpoint stamps it on
+  // every write (src/pipeline-checkpoints.js:72), and a resumed run writes
+  // state:'running' the instant it starts (src/notes-pipeline.js:1851). So each
+  // resume attempt resets it, and during a long outage a re-park → retry → re-park
+  // cycle would keep reporting a fresh pause forever — measuring time since the
+  // last attempt instead of the age of the cached artifacts, which is the quantity
+  // this gate exists to bound. `pauseAnchorAt` is written once, on the first
+  // resume, and no later write moves it. Never replace it with `updatedAt`.
+  const pausedMs = Date.parse(cp.pauseAnchorAt || cp.updatedAt || '');
   const pausedAgeSeconds = Number.isFinite(pausedMs)
     ? Math.max(0, Math.round((now - pausedMs) / 1000))
     : null;
@@ -613,6 +665,15 @@ function classifyResumeRequest(cp, { force = false, now = Date.now() } = {}) {
     };
   }
   return { ok: true, resume, pausedAgeSeconds };
+}
+
+// The checkpoint patch that pins the age anchor, or null when nothing needs
+// writing. Extracted so the write-once property is testable without an HTTP
+// server: pinning the anchor twice would move it onto the fresh `updatedAt` that
+// the previous resume wrote, which is precisely the reset the anchor prevents.
+function resumeAnchorPatch(cp) {
+  if (!cp || cp.pauseAnchorAt || !cp.updatedAt) return null;
+  return { pauseAnchorAt: cp.updatedAt };
 }
 
 // POST /api/pipeline/{jobId}/resume — restart a run that parked itself on a
@@ -666,19 +727,33 @@ async function handleResumeRequest(req, res, jobId) {
       scope: parsed.scope,
     });
 
-    const verdict = classifyResumeRequest(cp, { force: body.force === true });
+    // Reconstruct the run from the checkpoint. `options.fresh` cannot appear here
+    // — it is omitted from ResumeBodySchema; see the comment there.
+    const scope = (cp && cp.scope) || parsed.scope;
+    const username = body.username || (cp && cp.username) || 'bible-editor';
+    const pipelineType = (cp && cp.pipelineType) || parsed.pipelineType;
+    const resumeOptions = body.options || (cp && cp.options) || {};
+
+    const verdict = classifyResumeRequest(cp, {
+      force: body.force === true,
+      // What the trigger will actually address — see the comparison in
+      // classifyResumeRequest.
+      derivedSessionKey: buildApiSessionKey(pipelineType, resumeOptions),
+    });
     if (!verdict.ok) {
       reply(res, verdict.status, { ...verdict.body, jobId });
       console.log(`[pipeline-api] resume ${jobId} → ${verdict.status} ${verdict.body.error}`);
       return;
     }
 
-    // Reconstruct the run from the checkpoint. `options.fresh` is deliberately
-    // NOT set — reusing the checkpoint is the entire point of this verb.
-    const scope = cp.scope || parsed.scope;
-    const username = body.username || cp.username || 'bible-editor';
+    // Pin the age anchor before launching, if it isn't pinned already.
+    const anchorPatch = resumeAnchorPatch(cp);
+    if (anchorPatch) {
+      setCheckpoint({ sessionKey: cp.sessionKey, pipelineType, scope }, anchorPatch);
+    }
+
     const trigger = triggerPipelineFromApi({
-      pipelineType: cp.pipelineType || parsed.pipelineType,
+      pipelineType,
       book: scope.book,
       startChapter: scope.startChapter,
       endChapter: scope.endChapter,
@@ -693,7 +768,7 @@ async function handleResumeRequest(req, res, jobId) {
       // options_json per job and replays it here. `cp.options` is a fallback
       // for callers that don't (the Zulip path), and is `{}` today because
       // checkpoints don't record them.
-      options: body.options || cp.options || {},
+      options: resumeOptions,
     });
 
     const lat = Date.now() - startedAt;
@@ -859,6 +934,7 @@ module.exports = {
   handleResumeRequest,
   // exposed for testing
   classifyResumeRequest,
+  resumeAnchorPatch,
   serializeCheckpoint,
   RESUME_MAX_PAUSE_AGE_MS,
   ResumeBodySchema,
