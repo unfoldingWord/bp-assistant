@@ -596,7 +596,7 @@ const ResumeBodySchema = z.object({
 // in production always pass it.
 function classifyResumeRequest(
   cp,
-  { force = false, now = Date.now(), derivedSessionKey = null } = {},
+  { force = false, now = Date.now(), derivedSessionKey = null, optionsKnown = true } = {},
 ) {
   if (!cp) {
     return { ok: false, status: 404, body: { error: 'not_found' } };
@@ -629,6 +629,26 @@ function classifyResumeRequest(
   // Fails CLOSED when the checkpoint carries no sessionKey at all. setCheckpoint
   // always writes one, so that means a hand-edited file — a documented practice
   // (see bp-assistant/CLAUDE.md) and exactly the case where guessing is worst.
+  // A resume whose options are UNKNOWN must not proceed. Checkpoints do not
+  // record the options their run started with, so falling back to `{}` silently
+  // relaunches with DEFAULTS — re-enabling intros, dropping the editor's hints,
+  // producing output that differs from what was asked for while we answer
+  // `202 resumed`. The caller is the only party that knows, so it must say, even
+  // if the answer is "there were none" (an explicit empty object). Refusing is
+  // recoverable; a wrong resume that pushes to Door43 is not.
+  if (!optionsKnown) {
+    return {
+      ok: false,
+      status: 409,
+      body: {
+        error: 'options_unknown',
+        state: cp.state,
+        message:
+          'resume requires the options the run started with (send an explicit {} if it had none) ' +
+          '— checkpoints do not record them, and resuming on defaults would change the output',
+      },
+    };
+  }
   if (derivedSessionKey !== null && cp.sessionKey !== derivedSessionKey) {
     return {
       ok: false,
@@ -732,10 +752,15 @@ async function handleResumeRequest(req, res, jobId) {
     const scope = (cp && cp.scope) || parsed.scope;
     const username = body.username || (cp && cp.username) || 'bible-editor';
     const pipelineType = (cp && cp.pipelineType) || parsed.pipelineType;
-    const resumeOptions = body.options || (cp && cp.options) || {};
+    // Present-but-empty is a real answer ("the run had no options"); absent is
+    // not. Only the caller knows, so `undefined` here means unknown, and
+    // classifyResumeRequest refuses rather than defaulting.
+    const suppliedOptions = body.options !== undefined ? body.options : (cp && cp.options);
+    const resumeOptions = suppliedOptions || {};
 
     const verdict = classifyResumeRequest(cp, {
       force: body.force === true,
+      optionsKnown: suppliedOptions !== undefined,
       // What the trigger will actually address — see the comparison in
       // classifyResumeRequest.
       derivedSessionKey: buildApiSessionKey(pipelineType, resumeOptions),

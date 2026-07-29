@@ -417,3 +417,44 @@ test('anchor — nothing to pin without a checkpoint or an updatedAt', () => {
   assert.equal(resumeAnchorPatch(null), null);
   assert.equal(resumeAnchorPatch(pausedCheckpoint({ updatedAt: undefined })), null);
 });
+
+// ---------------------------------------------------------------------------
+// Options must be known, not assumed
+// ---------------------------------------------------------------------------
+//
+// Checkpoints do not record the options their run started with. So a resume that
+// sends none relaunches on DEFAULTS — re-enabling intros, dropping the editor's
+// hints — and answers `202 resumed` while producing output nobody asked for.
+// "The run had no options" and "we don't know its options" are different answers
+// and only the caller can tell them apart.
+
+test('resume — refuses when the caller does not say what the options were', () => {
+  const v = classifyResumeRequest(pausedCheckpoint({ sessionKey: API_KEY }), {
+    now: NOW,
+    derivedSessionKey: API_KEY,
+    optionsKnown: false,
+  });
+  assert.equal(v.ok, false);
+  assert.equal(v.status, 409);
+  assert.equal(v.body.error, 'options_unknown');
+});
+
+test('resume — an explicit empty options object IS an answer, and is accepted', () => {
+  const v = classifyResumeRequest(pausedCheckpoint({ sessionKey: API_KEY }), {
+    now: NOW,
+    derivedSessionKey: API_KEY,
+    optionsKnown: true,
+  });
+  assert.equal(v.ok, true);
+});
+
+test('resume — force does NOT override unknown options (it overrides age only)', () => {
+  const v = classifyResumeRequest(pausedCheckpoint({ sessionKey: API_KEY }), {
+    now: NOW,
+    force: true,
+    derivedSessionKey: API_KEY,
+    optionsKnown: false,
+  });
+  assert.equal(v.ok, false);
+  assert.equal(v.body.error, 'options_unknown');
+});
