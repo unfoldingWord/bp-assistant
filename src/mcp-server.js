@@ -13,6 +13,7 @@ const { readSecret } = require('./secrets');
 const { readAdminStatus } = require('./admin-status');
 const { listCheckpoints } = require('./pipeline-checkpoints');
 const { handleTnQuickRequest } = require('./api/tn-quick');
+const { handleTemplateQuickRequest } = require('./api/template-quick');
 const { handleStartRequest, handleStatusRequest, handleOutputRequest, handleResumeRequest } = require('./api/pipeline');
 const { loadCache: loadVerseDataCache } = require('./api-runner/verse-data');
 const { readFetchStatus } = require('./curate-data');
@@ -730,6 +731,11 @@ function createHttpServer() {
 
     if (req.method === 'POST' && urlPath === '/api/tn-quick') {
       await handleTnQuickRequest(req, res);
+      return;
+    }
+
+    if (req.method === 'POST' && urlPath === '/api/template-quick') {
+      await handleTemplateQuickRequest(req, res);
       return;
     }
 
