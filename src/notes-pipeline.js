@@ -2549,7 +2549,12 @@ async function notesPipeline(route, message) {
             current: { chapter: ch, skill: skill.name, status: 'failed', errorKind: 'transient_outage', error: errText },
             resume: { chapter: ch, skill: skill.name },
           });
-          await status(`**${skill.name}** paused for ${ref}: Claude transient outage persisted for 10 minutes.`);
+          const outageMins = Math.round((skillError?.details?.elapsedMs || 0) / 60000);
+          const outageTries = skillError?.details?.attempts || 0;
+          await status(
+            `**${skill.name}** paused for ${ref}: Claude transient outage persisted through ` +
+            `${outageTries || 'all'} attempt(s) over ${outageMins}min.`
+          );
           break;
         }
         if (isUsageLimitError(errText)) {

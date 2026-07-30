@@ -288,6 +288,22 @@ const PERMISSION_WALL_BASE_DELAY_MS = 60 * 1000;
 const PERMISSION_WALL_MAX_DELAY_MS = 5 * 60 * 1000;
 
 const TRANSIENT_RETRY_WINDOW_MS = 10 * 60 * 1000;
+// Floor so a single attempt that itself runs longer than the window (e.g. a hung
+// call taking 686s) can't zero out retries entirely — the window check alone would
+// already be blown before the loop gets a second try.
+const MIN_TRANSIENT_ATTEMPTS = 3;
+// The floor is bounded in wall-clock too. Per-attempt timeouts run up to
+// MAX_TIMEOUT_MS (150min, pipeline-utils.js), so an unbounded floor could hold a
+// shard slot for ~7.5h and re-run the skill from scratch each attempt. Past this
+// ceiling the failure is no longer a transient blip worth retrying blind.
+const TRANSIENT_RETRY_CEILING_MS = 45 * 60 * 1000;
+
+// Retry while inside the normal window; beyond it, still honor the attempt floor,
+// but only up to the ceiling.
+function shouldRetryTransient(attempt, elapsed) {
+  if (elapsed < TRANSIENT_RETRY_WINDOW_MS) return true;
+  return attempt < MIN_TRANSIENT_ATTEMPTS && elapsed < TRANSIENT_RETRY_CEILING_MS;
+}
 const RETRY_BASE_DELAY_MS = 5000;
 const RETRY_MAX_DELAY_MS = 60000;
 
@@ -1584,13 +1600,15 @@ async function runClaude(args) {
         );
         return result;
       }
-      if (isTransientSdkMessage(resultMsg) && elapsed < TRANSIENT_RETRY_WINDOW_MS) {
+      if (isTransientSdkMessage(resultMsg) && shouldRetryTransient(attempt, elapsed)) {
         lastTransientMessage = resultMsg;
         if (!firstDowntimeNoticeSent) {
           firstDowntimeNoticeSent = true;
           await notifyAdminDowntime(
             `[claude-runner] First transient Claude outage signal detected (attempt ${attempt}). ` +
-            `Starting retry/backoff window up to 10 minutes. Last error: ${resultMsg.slice(0, 300)}`
+            `Starting retry/backoff window: ${Math.round(TRANSIENT_RETRY_WINDOW_MS / 60000)}min, ` +
+            `or ${MIN_TRANSIENT_ATTEMPTS} attempts within ${Math.round(TRANSIENT_RETRY_CEILING_MS / 60000)}min, ` +
+            `whichever is longer. Last error: ${resultMsg.slice(0, 300)}`
           );
         }
         const delay = backoffDelayMs(attempt);
@@ -1598,7 +1616,7 @@ async function runClaude(args) {
         await sleep(delay);
         continue;
       }
-      if (isTransientSdkMessage(resultMsg) && elapsed >= TRANSIENT_RETRY_WINDOW_MS) {
+      if (isTransientSdkMessage(resultMsg) && !shouldRetryTransient(attempt, elapsed)) {
         await notifyAdminDowntime(
           `[claude-runner] Retry window exhausted after ${Math.round(elapsed / 1000)}s and ${attempt} attempts. ` +
           `Giving up for now. Last error: ${resultMsg.slice(0, 300)}`
@@ -1613,13 +1631,15 @@ async function runClaude(args) {
     } catch (err) {
       const msg = err?.message || String(err);
       const elapsed = Date.now() - startedAt;
-      if (isTransientSdkMessage(msg) && elapsed < TRANSIENT_RETRY_WINDOW_MS) {
+      if (isTransientSdkMessage(msg) && shouldRetryTransient(attempt, elapsed)) {
         lastTransientMessage = msg;
         if (!firstDowntimeNoticeSent) {
           firstDowntimeNoticeSent = true;
           await notifyAdminDowntime(
             `[claude-runner] First transient Claude outage signal detected (attempt ${attempt}). ` +
-            `Starting retry/backoff window up to 10 minutes. Last error: ${msg.slice(0, 300)}`
+            `Starting retry/backoff window: ${Math.round(TRANSIENT_RETRY_WINDOW_MS / 60000)}min, ` +
+            `or ${MIN_TRANSIENT_ATTEMPTS} attempts within ${Math.round(TRANSIENT_RETRY_CEILING_MS / 60000)}min, ` +
+            `whichever is longer. Last error: ${msg.slice(0, 300)}`
           );
         }
         const delay = backoffDelayMs(attempt);
@@ -1627,7 +1647,7 @@ async function runClaude(args) {
         await sleep(delay);
         continue;
       }
-      if (isTransientSdkMessage(msg) && elapsed >= TRANSIENT_RETRY_WINDOW_MS) {
+      if (isTransientSdkMessage(msg) && !shouldRetryTransient(attempt, elapsed)) {
         await notifyAdminDowntime(
           `[claude-runner] Retry window exhausted after ${Math.round(elapsed / 1000)}s and ${attempt} attempts. ` +
           `Giving up for now. Last error: ${msg.slice(0, 300)}`
@@ -1736,6 +1756,11 @@ module.exports = {
   PERMISSION_STALL_WINDOW_MS,
   PERMISSION_WALL_DENIAL_LIMIT,
   PERMISSION_WALL_RETRY_WINDOW_MS,
+  shouldRetryTransient,
+  isTransientSdkMessage,
+  TRANSIENT_RETRY_WINDOW_MS,
+  MIN_TRANSIENT_ATTEMPTS,
+  TRANSIENT_RETRY_CEILING_MS,
   decideToolPermission,
   decideBashPermission,
   SUBAGENT_TOOL_ALLOWLIST,
