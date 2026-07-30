@@ -16,7 +16,7 @@
     "@google/genai": "^2.13.0",
     "@modelcontextprotocol/sdk": "^1.30.0",
     "@openai/agents": "^0.13.5",
-    "ccusage": "^20.0.14",
+    "ccusage": "^20.0.19",
     "dotenv": "^17.4.2",
     "fast-glob": "^3.3.3",
     "isomorphic-git": "^1.38.5",
