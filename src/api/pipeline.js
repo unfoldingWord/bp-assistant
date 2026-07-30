@@ -12,9 +12,14 @@ const fs = require('fs');
 const path = require('path');
 const { z } = require('zod');
 const { readSecret } = require('../secrets');
-const { getCheckpoint } = require('../pipeline-checkpoints');
+const { getCheckpoint, setCheckpoint } = require('../pipeline-checkpoints');
 const { CSKILLBP_DIR } = require('../pipeline-utils');
-const { triggerPipelineFromApi, buildApiJobId, API_PIPELINE_ROUTE_NAMES } = require('../router');
+const {
+  triggerPipelineFromApi,
+  buildApiJobId,
+  buildApiSessionKey,
+  API_PIPELINE_ROUTE_NAMES,
+} = require('../router');
 const { RESOURCE_TYPE_KEYS, isArticleResource } = require('../lib/resource-types');
 const { BOOK_NUMBERS } = require('../api-runner/verse-data');
 const {
@@ -27,6 +32,39 @@ const {
 const MAX_BODY_BYTES = 32 * 1024;
 const RATE_LIMIT_RPM = 60;
 const RATE_LIMIT_WINDOW_MS = 60_000;
+
+// SAFETY TIME-BOX — do not raise or remove this without reading
+// bp-bot/STALE-SOURCE-DIAGNOSIS.md §3.1 first.
+//
+// Resume is the top documented cause of the bot shipping "content generated
+// from OLD text": per-chapter artifacts (issue TSVs, the assembled notes TSV)
+// are cached keyed on scope ONLY — book/chapter, with no source fingerprint —
+// and the one gate that compares generated text against live master ULT
+// (`checkUltEdits`) is SKIPPED on the resume path
+// (src/notes-pipeline.js ~:1865-1872, which sets `{missing:[],resolved:{}}`
+// instead of running the check). So a resume re-ships work built against the
+// source as it was when the run first stalled, and nothing notices.
+//
+// Until now that was contained only by ACCIDENT: the sole way to resume was a
+// human typing `resume` in Zulip for a run they remembered starting, i.e.
+// within minutes, while the source could not plausibly have moved. Exposing
+// resume over HTTP so bible-editor can auto-recover removes that containment —
+// a machine will happily resume a checkpoint that has been parked for hours,
+// after translators have edited the very ULT the cached artifacts were built
+// from.
+//
+// This 90-minute window IS the replacement containment. It is a safety
+// mechanism, not a tuning parameter. Widening it (or deleting it, or making
+// `force` the default) re-opens a known stale-content bug that silently
+// publishes wrong text — it does not merely make recovery slower. The real fix
+// is to key artifact reuse on source identity and to run `checkUltEdits` on
+// the resume path; that work is deliberately NOT in this change.
+const RESUME_MAX_PAUSE_AGE_MS = 90 * 60 * 1000;
+
+// States a paused pipeline can legitimately be resumed from. `failed` is
+// deliberately excluded: bible-editor's auto-recovery is for transient Claude
+// outages, and a failed run needs a human to look at why.
+const RESUMABLE_STATES = new Set(['paused_for_outage', 'paused_for_usage_limit']);
 
 const PIPELINE_TYPES = Object.keys(API_PIPELINE_ROUTE_NAMES);
 
@@ -402,6 +440,26 @@ function serializeCheckpoint(jobId, cp) {
   // status payload (detectLandedOutputs never runs), and bible-editor's import
   // gate requires output.length > 0.
   if (Array.isArray(cp.output)) out.output = cp.output;
+  // Resume point, when the checkpoint carries one. Without this a caller can
+  // see `state: 'paused_for_outage'` but has no way to know the run is
+  // actually resumable (a paused checkpoint with resume.chapter null is not).
+  out.resume = (cp.resume && cp.resume.chapter != null)
+    ? { chapter: cp.resume.chapter, skill: cp.resume.skill ?? null }
+    : null;
+  // Pause time, so callers can apply their own staleness policy (and so the
+  // 409 stale_pause from /resume is predictable rather than a surprise).
+  //
+  // Reports `pauseAnchorAt` in preference to `updatedAt`, and the difference is
+  // the whole point: setCheckpoint stamps `updatedAt` on every write, and a
+  // resumed run writes state:'running' immediately, so `updatedAt` RESETS on
+  // every resume attempt. A caller applying a staleness policy to it would find
+  // its own gate silently decorative — which is exactly the bug the internal
+  // anchor was added to fix (see classifyResumeRequest). Report the anchor so a
+  // caller's policy binds on the same clock ours does. `updatedAt` remains the
+  // fallback for a checkpoint that has not been resumed yet, where it IS the
+  // moment the run parked.
+  const pausedAt = cp.pauseAnchorAt || cp.updatedAt;
+  if (RESUMABLE_STATES.has(cp.state) && pausedAt) out.pausedAt = pausedAt;
   const updatedMs = Date.parse(cp.updatedAt || '');
   if (Number.isFinite(updatedMs) && cp.state === 'running') {
     // Mirror /health/pipelines' heuristic: a 'running' checkpoint untouched
@@ -502,6 +560,275 @@ async function handleStartRequest(req, res) {
     console.log(`[pipeline-api] start ${body.pipelineType} ${book} ${startChapter}-${endChapter} → ${trigger.status} jobId=${trigger.jobId} user=${body.username} lat=${lat}ms`);
   } catch (err) {
     console.error(`[pipeline-api] start unhandled: ${err.stack || err.message}`);
+    if (!res.headersSent) {
+      reply(res, 500, { error: 'internal_error' });
+    }
+  }
+}
+
+const ResumeBodySchema = z.object({
+  // Bypass the RESUME_MAX_PAUSE_AGE_MS time-box. Read the comment on that
+  // constant before wiring a caller to send this unconditionally.
+  force: z.boolean().optional(),
+  // Commit attribution for the resumed run. Checkpoints do not record the
+  // username of the run that created them, so a resume cannot recover it;
+  // callers should pass the same username they used on /start.
+  username: z.string().min(1).max(80).regex(/^[A-Za-z0-9._-]+$/).optional(),
+  // Per-run flags for the resumed run. Checkpoints do not persist the options
+  // the original /start carried, so without this a resumed run silently reverts
+  // to defaults — a resume that quietly drops noIntro/contentTypes is worse
+  // than no resume at all. The caller (bible-editor stores options_json per
+  // job) is the authority; `cp.options` is only a fallback for the day
+  // checkpoints do record them.
+  //
+  // `fresh` is OMITTED, not merely ignored. It is a legitimate /start option, so
+  // a caller replaying a stored options_json could carry it in here — and on the
+  // resume path `fresh` calls clearCheckpoint() AND cleanupNotesArtifacts()
+  // (src/notes-pipeline.js:1801-1806), destroying the very checkpoint and
+  // artifacts this verb exists to reuse, while we have already answered
+  // 202 {status:'resumed'}. A resume that silently wipes the work and reports
+  // success is worse than no resume. Rejecting it as an unrecognized key (the
+  // schema is .strict()) makes the caller fix the call rather than guess.
+  options: OptionsSchema.omit({ fresh: true }).optional(),
+}).strict();
+
+// Pure decision function — every 409 case lives here so it can be tested
+// without an HTTP server (same pattern as the transient-retry classifiers).
+// Returns { ok: true, resume, pausedAgeSeconds } or { ok: false, status, body }.
+// `derivedSessionKey` is the key triggerPipelineFromApi will actually address.
+// Pass null ONLY to skip that comparison (tests that predate the check); callers
+// in production always pass it.
+function classifyResumeRequest(
+  cp,
+  { force = false, now = Date.now(), derivedSessionKey = null, optionsKnown = true } = {},
+) {
+  if (!cp) {
+    return { ok: false, status: 404, body: { error: 'not_found' } };
+  }
+  if (!RESUMABLE_STATES.has(cp.state)) {
+    return { ok: false, status: 409, body: { error: 'not_resumable', state: cp.state } };
+  }
+  const resume = cp.resume && cp.resume.chapter != null
+    ? { chapter: cp.resume.chapter, skill: cp.resume.skill ?? null }
+    : null;
+  if (!resume) {
+    return {
+      ok: false,
+      status: 409,
+      body: {
+        error: 'not_resumable',
+        state: cp.state,
+        message: 'no resume point on checkpoint',
+      },
+    };
+  }
+  // The checkpoint we validate here is not necessarily the one the trigger will
+  // address: triggerPipelineFromApi DERIVES its session key from the API control
+  // thread and (for translate) from the options, ignoring the key embedded in the
+  // jobId (src/router.js:1609-1621, :1670). For a Zulip-originated run the two
+  // differ, so we would validate a real checkpoint and then launch a run that
+  // finds none — silently restarting from chapter 1 and re-pushing already-
+  // completed chapters to Door43 while reporting `resumed from ch=N`.
+  //
+  // Fails CLOSED when the checkpoint carries no sessionKey at all. setCheckpoint
+  // always writes one, so that means a hand-edited file — a documented practice
+  // (see bp-assistant/CLAUDE.md) and exactly the case where guessing is worst.
+  // A resume whose options are UNKNOWN must not proceed. Checkpoints do not
+  // record the options their run started with, so falling back to `{}` silently
+  // relaunches with DEFAULTS — re-enabling intros, dropping the editor's hints,
+  // producing output that differs from what was asked for while we answer
+  // `202 resumed`. The caller is the only party that knows, so it must say, even
+  // if the answer is "there were none" (an explicit empty object). Refusing is
+  // recoverable; a wrong resume that pushes to Door43 is not.
+  if (!optionsKnown) {
+    return {
+      ok: false,
+      status: 409,
+      body: {
+        error: 'options_unknown',
+        state: cp.state,
+        message:
+          'resume requires the options the run started with (send an explicit {} if it had none) ' +
+          '— checkpoints do not record them, and resuming on defaults would change the output',
+      },
+    };
+  }
+  if (derivedSessionKey !== null && cp.sessionKey !== derivedSessionKey) {
+    return {
+      ok: false,
+      status: 409,
+      body: {
+        error: 'not_resumable',
+        state: cp.state,
+        message:
+          'checkpoint belongs to a different session than this endpoint would resume ' +
+          '(likely a Zulip-originated run) — resume it from Zulip instead',
+      },
+    };
+  }
+  // Age anchor. `updatedAt` is NOT usable on its own: setCheckpoint stamps it on
+  // every write (src/pipeline-checkpoints.js:72), and a resumed run writes
+  // state:'running' the instant it starts (src/notes-pipeline.js:1851). So each
+  // resume attempt resets it, and during a long outage a re-park → retry → re-park
+  // cycle would keep reporting a fresh pause forever — measuring time since the
+  // last attempt instead of the age of the cached artifacts, which is the quantity
+  // this gate exists to bound. `pauseAnchorAt` is written once, on the first
+  // resume, and no later write moves it. Never replace it with `updatedAt`.
+  const pausedMs = Date.parse(cp.pauseAnchorAt || cp.updatedAt || '');
+  const pausedAgeSeconds = Number.isFinite(pausedMs)
+    ? Math.max(0, Math.round((now - pausedMs) / 1000))
+    : null;
+  // Unparseable pause time is treated as stale: fail closed rather than resume
+  // a checkpoint whose age we cannot bound (see RESUME_MAX_PAUSE_AGE_MS).
+  const tooOld = !Number.isFinite(pausedMs) || (now - pausedMs) > RESUME_MAX_PAUSE_AGE_MS;
+  if (tooOld && force !== true) {
+    return {
+      ok: false,
+      status: 409,
+      body: { error: 'stale_pause', state: cp.state, pausedAgeSeconds },
+    };
+  }
+  return { ok: true, resume, pausedAgeSeconds };
+}
+
+// The checkpoint patch that pins the age anchor, or null when nothing needs
+// writing. Extracted so the write-once property is testable without an HTTP
+// server: pinning the anchor twice would move it onto the fresh `updatedAt` that
+// the previous resume wrote, which is precisely the reset the anchor prevents.
+function resumeAnchorPatch(cp) {
+  if (!cp || cp.pauseAnchorAt || !cp.updatedAt) return null;
+  return { pauseAnchorAt: cp.updatedAt };
+}
+
+// POST /api/pipeline/{jobId}/resume — restart a run that parked itself on a
+// transient Claude outage, reusing its on-disk checkpoint. Scope and
+// pipelineType come from the CHECKPOINT, never from caller input, so a caller
+// cannot use this verb to launch arbitrary work.
+async function handleResumeRequest(req, res, jobId) {
+  const startedAt = Date.now();
+  try {
+    applyCors(req, res);
+
+    if (!checkAuth(req, res)) return;
+
+    let raw;
+    try {
+      raw = await readBody(req, MAX_BODY_BYTES);
+    } catch (err) {
+      if (err.code === 'BODY_TOO_LARGE') {
+        reply(res, 413, { error: 'body_too_large', maxBytes: MAX_BODY_BYTES });
+        return;
+      }
+      throw err;
+    }
+
+    // An absent/empty body is valid and means force=false.
+    let parsedBody = {};
+    if (raw && raw.trim()) {
+      try {
+        parsedBody = JSON.parse(raw);
+      } catch {
+        reply(res, 400, { error: 'invalid_json' });
+        return;
+      }
+    }
+    const bodyResult = ResumeBodySchema.safeParse(parsedBody);
+    if (!bodyResult.success) {
+      reply(res, 400, { error: 'validation_failed', issues: bodyResult.error.issues });
+      return;
+    }
+    const body = bodyResult.data;
+
+    const parsed = parseJobId(jobId);
+    if (!parsed) {
+      reply(res, 400, { error: 'invalid_job_id', jobId });
+      return;
+    }
+
+    const cp = getCheckpoint({
+      sessionKey: parsed.sessionKey,
+      pipelineType: parsed.pipelineType,
+      scope: parsed.scope,
+    });
+
+    // Reconstruct the run from the checkpoint. `options.fresh` cannot appear here
+    // — it is omitted from ResumeBodySchema; see the comment there.
+    const scope = (cp && cp.scope) || parsed.scope;
+    const username = body.username || (cp && cp.username) || 'bible-editor';
+    const pipelineType = (cp && cp.pipelineType) || parsed.pipelineType;
+    // Present-but-empty is a real answer ("the run had no options"); absent is
+    // not. Only the caller knows, so `undefined` here means unknown, and
+    // classifyResumeRequest refuses rather than defaulting.
+    const suppliedOptions = body.options !== undefined ? body.options : (cp && cp.options);
+    const resumeOptions = suppliedOptions || {};
+
+    const verdict = classifyResumeRequest(cp, {
+      force: body.force === true,
+      optionsKnown: suppliedOptions !== undefined,
+      // What the trigger will actually address — see the comparison in
+      // classifyResumeRequest.
+      derivedSessionKey: buildApiSessionKey(pipelineType, resumeOptions),
+    });
+    if (!verdict.ok) {
+      reply(res, verdict.status, { ...verdict.body, jobId });
+      console.log(`[pipeline-api] resume ${jobId} → ${verdict.status} ${verdict.body.error}`);
+      return;
+    }
+
+    // Pin the age anchor before launching, if it isn't pinned already.
+    const anchorPatch = resumeAnchorPatch(cp);
+    if (anchorPatch) {
+      setCheckpoint({ sessionKey: cp.sessionKey, pipelineType, scope }, anchorPatch);
+    }
+
+    const trigger = triggerPipelineFromApi({
+      pipelineType,
+      book: scope.book,
+      startChapter: scope.startChapter,
+      endChapter: scope.endChapter,
+      verseStart: scope.verseStart ?? null,
+      verseEnd: scope.verseEnd ?? null,
+      username,
+      // Not used for identity — buildApiSessionKey derives the sessionKey from
+      // the API control thread (src/router.js:1609-1621). This value only
+      // reaches a log line, so it carries provenance instead.
+      apiSessionKey: `resume:${jobId}`,
+      // Caller-supplied options win: bible-editor keeps the original
+      // options_json per job and replays it here. `cp.options` is a fallback
+      // for callers that don't (the Zulip path), and is `{}` today because
+      // checkpoints don't record them.
+      options: resumeOptions,
+    });
+
+    const lat = Date.now() - startedAt;
+    if (trigger.status === 'already_running') {
+      reply(res, 200, { jobId: trigger.jobId, scope: trigger.scope, status: 'already_running' });
+      console.log(`[pipeline-api] resume ${jobId} → already_running lat=${lat}ms`);
+      return;
+    }
+    if (trigger.status === 'conflict') {
+      reply(res, 409, {
+        error: 'conflict',
+        jobId: trigger.jobId,
+        message: trigger.message || 'another run owns this scope',
+      });
+      console.log(`[pipeline-api] resume ${jobId} → 409 conflict lat=${lat}ms`);
+      return;
+    }
+    if (trigger.status === 'invalid') {
+      reply(res, 400, { error: 'validation_failed', message: trigger.message });
+      return;
+    }
+
+    reply(res, 202, {
+      jobId: trigger.jobId,
+      scope: trigger.scope,
+      status: 'resumed',
+      resume: verdict.resume,
+    });
+    console.log(`[pipeline-api] resume ${jobId} → resumed from ch=${verdict.resume.chapter} skill=${verdict.resume.skill} pausedAge=${verdict.pausedAgeSeconds}s force=${body.force === true} user=${username} lat=${lat}ms`);
+  } catch (err) {
+    console.error(`[pipeline-api] resume unhandled: ${err.stack || err.message}`);
     if (!res.headersSent) {
       reply(res, 500, { error: 'internal_error' });
     }
@@ -633,7 +960,13 @@ module.exports = {
   handleStartRequest,
   handleStatusRequest,
   handleOutputRequest,
+  handleResumeRequest,
   // exposed for testing
+  classifyResumeRequest,
+  resumeAnchorPatch,
+  serializeCheckpoint,
+  RESUME_MAX_PAUSE_AGE_MS,
+  ResumeBodySchema,
   parseJobId,
   StartBodySchema,
   HintSchema,
