@@ -9,8 +9,13 @@ const {
   checkTemplateInvariants,
   extractStructuralTokens,
   extractNumbering,
+  extractBoldRuns,
+  lineBreakSignature,
+  resolveRequestBudgetMs,
   MAX_BODY_BYTES,
-  MODEL_TIMEOUT_MS,
+  REQUEST_BUDGET_MS,
+  EDITOR_CLIENT_CEILING_MS,
+  DEFAULT_REQUEST_BUDGET_MS,
 } = require('../src/api/template-quick');
 
 const validBody = {
@@ -191,6 +196,52 @@ describe('checkTemplateInvariants', () => {
     assert.equal(r.ok, false);
     assert.match(r.violations.join(' '), /directional_controls/);
   });
+
+  test('fails when a line break is collapsed', () => {
+    const source = 'SPEAKER says **important words** to [text].\nThen continue.';
+    const collapsed = 'SPEAKER says **important words** to [text]. Then continue.';
+    const r = checkTemplateInvariants(source, collapsed);
+    assert.equal(r.ok, false);
+    assert.match(r.violations.join(' '), /line_breaks/);
+  });
+
+  test('passes when line-break structure is preserved (including an internal blank line)', () => {
+    const source = 'SPEAKER says **important words** to [text].\n\nThen continue.';
+    const target = 'SPEAKER يقول **كلمات مهمة** إلى [text].\n\nثم تابع.';
+    assert.deepEqual(lineBreakSignature(source), ['text', 'blank', 'text']);
+    const r = checkTemplateInvariants(source, target);
+    assert.equal(r.ok, true, r.violations.join('; '));
+  });
+
+  test('fails when ordinary bold markers are removed', () => {
+    const source = 'SPEAKER says **important words** to [text].';
+    const target = 'SPEAKER says important words to [text].';
+    const r = checkTemplateInvariants(source, target);
+    assert.equal(r.ok, false);
+    assert.match(r.violations.join(' '), /bold_runs/);
+  });
+
+  test('passes when ordinary bold content is translated but markers remain', () => {
+    const source = 'SPEAKER says **important words** as **text** then [text].';
+    const target = 'SPEAKER يقول **كلمات مهمة** كما **text** ثم [text].';
+    assert.deepEqual(
+      extractBoldRuns(source).map((b) => (b.isSlot ? 'slot' : 'bold')),
+      ['bold', 'slot'],
+    );
+    const r = checkTemplateInvariants(source, target);
+    assert.equal(r.ok, true, r.violations.join('; '));
+  });
+
+  test('fails when **text** slot inner content is translated inside bold', () => {
+    const source = 'Keep **text** here.';
+    const target = 'Keep **نص** here.';
+    const r = checkTemplateInvariants(source, target);
+    assert.equal(r.ok, false);
+    assert.ok(
+      /placeholders|bold_runs/.test(r.violations.join(' ')),
+      r.violations.join('; '),
+    );
+  });
 });
 
 describe('limits', () => {
@@ -198,8 +249,18 @@ describe('limits', () => {
     assert.equal(MAX_BODY_BYTES, 64 * 1024);
   });
 
-  test('model timeout is bounded under the editor 120 s ceiling', () => {
-    assert.ok(MODEL_TIMEOUT_MS > 0);
-    assert.ok(MODEL_TIMEOUT_MS <= 120_000);
+  test('request budget defaults under the editor 120 s ceiling', () => {
+    assert.equal(DEFAULT_REQUEST_BUDGET_MS, 90_000);
+    assert.equal(EDITOR_CLIENT_CEILING_MS, 120_000);
+    assert.ok(REQUEST_BUDGET_MS > 0);
+    assert.ok(REQUEST_BUDGET_MS <= EDITOR_CLIENT_CEILING_MS);
+  });
+
+  test('resolveRequestBudgetMs caps env overrides at the 120 s editor ceiling', () => {
+    assert.equal(resolveRequestBudgetMs('180000'), EDITOR_CLIENT_CEILING_MS);
+    assert.equal(resolveRequestBudgetMs('60000'), 60_000);
+    assert.equal(resolveRequestBudgetMs('0'), DEFAULT_REQUEST_BUDGET_MS);
+    assert.equal(resolveRequestBudgetMs('nope'), DEFAULT_REQUEST_BUDGET_MS);
+    assert.equal(resolveRequestBudgetMs(''), DEFAULT_REQUEST_BUDGET_MS);
   });
 });

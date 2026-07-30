@@ -24,10 +24,21 @@ async function getAgentSdkQuery() {
 const MAX_BODY_BYTES = 64 * 1024;
 const RATE_LIMIT_RPM = 60;
 const RATE_LIMIT_WINDOW_MS = 60_000;
-// Stay under the editor's 120 s client ceiling so a hung model call cannot
-// outlive the caller and keep consuming capacity during a bulk run.
-const MODEL_TIMEOUT_MS = Number(process.env.TEMPLATE_QUICK_TIMEOUT_MS) || 90_000;
+// Editor client ceiling is 120 s. All attempts share one request-level budget
+// capped at that ceiling so a repair retry cannot push past the caller.
+const EDITOR_CLIENT_CEILING_MS = 120_000;
+const DEFAULT_REQUEST_BUDGET_MS = 90_000;
 const MODEL_MAX_ATTEMPTS = 2;
+
+function resolveRequestBudgetMs(envValue = process.env.TEMPLATE_QUICK_TIMEOUT_MS) {
+  const raw = (envValue == null || envValue === '')
+    ? DEFAULT_REQUEST_BUDGET_MS
+    : Number(envValue);
+  if (!Number.isFinite(raw) || raw <= 0) return DEFAULT_REQUEST_BUDGET_MS;
+  return Math.min(Math.floor(raw), EDITOR_CLIENT_CEILING_MS);
+}
+
+const REQUEST_BUDGET_MS = resolveRequestBudgetMs();
 
 const LANG_NAMES = {
   ar: 'Arabic', 'es-419': 'Latin American Spanish', es: 'Spanish', ru: 'Russian',
@@ -151,6 +162,8 @@ const BIDI_CONTROL_RE = /[\u200E\u200F\u202A-\u202E\u2066-\u2069]/g;
 const STRUCTURAL_TOKEN_RE = /\*\*text\*\*|\{book\}|\[ALT\]|\[text\]|\bSPEAKER\b|\bNOTE\b|\[[^\]]*\]\((?!https?:\/\/|mailto:)([^)\s]+)\)/g;
 
 const NUMBERING_RE = /\((\d+)\)/g;
+// Non-nested bold runs. Inner text may be translated except for the **text** slot.
+const BOLD_RUN_RE = /\*\*([^*]+)\*\*/g;
 
 function extractStructuralTokens(md) {
   const tokens = [];
@@ -169,6 +182,44 @@ function extractNumbering(md) {
 
 function extractBidiControls(md) {
   return [...md.matchAll(BIDI_CONTROL_RE)].map((m) => m[0]);
+}
+
+function normalizeNewlines(md) {
+  return String(md).replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+}
+
+/**
+ * Line-break structure signature: line count + blank vs non-blank pattern.
+ * Leading/trailing newlines are ignored so sanitizeModelOutput's trim does not
+ * create false failures; internal blank lines remain load-bearing.
+ */
+function lineBreakSignature(md) {
+  const normalized = normalizeNewlines(md).replace(/^\n+/, '').replace(/\n+$/, '');
+  if (normalized === '') return [];
+  return normalized.split('\n').map((line) => (line.length === 0 ? 'blank' : 'text'));
+}
+
+/**
+ * Ordered bold runs. The **text** slot must stay verbatim; other runs may have
+ * translated inner text but must remain bold and in the same order/count.
+ */
+function extractBoldRuns(md) {
+  return [...md.matchAll(BOLD_RUN_RE)].map((m) => ({
+    inner: m[1],
+    isSlot: m[1] === 'text',
+  }));
+}
+
+function boldRunsMatch(sourceRuns, targetRuns) {
+  if (sourceRuns.length !== targetRuns.length) return false;
+  for (let i = 0; i < sourceRuns.length; i++) {
+    const src = sourceRuns[i];
+    const tgt = targetRuns[i];
+    if (src.isSlot || tgt.isSlot) {
+      if (src.inner !== 'text' || tgt.inner !== 'text') return false;
+    }
+  }
+  return true;
 }
 
 function sameSequence(a, b) {
@@ -200,6 +251,27 @@ function checkTemplateInvariants(sourceMd, targetMd) {
     violations.push(
       `numbering: expected (${srcNums.join(')(')}) `
         + `but got (${tgtNums.join(')(')})`,
+    );
+  }
+
+  const srcLines = lineBreakSignature(sourceMd);
+  const tgtLines = lineBreakSignature(targetMd);
+  if (!sameSequence(srcLines, tgtLines)) {
+    violations.push(
+      `line_breaks: expected ${srcLines.length} line(s) `
+        + `[${srcLines.join(',')}] but got ${tgtLines.length} `
+        + `[${tgtLines.join(',')}]`,
+    );
+  }
+
+  const srcBold = extractBoldRuns(sourceMd);
+  const tgtBold = extractBoldRuns(targetMd);
+  if (!boldRunsMatch(srcBold, tgtBold)) {
+    violations.push(
+      `bold_runs: expected ${srcBold.length} run(s) `
+        + `(${srcBold.map((b) => (b.isSlot ? '**text**' : '**…**')).join(', ')}) `
+        + `but got ${tgtBold.length} `
+        + `(${tgtBold.map((b) => (b.isSlot ? '**text**' : '**…**')).join(', ')})`,
     );
   }
 
@@ -254,8 +326,9 @@ function buildUserMessage(body, repair = null) {
       repair.previous,
       '',
       'Emit a corrected draft that restores every missing/altered placeholder, '
-        + 'relative link path, and (N) enumeration exactly as in the English source. '
-        + 'Do not insert directional control characters. Output ONLY the corrected template text.',
+        + 'relative link path, (N) enumeration, bold run, and line break exactly '
+        + 'as in the English source. Do not insert directional control characters. '
+        + 'Output ONLY the corrected template text.',
     );
   }
   return lines.join('\n');
@@ -270,7 +343,12 @@ function sanitizeModelOutput(text) {
   return out;
 }
 
-async function callModel({ system, userMessage, modelTier, timeoutMs = MODEL_TIMEOUT_MS }) {
+async function callModel({ system, userMessage, modelTier, timeoutMs }) {
+  if (!(timeoutMs > 0)) {
+    const err = new Error('model call timed out (no budget remaining)');
+    err.code = 'MODEL_TIMEOUT';
+    throw err;
+  }
   const query = await getAgentSdkQuery();
   const abortController = new AbortController();
   const timer = setTimeout(() => abortController.abort(), timeoutMs);
@@ -324,16 +402,27 @@ async function callModel({ system, userMessage, modelTier, timeoutMs = MODEL_TIM
   }
 }
 
-async function draftWithInvariants({ body, timeoutMs = MODEL_TIMEOUT_MS }) {
+async function draftWithInvariants({
+  body,
+  budgetMs = REQUEST_BUDGET_MS,
+  now = Date.now,
+}) {
+  const deadlineMs = now() + budgetMs;
   let repair = null;
   let lastViolations = [];
   for (let attempt = 1; attempt <= MODEL_MAX_ATTEMPTS; attempt++) {
+    const remainingMs = deadlineMs - now();
+    if (remainingMs <= 0) {
+      const err = new Error(`model call timed out after ${budgetMs}ms`);
+      err.code = 'MODEL_TIMEOUT';
+      throw err;
+    }
     const userMessage = buildUserMessage(body, repair);
     const targetMd = await callModel({
       system: TEMPLATE_QUICK_STYLE,
       userMessage,
       modelTier: body.model,
-      timeoutMs,
+      timeoutMs: remainingMs,
     });
     const check = checkTemplateInvariants(body.sourceMd, targetMd);
     if (check.ok) {
@@ -464,9 +553,14 @@ module.exports = {
   checkTemplateInvariants,
   extractStructuralTokens,
   extractNumbering,
+  extractBoldRuns,
+  lineBreakSignature,
   draftWithInvariants,
+  resolveRequestBudgetMs,
   TEMPLATE_QUICK_STYLE,
   MAX_BODY_BYTES,
-  MODEL_TIMEOUT_MS,
+  EDITOR_CLIENT_CEILING_MS,
+  DEFAULT_REQUEST_BUDGET_MS,
+  REQUEST_BUDGET_MS,
   MODEL_MAX_ATTEMPTS,
 };
