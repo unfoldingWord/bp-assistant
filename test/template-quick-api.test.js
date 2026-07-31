@@ -5,6 +5,12 @@ const assert = require('node:assert/strict');
 const {
   BodySchema,
   buildUserMessage,
+  buildSystemPrompt,
+  renderContextSections,
+  loadPackCached,
+  resetContextPackCache,
+  TEMPLATE_QUICK_STYLE,
+  PACK_CACHE_TTL_MS,
   sanitizeModelOutput,
   checkTemplateInvariants,
   extractStructuralTokens,
@@ -241,6 +247,143 @@ describe('checkTemplateInvariants', () => {
       /placeholders|bold_runs/.test(r.violations.join(' ')),
       r.violations.join('; '),
     );
+  });
+});
+
+describe('contextRef / translation preferences', () => {
+  const fullPack = {
+    ref: 'BSOJ/context-ar@main',
+    sha: 'a'.repeat(40),
+    register: 'formal',
+    brief: '**Register:** formal\nUse Modern Standard Arabic.',
+    instructions: 'Never use colloquial contractions.',
+    standards: null,
+    terms: [
+      { source: 'covenant', target: 'عهد', status: 'preferred', comment: '', replacement: '' },
+      { source: 'grace', target: 'نعمة‌سيء', status: 'forbidden', replacement: 'نعمة', comment: '' },
+    ],
+    templates: new Map(),
+    examples: [],
+    hasContent: true,
+  };
+
+  test('accepts an org/repo@ref contextRef', () => {
+    const r = BodySchema.safeParse({ ...validBody, contextRef: 'BSOJ/context-ar@main' });
+    assert.equal(r.success, true);
+    assert.equal(r.data.contextRef, 'BSOJ/context-ar@main');
+  });
+
+  test('contextRef stays optional (historical payloads still validate)', () => {
+    const r = BodySchema.safeParse(validBody);
+    assert.equal(r.success, true);
+    assert.equal(r.data.contextRef, undefined);
+  });
+
+  test('rejects a malformed contextRef and local directory paths', () => {
+    for (const bad of ['not-a-ref', 'org/repo', '/srv/fixtures/pack', 'org/repo@', 'a b/c@main']) {
+      assert.equal(
+        BodySchema.safeParse({ ...validBody, contextRef: bad }).success,
+        false,
+        `expected reject: ${bad}`,
+      );
+    }
+  });
+
+  test('unknown fields fail loudly instead of being silently dropped', () => {
+    const r = BodySchema.safeParse({ ...validBody, contextref: 'BSOJ/context-ar@main' });
+    assert.equal(r.success, false);
+    assert.equal(r.error.issues[0].code, 'unrecognized_keys');
+  });
+
+  test('injects register, brief, instructions and terminology into the system prompt', () => {
+    const body = BodySchema.parse({ ...validBody, contextRef: 'BSOJ/context-ar@main' });
+    const system = buildSystemPrompt(body, fullPack);
+    // The invariant style guide is still first and intact.
+    assert.ok(system.startsWith(TEMPLATE_QUICK_STYLE));
+    assert.match(system, /Use \*\*formal\*\* register/);
+    assert.match(system, /Modern Standard Arabic/);
+    assert.match(system, /Never use colloquial contractions/);
+    assert.match(system, /covenant/);
+    assert.match(system, /عهد/);
+    assert.match(system, /FORBIDDEN/);
+    // Placeholder rules outrank org wording preferences.
+    assert.match(system, /do NOT relax the hard rules/i);
+  });
+
+  test('system prompt is unchanged when no pack is supplied', () => {
+    const body = BodySchema.parse(validBody);
+    assert.equal(buildSystemPrompt(body, null), TEMPLATE_QUICK_STYLE);
+  });
+
+  test('a pack with no prompt-affecting content injects nothing', () => {
+    const body = BodySchema.parse({ ...validBody, contextRef: 'BSOJ/context-ar@main' });
+    const emptyPack = {
+      sha: null, register: null, brief: null, instructions: null, standards: null,
+      terms: [], templates: new Map(), examples: [], hasContent: false,
+    };
+    assert.equal(renderContextSections(emptyPack, body), null);
+    assert.equal(buildSystemPrompt(body, emptyPack), TEMPLATE_QUICK_STYLE);
+  });
+
+  test('a pack holding only templates/examples still injects nothing', () => {
+    const body = BodySchema.parse({ ...validBody, contextRef: 'BSOJ/context-ar@main' });
+    const pack = {
+      sha: 'b'.repeat(40), register: null, brief: null, instructions: null, standards: null,
+      terms: [], templates: new Map([['figs-metaphor', { template: 'x' }]]),
+      examples: [{ source: 'a', target: 'b' }], hasContent: true,
+    };
+    assert.equal(renderContextSections(pack, body), null);
+  });
+});
+
+describe('context pack cache', () => {
+  const packFor = (sha) => ({
+    sha, register: 'formal', brief: 'b', instructions: null, standards: null,
+    terms: [], templates: new Map(), examples: [], hasContent: true,
+  });
+
+  test('memoizes per contextRef and loads with allowEmpty', async () => {
+    resetContextPackCache();
+    let calls = 0;
+    let seenOpts = null;
+    const loadImpl = async (ref, opts) => { calls++; seenOpts = opts; return packFor('c'.repeat(40)); };
+    const ref = 'BSOJ/context-ar@main';
+    await loadPackCached(ref, { loadImpl, now: () => 1000 });
+    await loadPackCached(ref, { loadImpl, now: () => 1000 });
+    assert.equal(calls, 1);
+    assert.equal(seenOpts.allowEmpty, true);
+  });
+
+  test('a branch ref is re-read after the TTL', async () => {
+    resetContextPackCache();
+    let calls = 0;
+    const loadImpl = async () => { calls++; return packFor('d'.repeat(40)); };
+    const ref = 'BSOJ/context-ar@main';
+    await loadPackCached(ref, { loadImpl, now: () => 0 });
+    await loadPackCached(ref, { loadImpl, now: () => PACK_CACHE_TTL_MS - 1 });
+    assert.equal(calls, 1, 'still fresh inside the TTL');
+    await loadPackCached(ref, { loadImpl, now: () => PACK_CACHE_TTL_MS + 1 });
+    assert.equal(calls, 2, 'mutable branch re-read after the TTL');
+  });
+
+  test('a pinned commit ref is cached for the process lifetime', async () => {
+    resetContextPackCache();
+    let calls = 0;
+    const sha = 'e'.repeat(40);
+    const loadImpl = async () => { calls++; return packFor(sha); };
+    const ref = `BSOJ/context-ar@${sha}`;
+    await loadPackCached(ref, { loadImpl, now: () => 0 });
+    await loadPackCached(ref, { loadImpl, now: () => PACK_CACHE_TTL_MS * 100 });
+    assert.equal(calls, 1);
+  });
+
+  test('distinct refs do not alias', async () => {
+    resetContextPackCache();
+    const seen = [];
+    const loadImpl = async (ref) => { seen.push(ref); return packFor('f'.repeat(40)); };
+    await loadPackCached('BSOJ/context-ar@main', { loadImpl, now: () => 0 });
+    await loadPackCached('BSOJ/context-es@main', { loadImpl, now: () => 0 });
+    assert.deepEqual(seen, ['BSOJ/context-ar@main', 'BSOJ/context-es@main']);
   });
 });
 

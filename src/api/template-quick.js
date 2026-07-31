@@ -7,6 +7,8 @@ const crypto = require('crypto');
 const { z } = require('zod');
 const { readSecret } = require('../secrets');
 const { ensureFreshToken } = require('../auth-refresh');
+const { loadContextPack, parseContextRef } = require('../lib/context-pack');
+const { renderTerminologySections } = require('../lib/translate-core');
 
 let _agentSdkQuery = null;
 async function getAgentSdkQuery() {
@@ -48,6 +50,15 @@ const LANG_NAMES = {
   en: 'English', ka: 'Georgian',
 };
 
+// Same "org/repo@ref" shape pipeline.js OptionsSchema accepts. Local directory
+// refs (allowed by loadContextPack for dev fixtures) are deliberately NOT
+// accepted from a public HTTP body.
+const CONTEXT_REF_RE = /^[^/@\s]+\/[^/@\s]+@\S+$/;
+
+// .strict() is load-bearing: with zod's default strip, a client that starts
+// sending contextRef (or any preference field) would have it silently dropped
+// with a 200, making "preferences were applied" unverifiable from the caller
+// side. Unknown keys must fail loudly instead.
 const BodySchema = z.object({
   templateId: z.string().min(1).max(120),
   supportRef: z.string().min(1).max(200),
@@ -57,9 +68,13 @@ const BodySchema = z.object({
   targetLang: z.string().min(2).max(12).regex(/^[a-z]{2,3}(-[A-Za-z0-9]{2,8})?$/),
   targetOrg: z.string().min(1).max(60).regex(/^[A-Za-z0-9._-]+$/),
   direction: z.enum(['ltr', 'rtl']),
+  // Org translation preferences (brief / standing instructions / terminology /
+  // register) to draft under. Optional: absent means the historical behavior of
+  // drafting from TEMPLATE_QUICK_STYLE alone.
+  contextRef: z.string().min(3).max(200).regex(CONTEXT_REF_RE).optional(),
   // Accepted for forward compatibility; not required by the editor today.
   model: z.enum(['sonnet', 'opus']).default('sonnet'),
-});
+}).strict();
 
 const rateLimits = new Map();
 
@@ -152,6 +167,91 @@ translated markdown on its own.
 4. Translate the surrounding English prose naturally into the target language
    at a register suitable for Bible translators (clear, not scholarly jargon).
 `;
+
+// --- Context pack (org translation preferences) -----------------------------
+
+// A branch ref is mutable, so it is re-read after the TTL; a 40-hex commit ref
+// is immutable and cached for the process lifetime. Keyed by contextRef, and
+// each entry carries the resolved sha so the caller can verify which pack a
+// draft was produced under.
+const PACK_CACHE_TTL_MS = 5 * 60_000;
+const PACK_CACHE_MAX_ENTRIES = 32;
+const packCache = new Map();
+
+function isPinnedRef(contextRef) {
+  const parsed = parseContextRef(contextRef);
+  return !!parsed && /^[0-9a-f]{40}$/i.test(parsed.ref);
+}
+
+function resetContextPackCache() {
+  packCache.clear();
+}
+
+/**
+ * Load a context pack, memoized per contextRef. allowEmpty is true: an org
+ * whose pack repo is absent or unpopulated still gets a draft (from
+ * TEMPLATE_QUICK_STYLE alone) rather than a hard failure — the emptiness is
+ * surfaced to the caller as a warning instead.
+ */
+async function loadPackCached(contextRef, { loadImpl = loadContextPack, now = Date.now } = {}) {
+  const hit = packCache.get(contextRef);
+  if (hit && hit.expiresAt > now()) return hit.pack;
+  const pack = await loadImpl(contextRef, { allowEmpty: true });
+  packCache.delete(contextRef);
+  packCache.set(contextRef, {
+    pack,
+    expiresAt: isPinnedRef(contextRef) ? Infinity : now() + PACK_CACHE_TTL_MS,
+  });
+  // Map preserves insertion order — drop the oldest entries first.
+  while (packCache.size > PACK_CACHE_MAX_ENTRIES) {
+    packCache.delete(packCache.keys().next().value);
+  }
+  return pack;
+}
+
+/**
+ * Render the org's preferences as prompt sections. Returns null when there is
+ * nothing prompt-affecting to inject, so the caller can report honestly whether
+ * preferences actually reached the model.
+ *
+ * Scope note: templates/ and examples/ from the pack are intentionally not
+ * injected here. This endpoint drafts the template text itself, so the pack's
+ * own template row for the same supportRef would be a competing answer rather
+ * than context.
+ */
+function renderContextSections(pack, body) {
+  if (!pack) return null;
+  const sections = [];
+  if (pack.register) {
+    sections.push(`## Formality register\n\nUse **${pack.register}** register throughout this draft.`);
+  }
+  if (pack.brief) sections.push(`## Translation brief\n\n${String(pack.brief).trim()}`);
+  if (pack.instructions) sections.push(`## Standing instructions\n\n${String(pack.instructions).trim()}`);
+  if (pack.standards) sections.push(`## Quality standards\n\n${String(pack.standards).trim()}`);
+  sections.push(...renderTerminologySections(pack.terms || []));
+  if (!sections.length) return null;
+
+  const name = langName(body.targetLang);
+  return [
+    `# ${name} translation preferences (curated by ${body.targetOrg})`,
+    'These are the organization\'s standing preferences for this language. They'
+      + ' govern WORDING: register, terminology, and phrasing. They do NOT relax the'
+      + ' hard rules above — placeholder tokens, markdown structure, and the'
+      + ' output-only-the-template format still win in any conflict. Where a'
+      + ' preference cannot be honored without breaking a placeholder, keep the'
+      + ' placeholder.',
+    ...sections,
+  ].join('\n\n');
+}
+
+/**
+ * System prompt = the invariant style guide, plus the org's preferences when a
+ * contextRef resolved to something with content.
+ */
+function buildSystemPrompt(body, pack = null) {
+  const sections = renderContextSections(pack, body);
+  return sections ? `${TEMPLATE_QUICK_STYLE}\n${sections}\n` : TEMPLATE_QUICK_STYLE;
+}
 
 // Bidirectional / directional formatting controls the editor already handles
 // via dir attributes — the model must not insert these.
@@ -404,9 +504,11 @@ async function callModel({ system, userMessage, modelTier, timeoutMs }) {
 
 async function draftWithInvariants({
   body,
+  pack = null,
   budgetMs = REQUEST_BUDGET_MS,
   now = Date.now,
 }) {
+  const system = buildSystemPrompt(body, pack);
   const deadlineMs = now() + budgetMs;
   let repair = null;
   let lastViolations = [];
@@ -419,7 +521,7 @@ async function draftWithInvariants({
     }
     const userMessage = buildUserMessage(body, repair);
     const targetMd = await callModel({
-      system: TEMPLATE_QUICK_STYLE,
+      system,
       userMessage,
       modelTier: body.model,
       timeoutMs: remainingMs,
@@ -506,9 +608,39 @@ async function handleTemplateQuickRequest(req, res) {
       return;
     }
 
+    // Org preferences. A pack that cannot be fetched must not silently produce
+    // an unstyled draft — degrade, but say so in the response.
+    let pack = null;
+    const packWarnings = [];
+    if (body.contextRef) {
+      try {
+        pack = await loadPackCached(body.contextRef);
+        console.log(
+          `[template-quick] context pack: ${body.contextRef} @ ${pack.sha || 'unresolved'}`,
+        );
+        if (!pack.hasContent) {
+          packWarnings.push(
+            `context_pack_empty: no prompt-affecting files at ${body.contextRef}`,
+          );
+        }
+      } catch (err) {
+        console.error(
+          `[template-quick] context pack load failed for ${body.contextRef}: ${err.message}`,
+        );
+        packWarnings.push(`context_pack_unavailable: ${err.message}`);
+        pack = null;
+      }
+    }
+    const contextApplied = renderContextSections(pack, body) != null;
+    if (body.contextRef && !contextApplied && !packWarnings.length) {
+      packWarnings.push(
+        `context_pack_not_applied: ${body.contextRef} has no register/brief/instructions/terminology content`,
+      );
+    }
+
     let draft;
     try {
-      draft = await draftWithInvariants({ body });
+      draft = await draftWithInvariants({ body, pack });
     } catch (err) {
       console.error(`[template-quick] model error: ${err.message}`);
       if (err.code === 'MODEL_TIMEOUT') {
@@ -529,12 +661,21 @@ async function handleTemplateQuickRequest(req, res) {
 
     // Response is snake_case by contract — caller parses `target_md`, not targetMd.
     const response = { target_md: draft.targetMd };
-    if (draft.warnings.length) response.warnings = draft.warnings;
+    if (body.contextRef) {
+      // Echoed so the caller can verify which preferences a draft was produced
+      // under, rather than having to trust that the field was honored.
+      response.context_ref = body.contextRef;
+      response.pack_sha = (pack && pack.sha) || null;
+      response.context_applied = contextApplied;
+    }
+    const warnings = [...packWarnings, ...draft.warnings];
+    if (warnings.length) response.warnings = warnings;
     reply(res, 200, response);
     const lat = Date.now() - startedAt;
     logLine += `id=${body.templateId} lang=${body.targetLang} dir=${body.direction} `
       + `lat=${lat}ms model=${body.model} status=200 `
-      + `revise=${body.targetMd ? '1' : '0'} attempts=${draft.attempts}`;
+      + `revise=${body.targetMd ? '1' : '0'} attempts=${draft.attempts} `
+      + `ctx=${body.contextRef || 'none'} ctx_applied=${contextApplied ? '1' : '0'}`;
     console.log(logLine);
   } catch (err) {
     console.error(`[template-quick] unhandled: ${err.stack || err.message}`);
@@ -549,6 +690,10 @@ module.exports = {
   // exposed for testing
   BodySchema,
   buildUserMessage,
+  buildSystemPrompt,
+  renderContextSections,
+  loadPackCached,
+  resetContextPackCache,
   sanitizeModelOutput,
   checkTemplateInvariants,
   extractStructuralTokens,
@@ -558,6 +703,8 @@ module.exports = {
   draftWithInvariants,
   resolveRequestBudgetMs,
   TEMPLATE_QUICK_STYLE,
+  CONTEXT_REF_RE,
+  PACK_CACHE_TTL_MS,
   MAX_BODY_BYTES,
   EDITOR_CLIENT_CEILING_MS,
   DEFAULT_REQUEST_BUDGET_MS,
