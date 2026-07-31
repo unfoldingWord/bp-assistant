@@ -16,6 +16,9 @@ const {
   parseHebrewVerseWords,
   normalizeHebrewQuote,
 } = require('../workspace-tools/quality-tools');
+const { loadContextPack } = require('../lib/context-pack');
+const { renderPackPreamble } = require('../lib/translate-core');
+const { langName, defaultDirection } = require('../lib/lang-names');
 
 let _agentSdkQuery = null;
 async function getAgentSdkQuery() {
@@ -30,6 +33,13 @@ const HEBREW_DIR_REL = 'data/hebrew_bible';
 const MAX_BODY_BYTES = 32 * 1024;
 const RATE_LIMIT_RPM = 60;
 const RATE_LIMIT_WINDOW_MS = 60_000;
+
+// Context packs change rarely relative to Suggest-button traffic, so a short
+// in-process TTL keeps the per-note latency down without pinning stale prefs.
+const PACK_CACHE_TTL_MS = 5 * 60_000;
+const PACK_CACHE_MAX = 32;
+// Notes are drafted in English unless the caller says otherwise.
+const DEFAULT_TARGET_LANG = 'en';
 
 // Canonical source of these style rules: bp-assistant-skills/.claude/skills/tn-quick/SKILL.md
 // Keep in sync when style guidance there changes.
@@ -116,7 +126,17 @@ const BodySchema = z.object({
   ust: TextSideSchema,
   hebrewGuess: z.string().min(1).max(500),
   model: z.enum(['sonnet', 'opus']).default('sonnet'),
-});
+  // Org translation preferences, mirroring the translate pipeline. Same regex
+  // as OptionsSchema.contextRef in src/api/pipeline.js. When present the pack's
+  // register / brief / standing instructions / terminology are prepended to the
+  // system prompt so a Suggest draft honours the same curated style a batch
+  // translate run does.
+  contextRef: z.string().min(3).max(200).regex(/^[^/@\s]+\/[^/@\s]+@\S+$/).optional(),
+  targetLang: z.string().min(2).max(12).regex(/^[a-z]{2,3}(-[A-Za-z0-9]{2,8})?$/).optional(),
+  direction: z.enum(['ltr', 'rtl']).optional(),
+  // Strict so future contract drift (e.g. a client inventing a `preferences`
+  // field) fails loudly instead of being silently stripped behind a 200.
+}).strict();
 
 const rateLimits = new Map();
 
@@ -195,6 +215,50 @@ function formatContextLines(label, verseText, prev5, next5, refVerse) {
     lines.push(`${label} ${refVerse + i + 1}: ${next5[i]}`);
   }
   return lines.join('\n');
+}
+
+const packCache = new Map(); // contextRef -> { at, pack }
+
+/**
+ * Load a context pack, memoized per contextRef for PACK_CACHE_TTL_MS. Packs are
+ * loaded with allowEmpty because a Suggest draft must still work for an org
+ * that has not populated its context repo yet.
+ */
+async function loadPackCached(contextRef, { now = Date.now(), loader = loadContextPack } = {}) {
+  const hit = packCache.get(contextRef);
+  if (hit && now - hit.at < PACK_CACHE_TTL_MS) return hit.pack;
+  const pack = await loader(contextRef, { allowEmpty: true });
+  packCache.set(contextRef, { at: now, pack });
+  while (packCache.size > PACK_CACHE_MAX) {
+    packCache.delete(packCache.keys().next().value);
+  }
+  return pack;
+}
+
+/**
+ * System prompt = the tn-quick style rules, plus (when a pack is present) the
+ * org's standing preferences. The style rules come FIRST and are declared
+ * non-overridable: the pack governs wording/register/terminology, not the
+ * output contract the editor parses.
+ */
+function buildSystemPrompt({ pack, targetLang, direction }) {
+  if (!pack || !pack.hasContent) return TN_QUICK_STYLE;
+  const lang = targetLang || DEFAULT_TARGET_LANG;
+  const parts = renderPackPreamble({
+    pack,
+    targetLang: lang,
+    targetLangName: langName(lang),
+    direction: direction || defaultDirection(lang),
+  });
+  return [
+    TN_QUICK_STYLE,
+    '---',
+    "The sections below are this organization's standing translation preferences "
+      + 'for this project. Apply them to the wording of the note — register, '
+      + 'terminology, and standing instructions. They do NOT override the output '
+      + 'format rules above: still emit only the note text.',
+    parts.join('\n\n'),
+  ].join('\n\n');
 }
 
 function buildUserMessage({ body, templateInfo, hebrewQuote }) {
@@ -360,7 +424,33 @@ async function handleTnQuickRequest(req, res) {
       return;
     }
 
-    const system = TN_QUICK_STYLE;
+    // Org translation preferences. A pack that cannot be loaded must not fail
+    // the draft — degrade to the bare style rules, but surface it in warnings
+    // (and the log) so the caller never gets false confidence from the 200.
+    let pack = null;
+    let packSha = null;
+    if (body.contextRef) {
+      try {
+        pack = await loadPackCached(body.contextRef);
+        packSha = pack.sha || null;
+        console.log(`[tn-quick] context pack: ${body.contextRef}`
+          + `${packSha ? ` @ ${packSha.slice(0, 10)}` : ''}`
+          + `${pack.hasContent ? '' : ' (empty — no preferences applied)'}`);
+        if (!pack.hasContent) {
+          warnings.push(`context_pack_empty: no content files at ${body.contextRef}`);
+        }
+      } catch (err) {
+        pack = null;
+        console.warn(`[tn-quick] context pack load failed for ${body.contextRef}: ${err.message}`);
+        warnings.push(`context_pack_unavailable: ${err.message}`);
+      }
+    }
+
+    const system = buildSystemPrompt({
+      pack,
+      targetLang: body.targetLang,
+      direction: body.direction,
+    });
     const userMessage = buildUserMessage({
       body,
       templateInfo,
@@ -380,11 +470,12 @@ async function handleTnQuickRequest(req, res) {
       return;
     }
 
-    reply(res, 200, { quote: heb.quote, note: noteText, warnings });
+    reply(res, 200, { quote: heb.quote, note: noteText, warnings, packSha });
     const lat = Date.now() - startedAt;
     logLine += `book=${bookUpper} ${body.ref.chapter}:${body.ref.verse} `
       + `issue=${body.issueType} lat=${lat}ms model=${body.model} `
-      + `status=200 warnings=${warnings.length}`;
+      + `status=200 warnings=${warnings.length} `
+      + `pack=${body.contextRef ? (packSha ? packSha.slice(0, 10) : 'unresolved') : 'none'}`;
     console.log(logLine);
   } catch (err) {
     console.error(`[tn-quick] unhandled: ${err.stack || err.message}`);
@@ -394,4 +485,14 @@ async function handleTnQuickRequest(req, res) {
   }
 }
 
-module.exports = { handleTnQuickRequest };
+module.exports = {
+  handleTnQuickRequest,
+  // exposed for testing
+  BodySchema,
+  buildUserMessage,
+  buildSystemPrompt,
+  loadPackCached,
+  TN_QUICK_STYLE,
+  MAX_BODY_BYTES,
+  PACK_CACHE_TTL_MS,
+};
