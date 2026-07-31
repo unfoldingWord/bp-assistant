@@ -499,6 +499,7 @@ module.exports = {
   buildBatches,
   renderBatchPack,
   renderArticlePack,
+  renderPackPreamble,
   renderTerminologySections,
   selectExamples,
   writeBatchFiles,

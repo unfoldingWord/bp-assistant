@@ -3,10 +3,12 @@
 // See: /home/ubuntu/bp-bot/template-quick-contract.md for the client-facing
 // contract this implements.
 
+const fs = require('fs');
 const crypto = require('crypto');
 const { z } = require('zod');
 const { readSecret } = require('../secrets');
 const { ensureFreshToken } = require('../auth-refresh');
+const { loadQuickPack, renderQuickPackText, langName } = require('../lib/quick-context');
 
 let _agentSdkQuery = null;
 async function getAgentSdkQuery() {
@@ -40,13 +42,13 @@ function resolveRequestBudgetMs(envValue = process.env.TEMPLATE_QUICK_TIMEOUT_MS
 
 const REQUEST_BUDGET_MS = resolveRequestBudgetMs();
 
-const LANG_NAMES = {
-  ar: 'Arabic', 'es-419': 'Latin American Spanish', es: 'Spanish', ru: 'Russian',
-  fr: 'French', hi: 'Hindi', sw: 'Swahili', pt: 'Portuguese', id: 'Indonesian',
-  zh: 'Chinese', vi: 'Vietnamese', bn: 'Bengali', ur: 'Urdu', fa: 'Persian',
-  he: 'Hebrew', am: 'Amharic', ne: 'Nepali', my: 'Burmese', th: 'Thai',
-  en: 'English', ka: 'Georgian',
-};
+// "org/repo@ref" (branch name or 40-hex sha), or — only when the server opts
+// in via CONTEXT_PACK_ALLOW_LOCAL=1 — an existing local directory (dev
+// fixtures / dry runs). See src/lib/context-pack.js for the ref contract.
+function isValidContextRef(value) {
+  if (/^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+@\S+$/.test(value)) return true;
+  return process.env.CONTEXT_PACK_ALLOW_LOCAL === '1' && fs.existsSync(value);
+}
 
 const BodySchema = z.object({
   templateId: z.string().min(1).max(120),
@@ -59,7 +61,10 @@ const BodySchema = z.object({
   direction: z.enum(['ltr', 'rtl']),
   // Accepted for forward compatibility; not required by the editor today.
   model: z.enum(['sonnet', 'opus']).default('sonnet'),
-});
+  contextRef: z.string().min(3).max(200).refine(isValidContextRef, {
+    message: 'contextRef must be "org/repo@ref" or an existing local directory (CONTEXT_PACK_ALLOW_LOCAL=1)',
+  }).optional(),
+}).strict();
 
 const rateLimits = new Map();
 
@@ -116,10 +121,6 @@ function applyCors(req, res) {
   } else {
     res.removeHeader('Access-Control-Allow-Origin');
   }
-}
-
-function langName(code) {
-  return LANG_NAMES[code] || LANG_NAMES[code.split('-')[0]] || code;
 }
 
 const TEMPLATE_QUICK_STYLE = `You translate unfoldingWord note templates into a gateway language.
@@ -406,7 +407,12 @@ async function draftWithInvariants({
   body,
   budgetMs = REQUEST_BUDGET_MS,
   now = Date.now,
+  packText = null,
+  // Injectable for tests only (default is the real model call); lets the
+  // repair-loop behavior be verified without a live model call.
+  callModelFn = callModel,
 }) {
+  const system = packText ? `${TEMPLATE_QUICK_STYLE}\n\n${packText}` : TEMPLATE_QUICK_STYLE;
   const deadlineMs = now() + budgetMs;
   let repair = null;
   let lastViolations = [];
@@ -418,8 +424,8 @@ async function draftWithInvariants({
       throw err;
     }
     const userMessage = buildUserMessage(body, repair);
-    const targetMd = await callModel({
-      system: TEMPLATE_QUICK_STYLE,
+    const targetMd = await callModelFn({
+      system,
       userMessage,
       modelTier: body.model,
       timeoutMs: remainingMs,
@@ -441,6 +447,18 @@ async function draftWithInvariants({
   err.code = 'INVARIANT_FAILED';
   err.violations = lastViolations;
   throw err;
+}
+
+/**
+ * Assemble the snake_case response body. packSha is included only when the
+ * caller supplied a contextRef — omitted entirely otherwise, so a client that
+ * never asked for preferences sees no new field.
+ */
+function buildQuickResponse({ targetMd, warnings, pack, contextRef }) {
+  const response = { target_md: targetMd };
+  if (warnings && warnings.length) response.warnings = warnings;
+  if (contextRef) response.packSha = pack ? (pack.sha ?? null) : null;
+  return response;
 }
 
 async function handleTemplateQuickRequest(req, res) {
@@ -495,6 +513,23 @@ async function handleTemplateQuickRequest(req, res) {
     }
     const body = result.data;
 
+    const warnings = [];
+    let pack = null;
+    let sha10 = 'none';
+    if (body.contextRef) {
+      const loaded = await loadQuickPack(body.contextRef, {});
+      pack = loaded.pack;
+      if (loaded.warning) {
+        warnings.push(loaded.warning);
+        const reason = loaded.warning.replace(/^context_pack_unavailable:\s*/, '');
+        console.warn(`[template-quick] context pack unavailable at ${body.contextRef}: ${reason} — drafting without preferences`);
+      }
+      if (pack) {
+        sha10 = pack.sha ? pack.sha.slice(0, 10) : 'none';
+        console.log(`[template-quick] context pack: ${body.contextRef} @ ${sha10} — ${(pack.terms || []).length} terms`);
+      }
+    }
+
     try {
       await ensureFreshToken();
     } catch (err) {
@@ -506,9 +541,18 @@ async function handleTemplateQuickRequest(req, res) {
       return;
     }
 
+    const packText = pack
+      ? renderQuickPackText({
+        pack,
+        targetLang: body.targetLang,
+        targetLangName: langName(body.targetLang),
+        direction: body.direction,
+      })
+      : null;
+
     let draft;
     try {
-      draft = await draftWithInvariants({ body });
+      draft = await draftWithInvariants({ body, packText });
     } catch (err) {
       console.error(`[template-quick] model error: ${err.message}`);
       if (err.code === 'MODEL_TIMEOUT') {
@@ -528,13 +572,18 @@ async function handleTemplateQuickRequest(req, res) {
     }
 
     // Response is snake_case by contract — caller parses `target_md`, not targetMd.
-    const response = { target_md: draft.targetMd };
-    if (draft.warnings.length) response.warnings = draft.warnings;
+    const response = buildQuickResponse({
+      targetMd: draft.targetMd,
+      warnings: [...warnings, ...draft.warnings],
+      pack,
+      contextRef: body.contextRef,
+    });
     reply(res, 200, response);
     const lat = Date.now() - startedAt;
     logLine += `id=${body.templateId} lang=${body.targetLang} dir=${body.direction} `
       + `lat=${lat}ms model=${body.model} status=200 `
-      + `revise=${body.targetMd ? '1' : '0'} attempts=${draft.attempts}`;
+      + `revise=${body.targetMd ? '1' : '0'} attempts=${draft.attempts} `
+      + `pack=${body.contextRef ? sha10 : 'none'}`;
     console.log(logLine);
   } catch (err) {
     console.error(`[template-quick] unhandled: ${err.stack || err.message}`);
@@ -556,6 +605,7 @@ module.exports = {
   extractBoldRuns,
   lineBreakSignature,
   draftWithInvariants,
+  buildQuickResponse,
   resolveRequestBudgetMs,
   TEMPLATE_QUICK_STYLE,
   MAX_BODY_BYTES,

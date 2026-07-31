@@ -21,6 +21,11 @@ const path = require('path');
 
 const DCS_BASE = 'https://git.door43.org';
 const SUPPORTED_MANIFEST_FORMAT = 1;
+// Real pack files (manifest.yaml, brief.md, templates.tsv, terms.csv,
+// validated.jsonl) are KBs. This cap is a hardening bound, not a realistic
+// size — it protects both the quick endpoints and the translate pipeline
+// from an oversized/misconfigured or malicious pack file.
+const MAX_PACK_FILE_BYTES = 2_000_000;
 
 const PACK_FILES = {
   manifest: 'manifest.yaml',
@@ -55,7 +60,18 @@ async function fetchText(url, fetchImpl) {
   const res = await (fetchImpl || fetch)(url);
   if (res.status === 404) return null;
   if (!res.ok) throw new Error(`fetch ${url} → HTTP ${res.status}`);
-  return await res.text();
+  const contentLength = Number(res.headers && res.headers.get ? res.headers.get('content-length') : null);
+  if (Number.isFinite(contentLength) && contentLength > MAX_PACK_FILE_BYTES) {
+    throw new Error(`file too large (>${MAX_PACK_FILE_BYTES} bytes): ${url}`);
+  }
+  const text = await res.text();
+  // Byte length, not string length: pack files are often Arabic/Hebrew, where
+  // one character is 2-3 bytes, so a character count would let a file through
+  // at several times the intended cap.
+  if (Buffer.byteLength(text, 'utf8') > MAX_PACK_FILE_BYTES) {
+    throw new Error(`file too large (>${MAX_PACK_FILE_BYTES} bytes): ${url}`);
+  }
+  return text;
 }
 
 /** Resolve a branch contextRef to its current commit SHA (best effort). */
@@ -341,6 +357,7 @@ async function loadContextPack(contextRef, { fetchImpl, allowEmpty = false } = {
 
 module.exports = {
   loadContextPack,
+  resolveContextSha,
   parseContextRef,
   parseTemplatesTsv,
   parseTermsCsv,
@@ -352,4 +369,5 @@ module.exports = {
   parseCsvRecords,
   PACK_FILES,
   SUPPORTED_MANIFEST_FORMAT,
+  MAX_PACK_FILE_BYTES,
 };
