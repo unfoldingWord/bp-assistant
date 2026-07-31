@@ -12,6 +12,7 @@ const {
   BodySchema,
   buildSystemPrompt,
   TN_QUICK_STYLE,
+  TN_QUICK_PACK_FRAME,
 } = require('../src/api/tn-quick');
 const { loadQuickPack, _resetForTests } = require('../src/lib/quick-context');
 
@@ -191,6 +192,26 @@ describe('buildSystemPrompt', () => {
     });
     assert.doesNotMatch(system, /## Terminology — HARD CONSTRAINTS/);
     assert.doesNotMatch(system, /## Terminology — FORBIDDEN/);
+  });
+
+  test('frames the pack as background so a target-language pack cannot flip the note language', async () => {
+    _resetForTests();
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tnq-pack-frame-'));
+    writeFixturePack(dir);
+    const { pack } = await loadQuickPack(dir, {});
+    const system = buildSystemPrompt({
+      pack, targetLang: 'ar', targetLangName: 'Arabic', direction: 'rtl',
+    });
+    assert.ok(system.includes(TN_QUICK_PACK_FRAME), 'reconciliation frame present');
+    // The frame must sit between the style rules and the pack, so it governs
+    // how the pack that follows is read.
+    assert.ok(
+      system.indexOf(TN_QUICK_STYLE) < system.indexOf(TN_QUICK_PACK_FRAME)
+        && system.indexOf(TN_QUICK_PACK_FRAME) < system.indexOf('# Translation context'),
+      'frame is ordered after the style rules and before the pack',
+    );
+    // No frame when there is no pack to reconcile against.
+    assert.ok(!buildSystemPrompt({ pack: null }).includes(TN_QUICK_PACK_FRAME));
   });
 });
 

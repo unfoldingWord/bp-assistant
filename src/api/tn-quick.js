@@ -143,13 +143,25 @@ const BodySchema = z.object({
 // (template-quick keeps all buckets — it writes target-language text.)
 const TN_QUICK_TERM_STATUSES = ['forbidden', 'do_not_translate'];
 
+// The pack's brief and standing instructions are written for the org's
+// TARGET language and are often written IN it, while this endpoint drafts the
+// note in the note language (English) per TN_QUICK_STYLE. Without this
+// reconciliation the two halves of the system prompt contradict each other and
+// the model can answer in the wrong language. Keep this immediately before the
+// pack text so it governs how the pack is read.
+const TN_QUICK_PACK_FRAME = `## How to use the translation context below
+
+The context that follows is the organization's standing guidance for its own translation work. Use it ONLY as background: whose translation this serves, which terms are forbidden or must be left untranslated, and what the team cares about.
+
+It does NOT change the language or shape of your output. You are still drafting ONE note in the same language as the English source material and the templates above, following every style rule above. The context may itself be written in another language — do not mirror that language, and do not translate the note into the organization's target language.`;
+
 /** Build the system prompt: style rules alone, or with org preferences appended. */
 function buildSystemPrompt({ pack, targetLang, targetLangName, direction }) {
   if (!pack) return TN_QUICK_STYLE;
   const packText = renderQuickPackText({
     pack, targetLang, targetLangName, direction, termStatuses: TN_QUICK_TERM_STATUSES,
   });
-  return `${TN_QUICK_STYLE}\n\n${packText}`;
+  return `${TN_QUICK_STYLE}\n\n${TN_QUICK_PACK_FRAME}\n\n${packText}`;
 }
 
 const rateLimits = new Map();
@@ -455,5 +467,6 @@ module.exports = {
   BodySchema,
   buildSystemPrompt,
   TN_QUICK_STYLE,
+  TN_QUICK_PACK_FRAME,
   TN_QUICK_TERM_STATUSES,
 };

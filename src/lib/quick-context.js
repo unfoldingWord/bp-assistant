@@ -111,20 +111,42 @@ async function getContextPackCached(contextRef, { fetchImpl, now = Date.now } = 
   return loadPackBySha({ org: parsed.org, repo: parsed.repo, ref: sha }, shaRef, fetchImpl);
 }
 
+// Total wall-clock budget for loading a pack. These endpoints are interactive
+// (a Suggest click, a Draft-with-AI click) and the caller has its own client
+// ceiling, so a slow or stuck DCS must not hold the request open — past this
+// budget we abandon the pack and draft without preferences.
+const PACK_LOAD_TIMEOUT_MS = 8_000;
+
 /**
- * Load a context pack for a quick endpoint. Never throws: any load error, or
- * an empty pack, degrades to { pack: null, warning: <reason> } so the caller
- * can draft without preferences rather than fail the whole request.
+ * Load a context pack for a quick endpoint. Never throws and never outlasts
+ * PACK_LOAD_TIMEOUT_MS: any load error, timeout, or an empty pack degrades to
+ * { pack: null, warning: <reason> } so the caller can draft without
+ * preferences rather than fail or hang the whole request.
  */
-async function loadQuickPack(contextRef, { fetchImpl } = {}) {
+async function loadQuickPack(contextRef, { fetchImpl, timeoutMs = PACK_LOAD_TIMEOUT_MS } = {}) {
+  let timer;
   try {
-    const pack = await getContextPackCached(contextRef, { fetchImpl });
+    const pack = await Promise.race([
+      getContextPackCached(contextRef, { fetchImpl }),
+      new Promise((_, reject) => {
+        timer = setTimeout(
+          () => reject(new Error(`pack load timed out after ${timeoutMs}ms`)),
+          timeoutMs,
+        );
+        // Don't hold the event loop open on this timer.
+        if (timer.unref) timer.unref();
+      }),
+    ]);
     if (!pack.hasContent) {
       return { pack: null, warning: `context_pack_unavailable: empty pack at "${contextRef}"` };
     }
     return { pack, warning: null };
   } catch (err) {
     return { pack: null, warning: `context_pack_unavailable: ${err.message}` };
+  } finally {
+    // A timed-out load keeps running in the background; if it eventually
+    // resolves it still populates the sha cache, so the next request benefits.
+    clearTimeout(timer);
   }
 }
 
@@ -158,6 +180,7 @@ module.exports = {
   renderQuickPackText,
   BRANCH_SHA_TTL_MS,
   MAX_ENTRIES,
+  PACK_LOAD_TIMEOUT_MS,
   _cacheSizesForTests,
   _resetForTests,
 };

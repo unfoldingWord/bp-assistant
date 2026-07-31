@@ -199,6 +199,18 @@ test('fetchText rejects a file over the 2MB cap (Content-Length header)', async 
   assert.match(warning, /file too large/);
 });
 
+test('loadQuickPack degrades instead of hanging when the pack fetch stalls', async () => {
+  _resetForTests();
+  const ref = 'BSOJ/translation-context@stalledref';
+  // Never resolves — stands in for a stuck DCS connection.
+  const fetchImpl = () => new Promise(() => {});
+  const started = Date.now();
+  const { pack, warning } = await loadQuickPack(ref, { fetchImpl, timeoutMs: 40 });
+  assert.equal(pack, null);
+  assert.match(warning, /context_pack_unavailable: pack load timed out after 40ms/);
+  assert.ok(Date.now() - started < 2000, 'returned promptly rather than hanging');
+});
+
 test('fetchText rejects a file over the 2MB cap (body length, no Content-Length header)', async () => {
   _resetForTests();
   const ref = 'BSOJ/translation-context@notahexeither';
