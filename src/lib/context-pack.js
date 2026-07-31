@@ -341,6 +341,7 @@ async function loadContextPack(contextRef, { fetchImpl, allowEmpty = false } = {
 
 module.exports = {
   loadContextPack,
+  resolveContextSha,
   parseContextRef,
   parseTemplatesTsv,
   parseTermsCsv,

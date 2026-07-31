@@ -2,6 +2,7 @@
 // See: /home/ubuntu/bp-bot/tn-quick-api-contract.md for the client-facing
 // contract this implements.
 
+const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const { z } = require('zod');
@@ -16,6 +17,7 @@ const {
   parseHebrewVerseWords,
   normalizeHebrewQuote,
 } = require('../workspace-tools/quality-tools');
+const { loadQuickPack, renderQuickPackText, langName } = require('../lib/quick-context');
 
 let _agentSdkQuery = null;
 async function getAgentSdkQuery() {
@@ -97,26 +99,53 @@ Output: emit ONLY the final note text. No preamble, no explanation, no JSON wrap
 const ContextSchema = z.object({
   prev5: z.array(z.string().max(3000)).max(5).default([]),
   next5: z.array(z.string().max(3000)).max(5).default([]),
-}).default({ prev5: [], next5: [] });
+}).strict().default({ prev5: [], next5: [] });
 
 const TextSideSchema = z.object({
   selection: z.string().min(1).max(500),
   verse: z.string().min(1).max(3000),
   context: ContextSchema,
-});
+}).strict();
+
+// "org/repo@ref" (branch name or 40-hex sha), or — only when the server opts
+// in via CONTEXT_PACK_ALLOW_LOCAL=1 — an existing local directory (dev
+// fixtures / dry runs). See src/lib/context-pack.js for the ref contract.
+function isValidContextRef(value) {
+  if (/^[^/@\s]+\/[^/@\s]+@\S+$/.test(value)) return true;
+  return process.env.CONTEXT_PACK_ALLOW_LOCAL === '1' && fs.existsSync(value);
+}
 
 const BodySchema = z.object({
   ref: z.object({
     book: z.string().regex(/^[A-Za-z0-9]{3}$/),
     chapter: z.number().int().min(1).max(150),
     verse: z.number().int().min(1).max(200),
-  }),
+  }).strict(),
   issueType: z.string().min(2).max(80),
   ult: TextSideSchema,
   ust: TextSideSchema,
   hebrewGuess: z.string().min(1).max(500),
   model: z.enum(['sonnet', 'opus']).default('sonnet'),
-});
+  contextRef: z.string().min(3).max(200).refine(isValidContextRef, {
+    message: 'contextRef must be "org/repo@ref" or an existing local directory (CONTEXT_PACK_ALLOW_LOCAL=1)',
+  }).optional(),
+  targetLang: z.string().regex(/^[a-z]{2,3}(-[A-Za-z0-9]{2,8})?$/).optional(),
+  direction: z.enum(['ltr', 'rtl']).optional(),
+}).strict();
+
+// tn-quick drafts a single English note — org terminology preferences only
+// need the hard-constraint buckets, not "admitted" (valid-but-not-preferred)
+// or "deprecated" (legacy guidance for existing drafts).
+const TN_QUICK_TERM_STATUSES = ['preferred', 'forbidden', 'do_not_translate'];
+
+/** Build the system prompt: style rules alone, or with org preferences appended. */
+function buildSystemPrompt({ pack, targetLang, targetLangName, direction }) {
+  if (!pack) return TN_QUICK_STYLE;
+  const packText = renderQuickPackText({
+    pack, targetLang, targetLangName, direction, termStatuses: TN_QUICK_TERM_STATUSES,
+  });
+  return `${TN_QUICK_STYLE}\n\n${packText}`;
+}
 
 const rateLimits = new Map();
 
@@ -349,6 +378,22 @@ async function handleTnQuickRequest(req, res) {
     }
     const warnings = heb.warnings.map((w) => `${w.code}: ${w.detail}`);
 
+    let pack = null;
+    let sha10 = 'none';
+    if (body.contextRef) {
+      const loaded = await loadQuickPack(body.contextRef, {});
+      pack = loaded.pack;
+      if (loaded.warning) {
+        warnings.push(loaded.warning);
+        const reason = loaded.warning.replace(/^context_pack_unavailable:\s*/, '');
+        console.warn(`[tn-quick] context pack unavailable at ${body.contextRef}: ${reason} — drafting without preferences`);
+      }
+      if (pack) {
+        sha10 = pack.sha ? pack.sha.slice(0, 10) : 'none';
+        console.log(`[tn-quick] context pack: ${body.contextRef} @ ${sha10} — ${(pack.terms || []).length} terms`);
+      }
+    }
+
     try {
       await ensureFreshToken();
     } catch (err) {
@@ -360,7 +405,10 @@ async function handleTnQuickRequest(req, res) {
       return;
     }
 
-    const system = TN_QUICK_STYLE;
+    const targetLang = body.targetLang || (pack && pack.manifest && pack.manifest.language) || 'und';
+    const targetLangName = langName(targetLang);
+    const direction = body.direction || (pack && pack.manifest && pack.manifest.direction) || 'ltr';
+    const system = buildSystemPrompt({ pack, targetLang, targetLangName, direction });
     const userMessage = buildUserMessage({
       body,
       templateInfo,
@@ -380,11 +428,13 @@ async function handleTnQuickRequest(req, res) {
       return;
     }
 
-    reply(res, 200, { quote: heb.quote, note: noteText, warnings });
+    const responseBody = { quote: heb.quote, note: noteText, warnings };
+    if (body.contextRef) responseBody.packSha = pack ? (pack.sha ?? null) : null;
+    reply(res, 200, responseBody);
     const lat = Date.now() - startedAt;
     logLine += `book=${bookUpper} ${body.ref.chapter}:${body.ref.verse} `
       + `issue=${body.issueType} lat=${lat}ms model=${body.model} `
-      + `status=200 warnings=${warnings.length}`;
+      + `status=200 warnings=${warnings.length} pack=${body.contextRef ? sha10 : 'none'}`;
     console.log(logLine);
   } catch (err) {
     console.error(`[tn-quick] unhandled: ${err.stack || err.message}`);
@@ -394,4 +444,11 @@ async function handleTnQuickRequest(req, res) {
   }
 }
 
-module.exports = { handleTnQuickRequest };
+module.exports = {
+  handleTnQuickRequest,
+  // exposed for testing
+  BodySchema,
+  buildSystemPrompt,
+  TN_QUICK_STYLE,
+  TN_QUICK_TERM_STATUSES,
+};
