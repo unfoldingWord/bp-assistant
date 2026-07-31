@@ -100,6 +100,19 @@ describe('BodySchema', () => {
     }
   });
 
+  test('rejects a contextRef with disallowed characters in org/repo', () => {
+    for (const bad of [
+      'org#hash/repo@master',
+      'org/repo?query@master',
+      'org%2Fslash/repo@master',
+      '../../repo@master',
+      'org/repo/../evil@master',
+    ]) {
+      const r = BodySchema.safeParse({ ...validBody, contextRef: bad });
+      assert.equal(r.success, false, `expected rejection for ${JSON.stringify(bad)}`);
+    }
+  });
+
   test('rejects an unknown top-level field (strict)', () => {
     const r = BodySchema.safeParse({ ...validBody, preferences: { register: 'formal' } });
     assert.equal(r.success, false);

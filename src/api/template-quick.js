@@ -46,7 +46,7 @@ const REQUEST_BUDGET_MS = resolveRequestBudgetMs();
 // in via CONTEXT_PACK_ALLOW_LOCAL=1 — an existing local directory (dev
 // fixtures / dry runs). See src/lib/context-pack.js for the ref contract.
 function isValidContextRef(value) {
-  if (/^[^/@\s]+\/[^/@\s]+@\S+$/.test(value)) return true;
+  if (/^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+@\S+$/.test(value)) return true;
   return process.env.CONTEXT_PACK_ALLOW_LOCAL === '1' && fs.existsSync(value);
 }
 

@@ -8,7 +8,10 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 
-const { getContextPackCached, _resetForTests, BRANCH_SHA_TTL_MS } = require('../src/lib/quick-context');
+const {
+  getContextPackCached, loadQuickPack, _resetForTests, BRANCH_SHA_TTL_MS, MAX_ENTRIES, _cacheSizesForTests,
+} = require('../src/lib/quick-context');
+const { MAX_PACK_FILE_BYTES } = require('../src/lib/context-pack');
 
 function writeFixturePack(dir) {
   fs.mkdirSync(path.join(dir, 'templates'), { recursive: true });
@@ -152,4 +155,60 @@ test('a local directory ref bypasses the cache entirely', async () => {
   assert.equal(second.hasContent, true);
   assert.notEqual(first, second, 'local dir loads are not cached/coalesced (fresh object each call)');
   assert.equal(calls, 0, 'fetchImpl is never invoked for a local directory');
+});
+
+test('branchShaCache stays bounded at MAX_ENTRIES across many distinct branch refs', async () => {
+  _resetForTests();
+  const sha = 'f'.repeat(40);
+  const fetchImpl = async (url) => {
+    if (/\/api\/v1\/repos\/.+\/branches\//.test(url)) {
+      return { ok: true, status: 200, json: async () => ({ commit: { id: sha } }) };
+    }
+    if (/manifest\.yaml$/.test(url)) {
+      return { ok: true, status: 200, text: async () => 'format: 1\nlanguage: ar\ndirection: rtl\n' };
+    }
+    if (/brief\.md$/.test(url)) {
+      return { ok: true, status: 200, text: async () => 'Brief text.' };
+    }
+    return { ok: false, status: 404, text: async () => '' };
+  };
+
+  for (let i = 0; i < 21; i++) {
+    await getContextPackCached(`BSOJ/translation-context@branch-${i}`, { fetchImpl });
+  }
+  const { branchShaCacheSize } = _cacheSizesForTests();
+  assert.ok(branchShaCacheSize <= MAX_ENTRIES, `branchShaCache should be bounded at ${MAX_ENTRIES}, got ${branchShaCacheSize}`);
+});
+
+test('fetchText rejects a file over the 2MB cap (Content-Length header)', async () => {
+  _resetForTests();
+  const ref = 'BSOJ/translation-context@notahex';
+  const fetchImpl = async (url) => {
+    if (/brief\.md$/.test(url)) {
+      return {
+        ok: true,
+        status: 200,
+        headers: { get: (h) => (h.toLowerCase() === 'content-length' ? String(MAX_PACK_FILE_BYTES + 1) : null) },
+        text: async () => 'x'.repeat(MAX_PACK_FILE_BYTES + 1),
+      };
+    }
+    return { ok: false, status: 404, text: async () => '' };
+  };
+  const { pack, warning } = await loadQuickPack(ref, { fetchImpl });
+  assert.equal(pack, null);
+  assert.match(warning, /file too large/);
+});
+
+test('fetchText rejects a file over the 2MB cap (body length, no Content-Length header)', async () => {
+  _resetForTests();
+  const ref = 'BSOJ/translation-context@notahexeither';
+  const fetchImpl = async (url) => {
+    if (/brief\.md$/.test(url)) {
+      return { ok: true, status: 200, text: async () => 'x'.repeat(MAX_PACK_FILE_BYTES + 1) };
+    }
+    return { ok: false, status: 404, text: async () => '' };
+  };
+  const { pack, warning } = await loadQuickPack(ref, { fetchImpl });
+  assert.equal(pack, null);
+  assert.match(warning, /file too large/);
 });

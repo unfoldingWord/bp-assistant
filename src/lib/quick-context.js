@@ -54,6 +54,14 @@ function setCache(key, promise) {
   }
 }
 
+function setBranchShaCache(key, value) {
+  branchShaCache.set(key, value);
+  if (branchShaCache.size > MAX_ENTRIES) {
+    const oldestKey = branchShaCache.keys().next().value;
+    branchShaCache.delete(oldestKey);
+  }
+}
+
 function loadPackBySha(parsed, contextRef, fetchImpl) {
   const key = shaKey(parsed.org, parsed.repo, parsed.ref);
   if (packCache.has(key)) {
@@ -75,7 +83,7 @@ async function resolveBranchSha(parsed, fetchImpl, now) {
     return cached.shaPromise;
   }
   const shaPromise = resolveContextSha(parsed, fetchImpl);
-  branchShaCache.set(key, { shaPromise, resolvedAt: now() });
+  setBranchShaCache(key, { shaPromise, resolvedAt: now() });
   return shaPromise;
 }
 
@@ -138,6 +146,10 @@ function _resetForTests() {
   branchShaCache.clear();
 }
 
+function _cacheSizesForTests() {
+  return { packCacheSize: packCache.size, branchShaCacheSize: branchShaCache.size };
+}
+
 module.exports = {
   LANG_NAMES,
   langName,
@@ -146,5 +158,6 @@ module.exports = {
   renderQuickPackText,
   BRANCH_SHA_TTL_MS,
   MAX_ENTRIES,
+  _cacheSizesForTests,
   _resetForTests,
 };

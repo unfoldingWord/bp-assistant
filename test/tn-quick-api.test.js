@@ -71,6 +71,19 @@ describe('BodySchema — contextRef / targetLang / direction', () => {
     assert.equal(r.success, false);
   });
 
+  test('rejects a contextRef with disallowed characters in org/repo', () => {
+    for (const bad of [
+      'org#hash/repo@master',
+      'org/repo?query@master',
+      'org%2Fslash/repo@master',
+      '../../repo@master',
+      'org/repo/../evil@master',
+    ]) {
+      const r = BodySchema.safeParse({ ...validBody, contextRef: bad });
+      assert.equal(r.success, false, `expected rejection for ${JSON.stringify(bad)}`);
+    }
+  });
+
   test('rejects a local-directory contextRef without CONTEXT_PACK_ALLOW_LOCAL', () => {
     delete process.env.CONTEXT_PACK_ALLOW_LOCAL;
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tnq-local-'));
@@ -138,7 +151,7 @@ describe('buildSystemPrompt', () => {
     assert.equal(buildSystemPrompt({ pack: null }), TN_QUICK_STYLE);
   });
 
-  test('assembles hard-constraint terminology only (no "admitted" bucket) with a local fixture pack', async () => {
+  test('assembles forbidden/do-not-translate terminology only (no "preferred" or "admitted" bucket) with a local fixture pack', async () => {
     _resetForTests();
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tnq-pack-'));
     writeFixturePack(dir);
@@ -152,8 +165,32 @@ describe('buildSystemPrompt', () => {
     assert.match(system, /^You draft a single English translation note/);
     assert.match(system, /# Translation context/);
     assert.match(system, /## Translation brief/);
-    assert.match(system, /## Terminology — HARD CONSTRAINTS/);
+    // "preferred" is target-language guidance for the translate pipeline, not
+    // for an English note — tn-quick excludes it, so the HARD CONSTRAINTS
+    // section (which is rendered from the preferred bucket) does not appear.
+    assert.doesNotMatch(system, /## Terminology — HARD CONSTRAINTS/);
+    assert.match(system, /## Terminology — FORBIDDEN/);
     assert.doesNotMatch(system, /## Terminology — admitted/);
+  });
+
+  test('omits all terminology sections when the pack only has "preferred" terms', async () => {
+    _resetForTests();
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tnq-pack-preferred-only-'));
+    fs.mkdirSync(path.join(dir, 'terminology'), { recursive: true });
+    fs.writeFileSync(path.join(dir, 'manifest.yaml'), 'format: 1\nlanguage: ar\ndirection: rtl\n');
+    fs.writeFileSync(path.join(dir, 'brief.md'), '# Brief\n\n**Register:** formal\n\nTranslate simply.');
+    fs.writeFileSync(path.join(dir, 'terminology', 'terms.csv'),
+      'concept_id,source_term,target_term,status,replacement,comment,tw_link\n'
+      + 'names/yhwh,Yahweh,يهوه,preferred,,,\n');
+    const { pack, warning } = await loadQuickPack(dir, {});
+    assert.equal(warning, null);
+    assert.ok(pack);
+
+    const system = buildSystemPrompt({
+      pack, targetLang: 'ar', targetLangName: 'Arabic', direction: 'rtl',
+    });
+    assert.doesNotMatch(system, /## Terminology — HARD CONSTRAINTS/);
+    assert.doesNotMatch(system, /## Terminology — FORBIDDEN/);
   });
 });
 

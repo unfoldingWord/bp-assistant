@@ -111,7 +111,7 @@ const TextSideSchema = z.object({
 // in via CONTEXT_PACK_ALLOW_LOCAL=1 — an existing local directory (dev
 // fixtures / dry runs). See src/lib/context-pack.js for the ref contract.
 function isValidContextRef(value) {
-  if (/^[^/@\s]+\/[^/@\s]+@\S+$/.test(value)) return true;
+  if (/^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+@\S+$/.test(value)) return true;
   return process.env.CONTEXT_PACK_ALLOW_LOCAL === '1' && fs.existsSync(value);
 }
 
@@ -135,8 +135,13 @@ const BodySchema = z.object({
 
 // tn-quick drafts a single English note — org terminology preferences only
 // need the hard-constraint buckets, not "admitted" (valid-but-not-preferred)
-// or "deprecated" (legacy guidance for existing drafts).
-const TN_QUICK_TERM_STATUSES = ['preferred', 'forbidden', 'do_not_translate'];
+// or "deprecated" (legacy guidance for existing drafts). "preferred" is also
+// excluded: tn-quick drafts in the note language (usually English), while
+// target-language preferred renderings are translate-pipeline guidance and
+// could leak target-language words into an English note. forbidden /
+// do_not_translate still guard quoted terms regardless of note language.
+// (template-quick keeps all buckets — it writes target-language text.)
+const TN_QUICK_TERM_STATUSES = ['forbidden', 'do_not_translate'];
 
 /** Build the system prompt: style rules alone, or with org preferences appended. */
 function buildSystemPrompt({ pack, targetLang, targetLangName, direction }) {
