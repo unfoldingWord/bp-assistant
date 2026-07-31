@@ -224,3 +224,21 @@ test('fetchText rejects a file over the 2MB cap (body length, no Content-Length 
   assert.equal(pack, null);
   assert.match(warning, /file too large/);
 });
+
+test('the size cap counts bytes, not characters (multibyte pack text)', async () => {
+  _resetForTests();
+  const ref = 'BSOJ/translation-context@multibyteref';
+  // Under the cap as a character count, over it as UTF-8 bytes (2 bytes each).
+  const arabic = 'ع'.repeat(Math.floor(MAX_PACK_FILE_BYTES * 0.75));
+  const fetchImpl = async (url) => {
+    if (/brief\.md$/.test(url)) {
+      return { ok: true, status: 200, text: async () => arabic };
+    }
+    return { ok: false, status: 404, text: async () => '' };
+  };
+  assert.ok(arabic.length < MAX_PACK_FILE_BYTES, 'under the cap by character count');
+  assert.ok(Buffer.byteLength(arabic, 'utf8') > MAX_PACK_FILE_BYTES, 'over the cap by byte count');
+  const { pack, warning } = await loadQuickPack(ref, { fetchImpl });
+  assert.equal(pack, null);
+  assert.match(warning, /file too large/);
+});

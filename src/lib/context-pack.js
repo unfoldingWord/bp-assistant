@@ -65,7 +65,10 @@ async function fetchText(url, fetchImpl) {
     throw new Error(`file too large (>${MAX_PACK_FILE_BYTES} bytes): ${url}`);
   }
   const text = await res.text();
-  if (text.length > MAX_PACK_FILE_BYTES) {
+  // Byte length, not string length: pack files are often Arabic/Hebrew, where
+  // one character is 2-3 bytes, so a character count would let a file through
+  // at several times the intended cap.
+  if (Buffer.byteLength(text, 'utf8') > MAX_PACK_FILE_BYTES) {
     throw new Error(`file too large (>${MAX_PACK_FILE_BYTES} bytes): ${url}`);
   }
   return text;
