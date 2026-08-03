@@ -931,7 +931,10 @@ async function checkTnQuality({ tsvPath, preparedJson, ultUsfm, ustUsfm, book, h
     // figs-metaphor "heart") — a false positive. So the fallback applies only
     // when the sref has exactly one template; otherwise, with no resolved
     // template, skip the check.
-    let templateFirstPhrase = '';
+    // Named distinctly from the templateFirstPhrase() helper — a local called
+    // `templateFirstPhrase` shadowed it inside this block and turned every call
+    // into a TypeError on notes that had a resolved template.
+    let resolvedTemplatePhrase = '';
     {
       let templateText = prepItem?.template_text || '';
       if (!templateText) {
@@ -945,7 +948,7 @@ async function checkTnQuality({ tsvPath, preparedJson, ultUsfm, ustUsfm, book, h
         // template" means.
         const firstPhrase = templateFirstPhrase(templateText);
         if (firstPhrase) {
-          templateFirstPhrase = firstPhrase;
+          resolvedTemplatePhrase = firstPhrase;
           // Strip bold and brackets from note for comparison
           const noteStripped = n.note
             .replace(/\*\*[^*]+\*\*/g, ' ')
@@ -1004,7 +1007,7 @@ async function checkTnQuality({ tsvPath, preparedJson, ultUsfm, ustUsfm, book, h
       // template is known and its fixed phrase is absent from the FIRST
       // paragraph — 4 of the 215 golden notes are legitimately multi-paragraph,
       // and those keep the template up front.
-      if (templateFirstPhrase) {
+      if (resolvedTemplatePhrase) {
         const paras = n.note.split(/\\n|\n|<br\s*\/?>/i).map(s => s.trim()).filter(Boolean);
         if (paras.length > 1) {
           const firstPara = paras[0]
@@ -1012,7 +1015,7 @@ async function checkTnQuality({ tsvPath, preparedJson, ultUsfm, ustUsfm, book, h
             .replace(/\[[^\]]*\]/g, ' ')
             .replace(/\s+/g, ' ')
             .toLowerCase();
-          if (!firstPara.includes(templateFirstPhrase.toLowerCase())) {
+          if (!firstPara.includes(resolvedTemplatePhrase.toLowerCase())) {
             addFinding(n.row, n.ref, n.id, 'warning', 'preamble_paragraph',
               'Note has multiple paragraphs and the first does not contain the template phrase — possible preamble before the real note');
           }
