@@ -314,13 +314,29 @@ jobs:
           started=$SECONDS
           deadline=$((SECONDS + poll_window))
           attempt=0
+          fetch_failures=0
           busy_extensions=0
           last_active=""
+          # Counts only pipelines with `interrupted !== true` rather than the
+          # top-level `active`, which still includes stale `running` checkpoints
+          # from a crashed pipeline. Note the probe can wake the machine
+          # (auto_start_machines); see the matching note in review-gate.yml.
           health_url="https://${FLY_APP_NAME}.fly.dev/health/pipelines"
           get_active() {
             curl -sf --max-time 15 "$health_url" 2>/dev/null \
-              | node -e "let s='';process.stdin.on('data',c=>s+=c);process.stdin.on('end',()=>{try{const j=JSON.parse(s);if(typeof j.active==='number')process.stdout.write(String(j.active));}catch{}});" \
+              | node -e "let s='';process.stdin.on('data',c=>s+=c);process.stdin.on('end',()=>{try{const j=JSON.parse(s);const p=Array.isArray(j.pipelines)?j.pipelines:null;if(p)process.stdout.write(String(p.filter(x=>x&&x.interrupted!==true).length));}catch{}});" \
               || echo ""
+          }
+          maybe_extend() {
+            [ "$SECONDS" -ge "$deadline" ] || return 0
+            cap=$((started + max_window))
+            [ "$SECONDS" -lt "$cap" ] || return 0
+            last_active="$(get_active)"
+            [ -n "$last_active" ] && [ "$last_active" != "0" ] || return 0
+            deadline=$((SECONDS + 120))
+            [ "$deadline" -le "$cap" ] || deadline=$cap
+            busy_extensions=$((busy_extensions + 1))
+            echo "Reviewer host reports ${last_active} live pipeline(s); extending the wait (extension #${busy_extensions}, hard cap ${max_window}s total)."
           }
           # The success-path JSON serializes as `{"request":...,"decision":...,...}`
           # because executePrReview returns `{ request, ...aggregate, summary }`,
@@ -331,7 +347,15 @@ jobs:
           marker_line=""
           while [ "$SECONDS" -lt "$deadline" ]; do
             attempt=$((attempt + 1))
-            flyctl logs --app "$FLY_APP_NAME" --no-tail > all-logs.txt 2>&1 || true
+            # Don't swallow the fetch status: a run of failed `flyctl logs` calls
+            # is a different diagnosis from "the marker has not propagated yet".
+            if ! flyctl logs --app "$FLY_APP_NAME" --no-tail > all-logs.txt 2>&1; then
+              fetch_failures=$((fetch_failures + 1))
+              echo "flyctl logs fetch failed (attempt ${attempt}); retrying in 10s..."
+              sleep 10
+              maybe_extend
+              continue
+            fi
             marker_line="$(grep -E 'PR_REVIEW_RESULT:[[:space:]]*\{' all-logs.txt \
               | grep "\"prNumber\":${PR_NUMBER}" \
               | grep "\"headSha\":\"${HEAD_SHA}\"" \
@@ -342,18 +366,11 @@ jobs:
             fi
             echo "No marker yet for SHA ${HEAD_SHA} (attempt ${attempt}); waiting 10s for Fly log propagation..."
             sleep 10
-            if [ "$SECONDS" -ge "$deadline" ] && [ $((SECONDS - started)) -lt "$max_window" ]; then
-              last_active="$(get_active)"
-              if [ -n "$last_active" ] && [ "$last_active" != "0" ]; then
-                deadline=$((SECONDS + 120))
-                busy_extensions=$((busy_extensions + 1))
-                echo "Reviewer host reports ${last_active} active pipeline(s); extending the wait by 120s (extension #${busy_extensions}, hard cap ${max_window}s)."
-              fi
-            fi
+            maybe_extend
           done
           if [ -z "$marker_line" ]; then
             {
-              echo "TIMEOUT reading the automerge review result: no PR_REVIEW_RESULT marker for PR #${PR_NUMBER} SHA ${HEAD_SHA} appeared within ~$((SECONDS - started))s (${attempt} attempts, ${busy_extensions} busy-host extensions; last reported active pipelines: ${last_active:-<unknown>})."
+              echo "TIMEOUT reading the automerge review result: no PR_REVIEW_RESULT marker for PR #${PR_NUMBER} SHA ${HEAD_SHA} appeared within ~$((SECONDS - started))s (${attempt} attempts, ${fetch_failures} failed log fetches, ${busy_extensions} busy-host extensions; last reported live pipelines: ${last_active:-<unknown>})."
               echo
               echo "This is NOT a review verdict -- the reviewer did not report FAIL, and no"
               echo "verdict for this commit could be read at all. Automerge is blocked either"

@@ -15,10 +15,11 @@ concurrency:
 permissions:
   contents: read
   pull-requests: write
-  # `actions: write` lets the timeout path cancel its own run so an unread
-  # verdict surfaces as a grey "cancelled" check rather than a red "failure"
-  # that reads as a review rejection. See "Read review result from logs".
-  actions: write
+  # `checks: write` lets the timeout path publish a distinctly-named
+  # `review-verdict-unavailable` check run, so an unread verdict is visibly
+  # different from a FAIL verdict in the checks list rather than only in the
+  # job log. See "Read review result from logs".
+  checks: write
 
 jobs:
   review:
@@ -263,7 +264,6 @@ jobs:
           PR_NUMBER: ${{ github.event.pull_request.number }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          RUN_ID: ${{ github.run_id }}
           REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
@@ -305,13 +305,40 @@ jobs:
           fetch_failures=0
           busy_extensions=0
           last_active=""
-          # Same host the reviewer runs on; the health endpoint reports how many
+          # Same host the reviewer runs on; the health endpoint reports which
           # pipelines are currently checkpointed as running.
+          #
+          # Two caveats, both deliberate:
+          #  - This probe is NOT read-only. fly.toml sets auto_start_machines,
+          #    so hitting the endpoint can wake the (now RUN_MODE=hourly)
+          #    machine. deploy.yml already polls the same endpoint, and a fresh
+          #    process still reports the volume-persisted checkpoints, so the
+          #    answer stays usable.
+          #  - We count only pipelines with `interrupted !== true`, not the
+          #    top-level `active`. `active` includes stale `running` checkpoints
+          #    left behind by a crashed pipeline, which would buy a dead
+          #    reviewer the full 30-minute extension budget for nothing.
           health_url="https://${FLY_APP_NAME}.fly.dev/health/pipelines"
           get_active() {
             curl -sf --max-time 15 "$health_url" 2>/dev/null \
-              | node -e "let s='';process.stdin.on('data',c=>s+=c);process.stdin.on('end',()=>{try{const j=JSON.parse(s);if(typeof j.active==='number')process.stdout.write(String(j.active));}catch{}});" \
+              | node -e "let s='';process.stdin.on('data',c=>s+=c);process.stdin.on('end',()=>{try{const j=JSON.parse(s);const p=Array.isArray(j.pipelines)?j.pipelines:null;if(p)process.stdout.write(String(p.filter(x=>x&&x.interrupted!==true).length));}catch{}});" \
               || echo ""
+          }
+          # Called from both the fetch-failure and no-marker paths: a flaky Fly
+          # log API is plausibly correlated with a busy host, so the one case
+          # where extending is most defensible must not skip the check.
+          maybe_extend() {
+            [ "$SECONDS" -ge "$deadline" ] || return 0
+            cap=$((started + max_window))
+            [ "$SECONDS" -lt "$cap" ] || return 0
+            last_active="$(get_active)"
+            [ -n "$last_active" ] && [ "$last_active" != "0" ] || return 0
+            deadline=$((SECONDS + 120))
+            # Never overshoot the cap -- otherwise "hard cap ${max_window}s" in
+            # the log line is a lie by up to one full extension.
+            [ "$deadline" -le "$cap" ] || deadline=$cap
+            busy_extensions=$((busy_extensions + 1))
+            echo "Reviewer host reports ${last_active} live pipeline(s); extending the wait (extension #${busy_extensions}, hard cap ${max_window}s total)."
           }
           while [ "$SECONDS" -lt "$deadline" ]; do
             attempt=$((attempt + 1))
@@ -323,6 +350,7 @@ jobs:
               fetch_failures=$((fetch_failures + 1))
               echo "flyctl logs fetch failed (attempt ${attempt}); retrying in 10s..."
               sleep 10
+              maybe_extend
               continue
             fi
             marker_line="$(grep -E 'PR_REVIEW_RESULT:[[:space:]]*\{' all-logs.txt \
@@ -335,14 +363,7 @@ jobs:
             echo "No marker yet for SHA ${HEAD_SHA} (attempt ${attempt}); waiting 10s for Fly log propagation..."
             sleep 10
             # About to give up? Ask whether the shared host is still busy first.
-            if [ "$SECONDS" -ge "$deadline" ] && [ $((SECONDS - started)) -lt "$max_window" ]; then
-              last_active="$(get_active)"
-              if [ -n "$last_active" ] && [ "$last_active" != "0" ]; then
-                deadline=$((SECONDS + 120))
-                busy_extensions=$((busy_extensions + 1))
-                echo "Reviewer host reports ${last_active} active pipeline(s); extending the wait by 120s (extension #${busy_extensions}, hard cap ${max_window}s)."
-              fi
-            fi
+            maybe_extend
           done
           if [ -z "$marker_line" ]; then
             # This is a retrieval timeout, NOT a review verdict. Say so plainly:
@@ -391,25 +412,40 @@ jobs:
               echo "**This is not a review verdict.** The reviewer did not report FAIL -- this"
               echo "diff was not judged by this run. Re-run the Review Gate workflow to retry."
               echo
-              echo "This run is being cancelled rather than failed so the checks list shows it"
-              echo "as \`cancelled\` (incomplete), not \`failure\` (rejected). It is still not a pass."
+              echo "The checks list carries a separate \`review-verdict-unavailable\` entry for"
+              echo "this commit. That entry -- not the red \`review\` row -- is what happened here."
             } > timeout-comment.md
             gh pr comment "$PR_NUMBER" --repo "$REPO" --body-file timeout-comment.md \
               || echo "::warning::Could not post the no-verdict comment to PR #${PR_NUMBER}."
 
-            # Cancel our own run so the check concludes `cancelled` (grey, and
-            # treated as failing wherever required-status-check rules apply)
-            # instead of `failure` (red, indistinguishable from a FAIL verdict).
-            if gh api -X POST "repos/${REPO}/actions/runs/${RUN_ID}/cancel"; then
-              echo "Cancellation requested; waiting for GitHub to terminate this run."
-              # If cancellation lands, the runner kills us here. The sleep is the
-              # grace period; falling through means it did NOT land, so we still
-              # exit non-zero -- an unread verdict must never look like a pass.
-              sleep 60
-              echo "::warning::Cancellation did not take effect; failing this run instead." >&2
-            else
-              echo "::warning::Could not cancel this run (actions: write may be unavailable); failing instead." >&2
-            fi
+            # Publish a separately-NAMED check run so the checks list itself
+            # distinguishes "couldn't read a verdict" from "reviewer said FAIL".
+            #
+            # Why a distinct name rather than concluding this job as `neutral`
+            # or `cancelled`:
+            #  - a step cannot set its own job's conclusion to `neutral`, and
+            #    `neutral` counts as PASSING for required status checks, so it
+            #    could later read as approval;
+            #  - `cancelled` is already taken. This workflow sets
+            #    `cancel-in-progress: true`, so a grey `cancelled` row already
+            #    means "superseded by a newer push" -- routine and ignorable.
+            #    Reusing it would move the ambiguity, not remove it.
+            # A distinct name collides with nothing and says what happened.
+            gh api -X POST "repos/${REPO}/check-runs" \
+              -f name='review-verdict-unavailable' \
+              -f head_sha="$HEAD_SHA" \
+              -f status='completed' \
+              -f conclusion='neutral' \
+              -f 'output[title]=No review verdict could be read (not a rejection)' \
+              -f "output[summary]=The reviewer's result marker for ${HEAD_SHA} did not appear within ~${waited}s (${attempt} polls, ${busy_extensions} busy-host extensions). The reviewer did not report FAIL -- this diff was not judged by this run. Re-run the Review Gate workflow to retry." \
+              > /dev/null \
+              || echo "::warning::Could not publish the review-verdict-unavailable check run."
+
+            # The `review` job itself still FAILS. A verdict we could not read is
+            # never permission to merge, and this repo has no required-status-check
+            # rule to fall back on -- red is the only thing that reliably reads as
+            # "not ready". The comment and the named check run above are what tell
+            # a human that the red row is a retrieval failure, not a rejection.
             exit 1
           fi
           review_json="$(printf '%s\n' "$marker_line" | sed -E 's/^.*PR_REVIEW_RESULT:[[:space:]]*//')"
