@@ -15,6 +15,17 @@ concurrency:
 permissions:
   contents: read
   pull-requests: write
+  # `checks: write` lets the timeout path publish a distinctly-named
+  # `review-verdict-unavailable` check run, so an unread verdict is visibly
+  # different from a FAIL verdict in the checks list rather than only in the
+  # job log. See "Read review result from logs".
+  #
+  # That check is published as `neutral`, which review-gate-automerge.yml
+  # treats as OK (its `okConclusions` set). That is deliberate: while a
+  # timeout is the CURRENT state the `review` job itself concludes `failure`,
+  # which does block automerge; once a re-run reads a verdict the stale row is
+  # retired. A leftover "we couldn't read it then" must not block forever.
+  checks: write
 
 jobs:
   review:
@@ -258,6 +269,8 @@ jobs:
           FLY_APP_NAME: ${{ secrets.FLY_APP_NAME }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
           # Extract the PR_REVIEW_RESULT marker for THIS PR head SHA from the
@@ -281,11 +294,75 @@ jobs:
           # a red gate (#282). A longer wait costs nothing when the marker lands
           # early (we break immediately) and each spurious failure costs a full
           # reviewer pass off the weekly Claude allowance on re-trigger.
+          #
+          # The window also ADAPTS. The reviewer shares one Fly machine with the
+          # live notes/generate pipelines, so "no marker yet" is very often
+          # "the host is busy", not "the review failed" (#324: a 600s timeout
+          # while `/health/pipelines` reported active=1 for a NUM 26 run, while
+          # two sibling PRs opened minutes earlier both passed in 4-7m). Before
+          # giving up we ask the bot whether it is still working; if it is, we
+          # keep waiting up to a hard cap instead of declaring a timeout.
           poll_window=600
+          max_window=1800
+          started=$SECONDS
           deadline=$((SECONDS + poll_window))
           marker_line=""
           attempt=0
           fetch_failures=0
+          busy_extensions=0
+          last_active=""
+          # Same host the reviewer runs on; the health endpoint reports which
+          # pipelines are currently checkpointed as running.
+          #
+          # Two caveats, both deliberate:
+          #  - This probe is NOT read-only. fly.toml sets auto_start_machines,
+          #    so hitting the endpoint can wake the (now RUN_MODE=hourly)
+          #    machine. deploy.yml already polls the same endpoint, and a fresh
+          #    process still reports the volume-persisted checkpoints, so the
+          #    answer stays usable.
+          #  - We count only pipelines with `interrupted !== true`, not the
+          #    top-level `active`. `active` includes stale `running` checkpoints
+          #    left behind by a crashed pipeline, which would buy a dead
+          #    reviewer the full 30-minute extension budget for nothing.
+          #
+          # And we discard the reading entirely when `processStartedAt` is newer
+          # than this step, which closes a feedback loop the probe would
+          # otherwise create: probe wakes the machine -> woken machine begins an
+          # hourly run -> endpoint reports a live pipeline -> we extend, citing
+          # work our own probe started. The reviewer we are waiting on exited
+          # before this step began, so a process younger than the step is by
+          # definition not it.
+          health_url="https://${FLY_APP_NAME}.fly.dev/health/pipelines"
+          probe_epoch="$(date +%s)"
+          get_active() {
+            curl -sf --max-time 15 "$health_url" 2>/dev/null \
+              | node -e "let s='';process.stdin.on('data',c=>s+=c);process.stdin.on('end',()=>{try{const j=JSON.parse(s);const started=Date.parse(j.processStartedAt||'')/1000;if(Number.isFinite(started)&&started>Number(process.argv[1]))return;const p=Array.isArray(j.pipelines)?j.pipelines:null;if(p)process.stdout.write(String(p.filter(x=>x&&x.interrupted!==true).length));}catch{}});" \
+                "$probe_epoch" \
+              || echo ""
+          }
+          # Called from both the fetch-failure and no-marker paths: a flaky Fly
+          # log API is plausibly correlated with a busy host, so the one case
+          # where extending is most defensible must not skip the check.
+          maybe_extend() {
+            [ "$SECONDS" -ge "$deadline" ] || return 0
+            cap=$((started + max_window))
+            [ "$SECONDS" -lt "$cap" ] || return 0
+            last_active="$(get_active)"
+            if [ -z "$last_active" ]; then
+              # Distinguish "probe is broken" from "host is idle" -- otherwise a
+              # permanently wrong health URL would silently disable the adaptive
+              # window and look exactly like an idle host.
+              echo "Health probe returned no usable reading (${health_url}); not extending."
+              return 0
+            fi
+            [ "$last_active" != "0" ] || return 0
+            deadline=$((SECONDS + 120))
+            # Never overshoot the cap -- otherwise "hard cap ${max_window}s" in
+            # the log line is a lie by up to one full extension.
+            [ "$deadline" -le "$cap" ] || deadline=$cap
+            busy_extensions=$((busy_extensions + 1))
+            echo "Reviewer host reports ${last_active} live pipeline(s); extending the wait (extension #${busy_extensions}, hard cap ${max_window}s total)."
+          }
           while [ "$SECONDS" -lt "$deadline" ]; do
             attempt=$((attempt + 1))
             # Don't swallow the fetch status: a run of failed `flyctl logs` calls
@@ -296,6 +373,7 @@ jobs:
               fetch_failures=$((fetch_failures + 1))
               echo "flyctl logs fetch failed (attempt ${attempt}); retrying in 10s..."
               sleep 10
+              maybe_extend
               continue
             fi
             marker_line="$(grep -E 'PR_REVIEW_RESULT:[[:space:]]*\{' all-logs.txt \
@@ -307,6 +385,8 @@ jobs:
             fi
             echo "No marker yet for SHA ${HEAD_SHA} (attempt ${attempt}); waiting 10s for Fly log propagation..."
             sleep 10
+            # About to give up? Ask whether the shared host is still busy first.
+            maybe_extend
           done
           if [ -z "$marker_line" ]; then
             # This is a retrieval timeout, NOT a review verdict. Say so plainly:
@@ -315,8 +395,9 @@ jobs:
             # snapshot -- often another PR's review text -- read as though the
             # gate had reviewed the wrong PR and failed it. It had not, and it
             # cannot: the match above is scoped on this PR's head SHA.
+            waited=$((SECONDS - started))
             {
-              echo "TIMEOUT reading the review result: no PR_REVIEW_RESULT marker for SHA ${HEAD_SHA} appeared in the Fly log snapshot within ~${poll_window}s (${attempt} attempts, ${fetch_failures} failed log fetches)."
+              echo "TIMEOUT reading the review result: no PR_REVIEW_RESULT marker for SHA ${HEAD_SHA} appeared in the Fly log snapshot within ~${waited}s (${attempt} attempts, ${fetch_failures} failed log fetches, ${busy_extensions} busy-host extensions; last reported active pipelines: ${last_active:-<unknown>})."
               echo
               echo "This is NOT a review verdict. The reviewer did not report FAIL --"
               echo "no verdict for this commit could be read at all. Re-run this workflow"
@@ -336,8 +417,85 @@ jobs:
                   | sed 's/^/  /' || echo "  (none)"
               fi
             } >&2
+
+            # Leave the explanation where a human will actually see it. The
+            # careful paragraph above only exists inside the job log, which is
+            # why a busy-host timeout kept reading as "your code was rejected".
+            {
+              echo "<!-- bp-review-gate -->"
+              echo "## Remote Review Gate -- no verdict available"
+              echo
+              echo "- Decision: **UNKNOWN (not a rejection)**"
+              echo "- Commit: ${HEAD_SHA}"
+              echo
+              echo "The reviewer's result marker for this commit could not be read within"
+              echo "~${waited}s (${attempt} polls, ${busy_extensions} extensions while the shared"
+              echo "reviewer host reported active pipelines; last reported active: ${last_active:-unknown})."
+              echo
+              echo "**This is not a review verdict.** The reviewer did not report FAIL -- this"
+              echo "diff was not judged by this run. Re-run the Review Gate workflow to retry."
+              echo
+              echo "The checks list carries a separate \`review-verdict-unavailable\` entry for"
+              echo "this commit. That entry -- not the red \`review\` row -- is what happened here."
+            } > timeout-comment.md
+            gh pr comment "$PR_NUMBER" --repo "$REPO" --body-file timeout-comment.md \
+              || echo "::warning::Could not post the no-verdict comment to PR #${PR_NUMBER}."
+
+            # Publish a separately-NAMED check run so the checks list itself
+            # distinguishes "couldn't read a verdict" from "reviewer said FAIL".
+            #
+            # Why a distinct name rather than concluding this job as `neutral`
+            # or `cancelled`:
+            #  - a step cannot set its own job's conclusion to `neutral`, and
+            #    `neutral` counts as PASSING for required status checks, so it
+            #    could later read as approval;
+            #  - `cancelled` is already taken. This workflow sets
+            #    `cancel-in-progress: true`, so a grey `cancelled` row already
+            #    means "superseded by a newer push" -- routine and ignorable.
+            #    Reusing it would move the ambiguity, not remove it.
+            # A distinct name collides with nothing and says what happened.
+            # Upsert, not blind create: the timeout message tells you to re-run,
+            # so the same SHA timing out twice is the expected case, and blindly
+            # POSTing would stack duplicate rows -- undercutting the very
+            # legibility this is meant to buy.
+            existing_id="$(gh api "repos/${REPO}/commits/${HEAD_SHA}/check-runs?check_name=review-verdict-unavailable" \
+              --jq '.check_runs[0].id // empty' 2>/dev/null || true)"
+            if [ -n "$existing_id" ]; then
+              upsert=(-X PATCH "repos/${REPO}/check-runs/${existing_id}")
+            else
+              upsert=(-X POST "repos/${REPO}/check-runs" -f name='review-verdict-unavailable' -f head_sha="$HEAD_SHA")
+            fi
+            gh api "${upsert[@]}" \
+              -f status='completed' \
+              -f conclusion='neutral' \
+              -f 'output[title]=No review verdict could be read (not a rejection)' \
+              -f "output[summary]=The reviewer's result marker for ${HEAD_SHA} did not appear within ~${waited}s (${attempt} polls, ${busy_extensions} busy-host extensions). The reviewer did not report FAIL -- this diff was not judged by this run. Re-run the Review Gate workflow to retry." \
+              > /dev/null \
+              || echo "::warning::Could not publish the review-verdict-unavailable check run."
+
+            # The `review` job itself still FAILS. A verdict we could not read is
+            # never permission to merge, and this repo has no required-status-check
+            # rule to fall back on -- red is the only thing that reliably reads as
+            # "not ready". The comment and the named check run above are what tell
+            # a human that the red row is a retrieval failure, not a rejection.
             exit 1
           fi
+          # A verdict was read. If an earlier attempt on this same SHA left a
+          # `review-verdict-unavailable` row behind, retire it -- otherwise a
+          # stale "no verdict" entry sits next to a green review forever and
+          # says the opposite of what is now true.
+          stale_id="$(gh api "repos/${REPO}/commits/${HEAD_SHA}/check-runs?check_name=review-verdict-unavailable" \
+            --jq '.check_runs[0].id // empty' 2>/dev/null || true)"
+          if [ -n "$stale_id" ]; then
+            gh api -X PATCH "repos/${REPO}/check-runs/${stale_id}" \
+              -f status='completed' \
+              -f conclusion='success' \
+              -f 'output[title]=Resolved: a verdict was read on a later attempt' \
+              -f "output[summary]=A PR_REVIEW_RESULT marker for ${HEAD_SHA} was read successfully. See the \`review\` check for the actual verdict." \
+              > /dev/null \
+              || echo "::warning::Could not retire the stale review-verdict-unavailable check run."
+          fi
+
           review_json="$(printf '%s\n' "$marker_line" | sed -E 's/^.*PR_REVIEW_RESULT:[[:space:]]*//')"
           printf '%s\n' "$review_json" > review-result.json
           decision="$(node -e "const fs=require('fs'); const d=JSON.parse(fs.readFileSync('review-result.json','utf8')); process.stdout.write(String(d.decision||''));")"
