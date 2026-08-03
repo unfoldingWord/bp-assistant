@@ -363,16 +363,25 @@ async function fetchUpstreamIds(book) {
 // ONE definition — a repair gate that disagreed with the detector could "fix" a
 // note into text the checker still flags, or vice versa.
 //
-// Measured against the 215 published golden notes (JOS 1/3, MAL 1, NAM 1):
-// 1 false positive total (NAM 1 "tell his readers to actually look").
+// Measured against 368 PUBLISHED notes — the 215 golden ones (JOS 1/3, MAL 1,
+// NAM 1) plus the 153 in tn_OBA: zero false positives.
+//
+// Two patterns were tried and REMOVED, because they match canonical published
+// translationNotes prose. Do not reintroduce them:
+//   - a bare /\bactually\b/ hit "tell his readers to actually look" (NAM 1:15)
+//     and "higher than it is actually possible for humans to live" (OBA 1:4).
+//   - /this is (a|an) ...(metaphor|idiom|...)/ hit four Obadiah notes whose
+//     standard wording is exactly "This is an idiom that means..." and "This is
+//     a metaphor that pictures...". That pattern alone flagged 3.3% of a
+//     published book, and since the repair pass deletes what it flags, it would
+//     have stripped the explanatory opening out of correct notes.
+// The real MIC 5:7 leak is still caught twice over, by the self-correction and
+// sub-type-name patterns.
 const SELF_TALK_PATTERNS = [
   [/\bwait,?\s*(actually|no|sorry|hold on)\b/i, 'self-correction ("wait, actually...")'],
-  [/\bactually\b/i, 'deliberation marker ("actually")'],
   [/\b(let me|i think|hmm|on second thought|my mistake)\b/i, 'first-person deliberation'],
   [/\bthe (template|issue type|sref)\b/i, 'internal pipeline jargon'],
   [/\b(combine|repetition|generic|poetry) type\b/i, 'template sub-type name leaked'],
-  [/\bthis is (a|an) [a-z-]*(parallelism|metaphor|metonymy|idiom|hyperbole|euphemism)\b/i,
-    'note labels its own issue type instead of using the template'],
 ];
 
 /**
@@ -382,6 +391,41 @@ const SELF_TALK_PATTERNS = [
  * Bolded verse quotes and bracketed alternate translations are stripped before
  * matching — real verse text legitimately contains first-person pronouns.
  */
+/**
+ * Extract a template's first fixed phrase — the longest leading run of literal
+ * words before any placeholder. Used both by check 25 (template conformance)
+ * and by the repair gate in notes-pipeline.js, which must agree on what
+ * "the note still follows its template" means.
+ *
+ * Returns null when the template yields no phrase longer than 15 chars.
+ */
+function templateFirstPhrase(templateText) {
+  if (!templateText) return null;
+  const cleaned = String(templateText)
+    .replace(/Alternate translation:.*$/i, '')
+    .replace(/\*\*[^*]+\*\*/g, '\x00')   // **bold** placeholder positions
+    .replace(/\b[A-Z]{2,}\b/g, '\x00');  // ALL-CAPS placeholder positions
+  return cleaned
+    .split('\x00')
+    .map(s => s.trim().replace(/\s+/g, ' '))
+    .find(s => s.length > 15) || null;
+}
+
+/**
+ * Resolve the template for a note, falling back to the sref's single template
+ * when the writer packet carries none. Mirrors check 25's fallback rule: the
+ * fallback applies ONLY when the sref has exactly one template, since picking
+ * the first of several pulls in a different sub-type's wording.
+ */
+function resolveTemplateText(prepItem, sref) {
+  const direct = prepItem?.writer_packet?.template_text || prepItem?.template_text || '';
+  if (direct) return direct;
+  const slug = sref ? (String(sref).match(/translate\/([^\s;,]+)/) || [])[1] : '';
+  if (!slug) return '';
+  const tpls = loadTemplateMap().get(slug);
+  return tpls && tpls.length === 1 ? tpls[0].template : '';
+}
+
 function detectSelfTalk(noteText) {
   const prose = String(noteText || '')
     .replace(/\*\*[^*]+\*\*/g, ' ')   // bolded verse quotes
@@ -896,17 +940,10 @@ async function checkTnQuality({ tsvPath, preparedJson, ultUsfm, ustUsfm, book, h
         if (tpls25 && tpls25.length === 1) templateText = tpls25[0].template;
       }
       if (templateText) {
-        // Extract the first fixed phrase from the template (between start/placeholder boundaries)
-        // Strip AT, bold placeholders, and split on ALL-CAPS words
-        const cleaned = templateText
-          .replace(/Alternate translation:.*$/i, '')
-          .replace(/\*\*[^*]+\*\*/g, '\x00')  // mark **bold** placeholder positions
-          .replace(/\b[A-Z]{2,}\b/g, '\x00');  // mark ALL-CAPS placeholder positions
-        // Split on placeholder markers and take the first substantial segment
-        const firstPhrase = cleaned
-          .split('\x00')
-          .map(s => s.trim().replace(/\s+/g, ' '))
-          .find(s => s.length > 15);
+        // Shared with the repair gate in notes-pipeline.js — see
+        // templateFirstPhrase above. Both must agree on what "follows the
+        // template" means.
+        const firstPhrase = templateFirstPhrase(templateText);
         if (firstPhrase) {
           templateFirstPhrase = firstPhrase;
           // Strip bold and brackets from note for comparison
@@ -1055,6 +1092,8 @@ module.exports = {
   validateTnTsv,
   checkTnQuality,
   detectSelfTalk,
+  templateFirstPhrase,
+  resolveTemplateText,
   parseHebrewVerseWords,
   normalizeHebrewQuote,
 };

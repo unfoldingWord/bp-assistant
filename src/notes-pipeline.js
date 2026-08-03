@@ -19,7 +19,7 @@ const { resolveAutoModel } = require('./api-runner/provider-config');
 const { getDoor43Username, emailToFallbackUsername, buildBranchName, resolveOutputFile, discoverFreshOutput, checkPrerequisites, calcSkillTimeout, normalizeBookName, resolveConflictMention, parsePartialTsv, truncatePartialTsv, parseChunkRange, isUsageLimitError, CSKILLBP_DIR } = require('./pipeline-utils');
 const { splitTsv, fixTrailingNewlines } = require('./workspace-tools/tsv-tools');
 const { fillTsvIds, generateIds, prepareNotes, fillOrigQuotes, resolveGlQuotes, flagNarrowQuotes, extractAlignmentData, prepareATContext, substituteAT, fixUnicodeQuotes, verifyBoldMatches, syncCanonicalHebrewQuotes, applyHintsToPreparedNotes, _stripAlternateTranslation: stripAlternateTranslation } = require('./workspace-tools/tn-tools');
-const { checkTnQuality, detectSelfTalk } = require('./workspace-tools/quality-tools');
+const { checkTnQuality, detectSelfTalk, templateFirstPhrase, resolveTemplateText } = require('./workspace-tools/quality-tools');
 const { normalizeIssuesFile, buildParallelismIntroHintArgs } = require('./issue-normalizer');
 const { curlyQuotes } = require('./workspace-tools/usfm-tools');
 const { verifyRepoPush, verifyDcsToken } = require('./repo-verify');
@@ -1015,12 +1015,38 @@ async function repairSelfTalkNotes({ notesPath, pipeDir, status, ref }) {
 
   await status(`Repairing **${flaggedIds.length} note(s)** flagged for self-talk in ${ref}...`);
 
+  // Cap the fan-out. Notes are repaired one LLM call each, so a pathological
+  // chapter (PSA 119, or a chapter where the patterns cluster) could otherwise
+  // add many minutes inside the pipeline and collide with the deploy guard's
+  // running-checkpoint window. Anything over the cap is tagged for an editor
+  // rather than silently ignored.
+  const REPAIR_CAP = 25;
+  const overflowIds = flaggedIds.slice(REPAIR_CAP);
+  const workIds = flaggedIds.slice(0, REPAIR_CAP);
+  if (overflowIds.length > 0) {
+    const msg = `Self-talk repair cap reached for ${ref}: repairing ${workIds.length} of ${flaggedIds.length} flagged note(s); ${overflowIds.length} tagged for editor review instead`;
+    console.warn(`[notes] ${msg}`);
+    await status(msg);
+  }
+
   const results = { repaired: 0, kept: 0 };
   const tagsToApply = new Map();
+  const repairedText = new Map();
+  for (const id of overflowIds) tagsToApply.set(id, 'ISSUE:SELF_TALK');
 
-  for (const id of flaggedIds) {
+  async function repairOne(id) {
     const original = generatedNotes[id];
-    if (!original) { results.kept++; continue; }
+    if (!original) {
+      // Chapter-intro rows (and any note whose generation failed) live in
+      // prepared.intro_rows, never in generated_notes.json — there is nothing
+      // here to rewrite. Tag it so the row still carries a Door43-visible
+      // signal instead of vanishing. Intro rows are long, multi-paragraph
+      // prose, i.e. the most likely preamble_paragraph target.
+      results.kept++;
+      tagsToApply.set(id, 'ISSUE:SELF_TALK');
+      console.warn(`[notes] Self-talk flagged for ${id} but it has no generated text (intro row or failed generation) — tagged, not repaired`);
+      return;
+    }
 
     // The AT was appended by the AT stage and is validated separately — repair
     // only the prose and re-attach the AT verbatim so this cannot disturb it.
@@ -1030,16 +1056,24 @@ async function repairSelfTalkNotes({ notesPath, pipeDir, status, ref }) {
 
     const item = preparedById.get(id) || {};
     const packet = item.writer_packet || {};
-    const templateText = packet.template_text || '';
+    // Fall back to the sref's template when the writer packet carries none —
+    // otherwise the gate below silently loses its strongest check on exactly
+    // the notes whose flag is least trustworthy.
+    const templateText = resolveTemplateText(item, item.sref || packet.sref);
 
     const repairPrompt = [
       'The note below was generated for Bible translators, but it contains the',
       'model\'s own reasoning or commentary mixed in with the note text.',
       '',
-      'Remove everything that is not note text: deliberation, self-correction,',
-      'labels naming the figure of speech, and any internal template vocabulary.',
-      'Keep the note\'s wording otherwise intact — do NOT rewrite the explanation,',
-      'add new content, or change the translation advice.',
+      'Remove only the deliberation: thinking aloud, self-correction ("wait,',
+      'actually..."), and internal pipeline vocabulary (template sub-type names',
+      'like "combine type", "issue type", "sref").',
+      '',
+      'Keep the note\'s explanation intact. In particular, KEEP standard',
+      'translationNotes phrasing such as "This is an idiom that means..." or',
+      '"This is a metaphor that pictures..." — that is correct note wording, not',
+      'commentary. Do NOT rewrite the explanation, add new content, or change the',
+      'translation advice.',
       '',
       templateText ? `TEMPLATE THE NOTE MUST FOLLOW: "${templateText}"` : '',
       `GL_QUOTE: ${packet.gl_quote || item.gl_quote || ''}`,
@@ -1080,61 +1114,76 @@ async function repairSelfTalkNotes({ notesPath, pipeDir, status, ref }) {
       tagsToApply.set(id, 'ISSUE:SELF_TALK');
     };
 
-    if (!rewrite) { reject('empty rewrite'); continue; }
-    if (rewrite.length > prose.length) { reject('rewrite longer than original'); continue; }
-    if (detectSelfTalk(rewrite)) { reject('rewrite still reads as self-talk'); continue; }
+    if (!rewrite) return reject('empty rewrite');
+    if (rewrite.length > prose.length) return reject('rewrite longer than original');
+    if (detectSelfTalk(rewrite)) return reject('rewrite still reads as self-talk');
     if (templateText) {
       // The template's first fixed phrase must survive, or the model rewrote
-      // rather than trimmed.
-      const cleanedTpl = templateText
-        .replace(/Alternate translation:.*$/i, '')
-        .replace(/\*\*[^*]+\*\*/g, '\x00')
-        .replace(/\b[A-Z]{2,}\b/g, '\x00');
-      const firstPhrase = cleanedTpl.split('\x00').map(s => s.trim().replace(/\s+/g, ' ')).find(s => s.length > 15);
+      // rather than trimmed. Shared with check 25 so the two cannot disagree.
+      const firstPhrase = templateFirstPhrase(templateText);
       if (firstPhrase) {
         const stripped = rewrite.replace(/\*\*[^*]+\*\*/g, ' ').replace(/\s+/g, ' ').toLowerCase();
-        if (!stripped.includes(firstPhrase.toLowerCase())) { reject('template phrase missing from rewrite'); continue; }
+        if (!stripped.includes(firstPhrase.toLowerCase())) return reject('template phrase missing from rewrite');
       }
     }
 
+    repairedText.set(id, `${rewrite}${originalAt}`);
     generatedNotes[id] = `${rewrite}${originalAt}`;
     results.repaired++;
     console.log(`[notes] Self-talk repaired for ${id} (${prose.length} -> ${rewrite.length} chars)`);
+  }
+
+  // Bounded concurrency, matching the AT stage's limiter rather than running
+  // these serially.
+  const REPAIR_CONCURRENCY = 5;
+  for (let i = 0; i < workIds.length; i += REPAIR_CONCURRENCY) {
+    await Promise.all(workIds.slice(i, i + REPAIR_CONCURRENCY).map(id => repairOne(id)));
   }
 
   if (results.repaired === 0 && tagsToApply.size === 0) return null;
 
   fs.writeFileSync(genPath, JSON.stringify(generatedNotes, null, 2));
 
-  // Re-assemble so the TSV carries the repaired text.
-  if (results.repaired > 0 && notesPath) {
-    const { assembleNotes } = require('./workspace-tools/tn-tools');
-    assembleNotes({
-      preparedJson: ctx.runtime.preparedNotes,
-      generatedJson: ctx.runtime.generatedNotes,
-      output: notesPath,
-    });
-  }
-
-  // Tag rows we could not repair so an editor sees them on Door43.
-  if (tagsToApply.size > 0 && notesPath) {
+  // Patch the TSV in place — do NOT re-assemble.
+  //
+  // assembleNotes rebuilds the file from prepared+generated JSON and writes the
+  // Tags column empty, so it would erase the AT stage's `at-fit` tags (which
+  // live only in the TSV) and revert postProcessNotesTsv's in-place curly-quote
+  // and bold fixes. The recheck would then report quote errors that did not
+  // exist a moment earlier. Editing just the Note cell of the affected rows
+  // keeps every other column and every prior pass intact.
+  if (notesPath && (repairedText.size > 0 || tagsToApply.size > 0)) {
     const absNotes = path.resolve(CSKILLBP_DIR, notesPath);
     if (fs.existsSync(absNotes)) {
       const lines = fs.readFileSync(absNotes, 'utf8').split('\n');
       for (let i = 1; i < lines.length; i++) {
         if (!lines[i].trim()) continue;
         const cols = lines[i].split('\t');
-        const tag = tagsToApply.get(cols[1] || '');
+        const id = cols[1] || '';
+        let touched = false;
+
+        const newNote = repairedText.get(id);
+        if (newNote != null && cols.length >= 7) {
+          // Preserve any trailing \r from CRLF line endings, which lives on the
+          // end of the final (Note) column.
+          const cr = /\r$/.test(cols[6]) ? '\r' : '';
+          cols[6] = newNote + cr;
+          touched = true;
+        }
+
+        const tag = tagsToApply.get(id);
         if (tag && !(cols[2] || '').includes(tag)) {
           cols[2] = cols[2] ? `${cols[2]}, ${tag}` : tag;
-          lines[i] = cols.join('\t');
+          touched = true;
         }
+
+        if (touched) lines[i] = cols.join('\t');
       }
       fs.writeFileSync(absNotes, lines.join('\n'));
     }
   }
 
-  const summary = `Self-talk repair: ${results.repaired} repaired, ${results.kept} kept and tagged`;
+  const summary = `Self-talk repair: ${results.repaired} repaired, ${results.kept} kept and tagged for editor review`;
   console.log(`[notes] ${summary}`);
   return summary;
 }
