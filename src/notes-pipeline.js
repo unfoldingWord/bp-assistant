@@ -3076,6 +3076,9 @@ async function notesPipeline(route, message) {
         await status(`Repo verify FAILED for ${ref} (push reported no changes): ${contentOnly.details}`);
         console.warn(`[notes] noChanges content verify failed for ${ref}: ${contentOnly.details}`);
         chapterFailed = true;
+      } else if (contentOnly.inconclusive || contentOnly.shortfall) {
+        await status(`Repo verify INCONCLUSIVE for ${ref} (push reported no changes): ${contentOnly.details}`);
+        console.warn(`[notes] noChanges content verify inconclusive for ${ref}: ${contentOnly.details}`);
       } else {
         await status(`Repo verify OK for ${ref} (no changes needed): ${contentOnly.details}`);
       }
@@ -3089,6 +3092,9 @@ async function notesPipeline(route, message) {
         await status(`Repo verify FAILED for ${ref}: ${verify.details}`);
         console.warn(`[notes] Repo verify failed for ${ref}: ${verify.details}`);
         chapterFailed = true;
+      } else if (verify.inconclusive || verify.shortfall || verify.contentSkipped) {
+        await status(`Repo verify PARTIAL for ${ref}: ${verify.details}`);
+        console.warn(`[notes] Repo verify partial for ${ref}: ${verify.details}`);
       } else {
         await status(`Repo verify OK for ${ref}: ${verify.details}`);
       }

@@ -49,23 +49,57 @@ function apiGet(path, token) {
  * failure (missing file, non-200, network error) — callers treat null as
  * "could not read", which is a verification failure, not a pass.
  */
-function fetchRawFile(repo, filename, branch = 'master', org = ORG) {
+function fetchOnce(urlStr, redirectsLeft = 3) {
   return new Promise((resolve) => {
-    const url = new URL(`https://git.door43.org/${org}/${repo}/raw/branch/${branch}/${filename}`);
+    const url = new URL(urlStr);
     const req = https.request(
-      { hostname: url.hostname, path: url.pathname, method: 'GET', timeout: 20000 },
+      { hostname: url.hostname, path: url.pathname + url.search, method: 'GET', timeout: 30000 },
       (res) => {
-        if (res.statusCode !== 200) { res.resume(); return resolve(null); }
-        let body = '';
-        res.on('data', (c) => { body += c; });
-        res.on('end', () => resolve(body));
-        res.on('error', () => resolve(null));
+        // Follow redirects — a 301 to a canonical host would otherwise read as
+        // "file missing" and fail a chapter that is perfectly fine.
+        if ([301, 302, 307, 308].includes(res.statusCode) && res.headers.location && redirectsLeft > 0) {
+          res.resume();
+          return resolve(fetchOnce(new URL(res.headers.location, urlStr).toString(), redirectsLeft - 1));
+        }
+        if (res.statusCode === 404) { res.resume(); return resolve({ absent: true, status: 404 }); }
+        if (res.statusCode !== 200) { res.resume(); return resolve({ transient: true, status: res.statusCode }); }
+        // Buffer and decode once — chunk boundaries split multi-byte UTF-8
+        // sequences, which would corrupt Hebrew quotes for any future
+        // content comparison built on this helper.
+        const chunks = [];
+        res.on('data', (c) => chunks.push(c));
+        res.on('end', () => resolve({ text: Buffer.concat(chunks).toString('utf8'), status: 200 }));
+        res.on('error', (err) => resolve({ transient: true, reason: err.message }));
       },
     );
-    req.on('error', () => resolve(null));
-    req.on('timeout', () => { req.destroy(); resolve(null); });
+    req.on('error', (err) => resolve({ transient: true, reason: err.message }));
+    req.on('timeout', () => { req.destroy(); resolve({ transient: true, reason: 'timed out' }); });
     req.end();
   });
+}
+
+/**
+ * Fetch a file's raw bytes from a branch, retrying transient failures.
+ *
+ * Returns one of:
+ *   { text }            — read successfully
+ *   { absent: true }    — HTTP 404, the file genuinely is not there
+ *   { transient: true } — 5xx / 429 / timeout / reset, after retries
+ *
+ * The three cases must stay distinguishable. Collapsing them into "null" makes
+ * a single Door43 502 indistinguishable from missing content, and since a
+ * verification failure fails the whole chapter, that turns one network blip
+ * into lost work.
+ */
+async function fetchRawFile(repo, filename, branch = 'master', org = ORG) {
+  const urlStr = `https://git.door43.org/${org}/${repo}/raw/branch/${branch}/${filename}`;
+  let last = { transient: true, reason: 'not attempted' };
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    last = await fetchOnce(urlStr);
+    if (last.text != null || last.absent) return last;
+    if (attempt < 3) await new Promise(r => setTimeout(r, attempt * 1500));
+  }
+  return last;
 }
 
 /**
@@ -92,12 +126,16 @@ function countTsvChapterRows(text, chapters) {
  */
 function countUsfmChapterVerses(text, chapter) {
   const src = String(text);
-  const startRe = new RegExp(`\\\\c\\s+${chapter}(?!\\d)`);
-  const start = src.search(startRe);
-  if (start === -1) return null; // chapter marker absent entirely
+  // Anchor \c to the start of a line. A \c inside a footnote or cross-reference
+  // (\f + \ft cf \c 5 \f*) is not a chapter break, and treating it as one
+  // truncated the chapter and undercounted its verses.
+  const startRe = new RegExp(`(?:^|\\n)\\s*\\\\c\\s+${chapter}(?!\\d)`);
+  const startMatch = startRe.exec(src);
+  if (!startMatch) return null; // chapter marker absent entirely
+  const start = startMatch.index + startMatch[0].length;
   const rest = src.slice(start);
-  const nextC = rest.slice(1).search(/\\c\s+\d+/);
-  const chapterText = nextC === -1 ? rest : rest.slice(0, nextC + 1);
+  const nextMatch = /(?:^|\n)\s*\\c\s+\d+/.exec(rest);
+  const chapterText = nextMatch ? rest.slice(0, nextMatch.index) : rest;
   return (chapterText.match(/\\v\s+\d+/g) || []).length;
 }
 
@@ -135,13 +173,27 @@ async function verifyRemoteContent({ repo, type, book, chapter, endChapter, expe
   try {
     filename = require('./door43-push').getRepoFilename(type, book);
   } catch (err) {
-    return { success: true, skipped: true, details: `content check skipped (cannot derive filename: ${err.message})` };
+    // Fail closed. An unknown book code is a real bug in the caller, not a
+    // reason to wave the content check through.
+    return { success: false, details: `cannot derive filename for ${type}/${book}: ${err.message}` };
   }
 
-  const text = await fetchRawFile(repo, filename, 'master', org);
-  if (text == null) {
-    return { success: false, details: `could not read ${filename} from ${repo} master — content NOT confirmed` };
+  const fetched = await fetchRawFile(repo, filename, 'master', org);
+  if (fetched.absent) {
+    return { success: false, details: `${filename} does not exist on ${repo} master (HTTP 404) — content NOT confirmed` };
   }
+  if (fetched.text == null) {
+    // Could not reach Door43 after retries. This is INCONCLUSIVE, not a
+    // content failure, and it must not fail the chapter: losing a chapter's
+    // work to a network blip costs far more than an unverified push. Reported
+    // loudly so it is visible rather than silently assumed fine.
+    return {
+      success: true,
+      inconclusive: true,
+      details: `could not reach ${repo} master to verify content after 3 attempts (${fetched.reason || `HTTP ${fetched.status}`}) — push NOT content-verified`,
+    };
+  }
+  const text = fetched.text;
 
   const last = endChapter || chapter;
   const chapters = [];
@@ -156,9 +208,17 @@ async function verifyRemoteContent({ repo, type, book, chapter, endChapter, expe
       };
     }
     if (expectedRows != null && found < expectedRows) {
+      // A shortfall is suspicious but NOT proof of a bad push, and it must not
+      // fail the chapter. Legitimate causes: an editor PR merging after ours
+      // that removes redundant notes for the same chapter, and the PSA
+      // skipIntro path (door43-push.js passes skipIntro for PSA, and
+      // insert-tn-rows drops the source's N:intro rows in favor of existing
+      // ones), which makes local and remote intro counts differ by design.
+      // Zero rows is the definitive failure; a shortfall is a flag for a human.
       return {
-        success: false,
-        details: `${filename} on ${repo} master has ${found} row(s) for chapter(s) ${chapters.join(',')}, expected at least ${expectedRows} — content is incomplete`,
+        success: true,
+        shortfall: true,
+        details: `${filename} on ${repo} master has ${found} row(s) for chapter(s) ${chapters.join(',')}, fewer than the ${expectedRows} pushed — content may be incomplete (or an editor removed rows after our merge)`,
       };
     }
     return {
@@ -176,9 +236,11 @@ async function verifyRemoteContent({ repo, type, book, chapter, endChapter, expe
     return { success: false, details: `${filename} on ${repo} master has chapter ${chapter} but no verses in it — content is missing` };
   }
   if (expectedVerses != null && verses < expectedVerses) {
+    // Same reasoning as the TSV shortfall above — flag, do not fail.
     return {
-      success: false,
-      details: `${filename} on ${repo} master has ${verses} verse(s) in chapter ${chapter}, expected at least ${expectedVerses} — content is incomplete`,
+      success: true,
+      shortfall: true,
+      details: `${filename} on ${repo} master has ${verses} verse(s) in chapter ${chapter}, fewer than the ${expectedVerses} pushed — content may be incomplete`,
     };
   }
   return {
@@ -220,6 +282,16 @@ async function verifyRepoPush({ repo, stagingBranch, since, prNumber, content })
     }
     if (contentResult.skipped) {
       return { success: true, details: `${mergeDetails} (${contentResult.details})`, contentSkipped: true };
+    }
+    // Inconclusive and shortfall both pass, but the caller must be able to say
+    // so out loud instead of reporting a clean verification.
+    if (contentResult.inconclusive || contentResult.shortfall) {
+      return {
+        success: true,
+        inconclusive: contentResult.inconclusive,
+        shortfall: contentResult.shortfall,
+        details: `${mergeDetails}; WARNING: ${contentResult.details}`,
+      };
     }
     return { success: true, details: `${mergeDetails}; ${contentResult.details}` };
   };

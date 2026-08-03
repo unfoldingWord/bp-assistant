@@ -5,7 +5,7 @@ const fs = require('fs');
 const path = require('path');
 const { sendMessage, sendDM, addReaction, removeReaction } = require('./zulip-client');
 const { checkExistingBranch, buildBranchName, CSKILLBP_DIR } = require('./pipeline-utils');
-const { verifyRepoPush } = require('./repo-verify');
+const { verifyRepoPush, verifyRemoteContent } = require('./repo-verify');
 const { door43Push, checkConflictingBranches, getRepoFilename } = require('./door43-push');
 const { getPendingMerge, setPendingMerge, clearPendingMerge } = require('./pending-merges');
 const { publishAdminStatus } = require('./admin-status');
@@ -289,19 +289,29 @@ async function runNotesInsertPhase(completedChapters, username, book, notify) {
       chapterFailed = true;
     }
 
-    // repo-verify: belt-and-suspenders check
+    // repo-verify: belt-and-suspenders check. This is the same TN push as the
+    // notes pipeline's, just deferred past a conflicting branch, so it gets the
+    // same content assertion — a merged PR alone does not prove the rows landed.
+    const contentExpectation = { type: 'tn', book, chapter: ch.ch };
     if (!chapterFailed) {
       if (pushNoChanges) {
-        await status(`Repo verify SKIPPED for ${book} ${ch.ch}: no content changes to push`);
+        await status(`No content changes to push for ${book} ${ch.ch} — confirming existing content on master...`);
+        const contentOnly = await verifyRemoteContent({ repo: 'en_tn', ...contentExpectation });
+        if (!contentOnly.success) {
+          await status(`Repo verify FAILED for ${book} ${ch.ch} (push reported no changes): ${contentOnly.details}`);
+          chapterFailed = true;
+        } else {
+          await status(`Repo verify OK for ${book} ${ch.ch} (no changes needed): ${contentOnly.details}`);
+        }
       } else {
         const stagingBranch = buildBranchName(book, ch.ch);
         await status(`Verifying merge for ${book} ${ch.ch}...`);
-        const verify = await verifyRepoPush({ repo: 'en_tn', stagingBranch, since: pushStartTime, prNumber: pushPrNumber });
+        const verify = await verifyRepoPush({ repo: 'en_tn', stagingBranch, since: pushStartTime, prNumber: pushPrNumber, content: contentExpectation });
         if (!verify.success) {
           await status(`Repo verify FAILED for ${book} ${ch.ch}: ${verify.details}`);
           chapterFailed = true;
         } else {
-          await status(`Repo verify OK for ${book} ${ch.ch}`);
+          await status(`Repo verify OK for ${book} ${ch.ch}: ${verify.details}`);
         }
       }
     }
