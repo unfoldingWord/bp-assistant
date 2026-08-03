@@ -350,6 +350,92 @@ async function fetchUpstreamIds(book) {
   });
 }
 
+// --- self-talk / reasoning-leakage detection (shared) ---
+//
+// The per-note generator takes the model's final message verbatim
+// (notes-pipeline.js runPerNoteGeneration) — the only cleanup is trim +
+// trailing-AT strip. When the model deliberates out loud instead of emitting
+// just the note, its reasoning ships to Door43 inside the Note column
+// (MIC 5:7, 2026-08-03: a "wait, actually..." paragraph published above an
+// otherwise-correct figs-parallelism note).
+//
+// Exported so the quality check and the repair pass in notes-pipeline.js share
+// ONE definition — a repair gate that disagreed with the detector could "fix" a
+// note into text the checker still flags, or vice versa.
+//
+// Measured against 368 PUBLISHED notes — the 215 golden ones (JOS 1/3, MAL 1,
+// NAM 1) plus the 153 in tn_OBA: zero false positives.
+//
+// Two patterns were tried and REMOVED, because they match canonical published
+// translationNotes prose. Do not reintroduce them:
+//   - a bare /\bactually\b/ hit "tell his readers to actually look" (NAM 1:15)
+//     and "higher than it is actually possible for humans to live" (OBA 1:4).
+//   - /this is (a|an) ...(metaphor|idiom|...)/ hit four Obadiah notes whose
+//     standard wording is exactly "This is an idiom that means..." and "This is
+//     a metaphor that pictures...". That pattern alone flagged 3.3% of a
+//     published book, and since the repair pass deletes what it flags, it would
+//     have stripped the explanatory opening out of correct notes.
+// The real MIC 5:7 leak is still caught twice over, by the self-correction and
+// sub-type-name patterns.
+const SELF_TALK_PATTERNS = [
+  [/\bwait,?\s*(actually|no|sorry|hold on)\b/i, 'self-correction ("wait, actually...")'],
+  [/\b(let me|i think|hmm|on second thought|my mistake)\b/i, 'first-person deliberation'],
+  [/\bthe (template|issue type|sref)\b/i, 'internal pipeline jargon'],
+  [/\b(combine|repetition|generic|poetry) type\b/i, 'template sub-type name leaked'],
+];
+
+/**
+ * Returns a human-readable label for the first self-talk signal found in a
+ * note, or null when the note looks clean.
+ *
+ * Bolded verse quotes and bracketed alternate translations are stripped before
+ * matching — real verse text legitimately contains first-person pronouns.
+ */
+/**
+ * Extract a template's first fixed phrase — the longest leading run of literal
+ * words before any placeholder. Used both by check 25 (template conformance)
+ * and by the repair gate in notes-pipeline.js, which must agree on what
+ * "the note still follows its template" means.
+ *
+ * Returns null when the template yields no phrase longer than 15 chars.
+ */
+function templateFirstPhrase(templateText) {
+  if (!templateText) return null;
+  const cleaned = String(templateText)
+    .replace(/Alternate translation:.*$/i, '')
+    .replace(/\*\*[^*]+\*\*/g, '\x00')   // **bold** placeholder positions
+    .replace(/\b[A-Z]{2,}\b/g, '\x00');  // ALL-CAPS placeholder positions
+  return cleaned
+    .split('\x00')
+    .map(s => s.trim().replace(/\s+/g, ' '))
+    .find(s => s.length > 15) || null;
+}
+
+/**
+ * Resolve the template for a note, falling back to the sref's single template
+ * when the writer packet carries none. Mirrors check 25's fallback rule: the
+ * fallback applies ONLY when the sref has exactly one template, since picking
+ * the first of several pulls in a different sub-type's wording.
+ */
+function resolveTemplateText(prepItem, sref) {
+  const direct = prepItem?.writer_packet?.template_text || prepItem?.template_text || '';
+  if (direct) return direct;
+  const slug = sref ? (String(sref).match(/translate\/([^\s;,]+)/) || [])[1] : '';
+  if (!slug) return '';
+  const tpls = loadTemplateMap().get(slug);
+  return tpls && tpls.length === 1 ? tpls[0].template : '';
+}
+
+function detectSelfTalk(noteText) {
+  const prose = String(noteText || '')
+    .replace(/\*\*[^*]+\*\*/g, ' ')   // bolded verse quotes
+    .replace(/\[[^\]]*\]/g, ' ');     // bracketed alternate translations
+  for (const [re, label] of SELF_TALK_PATTERNS) {
+    if (re.test(prose)) return label;
+  }
+  return null;
+}
+
 // --- check_tn_quality ---
 
 async function checkTnQuality({ tsvPath, preparedJson, ultUsfm, ustUsfm, book, hebrewUsfm, output }) {
@@ -845,6 +931,10 @@ async function checkTnQuality({ tsvPath, preparedJson, ultUsfm, ustUsfm, book, h
     // figs-metaphor "heart") — a false positive. So the fallback applies only
     // when the sref has exactly one template; otherwise, with no resolved
     // template, skip the check.
+    // Named distinctly from the templateFirstPhrase() helper — a local called
+    // `templateFirstPhrase` shadowed it inside this block and turned every call
+    // into a TypeError on notes that had a resolved template.
+    let resolvedTemplatePhrase = '';
     {
       let templateText = prepItem?.template_text || '';
       if (!templateText) {
@@ -853,18 +943,12 @@ async function checkTnQuality({ tsvPath, preparedJson, ultUsfm, ustUsfm, book, h
         if (tpls25 && tpls25.length === 1) templateText = tpls25[0].template;
       }
       if (templateText) {
-        // Extract the first fixed phrase from the template (between start/placeholder boundaries)
-        // Strip AT, bold placeholders, and split on ALL-CAPS words
-        const cleaned = templateText
-          .replace(/Alternate translation:.*$/i, '')
-          .replace(/\*\*[^*]+\*\*/g, '\x00')  // mark **bold** placeholder positions
-          .replace(/\b[A-Z]{2,}\b/g, '\x00');  // mark ALL-CAPS placeholder positions
-        // Split on placeholder markers and take the first substantial segment
-        const firstPhrase = cleaned
-          .split('\x00')
-          .map(s => s.trim().replace(/\s+/g, ' '))
-          .find(s => s.length > 15);
+        // Shared with the repair gate in notes-pipeline.js — see
+        // templateFirstPhrase above. Both must agree on what "follows the
+        // template" means.
+        const firstPhrase = templateFirstPhrase(templateText);
         if (firstPhrase) {
+          resolvedTemplatePhrase = firstPhrase;
           // Strip bold and brackets from note for comparison
           const noteStripped = n.note
             .replace(/\*\*[^*]+\*\*/g, ' ')
@@ -892,6 +976,49 @@ async function checkTnQuality({ tsvPath, preparedJson, ultUsfm, ustUsfm, book, h
           addFinding(n.row, n.ref, n.id, 'error', 'contamination_phrase',
             `Note contains known contamination phrase: "${phrase}"`);
           break;
+        }
+      }
+    }
+
+    // 25c. Self-talk / reasoning leakage. The per-note generator takes the model's
+    // final message verbatim (notes-pipeline.js runPerNoteGeneration) — the only
+    // cleanup is trim + trailing-AT strip. When the model deliberates out loud
+    // instead of emitting just the note, its reasoning ships to Door43 inside the
+    // Note column (MIC 5:7, 2026-08-03: a "wait, actually..." paragraph published
+    // above an otherwise-correct figs-parallelism note). Check 25 could not catch
+    // it: the template phrase WAS present, in the second paragraph.
+    //
+    // Deliberately WARNING, not error: an editor rewriting one leaked note a month
+    // is far cheaper than a blocked push losing a whole chapter of notes.
+    //
+    // Measured against the 215 published golden notes (JOS 1/3, MAL 1, NAM 1):
+    // 1 false positive total (NAM 1 "tell his readers to actually look"). Bold
+    // quotes and bracketed ATs are stripped first — verse text legitimately
+    // contains first-person pronouns.
+    {
+      const leakLabel = detectSelfTalk(n.note);
+      if (leakLabel) {
+        addFinding(n.row, n.ref, n.id, 'warning', 'self_talk_leak',
+          `Note may contain model self-talk rather than note text: ${leakLabel}`);
+      }
+
+      // Structural signal for the same failure: a leading paragraph that is not
+      // the note, followed by the real note. Only fires when the resolved
+      // template is known and its fixed phrase is absent from the FIRST
+      // paragraph — 4 of the 215 golden notes are legitimately multi-paragraph,
+      // and those keep the template up front.
+      if (resolvedTemplatePhrase) {
+        const paras = n.note.split(/\\n|\n|<br\s*\/?>/i).map(s => s.trim()).filter(Boolean);
+        if (paras.length > 1) {
+          const firstPara = paras[0]
+            .replace(/\*\*[^*]+\*\*/g, ' ')
+            .replace(/\[[^\]]*\]/g, ' ')
+            .replace(/\s+/g, ' ')
+            .toLowerCase();
+          if (!firstPara.includes(resolvedTemplatePhrase.toLowerCase())) {
+            addFinding(n.row, n.ref, n.id, 'warning', 'preamble_paragraph',
+              'Note has multiple paragraphs and the first does not contain the template phrase — possible preamble before the real note');
+          }
         }
       }
     }
@@ -967,6 +1094,9 @@ async function checkTnQuality({ tsvPath, preparedJson, ultUsfm, ustUsfm, book, h
 module.exports = {
   validateTnTsv,
   checkTnQuality,
+  detectSelfTalk,
+  templateFirstPhrase,
+  resolveTemplateText,
   parseHebrewVerseWords,
   normalizeHebrewQuote,
 };

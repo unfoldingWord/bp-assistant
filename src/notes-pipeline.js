@@ -19,7 +19,7 @@ const { resolveAutoModel } = require('./api-runner/provider-config');
 const { getDoor43Username, emailToFallbackUsername, buildBranchName, resolveOutputFile, discoverFreshOutput, checkPrerequisites, calcSkillTimeout, normalizeBookName, resolveConflictMention, parsePartialTsv, truncatePartialTsv, parseChunkRange, isUsageLimitError, CSKILLBP_DIR } = require('./pipeline-utils');
 const { splitTsv, fixTrailingNewlines } = require('./workspace-tools/tsv-tools');
 const { fillTsvIds, generateIds, prepareNotes, fillOrigQuotes, resolveGlQuotes, flagNarrowQuotes, extractAlignmentData, prepareATContext, substituteAT, fixUnicodeQuotes, verifyBoldMatches, syncCanonicalHebrewQuotes, applyHintsToPreparedNotes, _stripAlternateTranslation: stripAlternateTranslation } = require('./workspace-tools/tn-tools');
-const { checkTnQuality } = require('./workspace-tools/quality-tools');
+const { checkTnQuality, detectSelfTalk, templateFirstPhrase, resolveTemplateText } = require('./workspace-tools/quality-tools');
 const { normalizeIssuesFile, buildParallelismIntroHintArgs } = require('./issue-normalizer');
 const { curlyQuotes } = require('./workspace-tools/usfm-tools');
 const { verifyRepoPush, verifyDcsToken } = require('./repo-verify');
@@ -965,6 +965,230 @@ function finalCanonicalHebrewQuoteSync({ notesPath, preparedJson, hebrewUsfm }) 
 }
 
 /**
+ * Repair notes flagged as containing model self-talk.
+ *
+ * Why this exists: a quality WARNING on its own changes nothing — the TN path
+ * never branches on severity, and the markdown quality report is written, never
+ * read, then deleted. So a self_talk_leak finding would only bump a count in a
+ * Zulip line while the leaked reasoning still shipped to Door43 (MIC 5:7).
+ *
+ * Each flagged note goes back to the model alone, with its template, asking for
+ * the note text only. The rewrite is accepted ONLY if it passes a gate:
+ * non-empty, still contains the template's fixed phrase, no longer than the
+ * original, and clean per the shared detector. A rewrite that fails the gate is
+ * discarded and the original kept — so the worst case is exactly today's
+ * behavior (an editor rewrites one note), never a mangled or emptied note.
+ *
+ * Notes that stay flagged get an ISSUE:SELF_TALK tag, which is the only quality
+ * signal that actually travels to Door43 where an editor will see it.
+ *
+ * Deliberately does NOT block the push. Losing a chapter of notes costs far
+ * more than an editor fixing one note a month.
+ *
+ * Returns a summary string for status reporting, or null if nothing was flagged.
+ */
+async function repairSelfTalkNotes({ notesPath, pipeDir, status, ref }) {
+  const ctx = readContext(pipeDir);
+
+  // Read the findings the mechanical check just wrote.
+  let findings = [];
+  try {
+    const raw = fs.readFileSync(path.resolve(CSKILLBP_DIR, ctx.runtime.tnQualityFindings), 'utf8');
+    const parsed = JSON.parse(raw);
+    findings = Array.isArray(parsed?.findings) ? parsed.findings : [];
+  } catch (_) {
+    return null; // no findings file — nothing to repair
+  }
+
+  const flaggedIds = [...new Set(
+    findings
+      .filter(f => ['self_talk_leak', 'preamble_paragraph'].includes(String(f.category || '')))
+      .map(f => f.id)
+      .filter(Boolean)
+  )];
+  if (flaggedIds.length === 0) return null;
+
+  const genPath = path.resolve(CSKILLBP_DIR, ctx.runtime.generatedNotes);
+  const generatedNotes = JSON.parse(fs.readFileSync(genPath, 'utf8'));
+  const prepared = JSON.parse(fs.readFileSync(path.resolve(CSKILLBP_DIR, ctx.runtime.preparedNotes), 'utf8'));
+  const preparedById = new Map((prepared.items || []).map(it => [it.id, it]));
+
+  await status(`Repairing **${flaggedIds.length} note(s)** flagged for self-talk in ${ref}...`);
+
+  // Cap the fan-out. Notes are repaired one LLM call each, so a pathological
+  // chapter (PSA 119, or a chapter where the patterns cluster) could otherwise
+  // add many minutes inside the pipeline and collide with the deploy guard's
+  // running-checkpoint window. Anything over the cap is tagged for an editor
+  // rather than silently ignored.
+  const REPAIR_CAP = 25;
+  const overflowIds = flaggedIds.slice(REPAIR_CAP);
+  const workIds = flaggedIds.slice(0, REPAIR_CAP);
+  if (overflowIds.length > 0) {
+    const msg = `Self-talk repair cap reached for ${ref}: repairing ${workIds.length} of ${flaggedIds.length} flagged note(s); ${overflowIds.length} tagged for editor review instead`;
+    console.warn(`[notes] ${msg}`);
+    await status(msg);
+  }
+
+  const results = { repaired: 0, kept: 0 };
+  const tagsToApply = new Map();
+  const repairedText = new Map();
+  for (const id of overflowIds) tagsToApply.set(id, 'ISSUE:SELF_TALK');
+
+  async function repairOne(id) {
+    const original = generatedNotes[id];
+    if (!original) {
+      // Chapter-intro rows (and any note whose generation failed) live in
+      // prepared.intro_rows, never in generated_notes.json — there is nothing
+      // here to rewrite. Tag it so the row still carries a Door43-visible
+      // signal instead of vanishing. Intro rows are long, multi-paragraph
+      // prose, i.e. the most likely preamble_paragraph target.
+      results.kept++;
+      tagsToApply.set(id, 'ISSUE:SELF_TALK');
+      console.warn(`[notes] Self-talk flagged for ${id} but it has no generated text (intro row or failed generation) — tagged, not repaired`);
+      return;
+    }
+
+    // The AT was appended by the AT stage and is validated separately — repair
+    // only the prose and re-attach the AT verbatim so this cannot disturb it.
+    const atMatch = original.match(/\s*Alternate translation:.*$/i);
+    const originalAt = atMatch ? atMatch[0] : '';
+    const prose = stripAlternateTranslation(original);
+
+    const item = preparedById.get(id) || {};
+    const packet = item.writer_packet || {};
+    // Fall back to the sref's template when the writer packet carries none —
+    // otherwise the gate below silently loses its strongest check on exactly
+    // the notes whose flag is least trustworthy.
+    const templateText = resolveTemplateText(item, item.sref || packet.sref);
+
+    const repairPrompt = [
+      'The note below was generated for Bible translators, but it contains the',
+      'model\'s own reasoning or commentary mixed in with the note text.',
+      '',
+      'Remove only the deliberation: thinking aloud, self-correction ("wait,',
+      'actually..."), and internal pipeline vocabulary (template sub-type names',
+      'like "combine type", "issue type", "sref").',
+      '',
+      'Keep the note\'s explanation intact. In particular, KEEP standard',
+      'translationNotes phrasing such as "This is an idiom that means..." or',
+      '"This is a metaphor that pictures..." — that is correct note wording, not',
+      'commentary. Do NOT rewrite the explanation, add new content, or change the',
+      'translation advice.',
+      '',
+      templateText ? `TEMPLATE THE NOTE MUST FOLLOW: "${templateText}"` : '',
+      `GL_QUOTE: ${packet.gl_quote || item.gl_quote || ''}`,
+      '',
+      'NOTE AS WRITTEN:',
+      prose,
+      '',
+      'Output ONLY the corrected note text, nothing else.',
+      'Do NOT include an alternate translation.',
+    ].filter(Boolean).join('\n');
+
+    let rewrite = '';
+    try {
+      const result = await runClaude({
+        prompt: repairPrompt,
+        label: `${ref} self-talk repair`,
+        cwd: CSKILLBP_DIR,
+        model: 'medium',
+        maxTurns: 2,
+        timeoutMs: 60 * 1000,
+        appendSystemPrompt: 'You clean up translation notes. Output only the note text, nothing else. Do not use any tools.',
+        mcpToolSet: 'none',
+        tools: [],
+        disallowedTools: ['Bash', 'Read', 'Write', 'Edit', 'Glob', 'Grep', 'Agent', 'Task', 'Skill'],
+      });
+      if (result?.result?.text) rewrite = result.result.text.trim();
+      else if (typeof result?.result === 'string') rewrite = result.result.trim();
+      rewrite = rewrite.replace(/\s*Alternate translation:.*$/i, '').trim();
+    } catch (err) {
+      console.warn(`[notes] Self-talk repair call failed for ${id}: ${err.message}`);
+    }
+
+    // Acceptance gate. Any failure keeps the original — a repair pass must never
+    // be able to make a note worse than it already is.
+    const reject = (why) => {
+      console.warn(`[notes] Self-talk repair rejected for ${id}: ${why}`);
+      results.kept++;
+      tagsToApply.set(id, 'ISSUE:SELF_TALK');
+    };
+
+    if (!rewrite) return reject('empty rewrite');
+    if (rewrite.length > prose.length) return reject('rewrite longer than original');
+    if (detectSelfTalk(rewrite)) return reject('rewrite still reads as self-talk');
+    if (templateText) {
+      // The template's first fixed phrase must survive, or the model rewrote
+      // rather than trimmed. Shared with check 25 so the two cannot disagree.
+      const firstPhrase = templateFirstPhrase(templateText);
+      if (firstPhrase) {
+        const stripped = rewrite.replace(/\*\*[^*]+\*\*/g, ' ').replace(/\s+/g, ' ').toLowerCase();
+        if (!stripped.includes(firstPhrase.toLowerCase())) return reject('template phrase missing from rewrite');
+      }
+    }
+
+    repairedText.set(id, `${rewrite}${originalAt}`);
+    generatedNotes[id] = `${rewrite}${originalAt}`;
+    results.repaired++;
+    console.log(`[notes] Self-talk repaired for ${id} (${prose.length} -> ${rewrite.length} chars)`);
+  }
+
+  // Bounded concurrency, matching the AT stage's limiter rather than running
+  // these serially.
+  const REPAIR_CONCURRENCY = 5;
+  for (let i = 0; i < workIds.length; i += REPAIR_CONCURRENCY) {
+    await Promise.all(workIds.slice(i, i + REPAIR_CONCURRENCY).map(id => repairOne(id)));
+  }
+
+  if (results.repaired === 0 && tagsToApply.size === 0) return null;
+
+  fs.writeFileSync(genPath, JSON.stringify(generatedNotes, null, 2));
+
+  // Patch the TSV in place — do NOT re-assemble.
+  //
+  // assembleNotes rebuilds the file from prepared+generated JSON and writes the
+  // Tags column empty, so it would erase the AT stage's `at-fit` tags (which
+  // live only in the TSV) and revert postProcessNotesTsv's in-place curly-quote
+  // and bold fixes. The recheck would then report quote errors that did not
+  // exist a moment earlier. Editing just the Note cell of the affected rows
+  // keeps every other column and every prior pass intact.
+  if (notesPath && (repairedText.size > 0 || tagsToApply.size > 0)) {
+    const absNotes = path.resolve(CSKILLBP_DIR, notesPath);
+    if (fs.existsSync(absNotes)) {
+      const lines = fs.readFileSync(absNotes, 'utf8').split('\n');
+      for (let i = 1; i < lines.length; i++) {
+        if (!lines[i].trim()) continue;
+        const cols = lines[i].split('\t');
+        const id = cols[1] || '';
+        let touched = false;
+
+        const newNote = repairedText.get(id);
+        if (newNote != null && cols.length >= 7) {
+          // Preserve any trailing \r from CRLF line endings, which lives on the
+          // end of the final (Note) column.
+          const cr = /\r$/.test(cols[6]) ? '\r' : '';
+          cols[6] = newNote + cr;
+          touched = true;
+        }
+
+        const tag = tagsToApply.get(id);
+        if (tag && !(cols[2] || '').includes(tag)) {
+          cols[2] = cols[2] ? `${cols[2]}, ${tag}` : tag;
+          touched = true;
+        }
+
+        if (touched) lines[i] = cols.join('\t');
+      }
+      fs.writeFileSync(absNotes, lines.join('\n'));
+    }
+  }
+
+  const summary = `Self-talk repair: ${results.repaired} repaired, ${results.kept} kept and tagged for editor review`;
+  console.log(`[notes] ${summary}`);
+  return summary;
+}
+
+/**
  * Run mechanical quality checks in Node.js before invoking tn-quality-check.
  * Runs fix_trailing_newlines + check_tn_quality directly so Claude reads
  * pre-run findings and cannot loop on re-checking.
@@ -983,8 +1207,32 @@ async function runMechanicalQualityPrep({ notesPath, pipeDir, status, ref }) {
     book: ctx.book,
     output: ctx.runtime.tnQualityFindings,
   });
-  const summary = qualityResult.split('\n')[0];
+  let summary = qualityResult.split('\n')[0];
   console.log(`[notes] Quality mechanical prep: ${fixResult}; ${summary}`);
+
+  // Self-talk repair runs on the findings we just wrote, then the check is
+  // re-run so the report Claude reads reflects the repaired text rather than
+  // the leaked original. Non-fatal by design: a repair failure must not cost
+  // the chapter its notes.
+  try {
+    const repairSummary = await repairSelfTalkNotes({ notesPath, pipeDir, status, ref });
+    if (repairSummary) {
+      const recheck = await checkTnQuality({
+        tsvPath: notesPath,
+        preparedJson: ctx.runtime.preparedNotes,
+        ultUsfm: ctx.sources.ultPlain || ctx.sources.ult,
+        ustUsfm: ctx.sources.ustPlain || ctx.sources.ust,
+        hebrewUsfm: ctx.sources.hebrew,
+        book: ctx.book,
+        output: ctx.runtime.tnQualityFindings,
+      });
+      summary = `${recheck.split('\n')[0]} (${repairSummary})`;
+      console.log(`[notes] Quality after self-talk repair: ${summary}`);
+    }
+  } catch (err) {
+    console.warn(`[notes] Self-talk repair pass failed (non-fatal): ${err.message}`);
+  }
+
   return summary;
 }
 
@@ -3252,6 +3500,7 @@ module.exports = {
   _postProcessNotesTsv: postProcessNotesTsv,
   _finalCanonicalHebrewQuoteSync: finalCanonicalHebrewQuoteSync,
   _runMechanicalQualityPrep: runMechanicalQualityPrep,
+  _repairSelfTalkNotes: repairSelfTalkNotes,
   _hasPauseBeforeATsFlag: hasPauseBeforeATsFlag,
   _buildAtGenerationCheckpoint: buildAtGenerationCheckpoint,
   _classifyRunClaudeEmpty: classifyRunClaudeEmpty,
