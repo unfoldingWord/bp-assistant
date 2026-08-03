@@ -321,10 +321,15 @@ jobs:
           # top-level `active`, which still includes stale `running` checkpoints
           # from a crashed pipeline. Note the probe can wake the machine
           # (auto_start_machines); see the matching note in review-gate.yml.
+          # Readings from a process younger than this step are discarded: the
+          # probe itself can wake the machine, and we must not cite work our own
+          # probe started as evidence the reviewer is still busy.
           health_url="https://${FLY_APP_NAME}.fly.dev/health/pipelines"
+          probe_epoch="$(date +%s)"
           get_active() {
             curl -sf --max-time 15 "$health_url" 2>/dev/null \
-              | node -e "let s='';process.stdin.on('data',c=>s+=c);process.stdin.on('end',()=>{try{const j=JSON.parse(s);const p=Array.isArray(j.pipelines)?j.pipelines:null;if(p)process.stdout.write(String(p.filter(x=>x&&x.interrupted!==true).length));}catch{}});" \
+              | node -e "let s='';process.stdin.on('data',c=>s+=c);process.stdin.on('end',()=>{try{const j=JSON.parse(s);const started=Date.parse(j.processStartedAt||'')/1000;if(Number.isFinite(started)&&started>Number(process.argv[1]))return;const p=Array.isArray(j.pipelines)?j.pipelines:null;if(p)process.stdout.write(String(p.filter(x=>x&&x.interrupted!==true).length));}catch{}});" \
+                "$probe_epoch" \
               || echo ""
           }
           maybe_extend() {
@@ -332,7 +337,11 @@ jobs:
             cap=$((started + max_window))
             [ "$SECONDS" -lt "$cap" ] || return 0
             last_active="$(get_active)"
-            [ -n "$last_active" ] && [ "$last_active" != "0" ] || return 0
+            if [ -z "$last_active" ]; then
+              echo "Health probe returned no usable reading (${health_url}); not extending."
+              return 0
+            fi
+            [ "$last_active" != "0" ] || return 0
             deadline=$((SECONDS + 120))
             [ "$deadline" -le "$cap" ] || deadline=$cap
             busy_extensions=$((busy_extensions + 1))

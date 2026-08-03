@@ -19,6 +19,12 @@ permissions:
   # `review-verdict-unavailable` check run, so an unread verdict is visibly
   # different from a FAIL verdict in the checks list rather than only in the
   # job log. See "Read review result from logs".
+  #
+  # That check is published as `neutral`, which review-gate-automerge.yml
+  # treats as OK (its `okConclusions` set). That is deliberate: while a
+  # timeout is the CURRENT state the `review` job itself concludes `failure`,
+  # which does block automerge; once a re-run reads a verdict the stale row is
+  # retired. A leftover "we couldn't read it then" must not block forever.
   checks: write
 
 jobs:
@@ -318,10 +324,20 @@ jobs:
           #    top-level `active`. `active` includes stale `running` checkpoints
           #    left behind by a crashed pipeline, which would buy a dead
           #    reviewer the full 30-minute extension budget for nothing.
+          #
+          # And we discard the reading entirely when `processStartedAt` is newer
+          # than this step, which closes a feedback loop the probe would
+          # otherwise create: probe wakes the machine -> woken machine begins an
+          # hourly run -> endpoint reports a live pipeline -> we extend, citing
+          # work our own probe started. The reviewer we are waiting on exited
+          # before this step began, so a process younger than the step is by
+          # definition not it.
           health_url="https://${FLY_APP_NAME}.fly.dev/health/pipelines"
+          probe_epoch="$(date +%s)"
           get_active() {
             curl -sf --max-time 15 "$health_url" 2>/dev/null \
-              | node -e "let s='';process.stdin.on('data',c=>s+=c);process.stdin.on('end',()=>{try{const j=JSON.parse(s);const p=Array.isArray(j.pipelines)?j.pipelines:null;if(p)process.stdout.write(String(p.filter(x=>x&&x.interrupted!==true).length));}catch{}});" \
+              | node -e "let s='';process.stdin.on('data',c=>s+=c);process.stdin.on('end',()=>{try{const j=JSON.parse(s);const started=Date.parse(j.processStartedAt||'')/1000;if(Number.isFinite(started)&&started>Number(process.argv[1]))return;const p=Array.isArray(j.pipelines)?j.pipelines:null;if(p)process.stdout.write(String(p.filter(x=>x&&x.interrupted!==true).length));}catch{}});" \
+                "$probe_epoch" \
               || echo ""
           }
           # Called from both the fetch-failure and no-marker paths: a flaky Fly
@@ -332,7 +348,14 @@ jobs:
             cap=$((started + max_window))
             [ "$SECONDS" -lt "$cap" ] || return 0
             last_active="$(get_active)"
-            [ -n "$last_active" ] && [ "$last_active" != "0" ] || return 0
+            if [ -z "$last_active" ]; then
+              # Distinguish "probe is broken" from "host is idle" -- otherwise a
+              # permanently wrong health URL would silently disable the adaptive
+              # window and look exactly like an idle host.
+              echo "Health probe returned no usable reading (${health_url}); not extending."
+              return 0
+            fi
+            [ "$last_active" != "0" ] || return 0
             deadline=$((SECONDS + 120))
             # Never overshoot the cap -- otherwise "hard cap ${max_window}s" in
             # the log line is a lie by up to one full extension.
@@ -431,9 +454,18 @@ jobs:
             #    means "superseded by a newer push" -- routine and ignorable.
             #    Reusing it would move the ambiguity, not remove it.
             # A distinct name collides with nothing and says what happened.
-            gh api -X POST "repos/${REPO}/check-runs" \
-              -f name='review-verdict-unavailable' \
-              -f head_sha="$HEAD_SHA" \
+            # Upsert, not blind create: the timeout message tells you to re-run,
+            # so the same SHA timing out twice is the expected case, and blindly
+            # POSTing would stack duplicate rows -- undercutting the very
+            # legibility this is meant to buy.
+            existing_id="$(gh api "repos/${REPO}/commits/${HEAD_SHA}/check-runs?check_name=review-verdict-unavailable" \
+              --jq '.check_runs[0].id // empty' 2>/dev/null || true)"
+            if [ -n "$existing_id" ]; then
+              upsert=(-X PATCH "repos/${REPO}/check-runs/${existing_id}")
+            else
+              upsert=(-X POST "repos/${REPO}/check-runs" -f name='review-verdict-unavailable' -f head_sha="$HEAD_SHA")
+            fi
+            gh api "${upsert[@]}" \
               -f status='completed' \
               -f conclusion='neutral' \
               -f 'output[title]=No review verdict could be read (not a rejection)' \
@@ -448,6 +480,22 @@ jobs:
             # a human that the red row is a retrieval failure, not a rejection.
             exit 1
           fi
+          # A verdict was read. If an earlier attempt on this same SHA left a
+          # `review-verdict-unavailable` row behind, retire it -- otherwise a
+          # stale "no verdict" entry sits next to a green review forever and
+          # says the opposite of what is now true.
+          stale_id="$(gh api "repos/${REPO}/commits/${HEAD_SHA}/check-runs?check_name=review-verdict-unavailable" \
+            --jq '.check_runs[0].id // empty' 2>/dev/null || true)"
+          if [ -n "$stale_id" ]; then
+            gh api -X PATCH "repos/${REPO}/check-runs/${stale_id}" \
+              -f status='completed' \
+              -f conclusion='success' \
+              -f 'output[title]=Resolved: a verdict was read on a later attempt' \
+              -f "output[summary]=A PR_REVIEW_RESULT marker for ${HEAD_SHA} was read successfully. See the \`review\` check for the actual verdict." \
+              > /dev/null \
+              || echo "::warning::Could not retire the stale review-verdict-unavailable check run."
+          fi
+
           review_json="$(printf '%s\n' "$marker_line" | sed -E 's/^.*PR_REVIEW_RESULT:[[:space:]]*//')"
           printf '%s\n' "$review_json" > review-result.json
           decision="$(node -e "const fs=require('fs'); const d=JSON.parse(fs.readFileSync('review-result.json','utf8')); process.stdout.write(String(d.decision||''));")"
