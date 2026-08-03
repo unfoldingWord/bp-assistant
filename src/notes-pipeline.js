@@ -22,7 +22,7 @@ const { fillTsvIds, generateIds, prepareNotes, fillOrigQuotes, resolveGlQuotes, 
 const { checkTnQuality, detectSelfTalk, templateFirstPhrase, resolveTemplateText } = require('./workspace-tools/quality-tools');
 const { normalizeIssuesFile, buildParallelismIntroHintArgs } = require('./issue-normalizer');
 const { curlyQuotes } = require('./workspace-tools/usfm-tools');
-const { verifyRepoPush, verifyDcsToken } = require('./repo-verify');
+const { verifyRepoPush, verifyDcsToken, verifyRemoteContent } = require('./repo-verify');
 const { recordMetrics, getCumulativeTokens, recordRunSummary, getAdaptiveSkillGuardrails } = require('./usage-tracker');
 const { door43Push, checkConflictingBranches, REPO_MAP, getRepoFilename } = require('./door43-push');
 const { setPendingMerge } = require('./pending-merges');
@@ -3297,18 +3297,52 @@ async function notesPipeline(route, message) {
       chapterFailed = true;
     }
 
+    // Row count from the TSV we just pushed, so verification can assert the
+    // chapter's content is actually readable on master rather than trusting
+    // that a merge happened.
+    let expectedRows = null;
+    try {
+      const absSource = path.resolve(CSKILLBP_DIR, notesSource);
+      if (fs.existsSync(absSource)) {
+        expectedRows = fs.readFileSync(absSource, 'utf8')
+          .split('\n')
+          .filter(l => l.trim() && String((l.split('\t')[0] || '').split(':')[0]) === String(ch))
+          .length;
+      }
+    } catch (err) {
+      console.warn(`[notes] Could not count local rows for ${ref} (content check will assert presence only): ${err.message}`);
+    }
+    const contentExpectation = { type: 'tn', book, chapter: ch, expectedRows };
+
+    // "No changes" is decided from the LOCAL clone's status, so a stale or
+    // mis-synced clone previously skipped the push AND the verification while
+    // still reporting success. Confirm against master instead of assuming.
     if (!chapterFailed && pushNoChanges) {
-      await status(`Repo verify SKIPPED for ${ref}: no content changes to push`);
+      await status(`No content changes to push for ${ref} — confirming existing content on master...`);
+      const contentOnly = await verifyRemoteContent({ repo: 'en_tn', ...contentExpectation });
+      if (!contentOnly.success) {
+        await status(`Repo verify FAILED for ${ref} (push reported no changes): ${contentOnly.details}`);
+        console.warn(`[notes] noChanges content verify failed for ${ref}: ${contentOnly.details}`);
+        chapterFailed = true;
+      } else if (contentOnly.inconclusive || contentOnly.shortfall) {
+        await status(`Repo verify INCONCLUSIVE for ${ref} (push reported no changes): ${contentOnly.details}`);
+        console.warn(`[notes] noChanges content verify inconclusive for ${ref}: ${contentOnly.details}`);
+      } else {
+        await status(`Repo verify OK for ${ref} (no changes needed): ${contentOnly.details}`);
+      }
     }
 
     if (!chapterFailed && !pushNoChanges) {
       await status(`Verifying push for ${ref}...`);
       const stagingBranch = buildBranchName(book, ch);
-      const verify = await verifyRepoPush({ repo: 'en_tn', stagingBranch, since: pushStartTime, prNumber: pushPrNumber });
+      const verify = await verifyRepoPush({ repo: 'en_tn', stagingBranch, since: pushStartTime, prNumber: pushPrNumber, content: contentExpectation });
       if (!verify.success) {
         await status(`Repo verify FAILED for ${ref}: ${verify.details}`);
         console.warn(`[notes] Repo verify failed for ${ref}: ${verify.details}`);
         chapterFailed = true;
+      } else if (verify.inconclusive || verify.shortfall || verify.contentSkipped) {
+        await status(`Repo verify PARTIAL for ${ref}: ${verify.details}`);
+        console.warn(`[notes] Repo verify partial for ${ref}: ${verify.details}`);
       } else {
         await status(`Repo verify OK for ${ref}: ${verify.details}`);
       }
