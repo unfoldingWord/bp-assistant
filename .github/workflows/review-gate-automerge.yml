@@ -299,20 +299,69 @@ jobs:
           HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
         run: |
           set -euo pipefail
-          flyctl logs --app "$FLY_APP_NAME" --no-tail > all-logs.txt 2>&1 || true
+          # Poll rather than single-fetch. Fly's log pipeline is eventually
+          # consistent and this machine is shared with the live pipelines, so a
+          # single snapshot taken right after the machine stops routinely
+          # predates this run's marker. Same failure that produced the spurious
+          # red gate on review-gate.yml (#324); the fix belongs here too.
+          #
+          # NOTE: unlike review-gate.yml, an unread verdict here stays a hard
+          # failure. This job's success is what authorizes an automerge, so
+          # "could not read a verdict" must never soften into anything that
+          # could be mistaken for permission to merge.
+          poll_window=600
+          max_window=1800
+          started=$SECONDS
+          deadline=$((SECONDS + poll_window))
+          attempt=0
+          busy_extensions=0
+          last_active=""
+          health_url="https://${FLY_APP_NAME}.fly.dev/health/pipelines"
+          get_active() {
+            curl -sf --max-time 15 "$health_url" 2>/dev/null \
+              | node -e "let s='';process.stdin.on('data',c=>s+=c);process.stdin.on('end',()=>{try{const j=JSON.parse(s);if(typeof j.active==='number')process.stdout.write(String(j.active));}catch{}});" \
+              || echo ""
+          }
           # The success-path JSON serializes as `{"request":...,"decision":...,...}`
           # because executePrReview returns `{ request, ...aggregate, summary }`,
           # so anchoring on `{"decision":` would only match the catch-block
           # failure object and silently drop every PASS result.
           # Scope to this run via the prNumber and headSha downstream filters
           # (those substrings are emitted in the request block).
-          marker_line="$(grep -E 'PR_REVIEW_RESULT:[[:space:]]*\{' all-logs.txt \
-            | grep "\"prNumber\":${PR_NUMBER}" \
-            | grep "\"headSha\":\"${HEAD_SHA}\"" \
-            | tail -1 || true)"
+          marker_line=""
+          while [ "$SECONDS" -lt "$deadline" ]; do
+            attempt=$((attempt + 1))
+            flyctl logs --app "$FLY_APP_NAME" --no-tail > all-logs.txt 2>&1 || true
+            marker_line="$(grep -E 'PR_REVIEW_RESULT:[[:space:]]*\{' all-logs.txt \
+              | grep "\"prNumber\":${PR_NUMBER}" \
+              | grep "\"headSha\":\"${HEAD_SHA}\"" \
+              | tail -1 || true)"
+            if [ -n "$marker_line" ]; then
+              echo "Found PR_REVIEW_RESULT marker for PR #${PR_NUMBER} SHA ${HEAD_SHA} on attempt ${attempt}."
+              break
+            fi
+            echo "No marker yet for SHA ${HEAD_SHA} (attempt ${attempt}); waiting 10s for Fly log propagation..."
+            sleep 10
+            if [ "$SECONDS" -ge "$deadline" ] && [ $((SECONDS - started)) -lt "$max_window" ]; then
+              last_active="$(get_active)"
+              if [ -n "$last_active" ] && [ "$last_active" != "0" ]; then
+                deadline=$((SECONDS + 120))
+                busy_extensions=$((busy_extensions + 1))
+                echo "Reviewer host reports ${last_active} active pipeline(s); extending the wait by 120s (extension #${busy_extensions}, hard cap ${max_window}s)."
+              fi
+            fi
+          done
           if [ -z "$marker_line" ]; then
-            echo "No PR_REVIEW_RESULT marker found in logs for PR #${PR_NUMBER} SHA ${HEAD_SHA} (pr-reviewer run may have crashed or not emitted a result)." >&2
-            tail -100 all-logs.txt >&2 || true
+            {
+              echo "TIMEOUT reading the automerge review result: no PR_REVIEW_RESULT marker for PR #${PR_NUMBER} SHA ${HEAD_SHA} appeared within ~$((SECONDS - started))s (${attempt} attempts, ${busy_extensions} busy-host extensions; last reported active pipelines: ${last_active:-<unknown>})."
+              echo
+              echo "This is NOT a review verdict -- the reviewer did not report FAIL, and no"
+              echo "verdict for this commit could be read at all. Automerge is blocked either"
+              echo "way: an unread verdict is never permission to merge. Re-run to retry."
+              echo
+              echo "Last 100 log lines (shared machine -- may contain other runs' output):"
+              tail -100 all-logs.txt || true
+            } >&2
             exit 1
           fi
           review_json="$(printf '%s\n' "$marker_line" | sed -E 's/^.*PR_REVIEW_RESULT:[[:space:]]*//')"
