@@ -45,6 +45,149 @@ function apiGet(path, token) {
 }
 
 /**
+ * Fetch a file's raw bytes from a branch. Returns the text, or null on any
+ * failure (missing file, non-200, network error) — callers treat null as
+ * "could not read", which is a verification failure, not a pass.
+ */
+function fetchRawFile(repo, filename, branch = 'master', org = ORG) {
+  return new Promise((resolve) => {
+    const url = new URL(`https://git.door43.org/${org}/${repo}/raw/branch/${branch}/${filename}`);
+    const req = https.request(
+      { hostname: url.hostname, path: url.pathname, method: 'GET', timeout: 20000 },
+      (res) => {
+        if (res.statusCode !== 200) { res.resume(); return resolve(null); }
+        let body = '';
+        res.on('data', (c) => { body += c; });
+        res.on('end', () => resolve(body));
+        res.on('error', () => resolve(null));
+      },
+    );
+    req.on('error', () => resolve(null));
+    req.on('timeout', () => { req.destroy(); resolve(null); });
+    req.end();
+  });
+}
+
+/**
+ * Count TSV rows whose Reference column belongs to one of `chapters`.
+ * Intro rows (`3:intro`) count — they are content we pushed.
+ */
+function countTsvChapterRows(text, chapters) {
+  const wanted = new Set(chapters.map(String));
+  let count = 0;
+  for (const line of String(text).split('\n')) {
+    if (!line.trim()) continue;
+    const ref = line.split('\t')[0] || '';
+    const ch = ref.split(':')[0];
+    if (wanted.has(ch)) count++;
+  }
+  return count;
+}
+
+/**
+ * Count verse markers inside one chapter of a USFM file.
+ *
+ * Counts \v markers anywhere on a line, not just at line start — mid-line \v
+ * markers are legitimate USFM and undercounting them was the #245 bug.
+ */
+function countUsfmChapterVerses(text, chapter) {
+  const src = String(text);
+  const startRe = new RegExp(`\\\\c\\s+${chapter}(?!\\d)`);
+  const start = src.search(startRe);
+  if (start === -1) return null; // chapter marker absent entirely
+  const rest = src.slice(start);
+  const nextC = rest.slice(1).search(/\\c\s+\d+/);
+  const chapterText = nextC === -1 ? rest : rest.slice(0, nextC + 1);
+  return (chapterText.match(/\\v\s+\d+/g) || []).length;
+}
+
+/**
+ * Assert that the content we pushed is actually readable on master.
+ *
+ * Why this exists: verifyRepoPush's merged-PR check proves a PR merged, not
+ * that the chapter's rows are in the file. A PR that merged zero rows, the
+ * wrong rows, or a truncated file satisfies it exactly as well as a correct
+ * one. The old Claude-mediated repo-verify skill DID compare content
+ * (`git show origin/master:tn_PSA.tsv | grep -c "^122:"`); that step was lost
+ * when the deterministic JS module replaced it, and every subsequent patch to
+ * this file (#79, #116, #73) addressed verification reporting failure wrongly
+ * — never the inverse. This closes the inverse.
+ *
+ * Asserts presence, not equality: remote may legitimately have MORE rows than
+ * we pushed (a concurrent editor PR). Missing content is the failure mode.
+ *
+ * @param {object} opts
+ * @param {string} opts.repo - Repo name (en_tn, en_ult, en_ust)
+ * @param {string} opts.type - Push type: 'tn' | 'tq' | 'ult' | 'ust'
+ * @param {string} opts.book - 3-letter book code
+ * @param {number} opts.chapter - First chapter pushed
+ * @param {number} [opts.endChapter] - Last chapter pushed (defaults to chapter)
+ * @param {number} [opts.expectedRows] - Local row count for TSV pushes
+ * @param {number} [opts.expectedVerses] - Local verse count for USFM pushes
+ * @returns {{ success: boolean, details: string, skipped?: boolean }}
+ */
+async function verifyRemoteContent({ repo, type, book, chapter, endChapter, expectedRows, expectedVerses, org = ORG }) {
+  if (!type || !book || chapter == null) {
+    return { success: true, skipped: true, details: 'content check skipped (caller passed no type/book/chapter)' };
+  }
+
+  let filename;
+  try {
+    filename = require('./door43-push').getRepoFilename(type, book);
+  } catch (err) {
+    return { success: true, skipped: true, details: `content check skipped (cannot derive filename: ${err.message})` };
+  }
+
+  const text = await fetchRawFile(repo, filename, 'master', org);
+  if (text == null) {
+    return { success: false, details: `could not read ${filename} from ${repo} master — content NOT confirmed` };
+  }
+
+  const last = endChapter || chapter;
+  const chapters = [];
+  for (let c = Number(chapter); c <= Number(last); c++) chapters.push(c);
+
+  if (filename.endsWith('.tsv')) {
+    const found = countTsvChapterRows(text, chapters);
+    if (found === 0) {
+      return {
+        success: false,
+        details: `${filename} on ${repo} master has NO rows for chapter(s) ${chapters.join(',')} — the merge landed but the content is missing`,
+      };
+    }
+    if (expectedRows != null && found < expectedRows) {
+      return {
+        success: false,
+        details: `${filename} on ${repo} master has ${found} row(s) for chapter(s) ${chapters.join(',')}, expected at least ${expectedRows} — content is incomplete`,
+      };
+    }
+    return {
+      success: true,
+      details: `${found} row(s) confirmed on master for chapter(s) ${chapters.join(',')}${expectedRows != null ? ` (expected >= ${expectedRows})` : ''}`,
+    };
+  }
+
+  // USFM (ULT/UST)
+  const verses = countUsfmChapterVerses(text, chapter);
+  if (verses == null) {
+    return { success: false, details: `${filename} on ${repo} master has no \\c ${chapter} marker — the merge landed but the chapter is missing` };
+  }
+  if (verses === 0) {
+    return { success: false, details: `${filename} on ${repo} master has chapter ${chapter} but no verses in it — content is missing` };
+  }
+  if (expectedVerses != null && verses < expectedVerses) {
+    return {
+      success: false,
+      details: `${filename} on ${repo} master has ${verses} verse(s) in chapter ${chapter}, expected at least ${expectedVerses} — content is incomplete`,
+    };
+  }
+  return {
+    success: true,
+    details: `${verses} verse(s) confirmed on master in chapter ${chapter}${expectedVerses != null ? ` (expected >= ${expectedVerses})` : ''}`,
+  };
+}
+
+/**
  * Verify that a repo-insert actually merged to master.
  *
  * Strategy: query the Gitea API for closed PRs from the staging branch.
@@ -64,8 +207,22 @@ function apiGet(path, token) {
  * @param {number} [opts.prNumber] - Numeric PR id from door43Push; enables direct PR lookup
  * @returns {{ success: boolean, details: string }}
  */
-async function verifyRepoPush({ repo, stagingBranch, since, prNumber }) {
+async function verifyRepoPush({ repo, stagingBranch, since, prNumber, content }) {
   const token = readSecret('door43_token', 'DOOR43_TOKEN') || readSecret('gitea_token', 'GITEA_TOKEN');
+
+  // A merged PR is necessary but not sufficient — it says a merge happened, not
+  // that the chapter's content is in the file. Every success path below funnels
+  // through here so "verified" always means both.
+  const confirm = async (mergeDetails) => {
+    const contentResult = await verifyRemoteContent({ repo, ...(content || {}) });
+    if (!contentResult.success) {
+      return { success: false, details: `${mergeDetails}, but content verification FAILED: ${contentResult.details}` };
+    }
+    if (contentResult.skipped) {
+      return { success: true, details: `${mergeDetails} (${contentResult.details})`, contentSkipped: true };
+    }
+    return { success: true, details: `${mergeDetails}; ${contentResult.details}` };
+  };
 
   if (!token) {
     return {
@@ -103,10 +260,7 @@ async function verifyRepoPush({ repo, stagingBranch, since, prNumber }) {
         const pr = prRes.data;
         const isMerged = pr.merged === true || pr.merged_by != null;
         if (isMerged && pr.merged_at && new Date(pr.merged_at) >= new Date(effectiveSince)) {
-          return {
-            success: true,
-            details: `PR #${prNumber} merged ${stagingBranch} into master on ${repo} (confirmed via direct PR lookup)`,
-          };
+          return await confirm(`PR #${prNumber} merged ${stagingBranch} into master on ${repo} (confirmed via direct PR lookup)`);
         }
       }
     } catch (_) {
@@ -140,10 +294,7 @@ async function verifyRepoPush({ repo, stagingBranch, since, prNumber }) {
     });
 
     if (merged) {
-      return {
-        success: true,
-        details: `PR #${merged.number} merged ${stagingBranch} into master on ${repo}`,
-      };
+      return await confirm(`PR #${merged.number} merged ${stagingBranch} into master on ${repo}`);
     }
 
     // No merged PR found — check if branch exists (PR created but not merged)
@@ -180,10 +331,7 @@ async function verifyRepoPush({ repo, stagingBranch, since, prNumber }) {
           return false;
         });
         if (fallbackMerged) {
-          return {
-            success: true,
-            details: `PR #${fallbackMerged.number} merged ${stagingBranch} into master on ${repo} (confirmed via fallback scan; head-filter was unreliable after branch deletion)`,
-          };
+          return await confirm(`PR #${fallbackMerged.number} merged ${stagingBranch} into master on ${repo} (confirmed via fallback scan; head-filter was unreliable after branch deletion)`);
         }
       }
     } catch (_) {
@@ -229,4 +377,12 @@ async function verifyDcsToken() {
 
 // apiGet + GITEA_API are reused by the overnight Sensor (overnight-watcher.js)
 // for read-only PR/branch enumeration against Door43.
-module.exports = { verifyRepoPush, verifyDcsToken, apiGet, GITEA_API };
+module.exports = {
+  verifyRepoPush,
+  verifyDcsToken,
+  verifyRemoteContent,
+  apiGet,
+  GITEA_API,
+  _countTsvChapterRows: countTsvChapterRows,
+  _countUsfmChapterVerses: countUsfmChapterVerses,
+};
