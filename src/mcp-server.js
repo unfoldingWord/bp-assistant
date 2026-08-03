@@ -23,7 +23,10 @@ const MCP_PORT = Number(process.env.MCP_PORT || 3001);
 const MCP_BIND_HOST = process.env.MCP_BIND_HOST || '127.0.0.1';
 const DOOR43_BASE = 'https://git.door43.org/unfoldingWord';
 
-const PROCESS_STARTED_AT_MS = Number(process.env.PROCESS_STARTED_AT_MS || Date.now());
+const {
+  getProcessStartedAtMs,
+  isInterruptedRunningCheckpoint,
+} = require('./pipeline-liveness');
 
 // Checkpoints not touched within this window are treated as crashed/stale even
 // if the bot didn't restart. Keep this comfortably longer than normal chapter
@@ -49,7 +52,7 @@ function getActivePipelines() {
       scope: cp.scope,
       updatedAt: cp.updatedAt,
       ageSeconds: Math.round(ageMs / 1000),
-      interrupted: updatedMs < PROCESS_STARTED_AT_MS,
+      interrupted: isInterruptedRunningCheckpoint(cp, now),
     });
   }
   return rows;
@@ -708,7 +711,7 @@ function createHttpServer() {
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({
         active: pipelines.length,
-        processStartedAt: new Date(PROCESS_STARTED_AT_MS).toISOString(),
+        processStartedAt: new Date(getProcessStartedAtMs()).toISOString(),
         pipelines,
       }));
       return;
