@@ -13,6 +13,7 @@ const path = require('path');
 const { z } = require('zod');
 const { readSecret } = require('../secrets');
 const { getCheckpoint, setCheckpoint } = require('../pipeline-checkpoints');
+const { isInterruptedRunningCheckpoint } = require('../pipeline-liveness');
 const { CSKILLBP_DIR } = require('../pipeline-utils');
 const {
   triggerPipelineFromApi,
@@ -460,11 +461,13 @@ function serializeCheckpoint(jobId, cp) {
   // moment the run parked.
   const pausedAt = cp.pauseAnchorAt || cp.updatedAt;
   if (RESUMABLE_STATES.has(cp.state) && pausedAt) out.pausedAt = pausedAt;
-  const updatedMs = Date.parse(cp.updatedAt || '');
-  if (Number.isFinite(updatedMs) && cp.state === 'running') {
-    // Mirror /health/pipelines' heuristic: a 'running' checkpoint untouched
-    // for more than 12h is almost certainly orphaned by a bot restart.
-    out.interrupted = (Date.now() - updatedMs) > (12 * 60 * 60 * 1000);
+  if (cp.state === 'running') {
+    // Genuinely shared with /health/pipelines and router's resume gate now.
+    // This used to be an inline 12h staleness window whose comment claimed to
+    // mirror /health/pipelines while doing something quite different, so a
+    // restart-orphaned run looked healthy here for up to 12h — long enough for
+    // bible-editor to hold a chapter lock across a whole evening.
+    out.interrupted = isInterruptedRunningCheckpoint(cp);
   }
   return out;
 }

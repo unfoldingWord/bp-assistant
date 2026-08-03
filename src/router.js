@@ -17,10 +17,10 @@ const {
 const { isTransientOutageError } = require('./claude-runner');
 const { publishAdminStatus } = require('./admin-status');
 const { handlePendingHumanDecisionConflictReply } = require('./issue-report-pipeline');
+const { isInterruptedRunningCheckpoint } = require('./pipeline-liveness');
 
 // In-memory pending confirmations for stream messages
 const pendingConfirmations = new Map();
-const PROCESS_STARTED_AT_MS = Date.now();
 
 // TEMPORARY TEST LOCK:
 // Restrict bot interactions to admin user during branch validation.
@@ -526,12 +526,9 @@ function getActiveCheckpoint(route, sessionKey, captures) {
 }
 
 function isStaleRunningCheckpoint(cp) {
-  if (!cp || cp.state !== 'running') return false;
-  const updatedMs = Date.parse(cp.updatedAt || '');
-  if (!Number.isFinite(updatedMs)) return false;
-  // If checkpoint was last updated before this bot process started,
-  // it cannot represent an actively running in-memory pipeline.
-  return updatedMs < PROCESS_STARTED_AT_MS;
+  // Shared with /health/pipelines and the job-status endpoint — see
+  // pipeline-liveness.js for why this must not be reimplemented inline.
+  return isInterruptedRunningCheckpoint(cp);
 }
 
 /**
