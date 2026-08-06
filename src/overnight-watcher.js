@@ -329,7 +329,21 @@ async function runOvernightReview({
   const log = deps.log || ((m) => process.stderr.write(`${m}\n`));
   const writeImpl = deps.writeFileSync || fs.writeFileSync;
   const mkdir = deps.mkdirSync || ((p) => fs.mkdirSync(p, { recursive: true }));
-  const stateFile = path.join(skillsRepo, state.DEFAULT_STATE_REL);
+
+  // #OVERNIGHT-STATE-LOCATION (issue #305): state.json lives on the volume,
+  // outside the skills checkout, and at the SAME path in both run modes — see
+  // the long comment at the top of overnight-review-state.js for why letting
+  // dry-run write an untracked file at a path PR mode later commits would jam
+  // every hourly sync. The proposal feed below still goes into `skillsRepo`
+  // (that IS the reviewable artifact PR mode commits); only the watermark moves.
+  const { stateFile, legacyStateFile } = state.resolveStateFile({ skillsRepo, env: deps.env || process.env });
+  state.migrateLegacyStateFile(stateFile, legacyStateFile, {
+    readImpl: deps.readFileSync || fs.readFileSync,
+    writeImpl,
+    mkdirImpl: mkdir,
+    unlinkImpl: deps.unlinkSync || fs.unlinkSync,
+    log,
+  });
 
   // #OVERNIGHT-STATE: probe for a pre-existing state file BEFORE loadState
   // swallows the distinction — this lets a cold start be logged as either a
@@ -426,8 +440,10 @@ async function runOvernightReview({
   }
 
   // Write under data/ (tracked) — NOT output/ (runtime, ephemeral on the wake
-  // machine). The feed must persist (committed alongside state.json) so the
-  // next Dreamer wake can read it after a fresh clone.
+  // machine). The feed must persist so the next Dreamer wake can read it after
+  // a fresh clone; in PR mode it is the content of the draft PR. (It no longer
+  // travels "alongside state.json" — the watermark moved out of the checkout
+  // in #305; the feed stays here because it is the reviewable artifact.)
   const outDir = path.join(skillsRepo, 'data/overnight-review', dateStamp(now));
   // #OVERNIGHT-FEED (closes the follow-up on #OVERNIGHT-STATE): the proposal
   // and review-task feed is a FILE for downstream automation/humans to read —
