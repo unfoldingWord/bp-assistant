@@ -336,14 +336,24 @@ async function runOvernightReview({
   // dry-run write an untracked file at a path PR mode later commits would jam
   // every hourly sync. The proposal feed below still goes into `skillsRepo`
   // (that IS the reviewable artifact PR mode commits); only the watermark moves.
-  const { stateFile, legacyStateFile } = state.resolveStateFile({ skillsRepo, env: deps.env || process.env });
-  state.migrateLegacyStateFile(stateFile, legacyStateFile, {
-    readImpl: deps.readFileSync || fs.readFileSync,
-    writeImpl,
-    mkdirImpl: mkdir,
-    unlinkImpl: deps.unlinkSync || fs.unlinkSync,
-    log,
-  });
+  const { stateFile, legacyStateFile } = state.resolveStateFile({ skillsRepo, env: deps.env || process.env, log });
+  // Migration is best-effort and must never abort the run: it happens before
+  // enumeration and before the feed write, so letting it throw would turn a
+  // one-off filesystem hiccup into "no proposal feed at all tonight". If it
+  // fails, the run continues; a genuinely unwritable state path still fails
+  // later at saveState — but by then the feed has been persisted.
+  try {
+    state.migrateLegacyStateFile(stateFile, legacyStateFile, {
+      readImpl: deps.readFileSync || fs.readFileSync,
+      writeImpl,
+      mkdirImpl: mkdir,
+      unlinkImpl: deps.unlinkSync || fs.unlinkSync,
+      renameImpl: deps.renameSync || fs.renameSync,
+      log,
+    });
+  } catch (err) {
+    log(`[overnight] WARNING: state migration to ${stateFile} failed (${(err && err.message) || err}) — continuing; the legacy file is left in place and the migration retries next run (issue #305).`);
+  }
 
   // #OVERNIGHT-STATE: probe for a pre-existing state file BEFORE loadState
   // swallows the distinction — this lets a cold start be logged as either a

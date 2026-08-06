@@ -65,14 +65,32 @@ function saveState(stateFile, state, { writeImpl = fs.writeFileSync, mkdirImpl }
 //      sees it in both modes.
 //   3. Fall back to the legacy in-repo path when neither is set (local dev and
 //      the existing unit tests, where there is no volume to write to). In that
-//      case there is nothing to migrate FROM, so legacyStateFile is null.
-function resolveStateFile({ skillsRepo, env = process.env } = {}) {
+//      case there is nothing to migrate FROM, so legacyStateFile is null — and
+//      it is LOGGED, because on the production host this fallback silently
+//      reproduces the exact #305 hazard the rest of this file exists to remove.
+function resolveStateFile({ skillsRepo, env = process.env, log } = {}) {
   const legacy = skillsRepo ? path.join(skillsRepo, DEFAULT_STATE_REL) : null;
   const explicit = String(env.OVERNIGHT_STATE_FILE || '').trim();
   if (explicit) return { stateFile: explicit, legacyStateFile: legacy };
   const home = String(env.BP_BOT_HOME || '').trim();
   if (home) return { stateFile: path.join(home, DEFAULT_STATE_BASENAME), legacyStateFile: legacy };
+  if (log) log(`[overnight] WARNING: neither OVERNIGHT_STATE_FILE nor BP_BOT_HOME is set — falling back to the legacy in-repo state path ${legacy}. That is fine for local dev, but on the bot host it puts the watermark back inside the git checkout (issue #305).`);
   return { stateFile: legacy, legacyStateFile: null };
+}
+
+// Does `p` hold a state file we can actually use? Mere existence is not enough:
+// a run killed mid-write (ENOSPC, OOM, container stop) can leave a truncated or
+// empty file, and treating that as "already migrated" would strand the real
+// watermark at the legacy path forever while loadState silently falls back to
+// defaultState() and primes the whole backlog away.
+function readUsableState(p, readImpl) {
+  let raw;
+  try { raw = readImpl(p, 'utf8'); } catch (err) { return { present: false, err }; }
+  try {
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== 'object') return { present: true, usable: false, raw };
+    return { present: true, usable: true, raw };
+  } catch { return { present: true, usable: false, raw }; }
 }
 
 // #OVERNIGHT-STATE-LOCATION: one-shot migration off the in-repo path. A real
@@ -83,23 +101,56 @@ function resolveStateFile({ skillsRepo, env = process.env } = {}) {
 // The legacy file is DELETED after a successful copy, on purpose: leaving it
 // behind would leave an untracked file sitting at exactly the path whose future
 // tracked twin is the whole hazard in issue #305, so the migration would fix
-// nothing. Copy first, unlink second — if the copy throws, the old file is
-// still there and the next run retries; if only the unlink fails, we have the
-// watermark and log loudly enough for someone to remove the file by hand.
+// nothing.
+//
+// Every step is defensive, because the failure mode here is losing a watermark
+// (and re-priming a real backlog past the point of recovery):
+//   - "already migrated" means the destination holds PARSEABLE state, not just
+//     that a file exists there — see readUsableState.
+//   - the legacy file must parse before it is copied; a corrupt one is left
+//     alone, both copies intact, for a human to look at.
+//   - the copy lands on a `.tmp` sibling and is renamed into place, so a
+//     half-written destination can never be mistaken for a completed migration.
+//   - the legacy file is unlinked only after that rename returns.
+// A read error on the legacy path that is NOT "file absent" is logged rather
+// than swallowed: silently declining to migrate would show up downstream as a
+// confident "COLD START (genuine first run)", which is precisely the
+// misleading-diagnostic failure #303 was written to kill.
 function migrateLegacyStateFile(stateFile, legacyStateFile, {
   readImpl = fs.readFileSync,
   writeImpl = fs.writeFileSync,
   mkdirImpl,
   unlinkImpl = fs.unlinkSync,
+  renameImpl = fs.renameSync,
   log = () => {},
 } = {}) {
   if (!legacyStateFile || legacyStateFile === stateFile) return false;
-  try { readImpl(stateFile, 'utf8'); return false; } catch { /* new location empty — continue */ }
-  let raw;
-  try { raw = readImpl(legacyStateFile, 'utf8'); } catch { return false; }
+
+  const dest = readUsableState(stateFile, readImpl);
+  if (dest.present && dest.usable) return false;
+  if (dest.present && !dest.usable) {
+    log(`[overnight] WARNING: ${stateFile} exists but does not parse as state — treating it as absent and re-running the migration from ${legacyStateFile} (issue #305).`);
+  }
+
+  const src = readUsableState(legacyStateFile, readImpl);
+  if (!src.present) {
+    // ENOENT is the normal, expected case (already migrated, or never existed).
+    // Anything else (EACCES, EIO) is a real problem worth surfacing.
+    if (src.err && src.err.code && src.err.code !== 'ENOENT') {
+      log(`[overnight] WARNING: could not read the legacy state file ${legacyStateFile} (${src.err.code}: ${src.err.message}) — NOT migrating. If a watermark exists there, this run will look like a cold start (issue #305).`);
+    }
+    return false;
+  }
+  if (!src.usable) {
+    log(`[overnight] WARNING: legacy state file ${legacyStateFile} does not parse as JSON — leaving both files untouched rather than migrating a corrupt watermark. Inspect it by hand (issue #305).`);
+    return false;
+  }
+
   const mkdir = mkdirImpl || ((p) => fs.mkdirSync(p, { recursive: true }));
   mkdir(path.dirname(stateFile));
-  writeImpl(stateFile, raw);
+  const tmp = `${stateFile}.tmp`;
+  writeImpl(tmp, src.raw);
+  renameImpl(tmp, stateFile);
   try {
     unlinkImpl(legacyStateFile);
   } catch (err) {
