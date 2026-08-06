@@ -139,6 +139,17 @@ function migrateLegacyStateFile(stateFile, legacyStateFile, {
   if (!legacyStateFile || legacyStateFile === stateFile) return 'noop';
 
   const dest = readUsableState(stateFile, readImpl);
+  // A read error on the DESTINATION that is not "file absent" must fail closed
+  // too, and this asymmetry was a live data-loss bug: readUsableState reports
+  // `present: false` for any errno, so an EACCES/EIO on the volume file made a
+  // perfectly current watermark look absent — and the migration would then
+  // overwrite it with the older legacy copy and delete the legacy original,
+  // reporting success. We cannot tell "no state here" from "cannot read the
+  // state here", so we must not write.
+  if (!dest.present && dest.err && dest.err.code && dest.err.code !== 'ENOENT') {
+    log(`[overnight] could not read the state file ${stateFile} (${dest.err.code}: ${dest.err.message}) — refusing to migrate over a file we cannot read (issue #305).`);
+    return 'blocked';
+  }
   if (dest.present && dest.usable) {
     // Already migrated — but a legacy file can still be sitting in the checkout
     // (e.g. an earlier run declined to migrate it and then cold-started, which
@@ -171,20 +182,48 @@ function migrateLegacyStateFile(stateFile, legacyStateFile, {
     return 'noop';
   }
   if (!src.usable) {
+    // Distinguish "carries nothing" from "carries something we can't read".
+    // An empty/whitespace file, or JSON with no state fields at all (`{}`,
+    // `[]`), holds no watermark to salvage — blocking on it would wedge the
+    // Sensor forever over an artifact that a single ENOSPC or OOM kill can
+    // produce, and pre-#305 such a file was simply harmless. Delete it (it is
+    // the untracked in-checkout file that IS the hazard) and carry on.
+    // A non-empty file that fails to PARSE is different: it may be a truncated
+    // real watermark, so stop and let a human look.
+    const empty = !String(src.raw || '').trim();
+    let parsedButEmptyShape = false;
+    if (!empty) {
+      try { JSON.parse(src.raw); parsedButEmptyShape = true; } catch { parsedButEmptyShape = false; }
+    }
+    if (empty || parsedButEmptyShape) {
+      try {
+        unlinkImpl(legacyStateFile);
+        log(`[overnight] removed an ${empty ? 'empty' : 'contentless'} legacy state file from the git checkout: ${legacyStateFile} — it carried no watermark (issue #305).`);
+      } catch (err) {
+        log(`[overnight] WARNING: an ${empty ? 'empty' : 'contentless'} legacy state file remains at ${legacyStateFile} and could not be removed (${(err && err.message) || err}). Remove it by hand (issue #305).`);
+      }
+      return 'noop';
+    }
     log(`[overnight] legacy state file ${legacyStateFile} does not parse as state — leaving both files untouched rather than migrating a corrupt watermark. Inspect it by hand (issue #305).`);
     return 'blocked';
   }
 
+  // From here on a real watermark exists at the legacy path and nowhere else.
+  // Any failure to move it must fail CLOSED: letting the exception escape means
+  // the caller continues, cold-starts, and primes the whole backlog away — and
+  // the run after that sees usable state at the new path and unlinks the legacy
+  // file as "stale", destroying the last copy. That is the exact outcome the
+  // 'blocked' status exists to prevent, so it must cover throws too.
   const mkdir = mkdirImpl || ((p) => fs.mkdirSync(p, { recursive: true }));
-  mkdir(path.dirname(stateFile));
   const tmp = `${stateFile}.tmp`;
-  writeImpl(tmp, src.raw);
   try {
+    mkdir(path.dirname(stateFile));
+    writeImpl(tmp, src.raw);
     renameImpl(tmp, stateFile);
   } catch (err) {
-    // Don't leave an orphan .tmp behind for every failed attempt.
-    try { unlinkImpl(tmp); } catch { /* best effort */ }
-    throw err;
+    try { unlinkImpl(tmp); } catch { /* best effort — don't orphan the .tmp */ }
+    log(`[overnight] could not move the legacy state file ${legacyStateFile} to ${stateFile} (${(err && err.message) || err}) — NOT migrating (issue #305).`);
+    return 'blocked';
   }
   try {
     unlinkImpl(legacyStateFile);

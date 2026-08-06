@@ -337,15 +337,17 @@ async function runOvernightReview({
   // every hourly sync. The proposal feed below still goes into `skillsRepo`
   // (that IS the reviewable artifact PR mode commits); only the watermark moves.
   const { stateFile, legacyStateFile } = state.resolveStateFile({ skillsRepo, env: deps.env || process.env, log });
-  // A migration that merely fails to run (throws) is survivable: it happens
-  // before enumeration and before the feed write, so letting it propagate would
-  // turn a one-off filesystem hiccup into "no proposal feed at all tonight". A
-  // migration that reports 'blocked' is NOT survivable, and the difference
-  // matters: 'blocked' means a legacy watermark is sitting there unreadable or
-  // corrupt, so continuing would cold-start, prime the whole enumerated backlog
-  // as already-seen — irreversibly — and log it as a confident "genuine first
-  // run". Fail the run instead: nothing is persisted, the operator gets a
-  // pointed error, and the next run retries.
+  // 'blocked' means a legacy watermark exists but could not be moved or read.
+  // Continuing would cold-start, prime the whole enumerated backlog as
+  // already-seen — irreversibly — and log it as a confident "genuine first
+  // run"; worse, the NEXT run would then see usable state at the new path and
+  // delete the legacy file as "stale", destroying the last copy. So the run
+  // fails instead: nothing is persisted and the next run retries.
+  //
+  // migrateLegacyStateFile converts its own filesystem failures into 'blocked'
+  // rather than throwing. An exception escaping it is therefore unexpected, and
+  // is treated as 'blocked' for the same reason — we cannot prove the legacy
+  // watermark is safe, so we must not proceed to prime past it.
   let migration = 'noop';
   try {
     migration = state.migrateLegacyStateFile(stateFile, legacyStateFile, {
@@ -357,7 +359,8 @@ async function runOvernightReview({
       log,
     });
   } catch (err) {
-    log(`[overnight] WARNING: state migration to ${stateFile} failed (${(err && err.message) || err}) — continuing; the legacy file is left in place and the migration retries next run (issue #305).`);
+    log(`[overnight] state migration to ${stateFile} threw unexpectedly (${(err && err.message) || err}) — treating it as blocked (issue #305).`);
+    migration = 'blocked';
   }
   if (migration === 'blocked') {
     throw new Error(`[overnight] refusing to run: a legacy state file exists at ${legacyStateFile} but could not be migrated to ${stateFile} (see the warning above). Continuing would cold-start and permanently prime the accumulated backlog past review. Fix or remove the legacy file, then re-run (issue #305).`);
