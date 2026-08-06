@@ -83,13 +83,17 @@ function resolveStateFile({ skillsRepo, env = process.env, log } = {}) {
 // empty file, and treating that as "already migrated" would strand the real
 // watermark at the legacy path forever while loadState silently falls back to
 // defaultState() and primes the whole backlog away.
+// "Parses as JSON" is too weak a bar: `[]`, `{}` and `null` all parse, and all
+// of them make loadState return defaultState() — i.e. a cold start that primes
+// the backlog away. Require something that actually looks like state.
 function readUsableState(p, readImpl) {
   let raw;
   try { raw = readImpl(p, 'utf8'); } catch (err) { return { present: false, err }; }
   try {
     const parsed = JSON.parse(raw);
-    if (!parsed || typeof parsed !== 'object') return { present: true, usable: false, raw };
-    return { present: true, usable: true, raw };
+    const looksLikeState = parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+      && (parsed.version !== undefined || parsed.reviewed !== undefined || parsed.initialized !== undefined);
+    return { present: true, usable: !!looksLikeState, raw };
   } catch { return { present: true, usable: false, raw }; }
 }
 
@@ -112,10 +116,18 @@ function readUsableState(p, readImpl) {
 //   - the copy lands on a `.tmp` sibling and is renamed into place, so a
 //     half-written destination can never be mistaken for a completed migration.
 //   - the legacy file is unlinked only after that rename returns.
-// A read error on the legacy path that is NOT "file absent" is logged rather
-// than swallowed: silently declining to migrate would show up downstream as a
-// confident "COLD START (genuine first run)", which is precisely the
-// misleading-diagnostic failure #303 was written to kill.
+//
+// Returns one of:
+//   'noop'     — nothing to do (already migrated, or no legacy file).
+//   'migrated' — the watermark moved; the legacy file is gone (or logged).
+//   'blocked'  — a legacy file EXISTS but could not be migrated (unreadable or
+//                corrupt). The caller MUST NOT continue: with no state at the
+//                new path the run would cold-start, prime the entire enumerated
+//                backlog as already-seen — irreversibly — and report it as a
+//                "genuine first run". That is the exact misleading diagnostic
+//                #303 was written to kill, and it would be caused by a
+//                transient, operator-fixable condition. Failing the run instead
+//                persists nothing and retries next hour.
 function migrateLegacyStateFile(stateFile, legacyStateFile, {
   readImpl = fs.readFileSync,
   writeImpl = fs.writeFileSync,
@@ -124,10 +136,26 @@ function migrateLegacyStateFile(stateFile, legacyStateFile, {
   renameImpl = fs.renameSync,
   log = () => {},
 } = {}) {
-  if (!legacyStateFile || legacyStateFile === stateFile) return false;
+  if (!legacyStateFile || legacyStateFile === stateFile) return 'noop';
 
   const dest = readUsableState(stateFile, readImpl);
-  if (dest.present && dest.usable) return false;
+  if (dest.present && dest.usable) {
+    // Already migrated — but a legacy file can still be sitting in the checkout
+    // (e.g. an earlier run declined to migrate it and then cold-started, which
+    // wrote a fresh state at the new path). Returning here without looking
+    // would leave the untracked file that IS the #305 hazard in place forever,
+    // and report success by silence. It is stale by definition — the live
+    // watermark is the one at `stateFile` — so remove it.
+    if (readUsableState(legacyStateFile, readImpl).present) {
+      try {
+        unlinkImpl(legacyStateFile);
+        log(`[overnight] removed a stale legacy state file left in the git checkout: ${legacyStateFile} (the live watermark is ${stateFile}) — issue #305.`);
+      } catch (err) {
+        log(`[overnight] WARNING: a stale legacy state file remains at ${legacyStateFile} and could not be removed (${(err && err.message) || err}). Remove it by hand — an untracked file there breaks \`git pull --ff-only\` on the skills checkout once PR mode commits one (issue #305).`);
+      }
+    }
+    return 'noop';
+  }
   if (dest.present && !dest.usable) {
     log(`[overnight] WARNING: ${stateFile} exists but does not parse as state — treating it as absent and re-running the migration from ${legacyStateFile} (issue #305).`);
   }
@@ -137,28 +165,35 @@ function migrateLegacyStateFile(stateFile, legacyStateFile, {
     // ENOENT is the normal, expected case (already migrated, or never existed).
     // Anything else (EACCES, EIO) is a real problem worth surfacing.
     if (src.err && src.err.code && src.err.code !== 'ENOENT') {
-      log(`[overnight] WARNING: could not read the legacy state file ${legacyStateFile} (${src.err.code}: ${src.err.message}) — NOT migrating. If a watermark exists there, this run will look like a cold start (issue #305).`);
+      log(`[overnight] could not read the legacy state file ${legacyStateFile} (${src.err.code}: ${src.err.message}) — NOT migrating (issue #305).`);
+      return 'blocked';
     }
-    return false;
+    return 'noop';
   }
   if (!src.usable) {
-    log(`[overnight] WARNING: legacy state file ${legacyStateFile} does not parse as JSON — leaving both files untouched rather than migrating a corrupt watermark. Inspect it by hand (issue #305).`);
-    return false;
+    log(`[overnight] legacy state file ${legacyStateFile} does not parse as state — leaving both files untouched rather than migrating a corrupt watermark. Inspect it by hand (issue #305).`);
+    return 'blocked';
   }
 
   const mkdir = mkdirImpl || ((p) => fs.mkdirSync(p, { recursive: true }));
   mkdir(path.dirname(stateFile));
   const tmp = `${stateFile}.tmp`;
   writeImpl(tmp, src.raw);
-  renameImpl(tmp, stateFile);
+  try {
+    renameImpl(tmp, stateFile);
+  } catch (err) {
+    // Don't leave an orphan .tmp behind for every failed attempt.
+    try { unlinkImpl(tmp); } catch { /* best effort */ }
+    throw err;
+  }
   try {
     unlinkImpl(legacyStateFile);
   } catch (err) {
     log(`[overnight] WARNING: migrated state to ${stateFile} but could not remove the legacy file ${legacyStateFile} (${(err && err.message) || err}). Remove it by hand — an untracked file at that path will break \`git pull --ff-only\` on the skills checkout once PR mode commits one (issue #305).`);
-    return true;
+    return 'migrated';
   }
   log(`[overnight] migrated state file out of the git checkout: ${legacyStateFile} → ${stateFile} (issue #305); legacy file removed.`);
-  return true;
+  return 'migrated';
 }
 
 // Stable unit key for a merged PR: repo#prId@headSha.

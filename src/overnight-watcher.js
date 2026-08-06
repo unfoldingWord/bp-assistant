@@ -337,13 +337,18 @@ async function runOvernightReview({
   // every hourly sync. The proposal feed below still goes into `skillsRepo`
   // (that IS the reviewable artifact PR mode commits); only the watermark moves.
   const { stateFile, legacyStateFile } = state.resolveStateFile({ skillsRepo, env: deps.env || process.env, log });
-  // Migration is best-effort and must never abort the run: it happens before
-  // enumeration and before the feed write, so letting it throw would turn a
-  // one-off filesystem hiccup into "no proposal feed at all tonight". If it
-  // fails, the run continues; a genuinely unwritable state path still fails
-  // later at saveState — but by then the feed has been persisted.
+  // A migration that merely fails to run (throws) is survivable: it happens
+  // before enumeration and before the feed write, so letting it propagate would
+  // turn a one-off filesystem hiccup into "no proposal feed at all tonight". A
+  // migration that reports 'blocked' is NOT survivable, and the difference
+  // matters: 'blocked' means a legacy watermark is sitting there unreadable or
+  // corrupt, so continuing would cold-start, prime the whole enumerated backlog
+  // as already-seen — irreversibly — and log it as a confident "genuine first
+  // run". Fail the run instead: nothing is persisted, the operator gets a
+  // pointed error, and the next run retries.
+  let migration = 'noop';
   try {
-    state.migrateLegacyStateFile(stateFile, legacyStateFile, {
+    migration = state.migrateLegacyStateFile(stateFile, legacyStateFile, {
       readImpl: deps.readFileSync || fs.readFileSync,
       writeImpl,
       mkdirImpl: mkdir,
@@ -353,6 +358,9 @@ async function runOvernightReview({
     });
   } catch (err) {
     log(`[overnight] WARNING: state migration to ${stateFile} failed (${(err && err.message) || err}) — continuing; the legacy file is left in place and the migration retries next run (issue #305).`);
+  }
+  if (migration === 'blocked') {
+    throw new Error(`[overnight] refusing to run: a legacy state file exists at ${legacyStateFile} but could not be migrated to ${stateFile} (see the warning above). Continuing would cold-start and permanently prime the accumulated backlog past review. Fix or remove the legacy file, then re-run (issue #305).`);
   }
 
   // #OVERNIGHT-STATE: probe for a pre-existing state file BEFORE loadState
