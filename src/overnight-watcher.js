@@ -363,7 +363,12 @@ async function runOvernightReview({
     migration = 'blocked';
   }
   if (migration === 'blocked') {
-    throw new Error(`[overnight] refusing to run: a legacy state file exists at ${legacyStateFile} but could not be migrated to ${stateFile} (see the warning above). Continuing would cold-start and permanently prime the accumulated backlog past review. Fix or remove the legacy file, then re-run (issue #305).`);
+    // Don't name a cause we haven't established: 'blocked' also covers "the
+    // state file at the NEW path could not be read", which happens in steady
+    // state with no legacy file present at all. Pointing the operator at a
+    // file that isn't there is the same species of confidently-wrong
+    // diagnostic this module keeps getting bitten by.
+    throw new Error(`[overnight] refusing to run: could not establish the review watermark — ${stateFile} was unreadable, or a legacy state file at ${legacyStateFile} could not be migrated to it (see the warning above for which). Continuing would cold-start and permanently prime the accumulated backlog past review. Resolve the file named in that warning, then re-run (issue #305).`);
   }
 
   // #OVERNIGHT-STATE: probe for a pre-existing state file BEFORE loadState
