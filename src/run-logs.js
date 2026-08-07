@@ -410,6 +410,7 @@ module.exports = {
   transcriptPathFor,
   subagentDirFor,
   escapeProjectDir,
+  redact,
   truncate,
   RUN_LOG_DIR,
   MAX_AGE_DAYS,
