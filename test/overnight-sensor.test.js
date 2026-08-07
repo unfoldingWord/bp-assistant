@@ -480,3 +480,353 @@ test('runOvernightReview reviews a fresh merged TN PR and emits proposals', asyn
   assert.equal(row.editor, 'pjoakes');
   assert.equal(row.book, 'PSA');
 });
+
+// --- state file location (#OVERNIGHT-STATE-LOCATION, issue #305) -------------
+// The watermark must NOT live inside the bp-assistant-skills checkout. Dry-run
+// mode writes it on the volume's checkout (untracked); PR mode runs in a
+// worktree and commits its output. If both wrote the in-repo path, the first
+// commit of state.json to main would make the volume's untracked copy block
+// `git pull --ff-only` on EVERY hourly wake, for every run mode.
+const BOT_HOME = '/data/bp-bot';
+const VOLUME_STATE = require('node:path').join(BOT_HOME, 'overnight-review-state.json');
+const LEGACY_STATE = require('node:path').join('/skills', 'data/overnight-review/state.json');
+
+test('resolveStateFile puts state on the volume in BOTH modes, never inside the skills checkout', () => {
+  const dry = stateLib.resolveStateFile({ skillsRepo: '/skills', env: { BP_BOT_HOME: BOT_HOME } });
+  const pr = stateLib.resolveStateFile({ skillsRepo: '/skills/../worktrees/overnight-1', env: { BP_BOT_HOME: BOT_HOME } });
+  assert.equal(dry.stateFile, VOLUME_STATE);
+  assert.equal(pr.stateFile, VOLUME_STATE); // mode-independent: same file, no collision possible
+  assert.equal(dry.legacyStateFile, LEGACY_STATE);
+});
+
+test('resolveStateFile honours an explicit OVERNIGHT_STATE_FILE override, and falls back in-repo with no env', () => {
+  assert.equal(
+    stateLib.resolveStateFile({ skillsRepo: '/skills', env: { OVERNIGHT_STATE_FILE: '/tmp/x.json', BP_BOT_HOME: BOT_HOME } }).stateFile,
+    '/tmp/x.json',
+  );
+  const bare = stateLib.resolveStateFile({ skillsRepo: '/skills', env: {} });
+  assert.equal(bare.stateFile, LEGACY_STATE);
+  assert.equal(bare.legacyStateFile, null); // nothing to migrate from when it IS the legacy path
+});
+
+test('a dry run writes state to the volume path, not into the skills checkout', async () => {
+  const writes = [];
+  const initState = JSON.stringify({ version: 1, initialized: true, lastRun: '2026-06-20T00:00:00Z', reviewed: {}, branchTips: {} });
+  const prs = { en_tn: [{ number: 9, merged: true, merged_at: '2026-06-23T22:00:00Z', head: { ref: 'PSA-be-pjoakes', sha: 'newhead' }, base: { sha: 'oldbase' }, user: { login: 'pjoakes' } }] };
+
+  const res = await watcher.runOvernightReview({
+    skillsRepo: '/skills', now: new Date('2026-06-24T07:00:00Z'), dryRun: true,
+    deps: {
+      env: { BP_BOT_HOME: BOT_HOME },
+      readFileSync: (p) => { if (p === VOLUME_STATE) return initState; throw new Error('ENOENT'); },
+      writeFileSync: (pth, content) => writes.push({ pth, content }),
+      mkdirSync: () => {}, unlinkSync: (p) => { throw new Error(`unexpected unlink of ${p}`); },
+      apiGetImpl: fakeApiGet(prs, {}), fetchTextImpl: async () => '', log: () => {},
+    },
+  });
+  assert.equal(res.reviewed, 1);
+  const stateWrites = writes.filter((w) => /state\.json$/.test(w.pth));
+  assert.equal(stateWrites.length, 1);
+  assert.equal(stateWrites[0].pth, VOLUME_STATE);
+  assert.ok(!writes.some((w) => w.pth === LEGACY_STATE), 'must never write the in-repo state path');
+  // The feed still belongs to the checkout — only the watermark moved.
+  const feedWrite = writes.find((w) => /proposals\.jsonl$/.test(w.pth));
+  assert.ok(feedWrite && feedWrite.pth.startsWith(require('node:path').join('/skills', 'data/overnight-review')));
+});
+
+test('an existing in-repo state file is migrated to the volume (watermark kept, no cold start) and the legacy file removed', async () => {
+  const legacyContent = JSON.stringify({
+    version: 1, initialized: true, lastRun: '2026-06-20T00:00:00Z',
+    reviewed: { 'en_tn#9@newhead': '2026-06-20T00:00:00Z' }, branchTips: {},
+  });
+  const disk = { [LEGACY_STATE]: legacyContent };
+  const unlinked = [];
+  const prs = { en_tn: [{ number: 9, merged: true, merged_at: '2026-06-23T22:00:00Z', head: { ref: 'PSA-be-pjoakes', sha: 'newhead' }, base: { sha: 'oldbase' }, user: { login: 'pjoakes' } }] };
+
+  const res = await watcher.runOvernightReview({
+    skillsRepo: '/skills', now: new Date('2026-06-24T07:00:00Z'), dryRun: true,
+    deps: {
+      env: { BP_BOT_HOME: BOT_HOME },
+      readFileSync: (p) => { if (disk[p] != null) return disk[p]; throw new Error('ENOENT'); },
+      writeFileSync: (p, content) => { disk[p] = content; },
+      mkdirSync: () => {},
+      renameSync: (from, to) => { disk[to] = disk[from]; delete disk[from]; },
+      unlinkSync: (p) => { unlinked.push(p); delete disk[p]; },
+      apiGetImpl: fakeApiGet(prs, {}), fetchTextImpl: async () => '', log: () => {},
+    },
+  });
+
+  assert.equal(res.coldStart, false, 'the migrated watermark must prevent a cold start');
+  assert.equal(res.reviewed, 0, 'the already-reviewed unit stays reviewed after migration');
+  assert.deepEqual(unlinked, [LEGACY_STATE]); // deliberate: an untracked file left there is the #305 hazard
+  assert.equal(disk[LEGACY_STATE], undefined);
+  const migrated = JSON.parse(disk[VOLUME_STATE]);
+  assert.ok(migrated.reviewed['en_tn#9@newhead'], 'reviewed-set survived the move');
+});
+
+test('migration is a one-shot: an existing volume state file is never overwritten by the legacy one', () => {
+  const disk = { [VOLUME_STATE]: '{"version":1,"reviewed":{"newer":"x"}}', [LEGACY_STATE]: '{"version":1,"reviewed":{"older":"x"}}' };
+  const unlinked = [];
+  const moved = stateLib.migrateLegacyStateFile(VOLUME_STATE, LEGACY_STATE, {
+    readImpl: (p) => { if (disk[p] != null) return disk[p]; throw new Error('ENOENT'); },
+    writeImpl: (p, c) => { disk[p] = c; },
+    mkdirImpl: () => {}, renameImpl: () => { throw new Error('rename must not be reached'); },
+    unlinkImpl: (p) => unlinked.push(p),
+  });
+  assert.equal(moved, 'noop');
+  assert.equal(disk[VOLUME_STATE], '{"version":1,"reviewed":{"newer":"x"}}'); // never overwritten by the older copy
+  // …but the stale in-repo copy is still cleared out: leaving an untracked file
+  // at that path is the #305 hazard, and the live watermark is the one at
+  // VOLUME_STATE, so the legacy one is stale by definition.
+  assert.deepEqual(unlinked, [LEGACY_STATE]);
+});
+
+test('feed-before-state ordering still holds with state on the volume: a failed feed write leaves the volume watermark untouched', async () => {
+  const initState = JSON.stringify({ version: 1, initialized: true, lastRun: '2026-06-20T00:00:00Z', reviewed: {}, branchTips: {} });
+  const disk = { [VOLUME_STATE]: initState };
+  const prs = { en_tn: [{ number: 9, merged: true, merged_at: '2026-06-23T22:00:00Z', head: { ref: 'PSA-be-pjoakes', sha: 'newhead' }, base: { sha: 'oldbase' }, user: { login: 'pjoakes' } }] };
+
+  await assert.rejects(
+    () => watcher.runOvernightReview({
+      skillsRepo: '/skills', now: new Date('2026-06-24T07:00:00Z'), dryRun: true,
+      deps: {
+        env: { BP_BOT_HOME: BOT_HOME },
+        readFileSync: (p) => { if (disk[p] != null) return disk[p]; throw new Error('ENOENT'); },
+        writeFileSync: (p, content) => { if (/proposals\.jsonl$/.test(p)) throw new Error('disk full'); disk[p] = content; },
+        mkdirSync: () => {}, unlinkSync: () => {},
+        apiGetImpl: fakeApiGet(prs, {}), fetchTextImpl: async () => '', log: () => {},
+      },
+    }),
+    /disk full/,
+  );
+  assert.equal(disk[VOLUME_STATE], initState); // watermark unadvanced → unit retried next run
+});
+
+// Migration hardening: the failure modes that lose a watermark. A run killed
+// mid-write leaves a truncated destination; if "a file exists there" counted as
+// "already migrated", the real watermark would be stranded at the legacy path
+// forever and the whole backlog primed away on the next cold start.
+test('a truncated/corrupt file at the new path does not count as migrated — the legacy watermark is recovered', () => {
+  const disk = { [VOLUME_STATE]: '{"version":1,"initial', [LEGACY_STATE]: '{"version":1,"initialized":true,"lastRun":"2026-06-20T00:00:00Z","reviewed":{},"branchTips":{}}' };
+  const unlinked = [];
+  const moved = stateLib.migrateLegacyStateFile(VOLUME_STATE, LEGACY_STATE, {
+    readImpl: (p) => { if (disk[p] != null) return disk[p]; const e = new Error('ENOENT'); e.code = 'ENOENT'; throw e; },
+    writeImpl: (p, c) => { disk[p] = c; },
+    mkdirImpl: () => {},
+    renameImpl: (from, to) => { disk[to] = disk[from]; delete disk[from]; },
+    unlinkImpl: (p) => { unlinked.push(p); delete disk[p]; },
+  });
+  assert.equal(moved, 'migrated');
+  assert.equal(JSON.parse(disk[VOLUME_STATE]).lastRun, '2026-06-20T00:00:00Z');
+  assert.deepEqual(unlinked, [LEGACY_STATE]);
+  // (The "no .tmp left behind" property cannot be asserted against a fake whose
+  // own renameImpl deletes the source — the real-filesystem test below covers it.)
+});
+
+test('a corrupt legacy state file is left alone rather than migrated and deleted', () => {
+  const disk = { [LEGACY_STATE]: '{"version":1,"revi' };
+  const unlinked = [];
+  const logs = [];
+  const moved = stateLib.migrateLegacyStateFile(VOLUME_STATE, LEGACY_STATE, {
+    readImpl: (p) => { if (disk[p] != null) return disk[p]; const e = new Error('ENOENT'); e.code = 'ENOENT'; throw e; },
+    writeImpl: (p, c) => { disk[p] = c; },
+    mkdirImpl: () => {}, renameImpl: () => {},
+    unlinkImpl: (p) => unlinked.push(p),
+    log: (m) => logs.push(m),
+  });
+  assert.equal(moved, 'blocked');
+  assert.deepEqual(unlinked, []); // the only copy of a damaged watermark survives for inspection
+  assert.ok(disk[LEGACY_STATE]);
+  assert.ok(logs.some((m) => /does not parse as state/.test(m)));
+});
+
+test('a non-ENOENT read failure on the legacy path is logged, not swallowed into a silent cold start', () => {
+  const logs = [];
+  const moved = stateLib.migrateLegacyStateFile(VOLUME_STATE, LEGACY_STATE, {
+    readImpl: (p) => { const e = new Error('permission denied'); e.code = p === LEGACY_STATE ? 'EACCES' : 'ENOENT'; throw e; },
+    writeImpl: () => { throw new Error('should not write'); },
+    mkdirImpl: () => {}, renameImpl: () => {}, unlinkImpl: () => { throw new Error('should not unlink'); },
+    log: (m) => logs.push(m),
+  });
+  assert.equal(moved, 'blocked');
+  assert.ok(logs.some((m) => /EACCES/.test(m) && /NOT migrating/.test(m)));
+});
+
+test('resolveStateFile warns when it falls back to the in-repo path (the #305 hazard, silently reintroduced)', () => {
+  const logs = [];
+  stateLib.resolveStateFile({ skillsRepo: '/skills', env: {}, log: (m) => logs.push(m) });
+  assert.ok(logs.some((m) => /falling back to the legacy in-repo state path/.test(m)));
+});
+
+// The tests above all inject fake filesystems, which cannot represent a partial
+// write or a real errno. This one drives the migration against real fs in a
+// tmpdir, end to end.
+test('migration works against a real filesystem: file moves, contents match, legacy path is gone', () => {
+  const nodeFs = require('node:fs');
+  const nodeOs = require('node:os');
+  const nodePath = require('node:path');
+  const root = nodeFs.mkdtempSync(nodePath.join(nodeOs.tmpdir(), 'overnight-state-'));
+  try {
+    const skills = nodePath.join(root, 'skills');
+    const home = nodePath.join(root, 'bot-home');
+    const legacy = nodePath.join(skills, 'data/overnight-review/state.json');
+    nodeFs.mkdirSync(nodePath.dirname(legacy), { recursive: true });
+    const content = JSON.stringify({ version: 1, initialized: true, lastRun: '2026-06-20T00:00:00Z', reviewed: { 'en_tn#1@abc': 'x' }, branchTips: {} });
+    nodeFs.writeFileSync(legacy, content);
+
+    const resolved = stateLib.resolveStateFile({ skillsRepo: skills, env: { BP_BOT_HOME: home } });
+    assert.equal(resolved.stateFile, nodePath.join(home, 'overnight-review-state.json'));
+    assert.equal(stateLib.migrateLegacyStateFile(resolved.stateFile, resolved.legacyStateFile), 'migrated');
+
+    assert.equal(nodeFs.existsSync(legacy), false, 'legacy file must be gone — leaving it is the #305 hazard');
+    assert.equal(nodeFs.readFileSync(resolved.stateFile, 'utf8'), content);
+    assert.equal(nodeFs.existsSync(`${resolved.stateFile}.tmp`), false);
+    // Idempotent: a second call is a no-op, and loadState reads the watermark.
+    assert.equal(stateLib.migrateLegacyStateFile(resolved.stateFile, resolved.legacyStateFile), 'noop');
+    assert.equal(stateLib.loadState(resolved.stateFile).lastRun, '2026-06-20T00:00:00Z');
+  } finally {
+    nodeFs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// The composition the cold review caught: migration declines (legacy file
+// unreadable/corrupt), so nothing lands at the new path, so the run would
+// cold-start, prime the whole enumerated backlog as already-seen —
+// irreversibly — and report it as a confident "genuine first run". Fail the
+// run instead: nothing is persisted and the next run retries.
+test('a blocked migration aborts the run instead of cold-starting and priming the backlog away', async () => {
+  const writes = [];
+  const prs = { en_tn: [{ number: 9, merged: true, merged_at: '2026-06-23T22:00:00Z', head: { ref: 'PSA-be-pjoakes', sha: 'newhead' }, base: { sha: 'oldbase' }, user: { login: 'pjoakes' } }] };
+  const run = (legacyRead) => watcher.runOvernightReview({
+    skillsRepo: '/skills', now: new Date('2026-06-24T07:00:00Z'), dryRun: true,
+    deps: {
+      env: { BP_BOT_HOME: BOT_HOME },
+      readFileSync: (p) => { if (p === LEGACY_STATE) return legacyRead(); const e = new Error('ENOENT'); e.code = 'ENOENT'; throw e; },
+      writeFileSync: (pth, content) => writes.push({ pth, content }),
+      mkdirSync: () => {}, renameSync: () => {}, unlinkSync: () => {},
+      apiGetImpl: fakeApiGet(prs, {}), fetchTextImpl: async () => '', log: () => {},
+    },
+  });
+
+  // (a) legacy unreadable for a reason that is not "absent"
+  await assert.rejects(
+    () => run(() => { const e = new Error('permission denied'); e.code = 'EACCES'; throw e; }),
+    /refusing to run/,
+  );
+  // (b) legacy present but corrupt
+  await assert.rejects(() => run(() => '{"version":1,"revi'), /refusing to run/);
+
+  assert.deepEqual(writes, [], 'a blocked run must persist nothing at all — no state, no primed watermark');
+});
+
+test('a missing legacy file is NOT blocked — a genuine first run still cold-starts normally', async () => {
+  const writes = [];
+  const res = await watcher.runOvernightReview({
+    skillsRepo: '/skills', now: new Date('2026-06-24T07:00:00Z'), dryRun: true,
+    deps: {
+      env: { BP_BOT_HOME: BOT_HOME },
+      readFileSync: () => { const e = new Error('ENOENT'); e.code = 'ENOENT'; throw e; },
+      writeFileSync: (pth, content) => writes.push({ pth, content }),
+      mkdirSync: () => {}, renameSync: () => {}, unlinkSync: () => {},
+      apiGetImpl: fakeApiGet({}, {}), fetchTextImpl: async () => '', log: () => {},
+    },
+  });
+  assert.equal(res.coldStart, true);
+  assert.equal(res.genuineFirstRun, true);
+  assert.equal(writes.find((w) => /state\.json$/.test(w.pth)).pth, VOLUME_STATE);
+});
+
+test('a stale legacy file left in the checkout is cleaned up even when the volume state is already good', async () => {
+  const goodState = JSON.stringify({ version: 1, initialized: true, lastRun: '2026-06-20T00:00:00Z', reviewed: {}, branchTips: {} });
+  const disk = { [VOLUME_STATE]: goodState, [LEGACY_STATE]: '{"version":1,"stale":true}' };
+  const unlinked = [];
+  await watcher.runOvernightReview({
+    skillsRepo: '/skills', now: new Date('2026-06-24T07:00:00Z'), dryRun: true,
+    deps: {
+      env: { BP_BOT_HOME: BOT_HOME },
+      readFileSync: (p) => { if (disk[p] != null) return disk[p]; const e = new Error('ENOENT'); e.code = 'ENOENT'; throw e; },
+      writeFileSync: (p, c) => { disk[p] = c; },
+      mkdirSync: () => {}, renameSync: () => {},
+      unlinkSync: (p) => { unlinked.push(p); delete disk[p]; },
+      apiGetImpl: fakeApiGet({}, {}), fetchTextImpl: async () => '', log: () => {},
+    },
+  });
+  assert.deepEqual(unlinked, [LEGACY_STATE]);
+  assert.equal(JSON.parse(disk[VOLUME_STATE]).lastRun, '2026-06-24T07:00:00.000Z'); // live watermark untouched by the cleanup
+});
+
+// Review of ad17371 found that fail-closed only covered the *returned* status,
+// not a migration that THREW: the throw was caught, the run continued, cold
+// started, primed the backlog away — and the run after that deleted the legacy
+// file as "stale", destroying the last copy of the real watermark.
+test('a filesystem failure while moving the legacy file blocks the run instead of priming the backlog away', async () => {
+  const legacy = JSON.stringify({ version: 1, initialized: true, lastRun: '2026-06-20T00:00:00Z', reviewed: {}, branchTips: {} });
+  const disk = { [LEGACY_STATE]: legacy };
+  const written = [];
+  const prs = { en_tn: [{ number: 9, merged: true, merged_at: '2026-06-23T22:00:00Z', head: { ref: 'PSA-be-pjoakes', sha: 'newhead' }, base: { sha: 'oldbase' }, user: { login: 'pjoakes' } }] };
+
+  await assert.rejects(
+    () => watcher.runOvernightReview({
+      skillsRepo: '/skills', now: new Date('2026-06-24T07:00:00Z'), dryRun: true,
+      deps: {
+        env: { BP_BOT_HOME: BOT_HOME },
+        readFileSync: (p) => { if (disk[p] != null) return disk[p]; const e = new Error('ENOENT'); e.code = 'ENOENT'; throw e; },
+        writeFileSync: (p, c) => { written.push(p); disk[p] = c; },
+        mkdirSync: () => {},
+        renameSync: () => { const e = new Error('operation not permitted'); e.code = 'EPERM'; throw e; },
+        unlinkSync: (p) => { delete disk[p]; },
+        apiGetImpl: fakeApiGet(prs, {}), fetchTextImpl: async () => '', log: () => {},
+      },
+    }),
+    /refusing to run/,
+  );
+  assert.equal(disk[LEGACY_STATE], legacy, 'the only copy of the watermark must survive');
+  assert.equal(disk[VOLUME_STATE], undefined, 'no primed state may be written at the new path');
+  assert.equal(disk[`${VOLUME_STATE}.tmp`], undefined, 'the .tmp sibling is cleaned up on a failed rename');
+});
+
+// The same asymmetry, on the other side: a read error on the DESTINATION made a
+// current watermark look absent, so the migration overwrote it with the older
+// legacy copy and deleted the original.
+test('an unreadable (not absent) state file at the new path is never overwritten by the older legacy copy', () => {
+  const current = JSON.stringify({ version: 1, initialized: true, lastRun: '2026-08-01T00:00:00Z', reviewed: {}, branchTips: {} });
+  const older = JSON.stringify({ version: 1, initialized: true, lastRun: '2026-01-01T00:00:00Z', reviewed: {}, branchTips: {} });
+  const disk = { [VOLUME_STATE]: current, [LEGACY_STATE]: older };
+  const unlinked = [];
+  const status = stateLib.migrateLegacyStateFile(VOLUME_STATE, LEGACY_STATE, {
+    readImpl: (p) => {
+      if (p === VOLUME_STATE) { const e = new Error('permission denied'); e.code = 'EACCES'; throw e; }
+      if (disk[p] != null) return disk[p];
+      const e = new Error('ENOENT'); e.code = 'ENOENT'; throw e;
+    },
+    writeImpl: (p, c) => { disk[p] = c; },
+    mkdirImpl: () => {}, renameImpl: (f, t) => { disk[t] = disk[f]; delete disk[f]; },
+    unlinkImpl: (p) => { unlinked.push(p); delete disk[p]; },
+  });
+  assert.equal(status, 'blocked');
+  assert.equal(disk[VOLUME_STATE], current, 'the current watermark must not be clobbered');
+  assert.deepEqual(unlinked, [], 'and the legacy copy must not be deleted');
+});
+
+// Blocking must not fire on artifacts that carry no watermark at all — an
+// ENOSPC/OOM-truncated zero-byte file, or `{}`/`[]` — or a single bad night
+// would wedge the Sensor forever over something that used to be harmless.
+test('a legacy file with no recoverable watermark is cleaned up, not treated as a blocker', async () => {
+  for (const contents of ['', '   \n', '{}', '[]']) {
+    const disk = { [LEGACY_STATE]: contents };
+    const res = await watcher.runOvernightReview({
+      skillsRepo: '/skills', now: new Date('2026-06-24T07:00:00Z'), dryRun: true,
+      deps: {
+        env: { BP_BOT_HOME: BOT_HOME },
+        readFileSync: (p) => { if (disk[p] != null) return disk[p]; const e = new Error('ENOENT'); e.code = 'ENOENT'; throw e; },
+        writeFileSync: (p, c) => { disk[p] = c; },
+        mkdirSync: () => {}, renameSync: (f, t) => { disk[t] = disk[f]; delete disk[f]; },
+        unlinkSync: (p) => { delete disk[p]; },
+        apiGetImpl: fakeApiGet({}, {}), fetchTextImpl: async () => '', log: () => {},
+      },
+    });
+    assert.equal(res.coldStart, true, `${JSON.stringify(contents)}: run proceeds as a normal cold start`);
+    assert.equal(disk[LEGACY_STATE], undefined, `${JSON.stringify(contents)}: the contentless in-checkout file is removed`);
+    assert.ok(disk[VOLUME_STATE], `${JSON.stringify(contents)}: state is written to the volume`);
+  }
+});
