@@ -261,7 +261,11 @@ function addLlmCall(acc, call) {
  * without driving a pipeline:
  *  - the message is scrubbed of the caller's API key before it reaches a
  *    checkpoint file, the admin board or Zulip (translate-llm already scrubs
- *    what it throws; this is the belt for anything else that saw the key);
+ *    what it throws; this is the belt for anything else that saw the key).
+ *    translatePipeline's catch also re-throws a NEW Error carrying this same
+ *    scrubbed message (rather than the original err), so router sinks —
+ *    console.error, publishRouterFailure, the Zulip control thread — never
+ *    see the unscrubbed original either;
  *  - a provider errorKind (invalid_key / rate_limited / model_not_found / …)
  *    rides on `current`, which serializeCheckpoint surfaces on
  *    GET /api/pipeline/{jobId} so the editor can render the cause.
@@ -331,7 +335,12 @@ async function runTsvBatch({ files, batchRows, params, resource, guard }) {
 
     // Direct-provider path: one completion writes files.outputFile, then the
     // SAME deterministic checks + repair loop below validate it.
-    if (params.provider && params.apiKey) {
+    if (params.provider) {
+      if (!params.apiKey) {
+        const err = new Error('provider run without api key');
+        err.errorKind = 'invalid_key';
+        throw err;
+      }
       llmCalls.push(await translateLlm.runTsvBatch({ files, params, repairNote }));
     } else {
       const result = await runClaude({
@@ -502,7 +511,12 @@ async function runArticleFile({ files, sourceMarkdown, params, guard }) {
       }\nRewrite ${files.outputFile} fixing every violation. Preserve every rc://, [[wiki]], and ](link) target byte-for-byte and keep the heading structure.`
       : '';
     // Direct-provider path — same output file, same checks + repair loop.
-    if (params.provider && params.apiKey) {
+    if (params.provider) {
+      if (!params.apiKey) {
+        const err = new Error('provider run without api key');
+        err.errorKind = 'invalid_key';
+        throw err;
+      }
       llmCalls.push(await translateLlm.runArticleFile({ files, params, repairNote }));
     } else {
       const result = await runClaude({
@@ -677,14 +691,21 @@ async function translatePipeline(route, message) {
     }
     return await runTsvDelivery({ params, ckptId, scope, workDir, runHash, label, username, post });
   } catch (err) {
-    const { message, patch } = buildFailurePatch(err, {
+    const { message: failureMessage, patch } = buildFailurePatch(err, {
       chapter: scope.startChapter, skill: params.skill, apiKey: params.apiKey,
     });
-    console.error(`${LOG_PREFIX} ${label} failed: ${message}`);
+    console.error(`${LOG_PREFIX} ${label} failed: ${failureMessage}`);
     setCheckpoint(ckptId, patch);
-    await publishAdminStatus({ source: 'translate-pipeline', pipelineType: 'translate', scope: label, phase: 'run', severity: 'error', message }).catch(() => {});
-    await post(`:cross_mark: Translate **${label}** failed: ${message}`);
-    throw err;
+    await publishAdminStatus({ source: 'translate-pipeline', pipelineType: 'translate', scope: label, phase: 'run', severity: 'error', message: failureMessage }).catch(() => {});
+    await post(`:cross_mark: Translate **${label}** failed: ${failureMessage}`);
+    // Re-throw a NEW error carrying the scrubbed message — the original err
+    // may still hold the caller's API key (e.g. in a raw SDK error string)
+    // and must not reach router sinks (console.error, publishRouterFailure,
+    // the Zulip control thread) unscrubbed.
+    const scrubbedErr = new Error(failureMessage);
+    if (err && err.errorKind) scrubbedErr.errorKind = err.errorKind;
+    if (err && err.stack) scrubbedErr.stack = err.stack;
+    throw scrubbedErr;
   }
 }
 

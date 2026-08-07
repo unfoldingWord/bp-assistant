@@ -99,10 +99,12 @@ function secretEnvValues() {
 
 const SECRET_PATTERNS = [
   [/sk-ant-[A-Za-z0-9_-]{16,}/g, '[redacted:anthropic-key]'],
-  [/sk-[A-Za-z0-9]{32,}/g, '[redacted:api-key]'],
+  // Modern OpenAI-style keys (sk-proj-…, sk-ant-api03-…) carry hyphens and
+  // underscores in the body, not just alnum — the plain alnum pattern missed them.
+  [/sk-[A-Za-z0-9_-]{20,}/g, '[redacted:api-key]'],
   [/gh[pousr]_[A-Za-z0-9]{16,}/g, '[redacted:github-token]'],
   [/github_pat_[A-Za-z0-9_]{20,}/g, '[redacted:github-pat]'],
-  [/xai-[A-Za-z0-9]{16,}/g, '[redacted:xai-key]'],
+  [/xai-[A-Za-z0-9_-]{16,}/g, '[redacted:xai-key]'],
   [/AIza[A-Za-z0-9_-]{20,}/g, '[redacted:google-key]'],
   [/\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}/g, '[redacted:jwt]'],
   [/\b(?:Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{16,}/gi, '[redacted:auth-header]'],

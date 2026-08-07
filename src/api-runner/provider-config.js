@@ -297,7 +297,12 @@ function resolveProviderModel(provider, model) {
   const cfg = getProviderConfig(provider);
   const candidate = model || cfg.defaultModel;
   if (typeof candidate !== 'string') return candidate;
-  return cfg.modelAliases?.[candidate] || candidate;
+  // hasOwnProperty guard: an unguarded cfg.modelAliases[candidate] read lets
+  // candidate values like "toString"/"constructor"/"__proto__" resolve to an
+  // inherited Object.prototype member instead of undefined, bypassing validation.
+  const aliases = cfg.modelAliases;
+  if (aliases && Object.prototype.hasOwnProperty.call(aliases, candidate)) return aliases[candidate];
+  return candidate;
 }
 
 // Difficulty-based selection. Jobs declare a DIFFICULTY tier (low/medium/high),
@@ -348,7 +353,8 @@ function resolveDifficultyEffort(requested) {
 function isConfiguredModel(provider, model) {
   if (!model || typeof model !== 'string') return false;
   const cfg = getProviderConfig(provider);
-  return !!cfg.models?.[model];
+  // hasOwnProperty guard — see resolveProviderModel above for the same reason.
+  return !!(cfg.models && Object.prototype.hasOwnProperty.call(cfg.models, model));
 }
 
 function assertProviderModel(provider, model) {

@@ -215,6 +215,20 @@ test('classifyProviderError reads a Gemini retryDelay out of the body', () => {
   assert.strictEqual(llm.classifyProviderError(err).retryAfterSeconds, 17);
 });
 
+const NETWORK_CASES = [
+  ['ECONNRESET via err.cause.code', { message: 'Connection error.', cause: { code: 'ECONNRESET' } }],
+  ['ECONNREFUSED via err.cause.code', { message: 'fetch failed', cause: { code: 'ECONNREFUSED' } }],
+  ['EAI_AGAIN via err.code', { message: 'getaddrinfo failed', code: 'EAI_AGAIN' }],
+  ['EPIPE via err.code', { message: 'write EPIPE', code: 'EPIPE' }],
+  ['UND_ERR_SOCKET via err.cause.code', { message: 'fetch failed', cause: { code: 'UND_ERR_SOCKET' } }],
+];
+
+for (const [label, err] of NETWORK_CASES) {
+  test(`classifyProviderError maps ${label} → network_error`, () => {
+    assert.strictEqual(llm.classifyProviderError(err).code, 'network_error');
+  });
+}
+
 // ---------------------------------------------------------------------------
 // Retry policy
 // ---------------------------------------------------------------------------
@@ -277,6 +291,49 @@ test('timeout is retried once', async () => {
   llm._resetTestHooks();
 });
 
+test('network_error (connection reset) retries twice, same policy as provider_overloaded', async () => {
+  const files = makeBatchFiles();
+  const stub = stubTransport((_args, n) => {
+    if (n <= 2) {
+      const err = new Error('fetch failed');
+      err.cause = { code: 'ECONNRESET' };
+      throw err;
+    }
+    return { text: wrapped(`${HEADER}\n${ROW}`), usage: { inputTokens: 1, outputTokens: 1 }, stopReason: 'end_turn' };
+  });
+  await llm.runTsvBatch({ files, params: withKey({ provider: 'claude', model: 'claude-sonnet-4-6', skill: 'translate-tn' }, 'k') });
+  assert.strictEqual(stub.calls.length, 3);
+  assert.deepStrictEqual(stub.sleeps, [15, 30]);
+  llm._resetTestHooks();
+});
+
+test('network_error gives up after 3 attempts, reporting network_error not provider_error', async () => {
+  const files = makeBatchFiles();
+  const stub = stubTransport(() => { const e = new Error('fetch failed'); e.cause = { code: 'ECONNRESET' }; throw e; });
+  await assert.rejects(
+    llm.runTsvBatch({ files, params: withKey({ provider: 'claude', model: 'claude-sonnet-4-6', skill: 'translate-tn' }, 'k') }),
+    (err) => err.code === 'network_error' && err.errorKind === 'network_error',
+  );
+  assert.strictEqual(stub.calls.length, 3);
+  llm._resetTestHooks();
+});
+
+test('backoff is capped at 120s even when Retry-After is huge', async () => {
+  const files = makeBatchFiles();
+  const stub = stubTransport((_args, n) => {
+    if (n <= 2) {
+      const err = new Error('rate limit');
+      err.status = 429;
+      err.headers = { 'retry-after': '9999' };
+      throw err;
+    }
+    return { text: wrapped(`${HEADER}\n${ROW}`), usage: { inputTokens: 1, outputTokens: 1 }, stopReason: 'end_turn' };
+  });
+  await llm.runTsvBatch({ files, params: withKey({ provider: 'claude', model: 'claude-sonnet-4-6', skill: 'translate-tn' }, 'k') });
+  assert.deepStrictEqual(stub.sleeps, [120, 120]);
+  llm._resetTestHooks();
+});
+
 test('an unknown model fails as model_not_found without calling the provider', async () => {
   const files = makeBatchFiles();
   const stub = stubTransport(() => { throw new Error('must not be reached'); });
@@ -305,6 +362,37 @@ test('a truncating stop reason becomes output_too_long, per provider', async () 
     );
     llm._resetTestHooks();
   }
+});
+
+test('output_too_long with reasoning enabled retries once with reasoning/thinking dropped', async () => {
+  const files = makeBatchFiles();
+  const stub = stubTransport((args, n) => {
+    if (n === 1) {
+      assert.strictEqual(args.thinking, 'medium');
+      return { text: wrapped('partial'), usage: { inputTokens: 1, outputTokens: 1 }, stopReason: 'max_tokens' };
+    }
+    return { text: wrapped(`${HEADER}\n${ROW}`), usage: { inputTokens: 1, outputTokens: 1 }, stopReason: 'end_turn' };
+  });
+  const res = await llm.runTsvBatch({
+    files,
+    params: withKey({ provider: 'claude', model: 'claude-sonnet-4-6', skill: 'translate-tn', thinking: 'medium' }, 'k'),
+  });
+  assert.strictEqual(stub.calls.length, 2);
+  // The retry drops thinking/reasoning entirely rather than repeating it.
+  assert.strictEqual(stub.calls[1].thinking, 'none');
+  assert.strictEqual(res.model, 'claude-sonnet-4-6');
+  llm._resetTestHooks();
+});
+
+test('output_too_long with no reasoning enabled still fails after one truncation (no fallback to try)', async () => {
+  const files = makeBatchFiles();
+  const stub = stubTransport(() => ({ text: wrapped('partial'), usage: { inputTokens: 1, outputTokens: 1 }, stopReason: 'max_tokens' }));
+  await assert.rejects(
+    llm.runTsvBatch({ files, params: withKey({ provider: 'claude', model: 'claude-sonnet-4-6', skill: 'translate-tn' }, 'k') }),
+    (err) => err.code === 'output_too_long',
+  );
+  assert.strictEqual(stub.calls.length, 1);
+  llm._resetTestHooks();
 });
 
 test('a reply with no extractable output becomes empty_output', async () => {
@@ -341,6 +429,41 @@ test('scrubSecrets redacts known key patterns', () => {
   const out = llm.scrubSecrets('key=sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAA and xai-BBBBBBBBBBBBBBBBBB');
   assert.ok(!out.includes('sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAA'));
   assert.ok(!out.includes('xai-BBBBBBBBBBBBBBBBBB'));
+});
+
+test('scrubSecrets redacts hyphenated modern key shapes (sk-proj-…, xai- hyphenated)', () => {
+  const out = llm.scrubSecrets('key=sk-proj-AbC-123_456789012345678901 and xai-AbC-1234567890123456');
+  assert.ok(!out.includes('sk-proj-AbC-123_456789012345678901'));
+  assert.ok(!out.includes('xai-AbC-1234567890123456'));
+});
+
+// ---------------------------------------------------------------------------
+// Key presence
+// ---------------------------------------------------------------------------
+
+test('a provider call with no apiKey throws invalid_key without touching the transport', async () => {
+  const files = makeBatchFiles();
+  const stub = stubTransport(() => { throw new Error('must not be reached — no key means no client'); });
+  await assert.rejects(
+    llm.runTsvBatch({ files, params: { provider: 'claude', model: 'claude-sonnet-4-6', skill: 'translate-tn' } }),
+    (err) => err.code === 'invalid_key' && err.provider === 'claude',
+  );
+  assert.strictEqual(stub.calls.length, 0);
+  llm._resetTestHooks();
+});
+
+// ---------------------------------------------------------------------------
+// Test-hook gating
+// ---------------------------------------------------------------------------
+
+test('_setTestHooks refuses to run outside a test context', () => {
+  const prev = process.env.NODE_TEST_CONTEXT;
+  delete process.env.NODE_TEST_CONTEXT;
+  try {
+    assert.throws(() => llm._setTestHooks({ transport: async () => ({}) }), /test-only/);
+  } finally {
+    if (prev === undefined) delete process.env.NODE_TEST_CONTEXT; else process.env.NODE_TEST_CONTEXT = prev;
+  }
 });
 
 // ---------------------------------------------------------------------------

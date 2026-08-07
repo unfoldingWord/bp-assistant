@@ -31,7 +31,13 @@ const MAX_TIMEOUT_MS = 10 * 60 * 1000;
 // directly, so the whole module is drivable without network or wall-clock.
 const _hooks = { transport: null, clients: null, sleep: null };
 
+// node --test sets NODE_TEST_CONTEXT on the worker running the suite; outside
+// that, a production caller must never be able to swap out the transport and
+// silently skip real provider calls (and the API key checks that gate them).
 function _setTestHooks(hooks) {
+  if (!process.env.NODE_TEST_CONTEXT) {
+    throw new Error('translate-llm: _setTestHooks is test-only (NODE_TEST_CONTEXT not set)');
+  }
   Object.assign(_hooks, hooks);
 }
 
@@ -199,11 +205,21 @@ function errorText(err) {
   if (!err) return '';
   const parts = [
     err.message,
+    err.cause?.message,
     err.error?.message,
     err.error?.error?.message,
     err.response?.data?.error?.message,
   ];
   return parts.filter(Boolean).join(' | ');
+}
+
+// Connection-level failures (DNS, reset, refused, broken pipe, undici's own
+// UND_ERR_* codes) surface via err.code or the wrapped err.cause.code — never
+// as an HTTP status — so they need their own check rather than riding the
+// status/text heuristics below.
+const NETWORK_ERROR_CODES = new Set(['ECONNRESET', 'ECONNREFUSED', 'ETIMEDOUT', 'EAI_AGAIN', 'EPIPE']);
+function isNetworkErrorCode(code) {
+  return typeof code === 'string' && (NETWORK_ERROR_CODES.has(code) || code.startsWith('UND_ERR_'));
 }
 
 function errorType(err) {
@@ -262,14 +278,18 @@ function classifyProviderError(err) {
   if (status === 400 && /context|token limit|too long|too many tokens|maximum.{0,20}tokens|exceeds/i.test(tag)) {
     return { code: 'context_too_long', status };
   }
+  const networkCode = (typeof err?.code === 'string' && err.code) || (typeof err?.cause?.code === 'string' && err.cause.code) || '';
+  if (isNetworkErrorCode(networkCode)) {
+    return { code: 'network_error', status };
+  }
   return { code: 'provider_error', status };
 }
 
-const RETRY_LIMITS = { rate_limited: 2, provider_overloaded: 2, timeout: 1 };
+const RETRY_LIMITS = { rate_limited: 2, provider_overloaded: 2, timeout: 1, network_error: 2 };
 
 function backoffSeconds(code, attempt, retryAfterSeconds) {
   if (code === 'timeout') return 5;
-  return Math.max(retryAfterSeconds || 0, 15 * attempt);
+  return Math.min(Math.max(retryAfterSeconds || 0, 15 * attempt), 120);
 }
 
 function sleep(seconds) {
@@ -458,6 +478,10 @@ async function callProvider({ provider, model, system, user, thinking, apiKey, t
   if (!transport) throw providerError(provider, 'provider_error', `no adapter for provider "${provider}"`, apiKey);
 
   const budget = Math.min(Number(timeoutMs) || MAX_TIMEOUT_MS, MAX_TIMEOUT_MS);
+  // Mutable copy: a truncated reply with reasoning/thinking enabled gets one
+  // retry with it stripped (see below) before giving up as output_too_long.
+  let effectiveThinking = thinking;
+  let retriedWithoutReasoning = false;
 
   for (let attempt = 1; ; attempt++) {
     const controller = new AbortController();
@@ -465,7 +489,7 @@ async function callProvider({ provider, model, system, user, thinking, apiKey, t
     let result;
     try {
       result = await transport({
-        provider, model, system, user, thinking, apiKey,
+        provider, model, system, user, thinking: effectiveThinking, apiKey,
         timeoutMs: budget,
         signal: controller.signal,
       });
@@ -486,6 +510,12 @@ async function callProvider({ provider, model, system, user, thinking, apiKey, t
     clearTimeout(timer);
 
     if ((TRUNCATED_STOP_REASONS[provider] || []).includes(result.stopReason)) {
+      if (!retriedWithoutReasoning && effectiveThinking && effectiveThinking !== 'none') {
+        console.warn(`[translate-llm] ${provider} output truncated with reasoning enabled — retrying without reasoning`);
+        retriedWithoutReasoning = true;
+        effectiveThinking = 'none';
+        continue;
+      }
       throw providerError(provider, 'output_too_long', `output truncated at ${MAX_OUTPUT_TOKENS} tokens (stop reason ${result.stopReason})`, apiKey);
     }
     return result;
@@ -521,6 +551,9 @@ function readIfExists(file) {
 async function runOne({ files, params, sourceText, taskJson, packMarkdown, repairNote }) {
   const provider = params.provider;
   const apiKey = params.apiKey;
+  // All three SDKs silently fall back to ANTHROPIC_API_KEY/OPENAI_API_KEY/GEMINI_API_KEY
+  // from the env — the bot's own keys — which would bill uW for an org's run.
+  if (!apiKey) throw providerError(provider, 'invalid_key', 'no API key supplied to translate-llm');
   const model = resolveModel(provider, params.model, apiKey);
 
   const { system, user } = buildTranslatePrompt({

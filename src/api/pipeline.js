@@ -631,6 +631,10 @@ async function handleStartRequest(req, res) {
       jobId: trigger.jobId,
       scope: trigger.scope,
       status: trigger.status,
+      // Echoed back only when the request carried a provider, so a caller
+      // (bible-editor) that sent one can fail closed if an old bot silently
+      // strips it instead of running the requested provider.
+      ...(ai ? { provider: ai.provider } : {}),
     });
     // Logs provider + resolved model, never the key.
     console.log(`[pipeline-api] start ${body.pipelineType} ${book} ${startChapter}-${endChapter} → ${trigger.status} jobId=${trigger.jobId} user=${body.username} provider=${ai ? `${ai.provider}/${ai.model}` : 'subscription'} lat=${lat}ms`);

@@ -280,6 +280,37 @@ test('TSV batch: without a provider the agentic runClaude path is used unchanged
   }
 });
 
+test('TSV batch: a provider without an apiKey fails closed and never calls runClaude', async () => {
+  const workDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tlwork-'));
+  runClaudeCalls.length = 0;
+  try {
+    const resource = tsvResource('tn');
+    const params = {
+      resourceType: 'tn', family: 'tsv', skill: 'translate-tn',
+      translateColumns: ['Note'], passThroughColumns: getResourceType('tn').passThroughColumns,
+      targetLang: 'ar', targetLangName: 'Arabic', sourceLangName: 'English', direction: 'rtl',
+      provider: 'claude', model: 'claude-opus-5', thinking: 'medium',
+      // apiKey deliberately absent — the call site must not silently fall
+      // through to the agentic runClaude path (which would bill on the
+      // bot's own subscription) nor to translate-llm's env-key fallback.
+    };
+    const files = core.writeBatchFiles(workDir, 0, {
+      batchRows: BATCH_ROWS,
+      packMarkdown: '# Translation context\n',
+      targetLang: 'ar', targetLangName: 'Arabic', sourceLangName: 'English', direction: 'rtl',
+      book: 'OBA', resource,
+    });
+
+    await assert.rejects(
+      runTsvBatch({ files, batchRows: BATCH_ROWS, params, resource }),
+      (err) => err.errorKind === 'invalid_key',
+    );
+    assert.strictEqual(runClaudeCalls.length, 0, 'fell through to runClaude without an api key');
+  } finally {
+    fs.rmSync(workDir, { recursive: true, force: true });
+  }
+});
+
 test('article file: provider params call translate-llm and skip runClaude', async () => {
   const skillsRoot = makeSkillsRoot();
   const workDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tlart-'));
