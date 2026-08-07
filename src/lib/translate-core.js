@@ -445,6 +445,10 @@ function buildTranslateReport({
   resourceType = 'tn', book, startChapter, endChapter, articleId, files,
   targetLang, sourceLang, sourceRef, contextRef, contextSha, batches, checks, selection,
   runId = null, jobId = null, generatedAt = null, targetOrg = null, targetRepo = null, branch = null,
+  // Direct-provider LLM accounting ({ provider, model, inputTokens, outputTokens,
+  // estimatedCostUsd, calls }). Omitted entirely on the default agentic path so
+  // subscription-run reports stay byte-identical.
+  llm = null,
 }) {
   return {
     version: 1,
@@ -489,6 +493,7 @@ function buildTranslateReport({
       errors: checks.errors,
       warnings: checks.warnings,
     },
+    ...(llm ? { llm } : {}),
   };
 }
 

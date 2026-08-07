@@ -1486,7 +1486,7 @@ function buildApiRunStamp({ pipelineType, scope, username, jobId }) {
   return `${buildApiRunLabel({ pipelineType, scope })} · triggered by @${username} · job \`${jobId}\``;
 }
 
-function buildApiSyntheticRoute(pipelineType, scope, options) {
+function buildApiSyntheticRoute(pipelineType, scope, options, ai) {
   // translate picks its base route by resourceType (four routes, all type
   // 'translate'); other pipelines have a single route name.
   const routeName = pipelineType === 'translate'
@@ -1526,7 +1526,11 @@ function buildApiSyntheticRoute(pipelineType, scope, options) {
       literalRef: options.literalRef,
       simplifiedRef: options.simplifiedRef,
       writeContextBack: options.writeContextBack,
-      model: options.model,
+      // A direct-provider run carries the model already resolved against the
+      // provider catalog (ai.model); options.model is the sonnet|opus agentic
+      // alias and must not reach a provider adapter.
+      model: ai && ai.provider ? ai.model : options.model,
+      provider: ai && ai.provider ? ai.provider : undefined,
       branchOnly: options.branchOnly,
       delivery: options.delivery,
       direction: options.direction,
@@ -1536,7 +1540,7 @@ function buildApiSyntheticRoute(pipelineType, scope, options) {
     }
     : null;
 
-  return {
+  const route = {
     ...baseRoute,
     _synthetic: true,
     _book: book,
@@ -1550,6 +1554,15 @@ function buildApiSyntheticRoute(pipelineType, scope, options) {
     _apiOrigin: true,
     confirmMessage: null,
   };
+
+  // The caller-supplied API key rides the route NON-ENUMERABLY: it must reach
+  // translate-pipeline without ever being visible to JSON.stringify,
+  // util.inspect, object spread or a log line that dumps the route.
+  if (translateOpts && ai && ai.provider && ai.apiKey) {
+    Object.defineProperty(route, '_apiKey', { value: ai.apiKey, enumerable: false });
+  }
+
+  return route;
 }
 
 function buildApiContentFlags(pipelineType, options) {
@@ -1635,6 +1648,9 @@ function buildApiJobId({ pipelineType, scope, options }) {
  * @param {string} input.username - DCS handle for commit attribution
  * @param {string} input.apiSessionKey - caller-supplied; idempotency + scoping
  * @param {object} [input.options] - per-pipeline flag toggles (contentTypes, noAlign, alignOnly, textOnly, fresh, noIntro, pauseBeforeATs)
+ * @param {object} [input.ai] - translate only: { provider, model, apiKey } for a
+ *   direct multi-provider LLM run. Kept OUT of `options` so the caller-supplied
+ *   apiKey never lands in a serializable per-run options object.
  * @returns {{ status: 'running'|'already_running'|'conflict'|'invalid', jobId?, scope?, conflictingJobId?, message? }}
  */
 function triggerPipelineFromApi(input) {
@@ -1648,6 +1664,7 @@ function triggerPipelineFromApi(input) {
     username,
     apiSessionKey,
     options = {},
+    ai = null,
   } = input;
 
   // Article translate runs have no book/chapter — synthesize a placeholder
@@ -1658,7 +1675,7 @@ function triggerPipelineFromApi(input) {
   const scope = isTranslateArticle
     ? { book: articleScopeBook(options.resourceType), startChapter: 1, endChapter: 1, verseStart: null, verseEnd: null }
     : { book, startChapter, endChapter, verseStart, verseEnd };
-  const route = buildApiSyntheticRoute(pipelineType, scope, options);
+  const route = buildApiSyntheticRoute(pipelineType, scope, options, ai);
   if (!route) {
     return { status: 'invalid', message: `Unknown pipelineType: ${pipelineType}` };
   }
@@ -1744,5 +1761,9 @@ module.exports = {
   // here, not taken from the caller, so the two can diverge.
   buildApiSessionKey,
   buildApiContentFlags,
+  // Exported for tests: the translate field allowlist and the non-enumerable
+  // _apiKey attachment are the two properties that keep a caller-supplied key
+  // out of every serialized form of a run.
+  buildApiSyntheticRoute,
   API_PIPELINE_ROUTE_NAMES,
 };

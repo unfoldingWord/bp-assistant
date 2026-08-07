@@ -45,6 +45,7 @@ const { resolveArticle } = require('./lib/article-resolver');
 const { buildSuggestionInbox, shouldWriteContextBack } = require('./lib/translate-suggestions');
 const { writeContextArtifactsSafe } = require('./lib/context-write');
 const core = require('./lib/translate-core');
+const translateLlm = require('./lib/translate-llm');
 const scriptureVerses = require('./lib/scripture-verses');
 
 const LOG_PREFIX = '[translate]';
@@ -150,7 +151,7 @@ function resolveParams(route, message) {
   const contextRef = opts.contextRef || cfg.contextRef || `${targetOrg}/translation-context@master`;
   const contextRefExplicit = !!(opts.contextRef || cfg.contextRef);
 
-  return {
+  const params = {
     resourceType,
     family,
     resourceLabel: rt.label,
@@ -188,10 +189,31 @@ function resolveParams(route, message) {
       : opts.writeContextBack === false ? false
         : null,
     jobId: opts.jobId || route._jobId || null,
-    model: opts.model || route.model || 'opus',
+    // Direct-provider runs carry a concrete catalog model id resolved by the API
+    // layer; the 'sonnet'|'opus' alias logic belongs to the agentic path only.
+    provider: opts.provider || null,
+    model: opts.provider ? (opts.model || null) : (opts.model || route.model || 'opus'),
+    // The provider adapters read params.thinking; keep it equal to the effort the
+    // agentic runClaude calls below already hardcode.
+    thinking: 'medium',
     delivery,
     branchOnly: opts.branchOnly !== false,
   };
+
+  // The caller-supplied API key is NON-ENUMERABLE: params is spread into pack
+  // renderers, logged, and reaches report builders, so the key must be invisible
+  // to JSON.stringify / util.inspect / object spread. Only translate-llm reads it.
+  if (params.provider) {
+    // A provider run without its key must fail, never fall back: the fallback
+    // would bill the bot's own Claude subscription and hand params.model (a
+    // provider catalog id) to the agentic runner.
+    if (!route._apiKey) {
+      throw new Error(`translate: provider "${params.provider}" was requested without an API key`);
+    }
+    Object.defineProperty(params, 'apiKey', { value: route._apiKey, enumerable: false });
+  }
+
+  return params;
 }
 
 function buildSessionKey(message, params) {
@@ -202,6 +224,78 @@ function buildSessionKey(message, params) {
     resourceType: params.resourceType,
     articleId: params.articleId || params.articleUrl || null,
   })}`;
+}
+
+// ---------------------------------------------------------------------------
+// Direct-provider LLM accounting (null on the default agentic path)
+// ---------------------------------------------------------------------------
+
+/** Accumulator for a direct-provider run; null for subscription runs. */
+function newLlmUsage(params) {
+  if (!params.provider) return null;
+  return {
+    provider: params.provider,
+    model: params.model || null,
+    inputTokens: 0,
+    outputTokens: 0,
+    // Stays null when no call could be priced from the catalog, so a missing
+    // price is visible rather than reported as $0.
+    estimatedCostUsd: null,
+    calls: 0,
+  };
+}
+
+/** Fold one translate-llm result ({ usage, costUsd, model }) into the accumulator. */
+function addLlmCall(acc, call) {
+  if (!acc || !call) return;
+  acc.calls += 1;
+  if (call.model) acc.model = call.model;
+  acc.inputTokens += call.usage?.inputTokens || 0;
+  acc.outputTokens += call.usage?.outputTokens || 0;
+  if (call.costUsd != null) acc.estimatedCostUsd = (acc.estimatedCostUsd || 0) + call.costUsd;
+}
+
+/**
+ * The failed-run checkpoint patch plus the (scrubbed) message every other
+ * failure channel reports. Two properties matter and both are testable here
+ * without driving a pipeline:
+ *  - the message is scrubbed of the caller's API key before it reaches a
+ *    checkpoint file, the admin board or Zulip (translate-llm already scrubs
+ *    what it throws; this is the belt for anything else that saw the key);
+ *  - a provider errorKind (invalid_key / rate_limited / model_not_found / …)
+ *    rides on `current`, which serializeCheckpoint surfaces on
+ *    GET /api/pipeline/{jobId} so the editor can render the cause.
+ * Without an errorKind the patch is shaped exactly as before.
+ */
+function buildFailurePatch(err, { chapter, skill, apiKey }) {
+  const raw = String(err && err.message != null ? err.message : '');
+  const message = translateLlm.scrubSecrets(raw, apiKey ? [apiKey] : []);
+  return {
+    message,
+    patch: {
+      state: 'failed',
+      current: {
+        chapter,
+        skill,
+        status: 'failed',
+        ...(err && err.errorKind ? { errorKind: err.errorKind } : {}),
+        error: message.slice(0, 300),
+      },
+    },
+  };
+}
+
+/**
+ * runHash separates distinct logical runs in the batch-reuse cache + branch
+ * name. The provider is appended ONLY when set: default-path hashes must stay
+ * byte-identical to pre-multi-provider runs (or every cached batch is orphaned),
+ * while a provider run must never reuse another provider's cached output.
+ */
+function buildRunHash(params, selTag) {
+  return crypto.createHash('sha1')
+    .update([params.resourceType, params.sourceRef, params.contextRef, params.model, params.direction, selTag].join('|')
+      + (params.provider ? `|${params.provider}` : ''))
+    .digest('hex').slice(0, 8);
 }
 
 // ---------------------------------------------------------------------------
@@ -224,6 +318,7 @@ function tsvResource(params) {
 
 async function runTsvBatch({ files, batchRows, params, resource, guard }) {
   let lastChecks = null;
+  const llmCalls = [];
   const cols = params.translateColumns.join(' + ');
 
   for (let attempt = 1; attempt <= MAX_BATCH_ATTEMPTS; attempt++) {
@@ -234,29 +329,35 @@ async function runTsvBatch({ files, batchRows, params, resource, guard }) {
       }\nRewrite ${files.outputFile} fixing every violation. Translate ONLY these columns: ${cols}. Every other column must be byte-identical to the source.`
       : '';
 
-    const result = await runClaude({
-      prompt: `${files.taskFile}${repairNote}`,
-      skill: params.skill,
-      cwd: CSKILLBP_DIR,
-      model: params.model,
-      thinking: 'medium',
-      tools: ['Read', 'Write'],
-      enableBash: false,
-      disableLocalSettings: true,
-      mcpToolSet: 'none',
-      maxTurns: 50,
-      timeoutMs: 20 * 60 * 1000,
-      label: `translate-${params.resourceType}-${params.targetLang}-batch${files.nn}${isRepair ? '-repair' : ''}`,
-      guardrails: guard,
-    });
-    if (result?.subtype !== 'success') {
-      throw new Error(`${params.skill} batch ${files.nn} failed: ${result?.error || result?.subtype || 'unknown'}`);
+    // Direct-provider path: one completion writes files.outputFile, then the
+    // SAME deterministic checks + repair loop below validate it.
+    if (params.provider && params.apiKey) {
+      llmCalls.push(await translateLlm.runTsvBatch({ files, params, repairNote }));
+    } else {
+      const result = await runClaude({
+        prompt: `${files.taskFile}${repairNote}`,
+        skill: params.skill,
+        cwd: CSKILLBP_DIR,
+        model: params.model,
+        thinking: 'medium',
+        tools: ['Read', 'Write'],
+        enableBash: false,
+        disableLocalSettings: true,
+        mcpToolSet: 'none',
+        maxTurns: 50,
+        timeoutMs: 20 * 60 * 1000,
+        label: `translate-${params.resourceType}-${params.targetLang}-batch${files.nn}${isRepair ? '-repair' : ''}`,
+        guardrails: guard,
+      });
+      if (result?.subtype !== 'success') {
+        throw new Error(`${params.skill} batch ${files.nn} failed: ${result?.error || result?.subtype || 'unknown'}`);
+      }
     }
 
     const { rows, checks } = core.readBatchOutput(files.outputFile, batchRows, {
       parse: resource._codec.parse, checkOpts: resource.checkOpts,
     });
-    if (checks.ok) return { rows, checks, attempts: attempt };
+    if (checks.ok) return { rows, checks, attempts: attempt, llmCalls };
     lastChecks = checks;
     console.warn(`${LOG_PREFIX} batch ${files.nn} attempt ${attempt}: ${checks.errors.length} blocking violation(s)`
       + (attempt < MAX_BATCH_ATTEMPTS ? ' — running repair pass' : ''));
@@ -320,6 +421,7 @@ async function translateChapters(params, { workDir, onProgress, runBatchImpl, ma
 
   const batchMeta = [];
   const targetRows = [];
+  const llm = newLlmUsage(params);
   for (let i = 0; i < batches.length; i++) {
     const batchRows = batches[i];
     const rendered = core.renderBatchPack({ batchRows, pack, scripture, ...params });
@@ -343,7 +445,10 @@ async function translateChapters(params, { workDir, onProgress, runBatchImpl, ma
     }
     if (!outRows) {
       const impl = runBatchImpl || runTsvBatch;
-      ({ rows: outRows, attempts } = await impl({ files, batchRows, params, resource }));
+      const res = await impl({ files, batchRows, params, resource });
+      outRows = res.rows;
+      attempts = res.attempts;
+      for (const call of res.llmCalls || []) addLlmCall(llm, call);
     }
     targetRows.push(...outRows);
     batchMeta.push({ nn: files.nn, rowCount: batchRows.length, attempts, templateFallbacks: rendered.templateFallbacks, slugs: rendered.slugs });
@@ -375,7 +480,7 @@ async function translateChapters(params, { workDir, onProgress, runBatchImpl, ma
     sourceRef: params.sourceRef, contextRef: params.contextRef, contextSha: pack.sha,
     targetOrg: params.targetOrg, targetRepo: params.repoName,
     jobId: params.jobId || null,
-    batches: batchMeta, checks,
+    batches: batchMeta, checks, llm,
     selection: { mergeMode: params.mergeMode, verseStart: params.verseStart ?? null, verseEnd: params.verseEnd ?? null, rowIds: params.rowIds ?? null },
   });
 
@@ -388,6 +493,7 @@ async function translateChapters(params, { workDir, onProgress, runBatchImpl, ma
 
 async function runArticleFile({ files, sourceMarkdown, params, guard }) {
   let lastChecks = null;
+  const llmCalls = [];
   for (let attempt = 1; attempt <= MAX_BATCH_ATTEMPTS; attempt++) {
     const isRepair = attempt > 1 && lastChecks;
     const repairNote = isRepair
@@ -395,26 +501,31 @@ async function runArticleFile({ files, sourceMarkdown, params, guard }) {
         lastChecks.errors.map((e) => `- [${e.check}]: ${e.message}`).join('\n')
       }\nRewrite ${files.outputFile} fixing every violation. Preserve every rc://, [[wiki]], and ](link) target byte-for-byte and keep the heading structure.`
       : '';
-    const result = await runClaude({
-      prompt: `${files.taskFile}${repairNote}`,
-      skill: params.skill,
-      cwd: CSKILLBP_DIR,
-      model: params.model,
-      thinking: 'medium',
-      tools: ['Read', 'Write'],
-      enableBash: false,
-      disableLocalSettings: true,
-      mcpToolSet: 'none',
-      maxTurns: 50,
-      timeoutMs: 20 * 60 * 1000,
-      label: `translate-${params.resourceType}-${params.targetLang}-${files.nn}${isRepair ? '-repair' : ''}`,
-      guardrails: guard,
-    });
-    if (result?.subtype !== 'success') {
-      throw new Error(`${params.skill} file ${files.nn} failed: ${result?.error || result?.subtype || 'unknown'}`);
+    // Direct-provider path — same output file, same checks + repair loop.
+    if (params.provider && params.apiKey) {
+      llmCalls.push(await translateLlm.runArticleFile({ files, params, repairNote }));
+    } else {
+      const result = await runClaude({
+        prompt: `${files.taskFile}${repairNote}`,
+        skill: params.skill,
+        cwd: CSKILLBP_DIR,
+        model: params.model,
+        thinking: 'medium',
+        tools: ['Read', 'Write'],
+        enableBash: false,
+        disableLocalSettings: true,
+        mcpToolSet: 'none',
+        maxTurns: 50,
+        timeoutMs: 20 * 60 * 1000,
+        label: `translate-${params.resourceType}-${params.targetLang}-${files.nn}${isRepair ? '-repair' : ''}`,
+        guardrails: guard,
+      });
+      if (result?.subtype !== 'success') {
+        throw new Error(`${params.skill} file ${files.nn} failed: ${result?.error || result?.subtype || 'unknown'}`);
+      }
     }
     const { markdown, checks } = core.readArticleOutput(files.outputFile, sourceMarkdown, { articleId: params.articleId, path: files.path });
-    if (checks.ok) return { markdown, checks, attempts: attempt };
+    if (checks.ok) return { markdown, checks, attempts: attempt, llmCalls };
     lastChecks = checks;
     console.warn(`${LOG_PREFIX} ${files.nn} attempt ${attempt}: ${checks.errors.length} blocking violation(s)`
       + (attempt < MAX_BATCH_ATTEMPTS ? ' — running repair pass' : ''));
@@ -454,6 +565,7 @@ async function translateArticles(params, { workDir, onProgress, resolveImpl, run
   const rendered = core.renderArticlePack({ ...params, pack, articleId: resolved.articleId });
   const outFiles = [];
   const fileMeta = [];
+  const llm = newLlmUsage(params);
   for (let i = 0; i < sourceFiles.length; i++) {
     const { path: filePath, sourceMarkdown } = sourceFiles[i];
     const files = core.writeArticleFiles(workDir, i, {
@@ -476,7 +588,11 @@ async function translateArticles(params, { workDir, onProgress, resolveImpl, run
     }
     if (markdown == null) {
       const impl = runFileImpl || runArticleFile;
-      ({ markdown, checks, attempts } = await impl({ files, sourceMarkdown, params }));
+      const res = await impl({ files, sourceMarkdown, params });
+      markdown = res.markdown;
+      checks = res.checks;
+      attempts = res.attempts;
+      for (const call of res.llmCalls || []) addLlmCall(llm, call);
     }
     outFiles.push({ path: filePath, markdown, checks });
     fileMeta.push({ nn: files.nn, path: filePath, attempts, rowCount: 1, templateFallbacks: rendered.templateFallbacks, slugs: rendered.slug ? [rendered.slug] : [] });
@@ -500,7 +616,7 @@ async function translateArticles(params, { workDir, onProgress, resolveImpl, run
     sourceRef: params.sourceRef, contextRef: params.contextRef, contextSha: pack.sha,
     targetOrg: params.targetOrg, targetRepo: params.repoName,
     jobId: params.jobId || null,
-    batches: fileMeta, checks: allChecks,
+    batches: fileMeta, checks: allChecks, llm,
     selection: { mergeMode: 'article', verseStart: null, verseEnd: null, rowIds: null },
   });
 
@@ -542,20 +658,17 @@ async function translatePipeline(route, message) {
     || message.sender_full_name
     || 'bp-assistant';
 
-  // runHash separates distinct logical runs in the batch-reuse cache + branch name.
   const selTag = isArticle
     ? `-a-${(params.articleId || params.articleUrl || '').replace(/[^A-Za-z0-9]+/g, '_').slice(0, 40)}`
     : params.rowIds ? `-ids-${params.rowIds.join('-')}`
       : params.verseStart != null ? `-v${params.verseStart}-${params.verseEnd}` : '';
-  const runHash = crypto.createHash('sha1')
-    .update([params.resourceType, params.sourceRef, params.contextRef, params.model, params.direction, selTag].join('|'))
-    .digest('hex').slice(0, 8);
+  const runHash = buildRunHash(params, selTag);
   const scopePart = isArticle
     ? `${params.resourceType}${selTag}`
     : `${params.book}-${params.startChapter}-${params.endChapter}${selTag}`;
   const workDir = path.join(CSKILLBP_DIR, 'tmp', `translate-${params.targetLang}-${scopePart}-${runHash}`);
 
-  console.log(`${LOG_PREFIX} Starting ${label} (org=${params.targetOrg}/${params.repoName}, source=${params.sourceRef}, context=${params.contextRef})`);
+  console.log(`${LOG_PREFIX} Starting ${label} (org=${params.targetOrg}/${params.repoName}, source=${params.sourceRef}, context=${params.contextRef}, provider=${params.provider || 'subscription'})`);
   setCheckpoint(ckptId, { state: 'running', current: { chapter: scope.startChapter, skill: params.skill, status: 'running' } });
 
   try {
@@ -564,10 +677,13 @@ async function translatePipeline(route, message) {
     }
     return await runTsvDelivery({ params, ckptId, scope, workDir, runHash, label, username, post });
   } catch (err) {
-    console.error(`${LOG_PREFIX} ${label} failed: ${err.message}`);
-    setCheckpoint(ckptId, { state: 'failed', current: { chapter: scope.startChapter, skill: params.skill, status: 'failed', error: String(err.message).slice(0, 300) } });
-    await publishAdminStatus({ source: 'translate-pipeline', pipelineType: 'translate', scope: label, phase: 'run', severity: 'error', message: err.message }).catch(() => {});
-    await post(`:cross_mark: Translate **${label}** failed: ${err.message}`);
+    const { message, patch } = buildFailurePatch(err, {
+      chapter: scope.startChapter, skill: params.skill, apiKey: params.apiKey,
+    });
+    console.error(`${LOG_PREFIX} ${label} failed: ${message}`);
+    setCheckpoint(ckptId, patch);
+    await publishAdminStatus({ source: 'translate-pipeline', pipelineType: 'translate', scope: label, phase: 'run', severity: 'error', message }).catch(() => {});
+    await post(`:cross_mark: Translate **${label}** failed: ${message}`);
     throw err;
   }
 }
@@ -811,6 +927,12 @@ module.exports = {
   runTsvDelivery,
   runArticleDelivery,
   resolveParams,
+  // Exported for tests: the direct-provider seam (branching, key containment,
+  // cache-key separation, failure reporting).
+  runTsvBatch,
+  runArticleFile,
+  buildRunHash,
+  buildFailurePatch,
   articleScopeBook,
   ROUTE_RESOURCE_TYPE,
   COMMAND_RE,
