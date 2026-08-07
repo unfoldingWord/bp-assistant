@@ -9,6 +9,8 @@ const {
   resolveProviderModel,
   resolveDifficultyModel,
   resolveDifficultyEffort,
+  resolveAutoModel,
+  assertProviderModel,
 } = require('../src/api-runner/provider-config');
 const { parseArgs } = require('../src/api-runner/cli');
 const {
@@ -726,4 +728,34 @@ test('BP_MODEL_<TIER> pins a tier to a model and opts out of effort mapping', ()
   } finally {
     delete process.env.BP_MODEL_LOW;
   }
+});
+
+test('2026 model catalog additions are additive: existing difficulty routing is unchanged', () => {
+  // Pin the exact pre-existing behavior (claude-runner.js resolveDifficultyModel and
+  // notes-pipeline.js resolveAutoModel consume this) so the new 2026 catalog entries
+  // below cannot have shifted defaultModel/modelAliases/autoModelByThinking.
+  assert.equal(resolveDifficultyModel('claude', 'high'), 'claude-opus-5');
+  assert.equal(resolveDifficultyModel('claude', 'low'), 'claude-opus-5');
+  assert.equal(resolveAutoModel('claude', undefined, 'high'), 'claude-opus-5');
+  assert.equal(resolveAutoModel('claude', undefined, 'low'), 'claude-haiku-4-5-20251001');
+  assert.equal(resolveAutoModel('claude', undefined, 'medium'), 'claude-sonnet-4-6');
+});
+
+test('2026 model catalog additions resolve as configured models', () => {
+  for (const model of ['gpt-5.5', 'gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna']) {
+    assert.equal(assertProviderModel('openai', model), model);
+  }
+  for (const model of ['grok-4.5', 'grok-4.3']) {
+    assert.equal(assertProviderModel('xai', model), model);
+  }
+  assert.equal(assertProviderModel('gemini', 'gemini-3.6-flash'), 'gemini-3.6-flash');
+
+  // New alias resolves to the existing dated model entry, without a duplicate row.
+  assert.equal(resolveProviderModel('claude', 'claude-haiku-4-5'), 'claude-haiku-4-5-20251001');
+  const claudeCfg = getProviderConfig('claude');
+  assert.equal(claudeCfg.models['claude-haiku-4-5'], undefined);
+  assert.equal(
+    Object.keys(claudeCfg.models).filter((m) => m.startsWith('claude-haiku-4-5')).length,
+    1
+  );
 });
