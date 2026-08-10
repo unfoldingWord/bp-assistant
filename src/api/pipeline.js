@@ -22,6 +22,7 @@ const {
   API_PIPELINE_ROUTE_NAMES,
 } = require('../router');
 const { RESOURCE_TYPE_KEYS, isArticleResource } = require('../lib/resource-types');
+const { assertProviderModel } = require('../api-runner/provider-config');
 const { BOOK_NUMBERS } = require('../api-runner/verse-data');
 const {
   getExpectedOutputs,
@@ -155,8 +156,26 @@ const OptionsSchema = z.object({
   hints: z.array(HintSchema).max(50).optional(),
 }).strict();
 
+// Providers a translate run may be pointed at with a caller-supplied key. Kept
+// as a literal list (not getProviderNames()) because it is a wire contract
+// settled with bible-editor, and because these four are exactly the adapters
+// src/lib/translate-llm.js implements.
+const TRANSLATE_PROVIDERS = ['claude', 'openai', 'gemini', 'xai'];
+
 const StartBodySchema = z.object({
   pipelineType: z.enum(PIPELINE_TYPES),
+  // --- Direct multi-provider translate run (top-level, NOT in options) ------
+  // provider/model/apiKey sit at the top level deliberately: the key must never
+  // be part of the per-run `options` object, which is serializable (stored by
+  // bible-editor, replayed into /resume) and reaches log lines.
+  //
+  // No fallback to the bot's own env keys: if `provider` is set, the injected
+  // key is the ONLY key used, so the caller is billed for their own run.
+  provider: z.enum(TRANSLATE_PROVIDERS).optional(),
+  // Validated against the provider catalog at start time (assertProviderModel),
+  // so an unknown model is a 400 rather than a job that fails minutes later.
+  model: z.string().min(1).max(64).optional(),
+  apiKey: z.string().min(8).max(512).optional(),
   // book/startChapter are required for every pipeline EXCEPT translate article
   // resources (tw/ta), which are scoped by articleId/articleUrl instead. The
   // superRefine below enforces presence per pipelineType/resourceType.
@@ -180,6 +199,40 @@ const StartBodySchema = z.object({
     }
     if (body.startChapter == null) {
       ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['startChapter'], message: 'startChapter is required' });
+    }
+  }
+  // Direct-provider fields: translate only, and apiKey ⇔ provider.
+  if (body.pipelineType !== 'translate') {
+    for (const k of ['provider', 'model', 'apiKey']) {
+      if (body[k] !== undefined) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: [k],
+          message: `${k} only valid for pipelineType "translate"`,
+        });
+      }
+    }
+  } else {
+    if (body.apiKey !== undefined && body.provider === undefined) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['provider'],
+        message: 'apiKey requires provider',
+      });
+    }
+    if (body.provider !== undefined && body.apiKey === undefined) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['apiKey'],
+        message: 'provider requires apiKey (the bot never falls back to its own provider keys)',
+      });
+    }
+    if (body.model !== undefined && body.provider === undefined) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['provider'],
+        message: 'top-level model requires provider (use options.model for the default agentic path)',
+      });
     }
   }
   // Mutually-exclusive align mode flags.
@@ -507,6 +560,23 @@ async function handleStartRequest(req, res) {
     const o = body.options || {};
     const isTranslateArticle = body.pipelineType === 'translate' && isArticleResource(o.resourceType);
 
+    // Resolve the direct-provider model against the catalog BEFORE anything is
+    // launched: an unknown model is a client error, not a job that dies after
+    // fetching source. assertProviderModel also expands aliases and supplies the
+    // provider default when no model was sent, so downstream always has a
+    // concrete id. The thrown message lists the valid ids and carries no secret.
+    let ai = null;
+    if (body.provider) {
+      let effectiveModel;
+      try {
+        effectiveModel = assertProviderModel(body.provider, body.model);
+      } catch (err) {
+        reply(res, 400, { error: 'model_not_found', message: err.message });
+        return;
+      }
+      ai = { provider: body.provider, model: effectiveModel, apiKey: body.apiKey };
+    }
+
     let book = null;
     let startChapter = 1;
     let endChapter = 1;
@@ -538,6 +608,8 @@ async function handleStartRequest(req, res) {
       username: body.username,
       apiSessionKey: body.sessionKey,
       options: body.options || {},
+      // Separate from `options` on purpose — see the schema comment on apiKey.
+      ...(ai ? { ai } : {}),
     });
 
     const lat = Date.now() - startedAt;
@@ -559,8 +631,20 @@ async function handleStartRequest(req, res) {
       jobId: trigger.jobId,
       scope: trigger.scope,
       status: trigger.status,
+      // Echoed back ONLY when this request actually started a run with that
+      // provider, so a caller (bible-editor) that sent one can fail closed if an
+      // old bot silently strips it instead of running the requested provider.
+      //
+      // Deliberately NOT echoed on already_running: the in-flight run holding
+      // this scope may be someone else's, and job identity does not include the
+      // caller's sessionKey or the provider (buildApiSessionKey folds only the
+      // control thread + translate suffix). Echoing here would let a BYO-key
+      // caller attach to — and import the output of — a run started on the bot's
+      // own subscription, misattributing the cost and crossing orgs.
+      ...(ai && trigger.status !== 'already_running' ? { provider: ai.provider } : {}),
     });
-    console.log(`[pipeline-api] start ${body.pipelineType} ${book} ${startChapter}-${endChapter} → ${trigger.status} jobId=${trigger.jobId} user=${body.username} lat=${lat}ms`);
+    // Logs provider + resolved model, never the key.
+    console.log(`[pipeline-api] start ${body.pipelineType} ${book} ${startChapter}-${endChapter} → ${trigger.status} jobId=${trigger.jobId} user=${body.username} provider=${ai ? `${ai.provider}/${ai.model}` : 'subscription'} lat=${lat}ms`);
   } catch (err) {
     console.error(`[pipeline-api] start unhandled: ${err.stack || err.message}`);
     if (!res.headersSent) {

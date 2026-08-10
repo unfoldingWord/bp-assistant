@@ -1,10 +1,16 @@
-// StartBodySchema rules for pipelineType "translate".
+// StartBodySchema rules for pipelineType "translate", plus the start-time
+// provider/model/apiKey gates on handleStartRequest.
 'use strict';
+
+process.env.BT_API_TOKEN = 'test-bt-api-token';
+delete process.env.BT_API_TOKEN_FILE;
+delete process.env.BOT_SECRETS_DIR;
 
 const { test } = require('node:test');
 const assert = require('node:assert');
+const { EventEmitter } = require('node:events');
 
-const { StartBodySchema } = require('../src/api/pipeline');
+const { StartBodySchema, handleStartRequest } = require('../src/api/pipeline');
 
 const base = {
   pipelineType: 'translate',
@@ -169,4 +175,122 @@ test('sourceLang accepted on translate only', () => {
   assert.ok(ok.success, JSON.stringify(ok.error?.issues));
   const bad = StartBodySchema.safeParse({ ...base, pipelineType: 'notes', options: { sourceLang: 'ru' } });
   assert.ok(!bad.success);
+});
+
+// --- direct multi-provider fields (top-level provider / model / apiKey) ----
+
+const KEY = 'sk-test-abcdef0123456789';
+const opts = { targetLang: 'ar' };
+
+test('provider + apiKey + model accepted on translate', () => {
+  const res = StartBodySchema.safeParse({
+    ...base, provider: 'openai', model: 'gpt-5.4-mini', apiKey: KEY, options: opts,
+  });
+  assert.ok(res.success, JSON.stringify(res.error?.issues));
+  assert.strictEqual(res.data.provider, 'openai');
+  assert.strictEqual(res.data.model, 'gpt-5.4-mini');
+});
+
+test('provider + apiKey without model accepted (provider default resolves later)', () => {
+  const res = StartBodySchema.safeParse({ ...base, provider: 'claude', apiKey: KEY, options: opts });
+  assert.ok(res.success, JSON.stringify(res.error?.issues));
+});
+
+test('apiKey without provider is rejected', () => {
+  const res = StartBodySchema.safeParse({ ...base, apiKey: KEY, options: opts });
+  assert.ok(!res.success);
+  assert.ok(res.error.issues.some((i) => /apiKey requires provider/.test(i.message)));
+});
+
+test('provider without apiKey is rejected (no fallback to the bot keys)', () => {
+  const res = StartBodySchema.safeParse({ ...base, provider: 'gemini', options: opts });
+  assert.ok(!res.success);
+  assert.ok(res.error.issues.some((i) => /provider requires apiKey/.test(i.message)));
+});
+
+test('top-level model without provider is rejected', () => {
+  const res = StartBodySchema.safeParse({ ...base, model: 'gpt-5.4', options: opts });
+  assert.ok(!res.success);
+  assert.ok(res.error.issues.some((i) => /model requires provider/.test(i.message)));
+});
+
+test('provider/model/apiKey rejected on notes, generate and tqs', () => {
+  for (const pipelineType of ['notes', 'generate', 'tqs']) {
+    const res = StartBodySchema.safeParse({
+      ...base, pipelineType, provider: 'claude', apiKey: KEY, options: {},
+    });
+    assert.ok(!res.success, `${pipelineType} accepted provider`);
+    assert.ok(res.error.issues.some((i) => /only valid for pipelineType "translate"/.test(i.message)),
+      `${pipelineType}: ${JSON.stringify(res.error.issues)}`);
+  }
+});
+
+test('unknown provider is rejected by the enum', () => {
+  const res = StartBodySchema.safeParse({ ...base, provider: 'llama', apiKey: KEY, options: opts });
+  assert.ok(!res.success);
+});
+
+test('options.model stays enum-limited and is independent of the provider model', () => {
+  const bad = StartBodySchema.safeParse({ ...base, options: { ...opts, model: 'gpt-5.4' } });
+  assert.ok(!bad.success);
+  // A provider run may still carry the (ignored) agentic alias in options.
+  const ok = StartBodySchema.safeParse({
+    ...base, provider: 'claude', model: 'claude-opus-5', apiKey: KEY, options: { ...opts, model: 'sonnet' },
+  });
+  assert.ok(ok.success, JSON.stringify(ok.error?.issues));
+});
+
+// --- handleStartRequest gates (both paths answer before anything launches) --
+
+function fakeReq(body) {
+  const req = new EventEmitter();
+  req.headers = { authorization: `Bearer ${process.env.BT_API_TOKEN}` };
+  const raw = Buffer.from(JSON.stringify(body), 'utf8');
+  // Emitted on the next tick so readBody's listeners are attached first.
+  process.nextTick(() => { req.emit('data', raw); req.emit('end'); });
+  return req;
+}
+
+function fakeRes() {
+  return {
+    status: null,
+    body: '',
+    headersSent: false,
+    setHeader() {},
+    removeHeader() {},
+    writeHead(status) { this.status = status; this.headersSent = true; },
+    end(payload) { this.body = payload == null ? '' : String(payload); },
+  };
+}
+
+async function post(body) {
+  const req = fakeReq(body);
+  const res = fakeRes();
+  await handleStartRequest(req, res);
+  return { status: res.status, raw: res.body, json: res.body ? JSON.parse(res.body) : null };
+}
+
+test('unknown provider model → 400 model_not_found listing the valid ids', async () => {
+  const r = await post({ ...base, provider: 'claude', model: 'claude-nope-9', apiKey: KEY, options: opts });
+  assert.strictEqual(r.status, 400);
+  assert.strictEqual(r.json.error, 'model_not_found');
+  assert.match(r.json.message, /Unknown claude model "claude-nope-9"/);
+  assert.match(r.json.message, /claude-opus-5/);
+  assert.ok(!r.raw.includes(KEY), 'model_not_found body leaked the key');
+});
+
+test('a rejected apiKey never appears in the 400 body', async () => {
+  const secret = 'sk-super-secret-key-value-9999';
+  // Too long for the 512-char cap → a zod string issue, which must not echo the value.
+  const r = await post({ ...base, provider: 'claude', apiKey: secret.repeat(30), options: opts });
+  assert.strictEqual(r.status, 400);
+  assert.strictEqual(r.json.error, 'validation_failed');
+  assert.ok(!r.raw.includes(secret), `400 body echoed the submitted key: ${r.raw}`);
+});
+
+test('a rejected apiKey on a non-translate pipeline never appears in the 400 body', async () => {
+  const secret = 'sk-another-secret-value-1234';
+  const r = await post({ ...base, pipelineType: 'notes', provider: 'claude', apiKey: secret, options: {} });
+  assert.strictEqual(r.status, 400);
+  assert.ok(!r.raw.includes(secret), `400 body echoed the submitted key: ${r.raw}`);
 });

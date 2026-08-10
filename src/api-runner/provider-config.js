@@ -11,6 +11,7 @@ const DEFAULT_PROVIDER_CONFIGS = {
       opus: 'claude-opus-5',
       sonnet: 'claude-sonnet-4-6',
       haiku: 'claude-haiku-4-5-20251001',
+      'claude-haiku-4-5': 'claude-haiku-4-5-20251001',
     },
     // Effort/thinking-level -> Claude tier (cost routing): low-effort phases to
     // Haiku, validation to Sonnet, generation to Opus. The JSON config overrides
@@ -50,6 +51,10 @@ const DEFAULT_PROVIDER_CONFIGS = {
       'gpt-5.4-nano': { label: 'GPT 5.4 nano', inputPer1M: 0.2, outputPer1M: 0.8 },
       'o3': { label: 'o3', inputPer1M: 2.5, outputPer1M: 10.0 },
       'o4-mini': { label: 'o4 mini', inputPer1M: 0.5, outputPer1M: 2.0 },
+      'gpt-5.5': { label: 'GPT 5.5', inputPer1M: 5.0, outputPer1M: 30.0 },
+      'gpt-5.6-sol': { label: 'GPT 5.6 Sol', inputPer1M: 5.0, outputPer1M: 30.0 },
+      'gpt-5.6-terra': { label: 'GPT 5.6 Terra', inputPer1M: 2.0, outputPer1M: 12.0 },
+      'gpt-5.6-luna': { label: 'GPT 5.6 Luna', inputPer1M: 0.2, outputPer1M: 1.2 },
     },
   },
   gemini: {
@@ -67,6 +72,7 @@ const DEFAULT_PROVIDER_CONFIGS = {
       'gemini-3-flash-preview': { label: 'Gemini 3 Flash (preview)', inputPer1M: 0.15, outputPer1M: 0.6 },
       'gemini-2.5-pro': { label: 'Gemini 2.5 Pro', inputPer1M: 1.25, outputPer1M: 10.0 },
       'gemini-2.5-flash': { label: 'Gemini 2.5 Flash', inputPer1M: 0.15, outputPer1M: 0.6 },
+      'gemini-3.6-flash': { label: 'Gemini 3.6 Flash', inputPer1M: 1.5, outputPer1M: 7.5 },
     },
     fallbackModels: {
       'gemini-3.1-pro-preview': ['gemini-3-pro-preview', 'gemini-2.5-pro'],
@@ -91,6 +97,8 @@ const DEFAULT_PROVIDER_CONFIGS = {
       'grok-4-1-fast-non-reasoning': { label: 'Grok 4.1 Fast (no CoT)', inputPer1M: 3.0, outputPer1M: 9.0 },
       'grok-3': { label: 'Grok 3', inputPer1M: 3.0, outputPer1M: 15.0 },
       'grok-3-mini': { label: 'Grok 3 Mini', inputPer1M: 0.3, outputPer1M: 0.5 },
+      'grok-4.5': { label: 'Grok 4.5', inputPer1M: 2.0, outputPer1M: 6.0 },
+      'grok-4.3': { label: 'Grok 4.3', inputPer1M: 1.25, outputPer1M: 2.5 },
     },
     autoModelByThinking: {
       low: 'grok-4-1-fast-non-reasoning',
@@ -289,7 +297,12 @@ function resolveProviderModel(provider, model) {
   const cfg = getProviderConfig(provider);
   const candidate = model || cfg.defaultModel;
   if (typeof candidate !== 'string') return candidate;
-  return cfg.modelAliases?.[candidate] || candidate;
+  // hasOwnProperty guard: an unguarded cfg.modelAliases[candidate] read lets
+  // candidate values like "toString"/"constructor"/"__proto__" resolve to an
+  // inherited Object.prototype member instead of undefined, bypassing validation.
+  const aliases = cfg.modelAliases;
+  if (aliases && Object.prototype.hasOwnProperty.call(aliases, candidate)) return aliases[candidate];
+  return candidate;
 }
 
 // Difficulty-based selection. Jobs declare a DIFFICULTY tier (low/medium/high),
@@ -340,7 +353,8 @@ function resolveDifficultyEffort(requested) {
 function isConfiguredModel(provider, model) {
   if (!model || typeof model !== 'string') return false;
   const cfg = getProviderConfig(provider);
-  return !!cfg.models?.[model];
+  // hasOwnProperty guard — see resolveProviderModel above for the same reason.
+  return !!(cfg.models && Object.prototype.hasOwnProperty.call(cfg.models, model));
 }
 
 function assertProviderModel(provider, model) {

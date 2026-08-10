@@ -17,6 +17,12 @@
 //
 // Source language is a first-class knob: --source-lang ru --source <ru_gl/ru_tn@master>.
 // Requires a Claude Code login (Agent SDK uses local CLI auth) or ANTHROPIC_API_KEY.
+//
+// Direct multi-provider path (one API completion per batch/article instead of the
+// agentic skill run), mirroring what POST /api/pipeline/start does:
+//   --provider claude|openai|gemini|xai --api-key-env <ENV_NAME> [--model <catalog id>]
+// The key is read from the NAMED ENV VAR, never from argv (argv is world-readable
+// in the process table). Without --provider nothing changes.
 
 'use strict';
 
@@ -45,9 +51,27 @@ async function main() {
   const targetLang = arg('lang', 'ar');
   const sourceLang = arg('source-lang', 'en');
   const contextRef = arg('context');
-  const model = arg('model', 'sonnet');
+  const provider = arg('provider') || null;
+  const modelArg = arg('model');
   const outDir = path.resolve(arg('out', `./dry-run-${targetLang}-${resourceType}`));
   const cfg = TARGETS[targetLang] || {};
+
+  // Provider run: resolve the model against the catalog up front (same gate the
+  // API applies) and take the key from the named env var only.
+  let model = modelArg || 'sonnet';
+  let apiKey = null;
+  if (provider) {
+    const keyEnv = arg('api-key-env');
+    if (!keyEnv) { console.error('--provider requires --api-key-env <ENV_NAME>'); process.exit(2); }
+    apiKey = process.env[keyEnv];
+    if (!apiKey) { console.error(`--api-key-env ${keyEnv} is not set in the environment`); process.exit(2); }
+    try {
+      model = require('../src/api-runner/provider-config').assertProviderModel(provider, modelArg);
+    } catch (err) {
+      console.error(`[dry-run] ${err.message}`);
+      process.exit(2);
+    }
+  }
 
   if (!contextRef) { console.error('Missing --context <dir | org/repo@ref>'); process.exit(2); }
   if (!process.env.CSKILLBP_DIR) {
@@ -73,6 +97,15 @@ async function main() {
     contextRef,
     contextRefExplicit: true,
     model,
+    provider,
+    thinking: 'medium',
+  };
+
+  // Non-enumerable, exactly as the API path attaches it: the key must survive
+  // into translate-llm without being visible to a spread, a log or a report.
+  const attachApiKey = (params) => {
+    if (provider && apiKey) Object.defineProperty(params, 'apiKey', { value: apiKey, enumerable: false });
+    return params;
   };
 
   fs.mkdirSync(outDir, { recursive: true });
@@ -84,8 +117,8 @@ async function main() {
     const articleRef = arg('article');
     if (!articleRef) { console.error('article resources need --article <name|url>'); process.exit(2); }
     const isUrl = /^https?:\/\//i.test(articleRef);
-    const params = { ...common, articleId: isUrl ? null : articleRef, articleUrl: isUrl ? articleRef : null };
-    console.log(`[dry-run] ${resourceType} ${articleRef} → ${params.targetLangName} (model=${model}); source ${params.sourceRef}`);
+    const params = attachApiKey({ ...common, articleId: isUrl ? null : articleRef, articleUrl: isUrl ? articleRef : null });
+    console.log(`[dry-run] ${resourceType} ${articleRef} → ${params.targetLangName} (${provider || 'subscription'}, model=${model}); source ${params.sourceRef}`);
     const maxFiles = arg('max-files') ? parseInt(arg('max-files'), 10) : null;
     const { articleId, files, report } = await translateArticles(params, {
       workDir, maxFiles, onProgress: (m) => console.log(`[dry-run] ${m}`),
@@ -101,6 +134,7 @@ async function main() {
     const mins = ((Date.now() - t0) / 60000).toFixed(1);
     console.log(`\n[dry-run] ===== RESULT (${articleId}) =====`);
     console.log(`[dry-run] ${files.length} file(s) in ${mins} min; checks ok=${report.checks.ok} errors=${report.checks.errorCount} warnings=${report.checks.warningCount}`);
+    if (report.llm) console.log(`[dry-run] llm: ${report.llm.provider}/${report.llm.model}, ${report.llm.calls} call(s), ${report.llm.inputTokens} in / ${report.llm.outputTokens} out tokens, est cost ${report.llm.estimatedCostUsd == null ? 'unpriced' : `$${report.llm.estimatedCostUsd.toFixed(4)}`}`);
     for (const f of files) console.log(`[dry-run]   ${f.path}`);
     console.log(`[dry-run] out: ${outArticleDir}\n[dry-run] report: ${reportFile}`);
     console.log('[dry-run] NO push performed (dry run by design).');
@@ -124,15 +158,15 @@ async function main() {
     process.exit(2);
   }
 
-  const params = {
+  const params = attachApiKey({
     ...common,
     book, startChapter, endChapter, verseStart, verseEnd, rowIds,
     mergeMode: hasSubset ? 'by-id' : 'range',
     passThroughColumns: rt.passThroughColumns,
     translateColumns: rt.translateColumns,
-  };
+  });
 
-  console.log(`[dry-run] ${resourceType} ${book} ${startChapter}-${endChapter} → ${params.targetLangName} (model=${model}${maxRows ? `, max-rows=${maxRows}` : ''}); source ${params.sourceRef}`);
+  console.log(`[dry-run] ${resourceType} ${book} ${startChapter}-${endChapter} → ${params.targetLangName} (${provider || 'subscription'}, model=${model}${maxRows ? `, max-rows=${maxRows}` : ''}); source ${params.sourceRef}`);
   const { sourceRows, targetRows, checks, report, bookText } = await translateChapters(params, {
     workDir, maxRows, existingTargetText, onProgress: (m) => console.log(`[dry-run] ${m}`),
   });
@@ -145,6 +179,7 @@ async function main() {
   console.log('\n[dry-run] ===== RESULT =====');
   console.log(`[dry-run] rows: ${sourceRows.length} source → ${targetRows.length} target in ${mins} min`);
   console.log(`[dry-run] checks: ok=${checks.ok} errors=${checks.errors.length} warnings=${checks.warnings.length}`);
+  if (report.llm) console.log(`[dry-run] llm: ${report.llm.provider}/${report.llm.model}, ${report.llm.calls} call(s), ${report.llm.inputTokens} in / ${report.llm.outputTokens} out tokens, est cost ${report.llm.estimatedCostUsd == null ? 'unpriced' : `$${report.llm.estimatedCostUsd.toFixed(4)}`}`);
   for (const w of checks.warnings.slice(0, 15)) console.log(`[dry-run]   warn [${w.check}] ${w.rowId}: ${String(w.message).slice(0, 140)}`);
   console.log(`[dry-run] book file: ${bookFile}\n[dry-run] report: ${reportFile}`);
   console.log('[dry-run] NO push performed (dry run by design).');
