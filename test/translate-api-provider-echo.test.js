@@ -20,9 +20,15 @@ const { EventEmitter } = require('node:events');
 
 const router = require('../src/router');
 const triggerCalls = [];
+// api/pipeline.js destructures triggerPipelineFromApi at require time, so this
+// single patch is the only seam — per-test reassignment would not be seen.
+// Tests steer the outcome through the sessionKey instead.
 router.triggerPipelineFromApi = (input) => {
   triggerCalls.push(input);
-  return { status: 'started', jobId: 'stub-job-1', scope: { book: input.book, startChapter: input.startChapter, endChapter: input.endChapter } };
+  const status = String(input.apiSessionKey || '').includes('want-already-running')
+    ? 'already_running'
+    : 'started';
+  return { status, jobId: 'stub-job-1', scope: { book: input.book, startChapter: input.startChapter, endChapter: input.endChapter } };
 };
 
 const { handleStartRequest } = require('../src/api/pipeline');
@@ -79,4 +85,25 @@ test('a subscription run (no provider) omits provider from the 202 body', async 
   assert.strictEqual(Object.keys(r.json).includes('provider'), false);
   assert.strictEqual(triggerCalls.length, 1);
   assert.strictEqual('ai' in triggerCalls[0], false);
+});
+
+// already_running means an EXISTING run holds this scope, and job identity does
+// not include the caller or the provider — so that run may have been started by
+// someone else, on the subscription. Echoing the provider here would tell a
+// BYO-key caller "your provider run is live" and let it import another org's
+// output on the bot's own subscription. The ack must be withheld so the caller
+// fails closed.
+test('already_running never echoes provider, even when one was requested', async () => {
+  triggerCalls.length = 0;
+  const r = await post({
+    ...base,
+    sessionKey: 'bible-editor/u1/want-already-running',
+    provider: 'openai',
+    apiKey: KEY,
+    options: { targetLang: 'ar' },
+  });
+  assert.strictEqual(r.status, 200);
+  assert.strictEqual(r.json.status, 'already_running');
+  assert.strictEqual(Object.keys(r.json).includes('provider'), false);
+  assert.strictEqual(r.raw.includes(KEY), false);
 });

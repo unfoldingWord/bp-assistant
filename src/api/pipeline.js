@@ -631,10 +631,17 @@ async function handleStartRequest(req, res) {
       jobId: trigger.jobId,
       scope: trigger.scope,
       status: trigger.status,
-      // Echoed back only when the request carried a provider, so a caller
-      // (bible-editor) that sent one can fail closed if an old bot silently
-      // strips it instead of running the requested provider.
-      ...(ai ? { provider: ai.provider } : {}),
+      // Echoed back ONLY when this request actually started a run with that
+      // provider, so a caller (bible-editor) that sent one can fail closed if an
+      // old bot silently strips it instead of running the requested provider.
+      //
+      // Deliberately NOT echoed on already_running: the in-flight run holding
+      // this scope may be someone else's, and job identity does not include the
+      // caller's sessionKey or the provider (buildApiSessionKey folds only the
+      // control thread + translate suffix). Echoing here would let a BYO-key
+      // caller attach to — and import the output of — a run started on the bot's
+      // own subscription, misattributing the cost and crossing orgs.
+      ...(ai && trigger.status !== 'already_running' ? { provider: ai.provider } : {}),
     });
     // Logs provider + resolved model, never the key.
     console.log(`[pipeline-api] start ${body.pipelineType} ${book} ${startChapter}-${endChapter} → ${trigger.status} jobId=${trigger.jobId} user=${body.username} provider=${ai ? `${ai.provider}/${ai.model}` : 'subscription'} lat=${lat}ms`);
