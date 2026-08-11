@@ -15,7 +15,7 @@ const {
 const {
   identicalRateGuard, IDENTICAL_TO_SOURCE_ABORT_RATIO, IDENTICAL_TO_SOURCE_MIN_ROWS, runArticleChecks,
 } = require('../src/lib/translate-checks');
-const { partitionRowsByScriptGuard } = require('../src/translate-pipeline');
+const { partitionRowsByScriptGuard, assessRowSetDivergence } = require('../src/translate-pipeline');
 const { buildMergedRows, assertNoDroppedRangeRows } = require('../src/lib/translate-core');
 
 // A real (representative) Arabic tN note string vs an English one.
@@ -323,4 +323,51 @@ test('buildMergedRows: empty existingInRange degrades to source order', () => {
   const chosenById = new Map([['s1', s1], ['s2', s2]]);
   const merged = buildMergedRows({ rows, chosenById, existingInRange: [] });
   assert.deepStrictEqual(merged.map((r) => r.ID), ['s1', 's2']);
+});
+
+// Row-set divergence. Now that source and target are different repos their ID
+// sets can drift, and for a couple of books they have drifted almost entirely:
+// measured 2026-08-11 against live Door43, BSOJ/ar_tn shares 100% of row IDs
+// with unfoldingWord/en_tn for RUT/OBA/MAT and 95% for GEN/JON, but only 13%
+// for PSA and 1% for ZEC. Because unmatched target rows are PRESERVED, a forked
+// book would merge to a range holding both row sets.
+test('assessRowSetDivergence: a healthy book does not trip the block', () => {
+  // GEN-shaped: 19 of 20 target rows also in source.
+  const existing = Array.from({ length: 20 }, (_, i) => ({ ID: `t${i}`, Reference: '1:1' }));
+  const source = Array.from({ length: 19 }, (_, i) => ({ ID: `t${i}`, Reference: '1:1' }));
+  const d = assessRowSetDivergence(source, existing);
+  assert.equal(d.shared, 19);
+  assert.equal(d.diverged, false);
+});
+
+test('assessRowSetDivergence: a forked book trips the block and reports the merged size', () => {
+  // ZEC 1 as measured live: 44 target rows, 60 source rows, 2 shared.
+  const existing = Array.from({ length: 44 }, (_, i) => ({ ID: `t${i}`, Reference: '1:1' }));
+  const source = [
+    { ID: 't0', Reference: '1:1' }, { ID: 't1', Reference: '1:1' },
+    ...Array.from({ length: 58 }, (_, i) => ({ ID: `s${i}`, Reference: '1:1' })),
+  ];
+  const d = assessRowSetDivergence(source, existing);
+  assert.equal(d.shared, 2);
+  assert.equal(d.existingInRange, 44);
+  assert.equal(d.sourceInRange, 60);
+  assert.equal(d.diverged, true);
+  // 44 + 60 - 2 — the same verses covered twice, which is why this blocks.
+  assert.equal(d.mergedSize, 102);
+});
+
+test('assessRowSetDivergence: exactly at the ratio does not trip; blockRatio is honoured', () => {
+  const existing = Array.from({ length: 10 }, (_, i) => ({ ID: `t${i}`, Reference: '1:1' }));
+  const source = Array.from({ length: 5 }, (_, i) => ({ ID: `t${i}`, Reference: '1:1' }));
+  // 5/10 = exactly the default 0.5 threshold — strictly-less-than, so no block.
+  assert.equal(assessRowSetDivergence(source, existing).diverged, false);
+  // Raise the bar and the same input now diverges.
+  assert.equal(assessRowSetDivergence(source, existing, { blockRatio: 0.9 }).diverged, true);
+});
+
+test('assessRowSetDivergence: a fresh target book (no in-range rows) is never blocked', () => {
+  const source = [{ ID: 's1', Reference: '1:1' }, { ID: 's2', Reference: '1:2' }];
+  const d = assessRowSetDivergence(source, []);
+  assert.equal(d.diverged, false);
+  assert.equal(d.sharedRatio, 1);
 });

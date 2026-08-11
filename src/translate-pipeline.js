@@ -77,10 +77,13 @@ try {
 
 const MAX_BATCH_ATTEMPTS = 2; // 1 draft + 1 repair pass
 
-// Warn when a target book shares fewer than this fraction of its in-range row
-// IDs with the source — it means the two files forked, and the merge will hold
-// both row sets. See the divergence check in translateChapters for measurements.
-const ROW_SET_DIVERGENCE_WARN_RATIO = 0.5;
+// Block when a target book shares fewer than this fraction of its in-range row
+// IDs with the source — it means the two files forked, and the merge would hold
+// both row sets, covering the same verses twice. Measured 2026-08-11 for
+// BSOJ/ar_tn vs unfoldingWord/en_tn: RUT/OBA/MAT 100%, TIT 99%, GEN/JON 95%,
+// PSA 13%, ZEC 1%. At 0.5 only genuinely-forked books trip it; a fresh target
+// book has no in-range rows and is never affected.
+const ROW_SET_DIVERGENCE_BLOCK_RATIO = 0.5;
 
 function langName(code) {
   return LANG_NAMES[code] || code;
@@ -204,6 +207,9 @@ function resolveParams(route, message) {
     thinking: 'medium',
     delivery,
     branchOnly: opts.branchOnly !== false,
+    // Expert override for the row-set divergence block (forked target book).
+    // Off by default — merging two diverged row sets doubles the range.
+    allowRowSetDivergence: opts.allowRowSetDivergence === true,
   };
 
   // The caller-supplied API key is NON-ENUMERABLE: params is spread into pack
@@ -440,6 +446,29 @@ function partitionRowsByScriptGuard(rows, { targetLang, translateColumns, existi
   return { toTranslate, skipped };
 }
 
+/**
+ * How far the target book's in-range row IDs have drifted from the source's.
+ * `diverged` is the merge-blocking signal: below ROW_SET_DIVERGENCE_BLOCK_RATIO
+ * the two files have forked, and since unmatched target rows are PRESERVED the
+ * merge would hold both row sets (~mergedSize rows) covering the same verses
+ * twice. Pure — no I/O, no params — so the block is unit-testable.
+ */
+function assessRowSetDivergence(sourceRows, existingInRange, { blockRatio = ROW_SET_DIVERGENCE_BLOCK_RATIO } = {}) {
+  const sourceIds = new Set(sourceRows.map((r) => r.ID));
+  const shared = existingInRange.filter((r) => sourceIds.has(r.ID)).length;
+  const sharedRatio = existingInRange.length ? shared / existingInRange.length : 1;
+  return {
+    existingInRange: existingInRange.length,
+    sourceInRange: sourceRows.length,
+    shared,
+    sharedRatio,
+    // What the union merge would emit for this range: every target row plus
+    // every source row it does not already cover.
+    mergedSize: existingInRange.length + sourceRows.length - shared,
+    diverged: existingInRange.length > 0 && sharedRatio < blockRatio,
+  };
+}
+
 /** Why the script guard has nothing to say for this language pair (report field). */
 function describeScriptGuardInapplicable(sourceLang, targetLang) {
   const srcScript = scriptOf(sourceLang);
@@ -561,16 +590,27 @@ async function translateChapters(params, { workDir, onProgress, runBatchImpl, ma
   if (params.mergeMode === 'range' && existingRows.length) {
     const inRange = existingRows.filter((r) => core.refInRange(r.Reference, params.startChapter, params.endChapter));
     if (inRange.length) {
-      const sourceIds = new Set(rows.map((r) => r.ID));
-      const shared = inRange.filter((r) => sourceIds.has(r.ID)).length;
-      const sharedRatio = shared / inRange.length;
-      rowSetDivergence = { existingInRange: inRange.length, sourceInRange: rows.length, shared, sharedRatio };
-      if (sharedRatio < ROW_SET_DIVERGENCE_WARN_RATIO) {
-        progress(`WARNING: ${params.targetOrg}/${params.repoName} ${params.book} ${rangeLabel} shares only `
-          + `${shared} of ${inRange.length} row ID(s) with ${params.sourceRef} (${Math.round(sharedRatio * 100)}%). `
-          + `The target book looks forked from a different ${params.sourceLangName} revision. Unmatched target rows `
-          + `are PRESERVED, so the merged range will hold ~${inRange.length + rows.length - shared} rows covering the `
-          + 'same verses twice. Reconcile the row sets before pushing this book.');
+      rowSetDivergence = assessRowSetDivergence(rows, inRange);
+      if (rowSetDivergence.diverged) {
+        const { shared, existingInRange, sharedRatio, mergedSize } = rowSetDivergence;
+        const detail = `${params.targetOrg}/${params.repoName} ${params.book} ${rangeLabel} shares only `
+          + `${shared} of ${existingInRange} row ID(s) with ${params.sourceRef} (${Math.round(sharedRatio * 100)}%). `
+          + `The target book looks forked from a different ${params.sourceLangName} revision.`;
+        if (!params.allowRowSetDivergence) {
+          // Blocking, not warning: unmatched target rows are preserved (deleting
+          // them is the bug the shrink-guard exists to prevent), so the merged
+          // range would hold BOTH row sets — a file covering the same verses
+          // twice, which is malformed output whether it is pushed to Door43 or
+          // handed to the editor. Neither outcome is acceptable silently, and
+          // reconciling the row sets is a data decision a translate run must
+          // not make on its own. Overridable for the deliberate case.
+          throw new Error(`translate ${params.resourceType}/${params.targetLang} ${params.book} ${rangeLabel}: ${detail} `
+            + `Merging would produce ~${mergedSize} rows for this range, covering the same `
+            + 'verses twice. Reconcile the row sets against the source revision first, or re-run with '
+            + 'allowRowSetDivergence:true if you intend to merge both sets.');
+        }
+        progress(`WARNING: ${detail} Proceeding with allowRowSetDivergence — the merged range will hold `
+          + `~${mergedSize} rows covering the same verses twice.`);
       }
     }
   }
@@ -1195,6 +1235,7 @@ module.exports = {
   // Script-guard pre-flight partition — exported for direct unit testing
   // (no translateChapters test harness with an injectable runBatchImpl exists yet).
   partitionRowsByScriptGuard,
+  assessRowSetDivergence,
   articleScopeBook,
   ROUTE_RESOURCE_TYPE,
   COMMAND_RE,

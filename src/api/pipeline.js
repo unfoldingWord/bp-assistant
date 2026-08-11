@@ -141,6 +141,10 @@ const OptionsSchema = z.object({
   simplifiedRef: z.string().min(3).max(200).regex(/^[^/@\s]+\/[^/@\s]+@\S+$/).optional(),
   writeContextBack: z.boolean().optional(),
   branchOnly: z.boolean().optional(),
+  // Expert override: proceed even when the target book's row IDs have diverged
+  // from the source revision. Merging both sets doubles the range, so this is
+  // off unless the caller has decided that is what they want.
+  allowRowSetDivergence: z.boolean().optional(),
   delivery: z.enum(['path', 'branch', 'editor']).optional(),
   direction: z.enum(['ltr', 'rtl']).optional(),
   // Individual-note / subset selection: translate only these published rows
@@ -315,7 +319,7 @@ const StartBodySchema = z.object({
       }
     }
   } else {
-    for (const k of ['resourceType', 'targetLang', 'targetOrg', 'repoName', 'sourceRef', 'sourceLang', 'contextRef', 'writeContextBack', 'branchOnly', 'delivery', 'direction', 'rowIds', 'articleId', 'articleUrl']) {
+    for (const k of ['resourceType', 'targetLang', 'targetOrg', 'repoName', 'sourceRef', 'sourceLang', 'contextRef', 'writeContextBack', 'branchOnly', 'allowRowSetDivergence', 'delivery', 'direction', 'rowIds', 'articleId', 'articleUrl']) {
       if (o[k] !== undefined) {
         ctx.addIssue({
           code: z.ZodIssueCode.custom,
