@@ -1,14 +1,14 @@
 {
-  "_comment": "Per-language Door43 target config for the translate pipeline. Verified 2026-07-13: org/repo naming is NOT derivable from the language code (ar lives in org 'BSOJ' not 'ar_gl'). Precedence for each field: per-call options > this file > derivation ({lang}_gl org, {lang}_{resource} repo, unfoldingWord/en_{resource}@master source). Per resourceType: tnRepo/tqRepo/twRepo/taRepo name the target repos; {tn,tq,tw,ta}SourceRef optionally override the SOURCE ref for that resource (org/repo@ref). SOURCE LANGUAGE is a first-class parameter: set sourceLang (default 'en') plus a matching {rt}SourceRef to translate FROM a non-English gateway language (e.g. Russian->Georgian: sourceLang 'ru', tnSourceRef 'ru_gl/ru_tn@master'). contextRef is intentionally omitted (no translation-context repo exists yet); pass it per-call until one is created.",
+  "_comment": "Per-language Door43 target config for the translate pipeline. Verified 2026-07-13: org/repo naming is NOT derivable from the language code (ar lives in org 'BSOJ' not 'ar_gl'). Precedence for each field: per-call options > this file > derivation ({lang}_gl org, {lang}_{resource} repo, unfoldingWord/en_{resource}@master source). Per resourceType: tnRepo/tqRepo/twRepo/taRepo name the target repos; {tn,tq,tw,ta}SourceRef optionally override the SOURCE ref for that resource (org/repo@ref). SOURCE LANGUAGE is a first-class parameter: set sourceLang (default 'en') plus a matching {rt}SourceRef to translate FROM a non-English gateway language (e.g. Russian->Georgian: sourceLang 'ru', tnSourceRef 'ru_gl/ru_tn@master'). contextRef is intentionally omitted (no translation-context repo exists yet); pass it per-call until one is created. src/lib/script-guard.js is a runtime backstop for this same class of misconfiguration: it skips any row already in the target script before a model call ever runs, so a stale sourceRef here degrades to a no-op skip instead of silently overwriting finished translation.",
   "ar": {
     "targetOrg": "BSOJ",
     "tnRepo": "ar_tn",
     "tqRepo": "ar_tq",
     "twRepo": "ar_tw",
     "taRepo": "ar_ta",
-    "tnSourceRef": "BSOJ/ar_tn@master",
+    "tnSourceRef": "unfoldingWord/en_tn@master",
     "direction": "rtl",
-    "note": "BSOJ = Arabic partner. All four repos exist (verified 2026-07-13, master, non-empty). ar_tn holds the partner's English copy of tN (row IDs identical to unfoldingWord/en_tn) -> translate TN in place from BSOJ/ar_tn. TQ/TW/TA source from unfoldingWord/en_* (the pilot default) since the pilot builds fresh gateway drafts; switch to in-place by adding tqSourceRef/twSourceRef/taSourceRef here once the partner content is confirmed."
+    "note": "BSOJ = Arabic partner; target repos are BSOJ/ar_*. Verified 2026-08-11 by sampling every tn_*.tsv Note column in BSOJ/ar_tn for Arabic script: 18 of 66 books are finished Arabic (1JN 1PE 1TH 1TI 2JN 2PE 2TH 2TI 3JN COL EPH GAL JAS JUD PHM PHP REV TIT), JON is 63% Arabic, and the other 47 are still the English placeholder. So the earlier 2026-07-13 premise recorded here -- that ar_tn is wholly an English copy of tN, so translate TN in place from BSOJ/ar_tn -- is retired: tN now sources from unfoldingWord/en_tn@master, same as TQ/TW/TA. Row IDs still align with unfoldingWord/en_tn, so merging by ID into BSOJ/ar_tn remains correct. The script guard in src/lib/script-guard.js skips rows already in Arabic, so runs on the 18 finished books will not overwrite human work."
   },
   "id": {
     "targetOrg": "id_gl",

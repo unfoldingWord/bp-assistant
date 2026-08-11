@@ -38,7 +38,8 @@ const { setCheckpoint } = require('./pipeline-checkpoints');
 const { publishAdminStatus } = require('./admin-status');
 const { door43Push } = require('./door43-push');
 const { loadContextPack } = require('./lib/context-pack');
-const { runChecks, runArticleChecks } = require('./lib/translate-checks');
+const { runChecks, runArticleChecks, identicalRateGuard, IDENTICAL_TO_SOURCE_ABORT_RATIO } = require('./lib/translate-checks');
+const { scriptGuardApplicable, isInTargetScript, scriptOf } = require('./lib/script-guard');
 const { makeTsvCodec } = require('./lib/tsv-resource');
 const { getResourceType, ROUTE_RESOURCE_TYPE, articleScopeBook } = require('./lib/resource-types');
 const { resolveArticle } = require('./lib/article-resolver');
@@ -376,8 +377,54 @@ async function runTsvBatch({ files, batchRows, params, resource, guard }) {
 }
 
 /**
+ * Pre-flight, no-LLM partition of in-scope source rows into "needs translation"
+ * vs "already in the target script" — run BEFORE any model call so a wrong
+ * sourceRef (source already = target language) or already-finished target
+ * rows never reach the model.
+ *   - source-already-target-script: ANY translateColumn of the SOURCE row is
+ *     already in the target script. Checked first — it is the misconfiguration
+ *     signal (e.g. tnSourceRef pointed at a finished Arabic tN book).
+ *   - target-already-translated: an existing target row with the same ID has
+ *     ANY translateColumn already non-empty and in the target script. Protects
+ *     finished human work from being overwritten by a fresh draft.
+ * Only called when scriptGuardApplicable(sourceLang, targetLang) is true —
+ * callers must gate on that themselves (see translateChapters).
+ */
+function partitionRowsByScriptGuard(rows, { targetLang, translateColumns, existingById }) {
+  const toTranslate = [];
+  const skipped = []; // { id, reason }
+  const isNonEmptyInTargetScript = (row, col) => {
+    const val = row[col];
+    return val != null && String(val).trim() !== '' && isInTargetScript(val, targetLang) === true;
+  };
+  for (const row of rows) {
+    if (translateColumns.some((col) => isNonEmptyInTargetScript(row, col))) {
+      skipped.push({ id: row.ID, reason: 'source-already-target-script' });
+      continue;
+    }
+    const existing = existingById && existingById.get(row.ID);
+    if (existing && translateColumns.some((col) => isNonEmptyInTargetScript(existing, col))) {
+      skipped.push({ id: row.ID, reason: 'target-already-translated' });
+      continue;
+    }
+    toTranslate.push(row);
+  }
+  return { toTranslate, skipped };
+}
+
+/** Why the script guard has nothing to say for this language pair (report field). */
+function describeScriptGuardInapplicable(sourceLang, targetLang) {
+  const srcScript = scriptOf(sourceLang);
+  const tgtScript = scriptOf(targetLang);
+  if (!srcScript || !tgtScript) {
+    return `script unknown for ${!srcScript ? `sourceLang "${sourceLang}"` : `targetLang "${targetLang}"`}`;
+  }
+  return `source (${sourceLang}) and target (${targetLang}) both use the ${srcScript} script`;
+}
+
+/**
  * Core TSV run, independent of Zulip/checkpoint plumbing (dry-run driveable).
- * Returns { sourceRows, targetRows, checks, report, bookText, existingBookText }.
+ * Returns { sourceRows, targetRows, mergedRows, checks, report, bookText, existingBookText, scriptGuard }.
  */
 async function translateChapters(params, { workDir, onProgress, runBatchImpl, maxRows, existingTargetText } = {}) {
   const progress = onProgress || (() => {});
@@ -390,16 +437,71 @@ async function translateChapters(params, { workDir, onProgress, runBatchImpl, ma
   const allRows = resource._codec.parse(sourceText);
   let rows = core.sliceChapterRows(allRows, params.startChapter, params.endChapter);
   rows = core.selectRows(rows, { rowIds: params.rowIds, verseStart: params.verseStart, verseEnd: params.verseEnd });
+  const rangeLabel = params.rowIds ? `rowIds ${params.rowIds.join(',')}`
+    : params.verseStart != null ? `${params.startChapter}:${params.verseStart}${params.verseEnd !== params.verseStart ? `-${params.verseEnd}` : ''}`
+      : `${params.startChapter}-${params.endChapter}`;
   if (!rows.length) {
-    const sel = params.rowIds ? `rowIds ${params.rowIds.join(',')}`
-      : params.verseStart != null ? `${params.startChapter}:${params.verseStart}${params.verseEnd !== params.verseStart ? `-${params.verseEnd}` : ''}`
-        : `${params.startChapter}-${params.endChapter}`;
-    throw new Error(`no source rows for ${params.book} ${sel}`);
+    throw new Error(`no source rows for ${params.book} ${rangeLabel}`);
   }
   if (maxRows && rows.length > maxRows) rows = rows.slice(0, maxRows);
   progress(`source: ${rows.length} row(s) from ${params.sourceRef}${params.mergeMode === 'by-id' ? ' (by-id subset)' : ''}`);
 
-  // 2. Context pack.
+  // 2. Existing target book (moved up from the old step 5): the pre-flight
+  //    script-guard partition below needs it to detect already-translated
+  //    rows before any model call, and the merge at the end still needs it.
+  let existingBookText = existingTargetText ?? null;
+  if (existingBookText == null) {
+    const targetRepoRef = `${params.targetOrg}/${params.repoName}@master`;
+    existingBookText = await core.fetchResourceFile(targetRepoRef, resource.file(params.book));
+    if (existingBookText == null) progress(`no existing target book at ${targetRepoRef} — starting fresh`);
+  }
+  let existingById = new Map();
+  if (existingBookText != null) {
+    try {
+      existingById = new Map(resource._codec.parse(existingBookText).map((r) => [r.ID, r]));
+    } catch (e) {
+      progress(`existing target book at ${params.targetOrg}/${params.repoName} failed to parse (${e.message}) — treating as no existing target`);
+      existingById = new Map();
+    }
+  }
+
+  // 3. Pre-flight script-guard partition (no LLM call yet). Skips rows whose
+  //    source is already in the target script (misconfigured sourceRef) or
+  //    whose existing target row already holds finished human translation.
+  //    scriptGuardApplicable is false whenever it can't tell source and
+  //    target apart (unknown lang, or same script) — in that case everything
+  //    is translated, unchanged from before this guard existed.
+  const guardApplicable = scriptGuardApplicable(params.sourceLang, params.targetLang);
+  let toTranslate = rows;
+  let skipped = [];
+  if (guardApplicable) {
+    ({ toTranslate, skipped } = partitionRowsByScriptGuard(rows, {
+      targetLang: params.targetLang, translateColumns: params.translateColumns, existingById,
+    }));
+    const skippedByReason = skipped.reduce((acc, s) => { acc[s.reason] = (acc[s.reason] || 0) + 1; return acc; }, {});
+    if (toTranslate.length === 0) {
+      const counts = Object.entries(skippedByReason).map(([k, v]) => `${k}: ${v}`).join(', ');
+      // The two reasons need opposite advice, so the remedy branches on which
+      // one dominates. Blaming the sourceRef when the real story is "the target
+      // is already fully translated" sends the operator to fix the wrong thing.
+      const remedy = (skippedByReason['source-already-target-script'] || 0) >= (skippedByReason['target-already-translated'] || 0)
+        ? `The source ref ${params.sourceRef} appears to already be ${params.targetLangName}; set the `
+          + `${params.resourceType}SourceRef for '${params.targetLang}' in config/translate-targets.json to an actual `
+          + 'source-language ref (e.g. unfoldingWord/en_tn@master), or use an explicit in-place revision mode.'
+        : `${params.targetOrg}/${params.repoName} already holds finished ${params.targetLangName} for every row in `
+          + 'this range, so there is nothing to draft. Pick a range that is not yet translated, or use an explicit '
+          + 'in-place revision mode to revise existing work.';
+      throw new Error(`translate ${params.resourceType}/${params.targetLang} ${params.book} ${rangeLabel}: `
+        + `all ${rows.length} row(s) are already in the target script (${counts}) — nothing to translate. ${remedy}`);
+    }
+    if (skipped.length > 0) {
+      progress(`script guard: skipping ${skipped.length} of ${rows.length} row(s) already in target script `
+        + `(source-already-target-script: ${skippedByReason['source-already-target-script'] || 0}, `
+        + `target-already-translated: ${skippedByReason['target-already-translated'] || 0})`);
+    }
+  }
+
+  // 4. Context pack.
   const pack = await loadContextPack(params.contextRef, { allowEmpty: !params.contextRefExplicit });
   if (!pack.hasContent) {
     progress(`WARNING: no context pack at ${params.contextRef} (repo absent/empty) — translating as a RAW BASELINE.`);
@@ -408,15 +510,16 @@ async function translateChapters(params, { workDir, onProgress, runBatchImpl, ma
       + ` — ${pack.templates.size} templates, ${pack.terms.length} terms, ${pack.examples.length} examples`);
   }
 
-  // 3. Batch → translate → validate (+1 repair) per batch.
+  // 5. Batch → translate → validate (+1 repair) per batch. Only toTranslate
+  //    rows reach the model — skipped rows never cost a token.
   fs.mkdirSync(workDir, { recursive: true });
-  const batches = core.buildBatches(rows, { sizeOf: resource.sizeOf });
+  const batches = core.buildBatches(toTranslate, { sizeOf: resource.sizeOf });
   progress(`translating ${params.resourceType} in ${batches.length} batch(es)`);
 
   let scripture = null;
   try {
     scripture = await scriptureVerses.buildScripturePack({
-      book: params.book, rows,
+      book: params.book, rows: toTranslate,
       sourceLiteralRef: params.sourceLiteralRef,
       sourceSimplifiedRef: params.sourceSimplifiedRef,
       targetLiteralRef: params.targetLiteralRef,
@@ -464,23 +567,56 @@ async function translateChapters(params, { workDir, onProgress, runBatchImpl, ma
     progress(`batch ${files.nn}/${String(batches.length).padStart(2, '0')} done (${batchRows.length} rows, ${attempts} attempt(s))`);
   }
 
-  // 4. Whole-range validation.
-  const checks = runChecks(rows, targetRows, resource.checkOpts);
+  // 6. Validation over the translated subset only. Skipped rows never went to
+  //    the model, and their preserved content can legitimately differ from
+  //    the source in pass-through columns (e.g. BSOJ/ar_tn runs a GL-quote-
+  //    adding Gitea workflow, so its Quote column can differ from en_tn) —
+  //    including them here would produce spurious passthrough-quote errors.
+  const checks = runChecks(toTranslate, targetRows, resource.checkOpts);
   if (!checks.ok) {
     const summary = checks.errors.slice(0, 5).map((e) => `[${e.check}] ${e.rowId}: ${e.message}`).join('; ');
     throw new Error(`whole-range deterministic checks failed: ${summary}`);
   }
 
-  // 5. Merge into the whole-book target file.
-  let existingBookText = existingTargetText ?? null;
-  if (existingBookText == null) {
-    const targetRepoRef = `${params.targetOrg}/${params.repoName}@master`;
-    existingBookText = await core.fetchResourceFile(targetRepoRef, resource.file(params.book));
-    if (existingBookText == null) progress(`no existing target book at ${targetRepoRef} — starting fresh`);
+  // 7. Aggregate identical-to-source gate: a run returning mostly unchanged
+  //    rows is almost always a wrong sourceRef, not a valid translation.
+  const identicalGuard = identicalRateGuard(checks, toTranslate.length);
+  if (identicalGuard.exceeded) {
+    const pct = (identicalGuard.rate * 100).toFixed(0);
+    const threshold = (IDENTICAL_TO_SOURCE_ABORT_RATIO * 100).toFixed(0);
+    throw new Error(`whole-range check: ${identicalGuard.identicalRows} of ${identicalGuard.rowCount} translated `
+      + `row(s) came back identical to source (${pct}% > ${threshold}%) — this is almost always a wrong sourceRef `
+      + `(${params.sourceRef}), not a valid translation.`);
   }
+
+  // 8. Merge translated + skipped rows back into in-scope order, then into the
+  //    whole-book target file. Skipped rows are never dropped from the book:
+  //    prefer the preserved existing target row (finished human work), else
+  //    the untouched source row (misconfigured-source case, no existing target).
+  const targetById = new Map(targetRows.map((r) => [r.ID, r]));
+  const mergedRows = rows.map((r) => {
+    if (targetById.has(r.ID)) return targetById.get(r.ID);
+    const existing = existingById.get(r.ID);
+    return existing || r;
+  });
   const bookText = params.mergeMode === 'by-id'
-    ? core.updateRowsById(existingBookText, targetRows, { parse: resource._codec.parse, serialize: resource._codec.serialize })
-    : core.mergeChapterIntoBook(existingBookText, targetRows, { ...params, parse: resource._codec.parse, serialize: resource._codec.serialize });
+    ? core.updateRowsById(existingBookText, mergedRows, { parse: resource._codec.parse, serialize: resource._codec.serialize })
+    : core.mergeChapterIntoBook(existingBookText, mergedRows, { ...params, parse: resource._codec.parse, serialize: resource._codec.serialize });
+
+  const skippedIdsAll = skipped.map((s) => s.id);
+  const scriptGuard = guardApplicable
+    ? {
+      applicable: true,
+      sourceScript: scriptOf(params.sourceLang),
+      targetScript: scriptOf(params.targetLang),
+      inScope: rows.length,
+      translated: toTranslate.length,
+      skipped: skipped.length,
+      skippedByReason: skipped.reduce((acc, s) => { acc[s.reason] = (acc[s.reason] || 0) + 1; return acc; }, {}),
+      skippedIds: skippedIdsAll.slice(0, 50),
+      truncated: skippedIdsAll.length > 50,
+    }
+    : { applicable: false, reason: describeScriptGuardInapplicable(params.sourceLang, params.targetLang) };
 
   const report = core.buildTranslateReport({
     resourceType: params.resourceType,
@@ -491,9 +627,11 @@ async function translateChapters(params, { workDir, onProgress, runBatchImpl, ma
     jobId: params.jobId || null,
     batches: batchMeta, checks, llm,
     selection: { mergeMode: params.mergeMode, verseStart: params.verseStart ?? null, verseEnd: params.verseEnd ?? null, rowIds: params.rowIds ?? null },
+    scriptGuard,
+    identicalRate: identicalGuard,
   });
 
-  return { sourceRows: rows, targetRows, checks, report, bookText, existingBookText, pack };
+  return { sourceRows: rows, targetRows, mergedRows, checks, report, bookText, existingBookText, pack, scriptGuard };
 }
 
 // ---------------------------------------------------------------------------
@@ -842,7 +980,9 @@ async function runTsvDelivery({ params, ckptId, scope, workDir, runHash, label, 
     donePatch.output = output;
   }
   setCheckpoint(ckptId, donePatch);
-  const summary = `${targetRows.length} rows, ${report.checks.warningCount} warning(s), 0 blocking violations`;
+  const skippedCount = report.scriptGuard && report.scriptGuard.applicable ? report.scriptGuard.skipped : 0;
+  const summary = `${targetRows.length} rows, ${report.checks.warningCount} warning(s), 0 blocking violations`
+    + (skippedCount ? `, ${skippedCount} skipped (already translated)` : '');
 
   if (params.delivery === 'path') {
     await post(`:check: Translated **${label}** — ${summary}.\nFile: \`${bookFile}\`\nReport: \`${reportFile}\``);
@@ -954,6 +1094,9 @@ module.exports = {
   runArticleFile,
   buildRunHash,
   buildFailurePatch,
+  // Script-guard pre-flight partition — exported for direct unit testing
+  // (no translateChapters test harness with an injectable runBatchImpl exists yet).
+  partitionRowsByScriptGuard,
   articleScopeBook,
   ROUTE_RESOURCE_TYPE,
   COMMAND_RE,

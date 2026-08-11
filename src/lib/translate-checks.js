@@ -23,6 +23,11 @@ const TN_TRANSLATE_COLUMNS = ['Note'];
 // Back-compat export (was TN_COLUMNS.filter(...) in the tN-only version).
 const PASS_THROUGH_COLUMNS = TN_PASS_THROUGH_COLUMNS;
 
+// A run returning mostly unchanged rows is essentially always misconfiguration
+// (wrong sourceRef pointing at target-language content already), not a valid
+// translation — verified case: BSOJ/ar_tn 2TH 3 returned 44/54 = 81% identical.
+const IDENTICAL_TO_SOURCE_ABORT_RATIO = 0.5;
+
 // rc:// URIs. Link targets are never localized; display text may be. The body
 // of a link (`rc://*/ta/man/translate/figs-metaphor`) contains `*` and `/`, so
 // only stop at whitespace or the closing `]`/`)` of the surrounding markdown.
@@ -219,8 +224,12 @@ function runArticleChecks(sourceMd, targetMd, { articleId, path: filePath } = {}
   if (src.trim() !== '' && tgt.trim() === '') {
     violations.push(violation('empty-translation', 'error', rowId, 'target article body empty while source non-empty'));
   }
+  // A whole article body byte-identical to source is the degenerate
+  // 100%-unchanged case — never a valid translation — so this is 'error', not
+  // 'warning'. (The per-row TSV identical-to-source check below stays a
+  // warning; identicalRateGuard is what enforces the aggregate there.)
   if (src.trim() !== '' && src === tgt) {
-    violations.push(violation('identical-to-source', 'warning', rowId, 'target article identical to source'));
+    violations.push(violation('identical-to-source', 'error', rowId, 'target article identical to source'));
   }
 
   // Links: three multisets, each compared independently.
@@ -251,6 +260,27 @@ function runArticleChecks(sourceMd, targetMd, { articleId, path: filePath } = {}
   return summarize(violations);
 }
 
+/**
+ * Aggregate guard over a batch/whole-range `checks` result: how many DISTINCT
+ * rows came back identical to source, out of `rowCount` rows actually sent to
+ * the model. tag() (checkTextColumn, above) appends a column suffix for
+ * multi-column resources (tQ: identical-to-source-question / -response), so
+ * this counts by check-id PREFIX and de-dupes by rowId — a row that's
+ * identical in both Question and Response counts once, not twice.
+ * See IDENTICAL_TO_SOURCE_ABORT_RATIO for why this exists.
+ */
+function identicalRateGuard(checks, rowCount, { ratio = IDENTICAL_TO_SOURCE_ABORT_RATIO } = {}) {
+  const rowIds = new Set(
+    (checks.warnings || [])
+      .filter((w) => typeof w.check === 'string' && w.check.startsWith('identical-to-source'))
+      .map((w) => w.rowId),
+  );
+  const identicalRows = rowIds.size;
+  const rate = rowCount ? identicalRows / rowCount : 0;
+  const exceeded = rowCount > 0 && rate > ratio;
+  return { identicalRows, rowCount, rate, exceeded };
+}
+
 function summarize(violations) {
   const errors = violations.filter((x) => x.severity === 'error');
   const warnings = violations.filter((x) => x.severity === 'warning');
@@ -269,6 +299,8 @@ module.exports = {
   checkRow,
   extractRcLinks,
   nfc,
+  identicalRateGuard,
+  IDENTICAL_TO_SOURCE_ABORT_RATIO,
   PASS_THROUGH_COLUMNS,
   TN_PASS_THROUGH_COLUMNS,
   TN_TRANSLATE_COLUMNS,

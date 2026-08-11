@@ -111,7 +111,10 @@ test('resolveParams: targets config resolves ar to BSOJ, options override', () =
   const ar = resolveParams({}, zmsg('translate notes OBA 1 to ar'));
   assert.strictEqual(ar.targetOrg, 'BSOJ');       // NOT ar_gl
   assert.strictEqual(ar.repoName, 'ar_tn');
-  assert.strictEqual(ar.sourceRef, 'BSOJ/ar_tn@master');
+  // 2026-08-11: tnSourceRef retired from BSOJ/ar_tn@master (18/66 books were
+  // already finished Arabic, not an English placeholder) to en_tn@master —
+  // see config/translate-targets.json's "ar".note and src/lib/script-guard.js.
+  assert.strictEqual(ar.sourceRef, 'unfoldingWord/en_tn@master');
   assert.strictEqual(ar.direction, 'rtl');
 
   const id = resolveParams({}, zmsg('translate notes OBA 1 to id'));

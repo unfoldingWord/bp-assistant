@@ -449,6 +449,13 @@ function buildTranslateReport({
   // estimatedCostUsd, calls }). Omitted entirely on the default agentic path so
   // subscription-run reports stay byte-identical.
   llm = null,
+  // Script-guard pre-flight ({ applicable, sourceScript, targetScript, inScope,
+  // translated, skipped, skippedByReason, skippedIds, truncated } or
+  // { applicable: false, reason }) and the aggregate identical-to-source rate
+  // ({ identicalRows, rowCount, rate, exceeded }). Both null for callers that
+  // don't pass them (article runs; back-compat).
+  scriptGuard = null,
+  identicalRate = null,
 }) {
   return {
     version: 1,
@@ -494,6 +501,8 @@ function buildTranslateReport({
       warnings: checks.warnings,
     },
     ...(llm ? { llm } : {}),
+    ...(scriptGuard ? { scriptGuard } : {}),
+    ...(identicalRate ? { identicalRate } : {}),
   };
 }
 
