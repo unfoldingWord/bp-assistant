@@ -77,6 +77,11 @@ try {
 
 const MAX_BATCH_ATTEMPTS = 2; // 1 draft + 1 repair pass
 
+// Warn when a target book shares fewer than this fraction of its in-range row
+// IDs with the source — it means the two files forked, and the merge will hold
+// both row sets. See the divergence check in translateChapters for measurements.
+const ROW_SET_DIVERGENCE_WARN_RATIO = 0.5;
+
 function langName(code) {
   return LANG_NAMES[code] || code;
 }
@@ -387,6 +392,13 @@ async function runTsvBatch({ files, batchRows, params, resource, guard }) {
  *   - target-already-translated: an existing target row with the same ID has
  *     ANY translateColumn already non-empty and in the target script. Protects
  *     finished human work from being overwritten by a fresh draft.
+ *   - partial-target-script: a refinement of either reason above for a
+ *     multi-column resource (tQ) — when only SOME, not all, of a row's
+ *     non-empty translate columns are already in the target script (e.g. an
+ *     Arabic Response next to an English Question). The row is still skipped
+ *     whole (never overwriting human work is the safer failure), but this
+ *     reason makes the partial state visible instead of it silently folding
+ *     into one of the two reasons above.
  * Only called when scriptGuardApplicable(sourceLang, targetLang) is true —
  * callers must gate on that themselves (see translateChapters).
  */
@@ -397,14 +409,30 @@ function partitionRowsByScriptGuard(rows, { targetLang, translateColumns, existi
     const val = row[col];
     return val != null && String(val).trim() !== '' && isInTargetScript(val, targetLang) === true;
   };
+  // Known limitation: the skip DECISION below still uses .some (whole-row),
+  // not per-column — never overwriting human work is the safer failure than
+  // translating only part of a row. A tQ-like row with an Arabic Response
+  // but an English Question is skipped entirely and its Question stays
+  // English forever. This only refines WHY it was skipped: when only SOME of
+  // the row's non-empty translate columns are in the target script, the
+  // reason is 'partial-target-script' instead of folding silently into the
+  // all-columns reason — that's how you'd find out full per-column
+  // partitioning is actually needed. For single-column tN this reason can
+  // never occur (there is only one column to be "some" of).
+  const reasonFor = (row, baseReason) => {
+    const nonEmptyCols = translateColumns.filter((col) => row[col] != null && String(row[col]).trim() !== '');
+    const matchedCols = nonEmptyCols.filter((col) => isNonEmptyInTargetScript(row, col));
+    if (matchedCols.length > 0 && matchedCols.length < nonEmptyCols.length) return 'partial-target-script';
+    return baseReason;
+  };
   for (const row of rows) {
     if (translateColumns.some((col) => isNonEmptyInTargetScript(row, col))) {
-      skipped.push({ id: row.ID, reason: 'source-already-target-script' });
+      skipped.push({ id: row.ID, reason: reasonFor(row, 'source-already-target-script') });
       continue;
     }
     const existing = existingById && existingById.get(row.ID);
     if (existing && translateColumns.some((col) => isNonEmptyInTargetScript(existing, col))) {
-      skipped.push({ id: row.ID, reason: 'target-already-translated' });
+      skipped.push({ id: row.ID, reason: reasonFor(existing, 'target-already-translated') });
       continue;
     }
     toTranslate.push(row);
@@ -416,6 +444,9 @@ function partitionRowsByScriptGuard(rows, { targetLang, translateColumns, existi
 function describeScriptGuardInapplicable(sourceLang, targetLang) {
   const srcScript = scriptOf(sourceLang);
   const tgtScript = scriptOf(targetLang);
+  if (!srcScript && !tgtScript) {
+    return `script unknown for sourceLang "${sourceLang}" and targetLang "${targetLang}"`;
+  }
   if (!srcScript || !tgtScript) {
     return `script unknown for ${!srcScript ? `sourceLang "${sourceLang}"` : `targetLang "${targetLang}"`}`;
   }
@@ -455,15 +486,26 @@ async function translateChapters(params, { workDir, onProgress, runBatchImpl, ma
     existingBookText = await core.fetchResourceFile(targetRepoRef, resource.file(params.book));
     if (existingBookText == null) progress(`no existing target book at ${targetRepoRef} — starting fresh`);
   }
-  let existingById = new Map();
+  // Parsed exactly once: both the script-guard partition below AND the merge
+  // at the end read `existingRows`/`existingById`. Previously this parse was
+  // wrapped in try/catch here (continuing with the guard silently disarmed)
+  // while the merge re-parsed the SAME text with no catch — so a bad parse
+  // let a misconfigured/overwrite-risky run past the guard and then crashed
+  // anyway with a raw codec error deep in the merge. Fail loudly, once, here
+  // instead: this is exactly the case where a bad parse could lead to
+  // overwriting existing target content, so continuing with the guard
+  // disarmed is never safe.
+  let existingRows = [];
   if (existingBookText != null) {
     try {
-      existingById = new Map(resource._codec.parse(existingBookText).map((r) => [r.ID, r]));
+      existingRows = resource._codec.parse(existingBookText);
     } catch (e) {
-      progress(`existing target book at ${params.targetOrg}/${params.repoName} failed to parse (${e.message}) — treating as no existing target`);
-      existingById = new Map();
+      throw new Error(`existing target book at ${params.targetOrg}/${params.repoName} `
+        + `(${resource.file(params.book)}) failed to parse (${e.message}) — refusing to continue with `
+        + 'the script guard disarmed or the merge computed against unparsed rows.');
     }
   }
+  const existingById = new Map(existingRows.map((r) => [r.ID, r]));
 
   // 3. Pre-flight script-guard partition (no LLM call yet). Skips rows whose
   //    source is already in the target script (misconfigured sourceRef) or
@@ -497,7 +539,39 @@ async function translateChapters(params, { workDir, onProgress, runBatchImpl, ma
     if (skipped.length > 0) {
       progress(`script guard: skipping ${skipped.length} of ${rows.length} row(s) already in target script `
         + `(source-already-target-script: ${skippedByReason['source-already-target-script'] || 0}, `
-        + `target-already-translated: ${skippedByReason['target-already-translated'] || 0})`);
+        + `target-already-translated: ${skippedByReason['target-already-translated'] || 0}, `
+        + `partial-target-script: ${skippedByReason['partial-target-script'] || 0})`);
+    }
+  }
+
+  // 3b. Row-set divergence warning. Now that source and target are different
+  //    repos, their ID sets can disagree — and for some books they disagree
+  //    almost completely, because the partner's book was forked from a much
+  //    older en_tn whose row IDs have since been regenerated. Measured
+  //    2026-08-11, shared IDs between BSOJ/ar_tn and unfoldingWord/en_tn:
+  //    RUT/OBA/MAT 100%, TIT 99%, GEN/JON 95% — but PSA 13% and ZEC just 1%.
+  //    The merge PRESERVES unmatched target rows (deleting them is the bug this
+  //    guard exists to prevent), so a low-overlap book merges to a file holding
+  //    both the old rows and the new ones — roughly double, covering the same
+  //    verses twice. That is recoverable and visible; silently deleting the
+  //    partner's work is not. So this warns rather than blocks, and reconciling
+  //    a forked book is a deliberate decision, not something a translate run
+  //    should make on its own.
+  let rowSetDivergence = null;
+  if (params.mergeMode === 'range' && existingRows.length) {
+    const inRange = existingRows.filter((r) => core.refInRange(r.Reference, params.startChapter, params.endChapter));
+    if (inRange.length) {
+      const sourceIds = new Set(rows.map((r) => r.ID));
+      const shared = inRange.filter((r) => sourceIds.has(r.ID)).length;
+      const sharedRatio = shared / inRange.length;
+      rowSetDivergence = { existingInRange: inRange.length, sourceInRange: rows.length, shared, sharedRatio };
+      if (sharedRatio < ROW_SET_DIVERGENCE_WARN_RATIO) {
+        progress(`WARNING: ${params.targetOrg}/${params.repoName} ${params.book} ${rangeLabel} shares only `
+          + `${shared} of ${inRange.length} row ID(s) with ${params.sourceRef} (${Math.round(sharedRatio * 100)}%). `
+          + `The target book looks forked from a different ${params.sourceLangName} revision. Unmatched target rows `
+          + `are PRESERVED, so the merged range will hold ~${inRange.length + rows.length - shared} rows covering the `
+          + 'same verses twice. Reconcile the row sets before pushing this book.');
+      }
     }
   }
 
@@ -594,14 +668,37 @@ async function translateChapters(params, { workDir, onProgress, runBatchImpl, ma
   //    prefer the preserved existing target row (finished human work), else
   //    the untouched source row (misconfigured-source case, no existing target).
   const targetById = new Map(targetRows.map((r) => [r.ID, r]));
-  const mergedRows = rows.map((r) => {
-    if (targetById.has(r.ID)) return targetById.get(r.ID);
+  const chosenById = new Map(rows.map((r) => {
+    if (targetById.has(r.ID)) return [r.ID, targetById.get(r.ID)];
     const existing = existingById.get(r.ID);
-    return existing || r;
-  });
-  const bookText = params.mergeMode === 'by-id'
-    ? core.updateRowsById(existingBookText, mergedRows, { parse: resource._codec.parse, serialize: resource._codec.serialize })
-    : core.mergeChapterIntoBook(existingBookText, mergedRows, { ...params, parse: resource._codec.parse, serialize: resource._codec.serialize });
+    return [r.ID, existing || r];
+  }));
+
+  let mergedRows;
+  let bookText;
+  if (params.mergeMode === 'by-id') {
+    // by-id replaces strictly by ID via updateRowsById, which can neither drop
+    // nor reorder existing rows — no union/shrink-guard needed here.
+    mergedRows = rows.map((r) => chosenById.get(r.ID));
+    bookText = core.updateRowsById(existingBookText, mergedRows, { parse: resource._codec.parse, serialize: resource._codec.serialize });
+  } else {
+    // Range mode: build the merged in-range row set as an ordered union (see
+    // core.buildMergedRows) so partner-authored rows outside the source's ID
+    // set survive a whole-file push, then hand the result to
+    // mergeChapterIntoBook unchanged.
+    const existingInRange = existingRows.filter((r) => core.refInRange(r.Reference, params.startChapter, params.endChapter));
+    mergedRows = core.buildMergedRows({ rows, chosenById, existingInRange });
+
+    // Shrink-guard: the merge must never drop an existing in-range target row.
+    // Makes the class of bug this run introduced (silently deleting
+    // partner-only rows) impossible to reintroduce without the run itself
+    // throwing.
+    core.assertNoDroppedRangeRows(mergedRows, existingInRange, {
+      book: params.book, startChapter: params.startChapter, endChapter: params.endChapter,
+    });
+
+    bookText = core.mergeChapterIntoBook(existingBookText, mergedRows, { ...params, parse: resource._codec.parse, serialize: resource._codec.serialize });
+  }
 
   const skippedIdsAll = skipped.map((s) => s.id);
   const scriptGuard = guardApplicable
@@ -629,9 +726,10 @@ async function translateChapters(params, { workDir, onProgress, runBatchImpl, ma
     selection: { mergeMode: params.mergeMode, verseStart: params.verseStart ?? null, verseEnd: params.verseEnd ?? null, rowIds: params.rowIds ?? null },
     scriptGuard,
     identicalRate: identicalGuard,
+    rowSetDivergence,
   });
 
-  return { sourceRows: rows, targetRows, mergedRows, checks, report, bookText, existingBookText, pack, scriptGuard };
+  return { sourceRows: rows, targetRows, mergedRows, checks, report, bookText, existingBookText, pack, scriptGuard, rowSetDivergence };
 }
 
 // ---------------------------------------------------------------------------

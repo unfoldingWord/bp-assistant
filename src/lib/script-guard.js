@@ -13,18 +13,32 @@
 // scriptGuardApplicable returns false — and cannot protect against either
 // misconfiguration above. Do not treat "applicable === false" as "safe"; it
 // only means this particular guard has nothing to say.
+//
+// isInTargetScript judges by SCRIPT DOMINANCE, not mere presence (see its own
+// comment below): link noise (rc://, [[wiki]], markdown link targets) and
+// script-neutral characters (digits, punctuation, separators, control/format
+// chars) are stripped first, then the remaining target-script character
+// count is compared against the remaining Latin character count. A single
+// stray character — a BOM, a quoted Hebrew/Greek term inside an otherwise-
+// English note — no longer flips the verdict the way bare presence did.
 
 'use strict';
 
 // Unicode block ranges. Not exhaustive of every script in existence — covers
 // the scripts unfoldingWord gateway/target languages actually use.
+// - arabic's last sub-range ends at U+FEFE, not U+FEFF: U+FEFF is ZERO WIDTH
+//   NO-BREAK SPACE (the UTF-8 byte-order-mark character), not an Arabic
+//   letter — a single stray BOM in an English note must never mark it
+//   "already Arabic".
+// - greek includes Greek Extended (U+1F00-U+1FFF, polytonic Greek).
+// - han includes CJK Unified Ideographs Extension A (U+3400-U+4DBF).
 const SCRIPT_RANGES = {
-  arabic: /[؀-ۿݐ-ݿࢠ-ࣿﭐ-﷿ﹰ-﻿]/,
+  arabic: /[؀-ۿݐ-ݿࢠ-ࣿﭐ-﷿ﹰ-﻾]/,
   hebrew: /[֐-׿יִ-ﭏ]/,
   cyrillic: /[Ѐ-ӿ]/,
   devanagari: /[ऀ-ॿ]/,
-  han: /[一-鿿]/,
-  greek: /[Ͱ-Ͽ]/,
+  han: /[㐀-䶿一-鿿]/,
+  greek: /[Ͱ-Ͽἀ-῿]/,
   ethiopic: /[ሀ-፿]/,
   thai: /[฀-๿]/,
   myanmar: /[က-႟]/,
@@ -66,16 +80,54 @@ function hasScript(text, script) {
   return re.test(s);
 }
 
+// rc://, [[wiki]], and markdown link targets are never localized — an Arabic
+// note full of Latin rc:// links must still read as Arabic — so link noise is
+// stripped before counting script characters.
+const RC_LINK_RE = /rc:\/\/[^\s\])]+/g;
+const WIKI_LINK_RE = /\[\[[^\]]*\]\]/g;
+const MD_LINK_TARGET_RE = /\]\([^)]*\)/g;
+
+function stripLinkNoise(text) {
+  return String(text ?? '')
+    .replace(RC_LINK_RE, ' ')
+    .replace(WIKI_LINK_RE, ' ')
+    .replace(MD_LINK_TARGET_RE, ' ');
+}
+
+// Numbers, punctuation, separators, and control/format characters carry no
+// script signal — stripping them also kills the Arabic-Indic-digit false
+// positive (a string of only Arabic-Indic digits has nothing left to count).
+function stripScriptNeutral(text) {
+  return String(text ?? '').replace(/[\p{N}\p{P}\p{Z}\p{C}]/gu, '');
+}
+
+function countMatches(text, re) {
+  const m = String(text ?? '').match(re);
+  return m ? m.length : 0;
+}
+
 /**
- * Is `text` in `targetLang`'s script? Returns true/false, or null when
- * undecidable (targetLang's script is unknown). Two-arg undecidability is
- * ONLY about the target lang being unrecognized — see scriptGuardApplicable
- * for the source-vs-target-same-script undecidability.
+ * Is `text` DOMINANTLY in `targetLang`'s script? Returns true/false, or null
+ * when undecidable (targetLang's script is unknown). Two-arg undecidability
+ * is ONLY about the target lang being unrecognized — see
+ * scriptGuardApplicable for the source-vs-target-same-script undecidability.
+ *
+ * Dominance, not presence: link noise and script-neutral characters (digits/
+ * punctuation/separators/control chars) are stripped first; what remains is
+ * counted per-script and compared against a Latin count. A text with no
+ * signal left after stripping (empty, punctuation-only) is `false`. When the
+ * target script itself IS latin, the Latin comparison would be circular, so
+ * presence of any Latin character after stripping is sufficient.
  */
 function isInTargetScript(text, targetLang) {
   const script = scriptOf(targetLang);
   if (!script) return null;
-  return hasScript(text, script);
+  const stripped = stripScriptNeutral(stripLinkNoise(text));
+  if (!stripped) return false;
+  const targetCount = countMatches(stripped, new RegExp(SCRIPT_RANGES[script].source, 'g'));
+  if (script === 'latin') return targetCount > 0;
+  const latinCount = countMatches(stripped, new RegExp(SCRIPT_RANGES.latin.source, 'g'));
+  return targetCount > 0 && targetCount > latinCount;
 }
 
 /**

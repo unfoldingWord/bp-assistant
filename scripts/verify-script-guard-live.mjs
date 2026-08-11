@@ -55,8 +55,16 @@ async function run(label, sourceRef, book, chapter) {
     console.log('  identicalRate:', JSON.stringify(out.report.identicalRate));
     // The merged book must keep every in-scope row: translated + preserved.
     console.log('  mergedRows:', out.mergedRows.length, 'of', out.sourceRows.length, 'in scope');
-    const preserved = out.mergedRows.filter((r) => /[؀-ۿ]/.test(r.Note || ''));
-    console.log('  merged rows still holding Arabic (human work preserved):', preserved.length);
+    // THE data-integrity assertion: no row that existed in the partner's book
+    // may be missing from the book we would push back. ar_tn carries notes that
+    // en_tn does not (GEN: 327, JON: 9, TIT: 3), so a source-ordered merge
+    // silently deletes them.
+    const ids = (text) => new Set((text || '').split(/\r?\n/).slice(1).filter((l) => l.trim()).map((l) => l.split('\t')[1]));
+    const beforeIds = ids(out.existingBookText);
+    const afterIds = ids(out.bookText);
+    const dropped = [...beforeIds].filter((id) => !afterIds.has(id));
+    console.log(`  book rows: ${beforeIds.size} before -> ${afterIds.size} after`);
+    console.log(`  DROPPED partner rows: ${dropped.length}${dropped.length ? ' !! ' + dropped.slice(0, 8).join(',') : ' (none)'}`);
   } catch (e) {
     console.log(`\n=== ${label} (${sourceRef}) ===`);
     for (const l of lines) console.log('  ' + l);
@@ -72,3 +80,6 @@ await run('NEW CONFIG — English source, finished book', 'unfoldingWord/en_tn@m
 await run('NEW CONFIG — English source, MIXED book', 'unfoldingWord/en_tn@master', 'JON', 1);
 // A wholly-English book must be entirely translated: guard stays out of the way.
 await run('NEW CONFIG — English source, untranslated book', 'unfoldingWord/en_tn@master', 'ZEC', 1);
+// GEN 1 is the row-divergence case: ar_tn has 16 notes in chapter 1 that en_tn
+// does not. A source-ordered merge deletes all 16.
+await run('NEW CONFIG — row divergence (GEN has 327 ar-only rows)', 'unfoldingWord/en_tn@master', 'GEN', 1);

@@ -28,6 +28,15 @@ const PASS_THROUGH_COLUMNS = TN_PASS_THROUGH_COLUMNS;
 // translation — verified case: BSOJ/ar_tn 2TH 3 returned 44/54 = 81% identical.
 const IDENTICAL_TO_SOURCE_ABORT_RATIO = 0.5;
 
+// A small run has no statistical signal — a legitimate single-row by-id run
+// (bible-editor's "translate this note" flow) whose one note is genuinely
+// identical to source (an rc://-link-only Note, a proper-noun-only tQ
+// Question) is 1/1 = 100% and would otherwise hard-abort a perfectly valid
+// translation. This threshold is about catching a misconfigured BATCH, not
+// policing individual rows, so the guard only fires once there are enough
+// rows for the rate to mean something.
+const IDENTICAL_TO_SOURCE_MIN_ROWS = 10;
+
 // rc:// URIs. Link targets are never localized; display text may be. The body
 // of a link (`rc://*/ta/man/translate/figs-metaphor`) contains `*` and `/`, so
 // only stop at whitespace or the closing `]`/`)` of the surrounding markdown.
@@ -224,12 +233,16 @@ function runArticleChecks(sourceMd, targetMd, { articleId, path: filePath } = {}
   if (src.trim() !== '' && tgt.trim() === '') {
     violations.push(violation('empty-translation', 'error', rowId, 'target article body empty while source non-empty'));
   }
-  // A whole article body byte-identical to source is the degenerate
-  // 100%-unchanged case — never a valid translation — so this is 'error', not
-  // 'warning'. (The per-row TSV identical-to-source check below stays a
-  // warning; identicalRateGuard is what enforces the aggregate there.)
+  // Warning, not error: legitimately-unchanged articles exist (link-only or
+  // stub tW/tA files whose body is nearly all rc://[[wiki]] links with little
+  // free text to translate). Promoting this to 'error' burns a repair pass
+  // and then hard-fails the whole article run via MAX_BATCH_ATTEMPTS, and
+  // also breaks the resume path that reuses a cached article output only
+  // when checks.ok. The TSV aggregate guard (identicalRateGuard) already
+  // covers the misconfiguration this was meant to catch, at the batch level
+  // where it has statistical signal — a single article has none.
   if (src.trim() !== '' && src === tgt) {
-    violations.push(violation('identical-to-source', 'error', rowId, 'target article identical to source'));
+    violations.push(violation('identical-to-source', 'warning', rowId, 'target article identical to source'));
   }
 
   // Links: three multisets, each compared independently.
@@ -269,7 +282,7 @@ function runArticleChecks(sourceMd, targetMd, { articleId, path: filePath } = {}
  * identical in both Question and Response counts once, not twice.
  * See IDENTICAL_TO_SOURCE_ABORT_RATIO for why this exists.
  */
-function identicalRateGuard(checks, rowCount, { ratio = IDENTICAL_TO_SOURCE_ABORT_RATIO } = {}) {
+function identicalRateGuard(checks, rowCount, { ratio = IDENTICAL_TO_SOURCE_ABORT_RATIO, minRows = IDENTICAL_TO_SOURCE_MIN_ROWS } = {}) {
   const rowIds = new Set(
     (checks.warnings || [])
       .filter((w) => typeof w.check === 'string' && w.check.startsWith('identical-to-source'))
@@ -277,8 +290,8 @@ function identicalRateGuard(checks, rowCount, { ratio = IDENTICAL_TO_SOURCE_ABOR
   );
   const identicalRows = rowIds.size;
   const rate = rowCount ? identicalRows / rowCount : 0;
-  const exceeded = rowCount > 0 && rate > ratio;
-  return { identicalRows, rowCount, rate, exceeded };
+  const exceeded = rowCount >= minRows && rate > ratio;
+  return { identicalRows, rowCount, rate, exceeded, minRows };
 }
 
 function summarize(violations) {
@@ -301,6 +314,7 @@ module.exports = {
   nfc,
   identicalRateGuard,
   IDENTICAL_TO_SOURCE_ABORT_RATIO,
+  IDENTICAL_TO_SOURCE_MIN_ROWS,
   PASS_THROUGH_COLUMNS,
   TN_PASS_THROUGH_COLUMNS,
   TN_TRANSLATE_COLUMNS,

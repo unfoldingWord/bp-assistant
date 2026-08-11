@@ -371,17 +371,25 @@ function readArticleOutput(outputFile, sourceMarkdown, { articleId, path: filePa
 }
 
 /**
+ * Is `reference`'s chapter within [startChapter, endChapter]? 'front' counts
+ * as in-range exactly when the range starts at chapter 1. Shared by
+ * mergeChapterIntoBook and buildMergedRows so both compute "in range" the
+ * same way — do not reimplement this predicate elsewhere.
+ */
+function refInRange(reference, startChapter, endChapter) {
+  const ch = refChapter(reference);
+  if (ch === 'front') return startChapter === 1;
+  return typeof ch === 'number' && ch >= startChapter && ch <= endChapter;
+}
+
+/**
  * Merge translated chapter-range rows into the whole-book target TSV. `parse`/
  * `serialize` default to tN's codec. existingBookText may be null (fresh file).
  */
 function mergeChapterIntoBook(existingBookText, newRows, { startChapter, endChapter, parse = parseTnTsv, serialize = serializeTnTsv }) {
   const existing = existingBookText ? parse(existingBookText) : [];
 
-  const inRange = (r) => {
-    const ch = refChapter(r.Reference);
-    if (ch === 'front') return startChapter === 1;
-    return typeof ch === 'number' && ch >= startChapter && ch <= endChapter;
-  };
+  const inRange = (r) => refInRange(r.Reference, startChapter, endChapter);
 
   const before = [];
   const after = [];
@@ -393,6 +401,85 @@ function mergeChapterIntoBook(existingBookText, newRows, { startChapter, endChap
     else after.push(r);
   }
   return serialize([...before, ...newRows, ...after]);
+}
+
+/**
+ * Ordered union merge for range-mode chapter translation, called by the
+ * pipeline BEFORE mergeChapterIntoBook so that helper's splice-in-range
+ * semantics stay untouched.
+ *
+ * WHY this exists: the source repo (e.g. unfoldingWord/en_tn) and the target
+ * repo (e.g. BSOJ/ar_tn) are different files with different ID sets — the
+ * partner translation team adds their own notes independent of the source.
+ * mergeChapterIntoBook's `newRows` used to be source-order rows only, so a
+ * whole-file push after a range translation silently DELETED every
+ * partner-only row in that chapter range on Door43 (measured live: GEN ch1
+ * had 16 partner-only rows, JON ch1 had 3, TIT ch1 had 3 — all would have
+ * been deleted by "translate notes GEN 1 to ar"). This builds the merged
+ * in-range row set as an ordered union instead: every existing target row in
+ * range is kept (in target order) unless a source row with the same ID
+ * supplies a different chosen value, and genuinely-new source rows (no
+ * counterpart in the target range) are spliced in next to their nearest
+ * preceding source-order neighbor that IS present in the target, so new
+ * notes land beside their neighbours instead of all at the end.
+ *
+ * When existingInRange is empty (no existing target book / range), this
+ * degrades exactly to source order (buildTranslateReport/mergeChapterIntoBook
+ * pre-union behavior).
+ *
+ * @param {Array} rows - in-scope SOURCE rows, in SOURCE order (anchors for new inserts).
+ * @param {Map} chosenById - per in-scope SOURCE row id -> the row to use
+ *   (translated row, else preserved existing target row, else the untouched
+ *   source row).
+ * @param {Array} existingInRange - parsed existing TARGET rows whose chapter
+ *   falls in range, in TARGET FILE ORDER (see refInRange).
+ */
+function buildMergedRows({ rows, chosenById, existingInRange }) {
+  const sourceIds = new Set(rows.map((r) => r.ID));
+  const out = [];
+  for (const t of existingInRange) {
+    out.push(sourceIds.has(t.ID) ? chosenById.get(t.ID) : t);
+  }
+  // Source rows with no counterpart in the target range are genuinely new;
+  // insert each after the nearest preceding source row that IS present in
+  // the target (or prepend, if no such anchor has been seen yet).
+  const present = new Set(out.filter((r) => sourceIds.has(r.ID)).map((r) => r.ID));
+  const insertAfter = new Map();
+  const prepend = [];
+  let lastAnchor = null;
+  for (const s of rows) {
+    if (present.has(s.ID)) { lastAnchor = s.ID; continue; }
+    const chosen = chosenById.get(s.ID);
+    if (lastAnchor == null) prepend.push(chosen);
+    else {
+      if (!insertAfter.has(lastAnchor)) insertAfter.set(lastAnchor, []);
+      insertAfter.get(lastAnchor).push(chosen);
+    }
+  }
+  const merged = [...prepend];
+  for (const r of out) {
+    merged.push(r);
+    const extra = insertAfter.get(r.ID);
+    if (extra) merged.push(...extra);
+  }
+  return merged;
+}
+
+/**
+ * Shrink-guard for the range-mode merge: throws when `mergedRows` is missing
+ * an ID that `existingInRange` had. Pulled out as its own pure function so
+ * the class of bug buildMergedRows exists to prevent (silently deleting
+ * partner-only rows) is impossible to reintroduce without the run itself
+ * throwing — and so it's unit-testable without a full translateChapters run.
+ */
+function assertNoDroppedRangeRows(mergedRows, existingInRange, { book, startChapter, endChapter } = {}) {
+  const mergedIds = new Set(mergedRows.map((r) => r.ID));
+  const droppedIds = existingInRange.filter((r) => !mergedIds.has(r.ID)).map((r) => r.ID);
+  if (droppedIds.length) {
+    const scope = book ? `${book} ${startChapter}-${endChapter}` : `${startChapter}-${endChapter}`;
+    throw new Error(`range merge for ${scope} would drop ${droppedIds.length} existing target row(s) `
+      + `that are absent from the merged result — refusing to merge (first few IDs: ${droppedIds.slice(0, 5).join(', ')}).`);
+  }
 }
 
 /**
@@ -456,6 +543,10 @@ function buildTranslateReport({
   // don't pass them (article runs; back-compat).
   scriptGuard = null,
   identicalRate = null,
+  // Row-set divergence between source and target in the merged range
+  // ({ existingInRange, sourceInRange, shared, sharedRatio }), or null for
+  // by-id runs and fresh target files.
+  rowSetDivergence = null,
 }) {
   return {
     version: 1,
@@ -503,6 +594,7 @@ function buildTranslateReport({
     ...(llm ? { llm } : {}),
     ...(scriptGuard ? { scriptGuard } : {}),
     ...(identicalRate ? { identicalRate } : {}),
+    ...(rowSetDivergence ? { rowSetDivergence } : {}),
   };
 }
 
@@ -520,7 +612,11 @@ module.exports = {
   writeArticleFiles,
   readBatchOutput,
   readArticleOutput,
+  refChapter,
+  refInRange,
   mergeChapterIntoBook,
+  buildMergedRows,
+  assertNoDroppedRangeRows,
   updateRowsById,
   selectRows,
   buildTranslateReport,
