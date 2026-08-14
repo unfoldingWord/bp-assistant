@@ -911,14 +911,34 @@ async function generatePipeline(route, message) {
             ...Object.values(resumeStatus.found),
             ...resumeStatus.observedTempArtifacts,
           ];
-          initialPrompt = buildInitialPipelineContinuationPrompt({
-            book,
-            chapter: ch,
-            missing: resumeStatus.missing,
-            observed: observedArtifacts,
-          });
-          invocationSkill = null;
-          invocationResume = resumeSessionId;
+          // #251: the in-loop continuation path already restarts the skill from
+          // scratch when the run produced nothing (see restartFromScratch
+          // below), but entering via a `continue_after_early_exit` checkpoint
+          // bypassed that check and always resumed. With zero artifacts on
+          // disk, the continuation prompt's "resume from the artifacts already
+          // on disk" instruction is a contradiction — the agent has nothing to
+          // pick up, returns success in seconds, and the chapter hard-fails
+          // again. A manual resume of a zero-progress failure would therefore
+          // retry the identical broken approach forever. Restart fresh instead.
+          if (observedArtifacts.length === 0) {
+            console.log(
+              `[generate] resume checkpoint for ${book} ${ch} has no artifacts on disk; ` +
+              `restarting initial-pipeline from scratch instead of resuming session ${resumeSessionId}.`
+            );
+            await status(
+              `Resume checkpoint for **${book} ${ch}** has no artifacts on disk to continue from; ` +
+              `restarting initial-pipeline from scratch.`
+            );
+          } else {
+            initialPrompt = buildInitialPipelineContinuationPrompt({
+              book,
+              chapter: ch,
+              missing: resumeStatus.missing,
+              observed: observedArtifacts,
+            });
+            invocationSkill = null;
+            invocationResume = resumeSessionId;
+          }
         }
         if (skill === 'UST-gen') {
           const existingUlt = resolveOutputFile(`output/AI-ULT/${hasVerseRange ? `${book}-${ch}-vv${verseStart}-${verseEnd}` : `${book}-${ch}`}.usfm`, book)
