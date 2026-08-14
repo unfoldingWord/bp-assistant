@@ -534,6 +534,72 @@ test('generatePipeline resumes initial-pipeline early-exit checkpoint without de
   }
 });
 
+test('generatePipeline restarts from scratch when an early-exit checkpoint has no artifacts on disk', async () => {
+  // #251: resuming a zero-progress early exit told the agent to "resume from
+  // the artifacts already on disk" when nothing was on disk, so it returned
+  // success in seconds having done nothing. With no artifacts, the checkpoint
+  // resume must re-invoke the skill fresh rather than resume the dead session.
+  const initialCheckpoint = {
+    state: 'failed',
+    success: 0,
+    fail: 1,
+    completedChapters: [],
+    current: {
+      chapter: 52,
+      skill: 'initial-pipeline',
+      status: 'failed',
+      errorKind: 'initial_pipeline_early_exit',
+      observedArtifacts: [],
+    },
+    resume: {
+      chapter: 52,
+      skill: 'initial-pipeline',
+      sessionId: 'session-dead-52',
+      mode: 'continue_after_early_exit',
+    },
+  };
+  const harness = createHarness({
+    initialCheckpoint,
+    runClaudeImpl: async ({ options, tempDir }) => {
+      // The dead session must NOT be resumed, and the skill must be re-invoked.
+      assert.equal(options.resume, null);
+      assert.equal(options.skill, 'initial-pipeline');
+      assert.equal(options.prompt, 'ISA 52');
+      assert.doesNotMatch(options.prompt, /Continue the existing initial-pipeline run/);
+      for (const dir of ['AI-ULT', 'AI-UST', 'issues']) {
+        fs.mkdirSync(path.join(tempDir, 'output', dir, 'ISA'), { recursive: true });
+      }
+      fs.writeFileSync(path.join(tempDir, 'output', 'AI-ULT', 'ISA', 'ISA-52.usfm'), '\\id ISA\n\\c 52\n\\v 1 ult\n');
+      fs.writeFileSync(path.join(tempDir, 'output', 'AI-UST', 'ISA', 'ISA-52.usfm'), '\\id ISA\n\\c 52\n\\v 1 ust\n');
+      fs.writeFileSync(path.join(tempDir, 'output', 'issues', 'ISA', 'ISA-52.tsv'), 'isa\t52:1\tfigs-activepassive\tYou were sold\n');
+      return { subtype: 'success', usage: {}, total_cost_usd: 0, session_id: 'session-fresh-52' };
+    },
+  });
+
+  try {
+    await harness.generatePipeline(
+      { _synthetic: true, _book: 'ISA', _startChapter: 52, _endChapter: 52, skill: 'initial-pipeline', operations: 6 },
+      buildMessage('generate isa 52')
+    );
+
+    // One fresh invocation was enough — no continuation loop, no hard fail.
+    assert.equal(harness.runClaudeCalls.length, 1);
+    assert.equal(harness.runClaudeCalls[0].resume, null);
+    assert.ok(harness.readStatusTexts().some((t) => t.includes('no artifacts on disk')));
+    // slice(1): index 0 is the seeded failure checkpoint this run resumes FROM,
+    // which carries errorKind by construction. Only patches written during the
+    // run indicate a fresh early exit.
+    assert.equal(
+      harness.checkpoints.slice(1).some((patch) => patch.current?.errorKind === 'initial_pipeline_early_exit'),
+      false
+    );
+    assert.equal(harness.diagnosisCalls.length, 0);
+    assert.equal(harness.runSummaries.at(-1).success, true);
+  } finally {
+    harness.cleanup();
+  }
+});
+
 test('generatePipeline does not apply initial-pipeline guardrails to direct ULT-only runs', async () => {
   const harness = createHarness({
     runClaudeImpl: async ({ options, tempDir }) => {
