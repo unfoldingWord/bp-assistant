@@ -482,3 +482,51 @@ test('checkTnQuality bold check tolerates curled quotes introduced by post-proce
     .filter((f) => f.category === 'bold_not_in_ult').map((f) => f.id);
   assert.deepEqual(boldIds, ['a2b3']);
 });
+
+test('checkTnQuality flags markdown inside AT brackets and leaves prose bold to check 8', async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'quality-at-markdown-'));
+  const relRoot = path.join('tmp', path.basename(tempDir));
+  fs.mkdirSync(path.join('/srv/bot/workspace', relRoot), { recursive: true });
+
+  const tsvRel = path.join(relRoot, 'tn.tsv');
+  const prepRel = path.join(relRoot, 'prepared_notes.json');
+  const ultRel = path.join(relRoot, 'ult.usfm');
+  const ustRel = path.join(relRoot, 'ust.usfm');
+  const findingsRel = path.join(relRoot, 'findings.json');
+
+  fs.writeFileSync(path.join('/srv/bot/workspace', tsvRel), [
+    'Reference\tID\tTags\tSupportReference\tQuote\tOccurrence\tNote',
+    // Bold inside the AT whose wording IS in the ULT: check 8 stays silent by
+    // design (an AT keeps ULT wording), so only at_markdown can catch this.
+    '1:1\ta1b2\t\trc://*/ta/man/translate/figs-metaphor\tמֶלֶךְ\t1\tHere the writer uses a figure. Alternate translation: [the **king** spoke]',
+    // Bold inside the AT whose wording is NOT in the ULT: previously reported
+    // as bold_not_in_ult, which mislabels a formatting violation.
+    '1:2\ta2b3\t\trc://*/ta/man/translate/figs-metaphor\tמֶלֶךְ\t1\tHere the writer uses a figure. Alternate translation: [the **chieftain** spoke]',
+    // Bold in explanatory prose, outside the brackets: still check 8's job.
+    '1:3\ta3b4\t\trc://*/ta/man/translate/figs-metaphor\tמֶלֶךְ\t1\tHere **the emperor** is the figure. Alternate translation: [the king spoke]',
+  ].join('\n'));
+  fs.writeFileSync(path.join('/srv/bot/workspace', prepRel), JSON.stringify({
+    items: [
+      { id: 'a1b2', reference: '1:1', gl_quote: 'king', issue_span_gl_quote: 'king', ult_verse: 'The king spoke.', ust_verse: 'The ruler addressed them.' },
+      { id: 'a2b3', reference: '1:2', gl_quote: 'king', issue_span_gl_quote: 'king', ult_verse: 'The king spoke.', ust_verse: 'The ruler addressed them.' },
+      { id: 'a3b4', reference: '1:3', gl_quote: 'king', issue_span_gl_quote: 'king', ult_verse: 'The king spoke.', ust_verse: 'The ruler addressed them.' },
+    ],
+  }, null, 2));
+  fs.writeFileSync(path.join('/srv/bot/workspace', ultRel), '\\c 1\n\\v 1 The king spoke.\n\\v 2 The king spoke.\n\\v 3 The king spoke.\n');
+  fs.writeFileSync(path.join('/srv/bot/workspace', ustRel), '\\c 1\n\\v 1 The ruler addressed them.\n\\v 2 The ruler addressed them.\n\\v 3 The ruler addressed them.\n');
+
+  await checkTnQuality({ tsvPath: tsvRel, preparedJson: prepRel, ultUsfm: ultRel, ustUsfm: ustRel, output: findingsRel });
+
+  const findings = readFindings(findingsRel);
+
+  const atMarkdown = findings.filter((f) => f.category === 'at_markdown');
+  assert.deepEqual(atMarkdown.map((f) => f.id), ['a1b2', 'a2b3']);
+  // Formatting violations are errors, matching the sibling at_brackets check.
+  assert.deepEqual([...new Set(atMarkdown.map((f) => f.severity))], ['error']);
+
+  // The AT-bracket spans are not double-reported under the bold label, and
+  // prose bold outside the brackets is still caught.
+  const boldIds = findings
+    .filter((f) => f.category === 'bold_not_in_ult').map((f) => f.id);
+  assert.deepEqual(boldIds, ['a3b4']);
+});
