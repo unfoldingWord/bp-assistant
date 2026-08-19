@@ -359,32 +359,44 @@ async function callModel({ system, userMessage, modelTier, timeoutMs }) {
       options: {
         model: modelTier,
         systemPrompt: system,
+        // allowedTools does NOT restrict which tools exist -- per the SDK types it
+        // only lists tools that are "auto-allowed without prompting". Paired with
+        // permissionMode 'auto' ("use a model classifier to approve/deny") an empty
+        // list left every tool reachable with a classifier as the only gate, on a
+        // public endpoint whose prompt embeds caller-supplied markdown. 'dontAsk'
+        // is documented as "deny if not pre-approved", making the empty list a
+        // real deny-all.
         allowedTools: [],
-        // Not 1. No tools are allowed, so a turn cannot fetch or loop -- the only
-      // way to spend one is an assistant message that stops before emitting the
-      // final text (a thinking-only first block, for instance). At maxTurns: 1
-      // that surfaced to the caller as a hard failure:
-      //   'Claude Code returned an error result: Reached maximum number of turns (1)'
-      // intermittently, depending on how the model chose to open. A small ceiling
-      // lets it finish while still bounding the request; with allowedTools: []
-      // there is nothing for the extra turns to do but complete the answer.
-      maxTurns: 4,
-        permissionMode: 'auto',
+        permissionMode: 'dontAsk',
+        // Not 1. A turn can be spent on an assistant message that stops before
+        // emitting the final text, which surfaced as a hard failure ('Reached
+        // maximum number of turns (1)'). 2 is enough to finish; with tools denied
+        // above the extra turn cannot fetch anything, and the per-attempt budget
+        // below still bounds wall time.
+        maxTurns: 2,
         settingSources: [],
         persistSession: false,
         abortController,
       },
     });
 
+    // Keep the LAST non-empty assistant turn rather than concatenating them all:
+    // once more than one turn is allowed, concatenation glues a preamble turn
+    // onto the answer with no separator, and sanitizeModelOutput only strips one
+    // markdown fence.
     let text = '';
     for await (const msg of conversation) {
       if (abortController.signal.aborted) break;
       if (msg.type === 'assistant' && msg.message && Array.isArray(msg.message.content)) {
+        let turnText = '';
         for (const block of msg.message.content) {
           if (block && block.type === 'text' && typeof block.text === 'string') {
-            text += block.text;
+            turnText += block.text;
           }
         }
+        if (turnText.trim()) text = turnText;
+      } else if (msg.type === 'result' && typeof msg.result === 'string' && !text.trim()) {
+        text = msg.result;
       }
     }
     if (abortController.signal.aborted) {

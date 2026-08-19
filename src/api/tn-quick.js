@@ -269,40 +269,73 @@ function buildUserMessage({ body, templateInfo, hebrewQuote }) {
   ].join('\n');
 }
 
-async function callModel({ system, userMessage, modelTier }) {
+// Timeout for one model call. There was previously none here at all, so a hung
+// request held its rate-limit slot indefinitely; raising the turn ceiling makes
+// the worst case longer, so a bound is required rather than optional.
+const MODEL_TIMEOUT_MS = 90_000;
+
+async function callModel({ system, userMessage, modelTier, timeoutMs = MODEL_TIMEOUT_MS }) {
   const query = await getAgentSdkQuery();
+  const abortController = new AbortController();
+  const timer = setTimeout(() => abortController.abort(), timeoutMs);
+
   const conversation = query({
     prompt: userMessage,
     options: {
       model: modelTier,
       systemPrompt: system,
+      abortController,
+      // allowedTools does NOT restrict which tools exist -- per the SDK types it
+      // only lists tools that are "auto-allowed without prompting". Paired with
+      // permissionMode 'auto' ("use a model classifier to approve/deny") an empty
+      // list therefore left every tool reachable, with a classifier as the only
+      // gate, on a public HTTPS endpoint whose prompt embeds caller-supplied text.
+      // 'dontAsk' is documented as "deny if not pre-approved", which is what makes
+      // the empty allowedTools an actual deny-all.
       allowedTools: [],
-      // Not 1. No tools are allowed, so a turn cannot fetch or loop -- the only
-      // way to spend one is an assistant message that stops before emitting the
-      // final text (a thinking-only first block, for instance). At maxTurns: 1
-      // that surfaced to the caller as a hard failure:
-      //   'Claude Code returned an error result: Reached maximum number of turns (1)'
-      // intermittently, depending on how the model chose to open. A small ceiling
-      // lets it finish while still bounding the request; with allowedTools: []
-      // there is nothing for the extra turns to do but complete the answer.
-      maxTurns: 4,
-      permissionMode: 'auto',
+      permissionMode: 'dontAsk',
+      // Not 1. A turn can be spent on an assistant message that stops before
+      // emitting the final text, which surfaced to the caller as a hard failure
+      // ("Reached maximum number of turns (1)") depending on how the model opened.
+      // 2 is enough to finish; with tools denied above, the extra turn cannot
+      // fetch anything.
+      maxTurns: 2,
       settingSources: [],
       persistSession: false,
     },
   });
 
-  let text = '';
-  for await (const msg of conversation) {
-    if (msg.type === 'assistant' && msg.message && Array.isArray(msg.message.content)) {
-      for (const block of msg.message.content) {
-        if (block && block.type === 'text' && typeof block.text === 'string') {
-          text += block.text;
+  // Keep the LAST non-empty assistant text rather than concatenating every turn.
+  // Concatenating glued a preamble turn onto the answer with no separator
+  // ("Here's the note:The note text") once more than one turn was allowed.
+  let lastText = '';
+  let resultText = '';
+  try {
+    for await (const msg of conversation) {
+      if (abortController.signal.aborted) break;
+      if (msg.type === 'assistant' && msg.message && Array.isArray(msg.message.content)) {
+        let turnText = '';
+        for (const block of msg.message.content) {
+          if (block && block.type === 'text' && typeof block.text === 'string') {
+            turnText += block.text;
+          }
         }
+        if (turnText.trim()) lastText = turnText;
+      } else if (msg.type === 'result' && typeof msg.result === 'string') {
+        resultText = msg.result;
       }
     }
+  } catch (err) {
+    if (abortController.signal.aborted) {
+      throw new Error(`model timed out after ${Math.round(timeoutMs / 1000)}s`);
+    }
+    throw err;
+  } finally {
+    clearTimeout(timer);
+    try { conversation.close(); } catch (_) { /* already closed */ }
   }
-  const trimmed = text.trim();
+
+  const trimmed = (lastText || resultText).trim();
   if (!trimmed) {
     throw new Error('model returned empty response');
   }
