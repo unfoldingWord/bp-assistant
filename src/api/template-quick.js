@@ -385,6 +385,7 @@ async function callModel({ system, userMessage, modelTier, timeoutMs }) {
     // onto the answer with no separator, and sanitizeModelOutput only strips one
     // markdown fence.
     let text = '';
+    let resultError = null;
     for await (const msg of conversation) {
       if (abortController.signal.aborted) break;
       if (msg.type === 'assistant' && msg.message && Array.isArray(msg.message.content)) {
@@ -395,10 +396,18 @@ async function callModel({ system, userMessage, modelTier, timeoutMs }) {
           }
         }
         if (turnText.trim()) text = turnText;
-      } else if (msg.type === 'result' && typeof msg.result === 'string' && !text.trim()) {
-        text = msg.result;
+      } else if (msg.type === 'result') {
+        // A terminal SDKResultError can arrive as an event rather than a throw.
+        // Accepting the text that preceded it would return an incomplete template
+        // as a 200 whenever the partial output happened to satisfy the invariants.
+        if (msg.is_error === true || /^error_/.test(msg.subtype || '')) {
+          resultError = msg.subtype || 'error';
+        } else if (typeof msg.result === 'string' && !text.trim()) {
+          text = msg.result;
+        }
       }
     }
+    if (resultError) throw new Error(`model ended with ${resultError}`);
     if (abortController.signal.aborted) {
       const err = new Error(`model call timed out after ${timeoutMs}ms`);
       err.code = 'MODEL_TIMEOUT';

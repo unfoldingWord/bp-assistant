@@ -319,6 +319,7 @@ async function callModel({ system, userMessage, modelTier, timeoutMs = MODEL_TIM
   // ("Here's the note:The note text") once more than one turn was allowed.
   let lastText = '';
   let resultText = '';
+  let resultError = null;
   try {
     for await (const msg of conversation) {
       if (abortController.signal.aborted) break;
@@ -330,8 +331,16 @@ async function callModel({ system, userMessage, modelTier, timeoutMs = MODEL_TIM
           }
         }
         if (turnText.trim()) lastText = turnText;
-      } else if (msg.type === 'result' && typeof msg.result === 'string') {
-        resultText = msg.result;
+      } else if (msg.type === 'result') {
+        // A terminal SDKResultError (subtype 'error_max_turns' and friends) can
+        // arrive as an event carrying no string `result`. Without this the
+        // preceding assistant text was kept and returned as a successful note,
+        // so a call that still exhausted its turns produced a truncated 200.
+        if (msg.is_error === true || /^error_/.test(msg.subtype || '')) {
+          resultError = msg.subtype || 'error';
+        } else if (typeof msg.result === 'string') {
+          resultText = msg.result;
+        }
       }
     }
   } catch (err) {
@@ -349,6 +358,7 @@ async function callModel({ system, userMessage, modelTier, timeoutMs = MODEL_TIM
   // through and a timed-out request returned its partial, truncated note as a
   // successful 200.
   if (abortController.signal.aborted) throw modelTimeoutError(timeoutMs);
+  if (resultError) throw new Error(`model ended with ${resultError}`);
 
   const trimmed = (lastText || resultText).trim();
   if (!trimmed) {
