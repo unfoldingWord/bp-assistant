@@ -168,27 +168,41 @@ async function buildTnIndex({ force, lookup, issue, stats }) {
   for (const file of files) {
     const content = fs.readFileSync(path.join(sourceDir, file), 'utf8');
     const lines = content.split('\n');
-    const firstLine = lines[0] ? lines[0].toLowerCase() : '';
-    const isFormatA = firstLine.includes('book');
-    const startIdx = (firstLine.includes('reference') || firstLine.includes('book')) ? 1 : 0;
+    // Fetched files begin with a '# Fetched: <date>' comment; drop it so the
+    // real header row drives the column lookup below.
+    if (lines.length && lines[0].startsWith('# Fetched:')) lines.shift();
+
+    // Resolve columns by header name, falling back to the fixed offsets of the
+    // two known layouts: the current 7-column en_tn (Reference..Note, no GL
+    // quote unless curate-data's resolve-quotes step added one) and the legacy
+    // 9-column form (Book..OccurrenceNote).
+    const col = {};
+    (lines[0] || '').split('\t').forEach((h, idx) => { col[h.trim()] = idx; });
+    const isFormatA = col.Book !== undefined;
+    const startIdx = (col.Reference !== undefined || isFormatA) ? 1 : 0;
+    const srefIdx = col.SupportReference !== undefined ? col.SupportReference : (isFormatA ? 4 : 3);
+    const glIdx = col.GLQuote !== undefined ? col.GLQuote : (isFormatA ? 7 : -1);
+    const noteIdx = col.OccurrenceNote !== undefined ? col.OccurrenceNote
+      : (col.Note !== undefined ? col.Note : (isFormatA ? 8 : 6));
+    const refIdx = col.Reference !== undefined ? col.Reference : 0;
 
     for (let i = startIdx; i < lines.length; i++) {
       const line = lines[i].trim();
       if (!line) continue;
       const cols = line.split('\t');
+      if (cols.length <= srefIdx) continue;
       totalNotes++;
 
-      let sref, glQuote, note;
-      if (isFormatA && cols.length >= 9) { sref = cols[4]; glQuote = cols[7]; note = cols[8]; }
-      else if (cols.length >= 7) { sref = cols[3]; glQuote = cols[4]; note = cols[6]; }
-      else continue;
+      const sref = cols[srefIdx];
+      const glQuote = glIdx >= 0 ? (cols[glIdx] || '') : '';
+      const note = cols[noteIdx] || '';
 
       const issueMatch = sref ? sref.match(/translate\/(.+)$/) : null;
       const issueType = issueMatch ? issueMatch[1] : '';
       if (!issueType) continue;
 
       const bookCode = file.replace(/^tn_/, '').replace('.tsv', '');
-      const ref = cols[0];
+      const ref = cols[refIdx] || '';
 
       if (!byIssue[issueType]) byIssue[issueType] = { count: 0, books: new Set(), samples: [] };
       byIssue[issueType].count++;
