@@ -7,7 +7,9 @@
 const fs = require('fs');
 const path = require('path');
 const https = require('https');
-const { optimizeIssuesResolved } = require('./optimize-tools');
+// Required lazily inside fetchIssuesResolved: optimize-tools pulls in the
+// Anthropic SDK, and loading it at module scope makes the book-set helpers here
+// unimportable without the full dependency tree.
 
 const CSKILLBP_DIR = process.env.CSKILLBP_DIR || '/srv/bot/workspace';
 
@@ -30,12 +32,23 @@ const BOOK_NUMBERS = {};
 OT_BOOKS.forEach((b, i) => { BOOK_NUMBERS[b] = String(i + 1).padStart(2, '0'); });
 NT_BOOKS.forEach((b, i) => { BOOK_NUMBERS[b] = String(i + 41).padStart(2, '0'); });
 
-// v89 (released 2026-06-23) added PSA, LAM, HAB to the v88 set of 24 OT books.
-const V89_PUBLISHED = [
+// Seed list only — do NOT hand-edit this to track a new release.
+//
+// The live published set is discovered from the latest en_ult release by
+// curate-data.js `discoverPublishedBooks` and cached in
+// data/cache/published_manifest.json. This constant is the fallback used only
+// when that manifest is missing or unreadable (fresh volume, first run).
+// It holds the v89 set (released 2026-06-23: v88's 24 OT books plus PSA, LAM,
+// HAB). Keeping a hardcoded list as the *primary* source is what let the
+// directories drift out of sync with the release (#336).
+const FALLBACK_PUBLISHED = [
   'GEN', 'EXO', 'LEV', 'DEU', 'JOS', 'JDG', 'RUT', '1SA', '2SA',
   '1KI', '2KI', 'EZR', 'NEH', 'EST', 'JOB', 'PSA', 'PRO', 'SNG',
   'LAM', 'JOL', 'OBA', 'JON', 'NAM', 'HAB', 'ZEP', 'HAG', 'MAL',
 ];
+
+// Written by curate-data.js after every release scan: { release, books: ["01-GEN", ...] }
+const PUBLISHED_MANIFEST = 'data/cache/published_manifest.json';
 
 const BOOK_ALIASES = {
   GENESIS: 'GEN', EXODUS: 'EXO', LEVITICUS: 'LEV', NUMBERS: 'NUM',
@@ -156,6 +169,74 @@ async function fetchDoor43Batch(repo, books, outputDir, force) {
   return results.join('\n');
 }
 
+// --- Published book set resolution ---
+
+// The published set comes from the release manifest, so a new release is picked
+// up without a code change. Falls back to FALLBACK_PUBLISHED when the manifest
+// is absent or malformed.
+function getPublishedBooks() {
+  try {
+    const manifest = JSON.parse(
+      fs.readFileSync(path.join(CSKILLBP_DIR, PUBLISHED_MANIFEST), 'utf8')
+    );
+    // Manifest entries are "NN-CODE" (e.g. "01-GEN", "09-1SA").
+    const books = (manifest.books || [])
+      .map(entry => String(entry).split('-').slice(1).join('-').toUpperCase())
+      .filter(code => BOOK_NUMBERS[code]);
+    if (books.length) {
+      return { books, source: `release ${manifest.release || 'unknown'}` };
+    }
+  } catch (err) {
+    // Missing/unreadable manifest is expected on a fresh volume — fall through.
+  }
+  return { books: FALLBACK_PUBLISHED.slice(), source: 'fallback list (no release manifest)' };
+}
+
+// Books that already have a file in the output directory. A forced refresh must
+// cover these even if they are not in the canonical set, otherwise a stray file
+// keeps its old "# Fetched:" date forever with no signal that it is stale (#336).
+function listBooksOnDisk(outputDir) {
+  let names;
+  try {
+    names = fs.readdirSync(path.join(CSKILLBP_DIR, outputDir));
+  } catch (err) {
+    return [];
+  }
+  return names
+    .map(name => {
+      const m = name.match(/^\d{2}-([A-Z0-9]+)\.usfm$/);
+      return m ? m[1] : null;
+    })
+    .filter(code => code && BOOK_NUMBERS[code]);
+}
+
+function byBookNumber(a, b) {
+  return (BOOK_NUMBERS[a] || '99').localeCompare(BOOK_NUMBERS[b] || '99');
+}
+
+// Resolves which books a published fetch should cover. Pure (no network) so it
+// can be unit-tested directly.
+function resolvePublishedBookList({ books, outputDir, masterTool }) {
+  const { books: published, source } = getPublishedBooks();
+  const onDisk = listBooksOnDisk(outputDir);
+
+  if (books && books.length) {
+    const requested = books.map(normalizeBook);
+    // A book already present in the directory stays refreshable even if it has
+    // dropped out of the published set — refusing it would strand the file.
+    const unknown = requested.filter(b => !published.includes(b) && !onDisk.includes(b));
+    if (unknown.length) {
+      return {
+        error: `Error: ${unknown.join(', ')} not in the published book set (${source}) and not present in ${outputDir}. Use ${masterTool} for master-branch content on non-published books.`,
+      };
+    }
+    return { bookList: requested, extras: [], source };
+  }
+
+  const extras = onDisk.filter(b => !published.includes(b)).sort(byBookNumber);
+  return { bookList: published.concat(extras), extras, source };
+}
+
 // --- Individual tool handlers ---
 
 async function fetchHebrewBible({ books, force }) {
@@ -163,22 +244,30 @@ async function fetchHebrewBible({ books, force }) {
   return fetchDoor43Batch('hbo_uhb', bookList, 'data/hebrew_bible', force || false);
 }
 
-async function fetchUlt({ books, force }) {
-  const bookList = books && books.length ? books.map(normalizeBook) : V89_PUBLISHED;
-  const notPublished = bookList.filter(b => !V89_PUBLISHED.includes(b));
-  if (notPublished.length) {
-    return `Error: ${notPublished.join(', ')} not in the v89 published list. Use fetch_master_ult for master-branch content on non-published books.`;
+async function fetchPublished(repo, outputDir, masterTool, { books, force }) {
+  const resolved = resolvePublishedBookList({ books, outputDir, masterTool });
+  if (resolved.error) return resolved.error;
+
+  const result = await fetchDoor43Batch(repo, resolved.bookList, outputDir, force || false);
+
+  const notes = [`Published set: ${resolved.source}.`];
+  if (resolved.extras.length) {
+    // Surface the drift instead of silently refreshing books the release scan
+    // does not list — they belong in master_* unless the set has moved on.
+    notes.push(
+      `Also refreshed ${resolved.extras.length} file(s) present in ${outputDir} but not in the published set: ${resolved.extras.join(', ')}. ` +
+      `If these are not published, move them to master_ult/master_ust.`
+    );
   }
-  return fetchDoor43Batch('en_ult', bookList, 'data/published_ult', force || false);
+  return `${result}\n${notes.join(' ')}`;
+}
+
+async function fetchUlt({ books, force }) {
+  return fetchPublished('en_ult', 'data/published_ult', 'fetch_master_ult', { books, force });
 }
 
 async function fetchUst({ books, force }) {
-  const bookList = books && books.length ? books.map(normalizeBook) : V89_PUBLISHED;
-  const notPublished = bookList.filter(b => !V89_PUBLISHED.includes(b));
-  if (notPublished.length) {
-    return `Error: ${notPublished.join(', ')} not in the v89 published list. Use fetch_master_ust for master-branch content on non-published books.`;
-  }
-  return fetchDoor43Batch('en_ust', bookList, 'data/published_ust', force || false);
+  return fetchPublished('en_ust', 'data/published_ust', 'fetch_master_ust', { books, force });
 }
 
 // fetchMasterUlt / fetchMasterUst — fetch non-published books from master branch.
@@ -307,6 +396,7 @@ async function fetchIssuesResolved({ force }) {
 
   // Optimize for AI consumption after fresh fetch
   try {
+    const { optimizeIssuesResolved } = require('./optimize-tools');
     const optMsg = await optimizeIssuesResolved();
     return `${fetchMsg}\n${optMsg}`;
   } catch (err) {
@@ -353,4 +443,9 @@ module.exports = {
   fetchGlossary,
   fetchIssuesResolved,
   fetchTemplates,
+  // Exported for test/published-book-set.test.js
+  getPublishedBooks,
+  listBooksOnDisk,
+  resolvePublishedBookList,
+  FALLBACK_PUBLISHED,
 };

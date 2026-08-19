@@ -45,9 +45,9 @@ function createWorkspaceTools(createSdkMcpServer, tool, z) {
       ),
       tool(
         'fetch_ult',
-        'Fetch published ULT (Literal Text — word-for-word, form-preserving rendering) USFM files from Door43 into data/published_ult/. Use this for the v89 published books when you need the literal rendering; use fetch_ust instead for the simplified/meaning-based rendering. For non-published books use fetch_master_ult.',
+        'Fetch published ULT (Literal Text — word-for-word, form-preserving rendering) USFM files from Door43 into data/published_ult/. Use this for the currently published books when you need the literal rendering; use fetch_ust instead for the simplified/meaning-based rendering. For non-published books use fetch_master_ult. The published set is read from the latest release manifest, not a hardcoded list.',
         {
-          books: z.array(z.string()).optional().describe('Specific book codes (must be v89 published). Omit for all v89 published books.'),
+          books: z.array(z.string()).optional().describe('Specific book codes (must be published, or already present in data/published_ult/). Omit for the full published set plus any file already in the directory.'),
           force: z.boolean().optional().describe('Force re-fetch even if cached today'),
         },
         async (args) => ({
@@ -56,9 +56,9 @@ function createWorkspaceTools(createSdkMcpServer, tool, z) {
       ),
       tool(
         'fetch_ust',
-        'Fetch published UST (Simplified Text — meaning-based, natural-English rendering) USFM files from Door43 into data/published_ust/. Use this for the v89 published books when you need the simplified rendering; use fetch_ult instead for the literal/word-for-word rendering. For non-published books use fetch_master_ust.',
+        'Fetch published UST (Simplified Text — meaning-based, natural-English rendering) USFM files from Door43 into data/published_ust/. Use this for the currently published books when you need the simplified rendering; use fetch_ult instead for the literal/word-for-word rendering. For non-published books use fetch_master_ust. The published set is read from the latest release manifest, not a hardcoded list.',
         {
-          books: z.array(z.string()).optional().describe('Specific book codes (must be v89 published). Omit for all v89 published books.'),
+          books: z.array(z.string()).optional().describe('Specific book codes (must be published, or already present in data/published_ust/). Omit for the full published set plus any file already in the directory.'),
           force: z.boolean().optional().describe('Force re-fetch even if cached today'),
         },
         async (args) => ({
