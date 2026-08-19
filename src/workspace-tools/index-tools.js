@@ -24,11 +24,19 @@ function parseAlignedUsfm(content) {
   const COMBINED_RE = /\\zaln-s\s+\|([^\\]*?)\\?\*|\\zaln-e\\?\*|\\w\s+([^|]*?)\|[^\\]*?\\w\*/g;
 
   for (const line of content.split('\n')) {
-    const trimmed = line.trim();
+    let trimmed = line.trim();
+    // Consume a leading verse/chapter marker and then KEEP SCANNING the rest of
+    // the line. These used to `continue`, discarding every alignment that shares
+    // a line with its verse marker -- and the ULT routinely puts them there:
+    // across real GEN/1KI/JOB/PSA/OBA/HAG, 2507 of 69210 zaln-s milestones (3.6%)
+    // sit on a verse-marker line, and in Genesis all 1492 of them do. Since
+    // curate-data's buildAllIndexes delegates here, this is the only parser
+    // behind strongs_index.json and ust_index.json.
     const cm = trimmed.match(/^\\c\s+(\d+)/);
-    if (cm) { chapter = parseInt(cm[1], 10); verse = 0; continue; }
+    if (cm) { chapter = parseInt(cm[1], 10); verse = 0; trimmed = trimmed.slice(cm[0].length).trim(); }
     const vm = trimmed.match(/^\\v\s+(\d+)/);
-    if (vm) { verse = parseInt(vm[1], 10); continue; }
+    if (vm) { verse = parseInt(vm[1], 10); trimmed = trimmed.slice(vm[0].length).trim(); }
+    if (!trimmed) continue;
     let m;
     COMBINED_RE.lastIndex = 0;
     while ((m = COMBINED_RE.exec(trimmed)) !== null) {

@@ -483,6 +483,11 @@ function resolveGlQuotes(ultAlignments, log) {
       if (!vAligns.length) continue;
 
       var tokens = hq.split(/\s*\u2026\s*|\s+/).filter(Boolean);
+      // A Quote cell of only ellipsis/separator characters is non-empty but
+      // yields no tokens; tokens[0] would then be undefined and the matcher threw
+      // a TypeError that aborted the entire curation run part-way through the
+      // books, leaving some TSVs rewritten and the rest untouched.
+      if (!tokens.length) continue;
 
       // Honor the row's Occurrence. Taking the first alignment that matches gave
       // occurrence 1's English to every repeat of a word in the same verse.
@@ -508,15 +513,41 @@ function resolveGlQuotes(ultAlignments, log) {
       // (the ULT may render repeats as one span) should still resolve.
       var startAt = starts[Math.min(occ, starts.length) - 1];
 
+      // Match forward from the anchor first, then fall back to any unused
+      // alignment in the verse. The forward pass is what makes Occurrence and
+      // word order mean something; the fallback is required because vAligns is in
+      // ULT ENGLISH order while the Quote tokens are in HEBREW order, and the two
+      // routinely differ -- without it a token whose span sits before the anchor
+      // was silently dropped. `used` keeps one alignment from serving two tokens.
+      // The fallback may only cross back before the anchor for a token that does
+      // NOT repeat an earlier token of this quote. For a repeated token, crossing
+      // back would pair the requested occurrence with an unrelated earlier one:
+      // with vAligns [A(first), A(second)] and an Occurrence=2 quote of 'A A', the
+      // second token would resolve to A(first). Repeats therefore stay at or after
+      // startAt, which is the occurrence boundary.
       var matched = [];
+      var used = {};
       var cursor = startAt;
       var droppedToken = false;
       for (var ti = 0; ti < tokens.length; ti++) {
-        var hit = null;
-        for (var vi = cursor; vi < vAligns.length; vi++) {
-          if (alignMatches(vAligns[vi], tokens[ti])) { hit = vAligns[vi]; cursor = vi + 1; break; }
+        var isRepeat = false;
+        for (var pi2 = 0; pi2 < ti; pi2++) {
+          if (stripCantillation(tokens[pi2]) === stripCantillation(tokens[ti])) { isRepeat = true; break; }
         }
-        if (hit && hit.english) matched.push(hit.english);
+        var floorIdx = isRepeat ? startAt : 0;
+        var hitIdx = -1;
+        for (var vi = cursor; vi < vAligns.length; vi++) {
+          if (!used[vi] && alignMatches(vAligns[vi], tokens[ti])) { hitIdx = vi; break; }
+        }
+        if (hitIdx === -1) {
+          for (var vj = floorIdx; vj < vAligns.length; vj++) {
+            if (!used[vj] && alignMatches(vAligns[vj], tokens[ti])) { hitIdx = vj; break; }
+          }
+        }
+        if (hitIdx === -1) { droppedToken = true; continue; }
+        used[hitIdx] = true;
+        if (hitIdx >= cursor) cursor = hitIdx + 1;
+        if (vAligns[hitIdx].english) matched.push(vAligns[hitIdx].english);
         else droppedToken = true;
       }
 
