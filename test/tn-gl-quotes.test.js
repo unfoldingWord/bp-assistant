@@ -284,3 +284,23 @@ test('tokens are found even when Hebrew order differs from ULT English order', (
   assert.ok(gl.includes('later'), `expected the anchor token: ${JSON.stringify(gl)}`);
   assert.ok(gl.includes('earlier'), `expected the out-of-order token too: ${JSON.stringify(gl)}`);
 });
+
+test('a repeated token in an Occurrence=2 quote does not fall back before the anchor', () => {
+  // vAligns = [A(first), A(second)]. An Occurrence=2 quote of 'A A' anchors on
+  // the second alignment; the repeated token must not cross back to the first,
+  // which would splice the requested occurrence to an unrelated earlier one.
+  seedRepeat([`3:1\trep2\t\t${SREF}\t${HEBREW} ${HEBREW}\t2\tRepeated token, occurrence 2.`]);
+  resolveGlQuotes(extractUnalignedEnglish(quiet), quiet);
+
+  const gl = glOf(2);
+  assert.ok(!gl.includes('the first'), `must not reach back to occurrence 1: ${JSON.stringify(gl)}`);
+  assert.ok(gl.includes('the second'), `should hold the anchored occurrence: ${JSON.stringify(gl)}`);
+});
+
+test('a non-repeated token may still fall back before the anchor', () => {
+  // The guard above must not undo the Hebrew/English word-order fallback: a
+  // DISTINCT token is still allowed to match an earlier alignment.
+  seedRepeat([`3:1\tdist1\t\t${SREF}\t${HEBREW}\t2\tDistinct token, occurrence 2.`]);
+  resolveGlQuotes(extractUnalignedEnglish(quiet), quiet);
+  assert.equal(glOf(2), 'the second', 'occurrence 2 still anchors correctly');
+});

@@ -519,17 +519,28 @@ function resolveGlQuotes(ultAlignments, log) {
       // ULT ENGLISH order while the Quote tokens are in HEBREW order, and the two
       // routinely differ -- without it a token whose span sits before the anchor
       // was silently dropped. `used` keeps one alignment from serving two tokens.
+      // The fallback may only cross back before the anchor for a token that does
+      // NOT repeat an earlier token of this quote. For a repeated token, crossing
+      // back would pair the requested occurrence with an unrelated earlier one:
+      // with vAligns [A(first), A(second)] and an Occurrence=2 quote of 'A A', the
+      // second token would resolve to A(first). Repeats therefore stay at or after
+      // startAt, which is the occurrence boundary.
       var matched = [];
       var used = {};
       var cursor = startAt;
       var droppedToken = false;
       for (var ti = 0; ti < tokens.length; ti++) {
+        var isRepeat = false;
+        for (var pi2 = 0; pi2 < ti; pi2++) {
+          if (stripCantillation(tokens[pi2]) === stripCantillation(tokens[ti])) { isRepeat = true; break; }
+        }
+        var floorIdx = isRepeat ? startAt : 0;
         var hitIdx = -1;
         for (var vi = cursor; vi < vAligns.length; vi++) {
           if (!used[vi] && alignMatches(vAligns[vi], tokens[ti])) { hitIdx = vi; break; }
         }
         if (hitIdx === -1) {
-          for (var vj = 0; vj < vAligns.length; vj++) {
+          for (var vj = floorIdx; vj < vAligns.length; vj++) {
             if (!used[vj] && alignMatches(vAligns[vj], tokens[ti])) { hitIdx = vj; break; }
           }
         }
