@@ -269,32 +269,98 @@ function buildUserMessage({ body, templateInfo, hebrewQuote }) {
   ].join('\n');
 }
 
-async function callModel({ system, userMessage, modelTier }) {
+// Timeout for one model call. There was previously none here at all, so a hung
+// request held its rate-limit slot indefinitely; raising the turn ceiling makes
+// the worst case longer, so a bound is required rather than optional.
+const MODEL_TIMEOUT_MS = 90_000;
+
+function modelTimeoutError(timeoutMs) {
+  const err = new Error(`model timed out after ${Math.round(timeoutMs / 1000)}s`);
+  // Matches template-quick, whose handler maps this code to 504 rather than the
+  // generic 502: a caller must be able to tell an upstream timeout from a model
+  // failure to pick the right retry behaviour.
+  err.code = 'MODEL_TIMEOUT';
+  return err;
+}
+
+async function callModel({ system, userMessage, modelTier, timeoutMs = MODEL_TIMEOUT_MS }) {
   const query = await getAgentSdkQuery();
+  const abortController = new AbortController();
+  const timer = setTimeout(() => abortController.abort(), timeoutMs);
+
   const conversation = query({
     prompt: userMessage,
     options: {
       model: modelTier,
       systemPrompt: system,
+      abortController,
+      // allowedTools does NOT restrict which tools exist -- per the SDK types it
+      // only lists tools that are "auto-allowed without prompting". Paired with
+      // permissionMode 'auto' ("use a model classifier to approve/deny") an empty
+      // list therefore left every tool reachable, with a classifier as the only
+      // gate, on a public HTTPS endpoint whose prompt embeds caller-supplied text.
+      // 'dontAsk' is documented as "deny if not pre-approved", which is what makes
+      // the empty allowedTools an actual deny-all.
       allowedTools: [],
-      maxTurns: 1,
-      permissionMode: 'auto',
+      permissionMode: 'dontAsk',
+      // Not 1. A turn can be spent on an assistant message that stops before
+      // emitting the final text, which surfaced to the caller as a hard failure
+      // ("Reached maximum number of turns (1)") depending on how the model opened.
+      // 2 is enough to finish; with tools denied above, the extra turn cannot
+      // fetch anything.
+      maxTurns: 2,
       settingSources: [],
       persistSession: false,
     },
   });
 
-  let text = '';
-  for await (const msg of conversation) {
-    if (msg.type === 'assistant' && msg.message && Array.isArray(msg.message.content)) {
-      for (const block of msg.message.content) {
-        if (block && block.type === 'text' && typeof block.text === 'string') {
-          text += block.text;
+  // Keep the LAST non-empty assistant text rather than concatenating every turn.
+  // Concatenating glued a preamble turn onto the answer with no separator
+  // ("Here's the note:The note text") once more than one turn was allowed.
+  let lastText = '';
+  let resultText = '';
+  let resultError = null;
+  try {
+    for await (const msg of conversation) {
+      if (abortController.signal.aborted) break;
+      if (msg.type === 'assistant' && msg.message && Array.isArray(msg.message.content)) {
+        let turnText = '';
+        for (const block of msg.message.content) {
+          if (block && block.type === 'text' && typeof block.text === 'string') {
+            turnText += block.text;
+          }
+        }
+        if (turnText.trim()) lastText = turnText;
+      } else if (msg.type === 'result') {
+        // A terminal SDKResultError (subtype 'error_max_turns' and friends) can
+        // arrive as an event carrying no string `result`. Without this the
+        // preceding assistant text was kept and returned as a successful note,
+        // so a call that still exhausted its turns produced a truncated 200.
+        if (msg.is_error === true || /^error_/.test(msg.subtype || '')) {
+          resultError = msg.subtype || 'error';
+        } else if (typeof msg.result === 'string') {
+          resultText = msg.result;
         }
       }
     }
+  } catch (err) {
+    if (abortController.signal.aborted) {
+      throw modelTimeoutError(timeoutMs);
+    }
+    throw err;
+  } finally {
+    clearTimeout(timer);
+    try { conversation.close(); } catch (_) { /* already closed */ }
   }
-  const trimmed = text.trim();
+
+  // The abort can surface as a terminal event that ends the loop instead of as a
+  // thrown AbortError. Without this check the loop's `break` fell straight
+  // through and a timed-out request returned its partial, truncated note as a
+  // successful 200.
+  if (abortController.signal.aborted) throw modelTimeoutError(timeoutMs);
+  if (resultError) throw new Error(`model ended with ${resultError}`);
+
+  const trimmed = (lastText || resultText).trim();
   if (!trimmed) {
     throw new Error('model returned empty response');
   }
@@ -440,6 +506,11 @@ async function handleTnQuickRequest(req, res) {
         modelTier: body.model,
       });
     } catch (err) {
+      if (err && err.code === 'MODEL_TIMEOUT') {
+        console.error(`[tn-quick] model timeout: ${err.message}`);
+        reply(res, 504, { error: 'model_timeout', message: err.message });
+        return;
+      }
       console.error(`[tn-quick] model error: ${err.message}`);
       reply(res, 502, { error: 'model_call_failed', message: err.message });
       return;

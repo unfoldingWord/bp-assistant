@@ -359,26 +359,55 @@ async function callModel({ system, userMessage, modelTier, timeoutMs }) {
       options: {
         model: modelTier,
         systemPrompt: system,
+        // allowedTools does NOT restrict which tools exist -- per the SDK types it
+        // only lists tools that are "auto-allowed without prompting". Paired with
+        // permissionMode 'auto' ("use a model classifier to approve/deny") an empty
+        // list left every tool reachable with a classifier as the only gate, on a
+        // public endpoint whose prompt embeds caller-supplied markdown. 'dontAsk'
+        // is documented as "deny if not pre-approved", making the empty list a
+        // real deny-all.
         allowedTools: [],
-        maxTurns: 1,
-        permissionMode: 'auto',
+        permissionMode: 'dontAsk',
+        // Not 1. A turn can be spent on an assistant message that stops before
+        // emitting the final text, which surfaced as a hard failure ('Reached
+        // maximum number of turns (1)'). 2 is enough to finish; with tools denied
+        // above the extra turn cannot fetch anything, and the per-attempt budget
+        // below still bounds wall time.
+        maxTurns: 2,
         settingSources: [],
         persistSession: false,
         abortController,
       },
     });
 
+    // Keep the LAST non-empty assistant turn rather than concatenating them all:
+    // once more than one turn is allowed, concatenation glues a preamble turn
+    // onto the answer with no separator, and sanitizeModelOutput only strips one
+    // markdown fence.
     let text = '';
+    let resultError = null;
     for await (const msg of conversation) {
       if (abortController.signal.aborted) break;
       if (msg.type === 'assistant' && msg.message && Array.isArray(msg.message.content)) {
+        let turnText = '';
         for (const block of msg.message.content) {
           if (block && block.type === 'text' && typeof block.text === 'string') {
-            text += block.text;
+            turnText += block.text;
           }
+        }
+        if (turnText.trim()) text = turnText;
+      } else if (msg.type === 'result') {
+        // A terminal SDKResultError can arrive as an event rather than a throw.
+        // Accepting the text that preceded it would return an incomplete template
+        // as a 200 whenever the partial output happened to satisfy the invariants.
+        if (msg.is_error === true || /^error_/.test(msg.subtype || '')) {
+          resultError = msg.subtype || 'error';
+        } else if (typeof msg.result === 'string' && !text.trim()) {
+          text = msg.result;
         }
       }
     }
+    if (resultError) throw new Error(`model ended with ${resultError}`);
     if (abortController.signal.aborted) {
       const err = new Error(`model call timed out after ${timeoutMs}ms`);
       err.code = 'MODEL_TIMEOUT';
