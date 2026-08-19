@@ -247,3 +247,40 @@ test('a BOM or padded header name does not silently skip the whole book', () => 
   resolveGlQuotes(extractUnalignedEnglish(quiet), quiet);
   assert.equal(glOf(2), 'the first', 'a BOM/padded header must still resolve');
 });
+
+test('a Quote of only ellipsis characters does not crash the run', () => {
+  // tokens comes back empty here; tokens[0] was undefined and the matcher threw
+  // a TypeError that aborted the whole curation part-way through the books.
+  seedRepeat(['3:1\tell0\t\t${SREF}\t\u2026\t1\tOnly an ellipsis.'.replace('${SREF}', SREF)]);
+  assert.doesNotThrow(() => resolveGlQuotes(extractUnalignedEnglish(quiet), quiet));
+  assert.equal(glOf(2), '', 'nothing to resolve, but the row survives');
+});
+
+test('tokens are found even when Hebrew order differs from ULT English order', () => {
+  // vAligns is in ULT English order. Here the SECOND Hebrew token aligns to the
+  // EARLIER English span, so a forward-only search from the anchor would drop it.
+  const OTHER = '\u05d3\u05d1\u05e8';
+  fs.mkdirSync(path.join(WS, 'data', 'published_ult'), { recursive: true });
+  fs.mkdirSync(path.join(WS, 'data', 'published-tns'), { recursive: true });
+  for (const f of fs.readdirSync(path.join(WS, 'data', 'published-tns'))) {
+    fs.rmSync(path.join(WS, 'data', 'published-tns', f));
+  }
+  fs.writeFileSync(path.join(WS, 'data', 'published_ult', '08-RUT.usfm'), [
+    '# Fetched: 2026-08-19',
+    '\\id RUT', '\\c 4', '\\p', '\\v 1',
+    `\\\\zaln-s |x-strong="H0001" x-content="${OTHER}"\\\\*\\\\w earlier|x-occurrence="1" x-occurrences="1"\\\\w*\\\\zaln-e\\\\*`,
+    `\\\\zaln-s |x-strong="H3045" x-content="${HEBREW}"\\\\*\\\\w later|x-occurrence="1" x-occurrences="1"\\\\w*\\\\zaln-e\\\\*`,
+    '',
+  ].join('\n'));
+  fs.writeFileSync(path.join(WS, 'data', 'published-tns', 'tn_RUT.tsv'), [
+    '# Fetched: 2026-08-19',
+    'Reference\tID\tTags\tSupportReference\tQuote\tOccurrence\tNote',
+    `4:1\tord1\t\t${SREF}\t${HEBREW} ${OTHER}\t1\tHebrew order differs.`,
+    '',
+  ].join('\n'));
+
+  resolveGlQuotes(extractUnalignedEnglish(quiet), quiet);
+  const gl = glOf(2);
+  assert.ok(gl.includes('later'), `expected the anchor token: ${JSON.stringify(gl)}`);
+  assert.ok(gl.includes('earlier'), `expected the out-of-order token too: ${JSON.stringify(gl)}`);
+});
