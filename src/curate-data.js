@@ -584,7 +584,10 @@ async function curatePublishedData(opts) {
   function log(msg) {
     messages.push(msg);
     if (onProgress) onProgress(msg);
-    console.log('[curate] ' + msg);
+    // `quiet` is for callers that surface `messages` themselves (the CLI, whose
+    // documented stdout is exactly the tool's return value). Printing here as
+    // well would emit the whole run twice.
+    if (!opts.quiet) console.log('[curate] ' + msg);
   }
 
   var manifest = readManifest();

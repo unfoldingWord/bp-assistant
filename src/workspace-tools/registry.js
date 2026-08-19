@@ -62,12 +62,13 @@ const TOOLS = {
       if (opts.step && !CURATE_STEPS.includes(opts.step)) {
         return 'Error: unknown step "' + opts.step + '". Expected one of: ' + CURATE_STEPS.join(', ');
       }
-      const result = await curatePublishedData({ step: opts.step, force: !!opts.force });
-      // curatePublishedData already console.log's every progress line, so
-      // returning them again would duplicate the whole run on the CLI (which
-      // documents stdout as exactly the tool's return value). Report the
-      // outcome instead, surfacing failures the messages alone would hide.
-      const out = [];
+      const result = await curatePublishedData({ step: opts.step, force: !!opts.force, quiet: true });
+      // Run quiet and return the progress lines, so the CLI's stdout is exactly
+      // this handler's return value (its documented contract) rather than the
+      // direct console.log output plus a summary. Append the outcome, which the
+      // messages alone do not carry -- curatePublishedData reports success even
+      // when release discovery failed, and fetchErrors were being discarded.
+      const out = (result.messages || []).slice();
       out.push(result.success ? 'Curation complete.' : 'Curation reported failure.');
       if (result.release) out.push('Release: ' + result.release + ' (' + (result.books || []).length + ' books)');
       if ((result.newBooks || []).length) out.push('New books: ' + result.newBooks.join(', '));
