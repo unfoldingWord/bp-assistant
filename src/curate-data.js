@@ -99,6 +99,22 @@ function ensureDir(dir) { fs.mkdirSync(dir, { recursive: true }); }
 function today() { return new Date().toISOString().slice(0, 10); }
 function stripBom(t) { return t.replace(/^\uFEFF/, ''); }
 
+// Every fetched file starts with a "# Fetched: <date>" line (written by
+// fetchDoor43Data / fetchGoogleData). TSV readers must step over it so that
+// lines[0] is the real header row -- reading the comment as the header
+// silently loses every named column. extractUnalignedEnglish already does
+// this for USFM. Returns the comment (or null) plus the remaining lines, so
+// a caller that rewrites the file can put the comment back.
+function splitFetchedHeader(text) {
+  var lines = text.split('\n');
+  var comment = (lines.length && lines[0].startsWith('# Fetched:')) ? lines.shift() : null;
+  return { comment: comment, lines: lines };
+}
+
+function joinFetchedHeader(comment, lines) {
+  return (comment ? comment + '\n' : '') + lines.join('\n');
+}
+
 function getCachedDate(filepath) {
   if (!fs.existsSync(filepath)) return null;
   var first = fs.readFileSync(filepath, 'utf-8').split('\n')[0];
@@ -398,14 +414,34 @@ function resolveGlQuotes(ultAlignments, log) {
     }
 
     var filepath = path.join(tnDir, filename);
-    var lines = fs.readFileSync(filepath, 'utf-8').split('\n');
+    var split = splitFetchedHeader(fs.readFileSync(filepath, 'utf-8'));
+    var lines = split.lines;
     if (lines.length < 2) continue;
 
     var header = lines[0].split('\t');
-    var glIdx = header.indexOf('GLQuote'), qIdx = header.indexOf('Quote'), refIdx = header.indexOf('Reference');
-    if (glIdx === -1 || qIdx === -1 || refIdx === -1) continue;
+    var qIdx = header.indexOf('Quote'), refIdx = header.indexOf('Reference');
+    if (qIdx === -1 || refIdx === -1) continue;
 
     var changed = false, fileResolved = 0;
+
+    // Upstream en_tn is 7-column (Reference..Note) and ships no GL quote at
+    // all, so this step used to skip every file -- leaving the TN keyword
+    // index with nothing English to index. Add the column ourselves and pad
+    // the existing rows, then fall through to the fill loop below.
+    var glIdx = header.indexOf('GLQuote');
+    if (glIdx === -1) {
+      glIdx = header.length;
+      header.push('GLQuote');
+      lines[0] = header.join('\t');
+      for (var pi = 1; pi < lines.length; pi++) {
+        if (!lines[pi].trim()) continue;
+        var prow = lines[pi].split('\t');
+        while (prow.length <= glIdx) prow.push('');
+        lines[pi] = prow.join('\t');
+      }
+      changed = true;
+    }
+
     for (var li = 1; li < lines.length; li++) {
       var fields = lines[li].split('\t');
       if (fields.length <= glIdx || (fields[glIdx] && fields[glIdx].trim())) continue;
@@ -442,7 +478,7 @@ function resolveGlQuotes(ultAlignments, log) {
       }
     }
     if (changed) {
-      fs.writeFileSync(filepath, lines.join('\n'));
+      fs.writeFileSync(filepath, joinFetchedHeader(split.comment, lines));
       log('  ' + filename + ': ' + fileResolved + ' resolved');
     }
   }
@@ -546,7 +582,7 @@ function buildTnIndex(log) {
   for (var fi = 0; fi < files.length; fi++) {
     var filename = files[fi];
     var bookCode = filename.replace('tn_', '').replace('.tsv', '');
-    var lines = fs.readFileSync(path.join(sourceDir, filename), 'utf-8').split('\n');
+    var lines = splitFetchedHeader(fs.readFileSync(path.join(sourceDir, filename), 'utf-8')).lines;
     if (lines.length < 2) continue;
 
     var headerFields = lines[0].split('\t');
@@ -726,4 +762,10 @@ async function curatePublishedData(opts) {
   return { success: true, messages: messages, release: releaseInfo.tag, books: releaseInfo.books, newBooks: newBooks, fetchErrors: fetchErrors };
 }
 
-module.exports = { curatePublishedData, readFetchStatus, FETCH_STATUS_PATH };
+// extractUnalignedEnglish and resolveGlQuotes are exported for the
+// test/tn-gl-quotes.test.js unit tests; production callers go through
+// curatePublishedData, which sequences them.
+module.exports = {
+  curatePublishedData, readFetchStatus, FETCH_STATUS_PATH,
+  extractUnalignedEnglish, resolveGlQuotes,
+};

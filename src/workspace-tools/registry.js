@@ -48,6 +48,19 @@ const {
 } = require('./validation-tools');
 
 const TOOLS = {
+  // --- Data curation ---
+  // Operator-facing refresh of the published Door43 data + indexes. The MCP
+  // surface registers this separately in mcp-server.js; this entry adds the
+  // CLI path so a refresh (or a single step) can be run without a Zulip DM.
+  curate_published_data: {
+    handler: async (args) => {
+      const { curatePublishedData } = require('../curate-data');
+      const opts = args || {};
+      const result = await curatePublishedData({ step: opts.step, force: !!opts.force });
+      return (result.messages || []).join('\n');
+    },
+  },
+
   // --- Fetch tools ---
   fetch_hebrew_bible: { handler: fetchHebrewBible },
   fetch_ult: { handler: fetchUlt },
