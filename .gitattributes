@@ -1,0 +1,5 @@
+# Shell scripts are COPYed into the Docker image and executed by bash, which
+# cannot run a CRLF script (`$'': command not found`). Force LF on checkout
+# so a deploy from a Windows working tree cannot bake a broken entrypoint.
+*.sh text eol=lf
+entrypoint.sh text eol=lf
