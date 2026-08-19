@@ -274,6 +274,15 @@ function buildUserMessage({ body, templateInfo, hebrewQuote }) {
 // the worst case longer, so a bound is required rather than optional.
 const MODEL_TIMEOUT_MS = 90_000;
 
+function modelTimeoutError(timeoutMs) {
+  const err = new Error(`model timed out after ${Math.round(timeoutMs / 1000)}s`);
+  // Matches template-quick, whose handler maps this code to 504 rather than the
+  // generic 502: a caller must be able to tell an upstream timeout from a model
+  // failure to pick the right retry behaviour.
+  err.code = 'MODEL_TIMEOUT';
+  return err;
+}
+
 async function callModel({ system, userMessage, modelTier, timeoutMs = MODEL_TIMEOUT_MS }) {
   const query = await getAgentSdkQuery();
   const abortController = new AbortController();
@@ -327,13 +336,19 @@ async function callModel({ system, userMessage, modelTier, timeoutMs = MODEL_TIM
     }
   } catch (err) {
     if (abortController.signal.aborted) {
-      throw new Error(`model timed out after ${Math.round(timeoutMs / 1000)}s`);
+      throw modelTimeoutError(timeoutMs);
     }
     throw err;
   } finally {
     clearTimeout(timer);
     try { conversation.close(); } catch (_) { /* already closed */ }
   }
+
+  // The abort can surface as a terminal event that ends the loop instead of as a
+  // thrown AbortError. Without this check the loop's `break` fell straight
+  // through and a timed-out request returned its partial, truncated note as a
+  // successful 200.
+  if (abortController.signal.aborted) throw modelTimeoutError(timeoutMs);
 
   const trimmed = (lastText || resultText).trim();
   if (!trimmed) {
@@ -481,6 +496,11 @@ async function handleTnQuickRequest(req, res) {
         modelTier: body.model,
       });
     } catch (err) {
+      if (err && err.code === 'MODEL_TIMEOUT') {
+        console.error(`[tn-quick] model timeout: ${err.message}`);
+        reply(res, 504, { error: 'model_timeout', message: err.message });
+        return;
+      }
       console.error(`[tn-quick] model error: ${err.message}`);
       reply(res, 502, { error: 'model_call_failed', message: err.message });
       return;
