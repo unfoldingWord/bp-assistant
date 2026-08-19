@@ -168,9 +168,12 @@ async function buildTnIndex({ force, lookup, issue, stats }) {
   for (const file of files) {
     const content = fs.readFileSync(path.join(sourceDir, file), 'utf8');
     const lines = content.split('\n');
-    const firstLine = lines[0] ? lines[0].toLowerCase() : '';
+    // Fetched files are prefixed with a "# Fetched: YYYY-MM-DD" line by curate-data.js
+    // and fetch-tools.js. Skip it so header detection sees the real header row.
+    const headerIdx = lines[0] && lines[0].startsWith('# Fetched:') ? 1 : 0;
+    const firstLine = lines[headerIdx] ? lines[headerIdx].toLowerCase() : '';
     const isFormatA = firstLine.includes('book');
-    const startIdx = (firstLine.includes('reference') || firstLine.includes('book')) ? 1 : 0;
+    const startIdx = (firstLine.includes('reference') || firstLine.includes('book')) ? headerIdx + 1 : headerIdx;
 
     for (let i = startIdx; i < lines.length; i++) {
       const line = lines[i].trim();
@@ -178,9 +181,12 @@ async function buildTnIndex({ force, lookup, issue, stats }) {
       const cols = line.split('\t');
       totalNotes++;
 
-      let sref, glQuote, note;
-      if (isFormatA && cols.length >= 9) { sref = cols[4]; glQuote = cols[7]; note = cols[8]; }
-      else if (cols.length >= 7) { sref = cols[3]; glQuote = cols[4]; note = cols[6]; }
+      let sref, glQuote, quote, note;
+      // Format A (legacy 9-column "Book" layout) carries a Gateway-Language quote at cols[7].
+      // The current 7-column layout's Quote column (cols[4]) is original-language Hebrew,
+      // so it is kept for sample display but is not a usable GL keyword source.
+      if (isFormatA && cols.length >= 9) { sref = cols[4]; glQuote = cols[7]; quote = cols[7]; note = cols[8]; }
+      else if (cols.length >= 7) { sref = cols[3]; glQuote = ''; quote = cols[4]; note = cols[6]; }
       else continue;
 
       const issueMatch = sref ? sref.match(/translate\/(.+)$/) : null;
@@ -195,11 +201,18 @@ async function buildTnIndex({ force, lookup, issue, stats }) {
       byIssue[issueType].books.add(bookCode);
       if (byIssue[issueType].samples.length < 5) {
         let preview = (note || '').replace(/\\n/g, ' ').replace(/\[([^\]]*)\]\([^)]*\)/g, '$1').replace(/\[\[rc:\/\/[^\]]*\]\]/g, '');
-        byIssue[issueType].samples.push({ ref, quote: glQuote || '', note_preview: preview.slice(0, 120) });
+        byIssue[issueType].samples.push({ ref, quote: quote || '', note_preview: preview.slice(0, 120) });
       }
 
-      if (glQuote) {
-        const words = glQuote.match(/[a-zA-Z']+/g) || [];
+      // Keyword source: the GL quote column when present (format A), otherwise the
+      // bold spans inside the note, which is where the current format puts the GL
+      // rendering being discussed (e.g. "Here **vision** is used in the general sense").
+      // Indexing whole-note prose instead would swamp by_keyword with note boilerplate
+      // ("alternate", "translation", "language") rather than scripture vocabulary.
+      const keywordSource = glQuote || (note || '').match(/\*\*([^*]+)\*\*/g)?.join(' ') || '';
+
+      if (keywordSource) {
+        const words = keywordSource.match(/[a-zA-Z']+/g) || [];
         for (const w of words) {
           const kw = w.toLowerCase();
           if (kw.length < 3 || STOP_WORDS.has(kw)) continue;
