@@ -418,27 +418,40 @@ function resolveGlQuotes(ultAlignments, log) {
     var lines = split.lines;
     if (lines.length < 2) continue;
 
-    var header = lines[0].split('\t');
+    // Match header names loosely: a stray BOM or trailing space in the header
+    // row used to make every lookup below miss, which skipped the whole book
+    // silently while index-tools (which trims) read the same file happily.
+    var header = lines[0].split('\t').map(function (h) { return h.replace(/^\uFEFF/, '').trim(); });
     var qIdx = header.indexOf('Quote'), refIdx = header.indexOf('Reference');
-    if (qIdx === -1 || refIdx === -1) continue;
+    var occIdx = header.indexOf('Occurrence');
+    if (qIdx === -1 || refIdx === -1) {
+      log('  ' + filename + ': skipped (no Quote/Reference column)');
+      continue;
+    }
 
     var changed = false, fileResolved = 0;
 
     // Upstream en_tn is 7-column (Reference..Note) and ships no GL quote at
     // all, so this step used to skip every file -- leaving the TN keyword
-    // index with nothing English to index. Add the column ourselves and pad
-    // the existing rows, then fall through to the fill loop below.
+    // index with nothing English to index. Add the column ourselves, then fall
+    // through to the fill loop below.
     var glIdx = header.indexOf('GLQuote');
     if (glIdx === -1) {
       glIdx = header.length;
       header.push('GLQuote');
-      lines[0] = header.join('\t');
-      for (var pi = 1; pi < lines.length; pi++) {
-        if (!lines[pi].trim()) continue;
-        var prow = lines[pi].split('\t');
-        while (prow.length <= glIdx) prow.push('');
-        lines[pi] = prow.join('\t');
-      }
+      changed = true;
+    }
+    lines[0] = header.join('\t');
+
+    // Pad short rows to the header width on every run, not only when the column
+    // is created. A row shorter than glIdx would otherwise be skipped by the
+    // fill loop forever, leaving the file permanently ragged.
+    for (var pi = 1; pi < lines.length; pi++) {
+      if (!lines[pi].trim()) continue;
+      var prow = lines[pi].split('\t');
+      if (prow.length > glIdx) continue;
+      while (prow.length <= glIdx) prow.push('');
+      lines[pi] = prow.join('\t');
       changed = true;
     }
 
@@ -449,28 +462,71 @@ function resolveGlQuotes(ultAlignments, log) {
       if (!hq || !hq.trim()) continue;
       var ref = fields[refIdx];
       if (!ref || ref.includes('intro')) continue;
-      var rm = ref.match(/(\d+):(\d+)/);
+      // Accept a verse range (e.g. '2:1-2'): the quote can sit in any verse it
+      // spans, so search the whole span in order instead of only the first
+      // verse. Ranges that cross a chapter boundary keep the start chapter,
+      // which is what the alignment map is keyed on.
+      var rm = ref.match(/(\d+):(\d+)(?:\s*[-\u2013]\s*(?:(\d+):)?(\d+))?/);
       if (!rm) continue;
       totalEmpty++;
 
-      var vAligns = byVerse.get(parseInt(rm[1]) + ':' + parseInt(rm[2]));
-      if (!vAligns) continue;
+      var chapter = parseInt(rm[1], 10);
+      var verseFrom = parseInt(rm[2], 10);
+      var verseTo = rm[4] !== undefined ? parseInt(rm[4], 10) : verseFrom;
+      if (!(verseTo >= verseFrom)) verseTo = verseFrom;
+
+      var vAligns = [];
+      for (var vnum = verseFrom; vnum <= verseTo; vnum++) {
+        var slice = byVerse.get(chapter + ':' + vnum);
+        if (slice) vAligns = vAligns.concat(slice);
+      }
+      if (!vAligns.length) continue;
 
       var tokens = hq.split(/\s*\u2026\s*|\s+/).filter(Boolean);
+
+      // Honor the row's Occurrence. Taking the first alignment that matches gave
+      // occurrence 1's English to every repeat of a word in the same verse.
+      // Anchor on the Nth match of the FIRST token, then match the remaining
+      // tokens forward from there so word order is respected too.
+      var occ = 1;
+      if (occIdx !== -1) {
+        var parsedOcc = parseInt(fields[occIdx], 10);
+        if (parsedOcc > 0) occ = parsedOcc;
+      }
+
+      function alignMatches(align, token) {
+        return align.source.word === token
+          || stripCantillation(align.source.word) === stripCantillation(token);
+      }
+
+      var starts = [];
+      for (var si = 0; si < vAligns.length; si++) {
+        if (alignMatches(vAligns[si], tokens[0])) starts.push(si);
+      }
+      if (!starts.length) continue;
+      // Clamp rather than skip: an Occurrence past what the alignment exposes
+      // (the ULT may render repeats as one span) should still resolve.
+      var startAt = starts[Math.min(occ, starts.length) - 1];
+
       var matched = [];
+      var cursor = startAt;
+      var droppedToken = false;
       for (var ti = 0; ti < tokens.length; ti++) {
-        var tok = tokens[ti];
-        var stripped = stripCantillation(tok);
         var hit = null;
-        for (var vi = 0; vi < vAligns.length; vi++) {
-          if (vAligns[vi].source.word === tok || stripCantillation(vAligns[vi].source.word) === stripped) {
-            hit = vAligns[vi]; break;
-          }
+        for (var vi = cursor; vi < vAligns.length; vi++) {
+          if (alignMatches(vAligns[vi], tokens[ti])) { hit = vAligns[vi]; cursor = vi + 1; break; }
         }
         if (hit && hit.english) matched.push(hit.english);
+        else droppedToken = true;
       }
+
+      // A partial resolution is worse than none for a multi-token quote: it
+      // reads as the whole phrase while silently omitting words. Nested zaln
+      // milestones are the usual cause of an empty english (see gatherWords).
+      if (tokens.length > 1 && droppedToken) continue;
+
       if (matched.length) {
-        fields[glIdx] = matched.join(' ... ');
+        fields[glIdx] = matched.join(' \u2026 ');
         lines[li] = fields.join('\t');
         changed = true;
         fileResolved++;
@@ -487,196 +543,27 @@ function resolveGlQuotes(ultAlignments, log) {
 
 // ── Step 7: Build indexes ──────────────────────────────────────────────────
 
-function normalizeStrong(raw) {
-  var result = raw.replace(/^(?:[a-z]:)+/, '');
-  return /^[HG]\d/.test(result) ? result : null;
-}
-
-function buildStrongsIndex(sourceDir, label, releaseTag, log) {
-  log('Building ' + label + " Strong's index...");
-  if (!fs.existsSync(sourceDir)) { log('  Source not found'); return null; }
-  var files = fs.readdirSync(sourceDir).filter(function (f) { return f.endsWith('.usfm'); }).sort();
-  if (!files.length) { log('  No USFM files'); return null; }
-
-  var agg = new Map();
-  var totalAlignments = 0;
-  var markerRe = /\\zaln-s\s+\|([^\\]*?)\\\*|\\zaln-e\\\*|\\w\s+([^|]*?)\|[^\\]*?\\w\*/g;
-
-  for (var fi = 0; fi < files.length; fi++) {
-    var content = fs.readFileSync(path.join(sourceDir, files[fi]), 'utf-8');
-    if (content.startsWith('# Fetched:')) content = content.split('\n').slice(1).join('\n');
-
-    var lines = content.split('\n');
-    var bookId = '', chapter = 0, verse = 0;
-    var stack = [];
-
-    for (var li = 0; li < lines.length; li++) {
-      var line = lines[li];
-      var m;
-      if ((m = line.match(/\\id\s+(\w+)/))) bookId = m[1];
-      if ((m = line.match(/\\c\s+(\d+)/))) chapter = parseInt(m[1]);
-      if ((m = line.match(/\\v\s+(\d+)/))) verse = parseInt(m[1]);
-
-      markerRe.lastIndex = 0;
-      var match;
-      while ((match = markerRe.exec(line)) !== null) {
-        if (match[0].startsWith('\\zaln-s')) {
-          var attrStr = match[1];
-          var attrs = {};
-          var am;
-          if ((am = attrStr.match(/x-strong="([^"]+)"/))) attrs.strong = am[1];
-          if ((am = attrStr.match(/x-content="([^"]+)"/))) attrs.content = am[1];
-          if ((am = attrStr.match(/x-lemma="([^"]+)"/))) attrs.lemma = am[1];
-          stack.push({ attrs: attrs, words: [] });
-        } else if (match[0].startsWith('\\zaln-e')) {
-          if (stack.length) {
-            var closed = stack.pop();
-            var english = closed.words.join(' ');
-            if (stack.length) Array.prototype.push.apply(stack[stack.length - 1].words, closed.words);
-            var sn = closed.attrs.strong ? normalizeStrong(closed.attrs.strong) : null;
-            if (sn && english) {
-              totalAlignments++;
-              if (!agg.has(sn)) agg.set(sn, { lemma: '', content: '', renderings: new Map() });
-              var entry = agg.get(sn);
-              if (!entry.lemma && closed.attrs.lemma) entry.lemma = closed.attrs.lemma;
-              if (!entry.content && closed.attrs.content) entry.content = closed.attrs.content;
-              if (!entry.renderings.has(english)) entry.renderings.set(english, { count: 0, refs: [] });
-              var r = entry.renderings.get(english);
-              r.count++;
-              if (r.refs.length < MAX_SAMPLE_REFS) r.refs.push(bookId + ' ' + chapter + ':' + verse);
-            }
-          }
-        } else if (match[2] !== undefined) {
-          var word = match[2].trim();
-          if (word && stack.length) stack[stack.length - 1].words.push(word);
-        }
-      }
-    }
-  }
-
-  var index = {
-    _meta: { built: today(), source_dir: sourceDir.replace(WORKSPACE + '/', ''), file_count: files.length, total_alignments: totalAlignments, unique_strongs: agg.size, release: releaseTag || 'unknown' },
-  };
-  var sorted = Array.from(agg.entries()).sort(function (a, b) { return a[0].localeCompare(b[0]); });
-  for (var si = 0; si < sorted.length; si++) {
-    var strong = sorted[si][0], data = sorted[si][1];
-    var renderings = Array.from(data.renderings.entries()).map(function (e) { return { text: e[0], count: e[1].count, refs: e[1].refs }; }).sort(function (a, b) { return b.count - a.count; });
-    index[strong] = { lemma: data.lemma, total: renderings.reduce(function (s, r) { return s + r.count; }, 0), renderings: renderings };
-  }
-
-  log('  ' + label + ': ' + files.length + ' files, ' + totalAlignments + ' alignments, ' + agg.size + " Strong's");
-  return index;
-}
-
-function buildTnIndex(log) {
-  log('Building TN index...');
-  var sourceDir = path.join(DATA_DIR, 'published-tns');
-  if (!fs.existsSync(sourceDir)) { log('  Source not found'); return null; }
-  var files = fs.readdirSync(sourceDir).filter(function (f) { return f.startsWith('tn_') && f.endsWith('.tsv'); }).sort();
-  if (!files.length) { log('  No TN files'); return null; }
-
-  var issueAgg = new Map();
-  var keywordAgg = new Map();
-  var totalNotes = 0;
-
-  for (var fi = 0; fi < files.length; fi++) {
-    var filename = files[fi];
-    var bookCode = filename.replace('tn_', '').replace('.tsv', '');
-    var lines = splitFetchedHeader(fs.readFileSync(path.join(sourceDir, filename), 'utf-8')).lines;
-    if (lines.length < 2) continue;
-
-    var headerFields = lines[0].split('\t');
-    var fm = {};
-    headerFields.forEach(function (h, i) { fm[h] = i; });
-
-    for (var li = 1; li < lines.length; li++) {
-      var row = lines[li].split('\t');
-      if (row.length < 4) continue;
-
-      var book, refStr, supportRef, glQuote, note;
-      if (fm.Book !== undefined) {
-        book = row[fm.Book] || bookCode;
-        refStr = (row[fm.Chapter] || '') + ':' + (row[fm.Verse] || '');
-        supportRef = row[fm.SupportReference] || '';
-        glQuote = fm.GLQuote !== undefined ? (row[fm.GLQuote] || '') : '';
-        note = row[fm.OccurrenceNote !== undefined ? fm.OccurrenceNote : fm.Note] || '';
-      } else {
-        book = bookCode;
-        refStr = row[fm.Reference !== undefined ? fm.Reference : 0] || '';
-        supportRef = row[fm.SupportReference !== undefined ? fm.SupportReference : 3] || '';
-        glQuote = fm.GLQuote !== undefined ? (row[fm.GLQuote] || '') : '';
-        note = fm.Note !== undefined ? (row[fm.Note] || '') : '';
-      }
-
-      if (refStr.includes('intro')) continue;
-      var im = supportRef.match(/translate\/(.+)$/);
-      var issueType = im ? im[1] : null;
-      if (!issueType && /^(figs-|grammar-|writing-|translate-)/.test(supportRef)) issueType = supportRef;
-      if (!issueType) continue;
-
-      totalNotes++;
-      var fullRef = book + ' ' + refStr;
-
-      if (!issueAgg.has(issueType)) issueAgg.set(issueType, { count: 0, books: new Set(), samples: [] });
-      var ie = issueAgg.get(issueType);
-      ie.count++;
-      ie.books.add(book);
-      if (ie.samples.length < MAX_SAMPLES) {
-        var np = (note || '').replace(/\\n/g, ' ').trim().replace(/\[([^\]]*)\]\([^)]*\)/g, '$1').replace(/\[\[rc:\/\/[^\]]*\]\]/g, '').slice(0, 120).trim();
-        ie.samples.push({ ref: fullRef, quote: glQuote.slice(0, 80), note_preview: np });
-      }
-
-      var words = (glQuote || '').toLowerCase().match(/[a-z']+/g) || [];
-      for (var wi = 0; wi < words.length; wi++) {
-        var w = words[wi];
-        if (STOP_WORDS.has(w) || w.length < MIN_KEYWORD_LEN) continue;
-        if (!keywordAgg.has(w)) keywordAgg.set(w, new Map());
-        var kwIssues = keywordAgg.get(w);
-        if (!kwIssues.has(issueType)) kwIssues.set(issueType, { count: 0, sample_ref: '' });
-        var ke = kwIssues.get(issueType);
-        ke.count++;
-        if (!ke.sample_ref) ke.sample_ref = fullRef;
-      }
-    }
-  }
-
-  var index = {
-    _meta: { built: today(), source_dir: 'data/published-tns/', file_count: files.length, total_notes: totalNotes, unique_issues: issueAgg.size, unique_keywords: keywordAgg.size },
-    by_issue: {},
-    by_keyword: {},
-  };
-
-  var sortedIssues = Array.from(issueAgg.entries()).sort(function (a, b) { return b[1].count - a[1].count; });
-  for (var ii = 0; ii < sortedIssues.length; ii++) {
-    var issue = sortedIssues[ii][0], idata = sortedIssues[ii][1];
-    index.by_issue[issue] = { count: idata.count, books: Array.from(idata.books).sort(), samples: idata.samples };
-  }
-  var kwKeys = Array.from(keywordAgg.keys()).sort();
-  for (var ki = 0; ki < kwKeys.length; ki++) {
-    var kw = kwKeys[ki];
-    var issues = keywordAgg.get(kw);
-    var top = Array.from(issues.entries()).sort(function (a, b) { return b[1].count - a[1].count; }).slice(0, MAX_KEYWORD_ISSUES);
-    var total = top.reduce(function (s, e) { return s + e[1].count; }, 0);
-    if (total < 2) continue;
-    index.by_keyword[kw] = top.map(function (e) { return { issue: e[0], count: e[1].count, sample_ref: e[1].sample_ref }; });
-  }
-
-  log('  ' + files.length + ' files, ' + totalNotes + ' notes, ' + issueAgg.size + ' issues');
-  return index;
-}
-
-function buildAllIndexes(releaseTag, log) {
+// Index building is delegated to workspace-tools/index-tools.js, which owns the
+// three data/cache/*_index.json files. curate-data.js used to carry its own
+// near-copies of these builders; both wrote the SAME cache paths with different
+// content (differing total_notes, sample_ref with vs without a book prefix, and
+// a unique_keywords count taken before the keep-if-seen-twice filter), so an
+// agent's lookup result depended on which builder happened to run last.
+async function buildAllIndexes(log) {
   ensureDir(CACHE_DIR);
-
-  var ultIdx = buildStrongsIndex(path.join(DATA_DIR, 'published_ult'), 'ULT', releaseTag, log);
-  if (ultIdx) fs.writeFileSync(path.join(CACHE_DIR, 'strongs_index.json'), JSON.stringify(ultIdx));
-
-  var ustIdx = buildStrongsIndex(path.join(DATA_DIR, 'published_ust'), 'UST', releaseTag, log);
-  if (ustIdx) fs.writeFileSync(path.join(CACHE_DIR, 'ust_index.json'), JSON.stringify(ustIdx));
-
-  var tnIdx = buildTnIndex(log);
-  if (tnIdx) fs.writeFileSync(path.join(CACHE_DIR, 'tn_index.json'), JSON.stringify(tnIdx));
+  var idx = require('./workspace-tools/index-tools');
+  log('  ' + await idx.buildStrongsIndex({ force: true }));
+  log('  ' + await idx.buildUstIndex({ force: true }));
+  log('  ' + await idx.buildTnIndex({ force: true }));
 }
+
+
+// The valid `step` values, shared by every surface that exposes curation so a
+// typo is rejected rather than silently running nothing.
+const CURATE_STEPS = [
+  'check', 'setup', 'fetch-door43', 'fetch-google',
+  'extract-english', 'resolve-quotes', 'build-indexes',
+];
 
 // ── Main entry point ───────────────────────────────────────────────────────
 
@@ -747,7 +634,7 @@ async function curatePublishedData(opts) {
   }
 
   if (runStep('build-indexes')) {
-    buildAllIndexes(releaseInfo.tag, log);
+    await buildAllIndexes(log);
     if (newBooks.length) log('New books imported: ' + newBooks.map(function (b) { return b.split('-')[1]; }).join(', '));
   }
 
@@ -766,6 +653,6 @@ async function curatePublishedData(opts) {
 // test/tn-gl-quotes.test.js unit tests; production callers go through
 // curatePublishedData, which sequences them.
 module.exports = {
-  curatePublishedData, readFetchStatus, FETCH_STATUS_PATH,
+  curatePublishedData, readFetchStatus, FETCH_STATUS_PATH, CURATE_STEPS,
   extractUnalignedEnglish, resolveGlQuotes,
 };

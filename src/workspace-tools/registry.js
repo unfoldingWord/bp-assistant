@@ -54,10 +54,28 @@ const TOOLS = {
   // CLI path so a refresh (or a single step) can be run without a Zulip DM.
   curate_published_data: {
     handler: async (args) => {
-      const { curatePublishedData } = require('../curate-data');
+      const { curatePublishedData, CURATE_STEPS } = require('../curate-data');
       const opts = args || {};
+      // Validate `step` the way the MCP surface does with its zod enum. Without
+      // this a typo ('resolve_quotes' for 'resolve-quotes') ran no steps at all,
+      // still rewrote the manifest, printed 'Done.' and exited 0.
+      if (opts.step && !CURATE_STEPS.includes(opts.step)) {
+        return 'Error: unknown step "' + opts.step + '". Expected one of: ' + CURATE_STEPS.join(', ');
+      }
       const result = await curatePublishedData({ step: opts.step, force: !!opts.force });
-      return (result.messages || []).join('\n');
+      // curatePublishedData already console.log's every progress line, so
+      // returning them again would duplicate the whole run on the CLI (which
+      // documents stdout as exactly the tool's return value). Report the
+      // outcome instead, surfacing failures the messages alone would hide.
+      const out = [];
+      out.push(result.success ? 'Curation complete.' : 'Curation reported failure.');
+      if (result.release) out.push('Release: ' + result.release + ' (' + (result.books || []).length + ' books)');
+      if ((result.newBooks || []).length) out.push('New books: ' + result.newBooks.join(', '));
+      if ((result.fetchErrors || []).length) {
+        out.push('Fetch errors (' + result.fetchErrors.length + '):');
+        for (const e of result.fetchErrors) out.push('  ' + e.file + ': ' + e.message);
+      }
+      return out.join('\n');
     },
   },
 

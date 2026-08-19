@@ -110,7 +110,17 @@ test('resolveGlQuotes is idempotent and does not clobber a populated GLQuote', (
   const reread = readTn('tn_RUT.tsv');
   assert.equal(reread[2].split('\t')[glIdx], 'an editor-chosen phrase');
   assert.equal(reread[1].split('\t').filter((h) => h === 'GLQuote').length, 1, 'must not add GLQuote twice');
-  assert.notEqual(afterFirst, '', 'sanity: first pass produced content');
+
+  // The real idempotence guard: a second pass over an untouched file must not
+  // change a byte. (The old assertion here only checked afterFirst was non-empty,
+  // which every implementation passes.)
+  seedWorkspace();
+  resolveGlQuotes(aligns, quiet);
+  const pass1 = fs.readFileSync(path.join(WS, 'data', 'published-tns', 'tn_RUT.tsv'), 'utf-8');
+  resolveGlQuotes(aligns, quiet);
+  const pass2 = fs.readFileSync(path.join(WS, 'data', 'published-tns', 'tn_RUT.tsv'), 'utf-8');
+  assert.equal(pass2, pass1, 'a second resolve pass must be byte-identical');
+  assert.ok(afterFirst.length > 0, 'sanity: first pass produced content');
 });
 
 test('buildTnIndex produces keywords from the generated GLQuote column', async () => {
@@ -144,4 +154,94 @@ test('buildTnIndex still indexes the legacy 9-column layout', async () => {
   const idx = JSON.parse(fs.readFileSync(path.join(WS, 'data', 'cache', 'tn_index.json'), 'utf-8'));
   assert.ok(idx.by_keyword.commander, 'expected "commander" from the legacy GLQuote column');
   assert.ok(idx.by_issue['figs-metaphor'].books.includes('JOS'));
+});
+
+// --- Occurrence and verse-range handling (both reviewers flagged the first) ---
+
+// Two alignments of the SAME Hebrew word in one verse, with distinct English,
+// plus a second verse so a range can be exercised.
+const REPEAT_USFM = [
+  '# Fetched: 2026-08-19',
+  '\\id RUT',
+  '\\c 3',
+  '\\p',
+  '\\v 1',
+  `\\zaln-s |x-strong="H3045" x-content="${HEBREW}"\\*\\w the|x-occurrence="1" x-occurrences="1"\\w* \\w first|x-occurrence="1" x-occurrences="1"\\w*\\zaln-e\\*`,
+  `\\zaln-s |x-strong="H3045" x-content="${HEBREW}"\\*\\w the|x-occurrence="1" x-occurrences="1"\\w* \\w second|x-occurrence="1" x-occurrences="1"\\w*\\zaln-e\\*`,
+  '\\v 2',
+  `\\zaln-s |x-strong="H3045" x-content="${HEBREW}"\\*\\w in|x-occurrence="1" x-occurrences="1"\\w* \\w verse-two|x-occurrence="1" x-occurrences="1"\\w*\\zaln-e\\*`,
+  '',
+].join('\n');
+
+function seedRepeat(rows) {
+  fs.mkdirSync(path.join(WS, 'data', 'published_ult'), { recursive: true });
+  fs.mkdirSync(path.join(WS, 'data', 'published-tns'), { recursive: true });
+  // Remove the other fixture so only this book is in play.
+  for (const f of fs.readdirSync(path.join(WS, 'data', 'published-tns'))) {
+    fs.rmSync(path.join(WS, 'data', 'published-tns', f));
+  }
+  fs.writeFileSync(path.join(WS, 'data', 'published_ult', '08-RUT.usfm'), REPEAT_USFM);
+  fs.writeFileSync(path.join(WS, 'data', 'published-tns', 'tn_RUT.tsv'), [
+    '# Fetched: 2026-08-19',
+    'Reference\tID\tTags\tSupportReference\tQuote\tOccurrence\tNote',
+    ...rows,
+    '',
+  ].join('\n'));
+}
+
+function glOf(rowIdx) {
+  const lines = readTn('tn_RUT.tsv');
+  const glIdx = lines[1].split('\t').indexOf('GLQuote');
+  return lines[rowIdx].split('\t')[glIdx];
+}
+
+test('Occurrence 2 resolves to the second alignment, not the first', () => {
+  seedRepeat([
+    `3:1\tocc1\t\t${SREF}\t${HEBREW}\t1\tFirst occurrence.`,
+    `3:1\tocc2\t\t${SREF}\t${HEBREW}\t2\tSecond occurrence.`,
+  ]);
+  resolveGlQuotes(extractUnalignedEnglish(quiet), quiet);
+
+  assert.equal(glOf(2), 'the first', 'Occurrence=1 must take the first alignment');
+  assert.equal(glOf(3), 'the second', 'Occurrence=2 must take the second alignment');
+});
+
+test('an Occurrence beyond what the alignment exposes clamps instead of dropping the row', () => {
+  seedRepeat([`3:1\tocc9\t\t${SREF}\t${HEBREW}\t9\tOut of range.`]);
+  resolveGlQuotes(extractUnalignedEnglish(quiet), quiet);
+  assert.equal(glOf(2), 'the second', 'should clamp to the last available match');
+});
+
+test('a verse range searches every verse it spans, not just the first', () => {
+  // The quote here only resolves if verse 2 is searched as part of "3:1-2".
+  seedRepeat([`3:1-2\trng1\t\t${SREF}\t${HEBREW}\t3\tSpans two verses.`]);
+  resolveGlQuotes(extractUnalignedEnglish(quiet), quiet);
+  assert.equal(glOf(2), 'in verse-two', 'the third match lives in verse 2 of the range');
+});
+
+test('a multi-token quote that cannot fully resolve is left empty rather than partial', () => {
+  // MISSING is absent from the ULT alignment, so the phrase cannot resolve in
+  // full. A partial value would read as the whole phrase.
+  seedRepeat([`3:1\tpart1\t\t${SREF}\t${HEBREW} \u05d3\u05d1\u05e8\t1\tPartial.`]);
+  resolveGlQuotes(extractUnalignedEnglish(quiet), quiet);
+  assert.equal(glOf(2), '', 'partial multi-token resolution must be withheld');
+});
+
+test('multi-token GL quotes join with the U+2026 ellipsis, not ASCII dots', () => {
+  seedRepeat([`3:1\tell1\t\t${SREF}\t${HEBREW} ${HEBREW}\t1\tTwo tokens.`]);
+  resolveGlQuotes(extractUnalignedEnglish(quiet), quiet);
+  const gl = glOf(2);
+  assert.ok(gl.includes('\u2026'), `expected U+2026 in ${JSON.stringify(gl)}`);
+  assert.ok(!gl.includes('...'), 'must not use ASCII ellipsis');
+});
+
+test('a BOM or padded header name does not silently skip the whole book', () => {
+  seedRepeat([`3:1\tbom1\t\t${SREF}\t${HEBREW}\t1\tHeader has a BOM.`]);
+  const p = path.join(WS, 'data', 'published-tns', 'tn_RUT.tsv');
+  const lines = fs.readFileSync(p, 'utf-8').split('\n');
+  lines[1] = '\uFEFFReference\tID\tTags\tSupportReference \tQuote\tOccurrence\tNote';
+  fs.writeFileSync(p, lines.join('\n'));
+
+  resolveGlQuotes(extractUnalignedEnglish(quiet), quiet);
+  assert.equal(glOf(2), 'the first', 'a BOM/padded header must still resolve');
 });
