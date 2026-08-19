@@ -360,7 +360,15 @@ async function callModel({ system, userMessage, modelTier, timeoutMs }) {
         model: modelTier,
         systemPrompt: system,
         allowedTools: [],
-        maxTurns: 1,
+        // Not 1. No tools are allowed, so a turn cannot fetch or loop -- the only
+      // way to spend one is an assistant message that stops before emitting the
+      // final text (a thinking-only first block, for instance). At maxTurns: 1
+      // that surfaced to the caller as a hard failure:
+      //   'Claude Code returned an error result: Reached maximum number of turns (1)'
+      // intermittently, depending on how the model chose to open. A small ceiling
+      // lets it finish while still bounding the request; with allowedTools: []
+      // there is nothing for the extra turns to do but complete the answer.
+      maxTurns: 4,
         permissionMode: 'auto',
         settingSources: [],
         persistSession: false,
