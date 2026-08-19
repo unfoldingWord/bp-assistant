@@ -219,12 +219,14 @@ test('a verse range searches every verse it spans, not just the first', () => {
   assert.equal(glOf(2), 'in verse-two', 'the third match lives in verse 2 of the range');
 });
 
-test('a multi-token quote that cannot fully resolve is left empty rather than partial', () => {
+test('a multi-token quote that cannot fully resolve keeps the part that did', () => {
   // MISSING is absent from the ULT alignment, so the phrase cannot resolve in
   // full. A partial value would read as the whole phrase.
   seedRepeat([`3:1\tpart1\t\t${SREF}\t${HEBREW} \u05d3\u05d1\u05e8\t1\tPartial.`]);
   resolveGlQuotes(extractUnalignedEnglish(quiet), quiet);
-  assert.equal(glOf(2), '', 'partial multi-token resolution must be withheld');
+  // Kept, not withheld: this column is only mined for keywords, never shown as
+  // a quote, and withholding measurably cut coverage (see resolveGlQuotes).
+  assert.equal(glOf(2), 'the first', 'the resolvable token must still be recorded');
 });
 
 test('multi-token GL quotes join with the U+2026 ellipsis, not ASCII dots', () => {

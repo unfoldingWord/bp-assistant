@@ -520,10 +520,16 @@ function resolveGlQuotes(ultAlignments, log) {
         else droppedToken = true;
       }
 
-      // A partial resolution is worse than none for a multi-token quote: it
-      // reads as the whole phrase while silently omitting words. Nested zaln
-      // milestones are the usual cause of an empty english (see gatherWords).
-      if (tokens.length > 1 && droppedToken) continue;
+      // A partial resolution is KEPT even though it understates the phrase.
+      // Withholding it was tried and measured worse: on the live corpus it cut
+      // resolutions from 37158 to 22001 and keywords from 6333 to 5420, and it
+      // buys nothing, because this column is never shown as a quote -- both
+      // buildTnIndex lookup paths print note_preview / sample_ref and only mine
+      // GLQuote for keywords. Partial therefore means fewer-but-correct
+      // keywords, not a misleading quote. `droppedToken` is tracked so the
+      // root cause stays visible: gatherWords skips nested zaln children, so an
+      // outer milestone wrapping only a nested one has english: ''.
+      void droppedToken;
 
       if (matched.length) {
         fields[glIdx] = matched.join(' \u2026 ');
