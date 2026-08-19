@@ -28,6 +28,12 @@ The bot runs as the Fly.io app `uw-bt-bot` (single machine, region `dfw`).
 At the start of a session, run `git branch` to check the current branch. If not on `main`, flag it to the user before making changes — they may have been left on a feature branch from a previous session.
 
 ## Git Discipline
+- **Open every PR as a draft**, and only mark it ready once verification and
+  review are finished. An auto-merge bot watches non-draft PRs and merges them
+  almost immediately: PR #338 was merged while review fixes for that same branch
+  were still being written, so the follow-up commits needed a second PR and the
+  incomplete version reached `main` first. Use `--draft` on create and a separate
+  ready-for-review step afterwards.
 - After making code changes, always suggest a commit to the user. Don't commit automatically — ask first.
 - Use descriptive commit messages summarizing what changed and why.
 
