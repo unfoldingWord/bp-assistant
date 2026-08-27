@@ -1,8 +1,19 @@
 #!/bin/bash
 set -e
 
+BOTUSER=botuser
+DOOR43_REPOS="${DOOR43_REPOS_PATH:-/data/workspace/door43-repos}"
+
 # Create volume subdirectories on first run
-mkdir -p /data/workspace /data/appdata /data/claude-config
+mkdir -p /data/workspace /data/appdata /data/claude-config "$DOOR43_REPOS"
+
+# Self-heal door43-repos ownership at boot. Prior privileged ops (fly ssh as
+# root, container restart mid-write) can leave root-owned .git/objects shards;
+# the unprivileged bot process then gets EACCES on door43-push (issues #207,
+# #352). pipeline-runner's ownership-sweep only warns when not root.
+if [ "$(id -u)" = "0" ]; then
+  chown -R "$BOTUSER:$BOTUSER" "$DOOR43_REPOS" 2>/dev/null || true
+fi
 
 # Symlink /app/data into the volume so session/checkpoint files persist
 if [ ! -L /app/data ]; then
@@ -13,6 +24,9 @@ fi
 if [ -n "$CONFIG_LOCAL_JSON" ]; then
   mkdir -p /app/data
   printf '%s' "$CONFIG_LOCAL_JSON" > /app/data/config.local.json
+  if [ "$(id -u)" = "0" ]; then
+    chown "$BOTUSER:$BOTUSER" /app/data/config.local.json 2>/dev/null || true
+  fi
 fi
 
 # Crash-loop backoff + circuit breaker (failure mode B). Runs BEFORE the workspace
@@ -31,8 +45,14 @@ bash /app/scripts/boot-guard.sh || true
 # immediate-strategy deploy restarts it, so this fires on every deploy — at boot,
 # before any pipeline starts. Bounded by `timeout` and `|| true`-equivalent so a
 # slow/failed refresh can never hang or abort boot (the script already exits 0).
-timeout 300 bash /app/scripts/refresh-workspace.sh \
-  || echo "[entrypoint] workspace refresh skipped (timeout or error) — continuing boot on existing checkout"
+# Run as botuser so git objects in the skills checkout stay app-owned.
+if [ "$(id -u)" = "0" ]; then
+  timeout 300 su "$BOTUSER" -s /bin/bash -c "bash /app/scripts/refresh-workspace.sh" \
+    || echo "[entrypoint] workspace refresh skipped (timeout or error) — continuing boot on existing checkout"
+else
+  timeout 300 bash /app/scripts/refresh-workspace.sh \
+    || echo "[entrypoint] workspace refresh skipped (timeout or error) — continuing boot on existing checkout"
+fi
 
 # Persist stdout/stderr to the volume as well as to `fly logs`. Fly only keeps a
 # short live-tail window, so without this every log older than that is gone.
@@ -45,4 +65,8 @@ timeout 300 bash /app/scripts/refresh-workspace.sh \
 # and degrades to pass-through internally if it also fails (issue #290).
 BOT_LOG_DIR="${BOT_LOG_DIR:-/data/logs}"
 mkdir -p "$BOT_LOG_DIR" || true
+if [ "$(id -u)" = "0" ]; then
+  chown "$BOTUSER:$BOTUSER" "$BOT_LOG_DIR" 2>/dev/null || true
+  exec su "$BOTUSER" -s /bin/bash -c "cd /app && exec node src/index.js > >(node /app/scripts/log-tee.js \"${BOT_LOG_DIR}/app.log\") 2>&1"
+fi
 exec node src/index.js > >(node /app/scripts/log-tee.js "${BOT_LOG_DIR}/app.log") 2>&1

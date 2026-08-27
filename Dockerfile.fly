@@ -34,5 +34,7 @@ COPY model-provider-config.json /config/model-provider-config.json
 RUN chmod +x /app/entrypoint.sh && \
     chown -R botuser:botuser /app
 
-USER botuser
+# entrypoint.sh starts as root to chown volume paths (door43-repos) that prior
+# privileged ops may have left root-owned, then drops to botuser before node.
+USER root
 CMD ["/bin/bash", "/app/entrypoint.sh"]
