@@ -8,13 +8,56 @@
 const WORKSPACE_WRITING_ROUTES = new Set(['sdk', 'notes', 'tqs', 'translate']);
 const SWEEP_SUBDIRS = ['output', 'tmp', 'door43-repos'];
 
+// Surface unfixable foreign ownership on the admin dashboard, and abort before
+// the run starts when the blocked paths are in a door43 git tree — otherwise the
+// pipeline discovers them ~55 minutes later at door43-push (issue #349).
+async function guardWorkspaceOwnership(route) {
+  const { sweepWorkspaceOwnership, sweepStaleTmp, partitionBlocked } = require('./ownership-sweep');
+  const result = sweepWorkspaceOwnership({ subdirs: SWEEP_SUBDIRS });
+  sweepStaleTmp();
+  if (!result || !result.blocked.length) return;
+
+  const { publishAdminStatus } = require('./admin-status');
+  const { fatal, advisory } = partitionBlocked(result.blocked);
+  const owner = `uid ${result.targetUid}:${result.targetGid}`;
+  const preview = (list) => list.slice(0, 5).join(', ') + (list.length > 5 ? `, +${list.length - 5} more` : '');
+
+  if (advisory.length) {
+    await publishAdminStatus({
+      pipelineType: route.type,
+      phase: 'preflight',
+      severity: 'warn',
+      message:
+        `ownership-sweep: ${advisory.length} workspace path(s) are foreign-owned and unwritable by ${owner} ` +
+        `— running unprivileged, could not chown. These may cause EACCES: ${preview(advisory)}`,
+    });
+  }
+
+  if (fatal.length) {
+    const detail =
+      `ownership-sweep: ${fatal.length} path(s) under door43-repos/*/.git are foreign-owned and unwritable by ` +
+      `${owner} — every push writes loose objects there, so this run would fail at door43-push. ` +
+      `Aborting before work starts. Fix with a privileged chown -R, then re-run: ${preview(fatal)}`;
+    await publishAdminStatus({
+      pipelineType: route.type,
+      phase: 'preflight',
+      severity: 'error',
+      message: detail,
+    });
+    const err = new Error(detail);
+    err.errorKind = 'workspace_ownership_blocked';
+    throw err;
+  }
+}
+
 async function runPipeline(route, message) {
   if (WORKSPACE_WRITING_ROUTES.has(route.type)) {
     try {
-      const { sweepWorkspaceOwnership, sweepStaleTmp } = require('./ownership-sweep');
-      sweepWorkspaceOwnership({ subdirs: SWEEP_SUBDIRS });
-      sweepStaleTmp();
+      await guardWorkspaceOwnership(route);
     } catch (err) {
+      // A blocked door43 git tree is fatal; anything else in the sweep is
+      // best-effort and must not take the pipeline down.
+      if (err && err.errorKind === 'workspace_ownership_blocked') throw err;
       console.warn(`[ownership-sweep] skipped: ${err.message}`);
     }
   }
