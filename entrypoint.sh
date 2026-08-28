@@ -7,12 +7,13 @@ DOOR43_REPOS="${DOOR43_REPOS_PATH:-/data/workspace/door43-repos}"
 # Create volume subdirectories on first run
 mkdir -p /data/workspace /data/appdata /data/claude-config "$DOOR43_REPOS"
 
-# Self-heal door43-repos ownership at boot. Prior privileged ops (fly ssh as
-# root, container restart mid-write) can leave root-owned .git/objects shards;
+# Self-heal volume ownership at boot. Prior privileged ops (fly ssh as root,
+# container restart mid-write) can leave root-owned paths under door43-repos;
 # the unprivileged bot process then gets EACCES on door43-push (issues #207,
-# #352). pipeline-runner's ownership-sweep only warns when not root.
+# #352). pipeline-runner's ownership-sweep only warns when not root. On a
+# fresh volume, mkdir above creates these dirs as root — chown all of them.
 if [ "$(id -u)" = "0" ]; then
-  chown -R "$BOTUSER:$BOTUSER" "$DOOR43_REPOS" 2>/dev/null || true
+  chown -R "$BOTUSER:$BOTUSER" /data/workspace /data/appdata /data/claude-config "$DOOR43_REPOS" 2>/dev/null || true
 fi
 
 # Symlink /app/data into the volume so session/checkpoint files persist
@@ -47,7 +48,7 @@ bash /app/scripts/boot-guard.sh || true
 # slow/failed refresh can never hang or abort boot (the script already exits 0).
 # Run as botuser so git objects in the skills checkout stay app-owned.
 if [ "$(id -u)" = "0" ]; then
-  timeout 300 su "$BOTUSER" -s /bin/bash -c "bash /app/scripts/refresh-workspace.sh" \
+  timeout 300 gosu "$BOTUSER" bash /app/scripts/refresh-workspace.sh \
     || echo "[entrypoint] workspace refresh skipped (timeout or error) — continuing boot on existing checkout"
 else
   timeout 300 bash /app/scripts/refresh-workspace.sh \
@@ -67,6 +68,6 @@ BOT_LOG_DIR="${BOT_LOG_DIR:-/data/logs}"
 mkdir -p "$BOT_LOG_DIR" || true
 if [ "$(id -u)" = "0" ]; then
   chown "$BOTUSER:$BOTUSER" "$BOT_LOG_DIR" 2>/dev/null || true
-  exec su "$BOTUSER" -s /bin/bash -c "cd /app && exec node src/index.js > >(node /app/scripts/log-tee.js \"${BOT_LOG_DIR}/app.log\") 2>&1"
+  exec gosu "$BOTUSER" node src/index.js > >(node /app/scripts/log-tee.js "${BOT_LOG_DIR}/app.log") 2>&1
 fi
 exec node src/index.js > >(node /app/scripts/log-tee.js "${BOT_LOG_DIR}/app.log") 2>&1

@@ -84,7 +84,7 @@ if [ "$CSV_APPLIED" = 1 ]; then
 fi
 
 # Keep the tree writable by the app user in case this ran as root.
-chown -R botuser:botuser "$WS/.claude" "$WS/data" "$WS/.git" "$WS/door43-repos" 2>/dev/null || true
+chown -R botuser:botuser "$WS/.claude" "$WS/data" "$WS/.git" 2>/dev/null || true
 
 echo "[refresh-workspace] now at $(git log -1 --format=%h 2>/dev/null)"
 exit 0
