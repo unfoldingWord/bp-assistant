@@ -11,6 +11,7 @@ const path = require('path');
 const {
   BodySchema,
   buildSystemPrompt,
+  buildUserMessage,
   TN_QUICK_STYLE,
   TN_QUICK_PACK_FRAME,
 } = require('../src/api/tn-quick');
@@ -132,6 +133,79 @@ describe('BodySchema — strict', () => {
   test('rejects an unknown nested field in ult', () => {
     const r = BodySchema.safeParse({ ...validBody, ult: { ...textSide, extra: 1 } });
     assert.equal(r.success, false);
+  });
+});
+
+describe('BodySchema — REDO fields (priorDraft / sourceGuidance)', () => {
+  test('accepts priorDraft and sourceGuidance', () => {
+    const r = BodySchema.safeParse({
+      ...validBody,
+      priorDraft: 'Habakkuk speaks of the wicked as if they were a besieging army.',
+      sourceGuidance: 'Explain the siege image; keep the AT active.',
+    });
+    assert.equal(r.success, true);
+    assert.equal(r.data.sourceGuidance, 'Explain the siege image; keep the AT active.');
+  });
+
+  test('both are optional — a fresh draft omits them', () => {
+    const r = BodySchema.safeParse(validBody);
+    assert.equal(r.success, true);
+    assert.equal(r.data.priorDraft, undefined);
+    assert.equal(r.data.sourceGuidance, undefined);
+  });
+
+  test('rejects empty or oversized values', () => {
+    assert.equal(BodySchema.safeParse({ ...validBody, priorDraft: '' }).success, false);
+    assert.equal(BodySchema.safeParse({ ...validBody, sourceGuidance: '' }).success, false);
+    assert.equal(BodySchema.safeParse({ ...validBody, priorDraft: 'x'.repeat(4001) }).success, false);
+    assert.equal(BodySchema.safeParse({ ...validBody, sourceGuidance: 'x'.repeat(4001) }).success, false);
+  });
+});
+
+const templateInfo = { templates: [{ id: 't1', text: 'speaking of X as if it were Y' }] };
+
+describe('buildUserMessage — REDO block', () => {
+  test('a fresh draft adds no redraft framing', () => {
+    const msg = buildUserMessage({ body: BodySchema.parse(validBody), templateInfo, hebrewQuote: 'רָשָׁע' });
+    assert.equal(msg.includes('REDRAFT'), false);
+    assert.equal(msg.includes('Prior draft of this note'), false);
+    assert.equal(msg.includes('Guidance points from the source note'), false);
+    assert.match(msg, /Draft ONE translation note/);
+  });
+
+  test('carries the prior draft and guidance, and asks to match register/length', () => {
+    const body = BodySchema.parse({
+      ...validBody,
+      priorDraft: 'PRIOR_DRAFT_SENTINEL',
+      sourceGuidance: 'SOURCE_GUIDANCE_SENTINEL',
+    });
+    const msg = buildUserMessage({ body, templateInfo, hebrewQuote: 'רָשָׁע' });
+    assert.match(msg, /PRIOR_DRAFT_SENTINEL/);
+    assert.match(msg, /SOURCE_GUIDANCE_SENTINEL/);
+    assert.match(msg, /MUST survive the redraft/);
+    assert.match(msg, /register, depth, and length/);
+    // The verse context must still precede the redraft framing.
+    assert.ok(msg.indexOf('UST context') < msg.indexOf('REDRAFT'));
+  });
+
+  test('either field alone is enough to trigger the redraft framing', () => {
+    const onlyGuidance = buildUserMessage({
+      body: BodySchema.parse({ ...validBody, sourceGuidance: 'G_ONLY' }),
+      templateInfo,
+      hebrewQuote: 'רָשָׁע',
+    });
+    assert.match(onlyGuidance, /G_ONLY/);
+    assert.match(onlyGuidance, /REDRAFT/);
+    assert.equal(onlyGuidance.includes('Prior draft of this note'), false);
+
+    const onlyPrior = buildUserMessage({
+      body: BodySchema.parse({ ...validBody, priorDraft: 'P_ONLY' }),
+      templateInfo,
+      hebrewQuote: 'רָשָׁע',
+    });
+    assert.match(onlyPrior, /P_ONLY/);
+    assert.match(onlyPrior, /REDRAFT/);
+    assert.equal(onlyPrior.includes('Guidance points from the source note'), false);
   });
 });
 
