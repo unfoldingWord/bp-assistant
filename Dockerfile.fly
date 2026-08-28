@@ -4,7 +4,7 @@
 FROM node:22.22.3-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    git curl ca-certificates python3 \
+    git curl ca-certificates python3 gosu \
     && rm -rf /var/lib/apt/lists/*
 
 RUN useradd -m -s /bin/bash -u 1001 botuser
@@ -34,5 +34,7 @@ COPY model-provider-config.json /config/model-provider-config.json
 RUN chmod +x /app/entrypoint.sh && \
     chown -R botuser:botuser /app
 
-USER botuser
+# entrypoint.sh starts as root to chown volume paths (door43-repos) that prior
+# privileged ops may have left root-owned, then drops to botuser before node.
+USER root
 CMD ["/bin/bash", "/app/entrypoint.sh"]
