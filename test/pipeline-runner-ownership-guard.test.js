@@ -114,6 +114,48 @@ test('runPipeline warns but proceeds when blocked paths are outside door43 git t
   }
 });
 
+test('runPipeline aborts when door43 git paths are blocked even if admin status publish fails', async () => {
+  const blockedPath = '/data/workspace/door43-repos/en_tn/.git/objects/6d';
+  const advisoryPath = '/data/workspace/output/JER/4/stale.tsv';
+  const { readAdminStatus, notesRan } = setup({
+    blocked: [advisoryPath, blockedPath],
+  });
+
+  const adminStatusPath = require.resolve('../src/admin-status');
+  const realAdminStatus = require(adminStatusPath);
+  let publishCalls = 0;
+  installStub(adminStatusPath, {
+    ...realAdminStatus,
+    publishAdminStatus: async (event) => {
+      publishCalls += 1;
+      if (publishCalls === 1) {
+        throw new Error('EACCES: permission denied');
+      }
+      return realAdminStatus.publishAdminStatus(event);
+    },
+  });
+  delete require.cache[runnerPath];
+  const { runPipeline: runPipelineWithFailingPublish } = require(runnerPath);
+
+  try {
+    await assert.rejects(
+      () => runPipelineWithFailingPublish({ type: 'notes', name: 'write-notes' }, { content: '/write notes JER 4' }),
+      (err) => {
+        assert.equal(err.errorKind, 'workspace_ownership_blocked');
+        return true;
+      },
+    );
+
+    assert.equal(notesRan(), false, 'fatal ownership must abort even when admin status publish throws');
+    assert.equal(publishCalls, 1, 'fatal abort must be decided before advisory publish');
+
+    const events = readAdminStatus({});
+    assert.equal(events.filter((e) => e.severity === 'error').length, 0);
+  } finally {
+    teardown();
+  }
+});
+
 test('runPipeline is unaffected when the sweep reports nothing blocked', async () => {
   const { runPipeline, readAdminStatus, notesRan } = setup({ blocked: [] });
 

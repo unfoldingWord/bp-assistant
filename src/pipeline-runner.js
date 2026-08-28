@@ -22,31 +22,41 @@ async function guardWorkspaceOwnership(route) {
   const owner = `uid ${result.targetUid}:${result.targetGid}`;
   const preview = (list) => list.slice(0, 5).join(', ') + (list.length > 5 ? `, +${list.length - 5} more` : '');
 
-  if (advisory.length) {
-    await publishAdminStatus({
-      pipelineType: route.type,
-      phase: 'preflight',
-      severity: 'warn',
-      message:
-        `ownership-sweep: ${advisory.length} workspace path(s) are foreign-owned and unwritable by ${owner} ` +
-        `— running unprivileged, could not chown. These may cause EACCES: ${preview(advisory)}`,
-    });
-  }
-
+  // Fatal before advisory: an advisory publishAdminStatus failure must not
+  // reach runPipeline's catch and let a blocked door43 git tree proceed.
   if (fatal.length) {
     const detail =
       `ownership-sweep: ${fatal.length} path(s) under door43-repos/*/.git are foreign-owned and unwritable by ` +
       `${owner} — every push writes loose objects there, so this run would fail at door43-push. ` +
       `Aborting before work starts. Fix with a privileged chown -R, then re-run: ${preview(fatal)}`;
-    await publishAdminStatus({
-      pipelineType: route.type,
-      phase: 'preflight',
-      severity: 'error',
-      message: detail,
-    });
     const err = new Error(detail);
     err.errorKind = 'workspace_ownership_blocked';
+    try {
+      await publishAdminStatus({
+        pipelineType: route.type,
+        phase: 'preflight',
+        severity: 'error',
+        message: detail,
+      });
+    } catch (publishErr) {
+      console.warn(`[ownership-sweep] failed to publish fatal admin status: ${publishErr.message}`);
+    }
     throw err;
+  }
+
+  if (advisory.length) {
+    try {
+      await publishAdminStatus({
+        pipelineType: route.type,
+        phase: 'preflight',
+        severity: 'warn',
+        message:
+          `ownership-sweep: ${advisory.length} workspace path(s) are foreign-owned and unwritable by ${owner} ` +
+          `— running unprivileged, could not chown. These may cause EACCES: ${preview(advisory)}`,
+      });
+    } catch (publishErr) {
+      console.warn(`[ownership-sweep] failed to publish advisory admin status: ${publishErr.message}`);
+    }
   }
 }
 
