@@ -7,13 +7,19 @@ const { getVerseCount, getTotalVerses } = require('./verse-counts');
 
 // ccusage is ESM-only — lazy-load via dynamic import() from CommonJS
 let _loadSessionBlockData = null;
+let _ccusageUnavailable = false;
 async function loadCcusageBlocks() {
+  if (_ccusageUnavailable) return [];
   if (!_loadSessionBlockData) {
     try {
       const mod = await import('ccusage/data-loader');
       _loadSessionBlockData = mod.loadSessionBlockData;
     } catch (err) {
-      console.warn(`[usage-tracker] ccusage library not available: ${err.message}`);
+      // Expected where the repo is cloned without node_modules (e.g. the
+      // auto-issue-handler cron machine). Log once per process, then stay
+      // quiet -- getHeadroom() falls back to bot-log metrics either way.
+      _ccusageUnavailable = true;
+      console.warn(`[usage-tracker] ccusage not installed; using bot-log metrics only (${err.message})`);
       return [];
     }
   }
