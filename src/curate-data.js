@@ -200,9 +200,16 @@ async function fetchDoor43Data(books, force, manifest, log) {
 
     for (var ti = 0; ti < targets.length; ti++) {
       var target = targets[ti];
-      if (!force && fs.existsSync(target.dest)) {
-        var first = fs.readFileSync(target.dest, 'utf-8').split('\n')[0];
-        if (first.startsWith('# Fetched:') && !newBooks.includes(books[bi])) continue;
+      // Age-based, not presence-based. This used to skip any file that merely
+      // carried a "# Fetched:" header, so a file fetched once in April was
+      // never revisited without an explicit forced run -- staleness was sticky
+      // rather than self-healing, and UHB/ULT/UST/TN sat 1-6 months old on the
+      // Fly volume. Reusing the same weekly boundary as the Google sources
+      // means a missed scheduled refresh is repaired by the next pipeline that
+      // fetches, instead of persisting for months (#335). getCachedDate returns
+      // null for a file with no header, which still refetches as before.
+      if (!force && fs.existsSync(target.dest) && !newBooks.includes(books[bi])) {
+        if (!shouldRefreshWeekly(getCachedDate(target.dest))) continue;
       }
       try {
         var content = await httpFetch(target.url);
@@ -695,4 +702,8 @@ async function curatePublishedData(opts) {
 module.exports = {
   curatePublishedData, readFetchStatus, FETCH_STATUS_PATH, CURATE_STEPS,
   extractUnalignedEnglish, resolveGlQuotes,
+  // shouldRefreshWeekly is exported for test/weekly-refresh.test.js, which
+  // pins the age-based cache boundary the Door43 fetch now shares with the
+  // Google fetch.
+  shouldRefreshWeekly,
 };
