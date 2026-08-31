@@ -11,9 +11,11 @@ const path = require('path');
 const {
   BodySchema,
   buildSystemPrompt,
+  buildUserMessage,
   TN_QUICK_STYLE,
   TN_QUICK_PACK_FRAME,
 } = require('../src/api/tn-quick');
+const { BOOK_NUMBERS, BOOK_NAMES } = require('../src/api-runner/verse-data');
 const { loadQuickPack, _resetForTests } = require('../src/lib/quick-context');
 
 const textSide = {
@@ -231,5 +233,72 @@ describe('loadQuickPack — degrade semantics', () => {
     const { pack, warning } = await loadQuickPack(dir, {});
     assert.equal(pack, null);
     assert.match(warning, /^context_pack_unavailable:/);
+  });
+});
+
+// Regression: the style guide used to name Habakkuk twice (as the first
+// "Author References" example and in the "Here" Rule counter-example). In a
+// single-shot call those were the only book names in the prompt, so the model
+// anchored on them and named Habakkuk as the speaker while working in other
+// books. See issue #358.
+describe('speaker attribution — no book anchors in the prompt', () => {
+  const OTHER_BOOKS = Object.values(BOOK_NAMES).filter((n) => n !== 'Psalms');
+
+  // Word-boundary matching, so "Quotation Marks" is not read as the book Mark.
+  // A few book names are also ordinary English words (Mark, Job, Acts, Song);
+  // if legitimate prose ever trips this, reword the prose rather than naming a
+  // book — a book name in the style guide is exactly what caused #358.
+  test('TN_QUICK_STYLE names no specific book or its author', () => {
+    for (const name of OTHER_BOOKS) {
+      assert.ok(
+        !new RegExp(`\\b${name}\\b`).test(TN_QUICK_STYLE),
+        `TN_QUICK_STYLE must not name a specific book (found "${name}") — it anchors the speaker`,
+      );
+    }
+    assert.ok(!/\bMoses\b/.test(TN_QUICK_STYLE), 'no book-specific author names');
+  });
+
+  test('TN_QUICK_STYLE tells the model to derive the author from the Reference line', () => {
+    assert.match(TN_QUICK_STYLE, /Reference line/);
+    assert.match(TN_QUICK_STYLE, /traditional author/);
+  });
+
+  test('Psalms guidance survives (psalmist rules are book-specific on purpose)', () => {
+    assert.match(TN_QUICK_STYLE, /the psalmist/);
+  });
+});
+
+describe('buildUserMessage — Reference line', () => {
+  const templateInfo = { templates: [{ id: 'figs-metaphor', text: 'SPEAKER speaks of X...' }] };
+
+  function refLine(book, chapter, verse) {
+    const body = BodySchema.parse({
+      ...validBody,
+      ref: { book, chapter, verse },
+    });
+    const msg = buildUserMessage({ body, templateInfo, hebrewQuote: 'רָשָׁע' });
+    return msg.split('\n')[0];
+  }
+
+  test('spells out the book name alongside the code', () => {
+    assert.equal(refLine('JER', 24, 5), 'Reference: JER 24:5 (Jeremiah)');
+  });
+
+  test('lowercase book codes are upcased and still resolve a name', () => {
+    assert.equal(refLine('hab', 1, 4), 'Reference: HAB 1:4 (Habakkuk)');
+  });
+
+  test('numbered books use the spaced display form', () => {
+    assert.equal(refLine('1SA', 3, 1), 'Reference: 1SA 3:1 (1 Samuel)');
+  });
+
+  test('an unknown code degrades to the bare code rather than throwing', () => {
+    assert.equal(refLine('ZZZ', 1, 1), 'Reference: ZZZ 1:1');
+  });
+});
+
+describe('BOOK_NAMES', () => {
+  test('covers exactly the codes BOOK_NUMBERS accepts', () => {
+    assert.deepEqual(Object.keys(BOOK_NAMES).sort(), Object.keys(BOOK_NUMBERS).sort());
   });
 });

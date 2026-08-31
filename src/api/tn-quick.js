@@ -12,6 +12,7 @@ const {
   getTemplate,
   loadCache,
   BOOK_NUMBERS,
+  BOOK_NAMES,
 } = require('../api-runner/verse-data');
 const {
   parseHebrewVerseWords,
@@ -66,12 +67,14 @@ Output: emit ONLY the final note text. No preamble, no explanation, no JSON wrap
 - Alternate translation brackets [] are unaffected.
 
 ### Author References
-- Always use the author's name, never "the author." Replace SPEAKER placeholders in templates with the name (e.g., Habakkuk, Isaiah, Moses).
+- Always use the author's name, never "the author." Replace SPEAKER placeholders in templates with the name.
+- Derive that name from the book on the Reference line, using the book's traditional author. Never name an author from any other book.
 - For Psalms, check the superscription: use David, Asaph, etc. if named; use "the psalmist" if anonymous.
+- Only if the book's author is genuinely unknown, use "the author."
 
 ### "Here" Rule
 - Only start with "Here, " if immediately followed by a bolded lowercase quote: \`Here, **admonish** means...\`.
-- Never: \`Here the author is speaking...\` or \`Here Habakkuk is saying...\`.
+- Never: \`Here the author is speaking...\` or \`Here the prophet is saying...\`.
 
 ### Restrictions
 - No source language names (Hebrew, Greek, Aramaic) in note text.
@@ -245,11 +248,13 @@ function formatContextLines(label, verseText, prev5, next5, refVerse) {
 
 function buildUserMessage({ body, templateInfo, hebrewQuote }) {
   const { ref, issueType, ult, ust } = body;
+  const bookCode = ref.book.toUpperCase();
+  const bookName = BOOK_NAMES[bookCode] || '';
   const ultCtx = formatContextLines('ULT v.', ult.verse, ult.context.prev5, ult.context.next5, ref.verse);
   const ustCtx = formatContextLines('UST v.', ust.verse, ust.context.prev5, ust.context.next5, ref.verse);
 
   return [
-    `Reference: ${ref.book.toUpperCase()} ${ref.chapter}:${ref.verse}`,
+    `Reference: ${bookCode} ${ref.chapter}:${ref.verse}${bookName ? ` (${bookName})` : ''}`,
     `Issue type: ${issueType}`,
     '',
     `ULT support phrase: "${ult.selection}"`,
@@ -537,6 +542,7 @@ module.exports = {
   // exposed for testing
   BodySchema,
   buildSystemPrompt,
+  buildUserMessage,
   TN_QUICK_STYLE,
   TN_QUICK_PACK_FRAME,
   TN_QUICK_TERM_STATUSES,
