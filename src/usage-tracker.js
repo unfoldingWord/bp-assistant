@@ -5,19 +5,39 @@ const fs = require('fs');
 const path = require('path');
 const { getVerseCount, getTotalVerses } = require('./verse-counts');
 
-// ccusage is ESM-only — lazy-load via dynamic import() from CommonJS
-let _loadSessionBlockData = null;
-async function loadCcusageBlocks() {
-  if (!_loadSessionBlockData) {
-    try {
-      const mod = await import('ccusage/data-loader');
-      _loadSessionBlockData = mod.loadSessionBlockData;
-    } catch (err) {
-      console.warn(`[usage-tracker] ccusage library not available: ${err.message}`);
-      return [];
-    }
+// ccusage is ESM-only — lazy-load via dynamic import() from CommonJS.
+// It is an OPTIONAL dependency: the bot image installs it, but lightweight
+// automation contexts (cron scripts running from a bare checkout with no
+// node_modules) do not have it. Absence is expected and non-fatal — getHeadroom()
+// degrades to bot-log-only and reports ccusageOk: false.
+//
+// Resolution is memoized as a promise so the import is attempted exactly once per
+// process (race-safe across concurrent getHeadroom() callers) and a miss is never
+// retried or re-logged. Previously the failure was not cached, so every call
+// re-attempted the import and re-emitted a console.warn on each one.
+let _ccusagePromise = null;
+
+function resolveCcusageLoader() {
+  if (!_ccusagePromise) {
+    _ccusagePromise = import('ccusage/data-loader')
+      .then(mod => mod.loadSessionBlockData || null)
+      .catch(err => {
+        // Debug-level only: an expected fallback, not an error condition.
+        if (process.env.BP_DEBUG) {
+          console.debug(
+            `[usage-tracker] ccusage unavailable, using bot-log only: ${err.message}`
+          );
+        }
+        return null;
+      });
   }
-  return _loadSessionBlockData({
+  return _ccusagePromise;
+}
+
+async function loadCcusageBlocks() {
+  const loadSessionBlockData = await resolveCcusageLoader();
+  if (!loadSessionBlockData) return [];
+  return loadSessionBlockData({
     offline: true,
     claudePath: process.env.CLAUDE_CONFIG_DIR || undefined,
   });
