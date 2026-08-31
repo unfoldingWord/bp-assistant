@@ -18,6 +18,7 @@ const {
   normalizeHebrewQuote,
 } = require('../workspace-tools/quality-tools');
 const { loadQuickPack, renderQuickPackText, langName } = require('../lib/quick-context');
+const { substituteAT } = require('../workspace-tools/tn-tools');
 
 let _agentSdkQuery = null;
 async function getAgentSdkQuery() {
@@ -54,6 +55,10 @@ Output: emit ONLY the final note text. No preamble, no explanation, no JSON wrap
 - Minimal change to ULT wording — only change what the issue requires.
 - No punctuation at start/end of brackets unless the note is about punctuation.
 - Match capitalization to sentence position of the quoted phrase.
+- Conjunctions and prepositions at the quote boundary: keep whatever the quoted phrase itself includes. If the quote starts with “And” / “in” / “to” / “from”, the AT starts with it too (quote “And he went” → [And he traveled], not [he traveled]); if the quote starts after such a word, do not add one.
+- Discontinuous quotes (the quote contains …): use one pair of brackets with … between the parts — never join the parts with “and.”
+- Resolve the figure: a plain-meaning AT must not reuse the figure the note explains. A personification note's AT should not give the non-living thing an action verb (“the deep waters were loud,” not “the deep waters roared”).
+- If the passage is so obscure that any plain-meaning AT would just restate the UST, omit the bracket entirely and end the sentence with “as the UST does.”
 
 ### Bold and Quoting
 - Bold words/phrases quoted from the verse: \`**quoted words**\`.
@@ -162,6 +167,63 @@ function buildSystemPrompt({ pack, targetLang, targetLangName, direction }) {
     pack, targetLang, targetLangName, direction, termStatuses: TN_QUICK_TERM_STATUSES,
   });
   return `${TN_QUICK_STYLE}\n\n${TN_QUICK_PACK_FRAME}\n\n${packText}`;
+}
+
+// --- AT fit post-check -----------------------------------------------------
+// The chapter pipeline mechanically substitutes every AT back into its verse
+// (verifyAtFit in workspace-tools/tn-tools.js) before a note ships. tn-quick is
+// a single model call returned verbatim, so it had no equivalent guard and
+// shipped ATs that do not read as drop-in replacements for the selected ULT
+// phrase. This reuses the pipeline's substituteAT to run the same substitution
+// locally — no extra model turns, no network — and reports what it finds as
+// advisory `warnings` rather than failing the request, since the note may still
+// be useful to the editor.
+
+const AT_LABEL_RE = /Alternate translations?:/i;
+const AT_BRACKET_RE = /Alternate translations?:\s*\[([^\]]*)\]/gi;
+const DISCONTINUOUS_RE = /(?:\u2026|\.{3}| & )/;
+
+/**
+ * Substitute each bracketed AT in `note` into `verse` at `selection`.
+ * Returns an array of warning strings (empty when everything lands cleanly).
+ */
+function checkAtFit({ note, selection, verse }) {
+  const warnings = [];
+  const noteText = String(note || '');
+  const sel = String(selection || '');
+  const verseText = String(verse || '');
+  if (!noteText || !sel || !verseText) return warnings;
+
+  const ats = [...noteText.matchAll(AT_BRACKET_RE)].map((m) => m[1]);
+
+  // A note may legitimately carry no AT (e.g. the "as the UST does" exception),
+  // but "Alternate translation:" without brackets is a formatting miss that
+  // costs the editor the substitution.
+  if (ats.length === 0) {
+    if (AT_LABEL_RE.test(noteText)) {
+      warnings.push('at_fit: note offers an alternate translation but it is not enclosed in square brackets');
+    }
+    return warnings;
+  }
+
+  for (const at of ats) {
+    const trimmed = at.trim();
+    if (!trimmed) {
+      warnings.push('at_fit: alternate translation brackets are empty');
+      continue;
+    }
+    // A discontinuous selection needs a matching separator in the AT, or
+    // substitution drops the same text into both spans.
+    if (DISCONTINUOUS_RE.test(sel) && !DISCONTINUOUS_RE.test(trimmed)) {
+      warnings.push(`at_fit: selected phrase is discontinuous but the alternate translation "${trimmed}" has no \u2026 between the parts`);
+      continue;
+    }
+    const preview = substituteAT(verseText, sel, trimmed);
+    if (preview === null) {
+      warnings.push(`at_fit: could not substitute "${trimmed}" — the selected phrase was not found in the ULT verse`);
+    }
+  }
+  return warnings;
 }
 
 const rateLimits = new Map();
@@ -516,6 +578,12 @@ async function handleTnQuickRequest(req, res) {
       return;
     }
 
+    warnings.push(...checkAtFit({
+      note: noteText,
+      selection: body.ult.selection,
+      verse: body.ult.verse,
+    }));
+
     const responseBody = { quote: heb.quote, note: noteText, warnings };
     if (body.contextRef) responseBody.packSha = pack ? (pack.sha ?? null) : null;
     reply(res, 200, responseBody);
@@ -540,4 +608,5 @@ module.exports = {
   TN_QUICK_STYLE,
   TN_QUICK_PACK_FRAME,
   TN_QUICK_TERM_STATUSES,
+  checkAtFit,
 };

@@ -13,6 +13,7 @@ const {
   buildSystemPrompt,
   TN_QUICK_STYLE,
   TN_QUICK_PACK_FRAME,
+  checkAtFit,
 } = require('../src/api/tn-quick');
 const { loadQuickPack, _resetForTests } = require('../src/lib/quick-context');
 
@@ -231,5 +232,93 @@ describe('loadQuickPack — degrade semantics', () => {
     const { pack, warning } = await loadQuickPack(dir, {});
     assert.equal(pack, null);
     assert.match(warning, /^context_pack_unavailable:/);
+  });
+});
+
+describe('TN_QUICK_STYLE — AT rules carried over from tn-writer', () => {
+  test('covers the boundary conjunction/preposition, discontinuous, resolve-the-figure, and UST-collision rules', () => {
+    assert.match(TN_QUICK_STYLE, /Conjunctions and prepositions at the quote boundary/);
+    assert.match(TN_QUICK_STYLE, /Discontinuous quotes/);
+    assert.match(TN_QUICK_STYLE, /Resolve the figure/);
+    assert.match(TN_QUICK_STYLE, /as the UST does/);
+  });
+});
+
+describe('checkAtFit — mechanical substitution post-check', () => {
+  const verse = 'Therefore the law is paralyzed, and justice never goes out.';
+  const selection = 'the law is paralyzed';
+
+  test('an AT that substitutes cleanly produces no warnings', () => {
+    assert.deepEqual(
+      checkAtFit({ note: 'Alternate translation: [the law has no power]', selection, verse }),
+      [],
+    );
+  });
+
+  test('flags an AT whose selected phrase is not in the ULT verse', () => {
+    const w = checkAtFit({
+      note: 'Alternate translation: [the law has no power]',
+      selection: 'the wicked surround the righteous',
+      verse,
+    });
+    assert.equal(w.length, 1);
+    assert.match(w[0], /^at_fit: could not substitute/);
+  });
+
+  test('a note with no AT is not flagged (the "as the UST does" exception)', () => {
+    assert.deepEqual(
+      checkAtFit({ note: 'You could state the meaning plainly, as the UST does.', selection, verse }),
+      [],
+    );
+  });
+
+  test('flags an alternate translation that is not enclosed in brackets', () => {
+    const w = checkAtFit({ note: 'Alternate translation: the law has no power', selection, verse });
+    assert.equal(w.length, 1);
+    assert.match(w[0], /not enclosed in square brackets/);
+  });
+
+  test('flags empty brackets', () => {
+    const w = checkAtFit({ note: 'Alternate translation: []', selection, verse });
+    assert.equal(w.length, 1);
+    assert.match(w[0], /brackets are empty/);
+  });
+
+  test('a discontinuous selection with a matching ellipsis AT is clean', () => {
+    assert.deepEqual(
+      checkAtFit({
+        note: 'Alternate translation: [the law \u2026 has no strength]',
+        selection: 'the law \u2026 goes out',
+        verse,
+      }),
+      [],
+    );
+  });
+
+  test('flags a discontinuous selection whose AT has no ellipsis', () => {
+    const w = checkAtFit({
+      note: 'Alternate translation: [the law has no power]',
+      selection: 'the law \u2026 goes out',
+      verse,
+    });
+    assert.equal(w.length, 1);
+    assert.match(w[0], /discontinuous/);
+  });
+
+  test('brackets that are not an alternate translation are ignored', () => {
+    assert.deepEqual(
+      checkAtFit({
+        note: 'Habakkuk speaks of the law [see note] as if it were paralyzed.',
+        selection,
+        verse,
+      }),
+      [],
+    );
+  });
+
+  test('missing note, selection, or verse is a no-op rather than a throw', () => {
+    assert.deepEqual(checkAtFit({ note: '', selection, verse }), []);
+    assert.deepEqual(checkAtFit({ note: 'Alternate translation: [x]', selection: '', verse }), []);
+    assert.deepEqual(checkAtFit({ note: 'Alternate translation: [x]', selection, verse: '' }), []);
   });
 });
