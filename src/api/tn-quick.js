@@ -17,6 +17,7 @@ const {
   parseHebrewVerseWords,
   normalizeHebrewQuote,
 } = require('../workspace-tools/quality-tools');
+const { substituteAT } = require('../workspace-tools/tn-tools');
 const { loadQuickPack, renderQuickPackText, langName } = require('../lib/quick-context');
 
 let _agentSdkQuery = null;
@@ -54,6 +55,9 @@ Output: emit ONLY the final note text. No preamble, no explanation, no JSON wrap
 - Minimal change to ULT wording — only change what the issue requires.
 - No punctuation at start/end of brackets unless the note is about punctuation.
 - Match capitalization to sentence position of the quoted phrase.
+- Match the conjunction/preposition boundary of the quoted phrase. If the phrase includes a leading "And" or a preposition, the AT keeps it (\`And he went\` → [And he traveled]); if the phrase starts after it, the AT starts after it too.
+- Resolve the figure: state the plain meaning without reusing the figure the note explains. For personification, prefer a stative description over another action verb ("the deep waters were loud", not "the deep waters roared").
+- Before finalizing, mentally substitute the AT for the selected phrase in the full ULT verse and confirm the sentence reads naturally.
 
 ### Bold and Quoting
 - Bold words/phrases quoted from the verse: \`**quoted words**\`.
@@ -66,12 +70,14 @@ Output: emit ONLY the final note text. No preamble, no explanation, no JSON wrap
 - Alternate translation brackets [] are unaffected.
 
 ### Author References
-- Always use the author's name, never "the author." Replace SPEAKER placeholders in templates with the name (e.g., Habakkuk, Isaiah, Moses).
+- Work out which book the note is for from the Reference line, then replace SPEAKER placeholders with that book's traditional author or speaker. Always use a name, never "the author."
+- The name must belong to the book in the Reference line — do not carry over a name from another book.
 - For Psalms, check the superscription: use David, Asaph, etc. if named; use "the psalmist" if anonymous.
+- Fall back to "the author" only when the author is genuinely unknown. Never use "the writer."
 
 ### "Here" Rule
 - Only start with "Here, " if immediately followed by a bolded lowercase quote: \`Here, **admonish** means...\`.
-- Never: \`Here the author is speaking...\` or \`Here Habakkuk is saying...\`.
+- Never: \`Here the author is speaking...\` or \`Here the speaker is saying...\`.
 
 ### Restrictions
 - No source language names (Hebrew, Greek, Aramaic) in note text.
@@ -95,6 +101,35 @@ Output: emit ONLY the final note text. No preamble, no explanation, no JSON wrap
 | Hendiadys | The phrase X and Y expresses a single idea |
 | Reduplication | repeating forms of the word X to intensify |
 `;
+
+// Full book names for the Reference line. The style rules ask for the book's
+// traditional author, which the model cannot derive reliably from a 3-letter
+// code in a single-shot call — it anchored on whatever book the prompt itself
+// named instead (issue #358). Keys match BOOK_NUMBERS in api-runner/verse-data;
+// nothing in the repo exports a code -> full-name map, so it lives here.
+const BOOK_FULL_NAMES = {
+  GEN: 'Genesis', EXO: 'Exodus', LEV: 'Leviticus', NUM: 'Numbers', DEU: 'Deuteronomy',
+  JOS: 'Joshua', JDG: 'Judges', RUT: 'Ruth', '1SA': '1 Samuel', '2SA': '2 Samuel',
+  '1KI': '1 Kings', '2KI': '2 Kings', '1CH': '1 Chronicles', '2CH': '2 Chronicles', EZR: 'Ezra',
+  NEH: 'Nehemiah', EST: 'Esther', JOB: 'Job', PSA: 'Psalms', PRO: 'Proverbs',
+  ECC: 'Ecclesiastes', SNG: 'Song of Songs', ISA: 'Isaiah', JER: 'Jeremiah', LAM: 'Lamentations',
+  EZK: 'Ezekiel', DAN: 'Daniel', HOS: 'Hosea', JOL: 'Joel', AMO: 'Amos',
+  OBA: 'Obadiah', JON: 'Jonah', MIC: 'Micah', NAM: 'Nahum', HAB: 'Habakkuk',
+  ZEP: 'Zephaniah', HAG: 'Haggai', ZEC: 'Zechariah', MAL: 'Malachi',
+  MAT: 'Matthew', MRK: 'Mark', LUK: 'Luke', JHN: 'John', ACT: 'Acts',
+  ROM: 'Romans', '1CO': '1 Corinthians', '2CO': '2 Corinthians', GAL: 'Galatians', EPH: 'Ephesians',
+  PHP: 'Philippians', COL: 'Colossians', '1TH': '1 Thessalonians', '2TH': '2 Thessalonians',
+  '1TI': '1 Timothy', '2TI': '2 Timothy', TIT: 'Titus', PHM: 'Philemon', HEB: 'Hebrews',
+  JAS: 'James', '1PE': '1 Peter', '2PE': '2 Peter', '1JN': '1 John', '2JN': '2 John',
+  '3JN': '3 John', JUD: 'Jude', REV: 'Revelation',
+};
+
+/** "JER 24:5 (Jeremiah)" — the full name is omitted for an unrecognized code. */
+function formatReference(ref) {
+  const code = String(ref.book).toUpperCase();
+  const name = BOOK_FULL_NAMES[code];
+  return `${code} ${ref.chapter}:${ref.verse}${name ? ` (${name})` : ''}`;
+}
 
 const ContextSchema = z.object({
   prev5: z.array(z.string().max(3000)).max(5).default([]),
@@ -249,7 +284,7 @@ function buildUserMessage({ body, templateInfo, hebrewQuote }) {
   const ustCtx = formatContextLines('UST v.', ust.verse, ust.context.prev5, ust.context.next5, ref.verse);
 
   return [
-    `Reference: ${ref.book.toUpperCase()} ${ref.chapter}:${ref.verse}`,
+    `Reference: ${formatReference(ref)}`,
     `Issue type: ${issueType}`,
     '',
     `ULT support phrase: "${ult.selection}"`,
@@ -267,6 +302,55 @@ function buildUserMessage({ body, templateInfo, hebrewQuote }) {
     '',
     'Draft ONE translation note for the ULT support phrase above. Output ONLY the note text.',
   ].join('\n');
+}
+
+// An AT is written as `Alternate translation: [text]`, sometimes with a second
+// option (`... [a] or [b]`) on the same line, and a note may carry none at all.
+function extractAlternateTranslations(noteText) {
+  const ats = [];
+  const re = /Alternate translation:\s*(.+)/gi;
+  let m;
+  while ((m = re.exec(String(noteText || ''))) !== null) {
+    for (const bracket of m[1].match(/\[[^\]]*\]/g) || []) {
+      const at = bracket.slice(1, -1).trim();
+      if (at) ats.push(at);
+    }
+  }
+  return ats;
+}
+
+// Drop-in check for the ATs in a drafted note (issue #359): substitute each one
+// for the selected ULT phrase and look for the mechanical misfits a reader would
+// notice. Purely textual — no extra model turns, no network. Deliberately
+// conservative: every hit is surfaced to the caller next to an otherwise usable
+// note, so it only reports unambiguous problems and never rewrites the note.
+// Nothing is checked when the note has no AT, since there is nothing to fit.
+function checkAtFit({ noteText, verse, selection }) {
+  const warnings = [];
+  const ultVerse = String(verse || '');
+  const glQuote = String(selection || '');
+  if (!ultVerse || !glQuote) return warnings;
+
+  for (const at of extractAlternateTranslations(noteText)) {
+    const preview = substituteAT(ultVerse, glQuote, at);
+    if (preview === null) {
+      warnings.push(`at_fit_unverified: selected ULT phrase "${glQuote}" not found in the ULT verse, `
+        + `so alternate translation "${at}" could not be checked for fit`);
+      continue;
+    }
+    if (/ {2}/.test(preview) && !/ {2}/.test(ultVerse)) {
+      warnings.push(`at_fit_spacing: substituting "${at}" leaves a doubled space in the verse`);
+    }
+    if (/^[A-Z]/.test(ultVerse.trim()) && /^[a-z]/.test(preview.trim())) {
+      warnings.push(`at_fit_capitalization: substituting "${at}" leaves the verse starting with a lowercase word`);
+    }
+    // The style rules put no punctuation at the end of the brackets; an
+    // ellipsis is the exception, since it joins the parts of a discontinuous AT.
+    if (/[.!?]$/.test(at) && !/(?:…|\.{3})$/.test(at)) {
+      warnings.push(`at_fit_punctuation: alternate translation "${at}" ends with sentence punctuation inside the brackets`);
+    }
+  }
+  return warnings;
 }
 
 // Timeout for one model call. There was previously none here at all, so a hung
@@ -516,6 +600,12 @@ async function handleTnQuickRequest(req, res) {
       return;
     }
 
+    warnings.push(...checkAtFit({
+      noteText,
+      verse: body.ult.verse,
+      selection: body.ult.selection,
+    }));
+
     const responseBody = { quote: heb.quote, note: noteText, warnings };
     if (body.contextRef) responseBody.packSha = pack ? (pack.sha ?? null) : null;
     reply(res, 200, responseBody);
@@ -537,6 +627,11 @@ module.exports = {
   // exposed for testing
   BodySchema,
   buildSystemPrompt,
+  buildUserMessage,
+  formatReference,
+  checkAtFit,
+  extractAlternateTranslations,
+  BOOK_FULL_NAMES,
   TN_QUICK_STYLE,
   TN_QUICK_PACK_FRAME,
   TN_QUICK_TERM_STATUSES,
