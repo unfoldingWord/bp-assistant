@@ -6,36 +6,27 @@ const path = require('path');
 const { getVerseCount, getTotalVerses } = require('./verse-counts');
 
 // ccusage is ESM-only — lazy-load via dynamic import() from CommonJS.
-// It is an OPTIONAL dependency: the bot image installs it, but lightweight
-// automation contexts (cron scripts running from a bare checkout with no
-// node_modules) do not have it. Absence is expected and non-fatal — getHeadroom()
-// degrades to bot-log-only and reports ccusageOk: false.
-//
-// Resolution is memoized as a promise so the import is attempted exactly once per
-// process (race-safe across concurrent getHeadroom() callers) and a miss is never
-// retried or re-logged. Previously the failure was not cached, so every call
-// re-attempted the import and re-emitted a console.warn on each one.
-let _ccusagePromise = null;
-
-function resolveCcusageLoader() {
-  if (!_ccusagePromise) {
-    _ccusagePromise = import('ccusage/data-loader')
-      .then(mod => mod.loadSessionBlockData || null)
-      .catch(err => {
-        // Debug-level only: an expected fallback, not an error condition.
-        if (process.env.BP_DEBUG) {
-          console.debug(
-            `[usage-tracker] ccusage unavailable, using bot-log only: ${err.message}`
-          );
-        }
+// The import is memoized as a PROMISE (not a post-await flag) so concurrent
+// first callers share one probe and the not-installed warning fires exactly
+// once per process — a flag set after the await let every caller in a startup
+// burst warn before the first one landed.
+let _ccusageProbe = null;
+function probeCcusage() {
+  if (!_ccusageProbe) {
+    _ccusageProbe = import('ccusage/data-loader')
+      .then((mod) => mod.loadSessionBlockData)
+      .catch((err) => {
+        // Expected where the repo is cloned without node_modules (e.g. the
+        // auto-issue-handler cron machine). Log once, then stay quiet --
+        // getHeadroom() falls back to bot-log metrics either way.
+        console.warn(`[usage-tracker] ccusage not installed; using bot-log metrics only (${err.message})`);
         return null;
       });
   }
-  return _ccusagePromise;
+  return _ccusageProbe;
 }
-
 async function loadCcusageBlocks() {
-  const loadSessionBlockData = await resolveCcusageLoader();
+  const loadSessionBlockData = await probeCcusage();
   if (!loadSessionBlockData) return [];
   return loadSessionBlockData({
     offline: true,

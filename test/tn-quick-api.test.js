@@ -11,9 +11,11 @@ const path = require('path');
 const {
   BodySchema,
   buildSystemPrompt,
+  buildUserMessage,
   TN_QUICK_STYLE,
   TN_QUICK_PACK_FRAME,
 } = require('../src/api/tn-quick');
+const { BOOK_NUMBERS, BOOK_NAMES } = require('../src/api-runner/verse-data');
 const { loadQuickPack, _resetForTests } = require('../src/lib/quick-context');
 
 const textSide = {
@@ -135,6 +137,79 @@ describe('BodySchema — strict', () => {
   });
 });
 
+describe('BodySchema — REDO fields (priorDraft / sourceGuidance)', () => {
+  test('accepts priorDraft and sourceGuidance', () => {
+    const r = BodySchema.safeParse({
+      ...validBody,
+      priorDraft: 'Habakkuk speaks of the wicked as if they were a besieging army.',
+      sourceGuidance: 'Explain the siege image; keep the AT active.',
+    });
+    assert.equal(r.success, true);
+    assert.equal(r.data.sourceGuidance, 'Explain the siege image; keep the AT active.');
+  });
+
+  test('both are optional — a fresh draft omits them', () => {
+    const r = BodySchema.safeParse(validBody);
+    assert.equal(r.success, true);
+    assert.equal(r.data.priorDraft, undefined);
+    assert.equal(r.data.sourceGuidance, undefined);
+  });
+
+  test('rejects empty or oversized values', () => {
+    assert.equal(BodySchema.safeParse({ ...validBody, priorDraft: '' }).success, false);
+    assert.equal(BodySchema.safeParse({ ...validBody, sourceGuidance: '' }).success, false);
+    assert.equal(BodySchema.safeParse({ ...validBody, priorDraft: 'x'.repeat(4001) }).success, false);
+    assert.equal(BodySchema.safeParse({ ...validBody, sourceGuidance: 'x'.repeat(4001) }).success, false);
+  });
+});
+
+const templateInfo = { templates: [{ id: 't1', text: 'speaking of X as if it were Y' }] };
+
+describe('buildUserMessage — REDO block', () => {
+  test('a fresh draft adds no redraft framing', () => {
+    const msg = buildUserMessage({ body: BodySchema.parse(validBody), templateInfo, hebrewQuote: 'רָשָׁע' });
+    assert.equal(msg.includes('REDRAFT'), false);
+    assert.equal(msg.includes('Prior draft of this note'), false);
+    assert.equal(msg.includes('Guidance points from the source note'), false);
+    assert.match(msg, /Draft ONE translation note/);
+  });
+
+  test('carries the prior draft and guidance, and asks to match register/length', () => {
+    const body = BodySchema.parse({
+      ...validBody,
+      priorDraft: 'PRIOR_DRAFT_SENTINEL',
+      sourceGuidance: 'SOURCE_GUIDANCE_SENTINEL',
+    });
+    const msg = buildUserMessage({ body, templateInfo, hebrewQuote: 'רָשָׁע' });
+    assert.match(msg, /PRIOR_DRAFT_SENTINEL/);
+    assert.match(msg, /SOURCE_GUIDANCE_SENTINEL/);
+    assert.match(msg, /MUST survive the redraft/);
+    assert.match(msg, /register, depth, and length/);
+    // The verse context must still precede the redraft framing.
+    assert.ok(msg.indexOf('UST context') < msg.indexOf('REDRAFT'));
+  });
+
+  test('either field alone is enough to trigger the redraft framing', () => {
+    const onlyGuidance = buildUserMessage({
+      body: BodySchema.parse({ ...validBody, sourceGuidance: 'G_ONLY' }),
+      templateInfo,
+      hebrewQuote: 'רָשָׁע',
+    });
+    assert.match(onlyGuidance, /G_ONLY/);
+    assert.match(onlyGuidance, /REDRAFT/);
+    assert.equal(onlyGuidance.includes('Prior draft of this note'), false);
+
+    const onlyPrior = buildUserMessage({
+      body: BodySchema.parse({ ...validBody, priorDraft: 'P_ONLY' }),
+      templateInfo,
+      hebrewQuote: 'רָשָׁע',
+    });
+    assert.match(onlyPrior, /P_ONLY/);
+    assert.match(onlyPrior, /REDRAFT/);
+    assert.equal(onlyPrior.includes('Guidance points from the source note'), false);
+  });
+});
+
 function writeFixturePack(dir) {
   fs.mkdirSync(path.join(dir, 'terminology'), { recursive: true });
   fs.writeFileSync(path.join(dir, 'manifest.yaml'), 'format: 1\nlanguage: ar\ndirection: rtl\n');
@@ -231,5 +306,72 @@ describe('loadQuickPack — degrade semantics', () => {
     const { pack, warning } = await loadQuickPack(dir, {});
     assert.equal(pack, null);
     assert.match(warning, /^context_pack_unavailable:/);
+  });
+});
+
+// Regression: the style guide used to name Habakkuk twice (as the first
+// "Author References" example and in the "Here" Rule counter-example). In a
+// single-shot call those were the only book names in the prompt, so the model
+// anchored on them and named Habakkuk as the speaker while working in other
+// books. See issue #358.
+describe('speaker attribution — no book anchors in the prompt', () => {
+  const OTHER_BOOKS = Object.values(BOOK_NAMES).filter((n) => n !== 'Psalms');
+
+  // Word-boundary matching, so "Quotation Marks" is not read as the book Mark.
+  // A few book names are also ordinary English words (Mark, Job, Acts, Song);
+  // if legitimate prose ever trips this, reword the prose rather than naming a
+  // book — a book name in the style guide is exactly what caused #358.
+  test('TN_QUICK_STYLE names no specific book or its author', () => {
+    for (const name of OTHER_BOOKS) {
+      assert.ok(
+        !new RegExp(`\\b${name}\\b`).test(TN_QUICK_STYLE),
+        `TN_QUICK_STYLE must not name a specific book (found "${name}") — it anchors the speaker`,
+      );
+    }
+    assert.ok(!/\bMoses\b/.test(TN_QUICK_STYLE), 'no book-specific author names');
+  });
+
+  test('TN_QUICK_STYLE tells the model to derive the author from the Reference line', () => {
+    assert.match(TN_QUICK_STYLE, /Reference line/);
+    assert.match(TN_QUICK_STYLE, /traditional author/);
+  });
+
+  test('Psalms guidance survives (psalmist rules are book-specific on purpose)', () => {
+    assert.match(TN_QUICK_STYLE, /the psalmist/);
+  });
+});
+
+describe('buildUserMessage — Reference line', () => {
+  const templateInfo = { templates: [{ id: 'figs-metaphor', text: 'SPEAKER speaks of X...' }] };
+
+  function refLine(book, chapter, verse) {
+    const body = BodySchema.parse({
+      ...validBody,
+      ref: { book, chapter, verse },
+    });
+    const msg = buildUserMessage({ body, templateInfo, hebrewQuote: 'רָשָׁע' });
+    return msg.split('\n')[0];
+  }
+
+  test('spells out the book name alongside the code', () => {
+    assert.equal(refLine('JER', 24, 5), 'Reference: JER 24:5 (Jeremiah)');
+  });
+
+  test('lowercase book codes are upcased and still resolve a name', () => {
+    assert.equal(refLine('hab', 1, 4), 'Reference: HAB 1:4 (Habakkuk)');
+  });
+
+  test('numbered books use the spaced display form', () => {
+    assert.equal(refLine('1SA', 3, 1), 'Reference: 1SA 3:1 (1 Samuel)');
+  });
+
+  test('an unknown code degrades to the bare code rather than throwing', () => {
+    assert.equal(refLine('ZZZ', 1, 1), 'Reference: ZZZ 1:1');
+  });
+});
+
+describe('BOOK_NAMES', () => {
+  test('covers exactly the codes BOOK_NUMBERS accepts', () => {
+    assert.deepEqual(Object.keys(BOOK_NAMES).sort(), Object.keys(BOOK_NUMBERS).sort());
   });
 });
