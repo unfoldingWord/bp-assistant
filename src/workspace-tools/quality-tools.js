@@ -196,6 +196,36 @@ function extractAts(noteText) {
 }
 
 /**
+ * Blank the contents of AT [...] brackets, preserving the string's length and
+ * every character outside those ranges.
+ *
+ * Checks that scan the whole note (bold accuracy, check 8) would otherwise also
+ * report spans sitting inside AT brackets. Markdown inside brackets is owned by
+ * the `at_markdown` check, so masking keeps one span from being reported twice
+ * under two different labels.
+ *
+ * Traversal mirrors extractAts() so the two stay in agreement about what counts
+ * as AT bracket content.
+ */
+function maskAtBracketContent(noteText) {
+  const chars = noteText.split('');
+  const atLineRe = /Alternate translation:\s*(.*?)(?=\n|$)/g;
+  let m;
+  while ((m = atLineRe.exec(noteText)) !== null) {
+    const atLine = m[1];
+    // m[1] is the tail of m[0], so the captured line starts this far in.
+    const lineStart = m.index + m[0].length - atLine.length;
+    const bracketRe = /\[([^\]]+)\]/g;
+    let bm;
+    while ((bm = bracketRe.exec(atLine)) !== null) {
+      const contentStart = lineStart + bm.index + 1;
+      for (let i = 0; i < bm[1].length; i++) chars[contentStart + i] = ' ';
+    }
+  }
+  return chars.join('');
+}
+
+/**
  * Parse Hebrew USFM into a map of { "ch:vs": [wordToken, ...] }.
  * Extracts \w word|...\w* tokens by verse.
  */
@@ -564,6 +594,17 @@ async function checkTnQuality({ tsvPath, preparedJson, ultUsfm, ustUsfm, book, h
     // Extract ATs for this note
     const ats = extractAts(n.note);
 
+    // 5b. AT bracket content must be plain text — no markdown formatting.
+    // An AT is by design a minimal edit of the ULT that keeps ULT wording, so
+    // bolded wording copied from the ULT inside brackets passes check 8
+    // silently (the text *is* in the ULT). Nothing else inspects bracket
+    // content, so this check owns it.
+    for (const at of ats) {
+      if (at.includes('*')) {
+        addFinding(n.row, n.ref, n.id, 'error', 'at_markdown', `AT contains markdown formatting: "${at.slice(0, 50)}"`);
+      }
+    }
+
     // 6. AT text must NOT appear verbatim in UST verse
     if (ustVerse && ats.length) {
       for (const at of ats) {
@@ -628,7 +669,9 @@ async function checkTnQuality({ tsvPath, preparedJson, ultUsfm, ustUsfm, book, h
     // 8. Bold accuracy — normalized comparison (curly vs straight quotes,
     // whitespace, case): curly_quotes runs on the TSV before this check, so a
     // raw includes() would flag valid spans whose apostrophes were curled.
-    const boldMatches = n.note.match(/\*\*([^*]+)\*\*/g) || [];
+    // AT bracket content is masked out: markdown there is reported by
+    // `at_markdown` (5b), not as a bold-accuracy problem.
+    const boldMatches = maskAtBracketContent(n.note).match(/\*\*([^*]+)\*\*/g) || [];
     for (const bold of boldMatches) {
       const text = bold.slice(2, -2);
       if (ultVerse && countCaseInsensitiveOccurrences(ultVerse, text) === 0) {
