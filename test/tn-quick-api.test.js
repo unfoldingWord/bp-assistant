@@ -15,6 +15,7 @@ const {
   TN_QUICK_STYLE,
   TN_QUICK_PACK_FRAME,
   checkAtFit,
+  extractAlternateTranslations,
 } = require('../src/api/tn-quick');
 const { BOOK_NUMBERS, BOOK_NAMES } = require('../src/api-runner/verse-data');
 const { loadQuickPack, _resetForTests } = require('../src/lib/quick-context');
@@ -288,6 +289,137 @@ describe('buildSystemPrompt', () => {
     );
     // No frame when there is no pack to reconcile against.
     assert.ok(!buildSystemPrompt({ pack: null }).includes(TN_QUICK_PACK_FRAME));
+  });
+});
+
+describe('TN_QUICK_STYLE — speaker identification (#358)', () => {
+  test('names no specific book, so a single-shot call cannot anchor on one', () => {
+    assert.doesNotMatch(TN_QUICK_STYLE, /Habakkuk/);
+  });
+
+  test('tells the model to derive the speaker from the reference', () => {
+    assert.match(TN_QUICK_STYLE, /Reference line/);
+    assert.match(TN_QUICK_STYLE, /traditional author/);
+    assert.match(TN_QUICK_STYLE, /superscription/);
+  });
+});
+
+
+describe('buildUserMessage', () => {
+  const templateInfo = { templates: [{ id: 't1', text: 'SPEAKER is speaking of X as if it were Y' }] };
+
+  test('the Reference line carries the full book name', () => {
+    const msg = buildUserMessage({
+      body: { ...validBody, ref: { book: 'JER', chapter: 24, verse: 5 } },
+      templateInfo,
+      hebrewQuote: 'רָשָׁע',
+    });
+    assert.match(msg, /^Reference: JER 24:5 \(Jeremiah\)$/m);
+  });
+
+  test('still emits the phrases, templates, and both context blocks', () => {
+    const msg = buildUserMessage({ body: validBody, templateInfo, hebrewQuote: 'רָשָׁע' });
+    assert.match(msg, /ULT support phrase: "the wicked surround the righteous"/);
+    assert.match(msg, /UST parallel phrase: /);
+    assert.match(msg, /ULT v\. 4 \[TARGET VERSE\]: /);
+    assert.match(msg, /UST v\. 4 \[TARGET VERSE\]: /);
+    assert.match(msg, /SPEAKER is speaking of X as if it were Y/);
+  });
+});
+
+describe('extractAlternateTranslations', () => {
+  test('finds a single bracketed AT', () => {
+    assert.deepEqual(
+      extractAlternateTranslations('He is speaking of X as if it were Y. Alternate translation: [he traveled]'),
+      ['he traveled'],
+    );
+  });
+
+  test('finds both options when a note offers two', () => {
+    assert.deepEqual(extractAlternateTranslations('Alternate translation: [a] or [b]'), ['a', 'b']);
+  });
+
+  test('finds ATs across multiple lines', () => {
+    assert.deepEqual(
+      extractAlternateTranslations('Alternate translation: [x]\nAlternate translation: [y]'),
+      ['x', 'y'],
+    );
+  });
+
+  test('returns nothing for a note with no AT, and never throws on empty input', () => {
+    assert.deepEqual(extractAlternateTranslations('These two phrases mean basically the same thing.'), []);
+    assert.deepEqual(extractAlternateTranslations(''), []);
+    assert.deepEqual(extractAlternateTranslations(undefined), []);
+  });
+});
+
+describe('checkAtFit — drop-in check (#359)', () => {
+  test('a clean drop-in produces no warnings', () => {
+    assert.deepEqual(checkAtFit({
+      noteText: 'Alternate translation: [in my suffering]',
+      verse: 'And in my distress I called to Yahweh.',
+      selection: 'in my distress',
+    }), []);
+  });
+
+  test('a note with no AT is never warned about', () => {
+    assert.deepEqual(checkAtFit({
+      noteText: 'These two phrases mean basically the same thing.',
+      verse: 'And he went to the city.',
+      selection: 'he went',
+    }), []);
+  });
+
+  test('warns when the selected phrase is not in the verse', () => {
+    const w = checkAtFit({
+      noteText: 'Alternate translation: [he traveled]',
+      verse: 'And he went to the city.',
+      selection: 'a phrase from some other verse',
+    });
+    assert.equal(w.length, 1);
+    assert.match(w[0], /^at_fit_unverified: /);
+  });
+
+  test('warns when substitution leaves the verse starting with a lowercase word', () => {
+    const w = checkAtFit({
+      noteText: 'Alternate translation: [he traveled]',
+      verse: 'And he went to the city.',
+      selection: 'And he went',
+    });
+    assert.equal(w.length, 1);
+    assert.match(w[0], /^at_fit_capitalization: /);
+  });
+
+  test('warns on terminal punctuation inside the brackets, but not on an ellipsis', () => {
+    const punct = checkAtFit({
+      noteText: 'Alternate translation: [he traveled.]',
+      verse: 'And he went to the city.',
+      selection: 'he went',
+    });
+    assert.equal(punct.length, 1);
+    assert.match(punct[0], /^at_fit_punctuation: /);
+
+    assert.deepEqual(checkAtFit({
+      noteText: 'Alternate translation: [he traveled…]',
+      verse: 'And he went to the city.',
+      selection: 'he went',
+    }), []);
+  });
+
+  test('warns on a doubled space introduced by the substitution', () => {
+    const w = checkAtFit({
+      noteText: 'Alternate translation: [he  traveled]',
+      verse: 'And he went to the city.',
+      selection: 'he went',
+    });
+    assert.equal(w.length, 1);
+    assert.match(w[0], /^at_fit_spacing: /);
+  });
+
+  test('degrades quietly when the verse or selection is missing', () => {
+    const note = 'Alternate translation: [he traveled]';
+    assert.deepEqual(checkAtFit({ noteText: note, verse: '', selection: 'he went' }), []);
+    assert.deepEqual(checkAtFit({ noteText: note, verse: 'And he went.', selection: '' }), []);
   });
 });
 

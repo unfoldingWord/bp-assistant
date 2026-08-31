@@ -18,9 +18,8 @@ const {
   parseHebrewVerseWords,
   normalizeHebrewQuote,
 } = require('../workspace-tools/quality-tools');
-const { loadQuickPack, renderQuickPackText, langName } = require('../lib/quick-context');
 const { substituteAT } = require('../workspace-tools/tn-tools');
-
+const { loadQuickPack, renderQuickPackText, langName } = require('../lib/quick-context');
 let _agentSdkQuery = null;
 async function getAgentSdkQuery() {
   if (!_agentSdkQuery) {
@@ -232,6 +231,18 @@ function checkAtFit({ note, selection, verse }) {
     const preview = substituteAT(verseText, sel, trimmed);
     if (preview === null) {
       warnings.push(`at_fit: could not substitute "${trimmed}" — the selected phrase was not found in the ULT verse`);
+      continue;
+    }
+    if (/ {2}/.test(preview) && !/ {2}/.test(verseText)) {
+      warnings.push(`at_fit_spacing: substituting "${trimmed}" leaves a doubled space in the verse`);
+    }
+    if (/^[A-Z]/.test(verseText.trim()) && /^[a-z]/.test(preview.trim())) {
+      warnings.push(`at_fit_capitalization: substituting "${trimmed}" leaves the verse starting with a lowercase word`);
+    }
+    // The style rules put no punctuation at the end of the brackets; an
+    // ellipsis is the exception, since it joins the parts of a discontinuous AT.
+    if (/[.!?]$/.test(trimmed) && !/(?:…|\.{3})$/.test(trimmed)) {
+      warnings.push(`at_fit_punctuation: alternate translation "${trimmed}" ends with sentence punctuation inside the brackets`);
     }
   }
   return warnings;
@@ -371,6 +382,21 @@ function buildUserMessage({ body, templateInfo, hebrewQuote }) {
     '',
     'Draft ONE translation note for the ULT support phrase above. Output ONLY the note text.',
   ].join('\n');
+}
+
+// An AT is written as `Alternate translation: [text]`, sometimes with a second
+// option (`... [a] or [b]`) on the same line, and a note may carry none at all.
+function extractAlternateTranslations(noteText) {
+  const ats = [];
+  const re = /Alternate translation:\s*(.+)/gi;
+  let m;
+  while ((m = re.exec(String(noteText || ''))) !== null) {
+    for (const bracket of m[1].match(/\[[^\]]*\]/g) || []) {
+      const at = bracket.slice(1, -1).trim();
+      if (at) ats.push(at);
+    }
+  }
+  return ats;
 }
 
 // Timeout for one model call. There was previously none here at all, so a hung
@@ -651,6 +677,8 @@ module.exports = {
   BodySchema,
   buildSystemPrompt,
   buildUserMessage,
+  checkAtFit,
+  extractAlternateTranslations,
   TN_QUICK_STYLE,
   TN_QUICK_PACK_FRAME,
   TN_QUICK_TERM_STATUSES,
