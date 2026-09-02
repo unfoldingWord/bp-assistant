@@ -20,6 +20,7 @@ const { getDoor43Username, emailToFallbackUsername, buildBranchName, resolveOutp
 const { splitTsv, fixTrailingNewlines } = require('./workspace-tools/tsv-tools');
 const { fillTsvIds, generateIds, prepareNotes, fillOrigQuotes, resolveGlQuotes, flagNarrowQuotes, extractAlignmentData, prepareATContext, substituteAT, fixUnicodeQuotes, verifyBoldMatches, syncCanonicalHebrewQuotes, applyHintsToPreparedNotes, _stripAlternateTranslation: stripAlternateTranslation } = require('./workspace-tools/tn-tools');
 const { checkTnQuality, detectSelfTalk, templateFirstPhrase, resolveTemplateText } = require('./workspace-tools/quality-tools');
+const { buildBookRecurrenceIndex, deriveRecurrenceKeys, buildSeeHowSentence, isSeeHowEligible, hebTokens, verseNumber: recurrenceVerseNumber, SEE_HOW_NEVER_FOLD_SREFS } = require('./workspace-tools/recurrence-index');
 const { normalizeIssuesFile, buildParallelismIntroHintArgs } = require('./issue-normalizer');
 const { curlyQuotes } = require('./workspace-tools/usfm-tools');
 const { verifyRepoPush, verifyDcsToken, verifyRemoteContent } = require('./repo-verify');
@@ -308,113 +309,352 @@ async function runMechanicalPrep({ issuesPath, pipeDir, status }) {
 }
 
 /**
- * "See how" detection pass — groups recurring issue patterns within a chapter
- * and marks subsequent occurrences as back-references to the first.
+ * Build the book-scoped recurrence index for the current chapter and write it
+ * to recurrence_index.json.
  *
- * Runs after mechanical prep, modifies prepared_notes.json in place.
- * Items marked with see_how get a programmatic "See how you translated..."
- * note instead of a full template-based note.
+ * Degrades gracefully on purpose: a missing aligned book or a missing local
+ * en_tn clone simply yields a smaller index, and same-chapter see-how folding
+ * (which needs only the prepared items) still works without it.
  *
  * @param {object} args
  * @param {string} args.pipeDir - Pipeline working directory
- * @returns {string} Summary of see-how detections
+ * @returns {object} The index that was written
  */
-function runSeeHowDetection({ pipeDir }) {
+function buildRecurrenceIndexFile({ pipeDir }) {
+  const ctx = readContext(pipeDir);
+  const prepPath = path.resolve(CSKILLBP_DIR, ctx.runtime.preparedNotes);
+  const prepared = JSON.parse(fs.readFileSync(prepPath, 'utf8'));
+  const book = String(prepared.book || ctx.book || '').toUpperCase();
+  const chapter = parseInt(prepared.chapter || ctx.chapter, 10) || 0;
+
+  const readRel = (rel) => {
+    if (!rel) return '';
+    try {
+      const abs = path.resolve(CSKILLBP_DIR, rel);
+      return fs.existsSync(abs) ? fs.readFileSync(abs, 'utf8') : '';
+    } catch { return ''; }
+  };
+
+  const sources = ctx.sources || {};
+  const ultFullUsfm = readRel(sources.ultFull);
+  if (!ultFullUsfm) console.warn('[notes] Recurrence index: no full aligned ULT — cross-chapter spans unavailable');
+  const hebrewUsfm = readRel(sources.hebrew);
+
+  const reposPath = process.env.DOOR43_REPOS_PATH || '/srv/bot/workspace/door43-repos';
+  const tnClonePath = path.join(reposPath, 'en_tn', `tn_${book}.tsv`);
+  let tnBookTsv = '';
+  try {
+    if (fs.existsSync(tnClonePath)) tnBookTsv = fs.readFileSync(tnClonePath, 'utf8');
+  } catch { tnBookTsv = ''; }
+  if (!tnBookTsv) console.warn(`[notes] Recurrence index: no merged TN TSV at ${tnClonePath} — cross-chapter pointers unavailable`);
+
+  let alignmentData = {};
+  try {
+    alignmentData = JSON.parse(fs.readFileSync(path.resolve(CSKILLBP_DIR, ctx.runtime.alignmentData), 'utf8')) || {};
+  } catch { alignmentData = {}; }
+
+  const index = buildBookRecurrenceIndex({
+    book,
+    chapter,
+    ultFullUsfm,
+    hebrewUsfm,
+    tnBookTsv,
+    preparedItems: prepared.items || [],
+    alignmentData,
+  });
+
+  const outRel = (ctx.runtime && ctx.runtime.recurrenceIndex) || `${pipeDir}/recurrence_index.json`;
+  const outPath = path.resolve(CSKILLBP_DIR, outRel);
+  fs.mkdirSync(path.dirname(outPath), { recursive: true });
+  fs.writeFileSync(outPath, JSON.stringify(index));
+  console.log(`[notes] Recurrence index: ${index.counts.keys} keys (${index.counts.noteRows} earlier note rows, ${index.counts.corpusSpans} corpus spans) → ${outRel}`);
+  return index;
+}
+
+const SEE_HOW_ZERO_SUMMARY = '0 see-how back-refs, 0 folded, 0 injected, 0 also-occurs lists, 0 same-verse combinations';
+
+/**
+ * "See how" detection pass.
+ *
+ * Rule 1 (same chapter): later occurrences of a phrase that already carries a
+ *   note in this chapter are removed from the prepared list; their verses are
+ *   collected onto the first item as `also_occurs_verses`, rendered as
+ *   "This also occurs in verses …" when the TSV is assembled.
+ * Rule 2 (earlier chapter): the chapter's first occurrence of a phrase already
+ *   noted in an earlier chapter becomes a pointer to the FIRST occurrence in the
+ *   book that carries a note. Never the nearest, never a chain, never forward,
+ *   and never a pointer to nothing.
+ * Phase 3 (injection): when the chapter's first occurrence of such a phrase has
+ *   no prepared item at all, one is synthesized so the pointer still ships.
+ *
+ * Runs after mechanical prep and after the recurrence index is written; modifies
+ * prepared_notes.json in place.
+ *
+ * @param {object} args
+ * @param {string} args.pipeDir - Pipeline working directory
+ * @returns {Promise<string>} Summary of see-how detections
+ */
+async function runSeeHowDetection({ pipeDir, generateIdsFn = generateIds }) {
   const ctx = readContext(pipeDir);
   const prepPath = path.resolve(CSKILLBP_DIR, ctx.runtime.preparedNotes);
   const prepared = JSON.parse(fs.readFileSync(prepPath, 'utf8'));
   const items = prepared.items || [];
+  const book = String(prepared.book || ctx.book || '').toUpperCase();
+  const chapter = parseInt(prepared.chapter || ctx.chapter, 10) || 0;
 
-  if (items.length === 0) return '0 items';
+  let alignmentData = {};
+  try {
+    alignmentData = JSON.parse(fs.readFileSync(path.resolve(CSKILLBP_DIR, ctx.runtime.alignmentData), 'utf8')) || {};
+  } catch { alignmentData = {}; }
 
-  // Group items by issue type (sref)
-  const bySref = {};
+  let index = { byKey: {} };
+  const indexRel = (ctx.runtime && ctx.runtime.recurrenceIndex) || `${pipeDir}/recurrence_index.json`;
+  try {
+    const parsed = JSON.parse(fs.readFileSync(path.resolve(CSKILLBP_DIR, indexRel), 'utf8'));
+    if (parsed && parsed.byKey) index = parsed;
+  } catch { /* same-chapter behaviour still works without the index */ }
+
+  const verseOf = (ref) => String(ref || '').split(':')[1] || '';
+  const chapterOf = (ref) => parseInt(String(ref || '').split(':')[0], 10) || 0;
+  const sortByRef = (a, b) =>
+    (chapterOf(a.reference) - chapterOf(b.reference)) ||
+    (recurrenceVerseNumber(verseOf(a.reference)) - recurrenceVerseNumber(verseOf(b.reference)));
+
+  // Per-item keys. Both key forms are recorded so an index entry registered
+  // under the Strong's form and one registered under the text form both match.
+  const keysFor = new Map();
   for (const item of items) {
-    if (!item.sref) continue;
-    // Hint-driven items carry their own framing (seed prose); skip see-how
-    // detection so we don't overwrite the seed with a programmatic back-ref.
-    if (item.fromHint) continue;
-    if (!bySref[item.sref]) bySref[item.sref] = [];
-    bySref[item.sref].push(item);
+    const alignKey = `${chapterOf(item.reference)}:${recurrenceVerseNumber(verseOf(item.reference))}`;
+    const derived = deriveRecurrenceKeys({
+      origQuote: item.orig_quote || '',
+      alignmentEntries: alignmentData[alignKey] || [],
+    });
+    keysFor.set(item, derived);
   }
+  const primaryKey = (item) => {
+    const k = keysFor.get(item) || {};
+    return k.strongKey || k.textKey || '';
+  };
+
+  const occurrencesFor = (key) => (index.byKey && index.byKey[key]) || [];
+  const earlierNotedTarget = (key) => {
+    for (const occ of occurrencesFor(key)) {
+      if (occ.source !== 'tn') continue;
+      if (!occ.note) continue;
+      if (!occ.chapter || (chapter && occ.chapter >= chapter)) continue;
+      // Never point at an article that wants its own note at every occurrence.
+      if (SEE_HOW_NEVER_FOLD_SREFS.has(String(occ.sref || ''))) continue;
+      return occ;
+    }
+    return null;
+  };
+  const targetBoldQuote = (occ) => {
+    const m = String((occ && occ.note) || '').match(/\*\*([^*]+)\*\*/);
+    return m ? m[1].trim() : '';
+  };
+
+  const applyPointer = (item, key, target) => {
+    const targetSref = target.sref || '';
+    const bold = targetBoldQuote(target);
+    const glQuote = String(item.gl_quote || '').trim();
+    const sameSref = !!(targetSref && item.sref && targetSref === item.sref);
+    const sameWording = !!(bold && glQuote && bold.toLowerCase() === glQuote.toLowerCase());
+    let note = buildSeeHowSentence({
+      book,
+      targetRef: target.ref,
+      glQuote,
+      sameSref,
+      sameWording,
+      sref: targetSref || item.sref || '',
+    });
+    if (!note) return false;
+    if (item.at_provided) note += ` Alternate translation: [${item.at_provided}]`;
+    item.programmatic_note = note;
+    item.note_type = 'see_how';
+    item.tags = '';
+    item.support_reference = targetSref;
+    item.see_how_target = target.ref;
+    item.writer_packet = Object.assign({}, item.writer_packet || {}, { programmatic_note: note });
+    item.prompt = `Return only this note exactly as written:\n${note}`;
+    return true;
+  };
 
   let seeHowCount = 0;
   let combinedCount = 0;
+  let foldedCount = 0;
+  let injectedCount = 0;
+  let alsoOccursCount = 0;
 
-  for (const [sref, group] of Object.entries(bySref)) {
-    if (group.length < 2) continue;
+  // Hint-driven items carry their own framing (seed prose); leave them alone.
+  const candidates = items.filter((it) => !it.fromHint && primaryKey(it));
 
-    // Further group by gl_quote similarity (Hebrew pattern)
-    // Use a simple approach: group items with the same gl_quote text
-    const byQuote = {};
-    for (const item of group) {
-      const key = (item.gl_quote || '').toLowerCase().trim();
-      if (!key) continue;
-      if (!byQuote[key]) byQuote[key] = [];
-      byQuote[key].push(item);
-    }
-
-    for (const [, quoteGroup] of Object.entries(byQuote)) {
-      if (quoteGroup.length < 2) continue;
-
-      // Sort by verse reference to find the first occurrence
-      quoteGroup.sort((a, b) => {
-        const [aCh, aVs] = (a.reference || '').split(':').map(Number);
-        const [bCh, bVs] = (b.reference || '').split(':').map(Number);
-        return (aCh - bCh) || (aVs - bVs);
-      });
-
-      // Check for same-verse duplicates
-      const verseGroups = {};
-      for (const item of quoteGroup) {
-        const vs = item.reference;
-        if (!verseGroups[vs]) verseGroups[vs] = [];
-        verseGroups[vs].push(item);
-      }
-
-      for (const [vs, vsItems] of Object.entries(verseGroups)) {
-        if (vsItems.length > 1) {
-          // Same verse, same quote, same issue type — flag for combination
-          for (let i = 1; i < vsItems.length; i++) {
-            vsItems[i]._combine_with = vsItems[0].id;
-            combinedCount++;
-          }
-        }
-      }
-
-      // Mark subsequent cross-verse occurrences as "see how"
-      const canonicalItem = quoteGroup[0]; // First occurrence is canonical
-      const canonicalRef = canonicalItem.reference;
-
-      for (let i = 1; i < quoteGroup.length; i++) {
-        const item = quoteGroup[i];
-        // Skip same-verse items (handled as combinations above)
-        if (item.reference === canonicalRef) continue;
-        // Skip items already flagged
-        if (item._combine_with) continue;
-
-        // Build "see how" reference
-        const [ch, vs] = canonicalRef.split(':');
-        const bookLower = (prepared.book || '').toLowerCase();
-        const chPad = String(ch).padStart(prepared.book === 'PSA' ? 3 : 2, '0');
-        const vsPad = String(vs).padStart(2, '0');
-
-        item.programmatic_note = `See how you translated the similar expression in [${canonicalRef}](../${chPad}/${vsPad}.md).`;
-        if (item.at_provided) {
-          item.programmatic_note += ` Alternate translation: [${item.at_provided}]`;
-        }
-        item.note_type = 'see_how';
-        seeHowCount++;
-      }
+  // Same-verse duplicates keep the existing "combine" behaviour.
+  const sameVerseGroups = new Map();
+  for (const item of candidates) {
+    const gk = `${item.reference}|${item.sref || ''}|${primaryKey(item)}`;
+    if (!sameVerseGroups.has(gk)) sameVerseGroups.set(gk, []);
+    sameVerseGroups.get(gk).push(item);
+  }
+  for (const group of sameVerseGroups.values()) {
+    for (let i = 1; i < group.length; i++) {
+      group[i]._combine_with = group[0].id;
+      combinedCount++;
     }
   }
 
-  // Write back modified prepared notes
-  if (seeHowCount > 0 || combinedCount > 0) {
+  // Every key the chapter already covers — hint-driven items included, so
+  // injection never duplicates a note that is already being written.
+  const chapterKeys = new Set();
+  for (const item of items) {
+    const derived = keysFor.get(item) || {};
+    if (derived.strongKey) chapterKeys.add(derived.strongKey);
+    if (derived.textKey) chapterKeys.add(derived.textKey);
+  }
+
+  // Rule 1 + rule 2, grouped by recurrence key across the chapter. Articles on
+  // the never-fold list want a note at every occurrence, so they are excluded
+  // from grouping entirely; same-verse combining above still applies to them.
+  const byKeyItems = new Map();
+  for (const item of candidates) {
+    if (item._combine_with) continue;
+    if (SEE_HOW_NEVER_FOLD_SREFS.has(String(item.sref || ''))) continue;
+    const key = primaryKey(item);
+    if (!byKeyItems.has(key)) byKeyItems.set(key, []);
+    byKeyItems.get(key).push(item);
+  }
+
+  const removed = new Set();
+  for (const [key, group] of byKeyItems.entries()) {
+    group.sort(sortByRef);
+    const first = group[0];
+    const firstVerse = recurrenceVerseNumber(verseOf(first.reference));
+    const alsoVerses = [];
+    // One word can legitimately carry two different figurative notes in a
+    // chapter ("hand" as metonymy in v2, as metaphor in v8). Fold a later item
+    // only when it is the same kind of note, or when the key is see-how
+    // eligible (multi-word, or a consistency-bearing single-word article).
+    const foldsAnySref = isSeeHowEligible(key, first.sref);
+
+    for (let i = 1; i < group.length; i++) {
+      const later = group[i];
+      if (later.reference === first.reference) continue;
+      if (!foldsAnySref && String(later.sref || '') !== String(first.sref || '')) continue;
+      removed.add(later);
+      alsoVerses.push(verseOf(later.reference));
+      foldedCount++;
+    }
+
+    // The index knows every span, including repeats the issue finder never
+    // flagged. Only worth listing when the key is see-how eligible — otherwise
+    // a figs-metonymy note on "hand" would list every literal "hand" nearby.
+    if (foldsAnySref) {
+      for (const occ of occurrencesFor(key)) {
+        if (occ.source !== 'corpus') continue;
+        if (occ.chapter !== chapter) continue;
+        if (recurrenceVerseNumber(occ.verse) <= firstVerse) continue;
+        alsoVerses.push(String(occ.verse));
+      }
+    }
+    if (alsoVerses.length) {
+      const seen = new Set();
+      const list = alsoVerses.filter((v) => {
+        if (!v || seen.has(v)) return false;
+        seen.add(v);
+        return true;
+      });
+      if (list.length) {
+        first.also_occurs_verses = list;
+        alsoOccursCount++;
+      }
+    }
+
+    const target = earlierNotedTarget(key);
+    if (target && isSeeHowEligible(key, target.sref || first.sref)) {
+      if (applyPointer(first, key, target)) seeHowCount++;
+    }
+  }
+
+  // Phase 3 — inject a pointer where the chapter's first occurrence of an
+  // already-noted phrase produced no prepared item at all.
+  const injections = [];
+  const injectedAt = new Set();
+  for (const key of Object.keys(index.byKey || {})) {
+    if (chapterKeys.has(key)) continue;
+    const target = earlierNotedTarget(key);
+    if (!target) continue;
+    if (!isSeeHowEligible(key, target.sref)) continue;
+    const here = occurrencesFor(key)
+      .filter((o) => o.source === 'corpus' && o.chapter === chapter)
+      .sort((a, b) => recurrenceVerseNumber(a.verse) - recurrenceVerseNumber(b.verse));
+    if (!here.length) continue;
+    const firstOcc = here[0];
+    // A phrase is registered under both its Strong's and its text key; dedupe on
+    // the concrete verse + quote so it is only injected once.
+    const dedupe = `${firstOcc.ref}|${hebTokens(firstOcc.quote).join('+')}`;
+    if (injectedAt.has(dedupe)) continue;
+    injectedAt.add(dedupe);
+    injections.push({ key, target, firstOcc, later: here.slice(1) });
+  }
+
+  let newIds = [];
+  if (injections.length > 0) {
+    try {
+      const idStr = await generateIdsFn({ book, count: injections.length });
+      newIds = String(idStr).split('\n').filter(Boolean);
+    } catch (err) {
+      console.warn(`[notes] See-how injection: ID generation failed (${err.message})`);
+      newIds = [];
+    }
+  }
+
+  for (let i = 0; i < injections.length; i++) {
+    const { key, target, firstOcc, later } = injections[i];
+    const id = newIds[i] || '';
+    if (!id) continue;
+    const item = {
+      index: items.length,
+      reference: firstOcc.ref,
+      id,
+      sref: target.sref || '',
+      support_reference: target.sref || '',
+      tags: '',
+      gl_quote: '',
+      issue_span_gl_quote: '',
+      scope_mode: 'focused_span',
+      needs_at: false,
+      at_provided: '',
+      at_policy: 'not_needed',
+      at_required: false,
+      explanation: '',
+      orig_quote: firstOcc.quote || '',
+      ult_verse: '',
+      ust_verse: '',
+      note_type: 'see_how',
+      injected_see_how: true,
+      hebrew_front_words: [],
+      tcm_mode: false,
+    };
+    if (!applyPointer(item, key, target)) continue;
+    if (later.length) item.also_occurs_verses = later.map((o) => String(o.verse));
+    items.push(item);
+    injectedCount++;
+    seeHowCount++;
+  }
+
+  if (removed.size > 0) {
+    prepared.items = items.filter((it) => !removed.has(it));
+  } else {
+    prepared.items = items;
+  }
+  prepared.item_count = prepared.items.length;
+
+  // alsoOccursCount matters here: a chapter can gain nothing but an "also
+  // occurs" list, and that change still has to reach prepared_notes.json.
+  if (seeHowCount > 0 || combinedCount > 0 || foldedCount > 0 || injectedCount > 0 || alsoOccursCount > 0) {
     fs.writeFileSync(prepPath, JSON.stringify(prepared, null, 2));
   }
 
-  const summary = `${seeHowCount} see-how back-refs, ${combinedCount} same-verse combinations`;
+  const summary = `${seeHowCount} see-how back-refs, ${foldedCount} folded, ${injectedCount} injected, ${alsoOccursCount} also-occurs lists, ${combinedCount} same-verse combinations`;
   console.log(`[notes] See-how detection: ${summary}`);
   return summary;
 }
@@ -1823,6 +2063,7 @@ async function runParallelTnWriter({
         shardCtx.runtime.preparedNotes = `tmp/pipeline/${tag}/shards/${stem}.prepared_notes.json`;
         shardCtx.runtime.generatedNotes = `tmp/pipeline/${tag}/shards/${stem}.generated_notes.json`;
         shardCtx.runtime.alignmentData = `tmp/pipeline/${tag}/shards/${stem}.alignment_data.json`;
+        shardCtx.runtime.recurrenceIndex = `tmp/pipeline/${tag}/shards/${stem}.recurrence_index.json`;
         shardCtx.runtime.tnQualityFindings = `tmp/pipeline/${tag}/shards/${stem}.quality_findings.json`;
         fs.writeFileSync(shardCtxAbs, JSON.stringify(shardCtx, null, 2));
         shardCtxFlag = ` --context ${shardCtxRel}`;
@@ -2452,10 +2693,19 @@ async function notesPipeline(route, message) {
             console.warn(`[notes] Quote cleanup step failed (non-fatal): ${err.message}`);
           }
 
+          // Build the book-scoped recurrence index. Non-fatal: without it the
+          // detector still folds same-chapter repeats, it just cannot point at
+          // earlier chapters.
+          try {
+            buildRecurrenceIndexFile({ pipeDir });
+          } catch (indexErr) {
+            console.warn(`[notes] Recurrence index build failed (non-fatal): ${indexErr.message}`);
+          }
+
           // Run see-how detection after mechanical prep
           try {
-            const seeHowSummary = runSeeHowDetection({ pipeDir });
-            if (seeHowSummary !== '0 see-how back-refs, 0 same-verse combinations') {
+            const seeHowSummary = await runSeeHowDetection({ pipeDir });
+            if (seeHowSummary !== SEE_HOW_ZERO_SUMMARY) {
               await status(`**${ref}**: See-how detection — ${seeHowSummary}`);
             }
           } catch (seeHowErr) {
@@ -3534,6 +3784,9 @@ module.exports = {
   _postProcessNotesTsv: postProcessNotesTsv,
   _finalCanonicalHebrewQuoteSync: finalCanonicalHebrewQuoteSync,
   _runMechanicalQualityPrep: runMechanicalQualityPrep,
+  _runSeeHowDetection: runSeeHowDetection,
+  _buildRecurrenceIndexFile: buildRecurrenceIndexFile,
+  _SEE_HOW_ZERO_SUMMARY: SEE_HOW_ZERO_SUMMARY,
   _repairSelfTalkNotes: repairSelfTalkNotes,
   _hasPauseBeforeATsFlag: hasPauseBeforeATsFlag,
   _buildAtGenerationCheckpoint: buildAtGenerationCheckpoint,

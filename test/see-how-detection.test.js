@@ -1,0 +1,539 @@
+const test = require('node:test');
+const assert = require('node:assert/strict');
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+
+// CSKILLBP_DIR is captured when pipeline-utils loads, so it must be set before
+// notes-pipeline is required.
+const WORKSPACE = fs.mkdtempSync(path.join(os.tmpdir(), 'see-how-'));
+process.env.CSKILLBP_DIR = WORKSPACE;
+process.env.DOOR43_REPOS_PATH = path.join(WORKSPACE, 'door43-repos');
+
+const {
+  _runSeeHowDetection: runSeeHowDetection,
+  _buildRecurrenceIndexFile: buildRecurrenceIndexFile,
+  _SEE_HOW_ZERO_SUMMARY: SEE_HOW_ZERO_SUMMARY,
+} = require('../src/notes-pipeline');
+const { assembleNotes } = require('../src/workspace-tools/tn-tools');
+
+const WORD_OF_YAHWEH = 'דְּבַר־יְהוָ֖ה';
+
+function alignedWord(strong, content, words) {
+  return `\\zaln-s |x-strong="${strong}" x-lemma="l" x-occurrence="1" x-content="${content}"\\*` +
+    words.map((w) => `\\w ${w}|x-occurrence="1"\\w*`).join(' ') +
+    '\\zaln-e\\*';
+}
+
+function wordOfYahwehSpan() {
+  return `${alignedWord('H1697', 'דְּבַר', ['the', 'word'])} ${alignedWord('H3068', 'יְהוָ֖ה', ['of', 'Yahweh'])}`;
+}
+
+const ALIGNED_BOOK = [
+  '\\id ZEC',
+  '\\c 1',
+  '\\p',
+  `\\v 1 ${wordOfYahwehSpan()}`,
+  '\\c 2',
+  '\\p',
+  `\\v 4 ${wordOfYahwehSpan()}`,
+  '\\c 3',
+  '\\p',
+  `\\v 2 ${wordOfYahwehSpan()}`,
+  `\\v 5 ${wordOfYahwehSpan()}`,
+  `\\v 7 ${wordOfYahwehSpan()}`,
+  `\\v 8 ${alignedWord('H3027', 'יָ֣ד', ['hand'])}`,
+  `\\v 9 ${alignedWord('H4325', 'מַ֫יִם', ['water'])}`,
+  `\\v 12 ${alignedWord('H3027', 'יָ֣ד', ['hand'])}`,
+  '',
+].join('\n');
+
+// UHB fixture: the only source carrying the literal maqaf between the two words.
+const HEBREW_BOOK = [
+  '\\id ZEC',
+  '\\c 3',
+  '\\v 2 \\w דְּבַר|lemma="דָּבָר" strong="H1697"\\w*־\\w יְהוָ֖ה|lemma="יְהֹוָה" strong="H3068"\\w*',
+  '\\v 5 \\w דְּבַר|lemma="דָּבָר" strong="H1697"\\w*־\\w יְהוָ֖ה|lemma="יְהֹוָה" strong="H3068"\\w*',
+  '\\v 7 \\w דְּבַר|lemma="דָּבָר" strong="H1697"\\w*־\\w יְהוָ֖ה|lemma="יְהֹוָה" strong="H3068"\\w*',
+  '',
+].join('\n');
+
+const TN_BOOK_TSV = [
+  'Reference\tID\tTags\tSupportReference\tQuote\tOccurrence\tNote',
+  'front:intro\tyx6e\t\t\t\t0\t# Introduction',
+  `1:1\tabcd\t\trc://*/ta/man/translate/figs-possession\t${WORD_OF_YAHWEH}\t1\tThe possessive form **the word of Yahweh** describes a message from Yahweh.`,
+  `2:4\tefgh\t\trc://*/ta/man/translate/figs-possession\t${WORD_OF_YAHWEH}\t1\tSee how you translated the similar expression in [1:1](../01/01.md).`,
+  '',
+].join('\n');
+
+const ALIGNMENT_DATA = {
+  '3:2': [{ heb: 'דְּבַר', strong: 'H1697' }, { heb: 'יְהוָ֖ה', strong: 'H3068' }],
+  '3:5': [{ heb: 'דְּבַר', strong: 'H1697' }, { heb: 'יְהוָ֖ה', strong: 'H3068' }],
+  '3:7': [{ heb: 'דְּבַר', strong: 'H1697' }, { heb: 'יְהוָ֖ה', strong: 'H3068' }],
+};
+
+let dirCounter = 0;
+
+/**
+ * Lay out a pipeline directory in the fake workspace and return its relative path.
+ */
+function setupPipeDir({
+  book = 'ZEC',
+  chapter = '3',
+  items = [],
+  tnBookTsv = TN_BOOK_TSV,
+  alignedBook = ALIGNED_BOOK,
+  alignmentData = ALIGNMENT_DATA,
+  hebrewBook = '',
+  preparedName = 'prepared_notes.json',
+} = {}) {
+  const dirPath = `tmp/pipeline/${book}-${String(chapter).padStart(2, '0')}-${dirCounter++}`;
+  const abs = path.join(WORKSPACE, dirPath);
+  fs.mkdirSync(abs, { recursive: true });
+
+  fs.writeFileSync(path.join(abs, 'ult.usfm'), alignedBook);
+  if (hebrewBook) fs.writeFileSync(path.join(abs, 'hebrew.usfm'), hebrewBook);
+  fs.writeFileSync(path.join(abs, preparedName), JSON.stringify({
+    book, chapter, item_count: items.length, items,
+  }, null, 2));
+  fs.writeFileSync(path.join(abs, 'alignment_data.json'), JSON.stringify(alignmentData));
+  fs.writeFileSync(path.join(abs, 'generated_notes.json'), '{}');
+
+  const clone = path.join(WORKSPACE, 'door43-repos', 'en_tn');
+  fs.mkdirSync(clone, { recursive: true });
+  const tnPath = path.join(clone, `tn_${book}.tsv`);
+  if (tnBookTsv) fs.writeFileSync(tnPath, tnBookTsv);
+  else if (fs.existsSync(tnPath)) fs.unlinkSync(tnPath);
+
+  fs.writeFileSync(path.join(abs, 'context.json'), JSON.stringify({
+    version: 1,
+    pipeline: 'notes',
+    book,
+    chapter: Number(chapter),
+    sources: {
+      ultFull: `${dirPath}/ult.usfm`,
+      hebrew: hebrewBook ? `${dirPath}/hebrew.usfm` : null,
+    },
+    runtime: {
+      preparedNotes: `${dirPath}/${preparedName}`,
+      generatedNotes: `${dirPath}/generated_notes.json`,
+      alignmentData: `${dirPath}/alignment_data.json`,
+      recurrenceIndex: `${dirPath}/recurrence_index.json`,
+      tnQualityFindings: `${dirPath}/tn_quality_findings.json`,
+    },
+    artifacts: {},
+  }, null, 2));
+
+  return dirPath;
+}
+
+function readPrepared(dirPath, preparedName = 'prepared_notes.json') {
+  return JSON.parse(fs.readFileSync(path.join(WORKSPACE, dirPath, preparedName), 'utf8'));
+}
+
+const stubIds = ({ count }) => Array.from({ length: count }, (_, i) => `z${String(i).padStart(3, '0')}`).join('\n');
+
+function item(overrides) {
+  return Object.assign({
+    index: 0,
+    reference: '3:2',
+    id: 'aaaa',
+    sref: 'figs-possession',
+    gl_quote: 'the word of Yahweh',
+    issue_span_gl_quote: 'the word of Yahweh',
+    orig_quote: WORD_OF_YAHWEH,
+    at_provided: '',
+    explanation: 'The possessive describes a message.',
+    note_type: 'given_at',
+  }, overrides);
+}
+
+test('rule 1: later same-chapter items fold into the first item\'s also-occurs list', async () => {
+  const dirPath = setupPipeDir({
+    items: [
+      item({ reference: '3:2', id: 'aaaa', index: 0 }),
+      item({ reference: '3:5', id: 'bbbb', index: 1 }),
+      item({ reference: '3:7', id: 'cccc', index: 2 }),
+    ],
+    tnBookTsv: '',
+  });
+  buildRecurrenceIndexFile({ pipeDir: dirPath });
+  const summary = await runSeeHowDetection({ pipeDir: dirPath, generateIdsFn: stubIds });
+
+  const prepared = readPrepared(dirPath);
+  assert.deepEqual(prepared.items.map((it) => it.id), ['aaaa'], 'later occurrences are removed');
+  assert.deepEqual(prepared.items[0].also_occurs_verses, ['5', '7']);
+  assert.equal(prepared.item_count, 1);
+  assert.match(summary, /2 folded/);
+});
+
+test('rule 2: the chapter\'s first occurrence points at the FIRST noted occurrence in the book, not the nearest', async () => {
+  const dirPath = setupPipeDir({
+    items: [item({ reference: '3:2', id: 'aaaa' }), item({ reference: '3:5', id: 'bbbb', index: 1 })],
+  });
+  buildRecurrenceIndexFile({ pipeDir: dirPath });
+  await runSeeHowDetection({ pipeDir: dirPath, generateIdsFn: stubIds });
+
+  const first = readPrepared(dirPath).items[0];
+  assert.equal(first.note_type, 'see_how');
+  assert.equal(
+    first.programmatic_note,
+    'See how you translated **the word of Yahweh** in [1:1](../01/01.md).',
+    'target is 1:1 (book-first noted), not 2:4 (nearest)'
+  );
+  assert.equal(first.tags, '');
+  assert.equal(first.support_reference, 'figs-possession', 'SupportReference inherited from the target row');
+  assert.deepEqual(first.also_occurs_verses, ['5', '7']);
+});
+
+test('no pointer is emitted when no earlier chapter has a note for the key', async () => {
+  const dirPath = setupPipeDir({
+    items: [item({ reference: '3:2', id: 'aaaa' })],
+    tnBookTsv: [
+      'Reference\tID\tTags\tSupportReference\tQuote\tOccurrence\tNote',
+      '1:1\tabcd\t\trc://*/ta/man/translate/figs-metaphor\tמַ֫יִם\t1\tSomething else entirely.',
+      '',
+    ].join('\n'),
+  });
+  buildRecurrenceIndexFile({ pipeDir: dirPath });
+  const summary = await runSeeHowDetection({ pipeDir: dirPath, generateIdsFn: stubIds });
+
+  const first = readPrepared(dirPath).items[0];
+  assert.equal(first.programmatic_note, undefined);
+  assert.equal(first.note_type, 'given_at');
+  assert.match(summary, /^0 see-how back-refs/);
+});
+
+test('pointers never run forward: a note only in a later chapter is not a target', async () => {
+  const dirPath = setupPipeDir({
+    chapter: '1',
+    items: [item({ reference: '1:1', id: 'aaaa' })],
+    alignmentData: { '1:1': ALIGNMENT_DATA['3:2'] },
+  });
+  buildRecurrenceIndexFile({ pipeDir: dirPath });
+  await runSeeHowDetection({ pipeDir: dirPath, generateIdsFn: stubIds });
+
+  const first = readPrepared(dirPath).items[0];
+  assert.equal(first.programmatic_note, undefined, 'chapter 1 has nothing earlier to point at');
+});
+
+test('phase 3: a pointer is injected when the chapter flagged nothing for an already-noted phrase', async () => {
+  const dirPath = setupPipeDir({ items: [] });
+  buildRecurrenceIndexFile({ pipeDir: dirPath });
+  const summary = await runSeeHowDetection({ pipeDir: dirPath, generateIdsFn: stubIds });
+
+  const prepared = readPrepared(dirPath);
+  assert.equal(prepared.items.length, 1, 'exactly one injected item per key per chapter');
+  const injected = prepared.items[0];
+  assert.equal(injected.reference, '3:2', 'injected on the chapter\'s first occurrence');
+  assert.equal(injected.note_type, 'see_how');
+  assert.equal(injected.injected_see_how, true);
+  assert.equal(injected.at_policy, 'not_needed');
+  assert.equal(injected.id, 'z000');
+  assert.match(injected.programmatic_note, /\[1:1\]\(\.\.\/01\/01\.md\)/);
+  assert.deepEqual(injected.also_occurs_verses, ['5', '7']);
+  assert.match(summary, /1 injected/);
+});
+
+test('at_provided is appended to the pointer note', async () => {
+  const dirPath = setupPipeDir({
+    items: [item({ reference: '3:2', id: 'aaaa', at_provided: 'the message from Yahweh' })],
+  });
+  buildRecurrenceIndexFile({ pipeDir: dirPath });
+  await runSeeHowDetection({ pipeDir: dirPath, generateIdsFn: stubIds });
+
+  const first = readPrepared(dirPath).items[0];
+  assert.match(first.programmatic_note, /Alternate translation: \[the message from Yahweh\]$/);
+});
+
+test('fromHint items are left alone', async () => {
+  const dirPath = setupPipeDir({
+    items: [
+      item({ reference: '3:2', id: 'aaaa', fromHint: true, programmatic_note: 'Seed prose.' }),
+      item({ reference: '3:5', id: 'bbbb', index: 1, fromHint: true, programmatic_note: 'Other seed prose.' }),
+    ],
+  });
+  buildRecurrenceIndexFile({ pipeDir: dirPath });
+  const summary = await runSeeHowDetection({ pipeDir: dirPath, generateIdsFn: stubIds });
+
+  const prepared = readPrepared(dirPath);
+  assert.equal(prepared.items.length, 2, 'hint-driven items are neither folded nor duplicated by injection');
+  assert.equal(prepared.items[0].programmatic_note, 'Seed prose.');
+  assert.match(summary, /0 injected/);
+});
+
+test('same-verse duplicates keep the _combine_with behaviour', async () => {
+  const dirPath = setupPipeDir({
+    items: [
+      item({ reference: '3:2', id: 'aaaa' }),
+      item({ reference: '3:2', id: 'bbbb', index: 1 }),
+    ],
+    tnBookTsv: '',
+  });
+  buildRecurrenceIndexFile({ pipeDir: dirPath });
+  const summary = await runSeeHowDetection({ pipeDir: dirPath, generateIdsFn: stubIds });
+
+  const prepared = readPrepared(dirPath);
+  assert.equal(prepared.items.length, 2, 'same-verse duplicates are combined, not removed');
+  assert.equal(prepared.items[1]._combine_with, 'aaaa');
+  assert.match(summary, /1 same-verse combinations/);
+});
+
+test('a missing TN clone and a missing aligned book degrade gracefully; folding still works', async () => {
+  const dirPath = setupPipeDir({
+    items: [item({ reference: '3:2', id: 'aaaa' }), item({ reference: '3:5', id: 'bbbb', index: 1 })],
+    tnBookTsv: '',
+    alignedBook: '',
+  });
+  buildRecurrenceIndexFile({ pipeDir: dirPath });
+  const summary = await runSeeHowDetection({ pipeDir: dirPath, generateIdsFn: stubIds });
+
+  const prepared = readPrepared(dirPath);
+  assert.equal(prepared.items.length, 1);
+  assert.deepEqual(prepared.items[0].also_occurs_verses, ['5']);
+  assert.match(summary, /0 see-how back-refs/);
+});
+
+test('detection is a no-op on an empty chapter with no index', async () => {
+  const dirPath = setupPipeDir({ items: [], tnBookTsv: '', alignedBook: '' });
+  buildRecurrenceIndexFile({ pipeDir: dirPath });
+  const summary = await runSeeHowDetection({ pipeDir: dirPath, generateIdsFn: stubIds });
+  assert.equal(summary, SEE_HOW_ZERO_SUMMARY);
+});
+
+test('PSA pointers pad chapter and verse to three digits', async () => {
+  const psaAligned = [
+    '\\id PSA', '\\c 78', '\\p', `\\v 1 ${wordOfYahwehSpan()}`,
+    '\\c 79', '\\p', `\\v 3 ${wordOfYahwehSpan()}`, '',
+  ].join('\n');
+  const psaTsv = [
+    'Reference\tID\tTags\tSupportReference\tQuote\tOccurrence\tNote',
+    `78:1\tabcd\t\trc://*/ta/man/translate/figs-possession\t${WORD_OF_YAHWEH}\t1\tExplanatory note.`,
+    '',
+  ].join('\n');
+  const dirPath = setupPipeDir({
+    book: 'PSA',
+    chapter: '79',
+    items: [item({ reference: '79:3', id: 'aaaa' })],
+    tnBookTsv: psaTsv,
+    alignedBook: psaAligned,
+    alignmentData: { '79:3': ALIGNMENT_DATA['3:2'] },
+  });
+  buildRecurrenceIndexFile({ pipeDir: dirPath });
+  await runSeeHowDetection({ pipeDir: dirPath, generateIdsFn: stubIds });
+
+  const first = readPrepared(dirPath).items[0];
+  assert.match(first.programmatic_note, /\[78:1\]\(\.\.\/078\/001\.md\)/);
+});
+
+test('the also-occurs sentence lands before the Alternate translation clause at TSV assembly', async () => {
+  const dirPath = setupPipeDir({
+    items: [item({ reference: '3:2', id: 'aaaa' }), item({ reference: '3:5', id: 'bbbb', index: 1 })],
+    tnBookTsv: '',
+  });
+  buildRecurrenceIndexFile({ pipeDir: dirPath });
+  await runSeeHowDetection({ pipeDir: dirPath, generateIdsFn: stubIds });
+
+  fs.writeFileSync(
+    path.join(WORKSPACE, dirPath, 'generated_notes.json'),
+    JSON.stringify({ aaaa: 'The possessive form describes a message. Alternate translation: [a message from Yahweh]' })
+  );
+  assembleNotes({
+    preparedJson: `${dirPath}/prepared_notes.json`,
+    generatedJson: `${dirPath}/generated_notes.json`,
+    output: `${dirPath}/out.tsv`,
+  });
+  const tsv = fs.readFileSync(path.join(WORKSPACE, dirPath, 'out.tsv'), 'utf8');
+  const noteCol = tsv.split('\n')[1].split('\t')[6];
+  assert.equal(
+    noteCol,
+    'The possessive form describes a message. This also occurs in verses 5 and 7. Alternate translation: [a message from Yahweh]'
+  );
+});
+
+test('shard prepared files carry note_type and also_occurs_verses through detection', async () => {
+  // Parallel tn-writer shards get their own runtime paths and re-run mechanical
+  // prep + detection; the see-how fields must survive into the shard file.
+  const dirPath = setupPipeDir({
+    items: [item({ reference: '3:2', id: 'aaaa' }), item({ reference: '3:5', id: 'bbbb', index: 1 })],
+    preparedName: 'ZEC-03-v1-9.prepared_notes.json',
+  });
+  buildRecurrenceIndexFile({ pipeDir: dirPath });
+  await runSeeHowDetection({ pipeDir: dirPath, generateIdsFn: stubIds });
+
+  const prepared = readPrepared(dirPath, 'ZEC-03-v1-9.prepared_notes.json');
+  assert.equal(prepared.items[0].note_type, 'see_how');
+  assert.deepEqual(prepared.items[0].also_occurs_verses, ['5', '7']);
+});
+
+// --- F1: fold gating -------------------------------------------------------
+
+const HAND = 'יָ֣ד';
+
+function handItem(overrides) {
+  return Object.assign({
+    index: 0,
+    reference: '3:2',
+    id: 'aaaa',
+    sref: 'figs-metonymy',
+    gl_quote: 'hand',
+    issue_span_gl_quote: 'hand',
+    orig_quote: HAND,
+    at_provided: '',
+    explanation: 'The hand stands for power.',
+    note_type: 'given_at',
+  }, overrides);
+}
+
+test('F1: one single word carrying two different figurative notes is NOT folded', async () => {
+  const dirPath = setupPipeDir({
+    items: [
+      handItem({ reference: '3:2', id: 'aaaa', sref: 'figs-metonymy' }),
+      handItem({ reference: '3:8', id: 'bbbb', index: 1, sref: 'figs-metaphor' }),
+    ],
+    tnBookTsv: '',
+    alignmentData: {},
+  });
+  buildRecurrenceIndexFile({ pipeDir: dirPath });
+  const summary = await runSeeHowDetection({ pipeDir: dirPath, generateIdsFn: stubIds });
+
+  const prepared = readPrepared(dirPath);
+  assert.deepEqual(prepared.items.map((it) => it.id), ['aaaa', 'bbbb'], 'both notes survive');
+  assert.equal(prepared.items[0].also_occurs_verses, undefined);
+  assert.match(summary, /0 folded/);
+});
+
+test('F1: the same single word with the same sref still folds', async () => {
+  const dirPath = setupPipeDir({
+    items: [
+      handItem({ reference: '3:2', id: 'aaaa' }),
+      handItem({ reference: '3:8', id: 'bbbb', index: 1 }),
+    ],
+    tnBookTsv: '',
+    alignmentData: {},
+  });
+  buildRecurrenceIndexFile({ pipeDir: dirPath });
+  await runSeeHowDetection({ pipeDir: dirPath, generateIdsFn: stubIds });
+
+  const prepared = readPrepared(dirPath);
+  assert.deepEqual(prepared.items.map((it) => it.id), ['aaaa']);
+  // F2: an ineligible key must not pull in corpus spans, so verse 12 (a literal
+  // "hand" the issue finder never flagged) is absent.
+  assert.deepEqual(prepared.items[0].also_occurs_verses, ['8']);
+});
+
+test('F1: a multi-word key folds across different srefs', async () => {
+  const dirPath = setupPipeDir({
+    items: [
+      item({ reference: '3:2', id: 'aaaa', sref: 'figs-possession' }),
+      item({ reference: '3:5', id: 'bbbb', index: 1, sref: 'figs-abstractnouns' }),
+    ],
+    tnBookTsv: '',
+  });
+  buildRecurrenceIndexFile({ pipeDir: dirPath });
+  await runSeeHowDetection({ pipeDir: dirPath, generateIdsFn: stubIds });
+
+  const prepared = readPrepared(dirPath);
+  assert.deepEqual(prepared.items.map((it) => it.id), ['aaaa']);
+  assert.deepEqual(prepared.items[0].also_occurs_verses, ['5', '7']);
+});
+
+test('F1: writing-foreground is never folded, never pointed, never injected', async () => {
+  const hinneh = 'הִנֵּ֥ה';
+  const alignedBook = [
+    '\\id ZEC', '\\c 1', '\\p',
+    `\\v 1 ${alignedWord('H2009', hinneh, ['behold'])}`,
+    '\\c 3', '\\p',
+    `\\v 2 ${alignedWord('H2009', hinneh, ['behold'])}`,
+    `\\v 5 ${alignedWord('H2009', hinneh, ['behold'])}`,
+    `\\v 7 ${alignedWord('H2009', hinneh, ['behold'])}`,
+    '',
+  ].join('\n');
+  const tsv = [
+    'Reference\tID\tTags\tSupportReference\tQuote\tOccurrence\tNote',
+    `1:1\tabcd\t\trc://*/ta/man/translate/writing-foreground\t${hinneh}\t1\tThe word **behold** draws attention to what follows.`,
+    '',
+  ].join('\n');
+  const dirPath = setupPipeDir({
+    items: [
+      handItem({ reference: '3:2', id: 'aaaa', sref: 'writing-foreground', orig_quote: hinneh, gl_quote: 'behold' }),
+      handItem({ reference: '3:5', id: 'bbbb', index: 1, sref: 'writing-foreground', orig_quote: hinneh, gl_quote: 'behold' }),
+    ],
+    tnBookTsv: tsv,
+    alignedBook,
+    alignmentData: {},
+  });
+  buildRecurrenceIndexFile({ pipeDir: dirPath });
+  const summary = await runSeeHowDetection({ pipeDir: dirPath, generateIdsFn: stubIds });
+
+  const prepared = readPrepared(dirPath);
+  assert.deepEqual(prepared.items.map((it) => it.id), ['aaaa', 'bbbb'], 'every occurrence keeps its note');
+  assert.equal(prepared.items[0].programmatic_note, undefined, 'never rewritten as a pointer');
+  assert.equal(prepared.items[0].also_occurs_verses, undefined);
+  assert.equal(summary, SEE_HOW_ZERO_SUMMARY, 'nothing folded, pointed or injected');
+});
+
+test('F1: a writing-foreground row in an earlier chapter is never a pointer target', async () => {
+  const tsv = [
+    'Reference\tID\tTags\tSupportReference\tQuote\tOccurrence\tNote',
+    `1:1\tabcd\t\trc://*/ta/man/translate/writing-foreground\t${WORD_OF_YAHWEH}\t1\tAn earlier foregrounding note.`,
+    '',
+  ].join('\n');
+  const dirPath = setupPipeDir({ items: [item({ reference: '3:2', id: 'aaaa' })], tnBookTsv: tsv });
+  buildRecurrenceIndexFile({ pipeDir: dirPath });
+  const summary = await runSeeHowDetection({ pipeDir: dirPath, generateIdsFn: stubIds });
+
+  assert.equal(readPrepared(dirPath).items[0].programmatic_note, undefined);
+  assert.match(summary, /^0 see-how back-refs/);
+  assert.match(summary, /0 injected/);
+});
+
+// --- F2: corpus spans only for eligible keys --------------------------------
+
+test('F2: corpus spans ARE appended for an eligible (multi-word) key', async () => {
+  const dirPath = setupPipeDir({
+    items: [item({ reference: '3:2', id: 'aaaa' })],
+    tnBookTsv: '',
+  });
+  buildRecurrenceIndexFile({ pipeDir: dirPath });
+  await runSeeHowDetection({ pipeDir: dirPath, generateIdsFn: stubIds });
+
+  const first = readPrepared(dirPath).items[0];
+  assert.deepEqual(first.also_occurs_verses, ['5', '7'], 'unflagged repeats the index found');
+});
+
+test('F2: corpus spans are NOT appended for an ineligible single-word key', async () => {
+  const dirPath = setupPipeDir({
+    items: [handItem({ reference: '3:2', id: 'aaaa' })],
+    tnBookTsv: '',
+    alignmentData: {},
+  });
+  buildRecurrenceIndexFile({ pipeDir: dirPath });
+  await runSeeHowDetection({ pipeDir: dirPath, generateIdsFn: stubIds });
+
+  const first = readPrepared(dirPath).items[0];
+  assert.equal(first.also_occurs_verses, undefined, 'literal "hand" in 3:8 and 3:12 is not listed');
+});
+
+// --- F3: injected quotes are the exact source span --------------------------
+
+test('F3: an injected orig_quote reproduces the maqaf-joined source span exactly', async () => {
+  const dirPath = setupPipeDir({ items: [], hebrewBook: HEBREW_BOOK });
+  buildRecurrenceIndexFile({ pipeDir: dirPath });
+  await runSeeHowDetection({ pipeDir: dirPath, generateIdsFn: stubIds });
+
+  const injected = readPrepared(dirPath).items[0];
+  assert.equal(injected.injected_see_how, true);
+  assert.ok(injected.orig_quote.includes('־'), 'maqaf preserved');
+  assert.equal(injected.orig_quote, WORD_OF_YAHWEH, 'byte-for-byte the source span');
+});
+
+test('F3: without a UHB source the injected quote falls back to a space-join', async () => {
+  const dirPath = setupPipeDir({ items: [] });
+  buildRecurrenceIndexFile({ pipeDir: dirPath });
+  await runSeeHowDetection({ pipeDir: dirPath, generateIdsFn: stubIds });
+
+  const injected = readPrepared(dirPath).items[0];
+  assert.equal(injected.orig_quote.includes('־'), false);
+  assert.match(injected.orig_quote, / /);
+});

@@ -466,9 +466,44 @@ function detectSelfTalk(noteText) {
   return null;
 }
 
+/**
+ * Parse a TN Reference column value ("C:V", "C:V-V2", "C:V,V2", "C:intro", ...)
+ * into { chapter, ranges: [[start, end], ...] }, or null for intro/front/
+ * unparseable references. Shared by the see-how link guardrails (checkTnQuality
+ * check 26) to resolve whether a pointer's target chapter:verse is covered by
+ * a row — including verse-bridge rows, whose range covers every verse in it.
+ */
+function parseReferenceRanges(ref) {
+  const m = String(ref || '').match(/^(\d+):(.+)$/);
+  if (!m) return null;
+  const versePart = m[2];
+  if (versePart === 'intro' || versePart === 'front') return null;
+  const chapter = parseInt(m[1], 10);
+  const ranges = [];
+  for (const seg of versePart.split(',')) {
+    const rm = seg.trim().match(/^(\d+)(?:-(\d+))?$/);
+    if (!rm) continue;
+    const start = parseInt(rm[1], 10);
+    const end = rm[2] ? parseInt(rm[2], 10) : start;
+    ranges.push([start, end]);
+  }
+  return ranges.length ? { chapter, ranges } : null;
+}
+
+/** True when any Reference value in `refs` covers chapter:verse (bridges included). */
+function referencesCoverVerse(refs, chapter, verse) {
+  for (const ref of refs) {
+    const parsed = parseReferenceRanges(ref);
+    if (parsed && parsed.chapter === chapter && parsed.ranges.some(([s, e]) => verse >= s && verse <= e)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 // --- check_tn_quality ---
 
-async function checkTnQuality({ tsvPath, preparedJson, ultUsfm, ustUsfm, book, hebrewUsfm, output }) {
+async function checkTnQuality({ tsvPath, preparedJson, ultUsfm, ustUsfm, book, hebrewUsfm, output, bookTsvRows, bookTsvPath }) {
   const tsv = path.resolve(CSKILLBP_DIR, tsvPath);
   const content = fs.readFileSync(tsv, 'utf8');
   const lines = content.split('\n');
@@ -535,6 +570,32 @@ async function checkTnQuality({ tsvPath, preparedJson, ultUsfm, ustUsfm, book, h
   let upstreamIds = null;
   if (book) {
     upstreamIds = await fetchUpstreamIds(book);
+  }
+
+  // Merged book TSV for see-how target resolution (check 26). Explicit
+  // bookTsvRows (strings or {reference}/{ref} objects) wins over a path; the
+  // default path mirrors where the nightly export keeps the per-book merge.
+  const currentRefs = notes.map((n) => n.ref);
+  let bookTsvAvailable = false;
+  let mergedBookRefs = [];
+  if (bookTsvRows) {
+    bookTsvAvailable = true;
+    mergedBookRefs = bookTsvRows.map((r) => (typeof r === 'string' ? r : (r && (r.reference || r.ref)) || ''));
+  } else if (book) {
+    const defaultBookTsvPath = bookTsvPath || path.join(
+      process.env.DOOR43_REPOS_PATH || '/srv/bot/workspace/door43-repos',
+      'en_tn',
+      `tn_${book.toUpperCase()}.tsv`
+    );
+    const resolvedBookTsvPath = path.resolve(CSKILLBP_DIR, defaultBookTsvPath);
+    if (fs.existsSync(resolvedBookTsvPath)) {
+      bookTsvAvailable = true;
+      const bookLines = fs.readFileSync(resolvedBookTsvPath, 'utf8').split('\n');
+      for (let i = 1; i < bookLines.length; i++) {
+        const bl = bookLines[i].trim();
+        if (bl) mergedBookRefs.push(bl.split('\t')[0] || '');
+      }
+    }
   }
 
   const findings = [];
@@ -1065,6 +1126,83 @@ async function checkTnQuality({ tsvPath, preparedJson, ultUsfm, ustUsfm, book, h
         }
       }
     }
+
+    // 26. See-how link guardrails (docs/plan.md "Phase 4 — Guardrails"). Every
+    // see-how pointer targets the FIRST occurrence in the book, never forward.
+    {
+      const ownRef = parseReferenceRanges(n.ref);
+      const CANONICAL_LINK_RE = /\[[^\]]*\]\(\.\.\/(\d{2,3})\/(\d{2,3})\.md\)/g;
+      let lm;
+      while ((lm = CANONICAL_LINK_RE.exec(n.note)) !== null) {
+        const targetChapter = parseInt(lm[1], 10);
+        const targetVerse = parseInt(lm[2], 10);
+
+        // A link to the note's own verse (including its own bridge) is not a
+        // real pointer — ignore rather than flag as forward/missing.
+        if (ownRef && ownRef.chapter === targetChapter
+          && ownRef.ranges.some(([s, e]) => targetVerse >= s && targetVerse <= e)) {
+          continue;
+        }
+
+        // 26a. Forward pointer — pointers must only ever point backward.
+        if (ownRef) {
+          const ownStart = ownRef.ranges[0][0];
+          if (targetChapter > ownRef.chapter || (targetChapter === ownRef.chapter && targetVerse > ownStart)) {
+            addFinding(n.row, n.ref, n.id, 'error', 'seehow_forward_pointer',
+              `See-how link points forward to ${targetChapter}:${targetVerse}, after this note's own reference`);
+          }
+        }
+
+        // 26b. Target existence — current output TSV, else the merged book TSV.
+        const inCurrent = referencesCoverVerse(currentRefs, targetChapter, targetVerse);
+        const inBook = bookTsvAvailable && referencesCoverVerse(mergedBookRefs, targetChapter, targetVerse);
+        if (!inCurrent && !inBook) {
+          if (bookTsvAvailable) {
+            addFinding(n.row, n.ref, n.id, 'error', 'seehow_target_missing',
+              `See-how link target ${targetChapter}:${targetVerse} has no matching row in the output TSV or merged book TSV`);
+          } else {
+            addFinding(n.row, n.ref, n.id, 'warning', 'seehow_target_unverified',
+              `See-how link target ${targetChapter}:${targetVerse} could not be verified — merged book TSV unavailable`);
+          }
+        }
+      }
+
+      // 26c. "see how you rendered" is never valid phrasing (zero corpus hits).
+      if (/see how you rendered/i.test(n.note)) {
+        addFinding(n.row, n.ref, n.id, 'warning', 'seehow_noncanonical',
+          '"see how you rendered" is not valid phrasing — use "see how you translated"');
+      }
+
+      // 26d. A "See how you translated" note whose link path isn't the
+      // canonical ../CC/VV.md shape (e.g. the old ../../book/1/5.md format).
+      if (/see how you translated/i.test(n.note)) {
+        const ANY_LINK_RE = /\]\(([^)]+)\)/g;
+        let alm;
+        while ((alm = ANY_LINK_RE.exec(n.note)) !== null) {
+          const linkPath = alm[1];
+          if (!/^\.\.\/\d{2,3}\/\d{2,3}\.md$/.test(linkPath)) {
+            addFinding(n.row, n.ref, n.id, 'warning', 'seehow_noncanonical',
+              `See-how link path "${linkPath}" does not match the canonical ../CC/VV.md format`);
+          }
+        }
+      }
+
+      // 26e. Chapter/verse padding: 3 digits for PSA, 2 digits elsewhere.
+      {
+        const PAD_LINK_RE = /\[[^\]]*\]\(\.\.\/(\d{2,3})\/(\d{2,3})\.md\)/g;
+        const isPsa = book && book.toUpperCase() === 'PSA';
+        const expectedLen = isPsa ? 3 : 2;
+        let pm;
+        while ((pm = PAD_LINK_RE.exec(n.note)) !== null) {
+          const chStr = pm[1];
+          const vsStr = pm[2];
+          if (chStr.length !== expectedLen || vsStr.length !== expectedLen) {
+            addFinding(n.row, n.ref, n.id, 'warning', 'seehow_noncanonical',
+              `See-how link "../${chStr}/${vsStr}.md" does not use ${expectedLen}-digit padding for ${isPsa ? 'PSA' : 'this book'}`);
+          }
+        }
+      }
+    }
   }
 
   // Check 20c: Near-duplicate detection across adjacent verse notes with same issue slug
@@ -1142,4 +1280,6 @@ module.exports = {
   resolveTemplateText,
   parseHebrewVerseWords,
   normalizeHebrewQuote,
+  parseReferenceRanges,
+  referencesCoverVerse,
 };
