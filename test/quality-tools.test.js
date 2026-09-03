@@ -664,7 +664,7 @@ test('checkTnQuality seehow_noncanonical: "see how you rendered" and old-format 
     // "rendered" instead of "translated" — never valid, regardless of link shape.
     '3:1\ta1b2\t\t\t\t\tSee how you rendered the similar expression in [2:5](../02/05.md).',
     // "translated" with the old book-relative link format instead of ../CC/VV.md.
-    '3:2\tb2c3\t\t\t\t\tSee how you translated the similar expression in [2:5](../../book/02/05.md).',
+    '3:2\tb2c3\t\t\t\t\tSee how you translated the similar expression in [2:5](../../zec/02/05.md).',
   ].join('\n'));
 
   await checkTnQuality({ tsvPath: tsvRel, output: findingsRel });
@@ -769,4 +769,88 @@ test('checkTnQuality seehow_noncanonical: absolute links in a see-how note are n
 
   const nc = readFindings(findingsRel).filter((f) => f.category === 'seehow_noncanonical' && f.id === 'a1b2');
   assert.deepEqual(nc, [], 'the rc:// link is left alone');
+});
+
+// --- Round 3: S2 / S3 / S4 / S10 -------------------------------------------
+
+function writeQualityTsv(prefix, rows) {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+  const relRoot = path.join('tmp', path.basename(tempDir));
+  fs.mkdirSync(path.join('/srv/bot/workspace', relRoot), { recursive: true });
+  const tsvRel = path.join(relRoot, 'tn.tsv');
+  const findingsRel = path.join(relRoot, 'findings.json');
+  fs.writeFileSync(
+    path.join('/srv/bot/workspace', tsvRel),
+    ['Reference\tID\tTags\tSupportReference\tQuote\tOccurrence\tNote'].concat(rows).join('\n')
+  );
+  return { tsvRel, findingsRel };
+}
+
+test('S2: the deterministic also-occurs sentence is not multiverse language', async () => {
+  const shapes = [
+    'This also occurs in verses 5, 7, 8, and 11.',
+    'This also occurs in verses 5 and 7.',
+    'This also occurs in verse 5.',
+    'This also occurs in verses 3–5 and 9.',
+  ];
+  const rows = shapes.map((sentence, i) =>
+    `3:${i + 1}\tq${i}q${i}\t\t\t\t\tThe possessive form describes a message. ${sentence}`);
+  const { tsvRel, findingsRel } = writeQualityTsv('quality-alsooccurs-', rows);
+
+  await checkTnQuality({ tsvPath: tsvRel, output: findingsRel });
+
+  const noisy = readFindings(findingsRel)
+    .filter((f) => f.category === 'multiverse_language' || f.category === 'multiverse_backref');
+  assert.deepEqual(noisy, [], 'no multiverse findings for any also-occurs shape');
+});
+
+test('S3: an ordinary note that links forward is not a see-how pointer', async () => {
+  // Golden JOS 1 row w48w: "through [verse 9](../01/09.md)" in a plain note.
+  const { tsvRel, findingsRel } = writeQualityTsv('quality-forwardlink-', [
+    '1:5\tw48w\t\t\t\t\tThis command runs through [verse 9](../01/09.md) and shapes the paragraph.',
+  ]);
+
+  await checkTnQuality({ tsvPath: tsvRel, output: findingsRel });
+
+  const seeHow = readFindings(findingsRel).filter((f) => String(f.category).startsWith('seehow_'));
+  assert.deepEqual(seeHow, [], 'no see-how findings on a note without a pointer sentence');
+});
+
+test('S4: chapter intro rows are never treated as see-how pointers', async () => {
+  const { tsvRel, findingsRel } = writeQualityTsv('quality-intro-', [
+    '1:intro\tqki3\t\t\t\t0\t# Notes\\n\\nSee how you translated this in [1:7](../01/07.md) and [9:1](../09/01.md).',
+  ]);
+
+  await checkTnQuality({ tsvPath: tsvRel, output: findingsRel });
+
+  const seeHow = readFindings(findingsRel).filter((f) => String(f.category).startsWith('seehow_'));
+  assert.deepEqual(seeHow, [], 'intro rows are exempt');
+});
+
+test('S3: a forward link INSIDE a see-how sentence is still an error', async () => {
+  const { tsvRel, findingsRel } = writeQualityTsv('quality-forwardptr-', [
+    '2:1\tz9y8\t\t\t\t\tThe similar expression appears here.',
+    '2:1\ta1b2\t\t\t\t\tSee how you translated the similar expression in [2:5](../02/05.md).',
+  ]);
+
+  await checkTnQuality({ tsvPath: tsvRel, output: findingsRel });
+
+  assert.ok(readFindings(findingsRel).some(
+    (f) => f.id === 'a1b2' && f.category === 'seehow_forward_pointer' && f.severity === 'error'
+  ));
+});
+
+test('S10: tW and tA relative links in a see-how note are not flagged non-canonical', async () => {
+  const { tsvRel, findingsRel } = writeQualityTsv('quality-twlinks-', [
+    '2:5\tz0z0\t\t\t\t\tThe earlier note.',
+    '3:1\ta1b2\t\t\t\t\tSee how you translated the similar expression in [2:5](../02/05.md). ' +
+      '(See: [Yahweh](../../bible/kt/yahweh.md) and [Idiom](../../translate/figs-idiom/01.md))',
+  ]);
+
+  await checkTnQuality({ tsvPath: tsvRel, output: findingsRel });
+
+  const nc = readFindings(findingsRel).filter(
+    (f) => f.category === 'seehow_noncanonical' && f.id === 'a1b2'
+  );
+  assert.deepEqual(nc, [], 'only verse links are inspected');
 });

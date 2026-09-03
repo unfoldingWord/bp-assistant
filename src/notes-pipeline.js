@@ -20,7 +20,7 @@ const { getDoor43Username, emailToFallbackUsername, buildBranchName, resolveOutp
 const { splitTsv, fixTrailingNewlines } = require('./workspace-tools/tsv-tools');
 const { fillTsvIds, generateIds, prepareNotes, fillOrigQuotes, resolveGlQuotes, flagNarrowQuotes, extractAlignmentData, prepareATContext, substituteAT, fixUnicodeQuotes, verifyBoldMatches, syncCanonicalHebrewQuotes, applyHintsToPreparedNotes, _stripAlternateTranslation: stripAlternateTranslation } = require('./workspace-tools/tn-tools');
 const { checkTnQuality, detectSelfTalk, templateFirstPhrase, resolveTemplateText } = require('./workspace-tools/quality-tools');
-const { buildBookRecurrenceIndex, deriveRecurrenceKeys, buildSeeHowSentence, isSeeHowEligible, dedupeAlsoOccursVerses, selectAlsoOccursCarriers, hebTokens, verseNumber: recurrenceVerseNumber, SEE_HOW_NEVER_FOLD_SREFS } = require('./workspace-tools/recurrence-index');
+const { buildBookRecurrenceIndex, deriveRecurrenceKeys, buildSeeHowSentence, isSeeHowEligible, dedupeAlsoOccursVerses, selectAlsoOccursCarriers, resolveDoor43ReposPath, hebTokens, verseNumber: recurrenceVerseNumber, SEE_HOW_NEVER_FOLD_SREFS } = require('./workspace-tools/recurrence-index');
 const { normalizeIssuesFile, buildParallelismIntroHintArgs } = require('./issue-normalizer');
 const { curlyQuotes } = require('./workspace-tools/usfm-tools');
 const { verifyRepoPush, verifyDcsToken, verifyRemoteContent } = require('./repo-verify');
@@ -220,8 +220,20 @@ function runPythonWithTimeout(args, timeoutMs = 120000) {
  *
  * Returns a summary string for status reporting.
  */
-async function runMechanicalPrep({ issuesPath, pipeDir, status }) {
-  const ctx = readContext(pipeDir);
+/**
+ * Read a pipeline context either from `<pipeDir>/context.json` or from an
+ * explicit path. Parallel tn-writer shards get their own context file that
+ * does not live at the conventional location.
+ */
+function readContextAt(pipeDir, contextPath) {
+  if (contextPath) {
+    return JSON.parse(fs.readFileSync(path.resolve(CSKILLBP_DIR, contextPath), 'utf8'));
+  }
+  return readContext(pipeDir);
+}
+
+async function runMechanicalPrep({ issuesPath, pipeDir, contextPath, status }) {
+  const ctx = readContextAt(pipeDir, contextPath);
 
   // 0. Extract alignment data from aligned USFM before any steps that depend on it.
   //    Steps 1-3 all read alignment_data.json; it must be populated first.
@@ -320,8 +332,8 @@ async function runMechanicalPrep({ issuesPath, pipeDir, status }) {
  * @param {string} args.pipeDir - Pipeline working directory
  * @returns {object} The index that was written
  */
-function buildRecurrenceIndexFile({ pipeDir }) {
-  const ctx = readContext(pipeDir);
+function buildRecurrenceIndexFile({ pipeDir, contextPath }) {
+  const ctx = readContextAt(pipeDir, contextPath);
   const prepPath = path.resolve(CSKILLBP_DIR, ctx.runtime.preparedNotes);
   const prepared = JSON.parse(fs.readFileSync(prepPath, 'utf8'));
   const book = String(prepared.book || ctx.book || '').toUpperCase();
@@ -340,7 +352,7 @@ function buildRecurrenceIndexFile({ pipeDir }) {
   if (!ultFullUsfm) console.warn('[notes] Recurrence index: no full aligned ULT — cross-chapter spans unavailable');
   const hebrewUsfm = readRel(sources.hebrew);
 
-  const reposPath = process.env.DOOR43_REPOS_PATH || '/srv/bot/workspace/door43-repos';
+  const reposPath = resolveDoor43ReposPath(CSKILLBP_DIR);
   const tnClonePath = path.join(reposPath, 'en_tn', `tn_${book}.tsv`);
   let tnBookTsv = '';
   try {
@@ -371,7 +383,42 @@ function buildRecurrenceIndexFile({ pipeDir }) {
   return index;
 }
 
-const SEE_HOW_ZERO_SUMMARY = '0 see-how back-refs, 0 folded, 0 injected, 0 also-occurs lists, 0 same-verse combinations';
+/**
+ * Run mechanical prep, the recurrence index and see-how detection for one
+ * parallel tn-writer shard, against the shard's own context file.
+ *
+ * The chapter-level pass cannot serve the shards: each shard is handed fresh
+ * runtime paths, so the chapter's detection result never reaches the file the
+ * shard's writer session reads. Running it here means the shard's
+ * prepared_notes.json is already the post-detection one, with the shard's
+ * verseStart/verseEnd bounding injection and also-occurs lists.
+ *
+ * @returns {Promise<string|null>} the detection summary, or null on failure
+ */
+async function runShardSeeHowDetection({ contextPath, issuesPath, status, generateIdsFn }) {
+  const noop = async () => {};
+  try {
+    await runMechanicalPrep({ issuesPath, contextPath, status: status || noop });
+  } catch (err) {
+    console.warn(`[notes] Shard mechanical prep failed (non-fatal): ${err.message}`);
+    return null;
+  }
+  try {
+    buildRecurrenceIndexFile({ contextPath });
+  } catch (err) {
+    console.warn(`[notes] Shard recurrence index failed (non-fatal): ${err.message}`);
+  }
+  try {
+    const summary = await runSeeHowDetection({ contextPath, generateIdsFn });
+    console.log(`[notes] Shard see-how (${contextPath}): ${summary}`);
+    return summary;
+  } catch (err) {
+    console.warn(`[notes] Shard see-how detection failed (non-fatal): ${err.message}`);
+    return null;
+  }
+}
+
+const SEE_HOW_ZERO_SUMMARY = '0 see-how back-refs, 0 folded, 0 injected, 0 also-occurs lists, 0 skipped (inexact quote), 0 same-verse combinations';
 
 /**
  * "See how" detection pass.
@@ -394,8 +441,8 @@ const SEE_HOW_ZERO_SUMMARY = '0 see-how back-refs, 0 folded, 0 injected, 0 also-
  * @param {string} args.pipeDir - Pipeline working directory
  * @returns {Promise<string>} Summary of see-how detections
  */
-async function runSeeHowDetection({ pipeDir, generateIdsFn = generateIds }) {
-  const ctx = readContext(pipeDir);
+async function runSeeHowDetection({ pipeDir, contextPath, generateIdsFn = generateIds }) {
+  const ctx = readContextAt(pipeDir, contextPath);
   const prepPath = path.resolve(CSKILLBP_DIR, ctx.runtime.preparedNotes);
   const prepared = JSON.parse(fs.readFileSync(prepPath, 'utf8'));
   const items = prepared.items || [];
@@ -431,12 +478,23 @@ async function runSeeHowDetection({ pipeDir, generateIdsFn = generateIds }) {
     });
     keysFor.set(item, derived);
   }
+  // The index registers a phrase under both its Strong's and its text key.
+  // An item whose quote only partly resolves through alignment data has no
+  // Strong's key of its own, so it must be canonicalised through the index's
+  // alias map -- otherwise it lands in its own group and the injection pass,
+  // which only knows the other form, adds a second pointer on the same verse.
+  const canonicalKey = (key) => (key && index.canonical && index.canonical[key]) || key || '';
   const primaryKey = (item) => {
     const k = keysFor.get(item) || {};
-    return k.strongKey || k.textKey || '';
+    return canonicalKey(k.strongKey || k.textKey || '');
   };
 
-  const occurrencesFor = (key) => (index.byKey && index.byKey[key]) || [];
+  const occurrencesFor = (key) => {
+    const direct = (index.byKey && index.byKey[key]) || [];
+    if (direct.length) return direct;
+    const canon = canonicalKey(key);
+    return (canon !== key && index.byKey && index.byKey[canon]) || direct;
+  };
   const earlierNotedTarget = (key) => {
     for (const occ of occurrencesFor(key)) {
       if (occ.source !== 'tn') continue;
@@ -474,7 +532,9 @@ async function runSeeHowDetection({ pipeDir, generateIdsFn = generateIds }) {
     if (!note) return false;
     if (item.at_provided) note += ` Alternate translation: [${item.at_provided}]`;
     item.programmatic_note = note;
-    item.note_type = 'see_how';
+    // Same convention as prepareNotes (tn-tools.js): an item that still owes
+    // an alternate translation keeps see_how_at so the AT step picks it up.
+    item.note_type = (item.at_required && !item.at_provided) ? 'see_how_at' : 'see_how';
     item.tags = '';
     item.support_reference = targetSref;
     item.see_how_target = target.ref;
@@ -495,6 +555,7 @@ async function runSeeHowDetection({ pipeDir, generateIdsFn = generateIds }) {
   let foldedCount = 0;
   let injectedCount = 0;
   let alsoOccursCount = 0;
+  let inexactSkipped = 0;
 
   // Hint-driven items carry their own framing (seed prose); leave them alone.
   const candidates = items.filter((it) => !it.fromHint && primaryKey(it));
@@ -518,8 +579,11 @@ async function runSeeHowDetection({ pipeDir, generateIdsFn = generateIds }) {
   const chapterKeys = new Set();
   for (const item of items) {
     const derived = keysFor.get(item) || {};
-    if (derived.strongKey) chapterKeys.add(derived.strongKey);
-    if (derived.textKey) chapterKeys.add(derived.textKey);
+    for (const form of [derived.strongKey, derived.textKey]) {
+      if (!form) continue;
+      chapterKeys.add(form);
+      chapterKeys.add(canonicalKey(form));
+    }
   }
 
   // Rule 1 + rule 2, grouped by recurrence key across the chapter. Articles on
@@ -550,6 +614,21 @@ async function runSeeHowDetection({ pipeDir, generateIdsFn = generateIds }) {
     .sort((a, b) => recurrenceVerseNumber(a.verse) - recurrenceVerseNumber(b.verse));
 
   const removed = new Set();
+  // A same-verse duplicate is attached to its primary by _combine_with and is
+  // not itself grouped. If the primary is folded away, the duplicate must go
+  // with it -- otherwise it writes a full note on a verse the anchor's
+  // "also occurs" list has already declared folded.
+  const combinedBy = new Map();
+  for (const it of items) {
+    if (!it._combine_with) continue;
+    if (!combinedBy.has(it._combine_with)) combinedBy.set(it._combine_with, []);
+    combinedBy.get(it._combine_with).push(it);
+  }
+  const fold = (it) => {
+    if (removed.has(it)) return;
+    removed.add(it);
+    for (const dup of (combinedBy.get(it.id) || [])) removed.add(dup);
+  };
   const injections = [];
   const injectedAt = new Set();
 
@@ -616,16 +695,21 @@ async function runSeeHowDetection({ pipeDir, generateIdsFn = generateIds }) {
       }
 
       if (anchorItem) {
-        if (applyPointer(anchorItem, key, target)) seeHowCount++;
+        // If the sentence could not be built, leave the group exactly as it
+        // was: folding siblings into a note that never became a pointer would
+        // delete real notes and point at nothing.
+        if (!applyPointer(anchorItem, key, target)) continue;
+        seeHowCount++;
         if (setAlsoOccurs(anchorItem, alsoVerses)) alsoOccursCount++;
-        for (const it of foldItems) { removed.add(it); foldedCount++; }
+        for (const it of foldItems) { fold(it); foldedCount++; }
       } else if (anchorOcc) {
         // Nothing was flagged at the anchor verse — synthesize the pointer
         // there. The folds only happen if that injection actually materializes.
         const dedupe = `${anchorOcc.ref}|${hebTokens(anchorOcc.quote).join('+')}`;
         if (!injectedAt.has(dedupe)) {
           injectedAt.add(dedupe);
-          injections.push({ key, target, occ: anchorOcc, alsoVerses, foldItems });
+          if (anchorOcc.quote_exact === false) inexactSkipped++;
+          else injections.push({ key, target, occ: anchorOcc, alsoVerses, foldItems });
         }
       }
       continue;
@@ -639,7 +723,7 @@ async function runSeeHowDetection({ pipeDir, generateIdsFn = generateIds }) {
       const later = group[i];
       if (later.reference === lead.reference) continue;
       if (!canFold(later)) continue;
-      removed.add(later);
+      fold(later);
       alsoVerses.push(verseOf(later.reference));
       foldedCount++;
     }
@@ -654,8 +738,9 @@ async function runSeeHowDetection({ pipeDir, generateIdsFn = generateIds }) {
 
   // Phase 3 — inject a pointer for an already-noted phrase the chapter produced
   // no prepared item for at all.
-  for (const key of Object.keys(index.byKey || {})) {
-    if (chapterKeys.has(key)) continue;
+  for (const rawKey of Object.keys(index.byKey || {})) {
+    const key = canonicalKey(rawKey);
+    if (chapterKeys.has(rawKey) || chapterKeys.has(key)) continue;
     const target = earlierNotedTarget(key);
     if (!target) continue;
     if (!isSeeHowEligible(key, target.sref)) continue;
@@ -667,6 +752,10 @@ async function runSeeHowDetection({ pipeDir, generateIdsFn = generateIds }) {
     const dedupe = `${firstOcc.ref}|${hebTokens(firstOcc.quote).join('+')}`;
     if (injectedAt.has(dedupe)) continue;
     injectedAt.add(dedupe);
+    // A quote that could not be sliced out of the UHB byte-for-byte would be
+    // tagged ISSUE:MATCH_FAIL by syncCanonicalHebrewQuotes, so it is counted
+    // and skipped rather than shipped.
+    if (firstOcc.quote_exact === false) { inexactSkipped++; continue; }
     injections.push({
       key,
       target,
@@ -685,6 +774,14 @@ async function runSeeHowDetection({ pipeDir, generateIdsFn = generateIds }) {
       console.warn(`[notes] See-how injection: ID generation failed (${err.message})`);
       newIds = [];
     }
+    // generateIds only checks upstream en_tn; an id already used by this
+    // chapter's own prepared items would still collide.
+    const usedIds = new Set(items.map((it) => it.id).filter(Boolean));
+    newIds = newIds.filter((id) => {
+      if (usedIds.has(id)) return false;
+      usedIds.add(id);
+      return true;
+    });
   }
 
   for (let i = 0; i < injections.length; i++) {
@@ -716,7 +813,7 @@ async function runSeeHowDetection({ pipeDir, generateIdsFn = generateIds }) {
     };
     if (!applyPointer(item, key, target)) continue;
     if (setAlsoOccurs(item, alsoVerses)) alsoOccursCount++;
-    for (const it of (foldItems || [])) { removed.add(it); foldedCount++; }
+    for (const it of (foldItems || [])) { fold(it); foldedCount++; }
     items.push(item);
     injectedCount++;
     seeHowCount++;
@@ -735,7 +832,7 @@ async function runSeeHowDetection({ pipeDir, generateIdsFn = generateIds }) {
     fs.writeFileSync(prepPath, JSON.stringify(prepared, null, 2));
   }
 
-  const summary = `${seeHowCount} see-how back-refs, ${foldedCount} folded, ${injectedCount} injected, ${alsoOccursCount} also-occurs lists, ${combinedCount} same-verse combinations`;
+  const summary = `${seeHowCount} see-how back-refs, ${foldedCount} folded, ${injectedCount} injected, ${alsoOccursCount} also-occurs lists, ${inexactSkipped} skipped (inexact quote), ${combinedCount} same-verse combinations`;
   console.log(`[notes] See-how detection: ${summary}`);
   return summary;
 }
@@ -2126,7 +2223,7 @@ async function runParallelTnWriter({
       }
     }
 
-    const runPromises = pendingShards.map((shard, i) => {
+    const runPromises = pendingShards.map(async (shard, i) => {
       const vRange = shard.range ? `${shard.range.vStart}-${shard.range.vEnd}` : '';
       const verseArg = vRange ? `:${vRange}` : '';
       let shardCtxFlag = '';
@@ -2140,6 +2237,10 @@ async function runParallelTnWriter({
         const shardCtxAbs = path.resolve(CSKILLBP_DIR, shardCtxRel);
         const shardCtx = JSON.parse(JSON.stringify(baseContext));
         shardCtx.runtime = shardCtx.runtime || {};
+        // The shard's own verse window, so see-how detection never anchors,
+        // injects or lists anything outside it.
+        shardCtx.verseStart = shard.range.vStart;
+        shardCtx.verseEnd = shard.range.vEnd;
         const stem = `${tag}-v${shard.range.vStart}-${shard.range.vEnd}`;
         shardCtx.runtime.preparedNotes = `tmp/pipeline/${tag}/shards/${stem}.prepared_notes.json`;
         shardCtx.runtime.generatedNotes = `tmp/pipeline/${tag}/shards/${stem}.generated_notes.json`;
@@ -2171,6 +2272,13 @@ async function runParallelTnWriter({
         fs.writeFileSync(absPath, 'Reference\tID\tTags\tSupportReference\tQuote\tOccurrence\tNote\n' +
           `${book} ${ch}:${v1}\t\t\t\t\t1\t[Stub note for dry run]\n`);
         return Promise.resolve({ subtype: 'success', num_turns: 0, duration_ms: 100, total_cost_usd: 0, _shardIdx: i });
+      }
+
+      // See-how detection for this shard, against the shard's own context, so
+      // the prepared notes the writer session reads are the post-detection ones.
+      const shardContextRel = parseContextPathFlag(shardCtxFlag);
+      if (shardContextRel) {
+        await runShardSeeHowDetection({ contextPath: shardContextRel, issuesPath: shard.chunkPath });
       }
 
       console.log(`[notes] tn-writer shard ${i}: ${prompt}`);
@@ -2774,27 +2882,14 @@ async function notesPipeline(route, message) {
             console.warn(`[notes] Quote cleanup step failed (non-fatal): ${err.message}`);
           }
 
-          // Build the book-scoped recurrence index. Non-fatal: without it the
-          // detector still folds same-chapter repeats, it just cannot point at
-          // earlier chapters.
-          try {
-            buildRecurrenceIndexFile({ pipeDir });
-          } catch (indexErr) {
-            console.warn(`[notes] Recurrence index build failed (non-fatal): ${indexErr.message}`);
-          }
-
-          // Run see-how detection after mechanical prep
-          try {
-            const seeHowSummary = await runSeeHowDetection({ pipeDir });
-            if (seeHowSummary !== SEE_HOW_ZERO_SUMMARY) {
-              await status(`**${ref}**: See-how detection — ${seeHowSummary}`);
-            }
-          } catch (seeHowErr) {
-            console.warn(`[notes] See-how detection failed (non-fatal): ${seeHowErr.message}`);
-          }
-
-          // Apply editor-marked TN hints (API-origin only). Suppresses
-          // prepared items that match a hint on (verse, supportRef,
+          // Apply editor-marked TN hints (API-origin only) BEFORE see-how
+          // detection. Applied after, a hint on a verse whose only item had
+          // been folded away was dropped as "outside chapter scope", and a
+          // hint suppressing an anchor took its also-occurs list with it.
+          // Hint items carry fromHint, so detection skips them as anchors and
+          // as fold candidates and the editor's own note is preserved.
+          //
+          // Suppresses prepared items that match a hint on (verse, supportRef,
           // fuzzy-quote) and injects each hint as a synthetic prepared
           // item carrying its seed prose. hint.rowId is preserved as the
           // item's id → TSV column-1 ID → bible-editor's UPDATE key.
@@ -2820,6 +2915,25 @@ async function notesPipeline(route, message) {
               console.error(`[notes] applyHintsToPreparedNotes failed (non-fatal): ${hintErr.message}`);
               await status(`**${ref}**: hint application failed — ${hintErr.message}. Continuing without hints.`);
             }
+          }
+
+          // Build the book-scoped recurrence index. Non-fatal: without it the
+          // detector still folds same-chapter repeats, it just cannot point at
+          // earlier chapters.
+          try {
+            buildRecurrenceIndexFile({ pipeDir });
+          } catch (indexErr) {
+            console.warn(`[notes] Recurrence index build failed (non-fatal): ${indexErr.message}`);
+          }
+
+          // Run see-how detection after mechanical prep
+          try {
+            const seeHowSummary = await runSeeHowDetection({ pipeDir });
+            if (seeHowSummary !== SEE_HOW_ZERO_SUMMARY) {
+              await status(`**${ref}**: See-how detection — ${seeHowSummary}`);
+            }
+          } catch (seeHowErr) {
+            console.warn(`[notes] See-how detection failed (non-fatal): ${seeHowErr.message}`);
           }
         } catch (err) {
           console.error(`[notes] Mechanical prep failed for ${ref}: ${err.message}`);
@@ -3867,6 +3981,7 @@ module.exports = {
   _runMechanicalQualityPrep: runMechanicalQualityPrep,
   _runSeeHowDetection: runSeeHowDetection,
   _buildRecurrenceIndexFile: buildRecurrenceIndexFile,
+  _runShardSeeHowDetection: runShardSeeHowDetection,
   _SEE_HOW_ZERO_SUMMARY: SEE_HOW_ZERO_SUMMARY,
   _repairSelfTalkNotes: repairSelfTalkNotes,
   _hasPauseBeforeATsFlag: hasPauseBeforeATsFlag,

@@ -7,10 +7,44 @@ const path = require('path');
 const https = require('https');
 
 const { loadTemplateMap, resolveAtRequirement, _inspectOpeningBold, countCaseInsensitiveOccurrences } = require('./tn-tools');
+const { resolveWorkspacePath, resolveDoor43ReposPath } = require('./recurrence-index');
 
 const CSKILLBP_DIR = process.env.CSKILLBP_DIR || '/srv/bot/workspace';
 
 // Sets used by orphaned-word checks (Check 10 / 10b)
+// The deterministic "This also occurs in verses 5, 7, 8, and 11." sentence
+// the see-how detector appends. Removed before the multiverse checks, which
+// would otherwise read it as a note that belongs in a multi-verse entry.
+const ALSO_OCCURS_RE = /\bThis also occurs in verses?\s[^.]*\./gi;
+function stripAlsoOccursSentence(note) {
+  return String(note || '').replace(ALSO_OCCURS_RE, ' ');
+}
+
+// A relative link to a verse: ../CC/VV.md, or ../../bok/CC/VV.md for another
+// book. tW/tA links (../../bible/kt/yahweh.md, ../../translate/figs-idiom/01.md)
+// and absolute rc:// links are not pointers and are never inspected.
+const VERSE_LINK_PATH_RE = /^\.\.\/(?:\d{1,3}\/\d{1,3}\.md|\.\.\/[1-3a-z]{3}\/\d{1,3}\/\d{1,3}\.md)$/;
+
+// The see-how checks only apply to the pointer sentence itself: everything
+// from "See how you translated" up to that sentence's terminating period.
+// An ordinary note may legitimately link forward ("through [verse 9](../01/09.md)"),
+// and a chapter intro is full of verse links that are not pointers.
+// The terminator is a period followed by whitespace or end-of-note: the dots
+// inside "../02/05.md" are followed by a letter or a slash, so a naive [^.]*
+// would cut the sentence off before its own link.
+const SEE_HOW_SENTENCE_RE = /see how you translated[\s\S]*?\.(?=\s|$)/gi;
+function seeHowSentences(note) {
+  const text = String(note || '');
+  const found = text.match(SEE_HOW_SENTENCE_RE);
+  if (found && found.length) return found;
+  // Unterminated sentence (truncated note): take the rest of the text.
+  const start = text.search(/see how you translated/i);
+  return start >= 0 ? [text.slice(start)] : [];
+}
+function isIntroReference(ref) {
+  return /(?:^|:)(?:intro|front)$/i.test(String(ref || '').trim());
+}
+
 const CONJUNCTIONS = new Set(['and','but','so','then','or','for','yet','nor']);
 const PREPOSITIONS = new Set(['in','to','from','by','for','with','on','at','of','into','upon','about','through','against','between']);
 
@@ -582,12 +616,12 @@ async function checkTnQuality({ tsvPath, preparedJson, ultUsfm, ustUsfm, book, h
     bookTsvAvailable = true;
     mergedBookRefs = bookTsvRows.map((r) => (typeof r === 'string' ? r : (r && (r.reference || r.ref)) || ''));
   } else if (book) {
-    const defaultBookTsvPath = bookTsvPath || path.join(
-      process.env.DOOR43_REPOS_PATH || '/srv/bot/workspace/door43-repos',
-      'en_tn',
-      `tn_${book.toUpperCase()}.tsv`
-    );
-    const resolvedBookTsvPath = path.resolve(CSKILLBP_DIR, defaultBookTsvPath);
+    // Same resolver notes-pipeline uses, so both find the clone in the same
+    // place: an absolute DOOR43_REPOS_PATH is honoured, a relative one is
+    // resolved against the workspace root.
+    const defaultBookTsvPath = bookTsvPath
+      || path.join(resolveDoor43ReposPath(CSKILLBP_DIR), 'en_tn', `tn_${book.toUpperCase()}.tsv`);
+    const resolvedBookTsvPath = resolveWorkspacePath(defaultBookTsvPath, CSKILLBP_DIR);
     if (fs.existsSync(resolvedBookTsvPath)) {
       bookTsvAvailable = true;
       const bookLines = fs.readFileSync(resolvedBookTsvPath, 'utf8').split('\n');
@@ -920,13 +954,18 @@ async function checkTnQuality({ tsvPath, preparedJson, ultUsfm, ustUsfm, book, h
 
     // 20. Multiverse notes
     if (n.note) {
+      // The deterministic "This also occurs in verses 5, 7, 8, and 11."
+      // sentence appended by the see-how detector is by design a list of
+      // verse numbers; it is not the multi-verse-entry smell these checks
+      // look for, so it is removed before either of them runs.
+      const noteForMultiverse = stripAlsoOccursSentence(n.note);
       // 20a: multi-verse range language
-      if (/\bverses\s+\d+(?:\s*[-,]\s*\d+)*(?:\s*(?:,\s*)?and\s+\d+)/i.test(n.note) ||
-          /\bverses\s+\d+\s*[-\u2013]\s*\d+/i.test(n.note)) {
+      if (/\bverses\s+\d+(?:\s*[-,]\s*\d+)*(?:\s*(?:,\s*)?and\s+\d+)/i.test(noteForMultiverse) ||
+          /\bverses\s+\d+\s*[-\u2013]\s*\d+/i.test(noteForMultiverse)) {
         addFinding(n.row, n.ref, n.id, 'warning', 'multiverse_language', 'Note references multiple verses — may belong in a multi-verse entry');
       }
       // 20b: back-reference to another verse
-      if (/\b(?:as in|see|from|refers? to[^.]{0,30})\s+verse\s+\d+/i.test(n.note)) {
+      if (/\b(?:as in|see|from|refers? to[^.]{0,30})\s+verse\s+\d+/i.test(noteForMultiverse)) {
         addFinding(n.row, n.ref, n.id, 'warning', 'multiverse_backref', 'Note references another verse number');
       }
     }
@@ -1129,11 +1168,24 @@ async function checkTnQuality({ tsvPath, preparedJson, ultUsfm, ustUsfm, book, h
 
     // 26. See-how link guardrails (docs/plan.md "Phase 4 — Guardrails"). Every
     // see-how pointer targets the FIRST occurrence in the book, never forward.
-    {
+    //
+    // Scoped to the "See how you translated ..." sentence, and never applied to
+    // intro rows: run over whole notes these fired on ordinary forward links
+    // (golden JOS 1 row w48w: "through [verse 9](../01/09.md)") and on the verse
+    // links that fill a chapter intro.
+    // 26c. "see how you rendered" is never valid phrasing (zero corpus hits).
+    // Checked on the whole note: such a sentence has no "translated" to scope to.
+    if (n.note && !isIntroReference(n.ref) && /see how you rendered/i.test(n.note)) {
+      addFinding(n.row, n.ref, n.id, 'warning', 'seehow_noncanonical',
+        '"see how you rendered" is not valid phrasing — use "see how you translated"');
+    }
+
+    const seeHowText = isIntroReference(n.ref) ? '' : seeHowSentences(n.note).join(' ');
+    if (seeHowText) {
       const ownRef = parseReferenceRanges(n.ref);
       const CANONICAL_LINK_RE = /\[[^\]]*\]\(\.\.\/(\d{2,3})\/(\d{2,3})\.md\)/g;
       let lm;
-      while ((lm = CANONICAL_LINK_RE.exec(n.note)) !== null) {
+      while ((lm = CANONICAL_LINK_RE.exec(seeHowText)) !== null) {
         const targetChapter = parseInt(lm[1], 10);
         const targetVerse = parseInt(lm[2], 10);
 
@@ -1167,23 +1219,16 @@ async function checkTnQuality({ tsvPath, preparedJson, ultUsfm, ustUsfm, book, h
         }
       }
 
-      // 26c. "see how you rendered" is never valid phrasing (zero corpus hits).
-      if (/see how you rendered/i.test(n.note)) {
-        addFinding(n.row, n.ref, n.id, 'warning', 'seehow_noncanonical',
-          '"see how you rendered" is not valid phrasing — use "see how you translated"');
-      }
-
       // 26d. A "See how you translated" note whose link path isn't the
       // canonical ../CC/VV.md shape (e.g. the old ../../book/1/5.md format).
-      if (/see how you translated/i.test(n.note)) {
+      {
         const ANY_LINK_RE = /\]\(([^)]+)\)/g;
         let alm;
-        while ((alm = ANY_LINK_RE.exec(n.note)) !== null) {
+        while ((alm = ANY_LINK_RE.exec(seeHowText)) !== null) {
           const linkPath = alm[1];
-          // Only in-repo relative links are see-how targets. A note may also
-          // carry rc:// or other absolute links (e.g. a trailing tA article
-          // link); those are not pointers and must never be flagged here.
-          if (!linkPath.startsWith('../')) continue;
+          // Only a relative link that names a verse can be a pointer. rc://
+          // links and tW/tA relative links (../../bible/kt/yahweh.md) are not.
+          if (!VERSE_LINK_PATH_RE.test(linkPath)) continue;
           if (!/^\.\.\/\d{2,3}\/\d{2,3}\.md$/.test(linkPath)) {
             addFinding(n.row, n.ref, n.id, 'warning', 'seehow_noncanonical',
               `See-how link path "${linkPath}" does not match the canonical ../CC/VV.md format`);
@@ -1197,7 +1242,7 @@ async function checkTnQuality({ tsvPath, preparedJson, ultUsfm, ustUsfm, book, h
         const isPsa = book && book.toUpperCase() === 'PSA';
         const expectedLen = isPsa ? 3 : 2;
         let pm;
-        while ((pm = PAD_LINK_RE.exec(n.note)) !== null) {
+        while ((pm = PAD_LINK_RE.exec(seeHowText)) !== null) {
           const chStr = pm[1];
           const vsStr = pm[2];
           if (chStr.length !== expectedLen || vsStr.length !== expectedLen) {

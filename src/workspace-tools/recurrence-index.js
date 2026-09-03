@@ -8,6 +8,8 @@
 // (falling back to its consonantal Hebrew text) so that the same phrase is
 // recognised across chapters even when the English wording drifts.
 
+const path = require('path');
+
 // Cantillation / word-joiner / maqaf class. Deliberately identical to the
 // CANT_RE defined inside quality-tools.js — duplicated rather than shared so
 // that module keeps its own copy.
@@ -36,10 +38,13 @@ const SEE_HOW_NEVER_FOLD_SREFS = new Set(['writing-foreground']);
 
 // Ultra-frequent lemmas that never earn a single-word pointer. Stored both as
 // Strong's numbers and as consonant-only Hebrew so either key form matches.
+// Strong's numbers are stored zero-padded to four digits, the form UHB and
+// en_ult write in x-strong (H0430, not H430). Lookups canonicalise both sides
+// through normalizeStrong so either spelling matches.
 const SEE_HOW_STOPLIST = new Set([
   // Strong's
-  'H3068', 'H430', 'H559', 'H1961', 'H3605', 'H834', 'H853', 'H413', 'H5921',
-  'H3808', 'H1121', 'H776', 'H5971', 'H4428', 'H1697', 'H3027', 'H3117',
+  'H3068', 'H0430', 'H0559', 'H1961', 'H3605', 'H0834', 'H0853', 'H0413', 'H5921',
+  'H3808', 'H1121', 'H0776', 'H5971', 'H4428', 'H1697', 'H3027', 'H3117',
   'H3478', 'H6440', 'H3651', 'H1004', 'H3588',
   // consonant-only Hebrew
   'יהוה', 'אלהים', 'אמר', 'היה', 'כל', 'אשר', 'את', 'אל', 'על', 'לא',
@@ -51,9 +56,35 @@ const SEE_HOW_STOPLIST = new Set([
 // Normalisation
 // ---------------------------------------------------------------------------
 
+/**
+ * Canonical Strong's number: strip the `c:`/`b:` prefixes the aligner adds and
+ * zero-pad the numeric part to four digits, which is how UHB and en_ult write
+ * it. Without the padding "H559" and "H0559" are two different keys.
+ */
 function normalizeStrong(raw) {
   const s = String(raw || '').replace(/^(?:[a-z]:)+/, '');
+  const m = s.match(/^([HG])(\d+)([a-z]?)$/);
+  if (m) return `${m[1]}${m[2].padStart(4, '0')}${m[3]}`;
   return /^[HG]\d/.test(s) ? s : null;
+}
+
+/**
+ * Resolve a workspace-relative path against the workspace root; an absolute
+ * path is returned unchanged. Shared so notes-pipeline and quality-tools locate
+ * DOOR43_REPOS_PATH identically (one used to join it raw, the other resolved).
+ */
+function resolveWorkspacePath(p, baseDir) {
+  const raw = String(p || '');
+  if (!raw) return '';
+  return path.isAbsolute(raw) ? raw : path.resolve(baseDir || '.', raw);
+}
+
+/** The local Door43 clone root, resolved the same way everywhere. */
+function resolveDoor43ReposPath(baseDir) {
+  return resolveWorkspacePath(
+    process.env.DOOR43_REPOS_PATH || '/srv/bot/workspace/door43-repos',
+    baseDir
+  );
 }
 
 /**
@@ -103,6 +134,7 @@ function parseAlignedUsfmSpans(content) {
 
   const ZALN_S = /\\zaln-s\s+\|([^\\]*?)\\?\*/g;
   const ZALN_E = /\\zaln-e\\?\*/g;
+  const VERSE_RE = /\\v\s+(\d+[-\d]*|front)/g;
 
   const seenPerVerse = new Map(); // ref -> Set of dedupe keys
   const stackDepthByRef = new Map();
@@ -111,23 +143,28 @@ function parseAlignedUsfmSpans(content) {
     let trimmed = rawLine.trim();
     const cm = trimmed.match(/^\\c\s+(\d+)/);
     if (cm) { chapter = parseInt(cm[1], 10); verse = '0'; trimmed = trimmed.slice(cm[0].length).trim(); }
-    const vm = trimmed.match(/\\v\s+(\d+[-\d]*|front)/);
-    if (vm) { verse = String(vm[1]).split('-')[0]; }
     if (!trimmed || !chapter) continue;
 
-    const ref = `${chapter}:${verse}`;
-    if (!seenPerVerse.has(ref)) seenPerVerse.set(ref, new Set());
-    const seen = seenPerVerse.get(ref);
-
+    // A line can carry several verses (the AMO 8 shape). Verse markers are
+    // tokenized positionally, so a verse marker changes the current verse only
+    // for what follows it on that line rather than claiming the whole line.
     const tokens = [];
     let m;
     ZALN_S.lastIndex = 0;
     while ((m = ZALN_S.exec(trimmed)) !== null) tokens.push({ idx: m.index, attrs: m[1] });
     ZALN_E.lastIndex = 0;
     while ((m = ZALN_E.exec(trimmed)) !== null) tokens.push({ idx: m.index, close: true });
+    VERSE_RE.lastIndex = 0;
+    while ((m = VERSE_RE.exec(trimmed)) !== null) {
+      tokens.push({ idx: m.index, verse: String(m[1]).split('-')[0] });
+    }
     tokens.sort((a, b) => a.idx - b.idx);
 
     for (const tok of tokens) {
+      if (tok.verse !== undefined) { verse = tok.verse; continue; }
+      const ref = `${chapter}:${verse}`;
+      if (!seenPerVerse.has(ref)) seenPerVerse.set(ref, new Set());
+      const seen = seenPerVerse.get(ref);
       if (tok.close) {
         stackDepthByRef.set(ref, Math.max(0, (stackDepthByRef.get(ref) || 0) - 1));
         continue;
@@ -163,25 +200,39 @@ function parseHebrewUsfmWords(content) {
   const idMatch = String(content || '').match(/\\id\s+(\S+)/);
   if (idMatch) book = idMatch[1].substring(0, 3).toUpperCase();
   const WORD = /\\w\s+([^|\\]+)\|([^\\]*?)\\w\*/g;
+  const HEB_VERSE_RE = /\\v\s+(\d+[-\d]*|front)/g;
 
   for (const rawLine of String(content || '').split('\n')) {
     let trimmed = rawLine.trim();
     const cm = trimmed.match(/^\\c\s+(\d+)/);
     if (cm) { chapter = parseInt(cm[1], 10); verse = '0'; trimmed = trimmed.slice(cm[0].length).trim(); }
-    const vm = trimmed.match(/\\v\s+(\d+[-\d]*|front)/);
-    if (vm) { verse = String(vm[1]).split('-')[0]; }
     if (!trimmed || !chapter) continue;
     let m;
+    // Verse markers are positional here too - see parseAlignedUsfmSpans.
+    const verseMarks = [];
+    HEB_VERSE_RE.lastIndex = 0;
+    while ((m = HEB_VERSE_RE.exec(trimmed)) !== null) {
+      verseMarks.push({ idx: m.index, verse: String(m[1]).split('-')[0] });
+    }
+    const verseAt = (idx) => {
+      let v = verse;
+      for (const mark of verseMarks) {
+        if (mark.idx > idx) break;
+        v = mark.verse;
+      }
+      return v;
+    };
     WORD.lastIndex = 0;
     const lineWords = [];
     while ((m = WORD.exec(trimmed)) !== null) {
       const attrs = m[2] || '';
       const sM = attrs.match(/strong="([^"]*)"/);
+      const wordVerse = verseAt(m.index);
       lineWords.push({
         book,
         chapter,
-        verse,
-        ref: `${chapter}:${verse}`,
+        verse: wordVerse,
+        ref: `${chapter}:${wordVerse}`,
         strong: sM ? sM[1] : '',
         heb: m[1].trim(),
         occurrence: null,
@@ -200,6 +251,7 @@ function parseHebrewUsfmWords(content) {
       delete lineWords[i]._end;
       out.push(lineWords[i]);
     }
+    if (verseMarks.length) verse = verseMarks[verseMarks.length - 1].verse;
   }
   return out;
 }
@@ -274,7 +326,7 @@ function isSeeHowEligible(key, sref) {
   if (parts.length === 0) return false;
   if (parts.length > 1) return true;
   if (!SEE_HOW_SINGLE_WORD_SREFS.has(String(sref || ''))) return false;
-  if (SEE_HOW_STOPLIST.has(parts[0])) return false;
+  if (SEE_HOW_STOPLIST.has(normalizeStrong(parts[0]) || parts[0])) return false;
   return true;
 }
 
@@ -505,7 +557,7 @@ function parseTnTsv(tsv) {
     rows.push({
       ref,
       id: (cols[1] || '').trim(),
-      sref: (cols[3] || '').trim().replace(/^rc:\/\/\*\/ta\/man\/translate\//, ''),
+      sref: (cols[3] || '').trim().replace(/^rc:\/\/[^/]+\/ta\/man\/translate\//, ''),
       quote: (cols[4] || '').trim(),
       note: (cols[6] || '').trim(),
     });
@@ -639,7 +691,18 @@ function buildBookRecurrenceIndex({
 
   const queryKeys = new Map(); // key -> { strongs: string[]|null, tokens: string[] }
 
+  // A phrase is registered under both key forms. `canonical` maps either form
+  // to the Strong's form when it is known, so an item that could only resolve
+  // its text key still lands in the same group as one that resolved both.
+  const canonical = {};
+  const registerAlias = (strongKey, textKey) => {
+    if (strongKey) canonical[strongKey] = strongKey;
+    if (textKey && !canonical[textKey]) canonical[textKey] = strongKey || textKey;
+    if (textKey && strongKey) canonical[textKey] = strongKey;
+  };
+
   const registerQuery = (strongKey, textKey) => {
+    registerAlias(strongKey, textKey);
     if (strongKey && !queryKeys.has(strongKey)) {
       queryKeys.set(strongKey, { strongs: strongKey.split('+'), tokens: null });
     }
@@ -683,7 +746,7 @@ function buildBookRecurrenceIndex({
       alignmentEntries,
     });
     const key = strongKey || textKey;
-    if (item.id) keyById[item.id] = key;
+    if (item.id) keyById[item.id] = strongKey || canonical[textKey] || key;
     if (!key) continue;
     registerQuery(strongKey, textKey);
     preparedCount++;
@@ -734,6 +797,8 @@ function buildBookRecurrenceIndex({
       // Prefer the literal UHB slice; a space-join is only a fallback, because
       // an injected row's Quote is later matched against the source verbatim.
       const runTokens = run.flatMap((w) => hebTokens(w.heb));
+      // The matched run knows both forms, so a text-only key learns its alias.
+      registerAlias(keysFromWordRun(run).strongKey, runTokens.join('+'));
       const exact = exactSourceSpan(ref, runTokens);
       if (!exact) inexactSpans++;
       if (!byKey[key]) byKey[key] = [];
@@ -778,6 +843,7 @@ function buildBookRecurrenceIndex({
     chapter: curChapter,
     byKey,
     keyById,
+    canonical,
     counts: {
       keys: Object.keys(byKey).length,
       noteRows: noteRowCount,
@@ -809,6 +875,8 @@ module.exports = {
   hebTokens,
   stripCant,
   normalizeStrong,
+  resolveWorkspacePath,
+  resolveDoor43ReposPath,
   parseTnTsv,
   verseNumber,
   CANT_RE,

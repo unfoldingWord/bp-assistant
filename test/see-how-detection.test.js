@@ -49,6 +49,7 @@ const ALIGNED_BOOK = [
 ].join('\n');
 
 // UHB fixture: the only source carrying the literal maqaf between the two words.
+const UHB_WORD_OF_YAHWEH = '\\w דְּבַר|lemma="x" strong="H1697"\\w*־\\w יְהוָ֖ה|lemma="y" strong="H3068"\\w*';
 const HEBREW_BOOK = [
   '\\id ZEC',
   '\\c 3',
@@ -222,7 +223,7 @@ test('pointers never run forward: a note only in a later chapter is not a target
 });
 
 test('phase 3: a pointer is injected when the chapter flagged nothing for an already-noted phrase', async () => {
-  const dirPath = setupPipeDir({ items: [] });
+  const dirPath = setupPipeDir({ items: [], hebrewBook: HEBREW_BOOK });
   buildRecurrenceIndexFile({ pipeDir: dirPath });
   const summary = await runSeeHowDetection({ pipeDir: dirPath, generateIdsFn: stubIds });
 
@@ -532,14 +533,16 @@ test('F3: an injected orig_quote reproduces the maqaf-joined source span exactly
   assert.equal(injected.orig_quote, WORD_OF_YAHWEH, 'byte-for-byte the source span');
 });
 
-test('F3: without a UHB source the injected quote falls back to a space-join', async () => {
+test('N7: without a UHB source the injection is skipped and counted, not shipped inexact', async () => {
+  // A space-joined quote would be tagged ISSUE:MATCH_FAIL by
+  // syncCanonicalHebrewQuotes, so no row is better than a wrong one.
   const dirPath = setupPipeDir({ items: [] });
   buildRecurrenceIndexFile({ pipeDir: dirPath });
-  await runSeeHowDetection({ pipeDir: dirPath, generateIdsFn: stubIds });
+  const summary = await runSeeHowDetection({ pipeDir: dirPath, generateIdsFn: stubIds });
 
-  const injected = readPrepared(dirPath).items[0];
-  assert.equal(injected.orig_quote.includes('־'), false);
-  assert.match(injected.orig_quote, / /);
+  assert.deepEqual(readPrepared(dirPath).items, []);
+  assert.match(summary, /0 injected/);
+  assert.match(summary, /1 skipped \(inexact quote\)/);
 });
 
 // --- C1: anchor on the chapter's first occurrence ---------------------------
@@ -549,6 +552,7 @@ test('C1a: a cross-chapter pointer is injected at the chapter\'s first occurrenc
   const dirPath = setupPipeDir({
     items: [item({ reference: '3:5', id: 'bbbb' })],
     alignmentData: { '3:5': ALIGNMENT_DATA['3:5'] },
+    hebrewBook: HEBREW_BOOK,
   });
   buildRecurrenceIndexFile({ pipeDir: dirPath });
   const summary = await runSeeHowDetection({ pipeDir: dirPath, generateIdsFn: stubIds });
@@ -632,6 +636,14 @@ test('C2: when every earlier row is a pointer, nothing is emitted', async () => 
 
 // --- C3: partial-chapter bounds ---------------------------------------------
 
+const RANGED_HEBREW = [
+  '\\id ZEC',
+  '\\c 3',
+  `\\v 2 ${UHB_WORD_OF_YAHWEH}`,
+  `\\v 11 ${UHB_WORD_OF_YAHWEH}`,
+  '',
+].join('\n');
+
 const RANGED_BOOK = [
   '\\id ZEC',
   '\\c 1',
@@ -648,6 +660,7 @@ test('C3: a verse-range run anchors inside the range and never synthesizes outsi
   const dirPath = setupPipeDir({
     items: [],
     alignedBook: RANGED_BOOK,
+    hebrewBook: RANGED_HEBREW,
     alignmentData: {},
     verseStart: 10,
     verseEnd: 12,
@@ -786,4 +799,104 @@ test('C4: a suppressed sub-phrase still lists the verses of its own folded sibli
   assert.equal(byId.has('dddd'), false, '8:13 folds into 8:3');
   assert.deepEqual(byId.get('bbbb').also_occurs_verses, ['13'], 'own folded sibling only');
   assert.deepEqual(byId.get('aaaa').also_occurs_verses, ['4', '6']);
+});
+
+// --- Round 3: B1 / B2 / S8 / S9 ---------------------------------------------
+
+test('B1: an item that resolves only its text key gets ONE row, not a duplicate injection', async () => {
+  // alignment_data is empty, so the item has no Strong key of its own while the
+  // index registers the phrase under both forms. Before canonicalisation the
+  // injection pass did not recognise the item and added a second row on 3:2.
+  const dirPath = setupPipeDir({
+    items: [item({ reference: '3:2', id: 'aaaa' })],
+    alignmentData: {},
+    hebrewBook: HEBREW_BOOK,
+  });
+  buildRecurrenceIndexFile({ pipeDir: dirPath });
+  const summary = await runSeeHowDetection({ pipeDir: dirPath, generateIdsFn: stubIds });
+
+  const prepared = readPrepared(dirPath);
+  const atVerse2 = prepared.items.filter((it) => it.reference === '3:2');
+  assert.equal(atVerse2.length, 1, 'exactly one row on the verse');
+  assert.equal(atVerse2[0].id, 'aaaa', 'the model\'s own item, converted in place');
+  assert.match(summary, /0 injected/);
+});
+
+test('B1: two items on one phrase group together even when only one resolves its Strong key', async () => {
+  const dirPath = setupPipeDir({
+    items: [
+      item({ reference: '3:2', id: 'aaaa' }),
+      item({ reference: '3:5', id: 'bbbb', index: 1 }),
+    ],
+    // Only 3:2 has alignment data, so 3:5 falls back to its text key.
+    alignmentData: { '3:2': ALIGNMENT_DATA['3:2'] },
+    tnBookTsv: '',
+  });
+  buildRecurrenceIndexFile({ pipeDir: dirPath });
+  await runSeeHowDetection({ pipeDir: dirPath, generateIdsFn: stubIds });
+
+  const prepared = readPrepared(dirPath);
+  assert.deepEqual(prepared.items.map((it) => it.id), ['aaaa'], 'one group, one surviving note');
+  assert.deepEqual(prepared.items[0].also_occurs_verses, ['5', '7']);
+});
+
+test('B2: a same-verse duplicate is removed together with the primary it folds into', async () => {
+  const dirPath = setupPipeDir({
+    items: [
+      item({ reference: '3:2', id: 'aaaa' }),
+      item({ reference: '3:5', id: 'bbbb', index: 1 }),
+      item({ reference: '3:5', id: 'cccc', index: 2 }),
+    ],
+    tnBookTsv: '',
+  });
+  buildRecurrenceIndexFile({ pipeDir: dirPath });
+  await runSeeHowDetection({ pipeDir: dirPath, generateIdsFn: stubIds });
+
+  const prepared = readPrepared(dirPath);
+  assert.deepEqual(
+    prepared.items.map((it) => it.id),
+    ['aaaa'],
+    'the duplicate does not survive its primary being folded'
+  );
+  assert.deepEqual(prepared.items[0].also_occurs_verses, ['5', '7']);
+});
+
+test('S9: a required alternate translation keeps the see_how_at note type', async () => {
+  const dirPath = setupPipeDir({
+    items: [item({ reference: '3:2', id: 'aaaa', at_required: true, at_provided: '' })],
+  });
+  buildRecurrenceIndexFile({ pipeDir: dirPath });
+  await runSeeHowDetection({ pipeDir: dirPath, generateIdsFn: stubIds });
+  assert.equal(readPrepared(dirPath).items[0].note_type, 'see_how_at');
+
+  const dirPath2 = setupPipeDir({
+    items: [item({ reference: '3:2', id: 'aaaa', at_required: true, at_provided: 'a message' })],
+  });
+  buildRecurrenceIndexFile({ pipeDir: dirPath2 });
+  await runSeeHowDetection({ pipeDir: dirPath2, generateIdsFn: stubIds });
+  assert.equal(readPrepared(dirPath2).items[0].note_type, 'see_how');
+});
+
+test('S8: detection can be driven from an explicit shard context with its own verse range', async () => {
+  // Parallel tn-writer shards keep their context file outside the pipeline dir,
+  // so the detector must accept a contextPath and honour that context's range.
+  const dirPath = setupPipeDir({
+    items: [],
+    alignedBook: RANGED_BOOK,
+    hebrewBook: RANGED_HEBREW,
+    alignmentData: {},
+  });
+  // Re-point a copy of the context at a shard-style location with a verse window.
+  const ctx = JSON.parse(fs.readFileSync(path.join(WORKSPACE, dirPath, 'context.json'), 'utf8'));
+  ctx.verseStart = 10;
+  ctx.verseEnd = 12;
+  const shardCtxRel = `${dirPath}/shard-v10-12.context.json`;
+  fs.writeFileSync(path.join(WORKSPACE, shardCtxRel), JSON.stringify(ctx, null, 2));
+
+  buildRecurrenceIndexFile({ contextPath: shardCtxRel });
+  await runSeeHowDetection({ contextPath: shardCtxRel, generateIdsFn: stubIds });
+
+  const prepared = readPrepared(dirPath);
+  assert.equal(prepared.items.length, 1);
+  assert.equal(prepared.items[0].reference, '3:11', 'only the in-range occurrence is used');
 });

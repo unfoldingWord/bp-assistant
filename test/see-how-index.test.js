@@ -4,6 +4,7 @@ const assert = require('node:assert/strict');
 const {
   buildBookRecurrenceIndex,
   parseAlignedUsfmSpans,
+  normalizeStrong,
   deriveRecurrenceKey,
   deriveRecurrenceKeys,
   formatTnLink,
@@ -327,4 +328,106 @@ test('C4: a length tie is broken by the earlier anchor verse', () => {
 test('C4: an empty or single-key set is unchanged', () => {
   assert.deepEqual([...selectAlsoOccursCarriers([])], []);
   assert.deepEqual([...selectAlsoOccursCarriers([{ key: 'H3068', anchorVerse: 1 }])], ['H3068']);
+});
+
+// --- Round 3: S5 / S6 / N3 / S11 / B1 alias map -----------------------------
+
+const {
+  parseTnTsv,
+  resolveWorkspacePath,
+  resolveDoor43ReposPath,
+} = require('../src/workspace-tools/recurrence-index');
+
+test('S5: Strong numbers canonicalise to four digits, so H559 and H0559 are one lemma', () => {
+  assert.equal(normalizeStrong('H559'), 'H0559');
+  assert.equal(normalizeStrong('H0559'), 'H0559');
+  assert.equal(normalizeStrong('c:H1961'), 'H1961');
+  assert.equal(normalizeStrong('H6635b'), 'H6635b');
+  // Both spellings hit the stoplist, so neither earns a single-word pointer.
+  assert.equal(isSeeHowEligible('H559', 'translate-names'), false);
+  assert.equal(isSeeHowEligible('H0559', 'translate-names'), false);
+  assert.equal(isSeeHowEligible('H430', 'figs-idiom'), false);
+  assert.equal(isSeeHowEligible('H0430', 'figs-idiom'), false);
+});
+
+test('S6: several verses on one USFM line attribute words to the right verse', () => {
+  const aw = (strong, content, word) =>
+    `\\zaln-s |x-strong="${strong}" x-occurrence="1" x-content="${content}"\\*` +
+    `\\w ${word}|x-occurrence="1"\\w*\\zaln-e\\*`;
+  const aligned = [
+    '\\id AMO',
+    '\\c 1',
+    `\\q1 \\v 1 ${aw('H0001', 'a', 'A')} \\v 2 ${aw('H0002', 'b', 'B')} \\v 3 ${aw('H0003', 'c', 'C')}`,
+    '',
+  ].join('\n');
+  assert.deepEqual(
+    parseAlignedUsfmSpans(aligned).map((r) => `${r.ref}=${r.strong}`),
+    ['1:1=H0001', '1:2=H0002', '1:3=H0003']
+  );
+
+  const heb = [
+    '\\id AMO',
+    '\\c 1',
+    '\\v 1 \\w aleph|strong="H0001"\\w* \\v 2 \\w bet|strong="H0002"\\w* \\v 3 \\w gimel|strong="H0003"\\w*',
+    '',
+  ].join('\n');
+  assert.deepEqual(
+    parseHebrewUsfmWords(heb).map((r) => `${r.ref}=${r.strong}`),
+    ['1:1=H0001', '1:2=H0002', '1:3=H0003']
+  );
+});
+
+test('N3: parseTnTsv strips an rc:// prefix in any language, not just *', () => {
+  const tsv = [
+    'Reference\tID\tTags\tSupportReference\tQuote\tOccurrence\tNote',
+    '1:1\taaaa\t\trc://*/ta/man/translate/figs-idiom\tq\t1\tA',
+    '1:2\tbbbb\t\trc://en/ta/man/translate/figs-metaphor\tq\t1\tB',
+    '',
+  ].join('\n');
+  assert.deepEqual(parseTnTsv(tsv).map((r) => r.sref), ['figs-idiom', 'figs-metaphor']);
+});
+
+test('S11: the shared resolver honours an absolute path and resolves a relative one', () => {
+  const abs = process.platform === 'win32' ? 'C:\\srv\\repos' : '/srv/repos';
+  assert.equal(resolveWorkspacePath(abs, '/base'), abs);
+  assert.equal(
+    resolveWorkspacePath('door43-repos', process.cwd()),
+    require('path').resolve(process.cwd(), 'door43-repos')
+  );
+  const old = process.env.DOOR43_REPOS_PATH;
+  try {
+    process.env.DOOR43_REPOS_PATH = 'rel/repos';
+    assert.equal(
+      resolveDoor43ReposPath(process.cwd()),
+      require('path').resolve(process.cwd(), 'rel/repos')
+    );
+  } finally {
+    if (old == null) delete process.env.DOOR43_REPOS_PATH;
+    else process.env.DOOR43_REPOS_PATH = old;
+  }
+});
+
+test('B1: the index publishes an alias from the text key to the Strong key', () => {
+  const aligned = [
+    '\\id ZEC',
+    '\\c 1',
+    '\\p',
+    '\\v 1 \\zaln-s |x-strong="H1697" x-occurrence="1" x-content="דְּבַר"\\*\\w word|x-occurrence="1"\\w*\\zaln-e\\*' +
+      '\\zaln-s |x-strong="H3068" x-occurrence="1" x-content="יְהוָ֖ה"\\*\\w Yahweh|x-occurrence="1"\\w*\\zaln-e\\*',
+    '\\c 3',
+    '\\p',
+    '\\v 2 \\zaln-s |x-strong="H1697" x-occurrence="1" x-content="דְּבַר"\\*\\w word|x-occurrence="1"\\w*\\zaln-e\\*' +
+      '\\zaln-s |x-strong="H3068" x-occurrence="1" x-content="יְהוָ֖ה"\\*\\w Yahweh|x-occurrence="1"\\w*\\zaln-e\\*',
+    '',
+  ].join('\n');
+  const tsv = [
+    'Reference\tID\tTags\tSupportReference\tQuote\tOccurrence\tNote',
+    '1:1\tabcd\t\trc://*/ta/man/translate/figs-possession\tדְּבַר־יְהוָ֖ה\t1\tExplanatory note.',
+    '',
+  ].join('\n');
+  const index = buildBookRecurrenceIndex({
+    book: 'ZEC', chapter: 3, ultFullUsfm: aligned, tnBookTsv: tsv,
+  });
+  assert.equal(index.canonical['דבר+יהוה'], 'H1697+H3068');
+  assert.equal(index.canonical['H1697+H3068'], 'H1697+H3068');
 });
