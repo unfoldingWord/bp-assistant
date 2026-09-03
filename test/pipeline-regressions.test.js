@@ -618,3 +618,31 @@ test('#287: ordinary results are not misread as permission failures', () => {
   assert.equal(_classifyPermissionFailure(null), null);
   assert.equal(_classifyPermissionFailure(undefined), null);
 });
+
+// See-how recurrence: the parallel tn-writer shard context is cloned from the
+// chapter context and then has each runtime path rewritten per shard. If
+// recurrence_index.json is not part of buildRuntimePaths, a shard silently loses
+// the index (and with it every cross-chapter pointer), so assert the wiring.
+test('see-how: buildRuntimePaths exposes recurrenceIndex and preCreateStubs seeds it', () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'recurrence-paths-'));
+  const oldBaseDir = process.env.CSKILLBP_DIR;
+  process.env.CSKILLBP_DIR = tempDir;
+  const modulePath = require.resolve('../src/pipeline-context');
+  delete require.cache[modulePath];
+  const { buildRuntimePaths, preCreateStubs } = require('../src/pipeline-context');
+
+  try {
+    const dirPath = 'tmp/pipeline/ZEC-03';
+    fs.mkdirSync(path.join(tempDir, dirPath), { recursive: true });
+    const runtime = buildRuntimePaths(dirPath);
+    assert.equal(runtime.recurrenceIndex, `${dirPath}/recurrence_index.json`);
+    preCreateStubs(dirPath);
+    const stub = path.join(tempDir, runtime.recurrenceIndex);
+    assert.ok(fs.existsSync(stub), 'recurrence index stub is pre-created');
+    assert.equal(fs.readFileSync(stub, 'utf8'), '{}');
+  } finally {
+    if (oldBaseDir == null) delete process.env.CSKILLBP_DIR;
+    else process.env.CSKILLBP_DIR = oldBaseDir;
+    delete require.cache[modulePath];
+  }
+});

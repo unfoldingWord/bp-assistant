@@ -530,3 +530,327 @@ test('checkTnQuality flags markdown inside AT brackets and leaves prose bold to 
     .filter((f) => f.category === 'bold_not_in_ult').map((f) => f.id);
   assert.deepEqual(boldIds, ['a3b4']);
 });
+
+// --- Phase 4 guardrails: see-how link checks (docs/plan.md) ---
+
+test('checkTnQuality seehow_target_missing: no match in output TSV or merged book TSV', async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'quality-seehow-missing-'));
+  const relRoot = path.join('tmp', path.basename(tempDir));
+  fs.mkdirSync(path.join('/srv/bot/workspace', relRoot), { recursive: true });
+
+  const tsvRel = path.join(relRoot, 'tn.tsv');
+  const findingsRel = path.join(relRoot, 'findings.json');
+
+  fs.writeFileSync(path.join('/srv/bot/workspace', tsvRel), [
+    'Reference\tID\tTags\tSupportReference\tQuote\tOccurrence\tNote',
+    // Points at 2:9 — no row for 2:9 exists in this TSV, and no merged book
+    // TSV is supplied, so this must resolve as "unverified", not "missing".
+    '3:1\ta1b2\t\t\t\t\tSee how you translated the similar expression in [2:9](../02/09.md).',
+  ].join('\n'));
+
+  await checkTnQuality({ tsvPath: tsvRel, output: findingsRel });
+
+  const findings = readFindings(findingsRel);
+  assert.ok(findings.some((f) => f.id === 'a1b2' && f.category === 'seehow_target_unverified'));
+  assert.ok(!findings.some((f) => f.category === 'seehow_target_missing'));
+});
+
+test('checkTnQuality seehow_target_missing: merged book TSV available but target absent', async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'quality-seehow-missing2-'));
+  const relRoot = path.join('tmp', path.basename(tempDir));
+  fs.mkdirSync(path.join('/srv/bot/workspace', relRoot), { recursive: true });
+
+  const tsvRel = path.join(relRoot, 'tn.tsv');
+  const findingsRel = path.join(relRoot, 'findings.json');
+
+  fs.writeFileSync(path.join('/srv/bot/workspace', tsvRel), [
+    'Reference\tID\tTags\tSupportReference\tQuote\tOccurrence\tNote',
+    '3:1\ta1b2\t\t\t\t\tSee how you translated the similar expression in [2:9](../02/09.md).',
+  ].join('\n'));
+
+  await checkTnQuality({
+    tsvPath: tsvRel,
+    output: findingsRel,
+    // Merged book TSV is present (so the check has an authoritative answer)
+    // but has no row covering 2:9 — this is a real error, not "unverified".
+    bookTsvRows: ['2:5', '2:7'],
+  });
+
+  const findings = readFindings(findingsRel);
+  assert.ok(findings.some((f) => f.id === 'a1b2' && f.category === 'seehow_target_missing' && f.severity === 'error'));
+  assert.ok(!findings.some((f) => f.category === 'seehow_target_unverified'));
+});
+
+test('checkTnQuality seehow target resolves against the current TSV or a bridged merged-TSV row', async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'quality-seehow-hit-'));
+  const relRoot = path.join('tmp', path.basename(tempDir));
+  fs.mkdirSync(path.join('/srv/bot/workspace', relRoot), { recursive: true });
+
+  const tsvRel = path.join(relRoot, 'tn.tsv');
+  const findingsRel = path.join(relRoot, 'findings.json');
+
+  fs.writeFileSync(path.join('/srv/bot/workspace', tsvRel), [
+    'Reference\tID\tTags\tSupportReference\tQuote\tOccurrence\tNote',
+    // Target 2:5 exists as a row right here in the current output TSV.
+    '2:5\tz9y8\t\t\t\t\tThe similar expression appears here.',
+    '3:1\ta1b2\t\t\t\t\tSee how you translated the similar expression in [2:5](../02/05.md).',
+    // Target 5:6 is only covered by a verse-bridge row (5:6-7) in the merged book TSV.
+    '9:1\tc3d4\t\t\t\t\tSee how you translated the similar expression in [5:6](../05/06.md).',
+  ].join('\n'));
+
+  await checkTnQuality({
+    tsvPath: tsvRel,
+    output: findingsRel,
+    bookTsvRows: ['5:6-7'],
+  });
+
+  const findings = readFindings(findingsRel);
+  const seehowFindings = findings.filter((f) => ['seehow_target_missing', 'seehow_target_unverified'].includes(f.category));
+  assert.deepEqual(seehowFindings, []);
+});
+
+test('checkTnQuality seehow_forward_pointer: target later than the note\'s own reference', async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'quality-seehow-forward-'));
+  const relRoot = path.join('tmp', path.basename(tempDir));
+  fs.mkdirSync(path.join('/srv/bot/workspace', relRoot), { recursive: true });
+
+  const tsvRel = path.join(relRoot, 'tn.tsv');
+  const findingsRel = path.join(relRoot, 'findings.json');
+
+  fs.writeFileSync(path.join('/srv/bot/workspace', tsvRel), [
+    'Reference\tID\tTags\tSupportReference\tQuote\tOccurrence\tNote',
+    '2:1\tz9y8\t\t\t\t\tThe similar expression appears here.',
+    // 2:1 points forward to 2:5, in the same chapter — invalid.
+    '2:1\ta1b2\t\t\t\t\tSee how you translated the similar expression in [2:5](../02/05.md).',
+  ].join('\n'));
+
+  await checkTnQuality({ tsvPath: tsvRel, output: findingsRel });
+
+  const findings = readFindings(findingsRel);
+  assert.ok(findings.some((f) => f.id === 'a1b2' && f.category === 'seehow_forward_pointer' && f.severity === 'error'));
+});
+
+test('checkTnQuality seehow: same-verse link is ignored (not forward, not missing)', async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'quality-seehow-same-'));
+  const relRoot = path.join('tmp', path.basename(tempDir));
+  fs.mkdirSync(path.join('/srv/bot/workspace', relRoot), { recursive: true });
+
+  const tsvRel = path.join(relRoot, 'tn.tsv');
+  const findingsRel = path.join(relRoot, 'findings.json');
+
+  fs.writeFileSync(path.join('/srv/bot/workspace', tsvRel), [
+    'Reference\tID\tTags\tSupportReference\tQuote\tOccurrence\tNote',
+    // Link target 2:5 is the same verse as the note's own reference.
+    '2:5\ta1b2\t\t\t\t\tSee how you translated the similar expression in [2:5](../02/05.md).',
+  ].join('\n'));
+
+  await checkTnQuality({ tsvPath: tsvRel, output: findingsRel });
+
+  const findings = readFindings(findingsRel);
+  const seehowFindings = findings.filter((f) => f.category.startsWith('seehow_'));
+  assert.deepEqual(seehowFindings, []);
+});
+
+test('checkTnQuality seehow_noncanonical: "see how you rendered" and old-format link path', async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'quality-seehow-nc-'));
+  const relRoot = path.join('tmp', path.basename(tempDir));
+  fs.mkdirSync(path.join('/srv/bot/workspace', relRoot), { recursive: true });
+
+  const tsvRel = path.join(relRoot, 'tn.tsv');
+  const findingsRel = path.join(relRoot, 'findings.json');
+
+  fs.writeFileSync(path.join('/srv/bot/workspace', tsvRel), [
+    'Reference\tID\tTags\tSupportReference\tQuote\tOccurrence\tNote',
+    // "rendered" instead of "translated" — never valid, regardless of link shape.
+    '3:1\ta1b2\t\t\t\t\tSee how you rendered the similar expression in [2:5](../02/05.md).',
+    // "translated" with the old book-relative link format instead of ../CC/VV.md.
+    '3:2\tb2c3\t\t\t\t\tSee how you translated the similar expression in [2:5](../../zec/02/05.md).',
+  ].join('\n'));
+
+  await checkTnQuality({ tsvPath: tsvRel, output: findingsRel });
+
+  const findings = readFindings(findingsRel);
+  const ncById = new Map();
+  for (const f of findings.filter((f) => f.category === 'seehow_noncanonical')) {
+    if (!ncById.has(f.id)) ncById.set(f.id, []);
+    ncById.get(f.id).push(f.severity);
+  }
+  assert.deepEqual(ncById.get('a1b2'), ['warning']);
+  assert.deepEqual(ncById.get('b2c3'), ['warning']);
+});
+
+test('checkTnQuality seehow_noncanonical: PSA requires 3-digit padding, other books require 2-digit', async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'quality-seehow-pad-'));
+  const relRoot = path.join('tmp', path.basename(tempDir));
+  fs.mkdirSync(path.join('/srv/bot/workspace', relRoot), { recursive: true });
+
+  const tsvRel = path.join(relRoot, 'tn.tsv');
+  const findingsRel = path.join(relRoot, 'findings.json');
+
+  fs.writeFileSync(path.join('/srv/bot/workspace', tsvRel), [
+    'Reference\tID\tTags\tSupportReference\tQuote\tOccurrence\tNote',
+    // PSA note but 2-digit padding — should be flagged (needs 3-digit).
+    '78:1\ta1b2\t\t\t\t\tSee how you translated the similar expression in [39:5](../39/05.md).',
+  ].join('\n'));
+
+  await checkTnQuality({ tsvPath: tsvRel, output: findingsRel, book: 'PSA' });
+
+  const psaFindings = readFindings(findingsRel).filter((f) => f.category === 'seehow_noncanonical');
+  assert.ok(psaFindings.some((f) => f.id === 'a1b2'));
+
+  // Same shape, non-PSA book with 3-digit padding — also flagged (needs 2-digit).
+  const tempDir2 = fs.mkdtempSync(path.join(os.tmpdir(), 'quality-seehow-pad2-'));
+  const relRoot2 = path.join('tmp', path.basename(tempDir2));
+  fs.mkdirSync(path.join('/srv/bot/workspace', relRoot2), { recursive: true });
+  const tsvRel2 = path.join(relRoot2, 'tn.tsv');
+  const findingsRel2 = path.join(relRoot2, 'findings.json');
+  fs.writeFileSync(path.join('/srv/bot/workspace', tsvRel2), [
+    'Reference\tID\tTags\tSupportReference\tQuote\tOccurrence\tNote',
+    '3:1\tc3d4\t\t\t\t\tSee how you translated the similar expression in [002:005](../002/005.md).',
+  ].join('\n'));
+  await checkTnQuality({ tsvPath: tsvRel2, output: findingsRel2, book: 'ZEC' });
+  const zecFindings = readFindings(findingsRel2).filter((f) => f.category === 'seehow_noncanonical');
+  assert.ok(zecFindings.some((f) => f.id === 'c3d4'));
+
+  // Correctly-padded PSA link must NOT be flagged.
+  const tempDir3 = fs.mkdtempSync(path.join(os.tmpdir(), 'quality-seehow-pad3-'));
+  const relRoot3 = path.join('tmp', path.basename(tempDir3));
+  fs.mkdirSync(path.join('/srv/bot/workspace', relRoot3), { recursive: true });
+  const tsvRel3 = path.join(relRoot3, 'tn.tsv');
+  const findingsRel3 = path.join(relRoot3, 'findings.json');
+  fs.writeFileSync(path.join('/srv/bot/workspace', tsvRel3), [
+    'Reference\tID\tTags\tSupportReference\tQuote\tOccurrence\tNote',
+    '39:6\td4e5\t\t\t\t\tThe similar expression appears here.',
+    '78:1\td4e5b\t\t\t\t\tSee how you translated the similar expression in [039:006](../039/006.md).',
+  ].join('\n'));
+  await checkTnQuality({ tsvPath: tsvRel3, output: findingsRel3, book: 'PSA' });
+  const psaOkFindings = readFindings(findingsRel3).filter((f) => f.category === 'seehow_noncanonical');
+  assert.deepEqual(psaOkFindings, []);
+});
+
+test('multiverse_backref does not fire on canonical see-how sentences or the "also occurs" summary', async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'quality-backref-nonreg-'));
+  const relRoot = path.join('tmp', path.basename(tempDir));
+  fs.mkdirSync(path.join('/srv/bot/workspace', relRoot), { recursive: true });
+
+  const tsvRel = path.join(relRoot, 'tn.tsv');
+  const findingsRel = path.join(relRoot, 'findings.json');
+
+  fs.writeFileSync(path.join('/srv/bot/workspace', tsvRel), [
+    'Reference\tID\tTags\tSupportReference\tQuote\tOccurrence\tNote',
+    '2:5\tz9y8\t\t\t\t\tThe similar expression appears here.',
+    '3:1\ta1b2\t\t\t\t\tSee how you translated the similar expression in [2:5](../02/05.md).',
+    '3:5\tb2c3\t\t\t\t\tThe similar expression appears here. This also occurs in verses 5, 7, 8, and 11.',
+  ].join('\n'));
+
+  await checkTnQuality({ tsvPath: tsvRel, output: findingsRel });
+
+  const backrefFindings = readFindings(findingsRel).filter((f) => f.category === 'multiverse_backref');
+  assert.deepEqual(backrefFindings, []);
+});
+
+test('checkTnQuality seehow_noncanonical: absolute links in a see-how note are not pointers', async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'quality-seehow-abs-'));
+  const relRoot = path.join('tmp', path.basename(tempDir));
+  fs.mkdirSync(path.join('/srv/bot/workspace', relRoot), { recursive: true });
+
+  const tsvRel = path.join(relRoot, 'tn.tsv');
+  const findingsRel = path.join(relRoot, 'findings.json');
+
+  fs.writeFileSync(path.join('/srv/bot/workspace', tsvRel), [
+    'Reference\tID\tTags\tSupportReference\tQuote\tOccurrence\tNote',
+    '2:5\tz0z0\t\t\t\t\tThe earlier note this one points back to.',
+    // Canonical pointer plus a trailing tA article link. The rc:// link is not
+    // a pointer path and must not be scanned for the ../CC/VV.md shape.
+    '3:1\ta1b2\t\t\t\t\tSee how you translated the similar expression in [2:5](../02/05.md). (See: [Metaphor](rc://*/ta/man/translate/figs-metaphor))',
+  ].join('\n'));
+
+  await checkTnQuality({ tsvPath: tsvRel, output: findingsRel });
+
+  const nc = readFindings(findingsRel).filter((f) => f.category === 'seehow_noncanonical' && f.id === 'a1b2');
+  assert.deepEqual(nc, [], 'the rc:// link is left alone');
+});
+
+// --- Round 3: S2 / S3 / S4 / S10 -------------------------------------------
+
+function writeQualityTsv(prefix, rows) {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+  const relRoot = path.join('tmp', path.basename(tempDir));
+  fs.mkdirSync(path.join('/srv/bot/workspace', relRoot), { recursive: true });
+  const tsvRel = path.join(relRoot, 'tn.tsv');
+  const findingsRel = path.join(relRoot, 'findings.json');
+  fs.writeFileSync(
+    path.join('/srv/bot/workspace', tsvRel),
+    ['Reference\tID\tTags\tSupportReference\tQuote\tOccurrence\tNote'].concat(rows).join('\n')
+  );
+  return { tsvRel, findingsRel };
+}
+
+test('S2: the deterministic also-occurs sentence is not multiverse language', async () => {
+  const shapes = [
+    'This also occurs in verses 5, 7, 8, and 11.',
+    'This also occurs in verses 5 and 7.',
+    'This also occurs in verse 5.',
+    'This also occurs in verses 3–5 and 9.',
+  ];
+  const rows = shapes.map((sentence, i) =>
+    `3:${i + 1}\tq${i}q${i}\t\t\t\t\tThe possessive form describes a message. ${sentence}`);
+  const { tsvRel, findingsRel } = writeQualityTsv('quality-alsooccurs-', rows);
+
+  await checkTnQuality({ tsvPath: tsvRel, output: findingsRel });
+
+  const noisy = readFindings(findingsRel)
+    .filter((f) => f.category === 'multiverse_language' || f.category === 'multiverse_backref');
+  assert.deepEqual(noisy, [], 'no multiverse findings for any also-occurs shape');
+});
+
+test('S3: an ordinary note that links forward is not a see-how pointer', async () => {
+  // Golden JOS 1 row w48w: "through [verse 9](../01/09.md)" in a plain note.
+  const { tsvRel, findingsRel } = writeQualityTsv('quality-forwardlink-', [
+    '1:5\tw48w\t\t\t\t\tThis command runs through [verse 9](../01/09.md) and shapes the paragraph.',
+  ]);
+
+  await checkTnQuality({ tsvPath: tsvRel, output: findingsRel });
+
+  const seeHow = readFindings(findingsRel).filter((f) => String(f.category).startsWith('seehow_'));
+  assert.deepEqual(seeHow, [], 'no see-how findings on a note without a pointer sentence');
+});
+
+test('S4: chapter intro rows are never treated as see-how pointers', async () => {
+  const { tsvRel, findingsRel } = writeQualityTsv('quality-intro-', [
+    '1:intro\tqki3\t\t\t\t0\t# Notes\\n\\nSee how you translated this in [1:7](../01/07.md) and [9:1](../09/01.md).',
+  ]);
+
+  await checkTnQuality({ tsvPath: tsvRel, output: findingsRel });
+
+  const seeHow = readFindings(findingsRel).filter((f) => String(f.category).startsWith('seehow_'));
+  assert.deepEqual(seeHow, [], 'intro rows are exempt');
+});
+
+test('S3: a forward link INSIDE a see-how sentence is still an error', async () => {
+  const { tsvRel, findingsRel } = writeQualityTsv('quality-forwardptr-', [
+    '2:1\tz9y8\t\t\t\t\tThe similar expression appears here.',
+    '2:1\ta1b2\t\t\t\t\tSee how you translated the similar expression in [2:5](../02/05.md).',
+  ]);
+
+  await checkTnQuality({ tsvPath: tsvRel, output: findingsRel });
+
+  assert.ok(readFindings(findingsRel).some(
+    (f) => f.id === 'a1b2' && f.category === 'seehow_forward_pointer' && f.severity === 'error'
+  ));
+});
+
+test('S10: tW and tA relative links in a see-how note are not flagged non-canonical', async () => {
+  const { tsvRel, findingsRel } = writeQualityTsv('quality-twlinks-', [
+    '2:5\tz0z0\t\t\t\t\tThe earlier note.',
+    '3:1\ta1b2\t\t\t\t\tSee how you translated the similar expression in [2:5](../02/05.md). ' +
+      '(See: [Yahweh](../../bible/kt/yahweh.md) and [Idiom](../../translate/figs-idiom/01.md))',
+  ]);
+
+  await checkTnQuality({ tsvPath: tsvRel, output: findingsRel });
+
+  const nc = readFindings(findingsRel).filter(
+    (f) => f.category === 'seehow_noncanonical' && f.id === 'a1b2'
+  );
+  assert.deepEqual(nc, [], 'only verse links are inspected');
+});

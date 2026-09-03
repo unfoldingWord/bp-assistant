@@ -7,10 +7,48 @@ const path = require('path');
 const https = require('https');
 
 const { loadTemplateMap, resolveAtRequirement, _inspectOpeningBold, countCaseInsensitiveOccurrences } = require('./tn-tools');
+const { resolveWorkspacePath, resolveDoor43ReposPath } = require('./recurrence-index');
 
 const CSKILLBP_DIR = process.env.CSKILLBP_DIR || '/srv/bot/workspace';
 
 // Sets used by orphaned-word checks (Check 10 / 10b)
+// The deterministic "This also occurs in verses 5, 7, 8, and 11." sentence
+// the see-how detector appends. Removed before the multiverse checks, which
+// would otherwise read it as a note that belongs in a multi-verse entry.
+const ALSO_OCCURS_RE = /\bThis also occurs in verses?\s[^.]*\./gi;
+function stripAlsoOccursSentence(note) {
+  return String(note || '').replace(ALSO_OCCURS_RE, ' ');
+}
+
+// A relative link to a verse: ../CC/VV.md, or ../../bok/CC/VV.md for another
+// book. tW/tA links (../../bible/kt/yahweh.md, ../../translate/figs-idiom/01.md)
+// and absolute rc:// links are not pointers and are never inspected.
+const VERSE_LINK_PATH_RE = /^\.\.\/(?:\d{1,3}\/\d{1,3}\.md|\.\.\/[1-3a-z]{3}\/\d{1,3}\/\d{1,3}\.md)$/;
+
+// The see-how checks only apply to the pointer sentence itself: everything
+// from "See how you translated" up to that sentence's terminating period.
+// An ordinary note may legitimately link forward ("through [verse 9](../01/09.md)"),
+// and a chapter intro is full of verse links that are not pointers.
+// The terminator is a period followed by whitespace or end-of-note: the dots
+// inside "../02/05.md" are followed by a letter or a slash, so a naive [^.]*
+// would cut the sentence off before its own link.
+const SEE_HOW_SENTENCE_RE = /see how you translated[\s\S]*?\.(?=\s|$)/gi;
+function seeHowSentences(note) {
+  const text = String(note || '');
+  const found = text.match(SEE_HOW_SENTENCE_RE);
+  if (found && found.length) return found;
+  // Unterminated sentence (truncated note): take only up to the first link
+  // after the phrase (or a short bounded tail), never the whole remainder.
+  const start = text.search(/see how you translated/i);
+  if (start < 0) return [];
+  const tail = text.slice(start);
+  const firstLink = tail.match(/^[sS]*?]([^)]*).?/);
+  return [firstLink ? firstLink[0] : tail.slice(0, 200)];
+}
+function isIntroReference(ref) {
+  return /(?:^|:)(?:intro|front)$/i.test(String(ref || '').trim());
+}
+
 const CONJUNCTIONS = new Set(['and','but','so','then','or','for','yet','nor']);
 const PREPOSITIONS = new Set(['in','to','from','by','for','with','on','at','of','into','upon','about','through','against','between']);
 
@@ -466,9 +504,44 @@ function detectSelfTalk(noteText) {
   return null;
 }
 
+/**
+ * Parse a TN Reference column value ("C:V", "C:V-V2", "C:V,V2", "C:intro", ...)
+ * into { chapter, ranges: [[start, end], ...] }, or null for intro/front/
+ * unparseable references. Shared by the see-how link guardrails (checkTnQuality
+ * check 26) to resolve whether a pointer's target chapter:verse is covered by
+ * a row — including verse-bridge rows, whose range covers every verse in it.
+ */
+function parseReferenceRanges(ref) {
+  const m = String(ref || '').match(/^(\d+):(.+)$/);
+  if (!m) return null;
+  const versePart = m[2];
+  if (versePart === 'intro' || versePart === 'front') return null;
+  const chapter = parseInt(m[1], 10);
+  const ranges = [];
+  for (const seg of versePart.split(',')) {
+    const rm = seg.trim().match(/^(\d+)(?:-(\d+))?$/);
+    if (!rm) continue;
+    const start = parseInt(rm[1], 10);
+    const end = rm[2] ? parseInt(rm[2], 10) : start;
+    ranges.push([start, end]);
+  }
+  return ranges.length ? { chapter, ranges } : null;
+}
+
+/** True when any Reference value in `refs` covers chapter:verse (bridges included). */
+function referencesCoverVerse(refs, chapter, verse) {
+  for (const ref of refs) {
+    const parsed = parseReferenceRanges(ref);
+    if (parsed && parsed.chapter === chapter && parsed.ranges.some(([s, e]) => verse >= s && verse <= e)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 // --- check_tn_quality ---
 
-async function checkTnQuality({ tsvPath, preparedJson, ultUsfm, ustUsfm, book, hebrewUsfm, output }) {
+async function checkTnQuality({ tsvPath, preparedJson, ultUsfm, ustUsfm, book, hebrewUsfm, output, bookTsvRows, bookTsvPath }) {
   const tsv = path.resolve(CSKILLBP_DIR, tsvPath);
   const content = fs.readFileSync(tsv, 'utf8');
   const lines = content.split('\n');
@@ -535,6 +608,32 @@ async function checkTnQuality({ tsvPath, preparedJson, ultUsfm, ustUsfm, book, h
   let upstreamIds = null;
   if (book) {
     upstreamIds = await fetchUpstreamIds(book);
+  }
+
+  // Merged book TSV for see-how target resolution (check 26). Explicit
+  // bookTsvRows (strings or {reference}/{ref} objects) wins over a path; the
+  // default path mirrors where the nightly export keeps the per-book merge.
+  const currentRefs = notes.map((n) => n.ref);
+  let bookTsvAvailable = false;
+  let mergedBookRefs = [];
+  if (bookTsvRows) {
+    bookTsvAvailable = true;
+    mergedBookRefs = bookTsvRows.map((r) => (typeof r === 'string' ? r : (r && (r.reference || r.ref)) || ''));
+  } else if (book) {
+    // Same resolver notes-pipeline uses, so both find the clone in the same
+    // place: an absolute DOOR43_REPOS_PATH is honoured, a relative one is
+    // resolved against the workspace root.
+    const defaultBookTsvPath = bookTsvPath
+      || path.join(resolveDoor43ReposPath(CSKILLBP_DIR), 'en_tn', `tn_${book.toUpperCase()}.tsv`);
+    const resolvedBookTsvPath = resolveWorkspacePath(defaultBookTsvPath, CSKILLBP_DIR);
+    if (fs.existsSync(resolvedBookTsvPath)) {
+      bookTsvAvailable = true;
+      const bookLines = fs.readFileSync(resolvedBookTsvPath, 'utf8').split('\n');
+      for (let i = 1; i < bookLines.length; i++) {
+        const bl = bookLines[i].trim();
+        if (bl) mergedBookRefs.push(bl.split('\t')[0] || '');
+      }
+    }
   }
 
   const findings = [];
@@ -859,13 +958,18 @@ async function checkTnQuality({ tsvPath, preparedJson, ultUsfm, ustUsfm, book, h
 
     // 20. Multiverse notes
     if (n.note) {
+      // The deterministic "This also occurs in verses 5, 7, 8, and 11."
+      // sentence appended by the see-how detector is by design a list of
+      // verse numbers; it is not the multi-verse-entry smell these checks
+      // look for, so it is removed before either of them runs.
+      const noteForMultiverse = stripAlsoOccursSentence(n.note);
       // 20a: multi-verse range language
-      if (/\bverses\s+\d+(?:\s*[-,]\s*\d+)*(?:\s*(?:,\s*)?and\s+\d+)/i.test(n.note) ||
-          /\bverses\s+\d+\s*[-\u2013]\s*\d+/i.test(n.note)) {
+      if (/\bverses\s+\d+(?:\s*[-,]\s*\d+)*(?:\s*(?:,\s*)?and\s+\d+)/i.test(noteForMultiverse) ||
+          /\bverses\s+\d+\s*[-\u2013]\s*\d+/i.test(noteForMultiverse)) {
         addFinding(n.row, n.ref, n.id, 'warning', 'multiverse_language', 'Note references multiple verses — may belong in a multi-verse entry');
       }
       // 20b: back-reference to another verse
-      if (/\b(?:as in|see|from|refers? to[^.]{0,30})\s+verse\s+\d+/i.test(n.note)) {
+      if (/\b(?:as in|see|from|refers? to[^.]{0,30})\s+verse\s+\d+/i.test(noteForMultiverse)) {
         addFinding(n.row, n.ref, n.id, 'warning', 'multiverse_backref', 'Note references another verse number');
       }
     }
@@ -1065,6 +1169,93 @@ async function checkTnQuality({ tsvPath, preparedJson, ultUsfm, ustUsfm, book, h
         }
       }
     }
+
+    // 26. See-how link guardrails (docs/plan.md "Phase 4 — Guardrails"). Every
+    // see-how pointer targets the FIRST occurrence in the book, never forward.
+    //
+    // Scoped to the "See how you translated ..." sentence, and never applied to
+    // intro rows: run over whole notes these fired on ordinary forward links
+    // (golden JOS 1 row w48w: "through [verse 9](../01/09.md)") and on the verse
+    // links that fill a chapter intro.
+    // 26c. "see how you rendered" is never valid phrasing (zero corpus hits).
+    // Checked on the whole note: such a sentence has no "translated" to scope to.
+    if (n.note && !isIntroReference(n.ref) && /see how you rendered/i.test(n.note)) {
+      addFinding(n.row, n.ref, n.id, 'warning', 'seehow_noncanonical',
+        '"see how you rendered" is not valid phrasing — use "see how you translated"');
+    }
+
+    const seeHowText = isIntroReference(n.ref) ? '' : seeHowSentences(n.note).join(' ');
+    if (seeHowText) {
+      const ownRef = parseReferenceRanges(n.ref);
+      const CANONICAL_LINK_RE = /\[[^\]]*\]\(\.\.\/(\d{2,3})\/(\d{2,3})\.md\)/g;
+      let lm;
+      while ((lm = CANONICAL_LINK_RE.exec(seeHowText)) !== null) {
+        const targetChapter = parseInt(lm[1], 10);
+        const targetVerse = parseInt(lm[2], 10);
+
+        // A link to the note's own verse (including its own bridge) is not a
+        // real pointer — ignore rather than flag as forward/missing.
+        if (ownRef && ownRef.chapter === targetChapter
+          && ownRef.ranges.some(([s, e]) => targetVerse >= s && targetVerse <= e)) {
+          continue;
+        }
+
+        // 26a. Forward pointer — pointers must only ever point backward.
+        if (ownRef) {
+          const ownStart = ownRef.ranges[0][0];
+          if (targetChapter > ownRef.chapter || (targetChapter === ownRef.chapter && targetVerse > ownStart)) {
+            addFinding(n.row, n.ref, n.id, 'error', 'seehow_forward_pointer',
+              `See-how link points forward to ${targetChapter}:${targetVerse}, after this note's own reference`);
+          }
+        }
+
+        // 26b. Target existence — current output TSV, else the merged book TSV.
+        const inCurrent = referencesCoverVerse(currentRefs, targetChapter, targetVerse);
+        const inBook = bookTsvAvailable && referencesCoverVerse(mergedBookRefs, targetChapter, targetVerse);
+        if (!inCurrent && !inBook) {
+          if (bookTsvAvailable) {
+            addFinding(n.row, n.ref, n.id, 'error', 'seehow_target_missing',
+              `See-how link target ${targetChapter}:${targetVerse} has no matching row in the output TSV or merged book TSV`);
+          } else {
+            addFinding(n.row, n.ref, n.id, 'warning', 'seehow_target_unverified',
+              `See-how link target ${targetChapter}:${targetVerse} could not be verified — merged book TSV unavailable`);
+          }
+        }
+      }
+
+      // 26d. A "See how you translated" note whose link path isn't the
+      // canonical ../CC/VV.md shape (e.g. the old ../../book/1/5.md format).
+      {
+        const ANY_LINK_RE = /\]\(([^)]+)\)/g;
+        let alm;
+        while ((alm = ANY_LINK_RE.exec(seeHowText)) !== null) {
+          const linkPath = alm[1];
+          // Only a relative link that names a verse can be a pointer. rc://
+          // links and tW/tA relative links (../../bible/kt/yahweh.md) are not.
+          if (!VERSE_LINK_PATH_RE.test(linkPath)) continue;
+          if (!/^\.\.\/\d{2,3}\/\d{2,3}\.md$/.test(linkPath)) {
+            addFinding(n.row, n.ref, n.id, 'warning', 'seehow_noncanonical',
+              `See-how link path "${linkPath}" does not match the canonical ../CC/VV.md format`);
+          }
+        }
+      }
+
+      // 26e. Chapter/verse padding: 3 digits for PSA, 2 digits elsewhere.
+      {
+        const PAD_LINK_RE = /\[[^\]]*\]\(\.\.\/(\d{2,3})\/(\d{2,3})\.md\)/g;
+        const isPsa = book && book.toUpperCase() === 'PSA';
+        const expectedLen = isPsa ? 3 : 2;
+        let pm;
+        while ((pm = PAD_LINK_RE.exec(seeHowText)) !== null) {
+          const chStr = pm[1];
+          const vsStr = pm[2];
+          if (chStr.length !== expectedLen || vsStr.length !== expectedLen) {
+            addFinding(n.row, n.ref, n.id, 'warning', 'seehow_noncanonical',
+              `See-how link "../${chStr}/${vsStr}.md" does not use ${expectedLen}-digit padding for ${isPsa ? 'PSA' : 'this book'}`);
+          }
+        }
+      }
+    }
   }
 
   // Check 20c: Near-duplicate detection across adjacent verse notes with same issue slug
@@ -1142,4 +1333,6 @@ module.exports = {
   resolveTemplateText,
   parseHebrewVerseWords,
   normalizeHebrewQuote,
+  parseReferenceRanges,
+  referencesCoverVerse,
 };
