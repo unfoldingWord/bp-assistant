@@ -37,9 +37,13 @@ function seeHowSentences(note) {
   const text = String(note || '');
   const found = text.match(SEE_HOW_SENTENCE_RE);
   if (found && found.length) return found;
-  // Unterminated sentence (truncated note): take the rest of the text.
+  // Unterminated sentence (truncated note): take only up to the first link
+  // after the phrase (or a short bounded tail), never the whole remainder.
   const start = text.search(/see how you translated/i);
-  return start >= 0 ? [text.slice(start)] : [];
+  if (start < 0) return [];
+  const tail = text.slice(start);
+  const firstLink = tail.match(/^[sS]*?]([^)]*).?/);
+  return [firstLink ? firstLink[0] : tail.slice(0, 200)];
 }
 function isIntroReference(ref) {
   return /(?:^|:)(?:intro|front)$/i.test(String(ref || '').trim());

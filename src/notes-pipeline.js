@@ -375,7 +375,7 @@ function buildRecurrenceIndexFile({ pipeDir, contextPath }) {
     alignmentData,
   });
 
-  const outRel = (ctx.runtime && ctx.runtime.recurrenceIndex) || `${pipeDir}/recurrence_index.json`;
+  const outRel = (ctx.runtime && ctx.runtime.recurrenceIndex) || `${pipeDir || path.posix.dirname(String(contextPath || ''))}/recurrence_index.json`;
   const outPath = path.resolve(CSKILLBP_DIR, outRel);
   fs.mkdirSync(path.dirname(outPath), { recursive: true });
   fs.writeFileSync(outPath, JSON.stringify(index));
@@ -455,7 +455,7 @@ async function runSeeHowDetection({ pipeDir, contextPath, generateIdsFn = genera
   } catch { alignmentData = {}; }
 
   let index = { byKey: {} };
-  const indexRel = (ctx.runtime && ctx.runtime.recurrenceIndex) || `${pipeDir}/recurrence_index.json`;
+  const indexRel = (ctx.runtime && ctx.runtime.recurrenceIndex) || `${pipeDir || path.posix.dirname(String(contextPath || ''))}/recurrence_index.json`;
   try {
     const parsed = JSON.parse(fs.readFileSync(path.resolve(CSKILLBP_DIR, indexRel), 'utf8'));
     if (parsed && parsed.byKey) index = parsed;
