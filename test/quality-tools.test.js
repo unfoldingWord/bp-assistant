@@ -748,3 +748,25 @@ test('multiverse_backref does not fire on canonical see-how sentences or the "al
   const backrefFindings = readFindings(findingsRel).filter((f) => f.category === 'multiverse_backref');
   assert.deepEqual(backrefFindings, []);
 });
+
+test('checkTnQuality seehow_noncanonical: absolute links in a see-how note are not pointers', async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'quality-seehow-abs-'));
+  const relRoot = path.join('tmp', path.basename(tempDir));
+  fs.mkdirSync(path.join('/srv/bot/workspace', relRoot), { recursive: true });
+
+  const tsvRel = path.join(relRoot, 'tn.tsv');
+  const findingsRel = path.join(relRoot, 'findings.json');
+
+  fs.writeFileSync(path.join('/srv/bot/workspace', tsvRel), [
+    'Reference\tID\tTags\tSupportReference\tQuote\tOccurrence\tNote',
+    '2:5\tz0z0\t\t\t\t\tThe earlier note this one points back to.',
+    // Canonical pointer plus a trailing tA article link. The rc:// link is not
+    // a pointer path and must not be scanned for the ../CC/VV.md shape.
+    '3:1\ta1b2\t\t\t\t\tSee how you translated the similar expression in [2:5](../02/05.md). (See: [Metaphor](rc://*/ta/man/translate/figs-metaphor))',
+  ].join('\n'));
+
+  await checkTnQuality({ tsvPath: tsvRel, output: findingsRel });
+
+  const nc = readFindings(findingsRel).filter((f) => f.category === 'seehow_noncanonical' && f.id === 'a1b2');
+  assert.deepEqual(nc, [], 'the rc:// link is left alone');
+});

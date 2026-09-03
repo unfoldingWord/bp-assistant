@@ -258,3 +258,19 @@ test('F3: corpus occurrences carry the exact UHB span when the UHB is available'
   // Counted once per registered key form (Strong's and text), so >= 1.
   assert.ok(index.counts.inexactSpans >= 1);
 });
+
+const { dedupeAlsoOccursVerses } = require('../src/workspace-tools/recurrence-index');
+
+test('G3: also-occurs verses dedupe on the numeric first verse and keep the bridge form', () => {
+  // A folded prepared item contributes "5"; the source span for the same bridge
+  // contributes "5-6". Keyed by string those survive as two entries.
+  assert.deepEqual(dedupeAlsoOccursVerses(['5', '5-6']), ['5-6']);
+  assert.deepEqual(dedupeAlsoOccursVerses(['5-6', '5']), ['5-6']);
+  assert.deepEqual(dedupeAlsoOccursVerses(['9', '5', '7']), ['5', '7', '9'], 'ascending');
+  assert.deepEqual(dedupeAlsoOccursVerses(['5', '5']), ['5']);
+  assert.deepEqual(dedupeAlsoOccursVerses(['', null, undefined]), []);
+});
+
+test('G3: formatAlsoOccurs renders a de-duplicated bridge once', () => {
+  assert.equal(formatAlsoOccurs(['5', '5-6', '9']), 'This also occurs in verses 5–6 and 9.');
+});

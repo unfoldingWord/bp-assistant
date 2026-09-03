@@ -20,7 +20,7 @@ const { getDoor43Username, emailToFallbackUsername, buildBranchName, resolveOutp
 const { splitTsv, fixTrailingNewlines } = require('./workspace-tools/tsv-tools');
 const { fillTsvIds, generateIds, prepareNotes, fillOrigQuotes, resolveGlQuotes, flagNarrowQuotes, extractAlignmentData, prepareATContext, substituteAT, fixUnicodeQuotes, verifyBoldMatches, syncCanonicalHebrewQuotes, applyHintsToPreparedNotes, _stripAlternateTranslation: stripAlternateTranslation } = require('./workspace-tools/tn-tools');
 const { checkTnQuality, detectSelfTalk, templateFirstPhrase, resolveTemplateText } = require('./workspace-tools/quality-tools');
-const { buildBookRecurrenceIndex, deriveRecurrenceKeys, buildSeeHowSentence, isSeeHowEligible, hebTokens, verseNumber: recurrenceVerseNumber, SEE_HOW_NEVER_FOLD_SREFS } = require('./workspace-tools/recurrence-index');
+const { buildBookRecurrenceIndex, deriveRecurrenceKeys, buildSeeHowSentence, isSeeHowEligible, dedupeAlsoOccursVerses, hebTokens, verseNumber: recurrenceVerseNumber, SEE_HOW_NEVER_FOLD_SREFS } = require('./workspace-tools/recurrence-index');
 const { normalizeIssuesFile, buildParallelismIntroHintArgs } = require('./issue-normalizer');
 const { curlyQuotes } = require('./workspace-tools/usfm-tools');
 const { verifyRepoPush, verifyDcsToken, verifyRemoteContent } = require('./repo-verify');
@@ -442,6 +442,10 @@ async function runSeeHowDetection({ pipeDir, generateIdsFn = generateIds }) {
       if (occ.source !== 'tn') continue;
       if (!occ.note) continue;
       if (!occ.chapter || (chapter && occ.chapter >= chapter)) continue;
+      // A row that is itself a "See how you translated..." pointer is never a
+      // target: pointing at it would build a chain (the published corpus does
+      // chain; we deliberately do not). Keep scanning for an explanatory row.
+      if (occ.isPointer) continue;
       // Never point at an article that wants its own note at every occurrence.
       if (SEE_HOW_NEVER_FOLD_SREFS.has(String(occ.sref || ''))) continue;
       return occ;
@@ -476,6 +480,13 @@ async function runSeeHowDetection({ pipeDir, generateIdsFn = generateIds }) {
     item.see_how_target = target.ref;
     item.writer_packet = Object.assign({}, item.writer_packet || {}, { programmatic_note: note });
     item.prompt = `Return only this note exactly as written:\n${note}`;
+    return true;
+  };
+
+  const setAlsoOccurs = (item, verses) => {
+    const list = dedupeAlsoOccursVerses(verses);
+    if (!list.length) return false;
+    item.also_occurs_verses = list;
     return true;
   };
 
@@ -523,69 +534,106 @@ async function runSeeHowDetection({ pipeDir, generateIdsFn = generateIds }) {
     byKeyItems.get(key).push(item);
   }
 
+  // Partial-chapter runs (ctx.verseStart/verseEnd) must never anchor, inject,
+  // or list anything outside their own verse window.
+  const rangeStart = parseInt(ctx.verseStart, 10) || 0;
+  const rangeEnd = parseInt(ctx.verseEnd, 10) || 0;
+  const inRange = (verse) => {
+    if (!rangeStart && !rangeEnd) return true;
+    const n = recurrenceVerseNumber(verse);
+    if (rangeStart && n < rangeStart) return false;
+    if (rangeEnd && n > rangeEnd) return false;
+    return true;
+  };
+  const chapterCorpusOccs = (key) => occurrencesFor(key)
+    .filter((o) => o.source === 'corpus' && o.chapter === chapter && inRange(o.verse))
+    .sort((a, b) => recurrenceVerseNumber(a.verse) - recurrenceVerseNumber(b.verse));
+
   const removed = new Set();
+  const injections = [];
+  const injectedAt = new Set();
+
   for (const [key, group] of byKeyItems.entries()) {
     group.sort(sortByRef);
-    const first = group[0];
-    const firstVerse = recurrenceVerseNumber(verseOf(first.reference));
-    const alsoVerses = [];
+    const lead = group[0];
     // One word can legitimately carry two different figurative notes in a
     // chapter ("hand" as metonymy in v2, as metaphor in v8). Fold a later item
     // only when it is the same kind of note, or when the key is see-how
     // eligible (multi-word, or a consistency-bearing single-word article).
-    const foldsAnySref = isSeeHowEligible(key, first.sref);
+    const foldsAnySref = isSeeHowEligible(key, lead.sref);
+    const canFold = (it) => foldsAnySref || String(it.sref || '') === String(lead.sref || '');
+    const corpusHere = chapterCorpusOccs(key);
 
+    const target = earlierNotedTarget(key);
+    const pointerCase = !!target && isSeeHowEligible(key, target.sref || lead.sref);
+
+    if (pointerCase) {
+      // (a) Cross-chapter pointer. It belongs on the chapter's FIRST in-range
+      // occurrence of the phrase, not on whichever verse the model happened to
+      // flag — a phrase in v2 and v5 with only v5 flagged used to leave v2 bare.
+      const anchorOcc = corpusHere[0] || null;
+      const anchorVerseNum = anchorOcc
+        ? recurrenceVerseNumber(anchorOcc.verse)
+        : recurrenceVerseNumber(verseOf(lead.reference));
+      const anchorItem = group.find(
+        (it) => recurrenceVerseNumber(verseOf(it.reference)) === anchorVerseNum
+      ) || null;
+
+      const foldItems = group.filter((it) => it !== anchorItem && canFold(it));
+      const alsoVerses = foldItems.map((it) => verseOf(it.reference));
+      if (foldsAnySref) {
+        for (const occ of corpusHere) {
+          if (recurrenceVerseNumber(occ.verse) <= anchorVerseNum) continue;
+          alsoVerses.push(String(occ.verse));
+        }
+      }
+
+      if (anchorItem) {
+        if (applyPointer(anchorItem, key, target)) seeHowCount++;
+        if (setAlsoOccurs(anchorItem, alsoVerses)) alsoOccursCount++;
+        for (const it of foldItems) { removed.add(it); foldedCount++; }
+      } else if (anchorOcc) {
+        // Nothing was flagged at the anchor verse — synthesize the pointer
+        // there. The folds only happen if that injection actually materializes.
+        const dedupe = `${anchorOcc.ref}|${hebTokens(anchorOcc.quote).join('+')}`;
+        if (!injectedAt.has(dedupe)) {
+          injectedAt.add(dedupe);
+          injections.push({ key, target, occ: anchorOcc, alsoVerses, foldItems });
+        }
+      }
+      continue;
+    }
+
+    // (b) Book-first case: this IS the explanatory note and its prose is about
+    // the verse the model wrote it on, so it stays put. Every other in-range
+    // occurrence in the chapter — earlier as well as later — is merely listed.
+    const leadVerseNum = recurrenceVerseNumber(verseOf(lead.reference));
+    const alsoVerses = [];
     for (let i = 1; i < group.length; i++) {
       const later = group[i];
-      if (later.reference === first.reference) continue;
-      if (!foldsAnySref && String(later.sref || '') !== String(first.sref || '')) continue;
+      if (later.reference === lead.reference) continue;
+      if (!canFold(later)) continue;
       removed.add(later);
       alsoVerses.push(verseOf(later.reference));
       foldedCount++;
     }
-
-    // The index knows every span, including repeats the issue finder never
-    // flagged. Only worth listing when the key is see-how eligible — otherwise
-    // a figs-metonymy note on "hand" would list every literal "hand" nearby.
     if (foldsAnySref) {
-      for (const occ of occurrencesFor(key)) {
-        if (occ.source !== 'corpus') continue;
-        if (occ.chapter !== chapter) continue;
-        if (recurrenceVerseNumber(occ.verse) <= firstVerse) continue;
+      for (const occ of corpusHere) {
+        if (recurrenceVerseNumber(occ.verse) === leadVerseNum) continue;
         alsoVerses.push(String(occ.verse));
       }
     }
-    if (alsoVerses.length) {
-      const seen = new Set();
-      const list = alsoVerses.filter((v) => {
-        if (!v || seen.has(v)) return false;
-        seen.add(v);
-        return true;
-      });
-      if (list.length) {
-        first.also_occurs_verses = list;
-        alsoOccursCount++;
-      }
-    }
-
-    const target = earlierNotedTarget(key);
-    if (target && isSeeHowEligible(key, target.sref || first.sref)) {
-      if (applyPointer(first, key, target)) seeHowCount++;
-    }
+    if (setAlsoOccurs(lead, alsoVerses)) alsoOccursCount++;
   }
 
-  // Phase 3 — inject a pointer where the chapter's first occurrence of an
-  // already-noted phrase produced no prepared item at all.
-  const injections = [];
-  const injectedAt = new Set();
+  // Phase 3 — inject a pointer for an already-noted phrase the chapter produced
+  // no prepared item for at all.
   for (const key of Object.keys(index.byKey || {})) {
     if (chapterKeys.has(key)) continue;
     const target = earlierNotedTarget(key);
     if (!target) continue;
     if (!isSeeHowEligible(key, target.sref)) continue;
-    const here = occurrencesFor(key)
-      .filter((o) => o.source === 'corpus' && o.chapter === chapter)
-      .sort((a, b) => recurrenceVerseNumber(a.verse) - recurrenceVerseNumber(b.verse));
+    const here = chapterCorpusOccs(key);
     if (!here.length) continue;
     const firstOcc = here[0];
     // A phrase is registered under both its Strong's and its text key; dedupe on
@@ -593,7 +641,13 @@ async function runSeeHowDetection({ pipeDir, generateIdsFn = generateIds }) {
     const dedupe = `${firstOcc.ref}|${hebTokens(firstOcc.quote).join('+')}`;
     if (injectedAt.has(dedupe)) continue;
     injectedAt.add(dedupe);
-    injections.push({ key, target, firstOcc, later: here.slice(1) });
+    injections.push({
+      key,
+      target,
+      occ: firstOcc,
+      alsoVerses: here.slice(1).map((o) => String(o.verse)),
+      foldItems: [],
+    });
   }
 
   let newIds = [];
@@ -608,12 +662,12 @@ async function runSeeHowDetection({ pipeDir, generateIdsFn = generateIds }) {
   }
 
   for (let i = 0; i < injections.length; i++) {
-    const { key, target, firstOcc, later } = injections[i];
+    const { key, target, occ, alsoVerses, foldItems } = injections[i];
     const id = newIds[i] || '';
     if (!id) continue;
     const item = {
       index: items.length,
-      reference: firstOcc.ref,
+      reference: occ.ref,
       id,
       sref: target.sref || '',
       support_reference: target.sref || '',
@@ -626,7 +680,7 @@ async function runSeeHowDetection({ pipeDir, generateIdsFn = generateIds }) {
       at_policy: 'not_needed',
       at_required: false,
       explanation: '',
-      orig_quote: firstOcc.quote || '',
+      orig_quote: occ.quote || '',
       ult_verse: '',
       ust_verse: '',
       note_type: 'see_how',
@@ -635,7 +689,8 @@ async function runSeeHowDetection({ pipeDir, generateIdsFn = generateIds }) {
       tcm_mode: false,
     };
     if (!applyPointer(item, key, target)) continue;
-    if (later.length) item.also_occurs_verses = later.map((o) => String(o.verse));
+    if (setAlsoOccurs(item, alsoVerses)) alsoOccursCount++;
+    for (const it of (foldItems || [])) { removed.add(it); foldedCount++; }
     items.push(item);
     injectedCount++;
     seeHowCount++;

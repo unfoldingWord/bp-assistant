@@ -1180,6 +1180,10 @@ async function checkTnQuality({ tsvPath, preparedJson, ultUsfm, ustUsfm, book, h
         let alm;
         while ((alm = ANY_LINK_RE.exec(n.note)) !== null) {
           const linkPath = alm[1];
+          // Only in-repo relative links are see-how targets. A note may also
+          // carry rc:// or other absolute links (e.g. a trailing tA article
+          // link); those are not pointers and must never be flagged here.
+          if (!linkPath.startsWith('../')) continue;
           if (!/^\.\.\/\d{2,3}\/\d{2,3}\.md$/.test(linkPath)) {
             addFinding(n.row, n.ref, n.id, 'warning', 'seehow_noncanonical',
               `See-how link path "${linkPath}" does not match the canonical ../CC/VV.md format`);

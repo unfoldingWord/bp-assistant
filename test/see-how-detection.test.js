@@ -85,6 +85,8 @@ function setupPipeDir({
   alignedBook = ALIGNED_BOOK,
   alignmentData = ALIGNMENT_DATA,
   hebrewBook = '',
+  verseStart = null,
+  verseEnd = null,
   preparedName = 'prepared_notes.json',
 } = {}) {
   const dirPath = `tmp/pipeline/${book}-${String(chapter).padStart(2, '0')}-${dirCounter++}`;
@@ -110,6 +112,8 @@ function setupPipeDir({
     pipeline: 'notes',
     book,
     chapter: Number(chapter),
+    verseStart,
+    verseEnd,
     sources: {
       ultFull: `${dirPath}/ult.usfm`,
       hebrew: hebrewBook ? `${dirPath}/hebrew.usfm` : null,
@@ -536,4 +540,140 @@ test('F3: without a UHB source the injected quote falls back to a space-join', a
   const injected = readPrepared(dirPath).items[0];
   assert.equal(injected.orig_quote.includes('־'), false);
   assert.match(injected.orig_quote, / /);
+});
+
+// --- C1: anchor on the chapter's first occurrence ---------------------------
+
+test('C1a: a cross-chapter pointer is injected at the chapter\'s first occurrence, not the flagged verse', async () => {
+  // The phrase is in 3:2, 3:5 and 3:7; the model flagged only 3:5.
+  const dirPath = setupPipeDir({
+    items: [item({ reference: '3:5', id: 'bbbb' })],
+    alignmentData: { '3:5': ALIGNMENT_DATA['3:5'] },
+  });
+  buildRecurrenceIndexFile({ pipeDir: dirPath });
+  const summary = await runSeeHowDetection({ pipeDir: dirPath, generateIdsFn: stubIds });
+
+  const prepared = readPrepared(dirPath);
+  assert.equal(prepared.items.length, 1, 'the flagged 3:5 item is folded away');
+  const anchor = prepared.items[0];
+  assert.equal(anchor.reference, '3:2', 'pointer sits on the first occurrence');
+  assert.equal(anchor.injected_see_how, true);
+  assert.match(anchor.programmatic_note, /\[1:1\]\(\.\.\/01\/01\.md\)/);
+  assert.deepEqual(anchor.also_occurs_verses, ['5', '7']);
+  assert.match(summary, /1 injected/);
+  assert.match(summary, /1 folded/);
+});
+
+test('C1a: a prepared item already sitting on the first occurrence is converted in place', async () => {
+  const dirPath = setupPipeDir({
+    items: [item({ reference: '3:2', id: 'aaaa' }), item({ reference: '3:5', id: 'bbbb', index: 1 })],
+  });
+  buildRecurrenceIndexFile({ pipeDir: dirPath });
+  const summary = await runSeeHowDetection({ pipeDir: dirPath, generateIdsFn: stubIds });
+
+  const prepared = readPrepared(dirPath);
+  assert.deepEqual(prepared.items.map((it) => it.id), ['aaaa'], 'no injection, no relocation');
+  assert.equal(prepared.items[0].note_type, 'see_how');
+  assert.match(summary, /0 injected/);
+});
+
+test('C1b: a book-first explanatory note stays where the model wrote it and lists the others', async () => {
+  // No earlier-chapter note, so the 3:5 item IS the explanatory note.
+  const dirPath = setupPipeDir({
+    items: [item({ reference: '3:5', id: 'bbbb' })],
+    tnBookTsv: '',
+    alignmentData: { '3:5': ALIGNMENT_DATA['3:5'] },
+  });
+  buildRecurrenceIndexFile({ pipeDir: dirPath });
+  const summary = await runSeeHowDetection({ pipeDir: dirPath, generateIdsFn: stubIds });
+
+  const prepared = readPrepared(dirPath);
+  assert.equal(prepared.items.length, 1);
+  const kept = prepared.items[0];
+  assert.equal(kept.reference, '3:5', 'not relocated');
+  assert.equal(kept.programmatic_note, undefined, 'still the explanatory note');
+  assert.deepEqual(kept.also_occurs_verses, ['2', '7'], 'earlier AND later occurrences are listed');
+  assert.match(summary, /0 injected/);
+});
+
+// --- C2: a pointer row is never a pointer target ----------------------------
+
+test('C2: the earliest row being itself a pointer is skipped for the next explanatory row', async () => {
+  const tsv = [
+    'Reference\tID\tTags\tSupportReference\tQuote\tOccurrence\tNote',
+    `1:1\tabcd\t\trc://*/ta/man/translate/figs-possession\t${WORD_OF_YAHWEH}\t1\tSee how you translated the similar expression in [1:1](../01/01.md).`,
+    `2:4\tefgh\t\trc://*/ta/man/translate/figs-possession\t${WORD_OF_YAHWEH}\t1\tThe possessive form describes a message from Yahweh.`,
+    '',
+  ].join('\n');
+  const dirPath = setupPipeDir({ items: [item({ reference: '3:2', id: 'aaaa' })], tnBookTsv: tsv });
+  buildRecurrenceIndexFile({ pipeDir: dirPath });
+  await runSeeHowDetection({ pipeDir: dirPath, generateIdsFn: stubIds });
+
+  const first = readPrepared(dirPath).items[0];
+  assert.match(first.programmatic_note, /\[2:4\]\(\.\.\/02\/04\.md\)/, 'targets the explanatory row, not the pointer');
+  assert.doesNotMatch(first.programmatic_note, /\[1:1\]/);
+});
+
+test('C2: when every earlier row is a pointer, nothing is emitted', async () => {
+  const tsv = [
+    'Reference\tID\tTags\tSupportReference\tQuote\tOccurrence\tNote',
+    `1:1\tabcd\t\trc://*/ta/man/translate/figs-possession\t${WORD_OF_YAHWEH}\t1\tSee how you translated the similar expression in [1:1](../01/01.md).`,
+    `2:4\tefgh\t\trc://*/ta/man/translate/figs-possession\t${WORD_OF_YAHWEH}\t1\tSee how you translated the similar expression in [1:1](../01/01.md).`,
+    '',
+  ].join('\n');
+  const dirPath = setupPipeDir({ items: [item({ reference: '3:2', id: 'aaaa' })], tnBookTsv: tsv });
+  buildRecurrenceIndexFile({ pipeDir: dirPath });
+  const summary = await runSeeHowDetection({ pipeDir: dirPath, generateIdsFn: stubIds });
+
+  assert.equal(readPrepared(dirPath).items[0].programmatic_note, undefined);
+  assert.match(summary, /^0 see-how back-refs/);
+  assert.match(summary, /0 injected/);
+});
+
+// --- C3: partial-chapter bounds ---------------------------------------------
+
+const RANGED_BOOK = [
+  '\\id ZEC',
+  '\\c 1',
+  '\\p',
+  `\\v 1 ${wordOfYahwehSpan()}`,
+  '\\c 3',
+  '\\p',
+  `\\v 2 ${wordOfYahwehSpan()}`,
+  `\\v 11 ${wordOfYahwehSpan()}`,
+  '',
+].join('\n');
+
+test('C3: a verse-range run anchors inside the range and never synthesizes outside it', async () => {
+  const dirPath = setupPipeDir({
+    items: [],
+    alignedBook: RANGED_BOOK,
+    alignmentData: {},
+    verseStart: 10,
+    verseEnd: 12,
+  });
+  buildRecurrenceIndexFile({ pipeDir: dirPath });
+  await runSeeHowDetection({ pipeDir: dirPath, generateIdsFn: stubIds });
+
+  const prepared = readPrepared(dirPath);
+  assert.equal(prepared.items.length, 1);
+  assert.equal(prepared.items[0].reference, '3:11', 'v2 is out of range; v11 is the in-range first occurrence');
+  assert.equal(prepared.items[0].also_occurs_verses, undefined);
+});
+
+test('C3: also-occurs lists never reach outside the verse range', async () => {
+  const dirPath = setupPipeDir({
+    items: [item({ reference: '3:11', id: 'aaaa' })],
+    alignedBook: RANGED_BOOK,
+    tnBookTsv: '',
+    alignmentData: { '3:11': ALIGNMENT_DATA['3:2'] },
+    verseStart: 10,
+    verseEnd: 12,
+  });
+  buildRecurrenceIndexFile({ pipeDir: dirPath });
+  await runSeeHowDetection({ pipeDir: dirPath, generateIdsFn: stubIds });
+
+  const first = readPrepared(dirPath).items[0];
+  assert.equal(first.reference, '3:11');
+  assert.equal(first.also_occurs_verses, undefined, 'the out-of-range v2 occurrence is not listed');
 });

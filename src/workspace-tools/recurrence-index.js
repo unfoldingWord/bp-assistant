@@ -335,22 +335,34 @@ function buildSeeHowSentence({
 }
 
 /**
+ * Collapse an "also occurs" verse list on the NUMERIC first verse, not on the
+ * string. A folded prepared item contributes "5" while a source span for the
+ * same bridge contributes "5-6"; keyed by string those survive as two entries
+ * and render as "verses 5 and 5-6". The bridge form wins, because it says more.
+ * Returns the surviving verse strings in ascending order.
+ */
+function dedupeAlsoOccursVerses(verses) {
+  const isBridge = (s) => /[-–]/.test(s);
+  const byNumber = new Map();
+  for (const raw of verses || []) {
+    const v = String(raw == null ? '' : raw).trim();
+    if (!v) continue;
+    const n = verseNumber(v);
+    const existing = byNumber.get(n);
+    if (existing === undefined) { byNumber.set(n, v); continue; }
+    if (!isBridge(existing) && isBridge(v)) byNumber.set(n, v);
+  }
+  return [...byNumber.keys()].sort((a, b) => a - b).map((n) => byNumber.get(n));
+}
+
+/**
  * `This also occurs in verses 5, 7, 8, and 11.` — plain text, Oxford comma.
  * Runs of three or more consecutive verses collapse to `5–7` (en dash); a verse
  * bridge keeps its own span, rendered with an en dash.
  */
 function formatAlsoOccurs(verses) {
-  const seen = new Set();
-  const parts = [];
-  for (const raw of verses || []) {
-    const v = String(raw == null ? '' : raw).trim();
-    if (!v || seen.has(v)) continue;
-    seen.add(v);
-    parts.push(v);
-  }
+  const parts = dedupeAlsoOccursVerses(verses);
   if (parts.length === 0) return '';
-
-  parts.sort((a, b) => (parseInt(a, 10) || 0) - (parseInt(b, 10) || 0));
 
   // Collapse runs of 3+ consecutive plain verse numbers.
   const rendered = [];
@@ -706,6 +718,7 @@ module.exports = {
   formatTnLink,
   buildSeeHowSentence,
   formatAlsoOccurs,
+  dedupeAlsoOccursVerses,
   isSeeHowEligible,
   keyWordCount,
   hebTokens,
