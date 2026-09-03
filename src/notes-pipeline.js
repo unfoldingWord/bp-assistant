@@ -20,7 +20,7 @@ const { getDoor43Username, emailToFallbackUsername, buildBranchName, resolveOutp
 const { splitTsv, fixTrailingNewlines } = require('./workspace-tools/tsv-tools');
 const { fillTsvIds, generateIds, prepareNotes, fillOrigQuotes, resolveGlQuotes, flagNarrowQuotes, extractAlignmentData, prepareATContext, substituteAT, fixUnicodeQuotes, verifyBoldMatches, syncCanonicalHebrewQuotes, applyHintsToPreparedNotes, _stripAlternateTranslation: stripAlternateTranslation } = require('./workspace-tools/tn-tools');
 const { checkTnQuality, detectSelfTalk, templateFirstPhrase, resolveTemplateText } = require('./workspace-tools/quality-tools');
-const { buildBookRecurrenceIndex, deriveRecurrenceKeys, buildSeeHowSentence, isSeeHowEligible, dedupeAlsoOccursVerses, hebTokens, verseNumber: recurrenceVerseNumber, SEE_HOW_NEVER_FOLD_SREFS } = require('./workspace-tools/recurrence-index');
+const { buildBookRecurrenceIndex, deriveRecurrenceKeys, buildSeeHowSentence, isSeeHowEligible, dedupeAlsoOccursVerses, selectAlsoOccursCarriers, hebTokens, verseNumber: recurrenceVerseNumber, SEE_HOW_NEVER_FOLD_SREFS } = require('./workspace-tools/recurrence-index');
 const { normalizeIssuesFile, buildParallelismIntroHintArgs } = require('./issue-normalizer');
 const { curlyQuotes } = require('./workspace-tools/usfm-tools');
 const { verifyRepoPush, verifyDcsToken, verifyRemoteContent } = require('./repo-verify');
@@ -553,6 +553,9 @@ async function runSeeHowDetection({ pipeDir, generateIdsFn = generateIds }) {
   const injections = [];
   const injectedAt = new Set();
 
+  // Resolve each group's anchor before assigning any corpus-derived verses:
+  // which key is allowed to carry that list depends on the whole set of anchors.
+  const plans = [];
   for (const [key, group] of byKeyItems.entries()) {
     group.sort(sortByRef);
     const lead = group[0];
@@ -567,21 +570,45 @@ async function runSeeHowDetection({ pipeDir, generateIdsFn = generateIds }) {
     const target = earlierNotedTarget(key);
     const pointerCase = !!target && isSeeHowEligible(key, target.sref || lead.sref);
 
-    if (pointerCase) {
-      // (a) Cross-chapter pointer. It belongs on the chapter's FIRST in-range
-      // occurrence of the phrase, not on whichever verse the model happened to
-      // flag — a phrase in v2 and v5 with only v5 flagged used to leave v2 bare.
-      const anchorOcc = corpusHere[0] || null;
-      const anchorVerseNum = anchorOcc
-        ? recurrenceVerseNumber(anchorOcc.verse)
-        : recurrenceVerseNumber(verseOf(lead.reference));
-      const anchorItem = group.find(
-        (it) => recurrenceVerseNumber(verseOf(it.reference)) === anchorVerseNum
-      ) || null;
+    // (a) A cross-chapter pointer belongs on the chapter's FIRST in-range
+    // occurrence of the phrase, not on whichever verse the model happened to
+    // flag — a phrase in v2 and v5 with only v5 flagged used to leave v2 bare.
+    // (b) A book-first explanatory note stays on the verse it describes.
+    const anchorOcc = pointerCase ? (corpusHere[0] || null) : null;
+    const anchorVerseNum = anchorOcc
+      ? recurrenceVerseNumber(anchorOcc.verse)
+      : recurrenceVerseNumber(verseOf(lead.reference));
+    const anchorItem = pointerCase
+      ? (group.find((it) => recurrenceVerseNumber(verseOf(it.reference)) === anchorVerseNum) || null)
+      : lead;
 
+    plans.push({
+      key, group, lead, foldsAnySref, canFold, corpusHere,
+      target, pointerCase, anchorOcc, anchorVerseNum, anchorItem,
+    });
+  }
+
+  // A fixed formula and its sub-phrases match the same verses, so all three
+  // would otherwise print near-identical "This also occurs in verses …"
+  // sentences (published ZEC 8). Only the longest of a set of overlapping keys
+  // carries the corpus-derived list.
+  const alsoOccursCarriers = selectAlsoOccursCarriers(
+    plans.map((p) => ({ key: p.key, anchorVerse: p.anchorVerseNum }))
+  );
+
+  for (const plan of plans) {
+    const {
+      key, group, lead, foldsAnySref, canFold, corpusHere,
+      target, pointerCase, anchorOcc, anchorVerseNum, anchorItem,
+    } = plan;
+    // Folded siblings are always listed; corpus spans only when this key is the
+    // longest of its overlapping set and the key is see-how eligible.
+    const takesCorpus = foldsAnySref && alsoOccursCarriers.has(key);
+
+    if (pointerCase) {
       const foldItems = group.filter((it) => it !== anchorItem && canFold(it));
       const alsoVerses = foldItems.map((it) => verseOf(it.reference));
-      if (foldsAnySref) {
+      if (takesCorpus) {
         for (const occ of corpusHere) {
           if (recurrenceVerseNumber(occ.verse) <= anchorVerseNum) continue;
           alsoVerses.push(String(occ.verse));
@@ -607,7 +634,6 @@ async function runSeeHowDetection({ pipeDir, generateIdsFn = generateIds }) {
     // (b) Book-first case: this IS the explanatory note and its prose is about
     // the verse the model wrote it on, so it stays put. Every other in-range
     // occurrence in the chapter — earlier as well as later — is merely listed.
-    const leadVerseNum = recurrenceVerseNumber(verseOf(lead.reference));
     const alsoVerses = [];
     for (let i = 1; i < group.length; i++) {
       const later = group[i];
@@ -617,9 +643,9 @@ async function runSeeHowDetection({ pipeDir, generateIdsFn = generateIds }) {
       alsoVerses.push(verseOf(later.reference));
       foldedCount++;
     }
-    if (foldsAnySref) {
+    if (takesCorpus) {
       for (const occ of corpusHere) {
-        if (recurrenceVerseNumber(occ.verse) === leadVerseNum) continue;
+        if (recurrenceVerseNumber(occ.verse) === anchorVerseNum) continue;
         alsoVerses.push(String(occ.verse));
       }
     }

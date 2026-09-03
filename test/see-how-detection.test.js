@@ -677,3 +677,113 @@ test('C3: also-occurs lists never reach outside the verse range', async () => {
   assert.equal(first.reference, '3:11');
   assert.equal(first.also_occurs_verses, undefined, 'the out-of-range v2 occurrence is not listed');
 });
+
+// --- C4: overlapping formula and its sub-phrases ----------------------------
+
+// Published ZEC 8 shape: "thus says Yahweh of hosts" and its two sub-phrases
+// all match the same verses, so each used to print its own near-identical
+// "This also occurs in verses …" sentence.
+const KOH = 'כֹּ֤ה';
+const AMAR = 'אָמַר֙';
+const YHWH = 'יְהוָ֣ה';
+const TSEVAOT = 'צְבָא֔וֹת';
+
+const fullFormula = () =>
+  [alignedWord('H3541', KOH, ['thus']),
+    alignedWord('H0559', AMAR, ['says']),
+    alignedWord('H3068', YHWH, ['Yahweh']),
+    alignedWord('H6635b', TSEVAOT, ['of', 'hosts'])].join(' ');
+const kohAmarYhwh = () =>
+  [alignedWord('H3541', KOH, ['thus']),
+    alignedWord('H0559', AMAR, ['says']),
+    alignedWord('H3068', YHWH, ['Yahweh'])].join(' ');
+const amarYhwhTsevaot = () =>
+  [alignedWord('H0559', AMAR, ['says']),
+    alignedWord('H3068', YHWH, ['Yahweh']),
+    alignedWord('H6635b', TSEVAOT, ['of', 'hosts'])].join(' ');
+
+const ZEC8_BOOK = [
+  '\\id ZEC',
+  '\\c 8',
+  '\\p',
+  `\\v 2 ${fullFormula()}`,
+  `\\v 3 ${kohAmarYhwh()}`,
+  `\\v 4 ${fullFormula()}`,
+  `\\v 6 ${fullFormula()}`,
+  `\\v 14 ${amarYhwhTsevaot()}`,
+  '',
+].join('\n');
+
+const ZEC8_ALIGNMENT = {
+  '8:2': [
+    { heb: KOH, strong: 'H3541' }, { heb: AMAR, strong: 'H0559' },
+    { heb: YHWH, strong: 'H3068' }, { heb: TSEVAOT, strong: 'H6635b' },
+  ],
+  '8:3': [
+    { heb: KOH, strong: 'H3541' }, { heb: AMAR, strong: 'H0559' },
+    { heb: YHWH, strong: 'H3068' },
+  ],
+  '8:14': [
+    { heb: AMAR, strong: 'H0559' }, { heb: YHWH, strong: 'H3068' },
+    { heb: TSEVAOT, strong: 'H6635b' },
+  ],
+};
+
+function formulaItem(reference, id, origQuote, glQuote) {
+  return {
+    index: 0,
+    reference,
+    id,
+    sref: 'writing-quotations',
+    gl_quote: glQuote,
+    issue_span_gl_quote: glQuote,
+    orig_quote: origQuote,
+    at_provided: '',
+    explanation: 'The quotation formula introduces direct speech.',
+    note_type: 'given_at',
+  };
+}
+
+test('C4: a formula and its sub-phrases produce ONE corpus-derived also-occurs list', async () => {
+  const dirPath = setupPipeDir({
+    chapter: '8',
+    items: [
+      formulaItem('8:2', 'aaaa', `${KOH} ${AMAR} ${YHWH} ${TSEVAOT}`, 'thus says Yahweh of hosts'),
+      formulaItem('8:3', 'bbbb', `${KOH} ${AMAR} ${YHWH}`, 'thus says Yahweh'),
+      formulaItem('8:14', 'cccc', `${AMAR} ${YHWH} ${TSEVAOT}`, 'says Yahweh of hosts'),
+    ],
+    tnBookTsv: '',
+    alignedBook: ZEC8_BOOK,
+    alignmentData: ZEC8_ALIGNMENT,
+  });
+  buildRecurrenceIndexFile({ pipeDir: dirPath });
+  await runSeeHowDetection({ pipeDir: dirPath, generateIdsFn: stubIds });
+
+  const byId = new Map(readPrepared(dirPath).items.map((it) => [it.id, it]));
+  assert.equal(byId.size, 3, 'distinct keys, so nothing folds');
+  // Longest key wins: only 8:2 lists the other occurrences.
+  assert.deepEqual(byId.get('aaaa').also_occurs_verses, ['4', '6']);
+  assert.equal(byId.get('bbbb').also_occurs_verses, undefined, 'sub-phrase carries no corpus list');
+  assert.equal(byId.get('cccc').also_occurs_verses, undefined, 'sub-phrase carries no corpus list');
+});
+
+test('C4: a suppressed sub-phrase still lists the verses of its own folded siblings', async () => {
+  const dirPath = setupPipeDir({
+    chapter: '8',
+    items: [
+      formulaItem('8:2', 'aaaa', `${KOH} ${AMAR} ${YHWH} ${TSEVAOT}`, 'thus says Yahweh of hosts'),
+      formulaItem('8:3', 'bbbb', `${KOH} ${AMAR} ${YHWH}`, 'thus says Yahweh'),
+      formulaItem('8:13', 'dddd', `${KOH} ${AMAR} ${YHWH}`, 'thus says Yahweh'),
+    ],
+    tnBookTsv: '',
+    alignedBook: ZEC8_BOOK,
+    alignmentData: Object.assign({}, ZEC8_ALIGNMENT, { '8:13': ZEC8_ALIGNMENT['8:3'] }),
+  });
+  buildRecurrenceIndexFile({ pipeDir: dirPath });
+  await runSeeHowDetection({ pipeDir: dirPath, generateIdsFn: stubIds });
+
+  const byId = new Map(readPrepared(dirPath).items.map((it) => [it.id, it]));
+  assert.equal(byId.has('dddd'), false, '8:13 folds into 8:3');
+  assert.deepEqual(byId.get('bbbb').also_occurs_verses, ['13'], 'own folded sibling only');
+  assert.deepEqual(byId.get('aaaa').also_occurs_verses, ['4', '6']);
+});

@@ -274,3 +274,57 @@ test('G3: also-occurs verses dedupe on the numeric first verse and keep the brid
 test('G3: formatAlsoOccurs renders a de-duplicated bridge once', () => {
   assert.equal(formatAlsoOccurs(['5', '5-6', '9']), 'This also occurs in verses 5–6 and 9.');
 });
+
+const { selectAlsoOccursCarriers, isKeySubsequence } = require('../src/workspace-tools/recurrence-index');
+
+test('C4: isKeySubsequence matches only contiguous runs', () => {
+  assert.equal(isKeySubsequence('H0559+H3068', 'H3541+H0559+H3068+H6635b'), true);
+  assert.equal(isKeySubsequence('H3541+H0559', 'H3541+H0559+H3068'), true);
+  // Present but not contiguous.
+  assert.equal(isKeySubsequence('H3541+H3068', 'H3541+H0559+H3068'), false);
+  assert.equal(isKeySubsequence('H9999', 'H3541+H0559'), false);
+  assert.equal(isKeySubsequence('', 'H3541'), false);
+});
+
+test('C4: only the longest overlapping key carries the corpus list (published ZEC 8 shape)', () => {
+  const carriers = selectAlsoOccursCarriers([
+    { key: 'H3541+H0559+H3068+H6635b', anchorVerse: 2 },
+    { key: 'H3541+H0559+H3068', anchorVerse: 3 },
+    { key: 'H0559+H3068+H6635b', anchorVerse: 14 },
+  ]);
+  assert.deepEqual([...carriers], ['H3541+H0559+H3068+H6635b']);
+});
+
+test('C4: an unrelated key keeps its own corpus list', () => {
+  const carriers = selectAlsoOccursCarriers([
+    { key: 'H3541+H0559+H3068', anchorVerse: 3 },
+    { key: 'H3541+H0559', anchorVerse: 5 },
+    { key: 'H4325', anchorVerse: 9 },
+  ]);
+  assert.equal(carriers.has('H3541+H0559+H3068'), true);
+  assert.equal(carriers.has('H3541+H0559'), false);
+  assert.equal(carriers.has('H4325'), true, 'no containment relation, so it carries its own');
+});
+
+test('C4: a chain A subset B subset C leaves only C', () => {
+  const carriers = selectAlsoOccursCarriers([
+    { key: 'B', anchorVerse: 4 },
+    { key: 'A+B', anchorVerse: 2 },
+    { key: 'A+B+C', anchorVerse: 7 },
+  ]);
+  assert.deepEqual([...carriers], ['A+B+C']);
+});
+
+test('C4: a length tie is broken by the earlier anchor verse', () => {
+  const carriers = selectAlsoOccursCarriers([
+    { key: 'B', anchorVerse: 9 },
+    { key: 'B+C', anchorVerse: 11 },
+    { key: 'A+B', anchorVerse: 4 },
+  ]);
+  assert.deepEqual([...carriers], ['A+B'], 'same length, earlier anchor wins');
+});
+
+test('C4: an empty or single-key set is unchanged', () => {
+  assert.deepEqual([...selectAlsoOccursCarriers([])], []);
+  assert.deepEqual([...selectAlsoOccursCarriers([{ key: 'H3068', anchorVerse: 1 }])], ['H3068']);
+});

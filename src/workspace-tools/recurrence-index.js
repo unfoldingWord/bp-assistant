@@ -334,6 +334,88 @@ function buildSeeHowSentence({
   return `See how you translated ${subject} in ${link}.`;
 }
 
+/** Token sequence of a recurrence key (Strong's numbers, or text tokens). */
+function keyTokens(key) {
+  return String(key || '').split('+').filter(Boolean);
+}
+
+/** True when `a`'s token sequence appears contiguously inside `b`'s. */
+function isKeySubsequence(a, b) {
+  const ta = keyTokens(a);
+  const tb = keyTokens(b);
+  if (!ta.length || ta.length > tb.length) return false;
+  for (let i = 0; i + ta.length <= tb.length; i++) {
+    let ok = true;
+    for (let k = 0; k < ta.length; k++) {
+      if (ta[k] !== tb[i + k]) { ok = false; break; }
+    }
+    if (ok) return true;
+  }
+  return false;
+}
+
+/**
+ * Decide which keys may carry a corpus-derived "also occurs" list.
+ *
+ * A fixed formula and its sub-phrases all match the same verses. On published
+ * ZEC 8, "thus says Yahweh of hosts" (H3541+H0559+H3068+H6635b) plus its two
+ * sub-phrases each produced a near-identical "This also occurs in verses …"
+ * sentence. When one key's token sequence sits contiguously inside another's,
+ * only the longest of the related keys carries the corpus list; the shorter
+ * ones keep just the verses of their own folded prepared siblings.
+ *
+ * Keys related by containment form one cluster (so a chain A ⊂ B ⊂ C leaves
+ * only C). Ties on length are broken by the earlier anchor verse, then by key
+ * so the result is deterministic.
+ *
+ * @param {Array<{key: string, anchorVerse: (number|string)}>} groups
+ *   One entry per key that has an anchor item in the current chapter.
+ * @returns {Set<string>} the keys allowed to carry corpus-derived verses
+ */
+function selectAlsoOccursCarriers(groups) {
+  const list = [];
+  const seenKeys = new Set();
+  for (const g of groups || []) {
+    if (!g || !g.key || seenKeys.has(g.key)) continue;
+    seenKeys.add(g.key);
+    const n = parseInt(g.anchorVerse, 10);
+    list.push({
+      key: String(g.key),
+      tokens: keyTokens(g.key),
+      anchorVerse: Number.isFinite(n) ? n : Number.MAX_SAFE_INTEGER,
+    });
+  }
+  const carriers = new Set();
+  if (!list.length) return carriers;
+
+  // Union keys related by containment into clusters.
+  const parent = list.map((_, i) => i);
+  const find = (x) => { let r = x; while (parent[r] !== r) { parent[r] = parent[parent[r]]; r = parent[r]; } return r; };
+  const union = (a, b) => { const ra = find(a); const rb = find(b); if (ra !== rb) parent[rb] = ra; };
+  for (let i = 0; i < list.length; i++) {
+    for (let j = 0; j < list.length; j++) {
+      if (i === j) continue;
+      if (list[i].tokens.length >= list[j].tokens.length) continue;
+      if (isKeySubsequence(list[i].key, list[j].key)) union(i, j);
+    }
+  }
+
+  const clusters = new Map();
+  for (let i = 0; i < list.length; i++) {
+    const root = find(i);
+    if (!clusters.has(root)) clusters.set(root, []);
+    clusters.get(root).push(list[i]);
+  }
+  for (const members of clusters.values()) {
+    members.sort((a, b) =>
+      (b.tokens.length - a.tokens.length) ||
+      (a.anchorVerse - b.anchorVerse) ||
+      (a.key < b.key ? -1 : a.key > b.key ? 1 : 0));
+    carriers.add(members[0].key);
+  }
+  return carriers;
+}
+
 /**
  * Collapse an "also occurs" verse list on the NUMERIC first verse, not on the
  * string. A folded prepared item contributes "5" while a source span for the
@@ -719,6 +801,9 @@ module.exports = {
   buildSeeHowSentence,
   formatAlsoOccurs,
   dedupeAlsoOccursVerses,
+  selectAlsoOccursCarriers,
+  isKeySubsequence,
+  keyTokens,
   isSeeHowEligible,
   keyWordCount,
   hebTokens,
