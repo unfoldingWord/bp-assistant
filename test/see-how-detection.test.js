@@ -757,7 +757,7 @@ function formulaItem(reference, id, origQuote, glQuote) {
   };
 }
 
-test('C4: a formula and its sub-phrases produce ONE corpus-derived also-occurs list', async () => {
+test('C5: within a formula cluster exactly one key carries the verse list', async () => {
   const dirPath = setupPipeDir({
     chapter: '8',
     items: [
@@ -774,13 +774,14 @@ test('C4: a formula and its sub-phrases produce ONE corpus-derived also-occurs l
 
   const byId = new Map(readPrepared(dirPath).items.map((it) => [it.id, it]));
   assert.equal(byId.size, 3, 'distinct keys, so nothing folds');
-  // Longest key wins: only 8:2 lists the other occurrences.
-  assert.deepEqual(byId.get('aaaa').also_occurs_verses, ['4', '6']);
-  assert.equal(byId.get('bbbb').also_occurs_verses, undefined, 'sub-phrase carries no corpus list');
-  assert.equal(byId.get('cccc').also_occurs_verses, undefined, 'sub-phrase carries no corpus list');
+  // Coverage wins, not length: "thus says Yahweh" (8:3) reaches 2, 4 and 6,
+  // one more than the four-word formula, which only reaches 4 and 6.
+  assert.deepEqual(byId.get('bbbb').also_occurs_verses, ['2', '4', '6']);
+  assert.equal(byId.get('aaaa').also_occurs_verses, undefined, 'already listed by the carrier');
+  assert.equal(byId.get('cccc').also_occurs_verses, undefined, 'already listed by the carrier');
 });
 
-test('C4: a suppressed sub-phrase still lists the verses of its own folded siblings', async () => {
+test('C5: a non-carrier still lists the verses of its own folded siblings', async () => {
   const dirPath = setupPipeDir({
     chapter: '8',
     items: [
@@ -797,8 +798,9 @@ test('C4: a suppressed sub-phrase still lists the verses of its own folded sibli
 
   const byId = new Map(readPrepared(dirPath).items.map((it) => [it.id, it]));
   assert.equal(byId.has('dddd'), false, '8:13 folds into 8:3');
-  assert.deepEqual(byId.get('bbbb').also_occurs_verses, ['13'], 'own folded sibling only');
-  assert.deepEqual(byId.get('aaaa').also_occurs_verses, ['4', '6']);
+  // 8:3 covers 2, 4 and 6 so it carries them, plus its own folded sibling 13.
+  assert.deepEqual(byId.get('bbbb').also_occurs_verses, ['2', '4', '6', '13']);
+  assert.equal(byId.get('aaaa').also_occurs_verses, undefined, 'nothing left to list');
 });
 
 // --- Round 3: B1 / B2 / S8 / S9 ---------------------------------------------
@@ -899,4 +901,82 @@ test('S8: detection can be driven from an explicit shard context with its own ve
   const prepared = readPrepared(dirPath);
   assert.equal(prepared.items.length, 1);
   assert.equal(prepared.items[0].reference, '3:11', 'only the in-range occurrence is used');
+});
+
+// --- C5: the four-key ZEC 8 cluster, injected five-word variant included ----
+
+const KI = 'כִּ֣י';
+
+// "כי כה אמר יהוה צבאות" - only at 8:14, and nothing was flagged there, so it
+// arrives as a standalone injection and must take part in the computation.
+const kiFullFormula = () =>
+  [alignedWord('H3588a', KI, ['for']),
+    alignedWord('H3541', KOH, ['thus']),
+    alignedWord('H0559', AMAR, ['says']),
+    alignedWord('H3068', YHWH, ['Yahweh']),
+    alignedWord('H6635b', TSEVAOT, ['of', 'hosts'])].join(' ');
+
+const ZEC8_FOUR_KEY_BOOK = [
+  '\\id ZEC',
+  '\\c 1',
+  '\\p',
+  `\\v 1 ${fullFormula()}`,
+  '\\c 8',
+  '\\p',
+  `\\v 2 ${fullFormula()}`,
+  `\\v 3 ${kohAmarYhwh()}`,
+  `\\v 4 ${fullFormula()}`,
+  `\\v 6 ${fullFormula()}`,
+  `\\v 14 ${kiFullFormula()}`,
+  '',
+].join('\n');
+
+// An earlier-chapter explanatory note, so the five-word key can be injected.
+const ZEC8_TN_TSV = [
+  'Reference\tID\tTags\tSupportReference\tQuote\tOccurrence\tNote',
+  `1:1\tabcd\t\trc://*/ta/man/translate/writing-quotations\t${KI} ${KOH} ${AMAR} ${YHWH} ${TSEVAOT}\t1\tThe quotation formula introduces direct speech.`,
+  '',
+].join('\n');
+
+const ZEC8_UHB = [
+  '\\id ZEC',
+  '\\c 8',
+  `\\v 14 \\w ${KI}|lemma="a" strong="H3588a"\\w* \\w ${KOH}|lemma="b" strong="H3541"\\w* \\w ${AMAR}|lemma="c" strong="H0559"\\w* \\w ${YHWH}|lemma="d" strong="H3068"\\w* \\w ${TSEVAOT}|lemma="e" strong="H6635b"\\w*`,
+  '',
+].join('\n');
+
+test('C5: with an injected five-word variant the widest key still carries the list', async () => {
+  const dirPath = setupPipeDir({
+    chapter: '8',
+    items: [
+      formulaItem('8:2', 'aaaa', `${KOH} ${AMAR} ${YHWH} ${TSEVAOT}`, 'thus says Yahweh of hosts'),
+      formulaItem('8:3', 'bbbb', `${KOH} ${AMAR} ${YHWH}`, 'thus says Yahweh'),
+      formulaItem('8:14', 'cccc', `${AMAR} ${YHWH} ${TSEVAOT}`, 'says Yahweh of hosts'),
+    ],
+    tnBookTsv: ZEC8_TN_TSV,
+    alignedBook: ZEC8_FOUR_KEY_BOOK,
+    hebrewBook: ZEC8_UHB,
+    alignmentData: ZEC8_ALIGNMENT,
+  });
+  buildRecurrenceIndexFile({ pipeDir: dirPath });
+  await runSeeHowDetection({ pipeDir: dirPath, generateIdsFn: stubIds });
+
+  const prepared = readPrepared(dirPath);
+  const byId = new Map(prepared.items.map((it) => [it.id, it]));
+  const injected = prepared.items.find((it) => it.injected_see_how);
+  assert.ok(injected, 'the five-word variant is injected at 8:14');
+  assert.equal(injected.reference, '8:14');
+
+  // "thus says Yahweh" reaches 2, 3, 4 and 6 - one verse more than the
+  // four-word formula - so it carries. Before C5 the longest key (the
+  // five-word variant, which occurs once) won and the list was lost entirely.
+  assert.deepEqual(byId.get('bbbb').also_occurs_verses, ['2', '4', '6', '14']);
+  assert.equal(byId.get('aaaa').also_occurs_verses, undefined);
+  assert.equal(byId.get('cccc').also_occurs_verses, undefined);
+  assert.equal(injected.also_occurs_verses, undefined);
+
+  // Nothing is listed twice, and every verse the cluster covers is listed once.
+  const listed = prepared.items.flatMap((it) => it.also_occurs_verses || []);
+  assert.equal(new Set(listed).size, listed.length);
+  assert.deepEqual(listed.slice().sort((a, b) => Number(a) - Number(b)), ['2', '4', '6', '14']);
 });

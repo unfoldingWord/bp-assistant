@@ -407,38 +407,42 @@ function isKeySubsequence(a, b) {
 }
 
 /**
- * Decide which keys may carry a corpus-derived "also occurs" list.
+ * Decide which "also occurs" verses each of a set of overlapping keys may list.
  *
- * A fixed formula and its sub-phrases all match the same verses. On published
- * ZEC 8, "thus says Yahweh of hosts" (H3541+H0559+H3068+H6635b) plus its two
- * sub-phrases each produced a near-identical "This also occurs in verses …"
- * sentence. When one key's token sequence sits contiguously inside another's,
- * only the longest of the related keys carries the corpus list; the shorter
- * ones keep just the verses of their own folded prepared siblings.
+ * A fixed formula and its sub-phrases match overlapping verse sets. On
+ * published ZEC 8, "thus says Yahweh of hosts", its two three-word sub-phrases
+ * and a five-word variant all belong to one cluster; each used to print a
+ * near-identical "This also occurs in verses ..." sentence. Picking the longest
+ * key instead lost the list entirely, because the five-word variant occurs once.
  *
- * Keys related by containment form one cluster (so a chain A ⊂ B ⊂ C leaves
- * only C). Ties on length are broken by the earlier anchor verse, then by key
- * so the result is deterministic.
+ * So the carrier is the key that COVERS the most verses. It lists all of them;
+ * every other key in the cluster lists only the verses not already listed by a
+ * key processed before it. Within a cluster no verse is listed twice and none is
+ * lost: the union of the returned lists equals the union of the inputs.
  *
- * @param {Array<{key: string, anchorVerse: (number|string)}>} groups
- *   One entry per key that has an anchor item in the current chapter.
- * @returns {Set<string>} the keys allowed to carry corpus-derived verses
+ * Keys related by containment form one cluster, so a chain A subset B subset C
+ * is resolved together. Ordering is coverage, then token count, then the earlier
+ * anchor verse, then the key string, so the result is deterministic.
+ *
+ * @param {Array<{key: string, anchorVerse: (number|string), verses: Array<string>}>} groups
+ *   One entry per key with an anchor in the current chapter. `verses` is that
+ *   key's in-range occurrence verses; the anchor's own verse is dropped here.
+ * @returns {Map<string, string[]>} key -> the verses that key may list
  */
-function selectAlsoOccursCarriers(groups) {
+function assignAlsoOccursVerses(groups) {
   const list = [];
   const seenKeys = new Set();
   for (const g of groups || []) {
     if (!g || !g.key || seenKeys.has(g.key)) continue;
     seenKeys.add(g.key);
     const n = parseInt(g.anchorVerse, 10);
-    list.push({
-      key: String(g.key),
-      tokens: keyTokens(g.key),
-      anchorVerse: Number.isFinite(n) ? n : Number.MAX_SAFE_INTEGER,
-    });
+    const anchorVerse = Number.isFinite(n) ? n : Number.MAX_SAFE_INTEGER;
+    const verses = dedupeAlsoOccursVerses(g.verses)
+      .filter((v) => verseNumber(v) !== anchorVerse);
+    list.push({ key: String(g.key), tokens: keyTokens(g.key), anchorVerse, verses });
   }
-  const carriers = new Set();
-  if (!list.length) return carriers;
+  const out = new Map();
+  if (!list.length) return out;
 
   // Union keys related by containment into clusters.
   const parent = list.map((_, i) => i);
@@ -458,14 +462,27 @@ function selectAlsoOccursCarriers(groups) {
     if (!clusters.has(root)) clusters.set(root, []);
     clusters.get(root).push(list[i]);
   }
+
+  const rank = (a, b) =>
+    (b.verses.length - a.verses.length) ||
+    (b.tokens.length - a.tokens.length) ||
+    (a.anchorVerse - b.anchorVerse) ||
+    (a.key < b.key ? -1 : a.key > b.key ? 1 : 0);
+
   for (const members of clusters.values()) {
-    members.sort((a, b) =>
-      (b.tokens.length - a.tokens.length) ||
-      (a.anchorVerse - b.anchorVerse) ||
-      (a.key < b.key ? -1 : a.key > b.key ? 1 : 0));
-    carriers.add(members[0].key);
+    members.sort(rank);
+    const claimed = new Set();
+    for (const member of members) {
+      const allowed = member.verses.filter((v) => {
+        const n = verseNumber(v);
+        if (claimed.has(n)) return false;
+        claimed.add(n);
+        return true;
+      });
+      out.set(member.key, allowed);
+    }
   }
-  return carriers;
+  return out;
 }
 
 /**
@@ -867,7 +884,7 @@ module.exports = {
   buildSeeHowSentence,
   formatAlsoOccurs,
   dedupeAlsoOccursVerses,
-  selectAlsoOccursCarriers,
+  assignAlsoOccursVerses,
   isKeySubsequence,
   keyTokens,
   isSeeHowEligible,

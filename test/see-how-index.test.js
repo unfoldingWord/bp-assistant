@@ -276,7 +276,7 @@ test('G3: formatAlsoOccurs renders a de-duplicated bridge once', () => {
   assert.equal(formatAlsoOccurs(['5', '5-6', '9']), 'This also occurs in verses 5–6 and 9.');
 });
 
-const { selectAlsoOccursCarriers, isKeySubsequence } = require('../src/workspace-tools/recurrence-index');
+const { assignAlsoOccursVerses, isKeySubsequence } = require('../src/workspace-tools/recurrence-index');
 
 test('C4: isKeySubsequence matches only contiguous runs', () => {
   assert.equal(isKeySubsequence('H0559+H3068', 'H3541+H0559+H3068+H6635b'), true);
@@ -287,47 +287,96 @@ test('C4: isKeySubsequence matches only contiguous runs', () => {
   assert.equal(isKeySubsequence('', 'H3541'), false);
 });
 
-test('C4: only the longest overlapping key carries the corpus list (published ZEC 8 shape)', () => {
-  const carriers = selectAlsoOccursCarriers([
-    { key: 'H3541+H0559+H3068+H6635b', anchorVerse: 2 },
-    { key: 'H3541+H0559+H3068', anchorVerse: 3 },
-    { key: 'H0559+H3068+H6635b', anchorVerse: 14 },
-  ]);
-  assert.deepEqual([...carriers], ['H3541+H0559+H3068+H6635b']);
+// Published ZEC 8: the quotation formula, its two three-word sub-phrases and a
+// five-word variant. Verse sets are the real ones from the replay.
+const ZEC8_CLUSTER = [
+  // Five-word variant, occurs only at its own anchor.
+  { key: 'H3588a+H3541+H0559+H3068+H6635b', anchorVerse: 14, verses: ['14'] },
+  // "thus says Yahweh of hosts"
+  { key: 'H3541+H0559+H3068+H6635b', anchorVerse: 2, verses: ['2', '4', '6', '7', '9', '14', '19', '20', '23'] },
+  // "thus says Yahweh" - the only key that also reaches verse 3
+  { key: 'H3541+H0559+H3068', anchorVerse: 3, verses: ['2', '3', '4', '6', '7', '9', '14', '19', '20', '23'] },
+  // "says Yahweh of hosts"
+  { key: 'H0559+H3068+H6635b', anchorVerse: 14, verses: ['2', '4', '6', '7', '9', '14', '19', '20', '23'] },
+];
+
+test('C5: the key covering the most verses carries the list, not the longest one', () => {
+  const allowed = assignAlsoOccursVerses(ZEC8_CLUSTER);
+  // Coverage: 8 for the four-word key, 9 for "thus says Yahweh", 8 for the
+  // other three-word key, 0 for the five-word variant (its only occurrence is
+  // its own anchor). Picking the longest key used to hand the role to the
+  // five-word variant and lose the list entirely.
+  assert.deepEqual(
+    allowed.get('H3541+H0559+H3068'),
+    ['2', '4', '6', '7', '9', '14', '19', '20', '23']
+  );
+  assert.deepEqual(allowed.get('H3541+H0559+H3068+H6635b'), []);
+  assert.deepEqual(allowed.get('H0559+H3068+H6635b'), []);
+  assert.deepEqual(allowed.get('H3588a+H3541+H0559+H3068+H6635b'), []);
 });
 
-test('C4: an unrelated key keeps its own corpus list', () => {
-  const carriers = selectAlsoOccursCarriers([
-    { key: 'H3541+H0559+H3068', anchorVerse: 3 },
-    { key: 'H3541+H0559', anchorVerse: 5 },
-    { key: 'H4325', anchorVerse: 9 },
-  ]);
-  assert.equal(carriers.has('H3541+H0559+H3068'), true);
-  assert.equal(carriers.has('H3541+H0559'), false);
-  assert.equal(carriers.has('H4325'), true, 'no containment relation, so it carries its own');
+test('C5: within a cluster no verse is listed twice and none is lost', () => {
+  const allowed = assignAlsoOccursVerses(ZEC8_CLUSTER);
+  const listed = [];
+  for (const verses of allowed.values()) listed.push(...verses.map(Number));
+  assert.equal(new Set(listed).size, listed.length, 'no verse listed twice');
+
+  const expected = new Set();
+  for (const g of ZEC8_CLUSTER) {
+    for (const v of g.verses) {
+      if (Number(v) !== g.anchorVerse) expected.add(Number(v));
+    }
+  }
+  assert.deepEqual([...listed].sort((a, b) => a - b), [...expected].sort((a, b) => a - b));
 });
 
-test('C4: a chain A subset B subset C leaves only C', () => {
-  const carriers = selectAlsoOccursCarriers([
-    { key: 'B', anchorVerse: 4 },
-    { key: 'A+B', anchorVerse: 2 },
-    { key: 'A+B+C', anchorVerse: 7 },
+test('C5: an unrelated key keeps its own list', () => {
+  const allowed = assignAlsoOccursVerses([
+    { key: 'H3541+H0559+H3068', anchorVerse: 3, verses: ['3', '5'] },
+    { key: 'H3541+H0559', anchorVerse: 5, verses: ['3', '5'] },
+    { key: 'H4325', anchorVerse: 9, verses: ['9', '12'] },
   ]);
-  assert.deepEqual([...carriers], ['A+B+C']);
+  assert.deepEqual(allowed.get('H4325'), ['12'], 'no containment relation, so it keeps its own');
+  // The two related keys cover one verse each after dropping their anchors;
+  // the tie falls to the longer token sequence.
+  assert.deepEqual(allowed.get('H3541+H0559+H3068'), ['5']);
+  assert.deepEqual(allowed.get('H3541+H0559'), ['3']);
 });
 
-test('C4: a length tie is broken by the earlier anchor verse', () => {
-  const carriers = selectAlsoOccursCarriers([
-    { key: 'B', anchorVerse: 9 },
-    { key: 'B+C', anchorVerse: 11 },
-    { key: 'A+B', anchorVerse: 4 },
+test('C5: a chain A subset B subset C is resolved as one cluster', () => {
+  const allowed = assignAlsoOccursVerses([
+    { key: 'B', anchorVerse: 4, verses: ['4', '7'] },
+    { key: 'A+B', anchorVerse: 2, verses: ['2', '7'] },
+    { key: 'A+B+C', anchorVerse: 7, verses: ['7', '4', '2'] },
   ]);
-  assert.deepEqual([...carriers], ['A+B'], 'same length, earlier anchor wins');
+  // A+B+C covers 2 and 4 after dropping its anchor -- the widest -- so it leads.
+  assert.deepEqual(allowed.get('A+B+C'), ['2', '4']);
+  assert.deepEqual(allowed.get('A+B'), ['7']);
+  assert.deepEqual(allowed.get('B'), []);
 });
 
-test('C4: an empty or single-key set is unchanged', () => {
-  assert.deepEqual([...selectAlsoOccursCarriers([])], []);
-  assert.deepEqual([...selectAlsoOccursCarriers([{ key: 'H3068', anchorVerse: 1 }])], ['H3068']);
+test('C5: an equal-coverage tie falls to the longer key, then the earlier anchor', () => {
+  const byLength = assignAlsoOccursVerses([
+    { key: 'B', anchorVerse: 9, verses: ['9', '11'] },
+    { key: 'A+B', anchorVerse: 4, verses: ['4', '11'] },
+  ]);
+  assert.deepEqual(byLength.get('A+B'), ['11'], 'same coverage, longer key wins');
+  assert.deepEqual(byLength.get('B'), []);
+
+  const byAnchor = assignAlsoOccursVerses([
+    { key: 'A+B', anchorVerse: 9, verses: ['9', '11'] },
+    { key: 'B+C', anchorVerse: 4, verses: ['4', '11'] },
+    { key: 'B', anchorVerse: 2, verses: ['2'] },
+  ]);
+  assert.deepEqual(byAnchor.get('B+C'), ['11'], 'same coverage and length, earlier anchor wins');
+  assert.deepEqual(byAnchor.get('A+B'), [], 'verse 11 is taken and 9 is its own anchor');
+  assert.deepEqual(byAnchor.get('B'), []);
+});
+
+test('C5: an empty or single-key set is unchanged', () => {
+  assert.equal(assignAlsoOccursVerses([]).size, 0);
+  const one = assignAlsoOccursVerses([{ key: 'H3068', anchorVerse: 1, verses: ['1', '5'] }]);
+  assert.deepEqual(one.get('H3068'), ['5'], 'the anchor verse is never listed');
 });
 
 // --- Round 3: S5 / S6 / N3 / S11 / B1 alias map -----------------------------

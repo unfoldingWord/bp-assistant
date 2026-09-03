@@ -20,7 +20,7 @@ const { getDoor43Username, emailToFallbackUsername, buildBranchName, resolveOutp
 const { splitTsv, fixTrailingNewlines } = require('./workspace-tools/tsv-tools');
 const { fillTsvIds, generateIds, prepareNotes, fillOrigQuotes, resolveGlQuotes, flagNarrowQuotes, extractAlignmentData, prepareATContext, substituteAT, fixUnicodeQuotes, verifyBoldMatches, syncCanonicalHebrewQuotes, applyHintsToPreparedNotes, _stripAlternateTranslation: stripAlternateTranslation } = require('./workspace-tools/tn-tools');
 const { checkTnQuality, detectSelfTalk, templateFirstPhrase, resolveTemplateText } = require('./workspace-tools/quality-tools');
-const { buildBookRecurrenceIndex, deriveRecurrenceKeys, buildSeeHowSentence, isSeeHowEligible, dedupeAlsoOccursVerses, selectAlsoOccursCarriers, resolveDoor43ReposPath, hebTokens, verseNumber: recurrenceVerseNumber, SEE_HOW_NEVER_FOLD_SREFS } = require('./workspace-tools/recurrence-index');
+const { buildBookRecurrenceIndex, deriveRecurrenceKeys, buildSeeHowSentence, isSeeHowEligible, dedupeAlsoOccursVerses, assignAlsoOccursVerses, resolveDoor43ReposPath, hebTokens, verseNumber: recurrenceVerseNumber, SEE_HOW_NEVER_FOLD_SREFS } = require('./workspace-tools/recurrence-index');
 const { normalizeIssuesFile, buildParallelismIntroHintArgs } = require('./issue-normalizer');
 const { curlyQuotes } = require('./workspace-tools/usfm-tools');
 const { verifyRepoPush, verifyDcsToken, verifyRemoteContent } = require('./repo-verify');
@@ -489,12 +489,30 @@ async function runSeeHowDetection({ pipeDir, contextPath, generateIdsFn = genera
     return canonicalKey(k.strongKey || k.textKey || '');
   };
 
-  const occurrencesFor = (key) => {
-    const direct = (index.byKey && index.byKey[key]) || [];
-    if (direct.length) return direct;
-    const canon = canonicalKey(key);
-    return (canon !== key && index.byKey && index.byKey[canon]) || direct;
-  };
+  // Merge the two key forms into one bucket per canonical key. The corpus scan
+  // files occurrences under whichever form was queried, so a key canonicalised
+  // to its Strong form could otherwise resolve to an empty bucket.
+  const byCanonical = new Map();
+  for (const [rawKey, occs] of Object.entries((index && index.byKey) || {})) {
+    const canon = canonicalKey(rawKey);
+    if (!byCanonical.has(canon)) byCanonical.set(canon, []);
+    byCanonical.get(canon).push(...occs);
+  }
+  for (const [canon, occs] of byCanonical.entries()) {
+    const seen = new Set();
+    const merged = [];
+    for (const occ of occs) {
+      const dedupe = `${occ.ref}|${occ.source}|${occ.id || ''}`;
+      if (seen.has(dedupe)) continue;
+      seen.add(dedupe);
+      merged.push(occ);
+    }
+    merged.sort((a, b) =>
+      (a.chapter - b.chapter) ||
+      (recurrenceVerseNumber(a.verse) - recurrenceVerseNumber(b.verse)));
+    byCanonical.set(canon, merged);
+  }
+  const occurrencesFor = (key) => byCanonical.get(canonicalKey(key)) || [];
   const earlierNotedTarget = (key) => {
     for (const occ of occurrencesFor(key)) {
       if (occ.source !== 'tn') continue;
@@ -632,8 +650,9 @@ async function runSeeHowDetection({ pipeDir, contextPath, generateIdsFn = genera
   const injections = [];
   const injectedAt = new Set();
 
-  // Resolve each group's anchor before assigning any corpus-derived verses:
-  // which key is allowed to carry that list depends on the whole set of anchors.
+  // Resolve every anchor -- prepared groups and standalone injections alike --
+  // before assigning any corpus-derived verses: which key may list which verses
+  // depends on the whole set of anchors and on how much each key covers.
   const plans = [];
   for (const [key, group] of byKeyItems.entries()) {
     group.sort(sortByRef);
@@ -651,7 +670,7 @@ async function runSeeHowDetection({ pipeDir, contextPath, generateIdsFn = genera
 
     // (a) A cross-chapter pointer belongs on the chapter's FIRST in-range
     // occurrence of the phrase, not on whichever verse the model happened to
-    // flag — a phrase in v2 and v5 with only v5 flagged used to leave v2 bare.
+    // flag -- a phrase in v2 and v5 with only v5 flagged used to leave v2 bare.
     // (b) A book-first explanatory note stays on the verse it describes.
     const anchorOcc = pointerCase ? (corpusHere[0] || null) : null;
     const anchorVerseNum = anchorOcc
@@ -661,38 +680,85 @@ async function runSeeHowDetection({ pipeDir, contextPath, generateIdsFn = genera
       ? (group.find((it) => recurrenceVerseNumber(verseOf(it.reference)) === anchorVerseNum) || null)
       : lead;
 
-    plans.push({
+    const plan = {
+      kind: 'group',
       key, group, lead, foldsAnySref, canFold, corpusHere,
       target, pointerCase, anchorOcc, anchorVerseNum, anchorItem,
+      skipped: false,
+    };
+    // A pointer with nothing flagged at the anchor verse must be synthesized.
+    // Claim its dedupe slot now so the standalone pass cannot duplicate it.
+    if (pointerCase && !anchorItem && anchorOcc) {
+      const dedupe = `${anchorOcc.ref}|${hebTokens(anchorOcc.quote).join('+')}`;
+      if (injectedAt.has(dedupe)) {
+        plan.skipped = true;
+      } else {
+        injectedAt.add(dedupe);
+        // A quote that could not be sliced out of the UHB byte-for-byte would be
+        // tagged ISSUE:MATCH_FAIL by syncCanonicalHebrewQuotes, so it is counted
+        // and skipped rather than shipped.
+        if (anchorOcc.quote_exact === false) { inexactSkipped++; plan.skipped = true; }
+      }
+    }
+    plans.push(plan);
+  }
+
+  // Phase 3 -- a phrase already noted in an earlier chapter that this chapter
+  // produced no prepared item for at all. Planned here, alongside the prepared
+  // groups, so it takes part in the coverage computation below instead of
+  // assigning itself a list afterwards.
+  for (const key of byCanonical.keys()) {
+    if (chapterKeys.has(key)) continue;
+    const target = earlierNotedTarget(key);
+    if (!target) continue;
+    if (!isSeeHowEligible(key, target.sref)) continue;
+    const corpusHere = chapterCorpusOccs(key);
+    if (!corpusHere.length) continue;
+    const occ = corpusHere[0];
+    // A phrase is registered under both its Strong's and its text key; dedupe on
+    // the concrete verse + quote so it is only injected once.
+    const dedupe = `${occ.ref}|${hebTokens(occ.quote).join('+')}`;
+    if (injectedAt.has(dedupe)) continue;
+    injectedAt.add(dedupe);
+    if (occ.quote_exact === false) { inexactSkipped++; continue; }
+    plans.push({
+      kind: 'injection',
+      key,
+      target,
+      corpusHere,
+      anchorOcc: occ,
+      anchorVerseNum: recurrenceVerseNumber(occ.verse),
+      skipped: false,
     });
   }
 
-  // A fixed formula and its sub-phrases match the same verses, so all three
-  // would otherwise print near-identical "This also occurs in verses …"
-  // sentences (published ZEC 8). Only the longest of a set of overlapping keys
-  // carries the corpus-derived list.
-  const alsoOccursCarriers = selectAlsoOccursCarriers(
-    plans.map((p) => ({ key: p.key, anchorVerse: p.anchorVerseNum }))
+  // A fixed formula and its sub-phrases match overlapping verse sets, so each
+  // would otherwise print a near-identical "This also occurs in verses ..."
+  // sentence (published ZEC 8). Within a containment cluster the key covering
+  // the most verses lists them all and every other key lists only what is left
+  // over, so no verse is listed twice and none is lost.
+  const alsoOccursAllowed = assignAlsoOccursVerses(
+    plans
+      .filter((p) => !p.skipped && (p.kind === 'injection' || p.foldsAnySref))
+      .map((p) => ({
+        key: p.key,
+        anchorVerse: p.anchorVerseNum,
+        verses: p.corpusHere.map((o) => String(o.verse)),
+      }))
   );
+  const corpusVersesFor = (plan) => (plan.skipped ? [] : (alsoOccursAllowed.get(plan.key) || []));
 
   for (const plan of plans) {
-    const {
-      key, group, lead, foldsAnySref, canFold, corpusHere,
-      target, pointerCase, anchorOcc, anchorVerseNum, anchorItem,
-    } = plan;
-    // Folded siblings are always listed; corpus spans only when this key is the
-    // longest of its overlapping set and the key is see-how eligible.
-    const takesCorpus = foldsAnySref && alsoOccursCarriers.has(key);
+    if (plan.kind !== 'group') continue;
+    const { key, group, lead, canFold, target, pointerCase, anchorOcc, anchorItem } = plan;
+    const alsoVerses = [];
 
     if (pointerCase) {
       const foldItems = group.filter((it) => it !== anchorItem && canFold(it));
-      const alsoVerses = foldItems.map((it) => verseOf(it.reference));
-      if (takesCorpus) {
-        for (const occ of corpusHere) {
-          if (recurrenceVerseNumber(occ.verse) <= anchorVerseNum) continue;
-          alsoVerses.push(String(occ.verse));
-        }
-      }
+      // A folded sibling always contributes its own verse; the corpus-derived
+      // verses are whatever this key was allowed to keep.
+      alsoVerses.push(...foldItems.map((it) => verseOf(it.reference)));
+      alsoVerses.push(...corpusVersesFor(plan));
 
       if (anchorItem) {
         // If the sentence could not be built, leave the group exactly as it
@@ -702,23 +768,17 @@ async function runSeeHowDetection({ pipeDir, contextPath, generateIdsFn = genera
         seeHowCount++;
         if (setAlsoOccurs(anchorItem, alsoVerses)) alsoOccursCount++;
         for (const it of foldItems) { fold(it); foldedCount++; }
-      } else if (anchorOcc) {
-        // Nothing was flagged at the anchor verse — synthesize the pointer
+      } else if (anchorOcc && !plan.skipped) {
+        // Nothing was flagged at the anchor verse -- synthesize the pointer
         // there. The folds only happen if that injection actually materializes.
-        const dedupe = `${anchorOcc.ref}|${hebTokens(anchorOcc.quote).join('+')}`;
-        if (!injectedAt.has(dedupe)) {
-          injectedAt.add(dedupe);
-          if (anchorOcc.quote_exact === false) inexactSkipped++;
-          else injections.push({ key, target, occ: anchorOcc, alsoVerses, foldItems });
-        }
+        injections.push({ key, target, occ: anchorOcc, alsoVerses, foldItems });
       }
       continue;
     }
 
     // (b) Book-first case: this IS the explanatory note and its prose is about
     // the verse the model wrote it on, so it stays put. Every other in-range
-    // occurrence in the chapter — earlier as well as later — is merely listed.
-    const alsoVerses = [];
+    // occurrence in the chapter -- earlier as well as later -- is merely listed.
     for (let i = 1; i < group.length; i++) {
       const later = group[i];
       if (later.reference === lead.reference) continue;
@@ -727,40 +787,17 @@ async function runSeeHowDetection({ pipeDir, contextPath, generateIdsFn = genera
       alsoVerses.push(verseOf(later.reference));
       foldedCount++;
     }
-    if (takesCorpus) {
-      for (const occ of corpusHere) {
-        if (recurrenceVerseNumber(occ.verse) === anchorVerseNum) continue;
-        alsoVerses.push(String(occ.verse));
-      }
-    }
+    alsoVerses.push(...corpusVersesFor(plan));
     if (setAlsoOccurs(lead, alsoVerses)) alsoOccursCount++;
   }
 
-  // Phase 3 — inject a pointer for an already-noted phrase the chapter produced
-  // no prepared item for at all.
-  for (const rawKey of Object.keys(index.byKey || {})) {
-    const key = canonicalKey(rawKey);
-    if (chapterKeys.has(rawKey) || chapterKeys.has(key)) continue;
-    const target = earlierNotedTarget(key);
-    if (!target) continue;
-    if (!isSeeHowEligible(key, target.sref)) continue;
-    const here = chapterCorpusOccs(key);
-    if (!here.length) continue;
-    const firstOcc = here[0];
-    // A phrase is registered under both its Strong's and its text key; dedupe on
-    // the concrete verse + quote so it is only injected once.
-    const dedupe = `${firstOcc.ref}|${hebTokens(firstOcc.quote).join('+')}`;
-    if (injectedAt.has(dedupe)) continue;
-    injectedAt.add(dedupe);
-    // A quote that could not be sliced out of the UHB byte-for-byte would be
-    // tagged ISSUE:MATCH_FAIL by syncCanonicalHebrewQuotes, so it is counted
-    // and skipped rather than shipped.
-    if (firstOcc.quote_exact === false) { inexactSkipped++; continue; }
+  for (const plan of plans) {
+    if (plan.kind !== 'injection' || plan.skipped) continue;
     injections.push({
-      key,
-      target,
-      occ: firstOcc,
-      alsoVerses: here.slice(1).map((o) => String(o.verse)),
+      key: plan.key,
+      target: plan.target,
+      occ: plan.anchorOcc,
+      alsoVerses: corpusVersesFor(plan),
       foldItems: [],
     });
   }
