@@ -26,13 +26,12 @@
 // zero here; EZK 19 scored on its very first denial (a `Read` inside cwd).
 //
 // The evidence is also TIME-GATED, not acted on the instant the limit is reached
-// (JER 48, 2026-09-04 — issue #373). On bypass runs Bash counts too (#291), and a
-// 6-agent align fan-out reliably burns 1–2 sub-agent Bash denials ~35s in while
-// the allow-all hook is firing all around them. Aborting on the count killed every
-// such attempt within a second — 30 days of run logs show no align attempt with a
-// denial ever running longer than 44s, and chapters succeeding only on a retry
-// that happened to draw zero denials. So the reducer only accumulates; the abort
-// waits for the stall window (or the run's end) with the evidence still
+// (JER 48, 2026-09-04 — issue #373). Aborting on the count killed every attempt
+// with a denial within a second, so nothing could be learned from it. Letting
+// those runs continue showed the denials were the first seconds of a session-wide
+// wall caused by BACKGROUND sub-agent spawns (see subagent-foreground-spawn.test.js,
+// which guards the fix that removes the cause). The reducer only accumulates; the
+// abort waits for the stall window (or the run's end) with the evidence still
 // unresolved, and hasPermissionWallEvidence then labels that stall a wall.
 
 const test = require('node:test');

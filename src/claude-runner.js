@@ -276,10 +276,13 @@ const PERMISSION_STALL_POLL_MS = 30 * 1000;
 // did: every align-all-parallel attempt on a bypass run was bimodal — either 0
 // denials and a 8–20min success, or exactly 2 denials ~35s in (the first two
 // sub-agent Bash calls after a 6-agent fan-out, hook fired 25x around them) and an
-// abort within a second. No attempt with a denial ever got to run long enough to
-// recover; chapters succeeded only when a retry happened to draw zero denials.
-// EZK 33 needed 9 attempts, JER 43 five, JER 48 lost all six and the chapter
-// failed. So the count now only says WHICH kind of failure a stalled run is: the
+// abort within a second. Letting those runs continue (#374) showed the denials
+// were not a startup burst but the first seconds of a session-wide wall caused by
+// BACKGROUND sub-agent spawns — see the spawn hook in buildOptions, which now
+// forces foreground spawns so the wall does not arise at all. EZK 33 needed 9
+// attempts, JER 43 five, JER 48 lost all six and the chapter failed, because a
+// retry only helped when the model happened to spawn in the foreground. The
+// count now only says WHICH kind of failure a stalled run is: the
 // abort itself still waits for the stall window (or the run's own end) with the
 // evidence unresolved, exactly like #238's time-based rule — see stallTimer and
 // hasPermissionWallEvidence. The trade: a genuine wall that is up from the start
@@ -352,6 +355,11 @@ function buildOptions({
   thinking,
   hooks,
   compaction,
+  // Force every Task/Agent spawn to the foreground (see the spawn hook below).
+  // Opt-in per call site because the evidence is per skill: align-all-parallel
+  // (#373). Default false leaves every other skill's spawns exactly as the
+  // model wrote them.
+  foregroundSubagents = false,
   // issue #293: an optional shared bag the caller (runClaudeOnce) creates and
   // reads back from. buildOptions has no other way to hand data out — it
   // returns only `options` — so the bypass allow-all hook below writes agent
@@ -538,17 +546,54 @@ function buildOptions({
         }
 
         const ti = input.tool_input;
-        if (!ti || typeof ti !== 'object' || typeof ti.model !== 'string') return {};
-        const resolved = resolveDifficultyModel('claude', ti.model);
-        const tierEffort = resolveDifficultyEffort(ti.model); // set effort only when spawn used a tier and caller didn't specify one
-        const modelChanged = resolved && resolved !== ti.model;
-        const effortChanged = tierEffort && ti.effort == null && ti.effort !== tierEffort;
-        if (!modelChanged && !effortChanged) return {};
+        if (!ti || typeof ti !== 'object') return {};
         const updatedInput = { ...ti };
-        if (modelChanged) updatedInput.model = resolved;
-        if (effortChanged) updatedInput.effort = tierEffort;
-        // Auditable: makes a per-run force/override + difficulty->effort observable in run logs.
-        console.log(`[model-select] ${tool} sub-agent ${ti.model}${modelChanged ? ` model->${resolved}` : ''}${effortChanged ? ` effort->${tierEffort}` : ''}${process.env.BP_FORCE_MODEL ? ' (forced)' : ''}`);
+        let changed = false;
+        // Background sub-agents ARE the "permission wall" (JER 48, 2026-09-04 —
+        // issue #373). 64 align-all-parallel runs over 30 days, no exception: every
+        // run whose spawns came back "Async agent launched successfully" was denied
+        // session-wide from ~35s on — children AND the coordinator's own re-wake
+        // turn, Read/Write/Glob/mcp alike, with the PreToolUse hooks never consulted
+        // — and every run whose spawns carried `run_in_background: false` ran its
+        // 8–20 minutes with zero denials. Whether the model omits the flag (CLI
+        // 2.1.250 then launches async) or sets it true is the coin flip that made
+        // the failures look transient. Upstream documents the mechanism: a
+        // background sub-agent "auto-denies anything not pre-approved" and does not
+        // inherit bypassPermissions (anthropics/claude-code#30693, #36042, #37442).
+        // Background alone is not the whole story: the same day's initial-pipeline
+        // run spawned 5 background agents (spaced minutes apart, coordinator
+        // polling TaskList and trading SendMessage with them) and finished 53
+        // minutes later with zero denials. What the align failures add is a
+        // coordinator that ends its turn seconds after a burst of background
+        // spawns ("All 6 agents are running, I'll verify when they report back" —
+        // result at +37s, first denial 16s later). A foreground spawn makes that
+        // early turn-end impossible. Scoped per call site (`foregroundSubagents`,
+        // set by the align-all-parallel runs in generate-pipeline) because that is
+        // where the evidence is; initial-pipeline's message-driven agents keep
+        // their background semantics untouched.
+        // Forced here, not in skill prose, for the same reason as the spawn pacing
+        // above: the hook is the only choke point before a spawn. Foreground spawns
+        // issued in one message still run concurrently, so nothing is lost.
+        // Kill switch: BP_ALLOW_BACKGROUND_SUBAGENTS=1.
+        if (foregroundSubagents && ti.run_in_background !== false && process.env.BP_ALLOW_BACKGROUND_SUBAGENTS !== '1') {
+          updatedInput.run_in_background = false;
+          changed = true;
+          console.log(`[spawn-foreground] ${tool} sub-agent "${ti.description || ''}" run_in_background ${ti.run_in_background === undefined ? 'unset' : String(ti.run_in_background)} -> false (background sub-agents are denied session-wide, #373)`);
+        }
+        if (typeof ti.model === 'string') {
+          const resolved = resolveDifficultyModel('claude', ti.model);
+          const tierEffort = resolveDifficultyEffort(ti.model); // set effort only when spawn used a tier and caller didn't specify one
+          const modelChanged = resolved && resolved !== ti.model;
+          const effortChanged = tierEffort && ti.effort == null && ti.effort !== tierEffort;
+          if (modelChanged) updatedInput.model = resolved;
+          if (effortChanged) updatedInput.effort = tierEffort;
+          if (modelChanged || effortChanged) {
+            changed = true;
+            // Auditable: makes a per-run force/override + difficulty->effort observable in run logs.
+            console.log(`[model-select] ${tool} sub-agent ${ti.model}${modelChanged ? ` model->${resolved}` : ''}${effortChanged ? ` effort->${tierEffort}` : ''}${process.env.BP_FORCE_MODEL ? ' (forced)' : ''}`);
+          }
+        }
+        if (!changed) return {};
         return { hookSpecificOutput: { hookEventName: 'PreToolUse', updatedInput } };
       } catch (err) {
         console.warn(`[claude-runner] model-resolver hook error: ${err.message}`);
@@ -880,6 +925,7 @@ async function runClaudeOnce({
   enableBash,
   bypassPermissions,
   skill,
+  foregroundSubagents,
   maxTurns,
   timeoutMs,
   appendSystemPrompt,
@@ -1050,6 +1096,7 @@ async function runClaudeOnce({
     thinking,
     hooks,
     compaction,
+    foregroundSubagents,
     agentAttribution,
   });
 

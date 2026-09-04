@@ -21,13 +21,18 @@ session log — what you just did belongs in the commit message and PR body.
   of scripted output; it is not a pipeline message.
 - **Hebrew compares must NFC-normalize first.** Byte-wise quote checks have
   failed on visually identical strings more than once.
-- **Sub-agent denials at fan-out startup are normal, not a wall.** On bypass
-  align runs, 1–2 of the first sub-agent Bash calls get the canned "STOP and
-  wait" denial ~35s in, then the run recovers within seconds. Any rule that
-  aborts on a denial *count* kills these healthy runs (JER 48, #373: six
-  attempts in a row; 30 days of run logs were bimodal). Wall-vs-stall is decided
-  only after the stall window or at run end (`hasPermissionWallEvidence` in
-  `src/claude-runner.js`).
+- **Background batch spawns plus an early coordinator turn-end are the align
+  "permission wall".** In headless bypass runs, when `Agent` spawns launch async
+  ("Async agent launched successfully", which CLI 2.1.250 does when
+  `run_in_background` is omitted or true) and the coordinator then ends its turn
+  ("I'll verify when they report back"), the whole session is behind the canned
+  "STOP and wait" denial from ~35s on: children and coordinator alike, PreToolUse
+  hooks never consulted. 64 align runs over 30 days, no exception (#373). The
+  align runs pass `foregroundSubagents` and the spawn hook in
+  `src/claude-runner.js` then forces `run_in_background: false`; foreground
+  spawns in one message still run concurrently. initial-pipeline keeps background
+  agents on purpose (its coordinator polls them for an hour) and was never hit,
+  so the rewrite is opt-in per call site, never global.
 
 ## Lessons learned
 
