@@ -24,6 +24,16 @@
 // genuinely ambiguous and scores nothing. Every other tool is granted per-session,
 // so its denial cannot be an allowlist miss. #238's probes were all Bash and score
 // zero here; EZK 19 scored on its very first denial (a `Read` inside cwd).
+//
+// The evidence is also TIME-GATED, not acted on the instant the limit is reached
+// (JER 48, 2026-09-04 — issue #373). On bypass runs Bash counts too (#291), and a
+// 6-agent align fan-out reliably burns 1–2 sub-agent Bash denials ~35s in while
+// the allow-all hook is firing all around them. Aborting on the count killed every
+// such attempt within a second — 30 days of run logs show no align attempt with a
+// denial ever running longer than 44s, and chapters succeeding only on a retry
+// that happened to draw zero denials. So the reducer only accumulates; the abort
+// waits for the stall window (or the run's end) with the evidence still
+// unresolved, and hasPermissionWallEvidence then labels that stall a wall.
 
 const test = require('node:test');
 const assert = require('node:assert');
@@ -31,9 +41,12 @@ const assert = require('node:assert');
 const {
   classifyRunnerUserMessage,
   applyRunnerUserMessage,
+  assessPermissionStall,
+  hasPermissionWallEvidence,
   isPermissionWallEvidence,
   resultIndicatesPermissionWall,
   resultIndicatesPermissionStall,
+  PERMISSION_STALL_WINDOW_MS,
   PERMISSION_WALL_DENIAL_LIMIT,
 } = require('../src/claude-runner');
 
@@ -60,14 +73,21 @@ function freshState() {
 }
 
 // Feed one denial whose tool_use resolved to `toolName` (null = unresolved).
-function feedDenial(state, toolName, id = 'toolu_x') {
+function feedDenial(state, toolName, id = 'toolu_x', limits = LIMITS, now = Date.now()) {
   const sig = classifyRunnerUserMessage(denialText(id));
   sig.deniedToolName = toolName;
-  return applyRunnerUserMessage(state, sig, LIMITS, null);
+  return applyRunnerUserMessage(state, sig, limits, null, now);
 }
 
-function feed(state, text) {
-  return applyRunnerUserMessage(state, classifyRunnerUserMessage(text), LIMITS, null);
+function feed(state, text, limits = LIMITS, now = Date.now()) {
+  return applyRunnerUserMessage(state, classifyRunnerUserMessage(text), limits, null, now);
+}
+
+// What the runner's stall watchdog decides at `now`: nothing, a stall, or a wall.
+function watchdog(state, now) {
+  const stall = assessPermissionStall(state, now, PERMISSION_STALL_WINDOW_MS);
+  if (!stall.stalled) return 'running';
+  return hasPermissionWallEvidence(state, LIMITS.wallLimit) ? 'permission_wall' : 'permission_stall';
 }
 
 test('the denial message carries the tool_use_id, so the refused tool can be named', () => {
@@ -116,22 +136,68 @@ test('an unresolved tool name is never wall evidence, bypass or not', () => {
   }
 });
 
-test('EZK 19: two back-to-back Read denials trip the wall', () => {
+test('EZK 19: two back-to-back Read denials are wall evidence, and a silent run then fails as a wall', () => {
   const state = freshState();
+  const t0 = 1_000_000;
   // 19:36:36.318 — sub-agent's first call, a Read inside cwd.
-  assert.equal(feedDenial(state, 'Read', 'toolu_a').type, 'permission_denied');
-  // 19:36:36.335 — 17ms later, the hints-JSON Read. This is where we now bail,
-  // instead of never (the real run took 14 more denials and then gave up).
-  const action = feedDenial(state, 'Read', 'toolu_b');
-  assert.equal(action.type, 'abort_permission_wall');
+  assert.equal(feedDenial(state, 'Read', 'toolu_a', LIMITS, t0).type, 'permission_denied');
+  // 19:36:36.335 — 17ms later, the hints-JSON Read. The evidence is complete here,
+  // but nothing aborts yet: this second is indistinguishable from JER 48's benign
+  // startup burst (below).
+  const action = feedDenial(state, 'Read', 'toolu_b', LIMITS, t0 + 17);
+  assert.equal(action.type, 'permission_denied');
   assert.equal(action.wallDenials, 2);
-  assert.equal(action.tool, 'Read');
+  assert.equal(hasPermissionWallEvidence(state, LIMITS.wallLimit), true);
+  assert.equal(watchdog(state, t0 + 17), 'running');
+  // Nothing productive ever follows. Once the stall window elapses the watchdog
+  // fires — and because the evidence is still unresolved, as a WALL (retryable),
+  // not a stall (hard failure).
+  assert.equal(watchdog(state, t0 + PERMISSION_STALL_WINDOW_MS - 1), 'running');
+  assert.equal(watchdog(state, t0 + PERMISSION_STALL_WINDOW_MS), 'permission_wall');
 });
 
-test('the wall trips on mixed wholesale-granted tools, not just repeats of one', () => {
+test('a silent run with too little wall evidence still fails as a plain stall', () => {
+  const state = freshState();
+  const t0 = 1_000_000;
+  feedDenial(state, 'Read', 'toolu_a', LIMITS, t0);
+  assert.equal(hasPermissionWallEvidence(state, LIMITS.wallLimit), false);
+  assert.equal(watchdog(state, t0 + PERMISSION_STALL_WINDOW_MS), 'permission_stall');
+});
+
+// JER 48 (2026-09-04, #373), replayed from the run log of attempt q=i8w8f1 on a
+// bypass run: the coordinator spawned 6 align sub-agents, two of their first Bash
+// calls were denied 0.7s apart at +34.0s/+34.7s, and the very next stream message
+// was a productive tool_result from a sibling agent. Six attempts in a row were
+// aborted on that second denial; every one of them was healthy (allow-all hook
+// fired 25 times around the burst). The evidence must clear with the next
+// productive result and the run must simply continue.
+test('JER 48 regression: a startup burst that clears within seconds never aborts a bypass run', () => {
+  const state = freshState();
+  const limits = { transportLimit: 3, wallLimit: 2, isBypassRun: true };
+  const t0 = 34_000;
+  assert.equal(feedDenial(state, 'Bash', 'toolu_015H1eX7', limits, t0).type, 'permission_denied');
+  const second = feedDenial(state, 'Bash', 'toolu_01UipAfy', limits, t0 + 700);
+  // Both score on a bypass run (#291) — the evidence is "complete" for one second...
+  assert.equal(second.type, 'permission_denied');
+  assert.equal(second.wallDenials, 2);
+  assert.equal(hasPermissionWallEvidence(state, limits.wallLimit), true);
+  // ...but nothing fires mid-stream.
+  assert.equal(watchdog(state, t0 + 700), 'running');
+  // A sibling agent's productive result lands 1.5s later and clears everything.
+  assert.equal(feed(state, NORMAL_TOOL_RESULT, limits, t0 + 2200).type, 'tool_result_reset');
+  assert.equal(state.wallDenials, 0);
+  assert.equal(hasPermissionWallEvidence(state, limits.wallLimit), false);
+  assert.equal(state.stallStartAt, null);
+  // The run goes on for its full 15 minutes with nothing to abort it.
+  assert.equal(watchdog(state, t0 + PERMISSION_STALL_WINDOW_MS + 60_000), 'running');
+});
+
+test('mixed wholesale-granted tools accumulate wall evidence, not just repeats of one', () => {
   const state = freshState();
   assert.equal(feedDenial(state, 'Glob').type, 'permission_denied');
-  assert.equal(feedDenial(state, 'mcp__workspace-tools__read_usfm_chapter').type, 'abort_permission_wall');
+  assert.equal(feedDenial(state, 'mcp__workspace-tools__read_usfm_chapter').type, 'permission_denied');
+  assert.equal(state.wallDenials, 2);
+  assert.equal(hasPermissionWallEvidence(state, LIMITS.wallLimit), true);
 });
 
 test('#238 regression: a burst of benign raw-shell probe denials never trips the wall', () => {
@@ -229,42 +295,36 @@ test('the default wall limit is small — the wall is unambiguous once it appear
 // unconditional Bash exemption this scored only 1 (the lone Grep), below
 // PERMISSION_WALL_DENIAL_LIMIT (2), so no wall fired and the run hard-failed as a
 // permission_stall instead of getting the wall's 20-minute retry budget. On a
-// bypass run, Bash now counts too, so the wall must fire on the SECOND denial
-// (both Bash) — 2s into the real incident, instead of 512s in. On a non-bypass
+// bypass run, Bash now counts too, so the evidence is complete by the SECOND
+// denial (both Bash) — and when the run then goes silent for the stall window
+// (DAN 5 sat 512s), the watchdog labels it a WALL, not a stall. On a non-bypass
 // run the old behavior must hold: Bash stays ambiguous and the sequence never
-// trips the wall at all (only the trailing Grep would ever score).
-test('DAN 5 sequence (5x Bash then 1x Grep) trips the wall by the 2nd denial on a bypass run, not on non-bypass', () => {
+// amounts to a wall at all (only the trailing Grep would ever score).
+test('DAN 5 sequence (5x Bash then 1x Grep) is a wall on a bypass run, a stall on non-bypass', () => {
+  const t0 = 5_000_000;
+  const dan5Sequence = ['Bash', 'Bash', 'Bash', 'Bash', 'Bash', 'Grep'];
+
   const bypassState = freshState();
   const bypassLimits = { transportLimit: 3, wallLimit: 2, isBypassRun: true };
-  const feedBypass = (toolName, id) => {
-    const sig = classifyRunnerUserMessage(denialText(id));
-    sig.deniedToolName = toolName;
-    return applyRunnerUserMessage(bypassState, sig, bypassLimits, null);
-  };
-
-  const first = feedBypass('Bash', 'toolu_dan5_1');
+  const first = feedDenial(bypassState, 'Bash', 'toolu_dan5_1', bypassLimits, t0);
   assert.equal(first.type, 'permission_denied');
-  const second = feedBypass('Bash', 'toolu_dan5_2');
-  assert.equal(second.type, 'abort_permission_wall');
+  const second = feedDenial(bypassState, 'Bash', 'toolu_dan5_2', bypassLimits, t0 + 2000);
+  assert.equal(second.type, 'permission_denied');
   assert.equal(second.wallDenials, 2);
-  assert.equal(second.tool, 'Bash');
+  assert.equal(hasPermissionWallEvidence(bypassState, bypassLimits.wallLimit), true);
+  dan5Sequence.slice(2).forEach((toolName, i) => feedDenial(bypassState, toolName, `toolu_dan5_${i + 3}`, bypassLimits, t0 + 3000 + i));
+  assert.equal(bypassState.wallDenials, 6);
+  assert.equal(watchdog(bypassState, t0 + PERMISSION_STALL_WINDOW_MS), 'permission_wall');
 
-  // Same sequence, non-bypass: Bash never counts, so the wall never trips even
-  // after all 5 Bash denials plus the trailing Grep (which alone is only 1).
+  // Same sequence, non-bypass: Bash never counts, so even after all 5 Bash
+  // denials plus the trailing Grep (which alone is only 1) the silent run is a
+  // plain stall.
   const nonBypassState = freshState();
   const nonBypassLimits = { transportLimit: 3, wallLimit: 2, isBypassRun: false };
-  const feedNonBypass = (toolName, id) => {
-    const sig = classifyRunnerUserMessage(denialText(id));
-    sig.deniedToolName = toolName;
-    return applyRunnerUserMessage(nonBypassState, sig, nonBypassLimits, null);
-  };
-  const dan5Sequence = ['Bash', 'Bash', 'Bash', 'Bash', 'Bash', 'Grep'];
-  let lastAction = null;
-  dan5Sequence.forEach((toolName, i) => {
-    lastAction = feedNonBypass(toolName, `toolu_nb_${i}`);
-  });
-  assert.notEqual(lastAction.type, 'abort_permission_wall');
+  dan5Sequence.forEach((toolName, i) => feedDenial(nonBypassState, toolName, `toolu_nb_${i}`, nonBypassLimits, t0 + i));
   assert.equal(nonBypassState.wallDenials, 1); // only the trailing Grep scored
+  assert.equal(hasPermissionWallEvidence(nonBypassState, nonBypassLimits.wallLimit), false);
+  assert.equal(watchdog(nonBypassState, t0 + PERMISSION_STALL_WINDOW_MS), 'permission_stall');
 });
 
 // Gate 1 locking test (issue #291). A guard-hook denial (src/guard-hooks.js) must
@@ -300,10 +360,10 @@ test('Gate 1: a guard-hook denial can never be counted as wall evidence', () => 
 
     // Belt-and-braces: even if isPermissionDenied were somehow true, drive it
     // through the real reducer on a bypass run (the widest-evidence mode) and
-    // confirm a single such denial cannot trip the wall.
+    // confirm a single such denial accumulates no wall evidence.
     sig.deniedToolName = 'Bash';
     const state = freshState();
-    const action = applyRunnerUserMessage(state, sig, { transportLimit: 3, wallLimit: 2, isBypassRun: true }, null);
-    assert.notEqual(action.type, 'abort_permission_wall');
+    applyRunnerUserMessage(state, sig, { transportLimit: 3, wallLimit: 2, isBypassRun: true }, null);
+    assert.equal(hasPermissionWallEvidence(state, 2), false);
   }
 });
