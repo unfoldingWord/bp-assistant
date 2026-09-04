@@ -1574,6 +1574,11 @@ async function generatePipeline(route, message) {
         // denies sub-agent Write/Bash/Skill calls nondeterministically
         // (#195/#235/#238/#242). See buildOptions in claude-runner.js.
         bypassPermissions: true,
+        // Background batch spawns followed by an early coordinator turn-end put
+        // the whole session behind the canned "STOP and wait" denial (#373, 64
+        // align runs over 30 days). The spawn hook forces foreground spawns for
+        // this skill only; see buildOptions in claude-runner.js.
+        foregroundSubagents: true,
         disableLocalSettings: true,
         timeoutMs: alignTimeout,
         onProgress: ({ turnCount, lastTool, elapsedMs, timedOut }) => {
@@ -1801,6 +1806,7 @@ async function generatePipeline(route, message) {
           tools: DEFAULT_BASH_TOOLS,
           enableBash: true,
           bypassPermissions: true,
+          foregroundSubagents: true, // same reason as the first pass (#373)
           disableLocalSettings: true,
           timeoutMs: alignTimeout,
           onProgress: ({ turnCount, lastTool, elapsedMs, timedOut }) => {

@@ -355,6 +355,11 @@ function buildOptions({
   thinking,
   hooks,
   compaction,
+  // Force every Task/Agent spawn to the foreground (see the spawn hook below).
+  // Opt-in per call site because the evidence is per skill: align-all-parallel
+  // (#373). Default false leaves every other skill's spawns exactly as the
+  // model wrote them.
+  foregroundSubagents = false,
   // issue #293: an optional shared bag the caller (runClaudeOnce) creates and
   // reads back from. buildOptions has no other way to hand data out — it
   // returns only `options` — so the bypass allow-all hook below writes agent
@@ -555,11 +560,22 @@ function buildOptions({
         // the failures look transient. Upstream documents the mechanism: a
         // background sub-agent "auto-denies anything not pre-approved" and does not
         // inherit bypassPermissions (anthropics/claude-code#30693, #36042, #37442).
+        // Background alone is not the whole story: the same day's initial-pipeline
+        // run spawned 5 background agents (spaced minutes apart, coordinator
+        // polling TaskList and trading SendMessage with them) and finished 53
+        // minutes later with zero denials. What the align failures add is a
+        // coordinator that ends its turn seconds after a burst of background
+        // spawns ("All 6 agents are running, I'll verify when they report back" —
+        // result at +37s, first denial 16s later). A foreground spawn makes that
+        // early turn-end impossible. Scoped per call site (`foregroundSubagents`,
+        // set by the align-all-parallel runs in generate-pipeline) because that is
+        // where the evidence is; initial-pipeline's message-driven agents keep
+        // their background semantics untouched.
         // Forced here, not in skill prose, for the same reason as the spawn pacing
         // above: the hook is the only choke point before a spawn. Foreground spawns
         // issued in one message still run concurrently, so nothing is lost.
         // Kill switch: BP_ALLOW_BACKGROUND_SUBAGENTS=1.
-        if (ti.run_in_background !== false && process.env.BP_ALLOW_BACKGROUND_SUBAGENTS !== '1') {
+        if (foregroundSubagents && ti.run_in_background !== false && process.env.BP_ALLOW_BACKGROUND_SUBAGENTS !== '1') {
           updatedInput.run_in_background = false;
           changed = true;
           console.log(`[spawn-foreground] ${tool} sub-agent "${ti.description || ''}" run_in_background ${ti.run_in_background === undefined ? 'unset' : String(ti.run_in_background)} -> false (background sub-agents are denied session-wide, #373)`);
@@ -909,6 +925,7 @@ async function runClaudeOnce({
   enableBash,
   bypassPermissions,
   skill,
+  foregroundSubagents,
   maxTurns,
   timeoutMs,
   appendSystemPrompt,
@@ -1079,6 +1096,7 @@ async function runClaudeOnce({
     thinking,
     hooks,
     compaction,
+    foregroundSubagents,
     agentAttribution,
   });
 
