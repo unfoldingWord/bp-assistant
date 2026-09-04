@@ -21,16 +21,14 @@ session log — what you just did belongs in the commit message and PR body.
   of scripted output; it is not a pipeline message.
 - **Hebrew compares must NFC-normalize first.** Byte-wise quote checks have
   failed on visually identical strings more than once.
-- **Sub-agent denials at fan-out startup are normal, not a wall.** On bypass
-  align runs, 1–2 of the first sub-agent Bash calls get the canned "STOP and
-  wait" denial ~35s in, then the run recovers within seconds. Any rule that
-  aborts on a denial *count* kills these healthy runs (JER 48, #373: six
-  attempts in a row; 30 days of run logs were bimodal). Wall-vs-stall is decided
-  only after the stall window or at run end (`hasPermissionWallEvidence` in
-  `src/claude-runner.js`).
-
-## Lessons learned
-
+- **Background sub-agents are the "permission wall".** In headless bypass runs,
+  any `Agent` spawn that launches async ("Async agent launched successfully",
+  which CLI 2.1.250 does when `run_in_background` is omitted or true) puts the
+  whole session behind the canned "STOP and wait" denial from ~35s on: children
+  and the coordinator alike, PreToolUse hooks never consulted. 64 align runs over
+  30 days, no exception (#373). The spawn hook in `src/claude-runner.js` forces
+  `run_in_background: false`; foreground spawns in one message still run
+  concurrently. Never re-enable background spawns without a 30-day log check.
 - **See-how pointers are deterministic (decision 2026-09-02).** The recurrence
   index (`src/workspace-tools/recurrence-index.js`) and `runSeeHowDetection`
   in `src/notes-pipeline.js` implement the rule: same-chapter repeats fold into
