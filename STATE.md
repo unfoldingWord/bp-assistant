@@ -21,6 +21,13 @@ session log — what you just did belongs in the commit message and PR body.
   of scripted output; it is not a pipeline message.
 - **Hebrew compares must NFC-normalize first.** Byte-wise quote checks have
   failed on visually identical strings more than once.
+- **Sub-agent denials at fan-out startup are normal, not a wall.** On bypass
+  align runs, 1–2 of the first sub-agent Bash calls get the canned "STOP and
+  wait" denial ~35s in, then the run recovers within seconds. Any rule that
+  aborts on a denial *count* kills these healthy runs (JER 48, #373: six
+  attempts in a row; 30 days of run logs were bimodal). Wall-vs-stall is decided
+  only after the stall window or at run end (`hasPermissionWallEvidence` in
+  `src/claude-runner.js`).
 
 ## Lessons learned
 
