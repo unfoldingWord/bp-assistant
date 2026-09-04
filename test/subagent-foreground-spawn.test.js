@@ -79,13 +79,14 @@ test('the foreground rewrite composes with the difficulty->model rewrite in one 
 // the coordinator on a child that is waiting to hear from it, so the rewrite is
 // opt-in per call site and OFF by default.
 test('with foregroundSubagents unset (initial-pipeline and every other skill), spawns are left as written', async () => {
-  await withEnv('BP_ALLOW_BACKGROUND_SUBAGENTS', undefined, async () => {
+  // Two spawns through one hook: disable the 8s spawn pacing so the test stays fast.
+  await withEnv('BP_SUBAGENT_SPAWN_INTERVAL_MS', '0', () => withEnv('BP_ALLOW_BACKGROUND_SUBAGENTS', undefined, async () => {
     const hook = spawnHook(buildOptions({}));
     const out = await hook({ tool_name: 'Agent', tool_input: { prompt: 'Generate ULT for JER 48', run_in_background: true, subagent_type: 'general-purpose' } });
     assert.deepEqual(out, {});
     const omitted = await hook({ tool_name: 'Agent', tool_input: { prompt: 'Structure analyst JER 48', subagent_type: 'issue-identification' } });
     assert.deepEqual(omitted, {});
-  });
+  }));
 });
 
 test('BP_ALLOW_BACKGROUND_SUBAGENTS=1 restores the old behavior (kill switch)', async () => {
