@@ -18,7 +18,26 @@ let _sdkCreateSdkMcpServer = null;
 let _sdkTool = null;
 let _z = null;
 
+// Test doubles for the two Agent-SDK handles runClaudeOnce needs (issue #375).
+// The SDK ships as pure ESM ("type":"module", sdk.mjs), so the `require.cache`
+// substitution the rest of test/ uses for heavy CJS modules cannot reach it —
+// ESM has its own registry. Without a seam, runClaudeOnce's stall watchdog and
+// its post-loop wall/stall annotation are unreachable from a test, and reordering
+// the wall/stall checks inside either one breaks nothing. Set only by
+// __setSdkTestDoubles below; nothing in src/ ever calls that.
+let _testQuery = null;
+let _testWorkspaceToolsServer = null;
+
+// Install (or, with no argument, remove) the SDK test doubles. Returns a restore
+// function so a test can install in a try and clear in a finally.
+function __setSdkTestDoubles({ query, workspaceToolsServer } = {}) {
+  _testQuery = query || null;
+  _testWorkspaceToolsServer = workspaceToolsServer || null;
+  return () => { _testQuery = null; _testWorkspaceToolsServer = null; };
+}
+
 async function getQuery() {
+  if (_testQuery) return _testQuery;
   if (!_query) {
     const sdk = await import('@anthropic-ai/claude-agent-sdk');
     _query = sdk.query;
@@ -30,6 +49,7 @@ async function getQuery() {
 // The SDK connects a transport to each instance; reusing one across parallel
 // runClaude() calls causes "Already connected to a transport" crashes.
 async function createFreshWorkspaceToolsServer(toolSet) {
+  if (_testWorkspaceToolsServer) return _testWorkspaceToolsServer;
   if (!_sdkCreateSdkMcpServer) {
     const sdk = await import('@anthropic-ai/claude-agent-sdk');
     _sdkCreateSdkMcpServer = sdk.createSdkMcpServer;
@@ -1773,6 +1793,11 @@ async function runClaudeStream({
 
 module.exports = {
   runClaude,
+  // Exported for test/runner-stall-timer.test.js (#375), which drives the stall
+  // watchdog and the post-loop wall/stall annotation directly. runClaude() wraps
+  // this in transient/wall retry loops that would mask both.
+  runClaudeOnce,
+  __setSdkTestDoubles,
   runClaudeStream,
   buildOptions,
   createFreshWorkspaceToolsServer,
