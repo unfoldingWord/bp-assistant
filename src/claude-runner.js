@@ -282,7 +282,11 @@ const PERMISSION_STALL_POLL_MS = 30 * 1000;
 // failed. So the count now only says WHICH kind of failure a stalled run is: the
 // abort itself still waits for the stall window (or the run's own end) with the
 // evidence unresolved, exactly like #238's time-based rule — see stallTimer and
-// hasPermissionWallEvidence.
+// hasPermissionWallEvidence. The trade: a genuine wall that is up from the start
+// now costs ~5min per probe instead of ~1s, and PERMISSION_WALL_RETRY_WINDOW_MS
+// counts those minutes, so it gets ~4 probes over ~30min rather than 6–7 over 20.
+// A wall that ends the run early (EZK 19: normal-looking result at 88s) is still
+// caught at once by the unresolved-evidence check on the result.
 const PERMISSION_WALL_DENIAL_LIMIT = Number(process.env.BP_PERMISSION_WALL_DENIALS) > 0
   ? Number(process.env.BP_PERMISSION_WALL_DENIALS)
   : 2;
@@ -751,7 +755,7 @@ function isPermissionWallEvidence(toolName, isBypassRun = false) {
 // closed > permission-denial > tool_use_error > tool_result. `state` fields:
 // consecutiveToolErrors, consecutiveTransportErrors, consecutivePermissionDenials,
 // totalPermissionDenials, stallStartAt, toolErrorSigs (Map).
-// `limits` = { transportLimit, wallLimit, isBypassRun }.
+// `limits` = { transportLimit, isBypassRun }.
 function applyRunnerUserMessage(state, sig, limits, guardrails, now = Date.now()) {
   if (sig.isTransportClosed) {
     state.consecutiveTransportErrors += 1;
@@ -1184,7 +1188,6 @@ async function runClaudeOnce({
           sig,
           {
             transportLimit: MCP_TRANSPORT_ERROR_LIMIT,
-            wallLimit: PERMISSION_WALL_DENIAL_LIMIT,
             // issue #291: same distinction the startup log line above (`options.
             // permissionMode === 'bypassPermissions'`) already makes — reused
             // rather than recomputing BP_NO_BYPASS, which buildOptions already

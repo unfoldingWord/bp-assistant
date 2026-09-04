@@ -236,15 +236,16 @@ test('a real tool_use_error also clears wall evidence — tools are answering', 
   assert.equal(state.wallDenials, 0);
 });
 
-test('wall detection stays off when the caller supplies no wallLimit', () => {
-  // Guards the existing callers/tests that pass only { transportLimit }.
+test('the reducer never aborts on a denial count, however high it climbs', () => {
+  // The old reducer returned abort_permission_wall on the 2nd wall-evidence
+  // denial; the count is evidence for the watchdog now, nothing more.
   const state = freshState();
-  const limits = { transportLimit: 3 };
   for (let i = 0; i < 6; i++) {
     const sig = classifyRunnerUserMessage(denialText(`toolu_${i}`));
     sig.deniedToolName = 'Read';
-    assert.equal(applyRunnerUserMessage(state, sig, limits, null).type, 'permission_denied');
+    assert.equal(applyRunnerUserMessage(state, sig, { transportLimit: 3 }, null).type, 'permission_denied');
   }
+  assert.equal(state.wallDenials, 6);
 });
 
 test('the stall anchor still advances during a wall, so both signals stay coherent', () => {
