@@ -270,4 +270,88 @@ async function buildUstIndex({ force, lookup, stats }) {
   return buildAlignmentIndex(sourceDir, cacheFile, 'UST');
 }
 
-module.exports = { buildStrongsIndex, buildTnIndex, buildUstIndex };
+/**
+ * Cross-book see-how index: which phrase already carries an explanatory note in
+ * which book, plus how many books its source text occurs in.
+ *
+ * Reads `data/published_ult/*.usfm` joined to `data/published-tns/*.tsv` and
+ * caches to `data/cache/crossbook_seehow_index.json`, the same shape of
+ * daily-rebuilt cache as strongs_index.json. runSeeHowDetection consumes the
+ * cache if it is there and silently skips cross-book pointers if it is not.
+ */
+async function buildCrossBookSeeHowIndex({ force, stats } = {}) {
+  const { buildCrossBookIndex, CROSS_BOOK_MAX_BOOKS } = require('./recurrence-index');
+  const { BOOK_NUMBERS } = require('../api-runner/verse-data');
+  const ultDir = path.join(CSKILLBP_DIR, 'data/published_ult');
+  const tnDir = path.join(CSKILLBP_DIR, 'data/published-tns');
+  const cacheFile = path.join(CSKILLBP_DIR, 'data/cache/crossbook_seehow_index.json');
+  const today = todayStr();
+
+  if (stats && fs.existsSync(cacheFile)) {
+    const idx = JSON.parse(fs.readFileSync(cacheFile, 'utf8'));
+    const m = idx._meta || {};
+    return `Built: ${m.built}\nBooks: ${m.books}\nKeys: ${m.keys}\nNote rows: ${m.note_rows}\nPointer-eligible keys: ${m.eligible_keys}\nMax books: ${m.max_books}`;
+  }
+  if (!force && fs.existsSync(cacheFile)) {
+    try {
+      const idx = JSON.parse(fs.readFileSync(cacheFile, 'utf8'));
+      if (idx._meta && idx._meta.built === today) {
+        return `Cross-book see-how index is current (built ${today}, ${idx._meta.keys} keys)`;
+      }
+    } catch { /* rebuild */ }
+  }
+
+  if (!fs.existsSync(tnDir)) return `Source not found: ${tnDir}. Run fetch_published_tns first.`;
+  if (!fs.existsSync(ultDir)) return `Source not found: ${ultDir}. Run fetch_ult first.`;
+
+  // The two directories use different naming: published_ult is NN-CODE.usfm
+  // (curate-data's fetch), published-tns is tn_CODE.tsv. Canonical order comes
+  // from BOOK_NUMBERS rather than the filenames, so it is well defined even for
+  // a book whose ULT is missing — and it is what makes "the first note in the
+  // corpus" deterministic.
+  const filesIn = (dir, re) => {
+    const map = new Map();
+    let names = [];
+    try { names = fs.readdirSync(dir); } catch { names = []; }
+    for (const name of names) {
+      const m = name.match(re);
+      if (m) map.set(m[1].toUpperCase(), path.join(dir, name));
+    }
+    return map;
+  };
+  const ultFiles = filesIn(ultDir, /^\d{2,3}-([1-3A-Za-z]{3})\.usfm$/);
+  const tnFiles = filesIn(tnDir, /^tn_([1-3A-Za-z]{3})\.tsv$/i);
+  if (!tnFiles.size) return 'No tn_*.tsv files found in data/published-tns/';
+
+  const bookCodes = [...tnFiles.keys()]
+    .filter((code) => BOOK_NUMBERS[code])
+    .sort((a, b) => BOOK_NUMBERS[a].localeCompare(BOOK_NUMBERS[b]));
+
+  const readFile = (file) => {
+    if (!file) return '';
+    try { return fs.readFileSync(file, 'utf8'); } catch { return ''; }
+  };
+  const readBook = (code) => ({
+    ultUsfm: readFile(ultFiles.get(code)),
+    tnTsv: readFile(tnFiles.get(code)),
+  });
+
+  const index = buildCrossBookIndex({ bookCodes, readBook, maxBooks: CROSS_BOOK_MAX_BOOKS });
+  const output = {
+    _meta: {
+      built: today,
+      source_dirs: ['data/published_ult/', 'data/published-tns/'],
+      books: index.counts.books,
+      keys: index.counts.keys,
+      note_rows: index.counts.noteRows,
+      eligible_keys: index.counts.eligibleKeys,
+      max_books: index.counts.maxBooks,
+    },
+    byKey: index.byKey,
+  };
+  fs.mkdirSync(path.dirname(cacheFile), { recursive: true });
+  fs.writeFileSync(cacheFile, JSON.stringify(output));
+  return `Built cross-book see-how index: ${index.counts.keys} keys (${index.counts.eligibleKeys} pointer-eligible) from ${index.counts.noteRows} note rows across ${index.counts.books} books`;
+}
+
+module.exports = { buildStrongsIndex, buildTnIndex, buildUstIndex, buildCrossBookSeeHowIndex };
