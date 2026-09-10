@@ -16,6 +16,11 @@
 //   (--article also accepts a Door43 URL.)
 //
 // Source language is a first-class knob: --source-lang ru --source <ru_gl/ru_tn@master>.
+// Scripture refs resolve like the API route (flag > translate-targets.json > derivation):
+//   --source-literal <org/repo@ref>   (default unfoldingWord/en_ult@master)
+//   --source-simplified <org/repo@ref> (default unfoldingWord/en_ust@master)
+//   --literal <org/repo@ref>          (default {targetOrg}/{lang}_glt@master)
+//   --simplified <org/repo@ref>       (default {targetOrg}/{lang}_gst@master)
 // Requires a Claude Code login (Agent SDK uses local CLI auth) or ANTHROPIC_API_KEY.
 //
 // Direct multi-provider path (one API completion per batch/article instead of the
@@ -81,7 +86,15 @@ async function main() {
 
   const { translateChapters, translateArticles } = require('../src/translate-pipeline');
 
+  // Scripture refs mirror translate-pipeline.js resolution (opts > config > derivation);
+  // without them translateChapters() logs "scripture: skipped" and the skill never
+  // sees the target-language verse text.
+  const targetOrg = arg('org', cfg.targetOrg || `${targetLang}_gl`);
   const common = {
+    sourceLiteralRef: arg('source-literal', cfg.sourceLiteralRef || 'unfoldingWord/en_ult@master'),
+    sourceSimplifiedRef: arg('source-simplified', cfg.sourceSimplifiedRef || 'unfoldingWord/en_ust@master'),
+    targetLiteralRef: arg('literal', cfg.literalRef || `${targetOrg}/${cfg.literalRepo || `${targetLang}_glt`}@master`),
+    targetSimplifiedRef: arg('simplified', cfg.simplifiedRef || `${targetOrg}/${cfg.simplifiedRepo || `${targetLang}_gst`}@master`),
     resourceType,
     family: rt.family,
     skill: rt.skill,
@@ -91,7 +104,7 @@ async function main() {
     sourceLang,
     sourceLangName: langName(sourceLang),
     direction: arg('direction', RTL.has(targetLang.split('-')[0]) ? 'rtl' : 'ltr'),
-    targetOrg: arg('org', cfg.targetOrg || `${targetLang}_gl`),
+    targetOrg,
     repoName: arg('repo', cfg[rt.configRepoKey] || rt.defaultRepo(targetLang)),
     sourceRef: arg('source', cfg[`${resourceType}SourceRef`] || `unfoldingWord/${rt.defaultSourceRepo}@master`),
     contextRef,
