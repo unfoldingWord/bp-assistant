@@ -140,10 +140,56 @@ function chunkRows(rows, max = 40) {
 
 // --- Prompt building --------------------------------------------------------------
 
-function buildReviewPrompt({ book, chapter, ultText, ustText, hebrewText, rows, issueTypes }) {
+// Sections of a per-type skill file worth showing the reviewer: the definition
+// and the team's recorded decisions about what does and does not belong under
+// the type. The recognition walkthroughs and example lists are left out; the
+// 14 interpretive files total ~100K chars and the reviewer only needs the canon.
+const GUIDE_SECTION_RE = /definition|confirmed|\bnot\b|key differentiator|critical distinctions|relationship to other/i;
+const GUIDE_CHAR_CAP = 3000;
+
+function extractGuideSummary(markdown, cap = GUIDE_CHAR_CAP) {
+  const parts = String(markdown || '').split(/^(?=## )/m);
+  const kept = parts.filter((p) => {
+    const heading = (p.match(/^## (.*)$/m) || [])[1] || '';
+    return GUIDE_SECTION_RE.test(heading);
+  });
+  const text = kept.join('').trim();
+  return text.length > cap ? text.slice(0, cap).trimEnd() + '\n…' : text;
+}
+
+/**
+ * Load the canon summary for each issue type present in the selected rows from
+ * .claude/skills/issue-identification/<sref>.md. Missing files are skipped.
+ */
+function loadIssueTypeGuides(workspaceDir, srefs) {
+  const guides = {};
+  for (const sref of new Set((srefs || []).map((s) => String(s || '').trim().toLowerCase()).filter(Boolean))) {
+    if (!/^[a-z]+(-[a-z0-9]+)+$/.test(sref)) continue;
+    const file = path.resolve(workspaceDir, '.claude/skills/issue-identification', `${sref}.md`);
+    try {
+      if (!fs.existsSync(file)) continue;
+      const summary = extractGuideSummary(fs.readFileSync(file, 'utf8'));
+      if (summary) guides[sref] = summary;
+    } catch (err) {
+      console.warn(`[interp-review] Failed to load guide for ${sref}: ${err.message}`);
+    }
+  }
+  return guides;
+}
+
+function buildReviewPrompt({ book, chapter, ultText, ustText, hebrewText, rows, issueTypes, guides }) {
   const typeLine = (issueTypes && issueTypes.length)
     ? `Allowed issue-type slugs: ${issueTypes.join(', ')}`
     : 'Keep the existing type unless clearly wrong, use only slugs that already appear in the file.';
+
+  const guideEntries = Object.entries(guides || {});
+  const guideBlock = guideEntries.length
+    ? [
+      'Classification canon from the content team. These recorded decisions win over your own judgment about which type a phrase belongs under:',
+      ...guideEntries.map(([sref, text]) => `### ${sref}\n${text}`),
+      '',
+    ]
+    : [];
 
   const rowLines = rows.map((r) => `#${r.index} | ${r.ref} | ${r.sref} | "${r.quote}" | ${r.explanation}`);
 
@@ -159,6 +205,7 @@ function buildReviewPrompt({ book, chapter, ultText, ustText, hebrewText, rows, 
     'HEBREW:',
     hebrewText || '(none provided)',
     '',
+    ...guideBlock,
     'Rows to review (format: #index | ref | sref | "quote" | explanation):',
     ...rowLines,
     '',
@@ -169,9 +216,9 @@ function buildReviewPrompt({ book, chapter, ultText, ustText, hebrewText, rows, 
     '',
     'Rules:',
     '- "tcm" explanations must be written in the file\'s existing TCM form `TCM i:(1) <primary reading> (2) <secondary reading>` with the primary reading first.',
-    '- "retype" must include both sref and a fitting explanation.',
+    '- "retype" must include both sref and a fitting explanation. Retype when the canon above places the phrase under a different type: a descriptive phrase whose meaning follows from its words is figs-explicit, not figs-idiom; figs-idiom is for set phrases with non-compositional meaning.',
     '- Never change the quote.',
-    '- Prefer "agree" when the reading is defensible.',
+    '- Prefer "agree" when the reading is defensible and the type matches the canon.',
     '- "drop" only when the row is not a real translation issue.',
   ].join('\n');
 }
@@ -184,20 +231,34 @@ function stripJsonFence(text) {
   return fenced ? fenced[1].trim() : trimmed;
 }
 
-function parseVerdicts(text, rows) {
+// The explanation lands in a TSV cell: a tab or newline from the model would
+// split the row into fragments downstream, so collapse all whitespace runs.
+function sanitizeCell(text) {
+  return String(text == null ? '' : text).replace(/\s+/g, ' ').trim();
+}
+
+/**
+ * Parse the model's JSON verdicts for one chunk. `allowedSrefs`, when
+ * non-empty, is the catalog a retype must land in (data/translation-issues.csv);
+ * a slug outside it is rejected so tn-writer never links a TA article that does
+ * not exist. `parseFailed` is true when the whole response was unusable, as
+ * opposed to individual entries being invalid.
+ */
+function parseVerdicts(text, rows, allowedSrefs) {
   const errors = [];
   const verdicts = new Map();
   const validIndexes = new Set(rows.map((r) => r.index));
+  const allowed = allowedSrefs && allowedSrefs.length ? new Set(allowedSrefs.map((s) => String(s).trim().toLowerCase())) : null;
 
   let parsed;
   try {
     parsed = JSON.parse(stripJsonFence(text));
   } catch (err) {
-    return { verdicts, errors: [`JSON parse failure: ${err.message}`] };
+    return { verdicts, errors: [`JSON parse failure: ${err.message}`], parseFailed: true };
   }
 
   if (!Array.isArray(parsed)) {
-    return { verdicts, errors: ['response was not a JSON array'] };
+    return { verdicts, errors: ['response was not a JSON array'], parseFailed: true };
   }
 
   for (const entry of parsed) {
@@ -205,33 +266,46 @@ function parseVerdicts(text, rows) {
       errors.push('entry is not an object');
       continue;
     }
-    const { index, verdict, explanation, sref, reason } = entry;
+    const { index, verdict, reason } = entry;
+    const explanation = entry.explanation == null ? null : sanitizeCell(entry.explanation);
+    const sref = entry.sref == null ? null : String(entry.sref).trim().toLowerCase();
     if (typeof index !== 'number' || !validIndexes.has(index)) {
       errors.push(`index ${index} does not match a selected row`);
+      continue;
+    }
+    if (verdicts.has(index)) {
+      errors.push(`row ${index}: duplicate verdict, keeping the first`);
       continue;
     }
     if (!ALLOWED_VERDICTS.has(verdict)) {
       errors.push(`row ${index}: unknown verdict "${verdict}"`);
       continue;
     }
-    if ((verdict === 'revise' || verdict === 'tcm') && (typeof explanation !== 'string' || !explanation.trim())) {
+    if ((verdict === 'revise' || verdict === 'tcm') && !explanation) {
       errors.push(`row ${index}: "${verdict}" requires a non-empty explanation`);
       continue;
     }
     if (verdict === 'retype') {
-      if (typeof sref !== 'string' || !SREF_RE.test(sref.trim())) {
+      if (!sref || !SREF_RE.test(sref)) {
         errors.push(`row ${index}: "retype" requires a valid sref`);
         continue;
       }
-      if (typeof explanation !== 'string' || !explanation.trim()) {
+      if (allowed && !allowed.has(sref)) {
+        errors.push(`row ${index}: "retype" to "${sref}" is not in the issue-type catalog`);
+        continue;
+      }
+      if (!explanation) {
         errors.push(`row ${index}: "retype" requires a non-empty explanation`);
         continue;
       }
     }
-    verdicts.set(index, { index, verdict, explanation: explanation ?? null, sref: sref ?? null, reason: reason ?? '' });
+    verdicts.set(index, { index, verdict, explanation, sref, reason: sanitizeCell(reason) });
   }
 
-  return { verdicts, errors };
+  const missing = rows.filter((r) => !verdicts.has(r.index)).length;
+  if (missing > 0) errors.push(`${missing} row(s) received no verdict and were left unchanged`);
+
+  return { verdicts, errors, parseFailed: false };
 }
 
 function applyVerdicts(rows, verdicts) {
@@ -409,6 +483,54 @@ function readSourceFile(workspaceDir, relPath, label) {
   }
 }
 
+/**
+ * Cut one chapter out of a USFM text. context.sources.hebrew is the whole
+ * book (data/hebrew_bible/NN-BOOK.usfm, ~1.5 MB for EZK), and a chapter file
+ * is left as-is, so this is safe to apply to every source.
+ */
+function sliceChapter(usfm, chapter) {
+  if (!usfm) return '';
+  const re = /\\c\s+(\d+)\b/g;
+  let start = -1;
+  let end = usfm.length;
+  let m;
+  while ((m = re.exec(usfm)) !== null) {
+    const n = Number(m[1]);
+    if (start === -1 && n === Number(chapter)) { start = m.index; continue; }
+    if (start !== -1 && n !== Number(chapter)) { end = m.index; break; }
+  }
+  if (start === -1) return usfm; // single-chapter file without a \c, or chapter absent
+  return usfm.slice(start, end);
+}
+
+/**
+ * Drop alignment and word-attribute markup so the model reads text, not
+ * milestones: \zaln-s/e wrappers and \w word|attrs\w* → word. Roughly a 5x
+ * token saving on aligned ULT/UST and on the UHB's per-word strongs/morph.
+ */
+function stripWordMarkup(usfm) {
+  return String(usfm || '')
+    .replace(/\\zaln-s\s*\|[^*]*\*/g, '')
+    .replace(/\\zaln-e\\\*/g, '')
+    .replace(/\\k-s\s*\|[^*]*\*/g, '')
+    .replace(/\\k-e\\\*/g, '')
+    .replace(/\\w ([^|\\]*)\|[^\\]*\\w\*/g, '$1')
+    .replace(/\\w ([^\\]*)\\w\*/g, '$1')
+    .replace(/[ \t]+\n/g, '\n')
+    .replace(/[ \t]{2,}/g, ' ');
+}
+
+/**
+ * Pick the cheapest usable source text: the pipeline's alignment-stripped
+ * chapter file when context.json names one, else the raw path, then slice to
+ * the chapter and strip word markup.
+ */
+function prepareSourceText(workspaceDir, sources, { plainKey, rawKey, label, chapter }) {
+  const relPath = (sources && (sources[plainKey] || sources[rawKey])) || null;
+  const text = readSourceFile(workspaceDir, relPath, label);
+  return stripWordMarkup(sliceChapter(text, chapter)).trim();
+}
+
 function extractResultText(result) {
   if (result?.result?.text) return String(result.result.text).trim();
   if (typeof result?.result === 'string') return result.result.trim();
@@ -425,7 +547,7 @@ function accumulateUsage(total, usage) {
 
 async function runInterpretiveReview({ issuesPath, pipeDir, book, chapter, workspaceDir, runClaudeImpl, status, settings }) {
   try {
-    const { readContext } = require('./pipeline-context');
+    const { readContext, updateContextArtifacts } = require('./pipeline-context');
 
     const absIssuesPath = path.resolve(workspaceDir, issuesPath);
     const text = fs.readFileSync(absIssuesPath, 'utf8');
@@ -448,19 +570,36 @@ async function runInterpretiveReview({ issuesPath, pipeDir, book, chapter, works
       console.warn(`[interp-review] Failed to read context.json: ${err.message}`);
     }
 
-    const ultText = readSourceFile(workspaceDir, ctx?.sources?.ult, 'ULT');
-    const ustText = readSourceFile(workspaceDir, ctx?.sources?.ust, 'UST');
-    const hebrewText = readSourceFile(workspaceDir, ctx?.sources?.hebrew, 'Hebrew');
-    const issueTypes = loadIssueTypes(workspaceDir);
+    // Resume guard: a run that fails downstream and resumes at tn-writer comes
+    // back through here with mechanicalPrepDone reset. Without this marker an
+    // apply-mode chapter would be reviewed (and paid for) a second time on rows
+    // the first pass already rewrote.
+    const prior = ctx?.artifacts?.interp_review;
+    if (prior && prior.issuesPath === issuesPath) {
+      console.log(`[interp-review] Skipping ${book} ${chapter}: already ran (${prior.mode}) at ${prior.completedAt}`);
+      return { ran: false, skipped: 'already_ran', mode: settings.mode, selected: selected.length, total, changed: [], errors: [] };
+    }
 
-    const chunks = chunkRows(selected, settings.maxRows || 40);
+    const sources = ctx?.sources || {};
+    const ultText = prepareSourceText(workspaceDir, sources, { plainKey: 'ultPlain', rawKey: 'ult', label: 'ULT', chapter });
+    const ustText = prepareSourceText(workspaceDir, sources, { plainKey: 'ustPlain', rawKey: 'ust', label: 'UST', chapter });
+    const hebrewText = prepareSourceText(workspaceDir, sources, { plainKey: 'hebrewPlain', rawKey: 'hebrew', label: 'Hebrew', chapter });
+    const issueTypes = loadIssueTypes(workspaceDir);
+    const guides = loadIssueTypeGuides(workspaceDir, selected.map((r) => r.sref));
+
+    const maxRows = Math.max(1, Math.floor(Number(settings.maxRows)) || 40);
+    const chunks = chunkRows(selected, maxRows);
     const allErrors = [];
     const allVerdicts = new Map();
     let usage = null;
+    // Chunk-level failures (call threw, non-success, empty, unparseable). Any of
+    // these means part of the chapter went unreviewed, so apply mode must not
+    // write a half-reviewed file.
+    let hardErrors = 0;
 
     for (let i = 0; i < chunks.length; i++) {
       const chunkRowsForCall = chunks[i];
-      const prompt = buildReviewPrompt({ book, chapter, ultText, ustText, hebrewText, rows: chunkRowsForCall, issueTypes });
+      const prompt = buildReviewPrompt({ book, chapter, ultText, ustText, hebrewText, rows: chunkRowsForCall, issueTypes, guides });
 
       let result;
       try {
@@ -479,6 +618,7 @@ async function runInterpretiveReview({ issuesPath, pipeDir, book, chapter, works
         });
       } catch (err) {
         allErrors.push(`chunk ${i}: ${err.message}`);
+        hardErrors++;
         continue;
       }
 
@@ -486,25 +626,28 @@ async function runInterpretiveReview({ issuesPath, pipeDir, book, chapter, works
 
       if (result?.subtype !== 'success') {
         allErrors.push(`chunk ${i}: ${result?.subtype || 'empty'}`);
+        hardErrors++;
         continue;
       }
       const responseText = extractResultText(result);
       if (!responseText) {
         allErrors.push(`chunk ${i}: empty`);
+        hardErrors++;
         continue;
       }
 
-      const { verdicts, errors } = parseVerdicts(responseText, chunkRowsForCall);
+      const { verdicts, errors, parseFailed } = parseVerdicts(responseText, chunkRowsForCall, issueTypes);
+      if (parseFailed) hardErrors++;
       for (const [k, v] of verdicts) allVerdicts.set(k, v);
       for (const e of errors) allErrors.push(`chunk ${i}: ${e}`);
     }
 
-    // Drop guard: a response that wants to remove a large share of the chapter is
-    // far more likely a bad response than a bad chapter. Keep its revisions,
-    // discard its drops, and say so.
+    // Drop guard: a response that wants to remove a large share of the reviewed
+    // rows is far more likely a bad response than a bad chapter. Keep its
+    // revisions, discard its drops, and say so.
     const dropCount = [...allVerdicts.values()].filter((v) => v.verdict === 'drop').length;
-    if (total > 0 && dropCount / total > MAX_DROP_SHARE) {
-      allErrors.push(`drop guard: ${dropCount} of ${total} rows marked drop (> ${Math.round(MAX_DROP_SHARE * 100)}%); drops ignored`);
+    if (selected.length > 0 && dropCount / selected.length > MAX_DROP_SHARE) {
+      allErrors.push(`drop guard: ${dropCount} of ${selected.length} reviewed rows marked drop (> ${Math.round(MAX_DROP_SHARE * 100)}%); drops ignored`);
       for (const [k, v] of allVerdicts) {
         if (v.verdict === 'drop') allVerdicts.set(k, { ...v, verdict: 'agree' });
       }
@@ -512,8 +655,26 @@ async function runInterpretiveReview({ issuesPath, pipeDir, book, chapter, works
 
     const applied = applyVerdicts(rows, allVerdicts);
 
+    let written = false;
     if (settings.mode === 'apply' && applied.changed.length > 0) {
-      fs.writeFileSync(absIssuesPath, serializeIssuesTsv(applied.rows));
+      if (hardErrors > 0) {
+        allErrors.push(`apply skipped: ${hardErrors} chunk failure(s) left part of the chapter unreviewed; TSV left untouched`);
+      } else {
+        fs.writeFileSync(absIssuesPath, serializeIssuesTsv(applied.rows));
+        written = true;
+      }
+    }
+
+    // Record the run so a resume does not repeat it (see the guard above).
+    if (ctx) {
+      try {
+        updateContextArtifacts(pipeDir, 'interp_review', {
+          mode: settings.mode, issuesPath, completedAt: new Date().toISOString(),
+          changed: applied.changed.length, written,
+        });
+      } catch (err) {
+        console.warn(`[interp-review] Failed to record run in context.json: ${err.message}`);
+      }
     }
 
     const ch = chapterDirName(book, chapter);
@@ -534,7 +695,9 @@ async function runInterpretiveReview({ issuesPath, pipeDir, book, chapter, works
       selected: selected.length,
       total,
       changed: applied.changed,
+      written,
       errors: allErrors,
+      hardErrors,
       reviewPath,
       summary,
       usage,
@@ -558,4 +721,9 @@ module.exports = {
   summarizeChanges,
   resolveInterpReviewSettings,
   runInterpretiveReview,
+  sliceChapter,
+  stripWordMarkup,
+  prepareSourceText,
+  extractGuideSummary,
+  loadIssueTypeGuides,
 };

@@ -2893,18 +2893,26 @@ async function notesPipeline(route, message) {
         // tn-writer, ATs, and quality-check inherit it. Default off; non-fatal.
         if (!interpReviewDone) {
           interpReviewDone = true;
-          const settings = resolveInterpReviewSettings({ config, env: process.env, book });
-          if (settings.enabledForBook && !isDryRun) {
-            const review = await runInterpretiveReview({ issuesPath, pipeDir, book, chapter: ch, workspaceDir: CSKILLBP_DIR, runClaudeImpl: runClaude, status, settings });
-            if (review.ran) {
-              const summary = review.summary;
-              await status(`**${ref}**: ${summary.split('\n')[0]} (${review.reviewPath})`);
-              await reply(`**${ref}** — ${summary}`);
-              try { recordMetrics({ pipeline: 'notes', skill: 'interp-review', book, chapter: ch, result: { usage: review.usage }, success: review.errors.length === 0, userId: username }); } catch (_) {}
-              console.log(`[notes] interp-review ${ref}: mode=${review.mode} selected=${review.selected}/${review.total} changed=${review.changed.length} errors=${review.errors.length}`);
-            } else if (review.errors && review.errors.length) {
-              console.warn(`[notes] interp-review ${ref} skipped: ${review.errors.join('; ')}`);
+          try {
+            const settings = resolveInterpReviewSettings({ config, env: process.env, book });
+            if (settings.enabledForBook && !isDryRun) {
+              const review = await runInterpretiveReview({ issuesPath, pipeDir, book, chapter: ch, workspaceDir: CSKILLBP_DIR, runClaudeImpl: runClaude, status, settings });
+              if (review.ran) {
+                const summary = review.summary;
+                await status(`**${ref}**: ${summary.split('\n')[0]} (${review.reviewPath})`);
+                // The requesting editor sees this in the Zulip topic; stay quiet
+                // when there is nothing to look at.
+                if (review.changed.length > 0 || review.hardErrors > 0) await reply(`**${ref}** — ${summary}`);
+                try { recordMetrics({ pipeline: 'notes', skill: 'interp-review', book, chapter: ch, result: { usage: review.usage, model: settings.model }, success: review.hardErrors === 0, userId: username }); } catch (_) {}
+                console.log(`[notes] interp-review ${ref}: mode=${review.mode} selected=${review.selected}/${review.total} changed=${review.changed.length} written=${review.written} errors=${review.errors.length}`);
+              } else if (review.skipped) {
+                console.log(`[notes] interp-review ${ref} skipped: ${review.skipped}`);
+              } else if (review.errors && review.errors.length) {
+                console.warn(`[notes] interp-review ${ref} skipped: ${review.errors.join('; ')}`);
+              }
             }
+          } catch (err) {
+            console.error(`[notes] interp-review ${ref} failed (non-fatal): ${err.message}`);
           }
         }
         try {

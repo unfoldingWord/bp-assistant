@@ -12,6 +12,12 @@ const {
   applyVerdicts,
   resolveInterpReviewSettings,
   runInterpretiveReview,
+  sliceChapter,
+  stripWordMarkup,
+  prepareSourceText,
+  extractGuideSummary,
+  loadIssueTypeGuides,
+  buildReviewPrompt,
 } = require('../src/interp-review');
 const { writeContext } = require('../src/pipeline-context');
 
@@ -89,7 +95,7 @@ test('parseVerdicts rejects an unknown verdict', () => {
   const text = JSON.stringify([{ index: 0, verdict: 'maybe', explanation: null, sref: null, reason: '' }]);
   const { verdicts, errors } = parseVerdicts(text, rows);
   assert.equal(verdicts.size, 0);
-  assert.equal(errors.length, 1);
+  assert.ok(errors.some((e) => /unknown verdict "maybe"/.test(e)));
 });
 
 test('parseVerdicts rejects a retype without sref', () => {
@@ -97,14 +103,38 @@ test('parseVerdicts rejects a retype without sref', () => {
   const text = JSON.stringify([{ index: 0, verdict: 'retype', explanation: 'new explanation', sref: null, reason: '' }]);
   const { verdicts, errors } = parseVerdicts(text, rows);
   assert.equal(verdicts.size, 0);
-  assert.equal(errors.length, 1);
+  assert.ok(errors.some((e) => /"retype" requires a valid sref/.test(e)));
 });
 
 test('parseVerdicts returns one error on garbage JSON', () => {
   const rows = [{ ...row({ ref: '1:1', sref: 'figs-metaphor', explanation: 'x' }), index: 0 }];
-  const { verdicts, errors } = parseVerdicts('not json at all {{{', rows);
+  const { verdicts, errors, parseFailed } = parseVerdicts('not json at all {{{', rows);
   assert.equal(verdicts.size, 0);
   assert.equal(errors.length, 1);
+  assert.equal(parseFailed, true);
+});
+
+test('parseVerdicts collapses tabs and newlines in explanations so a row cannot split', () => {
+  const rows = [{ ...row({ ref: '1:1', sref: 'figs-metaphor', explanation: 'x' }), index: 0 }];
+  const text = JSON.stringify([{ index: 0, verdict: 'tcm', explanation: 'TCM i:(1) a\n\t(2)  b', sref: null, reason: 'r\nq' }]);
+  const { verdicts } = parseVerdicts(text, rows);
+  assert.equal(verdicts.get(0).explanation, 'TCM i:(1) a (2) b');
+  assert.equal(verdicts.get(0).reason, 'r q');
+});
+
+test('parseVerdicts rejects a retype outside the issue-type catalog and reports missing rows', () => {
+  const rows = [
+    { ...row({ ref: '1:1', sref: 'figs-idiom', explanation: 'x' }), index: 0 },
+    { ...row({ ref: '1:2', sref: 'figs-idiom', explanation: 'y' }), index: 1 },
+  ];
+  const text = JSON.stringify([{ index: 0, verdict: 'retype', explanation: 'e', sref: 'figs-implication', reason: '' }]);
+  const { verdicts, errors, parseFailed } = parseVerdicts(text, rows, ['figs-explicit', 'figs-idiom']);
+  assert.equal(verdicts.size, 0);
+  assert.equal(parseFailed, false);
+  assert.ok(errors.some((e) => /not in the issue-type catalog/.test(e)));
+  assert.ok(errors.some((e) => /2 row\(s\) received no verdict/.test(e)));
+  const ok = parseVerdicts(JSON.stringify([{ index: 0, verdict: 'retype', explanation: 'e', sref: 'figs-explicit', reason: '' }]), rows, ['figs-explicit']);
+  assert.equal(ok.verdicts.get(0).sref, 'figs-explicit');
 });
 
 // --- (d) applyVerdicts ---------------------------------------------------------------
@@ -177,6 +207,61 @@ test('resolveInterpReviewSettings falls back to off on an invalid mode', () => {
   const settings = resolveInterpReviewSettings({ config, env: {}, book: 'ISA' });
   assert.equal(settings.mode, 'off');
   assert.equal(settings.enabledForBook, false);
+});
+
+// --- source text preparation ---------------------------------------------------------
+
+test('sliceChapter cuts one chapter out of a whole-book USFM and leaves a chapter file alone', () => {
+  const book = '\\id EZK\n\\c 1\n\\v 1 one\n\\c 2\n\\v 1 two\n\\c 10\n\\v 1 ten\n';
+  assert.equal(sliceChapter(book, 1), '\\c 1\n\\v 1 one\n');
+  assert.equal(sliceChapter(book, 2), '\\c 2\n\\v 1 two\n');
+  assert.equal(sliceChapter(book, 10), '\\c 10\n\\v 1 ten\n');
+  assert.equal(sliceChapter('\\c 3\n\\v 1 only\n', 3), '\\c 3\n\\v 1 only\n');
+  assert.equal(sliceChapter('\\v 1 no chapter marker\n', 3), '\\v 1 no chapter marker\n');
+});
+
+test('stripWordMarkup reduces aligned ULT and UHB word markup to bare words', () => {
+  const aligned = '\\v 1 \\zaln-s |x-strong="H1961" x-content="וַיְהִי"\\*\\w And|x-occurrence="1" x-occurrences="1"\\w* \\w it|x-occurrence="1" x-occurrences="1"\\w*\\zaln-e\\*';
+  assert.equal(stripWordMarkup(aligned), '\\v 1 And it');
+  const uhb = '\\v 1 \\w וַ⁠יְהִ֣י|lemma="הָיָה" strong="c:H1961" x-morph="He,C:Vqw3ms"\\w*';
+  assert.equal(stripWordMarkup(uhb), '\\v 1 וַ⁠יְהִ֣י');
+});
+
+test('prepareSourceText prefers the plain file and slices a whole-book Hebrew source to the chapter', () => {
+  const ws = fs.mkdtempSync(path.join(os.tmpdir(), 'interp-src-'));
+  fs.writeFileSync(path.join(ws, 'ult_aligned.usfm'), '\\c 1\n\\v 1 \\w aligned|x=1\\w*\n');
+  fs.writeFileSync(path.join(ws, 'ult_plain.usfm'), '\\c 1\n\\v 1 plain\n');
+  fs.writeFileSync(path.join(ws, 'heb.usfm'), '\\id EZK\n\\c 1\n\\v 1 א\n\\c 2\n\\v 1 ב\n');
+  const sources = { ult: 'ult_aligned.usfm', ultPlain: 'ult_plain.usfm', hebrew: 'heb.usfm' };
+  assert.equal(prepareSourceText(ws, sources, { plainKey: 'ultPlain', rawKey: 'ult', label: 'ULT', chapter: 1 }), '\\c 1\n\\v 1 plain');
+  assert.equal(prepareSourceText(ws, sources, { plainKey: 'hebrewPlain', rawKey: 'hebrew', label: 'Hebrew', chapter: 2 }), '\\c 2\n\\v 1 ב');
+  assert.equal(prepareSourceText(ws, sources, { plainKey: 'ustPlain', rawKey: 'ust', label: 'UST', chapter: 1 }), '');
+});
+
+// --- issue-type canon in the prompt ----------------------------------------------------
+
+test('extractGuideSummary keeps definition/confirmed/NOT sections and drops walkthroughs', () => {
+  const md = '# figs-idiom\n\n## Purpose\nfind idioms\n\n## Definition\nnon-compositional\n\n## CONFIRMED figs-idiom Classifications\n| a | b |\n\n## NOT figs-idiom (Use These Instead)\n| c | d |\n\n## Recognition Process\n1. long walkthrough\n';
+  const out = extractGuideSummary(md);
+  assert.match(out, /non-compositional/);
+  assert.match(out, /\| a \| b \|/);
+  assert.match(out, /\| c \| d \|/);
+  assert.doesNotMatch(out, /walkthrough/);
+  assert.doesNotMatch(out, /find idioms/);
+  assert.ok(extractGuideSummary('## Definition\n' + 'x'.repeat(5000), 100).length <= 102);
+});
+
+test('loadIssueTypeGuides reads only the types present and the prompt carries them', () => {
+  const ws = fs.mkdtempSync(path.join(os.tmpdir(), 'interp-guides-'));
+  const dir = path.join(ws, '.claude/skills/issue-identification');
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, 'figs-idiom.md'), '## Definition\nIDIOM-CANON\n');
+  fs.writeFileSync(path.join(dir, 'figs-metaphor.md'), '## Definition\nMETAPHOR-CANON\n');
+  const guides = loadIssueTypeGuides(ws, ['figs-idiom', 'figs-idiom', 'figs-missing', '../etc']);
+  assert.deepEqual(Object.keys(guides), ['figs-idiom']);
+  const prompt = buildReviewPrompt({ book: 'EZK', chapter: 1, ultText: '', ustText: '', hebrewText: '', rows: [], issueTypes: [], guides });
+  assert.match(prompt, /IDIOM-CANON/);
+  assert.doesNotMatch(prompt, /METAPHOR-CANON/);
 });
 
 // --- (f) runInterpretiveReview end-to-end ---------------------------------------------
@@ -303,6 +388,51 @@ test('runInterpretiveReview ignores drops above the drop-share guard but keeps r
     assert.match(updatedText, /quote-two/); // drop was ignored
     assert.ok(result.errors.some((e) => /drop guard/.test(e)));
     assert.equal(result.changed.filter((c) => c.verdict === 'drop').length, 0);
+  } finally {
+    process.env.CSKILLBP_DIR = oldCskillbpDir;
+  }
+});
+
+test('runInterpretiveReview does not write in apply mode when any chunk failed, and does not run twice on resume', async () => {
+  const workspaceDir = makeWorkspace();
+  const oldCskillbpDir = process.env.CSKILLBP_DIR;
+  process.env.CSKILLBP_DIR = workspaceDir;
+  try {
+    const issuesPath = 'tmp/pipeline/ISA-01/issues.tsv';
+    const abs = path.resolve(workspaceDir, issuesPath);
+    fs.mkdirSync(path.dirname(abs), { recursive: true });
+    const lines = [];
+    for (let v = 1; v <= 3; v++) lines.push(`ISA\t1:${v}\tfigs-metaphor\tquote-${v}\t\t\told explanation ${v}`);
+    fs.writeFileSync(abs, lines.join('\n') + '\n');
+    const originalText = fs.readFileSync(abs, 'utf8');
+    const pipeDir = 'tmp/pipeline/ISA-01';
+    writeContext(pipeDir, { sources: {} });
+
+    // maxRows 2 → two chunks; the second fails.
+    let calls = 0;
+    const flaky = async () => {
+      calls++;
+      if (calls === 1) {
+        return { subtype: 'success', result: { text: JSON.stringify([
+          { index: 0, verdict: 'revise', explanation: 'new one', sref: null, reason: '' },
+          { index: 1, verdict: 'agree', explanation: null, sref: null, reason: '' },
+        ]) } };
+      }
+      return { subtype: 'success', result: { text: 'not json' } };
+    };
+    const settings = { mode: 'apply', model: 'x', maxRows: 2 };
+    const first = await runInterpretiveReview({ issuesPath, pipeDir, book: 'ISA', chapter: 1, workspaceDir, runClaudeImpl: flaky, status: null, settings });
+    assert.equal(calls, 2);
+    assert.equal(first.ran, true);
+    assert.equal(first.written, false);
+    assert.equal(fs.readFileSync(abs, 'utf8'), originalText);
+    assert.ok(first.errors.some((e) => /apply skipped/.test(e)));
+
+    // Resume: same chapter comes back through the stage; the marker stops it.
+    const second = await runInterpretiveReview({ issuesPath, pipeDir, book: 'ISA', chapter: 1, workspaceDir, runClaudeImpl: flaky, status: null, settings });
+    assert.equal(calls, 2);
+    assert.equal(second.ran, false);
+    assert.equal(second.skipped, 'already_ran');
   } finally {
     process.env.CSKILLBP_DIR = oldCskillbpDir;
   }
