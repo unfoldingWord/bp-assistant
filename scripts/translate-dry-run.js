@@ -86,9 +86,13 @@ async function main() {
 
   const { translateChapters, translateArticles } = require('../src/translate-pipeline');
 
-  // Scripture refs mirror translate-pipeline.js resolution (opts > config > derivation);
-  // without them translateChapters() logs "scripture: skipped" and the skill never
-  // sees the target-language verse text.
+  // Scripture refs mirror translate-pipeline.js resolveParams() (opts > config >
+  // derivation); without them translateChapters() logs "scripture: skipped" and the
+  // skill never sees the target-language verse text. Key names are the RESOLVED
+  // ones (targetLiteralRef / targetSimplifiedRef): this script bypasses
+  // resolveParams() — which is what reads opts.literalRef / opts.simplifiedRef —
+  // and hands params straight to translateChapters(), which consumes the resolved
+  // keys (see its buildScripturePack call).
   const targetOrg = arg('org', cfg.targetOrg || `${targetLang}_gl`);
   const common = {
     sourceLiteralRef: arg('source-literal', cfg.sourceLiteralRef || 'unfoldingWord/en_ult@master'),
