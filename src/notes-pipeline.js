@@ -30,6 +30,7 @@ const { setPendingMerge } = require('./pending-merges');
 const { mergeTsvs } = require('./workspace-tools/tsv-tools');
 const { getCheckpoint, setCheckpoint, clearCheckpoint, buildCheckpointKey } = require('./pipeline-checkpoints');
 const { buildNotesContext, updateContextArtifacts, readContext, writeContext } = require('./pipeline-context');
+const { runInterpretiveReview, resolveInterpReviewSettings } = require('./interp-review');
 const { checkUltEdits } = require('./check-ult-edits');
 const { getVerseCount } = require('./verse-counts');
 const { publishAdminStatus } = require('./admin-status');
@@ -2880,12 +2881,32 @@ async function notesPipeline(route, message) {
     // Quality mechanical prep flag — set true once runMechanicalQualityPrep() completes.
     let qualityPrepDone = false;
     let atGenerationDone = false;
+    let interpReviewDone = false;
 
     for (let si = startSkillIndex; si < skills.length; si++) {
       const skill = skills[si];
 
       // --- Mechanical prep: run all deterministic steps before tn-writer ---
       if (skill.name === 'tn-writer' && !mechanicalPrepDone && pipeDir && issuesPath) {
+        // Interpretive review (issue #382): one Fable pass over the interpretive
+        // rows of the issue TSV so a wrong type / primary reading is fixed before
+        // tn-writer, ATs, and quality-check inherit it. Default off; non-fatal.
+        if (!interpReviewDone) {
+          interpReviewDone = true;
+          const settings = resolveInterpReviewSettings({ config, env: process.env, book });
+          if (settings.enabledForBook && !isDryRun) {
+            const review = await runInterpretiveReview({ issuesPath, pipeDir, book, chapter: ch, workspaceDir: CSKILLBP_DIR, runClaudeImpl: runClaude, status, settings });
+            if (review.ran) {
+              const summary = review.summary;
+              await status(`**${ref}**: ${summary.split('\n')[0]} (${review.reviewPath})`);
+              await reply(`**${ref}** — ${summary}`);
+              try { recordMetrics({ pipeline: 'notes', skill: 'interp-review', book, chapter: ch, result: { usage: review.usage }, success: review.errors.length === 0, userId: username }); } catch (_) {}
+              console.log(`[notes] interp-review ${ref}: mode=${review.mode} selected=${review.selected}/${review.total} changed=${review.changed.length} errors=${review.errors.length}`);
+            } else if (review.errors && review.errors.length) {
+              console.warn(`[notes] interp-review ${ref} skipped: ${review.errors.join('; ')}`);
+            }
+          }
+        }
         try {
           await status(`**${ref}**: Running mechanical prep (prepare, fill quotes, resolve GL, flag narrow, generate IDs)...`);
           const prep = await runMechanicalPrep({ issuesPath, pipeDir, status });
