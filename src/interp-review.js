@@ -305,7 +305,11 @@ function parseVerdicts(text, rows, allowedSrefs) {
   const missing = rows.filter((r) => !verdicts.has(r.index)).length;
   if (missing > 0) errors.push(`${missing} row(s) received no verdict and were left unchanged`);
 
-  return { verdicts, errors, parseFailed: false };
+  // `complete` means every selected row got a valid verdict. Apply mode requires
+  // it: a response that answers 1 row of 40 with a "drop" is not a considered
+  // review of the chapter, and acting on its one drop would delete a row on the
+  // strength of an answer that skipped the other 39.
+  return { verdicts, errors, parseFailed: false, complete: missing === 0 && errors.length === 0 };
 }
 
 function applyVerdicts(rows, verdicts) {
@@ -636,8 +640,16 @@ async function runInterpretiveReview({ issuesPath, pipeDir, book, chapter, works
         continue;
       }
 
-      const { verdicts, errors, parseFailed } = parseVerdicts(responseText, chunkRowsForCall, issueTypes);
-      if (parseFailed) hardErrors++;
+      const { verdicts, errors, parseFailed, complete } = parseVerdicts(responseText, chunkRowsForCall, issueTypes);
+      if (parseFailed) {
+        hardErrors++;
+      } else if (!complete) {
+        // Incomplete or partly invalid: the report still shows every verdict it
+        // did give, but apply mode must not act on a chunk the model only half
+        // answered (a lone "drop" in a 1-of-40 response would delete a row).
+        hardErrors++;
+        allErrors.push(`chunk ${i}: incomplete response, not applied`);
+      }
       for (const [k, v] of verdicts) allVerdicts.set(k, v);
       for (const e of errors) allErrors.push(`chunk ${i}: ${e}`);
     }
@@ -658,7 +670,7 @@ async function runInterpretiveReview({ issuesPath, pipeDir, book, chapter, works
     let written = false;
     if (settings.mode === 'apply' && applied.changed.length > 0) {
       if (hardErrors > 0) {
-        allErrors.push(`apply skipped: ${hardErrors} chunk failure(s) left part of the chapter unreviewed; TSV left untouched`);
+        allErrors.push(`apply skipped: ${hardErrors} chunk(s) failed or came back incomplete; TSV left untouched`);
       } else {
         fs.writeFileSync(absIssuesPath, serializeIssuesTsv(applied.rows));
         written = true;

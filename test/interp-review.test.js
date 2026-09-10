@@ -438,6 +438,38 @@ test('runInterpretiveReview does not write in apply mode when any chunk failed, 
   }
 });
 
+test('runInterpretiveReview never applies a drop from a response that skipped other rows', async () => {
+  const workspaceDir = makeWorkspace();
+  const oldCskillbpDir = process.env.CSKILLBP_DIR;
+  process.env.CSKILLBP_DIR = workspaceDir;
+  try {
+    const issuesPath = 'tmp/pipeline/ISA-01/issues.tsv';
+    const abs = path.resolve(workspaceDir, issuesPath);
+    fs.mkdirSync(path.dirname(abs), { recursive: true });
+    const lines = [];
+    for (let v = 1; v <= 5; v++) lines.push(`ISA\t1:${v}\tfigs-metaphor\tquote-${v}\t\t\told explanation ${v}`);
+    fs.writeFileSync(abs, lines.join('\n') + '\n');
+    const originalText = fs.readFileSync(abs, 'utf8');
+    const pipeDir = 'tmp/pipeline/ISA-01';
+    writeContext(pipeDir, { sources: {} });
+
+    // One valid drop, four rows unanswered: 1 of 5 < the 25% drop guard, so only
+    // the completeness rule stands between this response and a deleted row.
+    const partial = async () => ({ subtype: 'success', result: { text: JSON.stringify([
+      { index: 2, verdict: 'drop', explanation: null, sref: null, reason: 'not an issue' },
+    ]) } });
+    const result = await runInterpretiveReview({ issuesPath, pipeDir, book: 'ISA', chapter: 1, workspaceDir, runClaudeImpl: partial, status: null, settings: { mode: 'apply', model: 'x', maxRows: 40 } });
+
+    assert.equal(result.ran, true);
+    assert.equal(result.written, false);
+    assert.equal(fs.readFileSync(abs, 'utf8'), originalText);
+    assert.ok(result.errors.some((e) => /incomplete response/.test(e)));
+    assert.equal(result.changed.filter((c) => c.verdict === 'drop').length, 1); // still reported
+  } finally {
+    process.env.CSKILLBP_DIR = oldCskillbpDir;
+  }
+});
+
 test('runInterpretiveReview leaves the TSV untouched and reports errors on a Claude failure, without throwing', async () => {
   const workspaceDir = makeWorkspace();
   const oldCskillbpDir = process.env.CSKILLBP_DIR;
