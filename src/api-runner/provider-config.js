@@ -9,6 +9,7 @@ const DEFAULT_PROVIDER_CONFIGS = {
     envName: 'ANTHROPIC_API_KEY',
     modelAliases: {
       opus: 'claude-opus-5',
+      fable: 'claude-fable-5-1',
       sonnet: 'claude-sonnet-4-6',
       haiku: 'claude-haiku-4-5-20251001',
       'claude-haiku-4-5': 'claude-haiku-4-5-20251001',
@@ -25,6 +26,7 @@ const DEFAULT_PROVIDER_CONFIGS = {
       max: 'claude-opus-5',
     },
     models: {
+      'claude-fable-5-1': { label: 'Claude Fable 5.1', inputPer1M: 10.0, outputPer1M: 50.0 },
       'claude-opus-5': { label: 'Claude Opus 5', inputPer1M: 5.0, outputPer1M: 25.0 },
       'claude-opus-4-8': { label: 'Claude Opus 4.8', inputPer1M: 5.0, outputPer1M: 25.0 },
       'claude-opus-4-7': { label: 'Claude Opus 4.7', inputPer1M: 5.0, outputPer1M: 25.0 },

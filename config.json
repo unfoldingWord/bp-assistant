@@ -158,6 +158,11 @@
       "maxRepeatedToolErrorSignature": 25
     }
   },
+  "interpReview": {
+    "mode": "off",
+    "books": ["ISA", "JER", "EZK"],
+    "model": "claude-fable-5-1"
+  },
   "notesGuardrails": {
     "tnWriterParallelMinVerses": 35,
     "tnWriterMaxTurns": 400,
