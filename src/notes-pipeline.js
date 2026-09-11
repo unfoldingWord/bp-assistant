@@ -25,6 +25,7 @@ const { normalizeIssuesFile, buildParallelismIntroHintArgs } = require('./issue-
 const { curlyQuotes } = require('./workspace-tools/usfm-tools');
 const { verifyRepoPush, verifyDcsToken, verifyRemoteContent } = require('./repo-verify');
 const { recordMetrics, getCumulativeTokens, recordRunSummary, getAdaptiveSkillGuardrails } = require('./usage-tracker');
+const { runInterpretiveReview } = require('./interp-review');
 const { door43Push, checkConflictingBranches, REPO_MAP, getRepoFilename } = require('./door43-push');
 const { setPendingMerge } = require('./pending-merges');
 const { mergeTsvs } = require('./workspace-tools/tsv-tools');
@@ -1738,6 +1739,8 @@ function cleanupNotesArtifacts({ book, chapter, verseStart, verseEnd }) {
     `output/quality/${tag}-quality.json`,
     `output/quality/${book}/${tag}-quality.md`,
     `output/quality/${book}/${tag}-quality.json`,
+    // interpretive review
+    `output/review/${book}/${tag}-interp-fable.md`,
   ];
 
   for (const rel of candidates) {
@@ -2875,6 +2878,8 @@ async function notesPipeline(route, message) {
       await runIssueNormalizationStage();
     }
 
+    // Interpretive review flag — set true once the interpretive review stage has run.
+    let interpretiveReviewDone = false;
     // Mechanical prep flag — set true once runMechanicalPrep() completes in the skill loop.
     let mechanicalPrepDone = false;
     // Quality mechanical prep flag — set true once runMechanicalQualityPrep() completes.
@@ -2883,6 +2888,39 @@ async function notesPipeline(route, message) {
 
     for (let si = startSkillIndex; si < skills.length; si++) {
       const skill = skills[si];
+
+      // --- Interpretive review: Fable pass over the issue TSV before mechanical prep ---
+      // Non-fatal and off by default; see src/interp-review.js and issue #382.
+      if (skill.name === 'tn-writer' && !interpretiveReviewDone && pipeDir && issuesPath) {
+        interpretiveReviewDone = true;
+        try {
+          const interp = await runInterpretiveReview({
+            issuesPath,
+            book,
+            chapter: ch,
+            tag,
+            ctx: readContext(pipeDir),
+            status,
+            reply,
+            config,
+          });
+          if (interp.ran) {
+            recordMetrics({
+              pipeline: 'notes',
+              skill: 'interp-review',
+              book,
+              chapter: ch,
+              result: { usage: interp.usage, model: interp.model },
+              success: true,
+              userId: message.sender_id,
+            });
+          } else if (interp.reason !== 'mode_off' && interp.reason !== 'book_not_selected') {
+            console.log(`[notes] Interpretive review skipped for ${ref}: ${interp.reason}`);
+          }
+        } catch (err) {
+          console.error(`[notes] Interpretive review failed for ${ref}: ${err.message}`);
+        }
+      }
 
       // --- Mechanical prep: run all deterministic steps before tn-writer ---
       if (skill.name === 'tn-writer' && !mechanicalPrepDone && pipeDir && issuesPath) {

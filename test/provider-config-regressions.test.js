@@ -35,3 +35,22 @@ test('assertProviderModel still resolves a real alias and a real model id', () =
   assert.strictEqual(assertProviderModel('claude', 'opus'), 'claude-opus-5');
   assert.strictEqual(assertProviderModel('claude', 'claude-sonnet-4-6'), 'claude-sonnet-4-6');
 });
+
+// Issue #382: the interpretive review stage runs on Claude Fable 5.1, so both
+// the `fable` alias and the bare model id must resolve and carry Fable pricing.
+test('claude-fable-5-1 is configured with the fable alias and Fable-tier pricing', () => {
+  assert.strictEqual(assertProviderModel('claude', 'fable'), 'claude-fable-5-1');
+  assert.strictEqual(assertProviderModel('claude', 'claude-fable-5-1'), 'claude-fable-5-1');
+
+  const { getProviderConfig } = require('../src/api-runner/provider-config');
+  const entry = getProviderConfig('claude').models['claude-fable-5-1'];
+  assert.strictEqual(entry.inputPer1M, 10.0);
+  assert.strictEqual(entry.outputPer1M, 50.0);
+
+  // Adding Fable must not make it the default or reroute any effort tier.
+  const cfg = getProviderConfig('claude');
+  assert.strictEqual(cfg.defaultModel, 'claude-opus-5');
+  for (const model of Object.values(cfg.autoModelByThinking || {})) {
+    assert.notStrictEqual(model, 'claude-fable-5-1');
+  }
+});
