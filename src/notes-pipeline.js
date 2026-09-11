@@ -20,7 +20,7 @@ const { getDoor43Username, emailToFallbackUsername, buildBranchName, resolveOutp
 const { splitTsv, fixTrailingNewlines } = require('./workspace-tools/tsv-tools');
 const { fillTsvIds, generateIds, prepareNotes, fillOrigQuotes, resolveGlQuotes, flagNarrowQuotes, extractAlignmentData, prepareATContext, substituteAT, fixUnicodeQuotes, verifyBoldMatches, syncCanonicalHebrewQuotes, applyHintsToPreparedNotes, _stripAlternateTranslation: stripAlternateTranslation } = require('./workspace-tools/tn-tools');
 const { checkTnQuality, detectSelfTalk, templateFirstPhrase, resolveTemplateText } = require('./workspace-tools/quality-tools');
-const { buildBookRecurrenceIndex, deriveRecurrenceKeys, buildSeeHowSentence, isSeeHowEligible, dedupeAlsoOccursVerses, assignAlsoOccursVerses, resolveDoor43ReposPath, hebTokens, verseNumber: recurrenceVerseNumber, SEE_HOW_NEVER_FOLD_SREFS } = require('./workspace-tools/recurrence-index');
+const { buildBookRecurrenceIndex, deriveRecurrenceKeys, buildSeeHowSentence, isSeeHowEligible, dedupeAlsoOccursVerses, assignAlsoOccursVerses, resolveDoor43ReposPath, hebTokens, verseNumber: recurrenceVerseNumber, SEE_HOW_NEVER_FOLD_SREFS, CROSS_BOOK_MAX_BOOKS } = require('./workspace-tools/recurrence-index');
 const { normalizeIssuesFile, buildParallelismIntroHintArgs } = require('./issue-normalizer');
 const { curlyQuotes } = require('./workspace-tools/usfm-tools');
 const { verifyRepoPush, verifyDcsToken, verifyRemoteContent } = require('./repo-verify');
@@ -418,7 +418,10 @@ async function runShardSeeHowDetection({ contextPath, issuesPath, status, genera
   }
 }
 
-const SEE_HOW_ZERO_SUMMARY = '0 see-how back-refs, 0 folded, 0 injected, 0 also-occurs lists, 0 skipped (inexact quote), 0 same-verse combinations';
+const SEE_HOW_ZERO_SUMMARY = '0 see-how back-refs, 0 folded, 0 injected, 0 also-occurs lists, 0 skipped (inexact quote), 0 same-verse combinations, 0 cross-book';
+
+// Corpus-wide index behind rule 3, rebuilt by build_crossbook_seehow_index.
+const CROSS_BOOK_INDEX_REL = 'data/cache/crossbook_seehow_index.json';
 
 /**
  * "See how" detection pass.
@@ -431,6 +434,10 @@ const SEE_HOW_ZERO_SUMMARY = '0 see-how back-refs, 0 folded, 0 injected, 0 also-
  *   noted in an earlier chapter becomes a pointer to the FIRST occurrence in the
  *   book that carries a note. Never the nearest, never a chain, never forward,
  *   and never a pointer to nothing.
+ * Rule 3 (other book): a phrase with no note anywhere earlier in THIS book, but
+ *   already explained in another book, gets one prose pointer -- and only on its
+ *   first occurrence in this book. Later occurrences fall to rules 1 and 2,
+ *   which by then have a same-book target to point at.
  * Phase 3 (injection): when the chapter's first occurrence of such a phrase has
  *   no prepared item at all, one is synthesized so the pointer still ships.
  *
@@ -460,6 +467,15 @@ async function runSeeHowDetection({ pipeDir, contextPath, generateIdsFn = genera
     const parsed = JSON.parse(fs.readFileSync(path.resolve(CSKILLBP_DIR, indexRel), 'utf8'));
     if (parsed && parsed.byKey) index = parsed;
   } catch { /* same-chapter behaviour still works without the index */ }
+
+  // Rule 3's corpus index is optional: without it (not built, or the published
+  // corpus not fetched) same-book detection is unaffected and no cross-book
+  // pointer is emitted.
+  let crossBookIndex = { byKey: {} };
+  try {
+    const parsed = JSON.parse(fs.readFileSync(path.resolve(CSKILLBP_DIR, CROSS_BOOK_INDEX_REL), 'utf8'));
+    if (parsed && parsed.byKey) crossBookIndex = parsed;
+  } catch { /* no cross-book pointers without the index */ }
 
   const verseOf = (ref) => String(ref || '').split(':')[1] || '';
   const chapterOf = (ref) => parseInt(String(ref || '').split(':')[0], 10) || 0;
@@ -528,6 +544,67 @@ async function runSeeHowDetection({ pipeDir, contextPath, generateIdsFn = genera
     }
     return null;
   };
+  // Rule 3 fires only on the phrase's FIRST occurrence in the book: nothing --
+  // note row or corpus span -- may sit in an earlier chapter, and `anchorVerse`
+  // must be this chapter's earliest occurrence. The second test matters for
+  // partial-verse-range runs, whose in-range anchor can be preceded by an
+  // out-of-range occurrence that is the real book-first one.
+  const isBookFirstOccurrence = (key, anchorVerse) => {
+    const occs = occurrencesFor(key);
+    // No corpus span anywhere means the full aligned ULT was unavailable, so
+    // earlier chapters are invisible and book-first cannot be established.
+    // Refuse rather than guess: a wrong cross-book pointer outranks a missing one.
+    if (!occs.some((o) => o.source === 'corpus')) return false;
+    if (chapter && occs.some((o) => o.chapter && o.chapter < chapter)) return false;
+    const here = occs
+      .filter((o) => o.chapter === chapter)
+      .map((o) => recurrenceVerseNumber(o.verse))
+      .filter(Boolean);
+    if (!here.length) return false;
+    return Math.min(...here) === anchorVerse;
+  };
+
+  // Canonical key -> corpus entry. An item registers under both key forms, so
+  // try each against the index, which files entries under both as well.
+  const crossBookByKey = new Map();
+  for (const item of items) {
+    const derived = keysFor.get(item) || {};
+    const canon = canonicalKey(derived.strongKey || derived.textKey || '');
+    if (!canon || crossBookByKey.has(canon)) continue;
+    for (const form of [derived.strongKey, derived.textKey]) {
+      const entry = form && crossBookIndex.byKey ? crossBookIndex.byKey[form] : null;
+      if (entry && entry.first) { crossBookByKey.set(canon, entry); break; }
+    }
+  }
+
+  /**
+   * A cross-book target for `key`, or null. Deliberately narrow: another book,
+   * pointer-eligible, not a common formula, and this chapter holds the book's
+   * first occurrence.
+   */
+  const crossBookTarget = (key, anchorVerse) => {
+    const entry = crossBookByKey.get(canonicalKey(key));
+    const cand = entry && entry.first;
+    if (!cand || !cand.ref) return null;
+    if (String(cand.book || '').toUpperCase() === book) return null;
+    if ((entry.bookCount || 0) > CROSS_BOOK_MAX_BOOKS) return null;
+    if (!isSeeHowEligible(key, cand.sref)) return null;
+    if (!isBookFirstOccurrence(key, anchorVerse)) return null;
+    return {
+      ref: cand.ref,
+      chapter: cand.chapter,
+      verse: cand.verse,
+      sref: cand.sref || '',
+      quote: cand.quote || '',
+      note: '',
+      isPointer: false,
+      source: 'crossbook',
+      crossBook: true,
+      book: String(cand.book || '').toUpperCase(),
+      id: cand.id || '',
+    };
+  };
+
   const targetBoldQuote = (occ) => {
     const m = String((occ && occ.note) || '').match(/\*\*([^*]+)\*\*/);
     return m ? m[1].trim() : '';
@@ -541,6 +618,7 @@ async function runSeeHowDetection({ pipeDir, contextPath, generateIdsFn = genera
     const sameWording = !!(bold && glQuote && bold.toLowerCase() === glQuote.toLowerCase());
     let note = buildSeeHowSentence({
       book,
+      targetBook: target.crossBook ? target.book : '',
       targetRef: target.ref,
       glQuote,
       sameSref,
@@ -555,7 +633,8 @@ async function runSeeHowDetection({ pipeDir, contextPath, generateIdsFn = genera
     item.note_type = (item.at_required && !item.at_provided) ? 'see_how_at' : 'see_how';
     item.tags = '';
     item.support_reference = targetSref;
-    item.see_how_target = target.ref;
+    item.see_how_target = target.crossBook ? `${target.book} ${target.ref}` : target.ref;
+    if (target.crossBook) item.see_how_cross_book = true;
     item.writer_packet = Object.assign({}, item.writer_packet || {}, { programmatic_note: note });
     item.prompt = `Return only this note exactly as written:\n${note}`;
     return true;
@@ -574,6 +653,7 @@ async function runSeeHowDetection({ pipeDir, contextPath, generateIdsFn = genera
   let injectedCount = 0;
   let alsoOccursCount = 0;
   let inexactSkipped = 0;
+  let crossBookCount = 0;
 
   // Hint-driven items carry their own framing (seed prose); leave them alone.
   const candidates = items.filter((it) => !it.fromHint && primaryKey(it));
@@ -665,8 +745,20 @@ async function runSeeHowDetection({ pipeDir, contextPath, generateIdsFn = genera
     const canFold = (it) => foldsAnySref || String(it.sref || '') === String(lead.sref || '');
     const corpusHere = chapterCorpusOccs(key);
 
-    const target = earlierNotedTarget(key);
-    const pointerCase = !!target && isSeeHowEligible(key, target.sref || lead.sref);
+    let target = earlierNotedTarget(key);
+    let pointerCase = !!target && isSeeHowEligible(key, target.sref || lead.sref);
+
+    // Rule 3. Only once rule 2 has found nothing: a same-book target always
+    // wins, so a book's later occurrences never reach here. The prospective
+    // anchor is the very verse rule 2 would have used, so resolve it first and
+    // let crossBookTarget confirm it really is the book's first occurrence.
+    if (!target) {
+      const prospective = corpusHere[0]
+        ? recurrenceVerseNumber(corpusHere[0].verse)
+        : recurrenceVerseNumber(verseOf(lead.reference));
+      const cross = crossBookTarget(key, prospective);
+      if (cross) { target = cross; pointerCase = true; }
+    }
 
     // (a) A cross-chapter pointer belongs on the chapter's FIRST in-range
     // occurrence of the phrase, not on whichever verse the model happened to
@@ -766,6 +858,7 @@ async function runSeeHowDetection({ pipeDir, contextPath, generateIdsFn = genera
         // delete real notes and point at nothing.
         if (!applyPointer(anchorItem, key, target)) continue;
         seeHowCount++;
+        if (target.crossBook) crossBookCount++;
         if (setAlsoOccurs(anchorItem, alsoVerses)) alsoOccursCount++;
         for (const it of foldItems) { fold(it); foldedCount++; }
       } else if (anchorOcc && !plan.skipped) {
@@ -849,6 +942,7 @@ async function runSeeHowDetection({ pipeDir, contextPath, generateIdsFn = genera
       tcm_mode: false,
     };
     if (!applyPointer(item, key, target)) continue;
+    if (target.crossBook) crossBookCount++;
     if (setAlsoOccurs(item, alsoVerses)) alsoOccursCount++;
     for (const it of (foldItems || [])) { fold(it); foldedCount++; }
     items.push(item);
@@ -869,7 +963,7 @@ async function runSeeHowDetection({ pipeDir, contextPath, generateIdsFn = genera
     fs.writeFileSync(prepPath, JSON.stringify(prepared, null, 2));
   }
 
-  const summary = `${seeHowCount} see-how back-refs, ${foldedCount} folded, ${injectedCount} injected, ${alsoOccursCount} also-occurs lists, ${inexactSkipped} skipped (inexact quote), ${combinedCount} same-verse combinations`;
+  const summary = `${seeHowCount} see-how back-refs, ${foldedCount} folded, ${injectedCount} injected, ${alsoOccursCount} also-occurs lists, ${inexactSkipped} skipped (inexact quote), ${combinedCount} same-verse combinations, ${crossBookCount} cross-book`;
   console.log(`[notes] See-how detection: ${summary}`);
   return summary;
 }

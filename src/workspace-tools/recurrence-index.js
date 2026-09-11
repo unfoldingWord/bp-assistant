@@ -9,6 +9,7 @@
 // recognised across chapters even when the English wording drifts.
 
 const path = require('path');
+const { BOOK_NAMES } = require('../api-runner/verse-data');
 
 // Cantillation / word-joiner / maqaf class. Deliberately identical to the
 // CANT_RE defined inside quality-tools.js — duplicated rather than shared so
@@ -51,6 +52,17 @@ const SEE_HOW_STOPLIST = new Set([
   'בן', 'ארץ', 'עם', 'מלך', 'דבר', 'יד', 'יום', 'ישראל', 'פנים', 'כן',
   'בית', 'כי',
 ]);
+
+// A phrase whose source text turns up in more than this many books of the
+// corpus is a common formula, not a distinctive rendering worth a cross-book
+// pointer. Without it every "the word of Yahweh" would earn one.
+const CROSS_BOOK_MAX_BOOKS = 8;
+
+/** English book name for a USFM code, for prose cross-book pointers. */
+function bookDisplayName(book) {
+  const code = String(book || '').toUpperCase();
+  return BOOK_NAMES[code] || code;
+}
 
 // ---------------------------------------------------------------------------
 // Normalisation
@@ -351,10 +363,35 @@ function countWords(text) {
 }
 
 /**
- * The pointer sentence. Wording follows the published corpus:
+ * What the pointer sentence calls the phrase. Wording follows the published
+ * corpus:
  *   same tA article + identical GL wording → bolded quote
  *   same tA article, different wording     → this name / word / phrase / expression
  *   different tA article                   → the similar expression
+ */
+function seeHowSubject({ glQuote = '', sameSref = false, sameWording = false, sref = '' } = {}) {
+  if (sameSref && sameWording && String(glQuote || '').trim()) {
+    return `**${String(glQuote).trim()}**`;
+  }
+  if (!sameSref) return 'the similar expression';
+  const words = countWords(glQuote);
+  if (String(sref || '') === 'translate-names') return 'this name';
+  // No GL wording to characterise (e.g. a deterministically injected pointer)
+  // — fall back to the corpus's most common frame.
+  if (words === 0) return 'the similar expression';
+  if (words === 1) return 'this word';
+  if (words >= 2 && words <= 5) return 'this phrase';
+  return 'this expression';
+}
+
+/**
+ * The pointer sentence.
+ *
+ * Same-book pointers use the canonical relative link `[C:V](../CC/VV.md)`.
+ * Cross-book pointers (`targetBook` set and different from `book`) are written
+ * as prose naming the book — `... in Isaiah 36:3.` — because that is what the
+ * published corpus does: markdown cross-book links occur about ten times in
+ * total, prose in the rest.
  */
 function buildSeeHowSentence({
   book = '',
@@ -363,26 +400,21 @@ function buildSeeHowSentence({
   sameSref = false,
   sameWording = false,
   sref = '',
+  targetBook = '',
 } = {}) {
   const [ch, vs] = String(targetRef || '').split(':');
+  const subject = seeHowSubject({ glQuote, sameSref, sameWording, sref });
+
+  const other = String(targetBook || '').toUpperCase();
+  if (other && other !== String(book || '').toUpperCase()) {
+    const c = String(ch == null ? '' : ch).trim();
+    const v = String(vs == null ? '' : vs).trim().split(/[-–]/)[0];
+    if (!c || !v) return '';
+    return `See how you translated ${subject} in ${bookDisplayName(other)} ${c}:${v}.`;
+  }
+
   const link = formatTnLink(book, ch, vs);
   if (!link) return '';
-
-  let subject;
-  if (sameSref && sameWording && String(glQuote || '').trim()) {
-    subject = `**${String(glQuote).trim()}**`;
-  } else if (sameSref) {
-    const words = countWords(glQuote);
-    if (String(sref || '') === 'translate-names') subject = 'this name';
-    // No GL wording to characterise (e.g. a deterministically injected pointer)
-    // — fall back to the corpus's most common frame.
-    else if (words === 0) subject = 'the similar expression';
-    else if (words === 1) subject = 'this word';
-    else if (words >= 2 && words <= 5) subject = 'this phrase';
-    else subject = 'this expression';
-  } else {
-    subject = 'the similar expression';
-  }
   return `See how you translated ${subject} in ${link}.`;
 }
 
@@ -872,8 +904,194 @@ function buildBookRecurrenceIndex({
   };
 }
 
+// ---------------------------------------------------------------------------
+// Cross-book index
+// ---------------------------------------------------------------------------
+
+/** Verse ref -> ordered source words, from one book's aligned ULT. */
+function versesFromAlignedUsfm(ultUsfm) {
+  const byVerse = new Map();
+  let records = [];
+  try { records = parseAlignedUsfmSpans(ultUsfm || ''); } catch { records = []; }
+  for (const rec of records) {
+    if (!rec.chapter) continue;
+    if (!byVerse.has(rec.ref)) byVerse.set(rec.ref, []);
+    byVerse.get(rec.ref).push(rec);
+  }
+  return byVerse;
+}
+
+/** First-token candidate maps for one book, so key lookup stays linear-ish. */
+function candidateMapsFor(byVerse) {
+  const byFirstStrong = new Map();
+  const byFirstToken = new Map();
+  for (const [ref, words] of byVerse.entries()) {
+    for (const w of words) {
+      const st = normalizeStrong(w.strong);
+      if (st) {
+        if (!byFirstStrong.has(st)) byFirstStrong.set(st, new Set());
+        byFirstStrong.get(st).add(ref);
+      }
+      const toks = hebTokens(w.heb);
+      if (toks.length) {
+        if (!byFirstToken.has(toks[0])) byFirstToken.set(toks[0], new Set());
+        byFirstToken.get(toks[0]).add(ref);
+      }
+    }
+  }
+  return { byFirstStrong, byFirstToken };
+}
+
+/**
+ * Build the corpus-wide "which phrase is already explained where" index that
+ * backs cross-book see-how pointers.
+ *
+ * Two passes, one book in memory at a time (the whole aligned OT does not fit
+ * comfortably at once):
+ *
+ *   A. Join each book's published TN rows to its aligned ULT to learn every
+ *      phrase that already carries an explanatory note, and where the FIRST
+ *      such note in canonical order sits.
+ *   B. Count how many books each candidate phrase's source text occurs in, so
+ *      the frequency filter can drop common formulas. Short-circuits at
+ *      `maxBooks + 1`, and is skipped entirely when no aligned ULT is readable.
+ *
+ * Entries are filed under BOTH key forms (Strong's sequence and consonantal
+ * text) so a caller that could only resolve one form still finds them.
+ *
+ * @param {object} args
+ * @param {string[]} args.bookCodes Books to scan, in canonical order.
+ * @param {(book:string)=>({ultUsfm?:string,tnTsv?:string})} args.readBook Loader.
+ * @param {number} [args.maxBooks] Frequency-filter threshold.
+ * @returns {{byKey:Object, counts:Object}}
+ */
+function buildCrossBookIndex({ bookCodes = [], readBook = null, maxBooks = CROSS_BOOK_MAX_BOOKS } = {}) {
+  const load = typeof readBook === 'function' ? readBook : () => ({});
+  const codes = (bookCodes || []).map((b) => String(b || '').toUpperCase()).filter(Boolean);
+
+  // --- Pass A: noted phrases and their first explanatory note ---------------
+  const entries = new Map(); // key -> { first, notedBooks:Set, specStrongs, specTokens }
+  let noteRows = 0;
+  let anyUlt = false;
+
+  for (const code of codes) {
+    const { ultUsfm = '', tnTsv = '' } = load(code) || {};
+    if (!tnTsv) continue;
+    if (ultUsfm) anyUlt = true;
+    const byVerse = versesFromAlignedUsfm(ultUsfm);
+
+    for (const row of parseTnTsv(tnTsv)) {
+      const { chapter, verse } = refParts(row.ref);
+      if (!chapter) continue;
+      const tokens = String(row.quote || '').split('&').flatMap((seg) => hebTokens(seg));
+      if (!tokens.length) continue;
+
+      const words = byVerse.get(`${chapter}:${verseNumber(verse)}`) || [];
+      const run = findRunByTokens(words, tokens);
+      const strongKey = run ? keysFromWordRun(run).strongKey : '';
+      const textKey = tokens.join('+');
+      noteRows++;
+
+      // A row that is itself a pointer, or one whose article wants a note at
+      // every occurrence, is never a pointer target — the same rule the
+      // same-book detector applies in earlierNotedTarget.
+      const isPointer = /^\s*See how you translated/i.test(row.note);
+      const usable = !!row.note && !isPointer
+        && !SEE_HOW_NEVER_FOLD_SREFS.has(String(row.sref || ''));
+
+      for (const key of [strongKey, textKey]) {
+        if (!key) continue;
+        if (!entries.has(key)) {
+          entries.set(key, {
+            first: null,
+            notedBooks: new Set(),
+            specStrongs: key === strongKey ? strongKey.split('+') : null,
+            specTokens: key === textKey ? textKey.split('+') : null,
+          });
+        }
+        const entry = entries.get(key);
+        entry.notedBooks.add(code);
+        // Canonical order is the scan order, so the first usable row wins.
+        if (usable && !entry.first) {
+          entry.first = {
+            book: code,
+            ref: row.ref,
+            chapter,
+            verse,
+            sref: row.sref || '',
+            quote: row.quote || '',
+            id: row.id || '',
+          };
+        }
+      }
+    }
+  }
+
+  // Drop keys that never found an explanatory note — they can never be a target.
+  for (const [key, entry] of entries) if (!entry.first) entries.delete(key);
+
+  // --- Pass B: source-text book counts for pointer-eligible keys ------------
+  const wanted = new Map();
+  for (const [key, entry] of entries) {
+    if (isSeeHowEligible(key, entry.first.sref)) wanted.set(key, entry);
+  }
+  const sourceBooks = new Map();
+  for (const key of wanted.keys()) sourceBooks.set(key, new Set());
+
+  if (anyUlt && wanted.size) {
+    for (const code of codes) {
+      const { ultUsfm = '' } = load(code) || {};
+      if (!ultUsfm) continue;
+      const byVerse = versesFromAlignedUsfm(ultUsfm);
+      if (!byVerse.size) continue;
+      const { byFirstStrong, byFirstToken } = candidateMapsFor(byVerse);
+
+      for (const [key, entry] of wanted) {
+        const seen = sourceBooks.get(key);
+        // Already over the threshold: the exact count no longer matters.
+        if (seen.size > maxBooks || seen.has(code)) continue;
+        const strongs = entry.specStrongs;
+        const tokens = entry.specTokens;
+        const candidates = strongs
+          ? (byFirstStrong.get(strongs[0]) || null)
+          : (byFirstToken.get(tokens[0]) || null);
+        if (!candidates) continue;
+        for (const ref of candidates) {
+          const words = byVerse.get(ref) || [];
+          const run = strongs ? findRunByStrongs(words, strongs) : findRunByTokens(words, tokens);
+          if (run && run.length) { seen.add(code); break; }
+        }
+      }
+    }
+  }
+
+  // --- Emit ----------------------------------------------------------------
+  const byKey = {};
+  let eligible = 0;
+  for (const [key, entry] of entries) {
+    // Fall back to the noted-book count when there was no aligned ULT to scan;
+    // an unfiltered index would hand out pointers on common formulas.
+    const counted = sourceBooks.get(key);
+    const bookCount = (counted && counted.size) ? counted.size : entry.notedBooks.size;
+    if (wanted.has(key) && bookCount <= maxBooks) eligible++;
+    byKey[key] = { first: entry.first, bookCount, notedBookCount: entry.notedBooks.size };
+  }
+
+  return {
+    byKey,
+    counts: {
+      books: codes.length,
+      keys: Object.keys(byKey).length,
+      noteRows,
+      eligibleKeys: eligible,
+      maxBooks,
+    },
+  };
+}
+
 module.exports = {
   buildBookRecurrenceIndex,
+  buildCrossBookIndex,
   parseAlignedUsfmSpans,
   parseHebrewUsfmWords,
   joinSourceSpan,
@@ -882,6 +1100,8 @@ module.exports = {
   deriveRecurrenceKeys,
   formatTnLink,
   buildSeeHowSentence,
+  seeHowSubject,
+  bookDisplayName,
   formatAlsoOccurs,
   dedupeAlsoOccursVerses,
   assignAlsoOccursVerses,
@@ -900,4 +1120,5 @@ module.exports = {
   SEE_HOW_SINGLE_WORD_SREFS,
   SEE_HOW_STOPLIST,
   SEE_HOW_NEVER_FOLD_SREFS,
+  CROSS_BOOK_MAX_BOOKS,
 };
