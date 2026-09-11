@@ -51,6 +51,19 @@ At the start of a session, run `git branch` to check the current branch. If not 
 - Checkpoint state must be one of: `running`, `failed`, `paused_for_outage`, `paused_for_usage_limit`
 - When manually editing checkpoint JSON to set a resume point, use `"state": "failed"` — other values like `"resumable"` are silently ignored
 
+### Interpretive review
+- `src/interp-review.js` runs one Fable pass over the interpretive rows of the
+  issue TSV (figures of speech, TCM readings, hedged explanations) right
+  before `tn-writer`, so a wrong issue type or primary reading is fixed once
+  upstream instead of note-by-note downstream.
+- Default off. Enable via `config.json`'s `interpReview` block or the env
+  overrides `BP_INTERP_REVIEW_MODE` (`off`|`report`|`apply`),
+  `BP_INTERP_REVIEW_BOOKS` (comma list or `all`), `BP_INTERP_REVIEW_MODEL`.
+- `report` mode never writes the issue TSV, only a markdown review under
+  `output/review/<BOOK>/`; `apply` mode writes it back. Either way it only
+  ever touches the `explanation`/`sref` columns — never the quote, book, or
+  ref columns — and never throws into the pipeline.
+
 ### Alignment batching
 - `align-all-parallel` splits chapters > 18 verses into `ceil(N/18)` contiguous
   batches of `ceil(N/numBatches)` verses each (evenly distributed; last batch

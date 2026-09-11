@@ -12,6 +12,7 @@ const DEFAULT_PROVIDER_CONFIGS = {
       sonnet: 'claude-sonnet-4-6',
       haiku: 'claude-haiku-4-5-20251001',
       'claude-haiku-4-5': 'claude-haiku-4-5-20251001',
+      fable: 'claude-fable-5-1',
     },
     // Effort/thinking-level -> Claude tier (cost routing): low-effort phases to
     // Haiku, validation to Sonnet, generation to Opus. The JSON config overrides
@@ -31,6 +32,7 @@ const DEFAULT_PROVIDER_CONFIGS = {
       'claude-sonnet-5': { label: 'Claude Sonnet 5', inputPer1M: 3.0, outputPer1M: 15.0 },
       'claude-sonnet-4-6': { label: 'Claude Sonnet 4.6', inputPer1M: 3.0, outputPer1M: 15.0 },
       'claude-haiku-4-5-20251001': { label: 'Claude Haiku 4.5', inputPer1M: 0.8, outputPer1M: 4.0 },
+      'claude-fable-5-1': { label: 'Claude Fable 5.1', inputPer1M: 10.0, outputPer1M: 50.0 },
     },
   },
   openai: {

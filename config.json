@@ -165,5 +165,11 @@
     "rescueMaxPasses": 1,
     "qualityCheckMaxConsecutiveToolErrors": 6,
     "qualityCheckMaxRepeatedToolErrorSignature": 5
+  },
+  "interpReview": {
+    "mode": "off",
+    "books": ["ISA", "JER", "EZK"],
+    "model": "claude-fable-5-1",
+    "maxRowsPerCall": 40
   }
 }
