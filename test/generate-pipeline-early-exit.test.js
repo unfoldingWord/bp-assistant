@@ -1219,3 +1219,136 @@ test('generatePipeline classifies permission-stalled continuation as initial_pip
     harness.cleanup();
   }
 });
+
+// Issue #364: EZK 23 was regenerated a month after a successful run. The
+// persistent workspace still held July's raw output/AI-ULT|AI-UST files, which
+// `align-all-parallel` consumes as input but never deletes. The pre-run cleanup
+// did not remove them, so the existence-only gate in
+// getInitialPipelineOutputStatus saw ULT/UST/issues-TSV all "present" the
+// instant the (no-op, 66-second) initial-pipeline call returned. That skipped
+// the early-exit/continuation retry loop entirely and dropped the run into the
+// freshness-gated hasUlt/hasUst check, which failed with a generic and
+// misleading `missing_output` — the files were on disk, just stale.
+test('stale leftovers from a prior run trigger the continuation retry loop, not a bogus missing_output (#364)', async () => {
+  const attempts = [];
+  const harness = createHarness({
+    runClaudeImpl: async ({ options }) => {
+      // Every attempt is a no-op: returns "success" almost immediately and
+      // writes nothing, mirroring the 66-second August 31 run.
+      attempts.push(options);
+      return { subtype: 'success', usage: {}, total_cost_usd: 0, session_id: 'session-ezk-23' };
+    },
+  });
+
+  try {
+    // Recreate July's leftovers, including the naming-variant twins that let a
+    // copy survive cleanup: resolveOutputFile returns the flat path first, so the
+    // old single-shot unlink deleted only that one and left the BOOK/ subdirectory
+    // copy on disk to satisfy the existence-only gate.
+    const stalePaths = [
+      ['output', 'AI-ULT', 'EZK-23.usfm'],
+      ['output', 'AI-ULT', 'EZK', 'EZK-23.usfm'],
+      ['output', 'AI-UST', 'EZK-23.usfm'],
+      ['output', 'AI-UST', 'EZK', 'EZK-23.usfm'],
+      ['output', 'issues', 'EZK', 'EZK-23.tsv'],
+    ].map((parts) => path.join(harness.tempDir, ...parts));
+    const monthAgoSec = Date.now() / 1000 - 32 * 24 * 60 * 60;
+    for (const abs of stalePaths) {
+      fs.mkdirSync(path.dirname(abs), { recursive: true });
+      fs.writeFileSync(abs, '\\id EZK\n\\c 23\n\\v 1 stale july output\n');
+      fs.utimesSync(abs, monthAgoSec, monthAgoSec);
+    }
+
+    await harness.generatePipeline(
+      { _synthetic: true, _book: 'EZK', _startChapter: 23, _endChapter: 23, skill: 'initial-pipeline', operations: 6 },
+      buildMessage('generate ezk 23', { subject: 'EZK 23' })
+    );
+
+    // The pre-run cleanup must remove *every* naming variant, not just the first
+    // one resolveOutputFile happens to return.
+    for (const abs of stalePaths.slice(0, 4)) {
+      assert.equal(
+        fs.existsSync(abs),
+        false,
+        `stale leftover ${path.relative(harness.tempDir, abs)} must be deleted before initial-pipeline runs`
+      );
+    }
+
+    // The core regression: the stale issues TSV (which cleanup never touches)
+    // must not make the gate believe initial-pipeline produced valid output.
+    // Before the fix the run made exactly one no-op call and fell straight
+    // through to the failure branch; now the retry loop fires and re-attempts.
+    assert.ok(attempts.length > 1, 'stale leftovers must not short-circuit the initial-pipeline retry loop');
+
+    // And if it still ends up failing, it must not be labelled missing_output
+    // when the files are sitting right there on disk.
+    const failed = harness.checkpoints.filter((patch) => patch.current?.status === 'failed');
+    for (const patch of failed) {
+      assert.notEqual(
+        patch.current.errorKind,
+        'missing_output',
+        'a stale-leftover failure must not be classified as missing_output'
+      );
+    }
+  } finally {
+    harness.cleanup();
+  }
+});
+
+// Issue #364, part 3: the `stale_output` branch further down only fires *after*
+// hasRequiredGeneratedOutputs succeeds, so a run whose only outputs are stale
+// leftovers could never reach it and was labelled `missing_output` instead —
+// pointing the operator at generation when the real problem was workspace
+// hygiene. For a non-initial-pipeline skill (which never enters the
+// continuation retry loop) the classification at that gate is the only signal,
+// so it must distinguish "no file at all" from "file present but stale".
+test('a failure whose outputs exist but are stale is classified stale_output, not missing_output (#364)', async () => {
+  const harness = createHarness({
+    // Returns success without writing anything: the leftovers on disk are all
+    // that will ever be there.
+    runClaudeImpl: async () => ({ subtype: 'success', usage: {}, total_cost_usd: 0 }),
+  });
+
+  try {
+    // Model hypothesis (a) from the issue: the leftovers survive the pre-run
+    // cleanup because the unlink itself fails. A read-only parent directory
+    // makes unlink raise EACCES, which the old code swallowed silently.
+    const monthAgoSec = Date.now() / 1000 - 32 * 24 * 60 * 60;
+    const lockedDirs = [];
+    for (const parts of [['output', 'AI-ULT', 'EZK', 'EZK-23.usfm'], ['output', 'AI-UST', 'EZK', 'EZK-23.usfm']]) {
+      const abs = path.join(harness.tempDir, ...parts);
+      fs.mkdirSync(path.dirname(abs), { recursive: true });
+      fs.writeFileSync(abs, '\\id EZK\n\\c 23\n\\v 1 stale july output\n');
+      fs.utimesSync(abs, monthAgoSec, monthAgoSec);
+      lockedDirs.push(path.dirname(abs));
+    }
+    for (const dir of lockedDirs) fs.chmodSync(dir, 0o555);
+
+    await harness.generatePipeline(
+      { _synthetic: true, _book: 'EZK', _startChapter: 23, _endChapter: 23, skill: 'ult-generation', operations: 6 },
+      buildMessage('generate ezk 23', { subject: 'EZK 23' })
+    );
+
+    const failed = harness.checkpoints.filter((patch) => patch.current?.status === 'failed');
+    assert.ok(failed.length > 0, 'the run should have failed');
+    const kinds = failed.map((patch) => patch.current.errorKind);
+    assert.ok(
+      kinds.includes('stale_output'),
+      `expected a stale_output classification, got ${JSON.stringify(kinds)}`
+    );
+    assert.equal(failed.at(-1).current.outputStatus, 'stale');
+    assert.ok(
+      failed.at(-1).current.staleOutputs?.length > 0,
+      'the checkpoint should name the stale files so the operator can inspect their mtimes'
+    );
+    assert.ok(
+      harness.readStatusTexts().some((text) => text.includes('stale from an earlier run')),
+      'the operator-facing message should say stale, not "missing expected output"'
+    );
+  } finally {
+    for (const parts of [['output', 'AI-ULT', 'EZK'], ['output', 'AI-UST', 'EZK']]) {
+      try { fs.chmodSync(path.join(harness.tempDir, ...parts), 0o755); } catch (_) { /* best effort */ }
+    }
+    harness.cleanup();
+  }
+});

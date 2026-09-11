@@ -280,7 +280,7 @@ function buildChapterTag(book, chapter) {
   return `${book}-${String(chapter).padStart(width, '0')}`;
 }
 
-function getInitialPipelineOutputStatus({ book, chapter, verseStart, verseEnd }) {
+function getInitialPipelineOutputStatus({ book, chapter, verseStart, verseEnd, freshAfterMs = null }) {
   const chapterTag = buildChapterTag(book, chapter);
   const verseSuffix = verseStart != null && verseEnd != null ? `-vv${verseStart}-${verseEnd}` : null;
   // Scope the ULT/UST completeness check to the requested verse range: without
@@ -298,10 +298,27 @@ function getInitialPipelineOutputStatus({ book, chapter, verseStart, verseEnd })
 
   const found = {};
   const missing = [];
+  const stale = [];
   for (const output of required) {
     const resolved = resolveOutputFile(output.path, book, output.verseSuffix);
-    if (resolved) found[output.label] = resolved;
-    else missing.push(output.label);
+    if (!resolved) {
+      missing.push(output.label);
+      continue;
+    }
+    // Existence alone is not proof *this* run produced the file. The workspace
+    // (CSKILLBP_DIR) is persistent and is never cleaned between reruns of the
+    // same chapter, so a leftover raw ULT/UST from a run weeks earlier used to
+    // satisfy this gate — short-circuiting the early-exit/continuation retry
+    // loop below and dropping a no-op run straight into a confusing generic
+    // "missing_output" failure (#364). When the caller supplies the same
+    // freshness cutoff used for hasUlt/hasUst, a stale file counts as missing
+    // so the retry loop actually fires.
+    if (freshAfterMs != null && !isFreshOutput(resolved, freshAfterMs)) {
+      stale.push({ label: output.label, path: resolved });
+      missing.push(output.label);
+      continue;
+    }
+    found[output.label] = resolved;
   }
 
   const tempDirs = [
@@ -322,7 +339,7 @@ function getInitialPipelineOutputStatus({ book, chapter, verseStart, verseEnd })
     if (observedTempArtifacts.length > 0) break;
   }
 
-  return { missing, found, observedTempArtifacts };
+  return { missing, found, stale, observedTempArtifacts };
 }
 
 function chicagoIsoFromUtcDate(date) {
@@ -807,6 +824,10 @@ async function generatePipeline(route, message) {
     await status(`Processing **${chapterRef}**...`);
 
     const chapterStart = Date.now();
+    // Non-ENOENT failures from the pre-run stale-output cleanup below. Surfaced in
+    // the failure diagnosis so a permissions/path problem in the persistent
+    // workspace reads as itself instead of as a generation bug (#364).
+    const staleCleanupFailures = [];
     let claudeResult = null;
     let sdkError = null;
     // Guard against the align-all-parallel resume shortcut incorrectly skipping
@@ -888,9 +909,27 @@ async function generatePipeline(route, message) {
       const vDel = hasVerseRange ? `${book}-${ch}-vv${verseStart}-${verseEnd}` : `${book}-${ch}`;
       if (!resumeInitialPipelineEarlyExit) {
         for (const rel of [`output/AI-ULT/${vDel}.usfm`, `output/AI-UST/${vDel}.usfm`]) {
-          const resolved = resolveOutputFile(rel, book);
-          if (resolved) {
-            try { fs.unlinkSync(path.resolve(CSKILLBP_DIR, resolved)); } catch (_) { /* fine if missing */ }
+          // resolveOutputFile returns one match at a time, but the same chapter can
+          // exist under several naming variants (flat vs BOOK/ subdir, padded vs
+          // unpadded). Deleting only the first left a stale twin on disk that later
+          // satisfied the existence-only gate in getInitialPipelineOutputStatus (#364),
+          // so loop until nothing resolves.
+          for (let guard = 0; guard < 8; guard++) {
+            const resolved = resolveOutputFile(rel, book);
+            if (!resolved) break;
+            try {
+              fs.unlinkSync(path.resolve(CSKILLBP_DIR, resolved));
+            } catch (err) {
+              // ENOENT is genuinely fine (nothing to clean). Anything else —
+              // permissions, EISDIR, a read-only mount — must not be swallowed:
+              // silently ignoring it is how a prior run's leftovers survived
+              // cleanup and masqueraded as this run's output (#364).
+              if (err && err.code !== 'ENOENT') {
+                console.warn(`[generate] Failed to delete stale output ${resolved}: ${err.message}`);
+                staleCleanupFailures.push(`${resolved} (${err.code || 'error'}: ${err.message})`);
+              }
+              break;
+            }
           }
         }
       }
@@ -1116,6 +1155,9 @@ async function generatePipeline(route, message) {
         chapter: ch,
         verseStart: hasVerseRange ? verseStart : null,
         verseEnd: hasVerseRange ? verseEnd : null,
+        // Same cutoff used for hasUlt/hasUst below, so a stale leftover cannot
+        // short-circuit the continuation retry loop (#364).
+        freshAfterMs: freshnessMs,
       });
       if (initialPipelineStatus.missing.length > 0) {
         let observedArtifacts = [
@@ -1236,6 +1278,7 @@ async function generatePipeline(route, message) {
               chapter: ch,
               verseStart: hasVerseRange ? verseStart : null,
               verseEnd: hasVerseRange ? verseEnd : null,
+              freshAfterMs: freshnessMs,
             });
             observedArtifacts = [
               ...Object.values(initialPipelineStatus.found),
@@ -1347,10 +1390,30 @@ async function generatePipeline(route, message) {
       // that should have been caught by the guard above — surfacing it here still
       // avoids the misdiagnosis-as-content-bug pattern that spawned issue #211.
       const skippedGeneration = !runInitialSkill;
+      // Freshness-gated discovery reports these as absent, but the files may still be
+      // sitting on disk as leftovers from an earlier run of the same chapter. The two
+      // cases need different fixes — "missing" points at generation, "stale" points at
+      // workspace/cleanup hygiene — so probe the ungated view before labelling (#364).
+      const staleLeftovers = [];
+      if (!skippedGeneration) {
+        for (const type of contentTypes) {
+          if (type === 'ult' ? hasUlt : hasUst) continue;
+          const anyRel = discoverFreshOutput(type === 'ult' ? 'output/AI-ULT' : 'output/AI-UST', book, chPat, null);
+          if (anyRel) {
+            staleLeftovers.push(`${type.toUpperCase()}: ${anyRel} (mtime ${new Date(mtimeMsOf(anyRel)).toISOString()})`);
+          }
+        }
+      }
+      const staleOnly = staleLeftovers.length > 0 && staleLeftovers.length === missingTypes.length;
       const contextNote = skippedGeneration
         ? ' (initial-pipeline was skipped this run because we resumed at align-all-parallel; the prior run likely used a narrower content-type mode)'
-        : (hasUlt || hasUst ? ' Some artifacts exist but may be incomplete.' : '');
-      const missingEvent = await status(`Failed to generate **${book} ${ch}**. Missing expected output: ${missingTypes.join(', ')}.${contextNote} Check logs for details.`);
+        : staleOnly
+          ? ' The files exist on disk but predate this run — initial-pipeline produced no new output, so the leftovers from a previous run were not replaced.'
+          : (hasUlt || hasUst ? ' Some artifacts exist but may be incomplete.' : '');
+      const headline = staleOnly
+        ? `Failed to generate **${book} ${ch}**: output is stale from an earlier run (${missingTypes.join(', ')}).${contextNote} Check logs for details.`
+        : `Failed to generate **${book} ${ch}**. Missing expected output: ${missingTypes.join(', ')}.${contextNote} Check logs for details.`;
+      const missingEvent = await status(headline);
       fail++;
       setCheckpoint(checkpointRef, {
         state: 'failed',
@@ -1361,15 +1424,27 @@ async function generatePipeline(route, message) {
           chapter: ch,
           skill,
           status: 'failed',
-          errorKind: skippedGeneration ? 'resume_scope_mismatch' : 'missing_output',
-          outputStatus: 'missing',
+          errorKind: skippedGeneration ? 'resume_scope_mismatch' : (staleOnly ? 'stale_output' : 'missing_output'),
+          outputStatus: staleOnly ? 'stale' : 'missing',
           missingTypes,
+          ...(staleLeftovers.length ? { staleOutputs: staleLeftovers } : {}),
+          ...(staleCleanupFailures.length ? { staleCleanupFailures } : {}),
         },
         resume: { chapter: ch, skill },
       });
       fireDiagnosis(missingEvent, {
         checkpoint: getCheckpoint(checkpointRef),
-        errorText: `Skill: ${skill}\nChapter: ${book} ${ch}\nMissing types: ${missingTypes.join(', ')}\nhasUlt=${hasUlt} hasUst=${hasUst}\nrunInitialSkill=${runInitialSkill}${skippedGeneration ? '\nNote: initial-pipeline was skipped this run (resumed at align-all-parallel with narrower content-type mode).' : ''}`,
+        errorText: [
+          `Skill: ${skill}`,
+          `Chapter: ${book} ${ch}`,
+          `Missing types: ${missingTypes.join(', ')}`,
+          `hasUlt=${hasUlt} hasUst=${hasUst}`,
+          `runInitialSkill=${runInitialSkill}`,
+          `Run started: ${new Date(chapterStart).toISOString()}`,
+          staleLeftovers.length ? `Stale leftovers on disk (older than this run):\n  ${staleLeftovers.join('\n  ')}` : null,
+          staleCleanupFailures.length ? `Pre-run cleanup failed to delete:\n  ${staleCleanupFailures.join('\n  ')}` : null,
+          skippedGeneration ? 'Note: initial-pipeline was skipped this run (resumed at align-all-parallel with narrower content-type mode).' : null,
+        ].filter(Boolean).join('\n'),
       });
       continue;
     }
