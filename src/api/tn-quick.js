@@ -30,6 +30,7 @@ async function getAgentSdkQuery() {
 }
 
 const HEBREW_DIR_REL = 'data/hebrew_bible';
+const GREEK_DIR_REL = 'data/greek_nt';
 const MAX_BODY_BYTES = 32 * 1024;
 const RATE_LIMIT_RPM = 60;
 const RATE_LIMIT_WINDOW_MS = 60_000;
@@ -305,13 +306,38 @@ function applyCors(req, res) {
   }
 }
 
-function getVerseWords(book, chapter, verse) {
-  const num = BOOK_NUMBERS[book.toUpperCase()];
+// BOOK_NUMBERS numbers the OT 01-39 and the NT 41-67 (there is no 40), and both
+// UHB and UGNT name their files `<num>-<CODE>.usfm`, so the book number alone
+// picks the testament and the filename. Returns null for an unknown book code.
+function sourceUsfmPathForBook(book) {
+  const bookUpper = String(book).toUpperCase();
+  const num = BOOK_NUMBERS[bookUpper];
   if (!num) return null;
-  const hebrewPath = path.posix.join(HEBREW_DIR_REL, `${num}-${book.toUpperCase()}.usfm`);
-  const verseMap = parseHebrewVerseWords(hebrewPath);
-  if (!verseMap || Object.keys(verseMap).length === 0) return null;
-  return verseMap[`${chapter}:${verse}`] || [];
+  const dir = parseInt(num, 10) >= 40 ? GREEK_DIR_REL : HEBREW_DIR_REL;
+  return path.posix.join(dir, `${num}-${bookUpper}.usfm`);
+}
+
+/**
+ * Load the canonical source words for a verse from the UHB (OT) or UGNT (NT).
+ *
+ * Returns { status, words, source }. The status distinguishes failures the
+ * caller must answer differently (#394): an unknown book code or a reference
+ * past the end of a book is a permanent client error, while a source file that
+ * should be on the volume and is not is transient — the fetch tools will fill
+ * it — so only that case earns a 503 the client may retry.
+ */
+function getVerseWords(book, chapter, verse) {
+  const source = sourceUsfmPathForBook(book);
+  if (!source) return { status: 'unknown_book', words: [], source: null };
+  const verseMap = parseHebrewVerseWords(source);
+  if (!verseMap || Object.keys(verseMap).length === 0) {
+    return { status: 'source_missing', words: [], source };
+  }
+  const words = verseMap[`${chapter}:${verse}`];
+  if (!words || words.length === 0) {
+    return { status: 'verse_not_found', words: [], source };
+  }
+  return { status: 'ok', words, source };
 }
 
 function formatContextLines(label, verseText, prev5, next5, refVerse) {
@@ -568,17 +594,40 @@ async function handleTnQuickRequest(req, res) {
       return;
     }
 
-    const verseWords = getVerseWords(bookUpper, body.ref.chapter, body.ref.verse);
-    if (!verseWords || verseWords.length === 0) {
-      reply(res, 503, { error: 'uhb_missing_for_verse', ref: body.ref });
+    const sourceVerse = getVerseWords(bookUpper, body.ref.chapter, body.ref.verse);
+    if (sourceVerse.status === 'unknown_book') {
+      reply(res, 400, { error: 'unknown_book', ref: body.ref });
       return;
     }
-
-    const heb = normalizeHebrewQuote(body.hebrewGuess, verseWords);
-    if (heb.status === 'no_rtl') {
+    if (sourceVerse.status === 'verse_not_found') {
+      // The book's source file is loaded and simply has no such verse — a bad
+      // reference, not a data gap. 4xx so the client stops rather than retries.
       reply(res, 422, {
-        error: 'no_rtl',
-        message: 'hebrewGuess contains no Hebrew characters',
+        error: 'verse_not_in_source',
+        ref: body.ref,
+        source: sourceVerse.source,
+      });
+      return;
+    }
+    if (sourceVerse.status !== 'ok') {
+      // Transient by design: the file belongs on the volume and is absent, so a
+      // fetch_hebrew_bible / fetch_greek_nt run fixes it and a retry succeeds.
+      reply(res, 503, {
+        error: 'source_verse_missing',
+        ref: body.ref,
+        source: sourceVerse.source,
+      });
+      return;
+    }
+    const verseWords = sourceVerse.words;
+
+    // Field stays `hebrewGuess` for wire compatibility with the editor, but it
+    // carries a Greek quote for the 27 NT books.
+    const heb = normalizeHebrewQuote(body.hebrewGuess, verseWords);
+    if (heb.status === 'no_source_script') {
+      reply(res, 422, {
+        error: 'no_source_script',
+        message: 'hebrewGuess contains no Hebrew or Greek characters',
       });
       return;
     }
@@ -683,4 +732,6 @@ module.exports = {
   TN_QUICK_PACK_FRAME,
   TN_QUICK_TERM_STATUSES,
   checkAtFit,
+  getVerseWords,
+  sourceUsfmPathForBook,
 };

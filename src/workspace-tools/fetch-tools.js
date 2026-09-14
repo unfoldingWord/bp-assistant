@@ -244,6 +244,15 @@ async function fetchHebrewBible({ books, force }) {
   return fetchDoor43Batch('hbo_uhb', bookList, 'data/hebrew_bible', force || false);
 }
 
+// Greek NT counterpart of fetchHebrewBible. UGNT files are named on the same
+// `<num>-<CODE>.usfm` pattern as UHB and mark words with the same \w ... \w*
+// shape, so the same batch fetch and the same verse-word parser serve both
+// testaments (#394).
+async function fetchGreekNt({ books, force }) {
+  const bookList = books && books.length ? books.map(normalizeBook) : NT_BOOKS;
+  return fetchDoor43Batch('el-x-koine_ugnt', bookList, 'data/greek_nt', force || false);
+}
+
 async function fetchPublished(repo, outputDir, masterTool, { books, force }) {
   const resolved = resolvePublishedBookList({ books, outputDir, masterTool });
   if (resolved.error) return resolved.error;
@@ -433,6 +442,7 @@ async function fetchTemplates({ sheetId, gid, output, format, force }) {
 
 module.exports = {
   fetchHebrewBible,
+  fetchGreekNt,
   fetchUlt,
   fetchUst,
   fetchMasterUlt,
