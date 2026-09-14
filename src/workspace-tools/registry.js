@@ -23,7 +23,7 @@
 // registered in index.js exists here, so the two surfaces cannot drift.
 
 const {
-  fetchHebrewBible, fetchUlt, fetchUst, fetchMasterUlt, fetchMasterUst, fetchT4t, fetchDoor43,
+  fetchHebrewBible, fetchGreekNt, fetchUlt, fetchUst, fetchMasterUlt, fetchMasterUst, fetchT4t, fetchDoor43,
   fetchGlossary, fetchIssuesResolved, fetchTemplates,
 } = require('./fetch-tools');
 const { splitTsv, mergeTsvs, fixTrailingNewlines } = require('./tsv-tools');
@@ -82,6 +82,7 @@ const TOOLS = {
 
   // --- Fetch tools ---
   fetch_hebrew_bible: { handler: fetchHebrewBible },
+  fetch_greek_nt: { handler: fetchGreekNt },
   fetch_ult: { handler: fetchUlt },
   fetch_ust: { handler: fetchUst },
   fetch_master_ult: { handler: fetchMasterUlt },
