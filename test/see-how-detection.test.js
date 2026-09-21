@@ -980,3 +980,54 @@ test('C5: with an injected five-word variant the widest key still carries the li
   assert.equal(new Set(listed).size, listed.length);
   assert.deepEqual(listed.slice().sort((a, b) => Number(a) - Number(b)), ['2', '4', '6', '14']);
 });
+
+// Context-dependent articles (JER 8:4 -> 25:27). The same lexemes recur as a
+// command rather than a question, so a figs-rquestion pointer back to 8:4 is
+// wrong even though the recurrence key matches.
+const TN_RQUESTION_TSV = [
+  'Reference\tID\tTags\tSupportReference\tQuote\tOccurrence\tNote',
+  `1:1\tabcd\t\trc://*/ta/man/translate/figs-rquestion\t${WORD_OF_YAHWEH}\t1\tYahweh is using the question form to appeal to what everyone knows.`,
+  '',
+].join('\n');
+
+test('context-dependent target: nothing is injected where the chapter flagged no issue', async () => {
+  const dirPath = setupPipeDir({ items: [], hebrewBook: HEBREW_BOOK, tnBookTsv: TN_RQUESTION_TSV });
+  buildRecurrenceIndexFile({ pipeDir: dirPath });
+  const summary = await runSeeHowDetection({ pipeDir: dirPath, generateIdsFn: stubIds });
+
+  assert.deepEqual(readPrepared(dirPath).items, [], 'no synthesized figs-rquestion pointer');
+  assert.match(summary, /0 injected/);
+});
+
+test('context-dependent target: an item with a different article gets no pointer', async () => {
+  const dirPath = setupPipeDir({
+    items: [item({ reference: '3:2', id: 'aaaa', sref: 'figs-metaphor' })],
+    tnBookTsv: TN_RQUESTION_TSV,
+  });
+  buildRecurrenceIndexFile({ pipeDir: dirPath });
+  await runSeeHowDetection({ pipeDir: dirPath, generateIdsFn: stubIds });
+
+  const first = readPrepared(dirPath).items[0];
+  assert.equal(first.programmatic_note, undefined, 'the words recur, the rhetorical question does not');
+  assert.equal(first.support_reference, undefined);
+});
+
+test('context-dependent target: the pointer ships where the same article was flagged independently', async () => {
+  const dirPath = setupPipeDir({
+    items: [
+      item({ reference: '3:2', id: 'aaaa', sref: 'figs-metaphor' }),
+      item({ reference: '3:5', id: 'bbbb', index: 1, sref: 'figs-rquestion' }),
+    ],
+    tnBookTsv: TN_RQUESTION_TSV,
+  });
+  buildRecurrenceIndexFile({ pipeDir: dirPath });
+  await runSeeHowDetection({ pipeDir: dirPath, generateIdsFn: stubIds });
+
+  const items = readPrepared(dirPath).items;
+  const pointer = items.find((it) => it.id === 'bbbb');
+  assert.equal(pointer.note_type, 'see_how');
+  assert.match(pointer.programmatic_note, /\[1:1\]\(\.\.\/01\/01\.md\)/);
+  assert.equal(pointer.support_reference, 'figs-rquestion');
+  assert.equal(pointer.also_occurs_verses, undefined, 'v7 was never checked for a question');
+  assert.equal(items.find((it) => it.id === 'aaaa').programmatic_note, undefined, 'the metaphor item is untouched');
+});
