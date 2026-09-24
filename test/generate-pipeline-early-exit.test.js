@@ -1274,10 +1274,10 @@ test('stale leftovers from a prior run trigger the continuation retry loop, not 
       );
     }
 
-    // The core regression: the stale issues TSV (which cleanup never touches)
-    // must not make the gate believe initial-pipeline produced valid output.
-    // Before the fix the run made exactly one no-op call and fell straight
-    // through to the failure branch; now the retry loop fires and re-attempts.
+    // The core regression: with the stale ULT/UST twins gone, leftovers must not
+    // make the gate believe initial-pipeline produced valid output. Before the
+    // fix the run made exactly one no-op call and fell straight through to the
+    // failure branch; now the retry loop fires and re-attempts.
     assert.ok(attempts.length > 1, 'stale leftovers must not short-circuit the initial-pipeline retry loop');
 
     // And if it still ends up failing, it must not be labelled missing_output
@@ -1349,6 +1349,93 @@ test('a failure whose outputs exist but are stale is classified stale_output, no
     for (const parts of [['output', 'AI-ULT', 'EZK'], ['output', 'AI-UST', 'EZK']]) {
       try { fs.chmodSync(path.join(harness.tempDir, ...parts), 0o755); } catch (_) { /* best effort */ }
     }
+    harness.cleanup();
+  }
+});
+
+// #364 review, F1: the pre-run cleanup must delete only the exact raw ULT/UST
+// names. An earlier version looped on resolveOutputFile, whose prefix fallback
+// matches any EZK-23-*.usfm once the raw files are gone, so it also deleted the
+// merged aligned file, banked per-batch aligned files and other-range files.
+test('pre-run cleanup removes only exact raw twins, never aligned/per-batch/range files (#364)', async () => {
+  const harness = createHarness({
+    runClaudeImpl: async () => ({ subtype: 'success', usage: {}, total_cost_usd: 0, session_id: 'session-ezk-23' }),
+  });
+
+  try {
+    const rawTwins = [
+      ['output', 'AI-ULT', 'EZK-23.usfm'],
+      ['output', 'AI-ULT', 'EZK', 'EZK-23.usfm'],
+      ['output', 'AI-ULT', 'EZK', 'EZK-023.usfm'],
+      ['output', 'AI-UST', 'EZK-23.usfm'],
+      ['output', 'AI-UST', 'EZK', 'EZK-23.usfm'],
+    ].map((parts) => path.join(harness.tempDir, ...parts));
+    const keep = [];
+    for (const type of ['AI-ULT', 'AI-UST']) {
+      for (const name of [
+        'EZK-23-aligned.usfm',
+        'EZK-23-v01-v16-aligned.usfm',
+        'EZK-23-v17-v32-aligned.usfm',
+        'EZK-23-vv1-16.usfm',
+        'EZK-23-vv1-16-aligned.usfm',
+      ]) {
+        keep.push(path.join(harness.tempDir, 'output', type, name));
+        keep.push(path.join(harness.tempDir, 'output', type, 'EZK', name));
+      }
+    }
+    for (const abs of [...rawTwins, ...keep]) {
+      fs.mkdirSync(path.dirname(abs), { recursive: true });
+      fs.writeFileSync(abs, '\\id EZK\n\\c 23\n\\v 1 text\n');
+    }
+
+    await harness.generatePipeline(
+      { _synthetic: true, _book: 'EZK', _startChapter: 23, _endChapter: 23, skill: 'initial-pipeline', operations: 6 },
+      buildMessage('generate ezk 23', { subject: 'EZK 23' })
+    );
+
+    for (const abs of rawTwins) {
+      assert.equal(fs.existsSync(abs), false, `raw twin ${path.relative(harness.tempDir, abs)} should be deleted`);
+    }
+    for (const abs of keep) {
+      assert.equal(fs.existsSync(abs), true, `${path.relative(harness.tempDir, abs)} must survive the pre-run cleanup`);
+    }
+  } finally {
+    harness.cleanup();
+  }
+});
+
+// #364 review, F2: the issues TSV is existence-only. Cleanup never deletes it
+// and the continuation prompt only checks that it exists, so a fresh ULT/UST
+// plus an older issues TSV is a complete initial-pipeline run, not an early exit.
+test('an older issues TSV next to fresh ULT/UST does not fail as initial_pipeline_early_exit (#364)', async () => {
+  const harness = createHarness({
+    runClaudeImpl: async ({ tempDir }) => {
+      for (const type of ['AI-ULT', 'AI-UST']) {
+        fs.mkdirSync(path.join(tempDir, 'output', type, 'EZK'), { recursive: true });
+        fs.writeFileSync(path.join(tempDir, 'output', type, 'EZK', 'EZK-23.usfm'), '\\id EZK\n\\c 23\n\\v 1 fresh\n');
+      }
+      return { subtype: 'success', usage: {}, total_cost_usd: 0, session_id: 'session-ezk-23' };
+    },
+  });
+
+  try {
+    const tsv = path.join(harness.tempDir, 'output', 'issues', 'EZK', 'EZK-23.tsv');
+    fs.mkdirSync(path.dirname(tsv), { recursive: true });
+    fs.writeFileSync(tsv, 'ezk\t23:1\tfigs-metaphor\told\n');
+    const monthAgoSec = Date.now() / 1000 - 32 * 24 * 60 * 60;
+    fs.utimesSync(tsv, monthAgoSec, monthAgoSec);
+
+    await harness.generatePipeline(
+      { _synthetic: true, _book: 'EZK', _startChapter: 23, _endChapter: 23, skill: 'initial-pipeline', operations: 6 },
+      buildMessage('generate ezk 23', { subject: 'EZK 23' })
+    );
+
+    assert.equal(harness.runClaudeCalls.length, 1, 'no continuation should be needed');
+    assert.equal(
+      harness.checkpoints.some((patch) => patch.current?.errorKind === 'initial_pipeline_early_exit'),
+      false
+    );
+  } finally {
     harness.cleanup();
   }
 });

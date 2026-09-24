@@ -280,6 +280,23 @@ function buildChapterTag(book, chapter) {
   return `${book}-${String(chapter).padStart(width, '0')}`;
 }
 
+// Every exact name a raw (unaligned) generation output for one chapter can have
+// on disk: flat or BOOK/ subdir, unpadded or 2-/3-digit padded chapter, and for
+// verse-range runs the exact -vvS-E range name. Deliberately an explicit list,
+// never resolveOutputFile's prefix fallback: that matches any <tag>-*.usfm, so
+// it would also hit <tag>-aligned.usfm, per-batch …-vNN-vMM-aligned.usfm and
+// other ranges' files, destroying banked alignment work (#364 review).
+function rawOutputVariants(outDir, book, chapter, verseStart = null, verseEnd = null) {
+  const suffix = verseStart != null && verseEnd != null ? `-vv${verseStart}-${verseEnd}` : '';
+  const names = [...new Set([String(chapter), String(chapter).padStart(2, '0'), String(chapter).padStart(3, '0')])]
+    .map((c) => `${book}-${c}${suffix}.usfm`);
+  const rels = [];
+  for (const dir of [outDir, `${outDir}/${book}`]) {
+    for (const name of names) rels.push(`${dir}/${name}`);
+  }
+  return rels;
+}
+
 function getInitialPipelineOutputStatus({ book, chapter, verseStart, verseEnd, freshAfterMs = null }) {
   const chapterTag = buildChapterTag(book, chapter);
   const verseSuffix = verseStart != null && verseEnd != null ? `-vv${verseStart}-${verseEnd}` : null;
@@ -290,10 +307,15 @@ function getInitialPipelineOutputStatus({ book, chapter, verseStart, verseEnd, f
   // alignment step believing initial-pipeline had produced a valid source
   // (#231). Passing a verseSuffix routes resolveOutputFile into its verse-
   // range branch, which requires the numeric suffix to equal verseStart-verseEnd.
+  //
+  // The issues TSV stays existence-only (outDir unset => not freshness-gated):
+  // the pre-run cleanup never deletes it and the continuation prompt's success
+  // check only tests existence, so gating it would fail a run whose ULT/UST are
+  // fresh but whose issues TSV predates it (#364 review).
   const required = [
-    { label: 'ULT', path: `output/AI-ULT/${chapterTag}.usfm`, verseSuffix },
-    { label: 'issues TSV', path: `output/issues/${chapterTag}.tsv`, verseSuffix },
-    { label: 'UST', path: `output/AI-UST/${chapterTag}.usfm`, verseSuffix },
+    { label: 'ULT', path: `output/AI-ULT/${chapterTag}.usfm`, verseSuffix, outDir: 'output/AI-ULT' },
+    { label: 'issues TSV', path: `output/issues/${chapterTag}.tsv`, verseSuffix, outDir: null },
+    { label: 'UST', path: `output/AI-UST/${chapterTag}.usfm`, verseSuffix, outDir: 'output/AI-UST' },
   ];
 
   const found = {};
@@ -313,7 +335,16 @@ function getInitialPipelineOutputStatus({ book, chapter, verseStart, verseEnd, f
     // "missing_output" failure (#364). When the caller supplies the same
     // freshness cutoff used for hasUlt/hasUst, a stale file counts as missing
     // so the retry loop actually fires.
-    if (freshAfterMs != null && !isFreshOutput(resolved, freshAfterMs)) {
+    if (freshAfterMs != null && output.outDir && !isFreshOutput(resolved, freshAfterMs)) {
+      // resolveOutputFile returns only the first naming variant; a fresh twin
+      // under another exact raw name (e.g. the BOOK/ subdir) is still this
+      // run's output, so check all of them before declaring the output stale.
+      const freshTwin = rawOutputVariants(output.outDir, book, chapter, verseStart, verseEnd)
+        .find((rel) => isFreshOutput(rel, freshAfterMs));
+      if (freshTwin) {
+        found[output.label] = freshTwin;
+        continue;
+      }
       stale.push({ label: output.label, path: resolved });
       missing.push(output.label);
       continue;
@@ -906,29 +937,28 @@ async function generatePipeline(route, message) {
       // Delete expected outputs so Claude must recreate them (prevents stale-mtime false failures on resume).
       // When resuming an early-exited initial-pipeline session, keep the ULT/Wave 2 artifacts
       // so the resumed session can continue downstream instead of restarting the chapter.
-      const vDel = hasVerseRange ? `${book}-${ch}-vv${verseStart}-${verseEnd}` : `${book}-${ch}`;
       if (!resumeInitialPipelineEarlyExit) {
-        for (const rel of [`output/AI-ULT/${vDel}.usfm`, `output/AI-UST/${vDel}.usfm`]) {
-          // resolveOutputFile returns one match at a time, but the same chapter can
-          // exist under several naming variants (flat vs BOOK/ subdir, padded vs
-          // unpadded). Deleting only the first left a stale twin on disk that later
-          // satisfied the existence-only gate in getInitialPipelineOutputStatus (#364),
-          // so loop until nothing resolves.
-          for (let guard = 0; guard < 8; guard++) {
-            const resolved = resolveOutputFile(rel, book);
-            if (!resolved) break;
-            try {
-              fs.unlinkSync(path.resolve(CSKILLBP_DIR, resolved));
-            } catch (err) {
-              // ENOENT is genuinely fine (nothing to clean). Anything else —
-              // permissions, EISDIR, a read-only mount — must not be swallowed:
-              // silently ignoring it is how a prior run's leftovers survived
-              // cleanup and masqueraded as this run's output (#364).
-              if (err && err.code !== 'ENOENT') {
-                console.warn(`[generate] Failed to delete stale output ${resolved}: ${err.message}`);
-                staleCleanupFailures.push(`${resolved} (${err.code || 'error'}: ${err.message})`);
-              }
-              break;
+        // The same chapter can exist under several exact raw names (flat vs BOOK/
+        // subdir, padded vs unpadded). Deleting only the first one
+        // resolveOutputFile returned left a stale twin on disk that satisfied the
+        // gate in getInitialPipelineOutputStatus (#364). The list is explicit, so
+        // aligned, per-batch and other-range files are never touched (same rule
+        // as deleteMergedAligned).
+        const rawRels = ['output/AI-ULT', 'output/AI-UST'].flatMap((dir) => rawOutputVariants(
+          dir, book, ch, hasVerseRange ? verseStart : null, hasVerseRange ? verseEnd : null
+        ));
+        for (const rel of rawRels) {
+          try {
+            fs.unlinkSync(path.resolve(CSKILLBP_DIR, rel));
+          } catch (err) {
+            // ENOENT is genuinely fine (nothing to clean). Anything else —
+            // permissions, EISDIR, a read-only mount — must not be swallowed:
+            // silently ignoring it is how a prior run's leftovers survived
+            // cleanup and masqueraded as this run's output (#364). Record it and
+            // keep cleaning the remaining variants.
+            if (err && err.code !== 'ENOENT') {
+              console.warn(`[generate] Failed to delete stale output ${rel}: ${err.message}`);
+              staleCleanupFailures.push(`${rel} (${err.code || 'error'}: ${err.message})`);
             }
           }
         }
