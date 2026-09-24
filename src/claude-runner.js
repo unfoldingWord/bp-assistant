@@ -322,10 +322,14 @@ const PERMISSION_WALL_MAX_DELAY_MS = 5 * 60 * 1000;
 // than the window can't zero out retries entirely"); the wall path had no equivalent.
 // Anchoring on first detection makes the budget mean what its comment already claimed.
 //
-// Total run time is still bounded so a late wall cannot push a shard past the caller's
-// own timeout (MAX_TIMEOUT_MS, 150min — pipeline-utils.js): past this ceiling we stop
-// retrying and return the wall result, so the caller records a correctly-labelled
-// failure instead of being killed mid-backoff and misfiled as a timeout.
+// Total run time is also capped, but only at retry-decision time: once runClaude has
+// been running this long, a wall is returned to the caller instead of retried. It is
+// NOT a deadline. Nothing wraps runClaude in an outer timer, and each retry is a fresh
+// runClaudeOnce with its own full per-attempt timeout (timeoutMs, up to MAX_TIMEOUT_MS
+// = 150min, pipeline-utils.js), so a retry started at 89min can still run to ~89+150min.
+// The ceiling bounds how many fresh attempts a late wall can start; it does not bound
+// the run's total length. (A tighter "elapsed + per-attempt timeout" check is not
+// possible here: timeoutMs IS the per-attempt budget, with no separate run budget.)
 const PERMISSION_WALL_RETRY_CEILING_MS = Number(process.env.BP_PERMISSION_WALL_CEILING_MS) > 0
   ? Number(process.env.BP_PERMISSION_WALL_CEILING_MS)
   : 90 * 60 * 1000;
@@ -336,6 +340,15 @@ const PERMISSION_WALL_RETRY_CEILING_MS = Number(process.env.BP_PERMISSION_WALL_C
 function shouldRetryPermissionWall(wallElapsedMs, totalElapsedMs) {
   return wallElapsedMs < PERMISSION_WALL_RETRY_WINDOW_MS
     && totalElapsedMs < PERMISSION_WALL_RETRY_CEILING_MS;
+}
+
+// The wall clock for the attempt that just ended. A walled attempt keeps the clock of
+// the wall it continues (or starts one now); any attempt that ends WITHOUT a wall (a
+// transient-error retry) clears it, so a later, separate wall gets its own full window
+// instead of inheriting an earlier wall's elapsed time.
+function nextWallStartedAt(prevWallStartedAt, attemptWalled, now) {
+  if (!attemptWalled) return null;
+  return prevWallStartedAt ?? now;
 }
 
 const TRANSIENT_RETRY_WINDOW_MS = 10 * 60 * 1000;
@@ -1686,7 +1699,7 @@ async function runClaude(args) {
       // `paused_for_outage`, which nothing auto-resumes, so it would just relocate the
       // manual step. Returning it lets the caller record a correctly-labelled failure.
       if (resultIndicatesPermissionWall(result)) {
-        if (wallStartedAt === null) wallStartedAt = Date.now();
+        wallStartedAt = nextWallStartedAt(wallStartedAt, true, Date.now());
         const wallElapsed = Date.now() - wallStartedAt;
         if (shouldRetryPermissionWall(wallElapsed, elapsed)) {
           const delay = wallBackoffDelayMs(attempt);
@@ -1730,6 +1743,7 @@ async function runClaude(args) {
       }
       if (isTransientSdkMessage(resultMsg) && shouldRetryTransient(attempt, elapsed)) {
         lastTransientMessage = resultMsg;
+        wallStartedAt = nextWallStartedAt(wallStartedAt, false, Date.now());
         if (!firstDowntimeNoticeSent) {
           firstDowntimeNoticeSent = true;
           await notifyAdminDowntime(
@@ -1761,6 +1775,7 @@ async function runClaude(args) {
       const elapsed = Date.now() - startedAt;
       if (isTransientSdkMessage(msg) && shouldRetryTransient(attempt, elapsed)) {
         lastTransientMessage = msg;
+        wallStartedAt = nextWallStartedAt(wallStartedAt, false, Date.now());
         if (!firstDowntimeNoticeSent) {
           firstDowntimeNoticeSent = true;
           await notifyAdminDowntime(
@@ -1887,6 +1902,7 @@ module.exports = {
   PERMISSION_WALL_RETRY_WINDOW_MS,
   PERMISSION_WALL_RETRY_CEILING_MS,
   shouldRetryPermissionWall,
+  nextWallStartedAt,
   shouldRetryTransient,
   isTransientSdkMessage,
   TRANSIENT_RETRY_WINDOW_MS,

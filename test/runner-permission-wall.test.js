@@ -50,6 +50,7 @@ const {
   PERMISSION_WALL_RETRY_WINDOW_MS,
   PERMISSION_WALL_RETRY_CEILING_MS,
   shouldRetryPermissionWall,
+  nextWallStartedAt,
 } = require('../src/claude-runner');
 
 const denialText = (toolUseId) =>
@@ -400,8 +401,9 @@ test('#380: the wall budget is spent by wall time, not by the run that preceded 
 });
 
 test('#380: the total-run ceiling still stops a late wall from outliving the caller timeout', () => {
-  // Fresh wall (clock at 0) but the run as a whole is past the ceiling: stop anyway,
-  // so the caller records a clean permission_wall instead of being killed mid-backoff.
+  // Fresh wall (clock at 0) but the run as a whole is past the ceiling: stop anyway
+  // rather than start another full-length attempt. (This is a retry-decision check,
+  // not a deadline — an attempt already running is not cut short.)
   assert.equal(shouldRetryPermissionWall(0, PERMISSION_WALL_RETRY_CEILING_MS), false);
   assert.equal(shouldRetryPermissionWall(0, PERMISSION_WALL_RETRY_CEILING_MS - 1000), true);
 });
@@ -411,4 +413,21 @@ test('#380: the wall ceiling leaves headroom under the 150min chapter timeout', 
     'the ceiling must not be tighter than the window it bounds');
   assert.ok(PERMISSION_WALL_RETRY_CEILING_MS + PERMISSION_WALL_RETRY_WINDOW_MS <= 150 * 60 * 1000,
     'ceiling + one final wall window must fit inside MAX_TIMEOUT_MS (150min)');
+});
+
+// A wall -> transient-error retry -> new wall sequence must not let the second wall
+// inherit the first wall's clock: an attempt that ends without a wall resets it.
+test('#380: the wall clock resets when an attempt ends without a wall', () => {
+  const t0 = 1_000_000;
+  let wallStartedAt = null;
+  wallStartedAt = nextWallStartedAt(wallStartedAt, true, t0);            // first wall
+  assert.equal(wallStartedAt, t0);
+  wallStartedAt = nextWallStartedAt(wallStartedAt, true, t0 + 60_000);   // same wall, retried
+  assert.equal(wallStartedAt, t0, 'a continuing wall keeps its original clock');
+  wallStartedAt = nextWallStartedAt(wallStartedAt, false, t0 + 120_000); // transient retry
+  assert.equal(wallStartedAt, null);
+  const t1 = t0 + PERMISSION_WALL_RETRY_WINDOW_MS + 60_000;
+  wallStartedAt = nextWallStartedAt(wallStartedAt, true, t1);            // a new, separate wall
+  assert.equal(wallStartedAt, t1, 'the new wall starts its own clock');
+  assert.equal(shouldRetryPermissionWall(t1 - wallStartedAt, 30 * 60 * 1000), true);
 });
