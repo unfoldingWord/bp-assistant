@@ -418,7 +418,9 @@ function normalizeHebrewQuote(rawQuote, verseWords) {
       }
     }
     if (pos < 0) {
-      warnings.push({ code: 'source_word_not_in_verse', detail: tok.text });
+      // Code name is historical and kept for wire compatibility; it now
+      // covers Greek (NT) source words as well as Hebrew.
+      warnings.push({ code: 'hebrew_word_not_in_verse', detail: tok.text });
     } else {
       matchCount++;
     }

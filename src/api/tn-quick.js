@@ -625,8 +625,10 @@ async function handleTnQuickRequest(req, res) {
     // carries a Greek quote for the 27 NT books.
     const heb = normalizeHebrewQuote(body.hebrewGuess, verseWords);
     if (heb.status === 'no_source_script') {
+      // Error code stays 'no_rtl' for wire compatibility with the editor,
+      // even though the check now covers Greek (NT) as well as Hebrew.
       reply(res, 422, {
-        error: 'no_source_script',
+        error: 'no_rtl',
         message: 'hebrewGuess contains no Hebrew or Greek characters',
       });
       return;

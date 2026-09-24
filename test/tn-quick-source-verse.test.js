@@ -140,7 +140,7 @@ describe('normalizeHebrewQuote — Greek quotes', () => {
   test('a Greek word absent from the verse reports no_words_match', () => {
     const r = normalizeHebrewQuote('θεός', LUK_1_1);
     assert.equal(r.status, 'no_words_match');
-    assert.equal(r.warnings[0].code, 'source_word_not_in_verse');
+    assert.equal(r.warnings[0].code, 'hebrew_word_not_in_verse');
   });
 
   test('a Latin-script quote is rejected as no_source_script', () => {

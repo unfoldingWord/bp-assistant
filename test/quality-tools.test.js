@@ -901,12 +901,12 @@ test('normalizeHebrewQuote matches maqaf-joined words and keeps the maqafs', () 
 test('normalizeHebrewQuote matches NFC quotes against legacy-order UHB words', () => {
   // Row qjok: כֹּ֥ה is dagesh-before-holam in the UHB, holam-before-dagesh in
   // NFC. Before the fix neither side was NFC'd, so it silently dropped out
-  // (1 of 2 matched -> partial_match + source_word_not_in_verse).
+  // (1 of 2 matched -> partial_match + hebrew_word_not_in_verse).
   const quote = `${JER_29_4_UHB[0]} ${JER_29_4_UHB[1]}`.normalize('NFC');
   const r = normalizeHebrewQuote(quote, JER_29_4_UHB);
 
   assert.equal(r.status, 'ok');
-  assert.deepEqual(r.warnings.filter((w) => w.code === 'source_word_not_in_verse'), []);
+  assert.deepEqual(r.warnings.filter((w) => w.code === 'hebrew_word_not_in_verse'), []);
 });
 
 test('normalizeHebrewQuote handles a whole NFC verse-opening phrase', () => {
@@ -943,7 +943,7 @@ test('normalizeHebrewQuote still reports words that are genuinely absent', () =>
   const ABSENT = '\u05d6\u05d6\u05d6\u05d6'; // זזזז - not in JER 29:4
   const r = normalizeHebrewQuote(`${JER_29_4_UHB[0]} ${ABSENT}`.normalize('NFC'), JER_29_4_UHB);
   assert.equal(r.status, 'partial_match');
-  assert.equal(r.warnings.filter((w) => w.code === 'source_word_not_in_verse').length, 1);
+  assert.equal(r.warnings.filter((w) => w.code === 'hebrew_word_not_in_verse').length, 1);
 
   const none = normalizeHebrewQuote(`${ABSENT} ${ABSENT}`.normalize('NFC'), JER_29_4_UHB);
   assert.equal(none.status, 'no_words_match');
