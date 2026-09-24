@@ -316,6 +316,7 @@ function parseHebrewVerseWords(hebrewUsfmPath) {
 
 const HEBREW_RTL_RE = /[֐-׿؀-ۿיִ-﷿ﹰ-﻿]/;
 const HEBREW_CANT_RE = /[֑-֯⁠־]/g;
+const HEBREW_MAQAF = '־';
 
 // Greek and Coptic (U+0370-03FF) plus Greek Extended (U+1F00-1FFF), where the
 // UGNT's precomposed accented forms live (e.g. the first letter of LUK 1:1's
@@ -357,9 +358,22 @@ function foldSourceToken(tok) {
  *   status   — 'ok' | 'no_source_script' | 'no_words_match' | 'partial_match'
  *   warnings — [{ code, detail }] zero or more soft issues
  *
- * Matching is diacritic-insensitive per script (see foldSourceToken). First
- * occurrence wins when a verse repeats a word (refinement candidate if
- * mis-matches show up).
+ * Matching is diacritic-insensitive per script and Unicode-normalization-
+ * insensitive (see foldSourceToken). First occurrence wins when a verse
+ * repeats a word (refinement candidate if mis-matches show up).
+ *
+ * Two properties of the UHB drive the tokenizing and comparison here:
+ *
+ *   Maqaf is a word boundary. The UHB stores maqaf-joined words as separate
+ *   \w tokens — no \w token in the corpus contains U+05BE — while notes and
+ *   bible-editor write them joined ("לְ⁠כָל־הַ֨⁠גּוֹלָ֔ה"). Splitting on whitespace alone
+ *   leaves a pair that HEBREW_CANT_RE then glues into one token matching no
+ *   verse word, so we split on maqaf too and remember the boundaries to
+ *   restore them on output.
+ *
+ *   UHB marks are in legacy order. Roughly 40% of words in a typical verse
+ *   differ from their NFC form (e.g. כֹּ֥ה is dagesh-before-holam in the UHB,
+ *   holam-before-dagesh in NFC), so both sides are NFC'd before comparing.
  */
 function normalizeHebrewQuote(rawQuote, verseWords) {
   const warnings = [];
@@ -370,10 +384,19 @@ function normalizeHebrewQuote(rawQuote, verseWords) {
     return { quote: rawQuote, status: 'no_source_script', warnings };
   }
 
-  const tokens = rawQuote
-    .split(/\s+&\s+|\s+/)
-    .map(s => s.trim())
-    .filter(Boolean);
+  // Split on whitespace and ` & ` first, then on maqaf within each chunk.
+  // maqafToPrev marks parts that were maqaf-joined to the preceding part so
+  // the output can rejoin them with ־ rather than a space.
+  const tokens = [];
+  for (const chunk of rawQuote.split(/\s+&\s+|\s+/)) {
+    const parts = chunk
+      .split(HEBREW_MAQAF)
+      .map(s => s.trim())
+      .filter(Boolean);
+    for (let i = 0; i < parts.length; i++) {
+      tokens.push({ text: parts[i], maqafToPrev: i > 0 });
+    }
+  }
   if (tokens.length === 0) {
     return { quote: rawQuote, status: 'no_words_match', warnings };
   }
@@ -386,20 +409,20 @@ function normalizeHebrewQuote(rawQuote, verseWords) {
   const matched = [];
   let matchCount = 0;
   for (const tok of tokens) {
-    const tokFolded = foldSourceToken(tok);
+    const tokFolded = foldSourceToken(tok.text);
     let pos = -1;
     for (let i = 0; i < words.length; i++) {
-      if (words[i] === tok || foldedWords[i] === tokFolded) {
+      if (words[i] === tok.text || foldedWords[i] === tokFolded) {
         pos = i;
         break;
       }
     }
     if (pos < 0) {
-      warnings.push({ code: 'source_word_not_in_verse', detail: tok });
+      warnings.push({ code: 'source_word_not_in_verse', detail: tok.text });
     } else {
       matchCount++;
     }
-    matched.push({ token: tok, position: pos });
+    matched.push({ token: tok.text, maqafToPrev: tok.maqafToPrev, position: pos });
   }
 
   if (matchCount === 0) {
@@ -410,6 +433,13 @@ function normalizeHebrewQuote(rawQuote, verseWords) {
   for (let i = 0; i < matched.length; i++) {
     const cur = matched[i];
     if (i === 0) {
+      parts.push(cur.token);
+      continue;
+    }
+    if (cur.maqafToPrev) {
+      // Adjacent maqaf parts are contiguous by construction — restore the
+      // maqaf and never insert a discontinuity joiner between them.
+      parts.push(HEBREW_MAQAF);
       parts.push(cur.token);
       continue;
     }
