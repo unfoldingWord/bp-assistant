@@ -1,11 +1,12 @@
 {
     "providers": {
         "claude": {
-            "defaultModel": "claude-opus-5",
+            "defaultModel": "claude-opus-5-5",
+            "difficultyModel": "opus",
             "secretName": "anthropic_api_key",
             "envName": "ANTHROPIC_API_KEY",
             "modelAliases": {
-                "opus": "claude-opus-5",
+                "opus": "claude-opus-5-5",
                 "sonnet": "claude-sonnet-4-6",
                 "haiku": "claude-haiku-4-5-20251001",
                 "claude-haiku-4-5": "claude-haiku-4-5-20251001"
@@ -14,11 +15,16 @@
                 "none": "claude-haiku-4-5-20251001",
                 "low": "claude-haiku-4-5-20251001",
                 "medium": "claude-sonnet-4-6",
-                "high": "claude-opus-5",
-                "xhigh": "claude-opus-5",
-                "max": "claude-opus-5"
+                "high": "opus",
+                "xhigh": "opus",
+                "max": "opus"
             },
             "models": {
+                "claude-opus-5-5": {
+                    "label": "Claude Opus 5.5",
+                    "inputPer1M": 4.0,
+                    "outputPer1M": 20.0
+                },
                 "claude-opus-5": {
                     "label": "Claude Opus 5",
                     "inputPer1M": 5.0,

@@ -4,11 +4,18 @@ const fs = require('fs');
 
 const DEFAULT_PROVIDER_CONFIGS = {
   claude: {
-    defaultModel: 'claude-opus-5',
+    // defaultModel / modelAliases feed the raw Messages API paths
+    // (providers/claude.js, lib/translate-llm.js), which need a concrete id.
+    defaultModel: 'claude-opus-5-5',
+    // Agent SDK paths (claude-runner difficulty tiers, BP_AUTO_MODEL routing)
+    // send the bare 'opus' alias, so the Opus they run is whatever the installed
+    // @anthropic-ai/claude-agent-sdk maps 'opus' to (it moves on SDK upgrades,
+    // or override it with the ANTHROPIC_DEFAULT_OPUS_MODEL env var).
+    difficultyModel: 'opus',
     secretName: 'anthropic_api_key',
     envName: 'ANTHROPIC_API_KEY',
     modelAliases: {
-      opus: 'claude-opus-5',
+      opus: 'claude-opus-5-5',
       sonnet: 'claude-sonnet-4-6',
       haiku: 'claude-haiku-4-5-20251001',
       'claude-haiku-4-5': 'claude-haiku-4-5-20251001',
@@ -20,11 +27,12 @@ const DEFAULT_PROVIDER_CONFIGS = {
       none: 'claude-haiku-4-5-20251001',
       low: 'claude-haiku-4-5-20251001',
       medium: 'claude-sonnet-4-6',
-      high: 'claude-opus-5',
-      xhigh: 'claude-opus-5',
-      max: 'claude-opus-5',
+      high: 'opus',
+      xhigh: 'opus',
+      max: 'opus',
     },
     models: {
+      'claude-opus-5-5': { label: 'Claude Opus 5.5', inputPer1M: 4.0, outputPer1M: 20.0 },
       'claude-opus-5': { label: 'Claude Opus 5', inputPer1M: 5.0, outputPer1M: 25.0 },
       'claude-opus-4-8': { label: 'Claude Opus 4.8', inputPer1M: 5.0, outputPer1M: 25.0 },
       'claude-opus-4-7': { label: 'Claude Opus 4.7', inputPer1M: 5.0, outputPer1M: 25.0 },
@@ -328,12 +336,15 @@ function topModel(cfg) {
 function resolveDifficultyModel(provider, requested) {
   let cfg;
   try { cfg = getProviderConfig(provider); } catch { return requested; }
+  // 'opus' maps to the top model (the bare SDK alias for claude), not the
+  // raw-API concrete id in modelAliases.
+  const pin = (v) => (v === 'opus' ? topModel(cfg) : cfg.modelAliases?.[v] || v);
   const force = process.env.BP_FORCE_MODEL;
-  if (force) return cfg.modelAliases?.[force] || force;
+  if (force) return pin(force);
   if (isDifficultyTier(requested)) {
     const tier = requested.toLowerCase();
     const override = process.env[DIFFICULTY_TIERS[tier]];
-    if (override) return cfg.modelAliases?.[override] || override;
+    if (override) return pin(override);
     return topModel(cfg); // every tier runs the top model; the tier is an EFFORT level
   }
   return requested;

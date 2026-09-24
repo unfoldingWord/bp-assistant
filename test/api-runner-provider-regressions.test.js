@@ -700,7 +700,7 @@ test('readPreparedNotes accepts object-backed prepared_notes packets', () => {
 
 test('difficulty tiers resolve to Opus with tier-as-effort (Opus everywhere)', () => {
   for (const tier of ['low', 'medium', 'high']) {
-    assert.equal(resolveDifficultyModel('claude', tier), 'claude-opus-5', `${tier} -> Opus`);
+    assert.equal(resolveDifficultyModel('claude', tier), 'opus', `${tier} -> Opus (bare SDK alias)`);
     assert.equal(resolveDifficultyEffort(tier), tier, `${tier} -> effort ${tier}`);
   }
   // Non-tier values pass through unchanged; no effort override.
@@ -734,9 +734,9 @@ test('2026 model catalog additions are additive: existing difficulty routing is 
   // Pin the exact pre-existing behavior (claude-runner.js resolveDifficultyModel and
   // notes-pipeline.js resolveAutoModel consume this) so the new 2026 catalog entries
   // below cannot have shifted defaultModel/modelAliases/autoModelByThinking.
-  assert.equal(resolveDifficultyModel('claude', 'high'), 'claude-opus-5');
-  assert.equal(resolveDifficultyModel('claude', 'low'), 'claude-opus-5');
-  assert.equal(resolveAutoModel('claude', undefined, 'high'), 'claude-opus-5');
+  assert.equal(resolveDifficultyModel('claude', 'high'), 'opus');
+  assert.equal(resolveDifficultyModel('claude', 'low'), 'opus');
+  assert.equal(resolveAutoModel('claude', undefined, 'high'), 'opus');
   assert.equal(resolveAutoModel('claude', undefined, 'low'), 'claude-haiku-4-5-20251001');
   assert.equal(resolveAutoModel('claude', undefined, 'medium'), 'claude-sonnet-4-6');
 });
