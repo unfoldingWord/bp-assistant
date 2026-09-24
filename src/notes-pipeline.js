@@ -20,7 +20,7 @@ const { getDoor43Username, emailToFallbackUsername, buildBranchName, resolveOutp
 const { splitTsv, fixTrailingNewlines } = require('./workspace-tools/tsv-tools');
 const { fillTsvIds, generateIds, prepareNotes, fillOrigQuotes, resolveGlQuotes, flagNarrowQuotes, extractAlignmentData, prepareATContext, substituteAT, fixUnicodeQuotes, verifyBoldMatches, syncCanonicalHebrewQuotes, applyHintsToPreparedNotes, _stripAlternateTranslation: stripAlternateTranslation } = require('./workspace-tools/tn-tools');
 const { checkTnQuality, detectSelfTalk, templateFirstPhrase, resolveTemplateText } = require('./workspace-tools/quality-tools');
-const { buildBookRecurrenceIndex, deriveRecurrenceKeys, buildSeeHowSentence, isSeeHowEligible, dedupeAlsoOccursVerses, assignAlsoOccursVerses, resolveDoor43ReposPath, hebTokens, verseNumber: recurrenceVerseNumber, SEE_HOW_NEVER_FOLD_SREFS, CROSS_BOOK_MAX_BOOKS } = require('./workspace-tools/recurrence-index');
+const { buildBookRecurrenceIndex, deriveRecurrenceKeys, buildSeeHowSentence, isSeeHowEligible, isContextDependentSref, dedupeAlsoOccursVerses, assignAlsoOccursVerses, resolveDoor43ReposPath, hebTokens, verseNumber: recurrenceVerseNumber, SEE_HOW_NEVER_FOLD_SREFS, CROSS_BOOK_MAX_BOOKS } = require('./workspace-tools/recurrence-index');
 const { normalizeIssuesFile, buildParallelismIntroHintArgs } = require('./issue-normalizer');
 const { curlyQuotes } = require('./workspace-tools/usfm-tools');
 const { verifyRepoPush, verifyDcsToken, verifyRemoteContent } = require('./repo-verify');
@@ -741,40 +741,64 @@ async function runSeeHowDetection({ pipeDir, contextPath, generateIdsFn = genera
     // chapter ("hand" as metonymy in v2, as metaphor in v8). Fold a later item
     // only when it is the same kind of note, or when the key is see-how
     // eligible (multi-word, or a consistency-bearing single-word article).
-    const foldsAnySref = isSeeHowEligible(key, lead.sref);
-    const canFold = (it) => foldsAnySref || String(it.sref || '') === String(lead.sref || '');
+    // A context-dependent article (a rhetorical question, say) is about the
+    // construction at its own verse, so a repeat of the wording is not a
+    // repeat of the note.
+    const foldsAnySref = isSeeHowEligible(key, lead.sref) && !isContextDependentSref(lead.sref);
     const corpusHere = chapterCorpusOccs(key);
 
     let target = earlierNotedTarget(key);
-    let pointerCase = !!target && isSeeHowEligible(key, target.sref || lead.sref);
 
     // Rule 3. Only once rule 2 has found nothing: a same-book target always
     // wins, so a book's later occurrences never reach here. The prospective
     // anchor is the very verse rule 2 would have used, so resolve it first and
     // let crossBookTarget confirm it really is the book's first occurrence.
-    if (!target) {
-      const prospective = corpusHere[0]
-        ? recurrenceVerseNumber(corpusHere[0].verse)
-        : recurrenceVerseNumber(verseOf(lead.reference));
-      const cross = crossBookTarget(key, prospective);
-      if (cross) { target = cross; pointerCase = true; }
-    }
+    const prospective = corpusHere[0]
+      ? recurrenceVerseNumber(corpusHere[0].verse)
+      : recurrenceVerseNumber(verseOf(lead.reference));
+    if (!target) target = crossBookTarget(key, prospective);
+
+    // Same reason in the other direction: a pointer back to a context-dependent
+    // note only ships where the issue pass independently flagged the same
+    // article here, and it stays on that item rather than moving to the
+    // chapter's first occurrence of the wording. A cross-book target was
+    // cleared for the book-first verse only, so its flagged item must sit there.
+    const ctxDependent = !!target && isContextDependentSref(target.sref);
+    const verifiedItem = ctxDependent
+      ? (group.find((it) => String(it.sref || '') === String(target.sref || '')
+        && (!target.crossBook || recurrenceVerseNumber(verseOf(it.reference)) === prospective)) || null)
+      : null;
+    // crossBookTarget has already applied the eligibility guard to its own sref.
+    const pointerCase = !!target
+      && (target.crossBook || isSeeHowEligible(key, target.sref || lead.sref))
+      && (!ctxDependent || !!verifiedItem);
+    const ctxPointer = pointerCase && ctxDependent;
+    // Under a context-dependent pointer only the items the issue pass gave the
+    // same article may fold into it, and unflagged corpus verses are never
+    // listed: no one checked that the construction is there.
+    const canFold = (it) => (ctxPointer
+      ? String(it.sref || '') === String(target.sref || '')
+      : (foldsAnySref || String(it.sref || '') === String(lead.sref || '')));
 
     // (a) A cross-chapter pointer belongs on the chapter's FIRST in-range
     // occurrence of the phrase, not on whichever verse the model happened to
     // flag -- a phrase in v2 and v5 with only v5 flagged used to leave v2 bare.
     // (b) A book-first explanatory note stays on the verse it describes.
-    const anchorOcc = pointerCase ? (corpusHere[0] || null) : null;
-    const anchorVerseNum = anchorOcc
-      ? recurrenceVerseNumber(anchorOcc.verse)
-      : recurrenceVerseNumber(verseOf(lead.reference));
+    const anchorOcc = (pointerCase && !ctxDependent) ? (corpusHere[0] || null) : null;
     const anchorItem = pointerCase
-      ? (group.find((it) => recurrenceVerseNumber(verseOf(it.reference)) === anchorVerseNum) || null)
+      ? (ctxDependent
+        ? verifiedItem
+        : (group.find((it) => recurrenceVerseNumber(verseOf(it.reference)) === recurrenceVerseNumber((anchorOcc && anchorOcc.verse) || verseOf(lead.reference))) || null))
       : lead;
+    const anchorVerseNum = recurrenceVerseNumber(
+      verseOf((anchorItem && anchorItem.reference) || '')
+      || (anchorOcc && anchorOcc.verse)
+      || verseOf(lead.reference)
+    );
 
     const plan = {
       kind: 'group',
-      key, group, lead, foldsAnySref, canFold, corpusHere,
+      key, group, lead, foldsAnySref, ctxPointer, canFold, corpusHere,
       target, pointerCase, anchorOcc, anchorVerseNum, anchorItem,
       skipped: false,
     };
@@ -804,6 +828,10 @@ async function runSeeHowDetection({ pipeDir, contextPath, generateIdsFn = genera
     const target = earlierNotedTarget(key);
     if (!target) continue;
     if (!isSeeHowEligible(key, target.sref)) continue;
+    // Nothing was prepared for this phrase here, so no one checked whether the
+    // construction the target's note describes is present. Never synthesize a
+    // pointer to a context-dependent article.
+    if (isContextDependentSref(target.sref)) continue;
     const corpusHere = chapterCorpusOccs(key);
     if (!corpusHere.length) continue;
     const occ = corpusHere[0];
@@ -831,7 +859,7 @@ async function runSeeHowDetection({ pipeDir, contextPath, generateIdsFn = genera
   // over, so no verse is listed twice and none is lost.
   const alsoOccursAllowed = assignAlsoOccursVerses(
     plans
-      .filter((p) => !p.skipped && (p.kind === 'injection' || p.foldsAnySref))
+      .filter((p) => !p.skipped && (p.kind === 'injection' || (p.foldsAnySref && !p.ctxPointer)))
       .map((p) => ({
         key: p.key,
         anchorVerse: p.anchorVerseNum,

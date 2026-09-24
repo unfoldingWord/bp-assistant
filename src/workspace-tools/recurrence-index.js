@@ -37,6 +37,22 @@ const SEE_HOW_SINGLE_WORD_SREFS = new Set([
 // requires hinneh foregrounding to be noted every time it appears.
 const SEE_HOW_NEVER_FOLD_SREFS = new Set(['writing-foreground']);
 
+// tA articles whose note is about the CONSTRUCTION at that occurrence, not
+// about the wording: the same lexemes recur as a plain statement or command
+// and the note no longer applies. JER 8:4 asks "will they fall and not rise?"
+// (figs-rquestion); JER 25:27 repeats "fall and do not rise" as a command, and
+// used to collect a figs-rquestion pointer back to 8:4 anyway. A pointer or an
+// "also occurs" entry for these is only allowed where the issue pass
+// independently flagged the same article -- recurrence of the words is not
+// evidence that the construction recurred.
+const SEE_HOW_CONTEXT_DEPENDENT_SREFS = new Set([
+  'figs-rquestion',
+  'figs-declarative',
+  'figs-imperative',
+  'figs-imperative3p',
+  'figs-exclamations',
+]);
+
 // Ultra-frequent lemmas that never earn a single-word pointer. Stored both as
 // Strong's numbers and as consonant-only Hebrew so either key form matches.
 // Strong's numbers are stored zero-padded to four digits, the form UHB and
@@ -331,6 +347,15 @@ function keyWordCount(key) {
  * Eligibility guard: multi-word keys always qualify; single-word keys need a
  * consistency-bearing tA article and a lemma that is not ultra-frequent.
  */
+/**
+ * True for articles whose applicability depends on the construction present at
+ * the occurrence rather than on the repeated wording. See
+ * SEE_HOW_CONTEXT_DEPENDENT_SREFS.
+ */
+function isContextDependentSref(sref) {
+  return SEE_HOW_CONTEXT_DEPENDENT_SREFS.has(String(sref || ''));
+}
+
 function isSeeHowEligible(key, sref) {
   if (!key) return false;
   if (SEE_HOW_NEVER_FOLD_SREFS.has(String(sref || ''))) return false;
@@ -1108,6 +1133,7 @@ module.exports = {
   isKeySubsequence,
   keyTokens,
   isSeeHowEligible,
+  isContextDependentSref,
   keyWordCount,
   hebTokens,
   stripCant,
@@ -1121,4 +1147,5 @@ module.exports = {
   SEE_HOW_STOPLIST,
   SEE_HOW_NEVER_FOLD_SREFS,
   CROSS_BOOK_MAX_BOOKS,
+  SEE_HOW_CONTEXT_DEPENDENT_SREFS,
 };

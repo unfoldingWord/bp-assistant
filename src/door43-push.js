@@ -674,18 +674,38 @@ async function commitAndPush(repoDir, branch, filename, commitMsg, { force = fal
 }
 
 // ---------------------------------------------------------------------------
-// createAndMergePR — Gitea API: create PR, merge, delete branch
+// PR description body
+//
+// Gitea rejects oversized PR bodies, so cap what callers hand us. The cap is a
+// safety net, not a formatter: callers own the content.
 // ---------------------------------------------------------------------------
 
-async function createAndMergePR(token, repo, branch, title, baseBranch = 'master', org = ORG) {
+const PR_BODY_MAX = 4000;
+const PR_BODY_TRUNC = '\n\n…(truncated)';
+
+function capPrBody(body) {
+  if (typeof body !== 'string' || body.length === 0) return '';
+  if (body.length <= PR_BODY_MAX) return body;
+  return body.slice(0, PR_BODY_MAX - PR_BODY_TRUNC.length) + PR_BODY_TRUNC;
+}
+
+// ---------------------------------------------------------------------------
+// createAndMergePR — Gitea API: create PR, merge, delete branch
+//
+// `body` is the PR description (capped at PR_BODY_MAX); defaults to ''.
+// `apiImpl` is injectable for tests.
+// ---------------------------------------------------------------------------
+
+async function createAndMergePR(token, repo, branch, title, baseBranch = 'master', org = ORG, { body = '', apiImpl = apiRequest } = {}) {
+  const api = apiImpl;
   // Validate token
-  const tokenCheck = await apiRequest('GET', `/repos/${org}/${repo}`, token);
+  const tokenCheck = await api('GET', `/repos/${org}/${repo}`, token);
   if (tokenCheck.status === 401 || tokenCheck.status === 403) {
     return { success: false, details: `API token invalid/expired (HTTP ${tokenCheck.status})` };
   }
 
   // Verify branch exists on remote
-  const branchCheck = await apiRequest('GET', `/repos/${org}/${repo}/branches/${branch}`, token);
+  const branchCheck = await api('GET', `/repos/${org}/${repo}/branches/${branch}`, token);
   if (branchCheck.status === 404) {
     return { success: false, details: `Branch '${branch}' does not exist on ${org}/${repo} — push may have failed` };
   }
@@ -694,11 +714,11 @@ async function createAndMergePR(token, repo, branch, title, baseBranch = 'master
   let prNumber;
   const createResult = await withRetry(
     async () => {
-      const res = await apiRequest('POST', `/repos/${org}/${repo}/pulls`, token, {
+      const res = await api('POST', `/repos/${org}/${repo}/pulls`, token, {
         title,
         head: branch,
         base: baseBranch,
-        body: '',
+        body: capPrBody(body),
       });
 
       if (res.status === 200 || res.status === 201) {
@@ -713,7 +733,7 @@ async function createAndMergePR(token, repo, branch, title, baseBranch = 'master
           return { prNumber: parseInt(m[1], 10), url: `https://git.door43.org/${org}/${repo}/pulls/${m[1]}` };
         }
         // If we can't parse the existing PR number, search for it
-        const searchRes = await apiRequest('GET', `/repos/${org}/${repo}/pulls?state=open&head=${org}:${branch}&limit=5`, token);
+        const searchRes = await api('GET', `/repos/${org}/${repo}/pulls?state=open&head=${org}:${branch}&limit=5`, token);
         if (searchRes.status === 200 && Array.isArray(searchRes.data) && searchRes.data.length > 0) {
           const pr = searchRes.data[0];
           return { prNumber: pr.number, url: pr.html_url || '' };
@@ -740,7 +760,7 @@ async function createAndMergePR(token, repo, branch, title, baseBranch = 'master
   // Merge PR
   await withRetry(
     async () => {
-      const res = await apiRequest('POST', `/repos/${org}/${repo}/pulls/${prNumber}/merge`, token, {
+      const res = await api('POST', `/repos/${org}/${repo}/pulls/${prNumber}/merge`, token, {
         Do: 'merge',
         merge_message_field: `Merge ${title}`,
       });
@@ -759,7 +779,7 @@ async function createAndMergePR(token, repo, branch, title, baseBranch = 'master
 
   // Delete branch (best-effort)
   try {
-    const delRes = await apiRequest('DELETE', `/repos/${org}/${repo}/branches/${branch}`, token);
+    const delRes = await api('DELETE', `/repos/${org}/${repo}/branches/${branch}`, token);
     if (delRes.status === 200 || delRes.status === 204 || delRes.status === 404) {
       console.log(`${LOG_PREFIX} Branch ${branch} deleted from ${repo}`);
     } else {
@@ -875,6 +895,7 @@ async function commitAndPushFiles(repoDir, branch, filepaths, commitMsg, { force
  * @param {boolean} [opts.wholeFile] - source is the complete book file; copy it over the repo file instead of chapter-splicing
  * @param {number} [opts.endChapter] - last chapter written (for wholeFile multi-chapter runs); defaults to chapter. The CI gate blocks on errors in [chapter, endChapter].
  * @param {string} [opts.pipeline] - explicit X-AI-Pipeline commit trailer (notes|tqs|generate|translate); defaults from type
+ * @param {string} [opts.body] - PR description (e.g. the interpretive-review summary); capped at PR_BODY_MAX, defaults to ''
  * @returns {{ success: boolean, details: string, prNumber?: number }}
  */
 async function door43Push(opts) {
@@ -1030,7 +1051,7 @@ async function door43Push(opts) {
       return { success: true, branchOnly: true, branchUrl, duration };
     }
 
-    const prResult = await createAndMergePR(config.token, repo, branch, prTitle, 'master', org);
+    const prResult = await createAndMergePR(config.token, repo, branch, prTitle, 'master', org, { body: opts.body });
     const duration = ((Date.now() - startTime) / 1000).toFixed(1);
 
     if (prResult.success) {
@@ -1047,4 +1068,4 @@ async function door43Push(opts) {
   }
 }
 
-module.exports = { door43Push, checkConflictingBranches, BOOK_NUMBERS, REPO_MAP, getRepoFilename };
+module.exports = { door43Push, checkConflictingBranches, createAndMergePR, capPrBody, PR_BODY_MAX, BOOK_NUMBERS, REPO_MAP, getRepoFilename };

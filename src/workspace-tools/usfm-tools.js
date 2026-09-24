@@ -1475,6 +1475,25 @@ function checkUltVoiceMismatch({ alignedUsfm }) {
   return lines3.join('\n');
 }
 
+// Hebrew cantillation accents (U+0591-U+05AF) and the invisible format marks that
+// UHB uses as morpheme separators. The AI alignment step sometimes substitutes one
+// for the other when writing x-content -- most often emitting a U+2060 WORD JOINER
+// where UHB carries a prepositive accent, apparently reading the accent as a prefix
+// boundary (#399). Stripping both yields a key under which the AI's x-content and
+// the UHB token still collide, so the milestone can be repaired to UHB bytes.
+const XC_ACCENT_RE = /[\u0591-\u05AF]/g;
+const XC_INVISIBLE_RE = /[\u200B-\u200F\u2060\uFEFF\u00AD]/g;
+
+/**
+ * Accent- and joiner-insensitive match key for a Hebrew word. Consonants, vowel
+ * points, dagesh and the shin/sin dots (U+05B0-U+05C7) are all preserved, so this
+ * stays far narrower than a full consonantal skeleton -- it only forgives the two
+ * classes of mark the aligner is known to confuse.
+ */
+function xContentMatchKey(word) {
+  return word.normalize('NFC').replace(XC_ACCENT_RE, '').replace(XC_INVISIBLE_RE, '');
+}
+
 /**
  * Repair x-content byte order in aligned USFM to match UHB verbatim.
  *
@@ -1487,6 +1506,16 @@ function checkUltVoiceMismatch({ alignedUsfm }) {
  * This function reads UHB token texts verbatim (bypassing any library that might
  * normalize) and patches any x-content value that differs from its UHB source
  * only in combining-mark order (i.e. same NFC glyph, different bytes).
+ *
+ * Lookup is tiered and fail-closed (#399):
+ *   1. exact NFC match -- fixes pure combining-mark reordering;
+ *   2. accent/joiner-insensitive match -- fixes x-content that swapped a
+ *      cantillation accent for a U+2060 WORD JOINER, or dropped the accent
+ *      outright, so the NFC forms genuinely differ. Applied only when every UHB
+ *      candidate under that key is the same verbatim token; a key shared by two
+ *      distinct tokens is left untouched and reported rather than guessed.
+ * Milestones that match no UHB token under either tier are counted and reported
+ * instead of silently passing, so a bad batch stops looking like a clean one.
  *
  * @param {object} opts
  * @param {string} opts.alignedUsfm - Path to aligned USFM file (relative to workspace)
@@ -1503,7 +1532,8 @@ function repairAlignmentXContent({ alignedUsfm, hebrewUsfm }) {
   // Build per-verse map of verbatim UHB word texts.
   // Use a plain regex — never pass through usfm-js or any library that might normalize.
   const hebrewContent = fs.readFileSync(hebrewPath, 'utf8');
-  const uhbByVerse = {};  // "ch:vs" -> { NFC(word): [verbatim1, verbatim2, ...] }
+  // "ch:vs" -> { byNfc: { NFC(word): [entry, ...] }, byKey: { matchKey: [entry, ...] } }
+  const uhbByVerse = {};
   let uhbCh = 0, uhbVs = 0;
   const UHB_W_RE = /\\w\s+([^\\]*)\\*/g;
 
@@ -1515,8 +1545,8 @@ function repairAlignmentXContent({ alignedUsfm, hebrewUsfm }) {
     if (!uhbCh || !uhbVs) continue;
 
     const key = `${uhbCh}:${uhbVs}`;
-    if (!uhbByVerse[key]) uhbByVerse[key] = {};
-    const map = uhbByVerse[key];
+    if (!uhbByVerse[key]) uhbByVerse[key] = { byNfc: {}, byKey: {} };
+    const { byNfc, byKey } = uhbByVerse[key];
 
     UHB_W_RE.lastIndex = 0;
     let m;
@@ -1529,20 +1559,25 @@ function repairAlignmentXContent({ alignedUsfm, hebrewUsfm }) {
       const lemmaM = attrStr.match(/lemma="([^"]*)"/);
       const lemma = lemmaM ? lemmaM[1] : null;
 
+      if (!word) continue;
+      const entry = { word, lemma };
+
       const nfc = word.normalize('NFC');
+      if (!byNfc[nfc]) byNfc[nfc] = [];
+      byNfc[nfc].push(entry);
 
-      if (!map[nfc]) map[nfc] = [];
-
-      map[nfc].push({
-        word,
-        lemma
-      });
+      const matchKey = xContentMatchKey(word);
+      if (!byKey[matchKey]) byKey[matchKey] = [];
+      byKey[matchKey].push(entry);
     }
   }
 
   // Patch x-content values in the aligned USFM.
   const alignedLines = fs.readFileSync(alignedPath, 'utf8').split('\n');
   let repaired = 0;
+  let accentRepaired = 0;
+  const ambiguous = [];   // matched >1 distinct UHB token under the relaxed key
+  const unmatched = [];   // matched no UHB token in the verse under either tier
   let aCh = 0, aVs = 0;
   const ZALN_RE = /\\zaln-s\s*\|([^*]*?)\\\*/g;
 
@@ -1558,8 +1593,8 @@ function repairAlignmentXContent({ alignedUsfm, hebrewUsfm }) {
     if (!line.includes('\\zaln-s')) continue;
 
     const verseKey = `${aCh}:${aVs}`;
-    const verseTokens = uhbByVerse[verseKey];
-    if (!verseTokens) continue;
+    const verseIndex = uhbByVerse[verseKey];
+    if (!verseIndex) continue;
 
     ZALN_RE.lastIndex = 0;
     let newLine = line;
@@ -1575,10 +1610,31 @@ function repairAlignmentXContent({ alignedUsfm, hebrewUsfm }) {
       // Only process Hebrew-range text
       if (!xContent || !/[֐-׿]/.test(xContent)) continue;
 
-      // Look up UHB verbatim words by NFC-normalized form
-      const nfc = xContent.normalize('NFC');
-      const candidates = verseTokens[nfc];
-      if (!candidates || !candidates.length) continue;
+      // Tier 1: look up UHB verbatim words by NFC-normalized form. Catches
+      // x-content that differs from UHB only in combining-mark order.
+      let candidates = verseIndex.byNfc[xContent.normalize('NFC')];
+      let accentTier = false;
+
+      if (!candidates || !candidates.length) {
+        // Tier 2 (#399): the NFC forms genuinely differ, because the aligner put a
+        // U+2060 WORD JOINER where UHB has a cantillation accent (or dropped the
+        // accent). Retry under the accent/joiner-insensitive key.
+        const relaxed = verseIndex.byKey[xContentMatchKey(xContent)];
+        if (!relaxed || !relaxed.length) {
+          unmatched.push(`${verseKey} ${xContent}`);
+          continue;
+        }
+        // Fail closed: if the relaxed key collapses two different UHB tokens, we
+        // cannot tell which one this milestone meant. x-occurrence is counted over
+        // the aligner's own spelling, so it is not a trustworthy tiebreaker here.
+        const distinct = new Set(relaxed.map((c) => c.word));
+        if (distinct.size > 1) {
+          ambiguous.push(`${verseKey} ${xContent}`);
+          continue;
+        }
+        candidates = relaxed;
+        accentTier = true;
+      }
 
       // Use x-occurrence (1-based) to select the right candidate
       const occM = attrStr.match(/x-occurrence="(\d+)"/);
@@ -1589,7 +1645,7 @@ function repairAlignmentXContent({ alignedUsfm, hebrewUsfm }) {
 
       if (!uhbWord || uhbWord === xContent) continue;
 
-      // Same NFC glyph, different byte order — patch to UHB verbatim bytes
+      // Patch to UHB verbatim bytes
       const posInNewLine = zm.index + offset;
 
       // start from original matched token
@@ -1617,10 +1673,20 @@ function repairAlignmentXContent({ alignedUsfm, hebrewUsfm }) {
 
       offset += newMatch.length - zm[0].length;
       repaired++;
+      if (accentTier) accentRepaired++;
     }
 
     if (newLine !== line) alignedLines[i] = newLine;
   }
+
+  const warnings = [];
+  if (ambiguous.length) {
+    warnings.push(`${ambiguous.length} x-content value(s) matched more than one UHB token once accents and joiners were ignored; left unchanged (ambiguous): ${ambiguous.slice(0, 5).join(', ')}`);
+  }
+  if (unmatched.length) {
+    warnings.push(`${unmatched.length} x-content value(s) matched no UHB \\w token in their verse: ${unmatched.slice(0, 5).join(', ')}`);
+  }
+  const warningText = warnings.length ? `\nWARNING: ${warnings.join('\nWARNING: ')}` : '';
 
   if (repaired > 0) {
     fs.writeFileSync(alignedPath, alignedLines.join('\n'));
@@ -1630,9 +1696,10 @@ function repairAlignmentXContent({ alignedUsfm, hebrewUsfm }) {
     // createAlignedUsfm or mergeAlignedUsfm. Normalization is newline-only and
     // idempotent, so applying it on both routes is harmless.
     normalizeVerseLineStartsInFile(alignedPath);
-    return `Repaired ${repaired} x-content byte-order mismatch(es) in ${path.basename(alignedUsfm)} — x-content now byte-identical to UHB`;
+    const accentNote = accentRepaired ? ` (${accentRepaired} of them an accent/word-joiner substitution)` : '';
+    return `Repaired ${repaired} x-content mismatch(es)${accentNote} in ${path.basename(alignedUsfm)} — x-content now byte-identical to UHB${warningText}`;
   }
-  return `No x-content byte-order mismatches found in ${path.basename(alignedUsfm)}`;
+  return `No x-content mismatches found in ${path.basename(alignedUsfm)}${warningText}`;
 }
 
 module.exports = {
