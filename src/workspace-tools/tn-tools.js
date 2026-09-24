@@ -3383,4 +3383,6 @@ module.exports = {
   _stripAlternateTranslation: stripAlternateTranslation,
   _locateQuoteStart: locateQuoteStart,
   _comparableQuoteLength: comparableQuoteLength,
+  _splitQuoteSegments: splitQuoteSegments,
+  _buildComparableIndex: buildComparableIndex,
 };

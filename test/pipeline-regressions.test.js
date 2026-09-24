@@ -311,6 +311,119 @@ test('checkUltEdits finds flat aligned ULT outputs', async () => {
   }
 });
 
+// Issue #186: ISA 53/54 issues TSV carried pre-edit ULT wording while the
+// aligned file already matched Door43 master, so the diff gate said "no human
+// edits" and the stale GLQuotes later produced blank orig_quotes.
+async function runCheckUltEditsFixture({ masterUsfm, alignedUsfm, issuesTsv }) {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'check-ult-stale-'));
+  if (alignedUsfm != null) {
+    const alignedDir = path.join(tempDir, 'output', 'AI-ULT', 'ISA');
+    fs.mkdirSync(alignedDir, { recursive: true });
+    fs.writeFileSync(path.join(alignedDir, 'ISA-53-aligned.usfm'), alignedUsfm);
+  }
+  const issuesRel = 'output/issues/ISA/ISA-53.tsv';
+  fs.mkdirSync(path.join(tempDir, 'output', 'issues', 'ISA'), { recursive: true });
+  fs.writeFileSync(path.join(tempDir, issuesRel), issuesTsv);
+
+  const oldBaseDir = process.env.CSKILLBP_DIR;
+  process.env.CSKILLBP_DIR = tempDir;
+  const pipelineUtilsPath = require.resolve('../src/pipeline-utils');
+  const checkUltEditsPath = require.resolve('../src/check-ult-edits');
+  delete require.cache[pipelineUtilsPath];
+  delete require.cache[checkUltEditsPath];
+
+  const originalGet = https.get;
+  https.get = (url, callback) => {
+    const { EventEmitter } = require('events');
+    const response = new EventEmitter();
+    response.statusCode = 200;
+    response.headers = {};
+    response.setEncoding = () => {};
+    response.resume = () => {};
+    process.nextTick(() => {
+      callback(response);
+      response.emit('data', masterUsfm);
+      response.emit('end');
+    });
+    return { on() { return this; } };
+  };
+
+  try {
+    const { checkUltEdits } = require('../src/check-ult-edits');
+    return await checkUltEdits({
+      book: 'ISA',
+      chapter: 53,
+      workspaceDir: tempDir,
+      pipeDir: 'tmp/pipeline/ISA-53',
+      issuesPath: issuesRel,
+    });
+  } finally {
+    https.get = originalGet;
+    if (oldBaseDir == null) delete process.env.CSKILLBP_DIR;
+    else process.env.CSKILLBP_DIR = oldBaseDir;
+    delete require.cache[pipelineUtilsPath];
+    delete require.cache[checkUltEditsPath];
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+}
+
+const ISA_53_MASTER = [
+  '\\id ISA',
+  '\\c 53',
+  '\\q1',
+  '\\v 2 \\zaln-s |x-strong="c:H5927" x-content="וַ⁠יַּ֨עַל"\\*\\w For|x-occurrence="1" x-occurrences="1"\\w* \\w he|x-occurrence="1" x-occurrences="1"\\w* \\w grew|x-occurrence="1" x-occurrences="1"\\w*\\zaln-e\\* \\w up|x-occurrence="1" x-occurrences="1"\\w* \\w like|x-occurrence="1" x-occurrences="2"\\w* \\w a|x-occurrence="1" x-occurrences="2"\\w* \\w young|x-occurrence="1" x-occurrences="1"\\w* \\w plant|x-occurrence="1" x-occurrences="1"\\w*,',
+  '\\q2 \\w and|x-occurrence="1" x-occurrences="1"\\w* \\w like|x-occurrence="2" x-occurrences="2"\\w* \\w a|x-occurrence="2" x-occurrences="2"\\w* \\w root|x-occurrence="1" x-occurrences="1"\\w* \\w from|x-occurrence="1" x-occurrences="1"\\w* \\w ground|x-occurrence="1" x-occurrences="1"\\w* \\w of|x-occurrence="1" x-occurrences="1"\\w* \\w dryness|x-occurrence="1" x-occurrences="1"\\w*.',
+  '\\v 3 \\w He|x-occurrence="1" x-occurrences="1"\\w* \\w was|x-occurrence="1" x-occurrences="1"\\w* \\w despised|x-occurrence="1" x-occurrences="1"\\w*.',
+  '',
+].join('\n');
+
+test('checkUltEdits routes stale issue GLQuotes to post-edit-review even when aligned matches master (#186)', async () => {
+  const result = await runCheckUltEditsFixture({
+    masterUsfm: ISA_53_MASTER,
+    alignedUsfm: ISA_53_MASTER,
+    issuesTsv: [
+      'ISA\t53:2\tfigs-simile\tlike a root from dry ground\t\t\tsimile explanation',
+      'ISA\t53:3\tfigs-activepassive\tHe was despised\t\t\tpassive explanation',
+    ].join('\n'),
+  });
+
+  assert.equal(result.hasEdits, true);
+  assert.match(result.reason, /stale_issue_quotes: 1 GLQuote/);
+  assert.doesNotMatch(result.reason, /ult_diff/);
+  assert.deepEqual(result.staleQuotes, [{ ref: '53:2', glQuote: 'like a root from dry ground' }]);
+  assert.equal(result.masterPath, 'tmp/pipeline/ISA-53/ult_master_plain.usfm');
+});
+
+test('checkUltEdits reports no edits when aligned matches master and every GLQuote is in master (#186)', async () => {
+  const result = await runCheckUltEditsFixture({
+    masterUsfm: ISA_53_MASTER,
+    alignedUsfm: ISA_53_MASTER,
+    issuesTsv: [
+      'ISA\t53:2\tfigs-simile\tlike a root from ground of dryness\t\t\tsimile explanation',
+      'ISA\t53:2\tfigs-ellipsis\tgrew up & like a young plant\t\t\tdiscontinuous quote',
+      'ISA\t53:2\tfigs-explicit\t\t\t\tempty GLQuote rows are ignored',
+      'ISA\t53:3\tfigs-activepassive\tHe was despised\t\t\tpassive explanation',
+    ].join('\n'),
+  });
+
+  assert.equal(result.hasEdits, false);
+  assert.equal(result.reason, null);
+  assert.deepEqual(result.staleQuotes, []);
+  assert.equal(result.masterPath, null);
+});
+
+test('checkUltEdits routes a chapter with no aligned file to post-edit-review instead of skipping (#186)', async () => {
+  const result = await runCheckUltEditsFixture({
+    masterUsfm: ISA_53_MASTER,
+    alignedUsfm: null,
+    issuesTsv: 'ISA\t53:3\tfigs-activepassive\tHe was despised\t\t\tpassive explanation\n',
+  });
+
+  assert.equal(result.hasEdits, true);
+  assert.equal(result.reason, 'aligned_missing');
+  assert.equal(result.masterPath, 'tmp/pipeline/ISA-53/ult_master_plain.usfm');
+});
+
 test('notes pipeline final canonical quote sync runs after quality and tags unresolved rows', () => {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'notes-final-sync-'));
   const relRoot = path.join('tmp', path.basename(tempDir));
