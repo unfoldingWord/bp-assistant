@@ -9,6 +9,8 @@ const path = require('path');
 const https = require('https');
 const crypto = require('crypto');
 const { normalizeIntroRow } = require('../lib/insert-tn-rows');
+const { buildSeeHowSentence, formatAlsoOccurs } = require('./recurrence-index');
+const { BOOK_NAMES } = require('../api-runner/verse-data');
 
 const CSKILLBP_DIR = process.env.CSKILLBP_DIR || '/srv/bot/workspace';
 
@@ -743,25 +745,25 @@ function formatAlternateTranslation(at) {
 function buildSeeHowReference(refHint, item) {
   const hint = normalizeWhitespace(refHint).replace(/^see how\s+/i, '');
   if (!hint) return '';
-  const currentBook = String(item.book || '').toLowerCase();
+  const currentBook = String(item.book || '').toUpperCase();
   const [currentChapter] = String(item.reference || '').split(':');
+  // Same-book pointers use the canonical corpus form [C:V](../CC/VV.md). The
+  // padding rule (three digits for PSA) lives in formatTnLink, one place.
   const sameVerse = hint.match(/^(\d+)$/);
-  if (sameVerse && currentBook && currentChapter) {
-    const verse = sameVerse[1];
-    return `See how you translated the similar expression in [verse ${verse}](../../${currentBook}/${currentChapter}/${verse}.md).`;
+  if (sameVerse && currentChapter) {
+    return buildSeeHowSentence({ book: currentBook, targetRef: `${currentChapter}:${sameVerse[1]}` });
   }
   const sameBook = hint.match(/^(\d+):(\d+)$/);
-  if (sameBook && currentBook) {
-    const chapter = sameBook[1];
-    const verse = sameBook[2];
-    return `See how you translated the similar expression in [chapter ${chapter}:${verse}](../../${currentBook}/${chapter}/${verse}.md).`;
+  if (sameBook) {
+    return buildSeeHowSentence({ book: currentBook, targetRef: `${sameBook[1]}:${sameBook[2]}` });
   }
+  // Cross-book pointers have no canonical relative-path form in the published
+  // corpus, so they are written as prose naming the book.
   const otherBook = hint.match(/^([1-3]?[A-Za-z]{3})\s+(\d+):(\d+)$/);
   if (otherBook) {
-    const book = otherBook[1].toLowerCase();
-    const chapter = otherBook[2];
-    const verse = otherBook[3];
-    return `See how you translated the similar expression in [${otherBook[1].toUpperCase()} ${chapter}:${verse}](../../${book}/${chapter}/${verse}.md).`;
+    const code = otherBook[1].toUpperCase();
+    const name = BOOK_NAMES[code] || code;
+    return `See how you translated the similar expression in ${name} ${otherBook[2]}:${otherBook[3]}.`;
   }
   return '';
 }
@@ -1155,6 +1157,22 @@ function normalizeAssembledNoteText(noteText) {
     .trim();
 }
 
+/**
+ * Append the deterministic "This also occurs in verses …" sentence produced by
+ * the see-how detector. It goes BEFORE any trailing " Alternate translation: ["
+ * so the AT clause stays last, and it is idempotent across the two assembly
+ * passes (pre- and post-AT generation).
+ */
+function appendAlsoOccurs(note, alsoOccursVerses) {
+  const sentence = formatAlsoOccurs(alsoOccursVerses || []);
+  if (!sentence) return note;
+  const text = String(note || '');
+  if (text.includes(sentence)) return text;
+  const atIdx = text.indexOf(' Alternate translation: [');
+  if (atIdx < 0) return `${text} ${sentence}`.trim();
+  return `${text.slice(0, atIdx)} ${sentence}${text.slice(atIdx)}`.trim();
+}
+
 function cleanPlainUsfmVerseText(rawText) {
   return String(rawText || '')
     .replace(/\\zaln-[se][^*]*\*/g, '')
@@ -1378,8 +1396,13 @@ function assembleNotes({ preparedJson, generatedJson, output }) {
     if (!noteText && item.reference && item.sref) noteText = generated[`${item.reference}:${item.sref}`] || generated[`${item.reference}_${item.sref}`];
     if (!noteText) { missing.push(item.id || `index:${item.index}`); continue; }
     const quote = item.orig_quote || '';
-    const note = normalizeAssembledNoteText(noteText);
-    const sref = item.sref ? `rc://*/ta/man/translate/${item.sref}` : '';
+    const note = appendAlsoOccurs(normalizeAssembledNoteText(noteText), item.also_occurs_verses);
+    // A see-how pointer inherits the target row's SupportReference; an empty
+    // string set by the detector means "leave the column blank".
+    const srefBase = String(
+      item.support_reference !== undefined ? item.support_reference : item.sref
+    ).replace(/^rc:\/\/\*\/ta\/man\/translate\//, '');
+    const sref = srefBase ? `rc://*/ta/man/translate/${srefBase}` : '';
     rows.push({ ref: item.reference, id: item.id, tags: '', sref, quote, occurrence: quote ? '1' : '', note, _rk: refKey(item.reference), _ik: intraKey(item) });
   }
   // Include intro rows in the sort pass so a well-formed Reference lands them
@@ -3353,6 +3376,8 @@ module.exports = {
   _buildWriterPrompt: buildWriterPrompt,
   _maybeBuildProgrammaticNote: maybeBuildProgrammaticNote,
   _normalizeAssembledNoteText: normalizeAssembledNoteText,
+  _appendAlsoOccurs: appendAlsoOccurs,
+  _buildSeeHowReference: buildSeeHowReference,
   _inspectOpeningBold: inspectOpeningBold,
   _resolveGlQuotes: resolveGlQuotes,
   _stripAlternateTranslation: stripAlternateTranslation,

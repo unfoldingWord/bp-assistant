@@ -117,6 +117,7 @@ function buildRuntimePaths(dirPath) {
     preparedNotes: `${dirPath}/prepared_notes.json`,
     generatedNotes: `${dirPath}/generated_notes.json`,
     alignmentData: `${dirPath}/alignment_data.json`,
+    recurrenceIndex: `${dirPath}/recurrence_index.json`,
     tnQualityFindings: `${dirPath}/tn_quality_findings.json`,
   };
 }
@@ -464,6 +465,8 @@ async function buildUstContext({ book, chapter, verseStart, verseEnd, localUltPa
 
 module.exports = {
   createPipelineDir,
+  buildRuntimePaths,
+  preCreateStubs,
   writeContext,
   readContext,
   updateContextArtifacts,

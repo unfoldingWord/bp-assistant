@@ -6,7 +6,7 @@ const path = require('path');
 const { z } = require('zod');
 
 const { createQualityTools } = require('../src/workspace-tools');
-const { checkTnQuality } = require('../src/workspace-tools/quality-tools');
+const { checkTnQuality, normalizeHebrewQuote } = require('../src/workspace-tools/quality-tools');
 
 test('checkTnQuality uses at_required as the missing_at contract', async () => {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'quality-tools-'));
@@ -529,4 +529,422 @@ test('checkTnQuality flags markdown inside AT brackets and leaves prose bold to 
   const boldIds = findings
     .filter((f) => f.category === 'bold_not_in_ult').map((f) => f.id);
   assert.deepEqual(boldIds, ['a3b4']);
+});
+
+// --- Phase 4 guardrails: see-how link checks (docs/plan.md) ---
+
+test('checkTnQuality seehow_target_missing: no match in output TSV or merged book TSV', async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'quality-seehow-missing-'));
+  const relRoot = path.join('tmp', path.basename(tempDir));
+  fs.mkdirSync(path.join('/srv/bot/workspace', relRoot), { recursive: true });
+
+  const tsvRel = path.join(relRoot, 'tn.tsv');
+  const findingsRel = path.join(relRoot, 'findings.json');
+
+  fs.writeFileSync(path.join('/srv/bot/workspace', tsvRel), [
+    'Reference\tID\tTags\tSupportReference\tQuote\tOccurrence\tNote',
+    // Points at 2:9 — no row for 2:9 exists in this TSV, and no merged book
+    // TSV is supplied, so this must resolve as "unverified", not "missing".
+    '3:1\ta1b2\t\t\t\t\tSee how you translated the similar expression in [2:9](../02/09.md).',
+  ].join('\n'));
+
+  await checkTnQuality({ tsvPath: tsvRel, output: findingsRel });
+
+  const findings = readFindings(findingsRel);
+  assert.ok(findings.some((f) => f.id === 'a1b2' && f.category === 'seehow_target_unverified'));
+  assert.ok(!findings.some((f) => f.category === 'seehow_target_missing'));
+});
+
+test('checkTnQuality seehow_target_missing: merged book TSV available but target absent', async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'quality-seehow-missing2-'));
+  const relRoot = path.join('tmp', path.basename(tempDir));
+  fs.mkdirSync(path.join('/srv/bot/workspace', relRoot), { recursive: true });
+
+  const tsvRel = path.join(relRoot, 'tn.tsv');
+  const findingsRel = path.join(relRoot, 'findings.json');
+
+  fs.writeFileSync(path.join('/srv/bot/workspace', tsvRel), [
+    'Reference\tID\tTags\tSupportReference\tQuote\tOccurrence\tNote',
+    '3:1\ta1b2\t\t\t\t\tSee how you translated the similar expression in [2:9](../02/09.md).',
+  ].join('\n'));
+
+  await checkTnQuality({
+    tsvPath: tsvRel,
+    output: findingsRel,
+    // Merged book TSV is present (so the check has an authoritative answer)
+    // but has no row covering 2:9 — this is a real error, not "unverified".
+    bookTsvRows: ['2:5', '2:7'],
+  });
+
+  const findings = readFindings(findingsRel);
+  assert.ok(findings.some((f) => f.id === 'a1b2' && f.category === 'seehow_target_missing' && f.severity === 'error'));
+  assert.ok(!findings.some((f) => f.category === 'seehow_target_unverified'));
+});
+
+test('checkTnQuality seehow target resolves against the current TSV or a bridged merged-TSV row', async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'quality-seehow-hit-'));
+  const relRoot = path.join('tmp', path.basename(tempDir));
+  fs.mkdirSync(path.join('/srv/bot/workspace', relRoot), { recursive: true });
+
+  const tsvRel = path.join(relRoot, 'tn.tsv');
+  const findingsRel = path.join(relRoot, 'findings.json');
+
+  fs.writeFileSync(path.join('/srv/bot/workspace', tsvRel), [
+    'Reference\tID\tTags\tSupportReference\tQuote\tOccurrence\tNote',
+    // Target 2:5 exists as a row right here in the current output TSV.
+    '2:5\tz9y8\t\t\t\t\tThe similar expression appears here.',
+    '3:1\ta1b2\t\t\t\t\tSee how you translated the similar expression in [2:5](../02/05.md).',
+    // Target 5:6 is only covered by a verse-bridge row (5:6-7) in the merged book TSV.
+    '9:1\tc3d4\t\t\t\t\tSee how you translated the similar expression in [5:6](../05/06.md).',
+  ].join('\n'));
+
+  await checkTnQuality({
+    tsvPath: tsvRel,
+    output: findingsRel,
+    bookTsvRows: ['5:6-7'],
+  });
+
+  const findings = readFindings(findingsRel);
+  const seehowFindings = findings.filter((f) => ['seehow_target_missing', 'seehow_target_unverified'].includes(f.category));
+  assert.deepEqual(seehowFindings, []);
+});
+
+test('checkTnQuality seehow_forward_pointer: target later than the note\'s own reference', async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'quality-seehow-forward-'));
+  const relRoot = path.join('tmp', path.basename(tempDir));
+  fs.mkdirSync(path.join('/srv/bot/workspace', relRoot), { recursive: true });
+
+  const tsvRel = path.join(relRoot, 'tn.tsv');
+  const findingsRel = path.join(relRoot, 'findings.json');
+
+  fs.writeFileSync(path.join('/srv/bot/workspace', tsvRel), [
+    'Reference\tID\tTags\tSupportReference\tQuote\tOccurrence\tNote',
+    '2:1\tz9y8\t\t\t\t\tThe similar expression appears here.',
+    // 2:1 points forward to 2:5, in the same chapter — invalid.
+    '2:1\ta1b2\t\t\t\t\tSee how you translated the similar expression in [2:5](../02/05.md).',
+  ].join('\n'));
+
+  await checkTnQuality({ tsvPath: tsvRel, output: findingsRel });
+
+  const findings = readFindings(findingsRel);
+  assert.ok(findings.some((f) => f.id === 'a1b2' && f.category === 'seehow_forward_pointer' && f.severity === 'error'));
+});
+
+test('checkTnQuality seehow: same-verse link is ignored (not forward, not missing)', async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'quality-seehow-same-'));
+  const relRoot = path.join('tmp', path.basename(tempDir));
+  fs.mkdirSync(path.join('/srv/bot/workspace', relRoot), { recursive: true });
+
+  const tsvRel = path.join(relRoot, 'tn.tsv');
+  const findingsRel = path.join(relRoot, 'findings.json');
+
+  fs.writeFileSync(path.join('/srv/bot/workspace', tsvRel), [
+    'Reference\tID\tTags\tSupportReference\tQuote\tOccurrence\tNote',
+    // Link target 2:5 is the same verse as the note's own reference.
+    '2:5\ta1b2\t\t\t\t\tSee how you translated the similar expression in [2:5](../02/05.md).',
+  ].join('\n'));
+
+  await checkTnQuality({ tsvPath: tsvRel, output: findingsRel });
+
+  const findings = readFindings(findingsRel);
+  const seehowFindings = findings.filter((f) => f.category.startsWith('seehow_'));
+  assert.deepEqual(seehowFindings, []);
+});
+
+test('checkTnQuality seehow_noncanonical: "see how you rendered" and old-format link path', async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'quality-seehow-nc-'));
+  const relRoot = path.join('tmp', path.basename(tempDir));
+  fs.mkdirSync(path.join('/srv/bot/workspace', relRoot), { recursive: true });
+
+  const tsvRel = path.join(relRoot, 'tn.tsv');
+  const findingsRel = path.join(relRoot, 'findings.json');
+
+  fs.writeFileSync(path.join('/srv/bot/workspace', tsvRel), [
+    'Reference\tID\tTags\tSupportReference\tQuote\tOccurrence\tNote',
+    // "rendered" instead of "translated" — never valid, regardless of link shape.
+    '3:1\ta1b2\t\t\t\t\tSee how you rendered the similar expression in [2:5](../02/05.md).',
+    // "translated" with the old book-relative link format instead of ../CC/VV.md.
+    '3:2\tb2c3\t\t\t\t\tSee how you translated the similar expression in [2:5](../../zec/02/05.md).',
+  ].join('\n'));
+
+  await checkTnQuality({ tsvPath: tsvRel, output: findingsRel });
+
+  const findings = readFindings(findingsRel);
+  const ncById = new Map();
+  for (const f of findings.filter((f) => f.category === 'seehow_noncanonical')) {
+    if (!ncById.has(f.id)) ncById.set(f.id, []);
+    ncById.get(f.id).push(f.severity);
+  }
+  assert.deepEqual(ncById.get('a1b2'), ['warning']);
+  assert.deepEqual(ncById.get('b2c3'), ['warning']);
+});
+
+test('checkTnQuality seehow_noncanonical: PSA requires 3-digit padding, other books require 2-digit', async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'quality-seehow-pad-'));
+  const relRoot = path.join('tmp', path.basename(tempDir));
+  fs.mkdirSync(path.join('/srv/bot/workspace', relRoot), { recursive: true });
+
+  const tsvRel = path.join(relRoot, 'tn.tsv');
+  const findingsRel = path.join(relRoot, 'findings.json');
+
+  fs.writeFileSync(path.join('/srv/bot/workspace', tsvRel), [
+    'Reference\tID\tTags\tSupportReference\tQuote\tOccurrence\tNote',
+    // PSA note but 2-digit padding — should be flagged (needs 3-digit).
+    '78:1\ta1b2\t\t\t\t\tSee how you translated the similar expression in [39:5](../39/05.md).',
+  ].join('\n'));
+
+  await checkTnQuality({ tsvPath: tsvRel, output: findingsRel, book: 'PSA' });
+
+  const psaFindings = readFindings(findingsRel).filter((f) => f.category === 'seehow_noncanonical');
+  assert.ok(psaFindings.some((f) => f.id === 'a1b2'));
+
+  // Same shape, non-PSA book with 3-digit padding — also flagged (needs 2-digit).
+  const tempDir2 = fs.mkdtempSync(path.join(os.tmpdir(), 'quality-seehow-pad2-'));
+  const relRoot2 = path.join('tmp', path.basename(tempDir2));
+  fs.mkdirSync(path.join('/srv/bot/workspace', relRoot2), { recursive: true });
+  const tsvRel2 = path.join(relRoot2, 'tn.tsv');
+  const findingsRel2 = path.join(relRoot2, 'findings.json');
+  fs.writeFileSync(path.join('/srv/bot/workspace', tsvRel2), [
+    'Reference\tID\tTags\tSupportReference\tQuote\tOccurrence\tNote',
+    '3:1\tc3d4\t\t\t\t\tSee how you translated the similar expression in [002:005](../002/005.md).',
+  ].join('\n'));
+  await checkTnQuality({ tsvPath: tsvRel2, output: findingsRel2, book: 'ZEC' });
+  const zecFindings = readFindings(findingsRel2).filter((f) => f.category === 'seehow_noncanonical');
+  assert.ok(zecFindings.some((f) => f.id === 'c3d4'));
+
+  // Correctly-padded PSA link must NOT be flagged.
+  const tempDir3 = fs.mkdtempSync(path.join(os.tmpdir(), 'quality-seehow-pad3-'));
+  const relRoot3 = path.join('tmp', path.basename(tempDir3));
+  fs.mkdirSync(path.join('/srv/bot/workspace', relRoot3), { recursive: true });
+  const tsvRel3 = path.join(relRoot3, 'tn.tsv');
+  const findingsRel3 = path.join(relRoot3, 'findings.json');
+  fs.writeFileSync(path.join('/srv/bot/workspace', tsvRel3), [
+    'Reference\tID\tTags\tSupportReference\tQuote\tOccurrence\tNote',
+    '39:6\td4e5\t\t\t\t\tThe similar expression appears here.',
+    '78:1\td4e5b\t\t\t\t\tSee how you translated the similar expression in [039:006](../039/006.md).',
+  ].join('\n'));
+  await checkTnQuality({ tsvPath: tsvRel3, output: findingsRel3, book: 'PSA' });
+  const psaOkFindings = readFindings(findingsRel3).filter((f) => f.category === 'seehow_noncanonical');
+  assert.deepEqual(psaOkFindings, []);
+});
+
+test('multiverse_backref does not fire on canonical see-how sentences or the "also occurs" summary', async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'quality-backref-nonreg-'));
+  const relRoot = path.join('tmp', path.basename(tempDir));
+  fs.mkdirSync(path.join('/srv/bot/workspace', relRoot), { recursive: true });
+
+  const tsvRel = path.join(relRoot, 'tn.tsv');
+  const findingsRel = path.join(relRoot, 'findings.json');
+
+  fs.writeFileSync(path.join('/srv/bot/workspace', tsvRel), [
+    'Reference\tID\tTags\tSupportReference\tQuote\tOccurrence\tNote',
+    '2:5\tz9y8\t\t\t\t\tThe similar expression appears here.',
+    '3:1\ta1b2\t\t\t\t\tSee how you translated the similar expression in [2:5](../02/05.md).',
+    '3:5\tb2c3\t\t\t\t\tThe similar expression appears here. This also occurs in verses 5, 7, 8, and 11.',
+  ].join('\n'));
+
+  await checkTnQuality({ tsvPath: tsvRel, output: findingsRel });
+
+  const backrefFindings = readFindings(findingsRel).filter((f) => f.category === 'multiverse_backref');
+  assert.deepEqual(backrefFindings, []);
+});
+
+test('checkTnQuality seehow_noncanonical: absolute links in a see-how note are not pointers', async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'quality-seehow-abs-'));
+  const relRoot = path.join('tmp', path.basename(tempDir));
+  fs.mkdirSync(path.join('/srv/bot/workspace', relRoot), { recursive: true });
+
+  const tsvRel = path.join(relRoot, 'tn.tsv');
+  const findingsRel = path.join(relRoot, 'findings.json');
+
+  fs.writeFileSync(path.join('/srv/bot/workspace', tsvRel), [
+    'Reference\tID\tTags\tSupportReference\tQuote\tOccurrence\tNote',
+    '2:5\tz0z0\t\t\t\t\tThe earlier note this one points back to.',
+    // Canonical pointer plus a trailing tA article link. The rc:// link is not
+    // a pointer path and must not be scanned for the ../CC/VV.md shape.
+    '3:1\ta1b2\t\t\t\t\tSee how you translated the similar expression in [2:5](../02/05.md). (See: [Metaphor](rc://*/ta/man/translate/figs-metaphor))',
+  ].join('\n'));
+
+  await checkTnQuality({ tsvPath: tsvRel, output: findingsRel });
+
+  const nc = readFindings(findingsRel).filter((f) => f.category === 'seehow_noncanonical' && f.id === 'a1b2');
+  assert.deepEqual(nc, [], 'the rc:// link is left alone');
+});
+
+// --- Round 3: S2 / S3 / S4 / S10 -------------------------------------------
+
+function writeQualityTsv(prefix, rows) {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+  const relRoot = path.join('tmp', path.basename(tempDir));
+  fs.mkdirSync(path.join('/srv/bot/workspace', relRoot), { recursive: true });
+  const tsvRel = path.join(relRoot, 'tn.tsv');
+  const findingsRel = path.join(relRoot, 'findings.json');
+  fs.writeFileSync(
+    path.join('/srv/bot/workspace', tsvRel),
+    ['Reference\tID\tTags\tSupportReference\tQuote\tOccurrence\tNote'].concat(rows).join('\n')
+  );
+  return { tsvRel, findingsRel };
+}
+
+test('S2: the deterministic also-occurs sentence is not multiverse language', async () => {
+  const shapes = [
+    'This also occurs in verses 5, 7, 8, and 11.',
+    'This also occurs in verses 5 and 7.',
+    'This also occurs in verse 5.',
+    'This also occurs in verses 3–5 and 9.',
+  ];
+  const rows = shapes.map((sentence, i) =>
+    `3:${i + 1}\tq${i}q${i}\t\t\t\t\tThe possessive form describes a message. ${sentence}`);
+  const { tsvRel, findingsRel } = writeQualityTsv('quality-alsooccurs-', rows);
+
+  await checkTnQuality({ tsvPath: tsvRel, output: findingsRel });
+
+  const noisy = readFindings(findingsRel)
+    .filter((f) => f.category === 'multiverse_language' || f.category === 'multiverse_backref');
+  assert.deepEqual(noisy, [], 'no multiverse findings for any also-occurs shape');
+});
+
+test('S3: an ordinary note that links forward is not a see-how pointer', async () => {
+  // Golden JOS 1 row w48w: "through [verse 9](../01/09.md)" in a plain note.
+  const { tsvRel, findingsRel } = writeQualityTsv('quality-forwardlink-', [
+    '1:5\tw48w\t\t\t\t\tThis command runs through [verse 9](../01/09.md) and shapes the paragraph.',
+  ]);
+
+  await checkTnQuality({ tsvPath: tsvRel, output: findingsRel });
+
+  const seeHow = readFindings(findingsRel).filter((f) => String(f.category).startsWith('seehow_'));
+  assert.deepEqual(seeHow, [], 'no see-how findings on a note without a pointer sentence');
+});
+
+test('S4: chapter intro rows are never treated as see-how pointers', async () => {
+  const { tsvRel, findingsRel } = writeQualityTsv('quality-intro-', [
+    '1:intro\tqki3\t\t\t\t0\t# Notes\\n\\nSee how you translated this in [1:7](../01/07.md) and [9:1](../09/01.md).',
+  ]);
+
+  await checkTnQuality({ tsvPath: tsvRel, output: findingsRel });
+
+  const seeHow = readFindings(findingsRel).filter((f) => String(f.category).startsWith('seehow_'));
+  assert.deepEqual(seeHow, [], 'intro rows are exempt');
+});
+
+test('S3: a forward link INSIDE a see-how sentence is still an error', async () => {
+  const { tsvRel, findingsRel } = writeQualityTsv('quality-forwardptr-', [
+    '2:1\tz9y8\t\t\t\t\tThe similar expression appears here.',
+    '2:1\ta1b2\t\t\t\t\tSee how you translated the similar expression in [2:5](../02/05.md).',
+  ]);
+
+  await checkTnQuality({ tsvPath: tsvRel, output: findingsRel });
+
+  assert.ok(readFindings(findingsRel).some(
+    (f) => f.id === 'a1b2' && f.category === 'seehow_forward_pointer' && f.severity === 'error'
+  ));
+});
+
+test('S10: tW and tA relative links in a see-how note are not flagged non-canonical', async () => {
+  const { tsvRel, findingsRel } = writeQualityTsv('quality-twlinks-', [
+    '2:5\tz0z0\t\t\t\t\tThe earlier note.',
+    '3:1\ta1b2\t\t\t\t\tSee how you translated the similar expression in [2:5](../02/05.md). ' +
+      '(See: [Yahweh](../../bible/kt/yahweh.md) and [Idiom](../../translate/figs-idiom/01.md))',
+  ]);
+
+  await checkTnQuality({ tsvPath: tsvRel, output: findingsRel });
+
+  const nc = readFindings(findingsRel).filter(
+    (f) => f.category === 'seehow_noncanonical' && f.id === 'a1b2'
+  );
+  assert.deepEqual(nc, [], 'only verse links are inspected');
+});
+
+// --- normalizeHebrewQuote: maqaf splitting + NFC comparison (issue #401) ---
+//
+// JER 29:4 as the UHB stores it: one \w token per word, marks in the UHB's
+// legacy order. Written as \u escapes so an editor or a tool that NFC's the
+// file cannot silently destroy the very byte order these tests exercise.
+// 5 of these 12 words change under NFC; notes and bible-editor send NFC.
+const JER_29_4_UHB = [
+  '\u05db\u05bc\u05b9\u05a5\u05d4', // 0 כֹּ֥ה  (NFC differs)
+  '\u05d0\u05b8\u05de\u05b7\u059b\u05e8', // 1 אָמַ֛ר
+  '\u05d9\u05b0\u05d4\u05d5\u05b8\u05a5\u05d4', // 2 יְהוָ֥ה
+  '\u05e6\u05b0\u05d1\u05b8\u05d0\u0596\u05d5\u05b9\u05ea', // 3 צְבָא֖וֹת
+  '\u05d0\u05b1\u05dc\u05b9\u05d4\u05b5\u05a3\u05d9', // 4 אֱלֹהֵ֣י
+  '\u05d9\u05b4\u05e9\u05c2\u05b0\u05e8\u05b8\u05d0\u05b5\u0591\u05dc', // 5 יִשְׂרָאֵ֑ל  (NFC differs)
+  '\u05dc\u05b0\u2060\u05db\u05b8\u05dc', // 6 לְ⁠כָל
+  '\u05d4\u05b7\u05a8\u2060\u05d2\u05bc\u05d5\u05b9\u05dc\u05b8\u0594\u05d4', // 7 הַ֨⁠גּוֹלָ֔ה
+  '\u05d0\u05b2\u05e9\u05c1\u05b6\u05e8', // 8 אֲשֶׁר  (NFC differs)
+  '\u05d4\u05b4\u05d2\u05b0\u05dc\u05b5\u05a5\u05d9\u05ea\u05b4\u05d9', // 9 הִגְלֵ֥יתִי
+  '\u05de\u05b4\u2060\u05d9\u05e8\u05d5\u05bc\u05e9\u05c1\u05b8\u05dc\u05b7\u0596\u05b4\u05dd', // 10 מִ⁠ירוּשָׁלִַ֖ם  (NFC differs)
+  '\u05d1\u05bc\u05b8\u05d1\u05b6\u05bd\u05dc\u05b8\u2060\u05d4', // 11 בָּבֶֽלָ⁠ה  (NFC differs)
+];
+
+const MAQAF = '\u05be';
+
+test('normalizeHebrewQuote fixture really is the UHB legacy byte order', () => {
+  // Guards the premise of the NFC tests below: if this fixture ever gets
+  // NFC-normalized in place, the F2 regressions stop testing anything.
+  const differ = JER_29_4_UHB.filter((w) => w.normalize('NFC') !== w);
+  assert.equal(differ.length, 5, 'expected 5 of 12 JER 29:4 words to differ under NFC');
+});
+
+test('normalizeHebrewQuote matches maqaf-joined words and keeps the maqafs', () => {
+  // Row gjh8: two maqaf pairs. Before the fix, splitting on whitespace alone
+  // left "לְ⁠כָל־הַ֨⁠גּוֹלָ֔ה" as one token that HEBREW_CANT_RE glued into a word the
+  // verse does not contain -> 0 of 2 matched -> 422 hebrew_words_not_in_verse.
+  const quote = `לְ⁠כָל${MAQAF}הַ֨⁠גּוֹלָ֔ה אֲשֶׁר${MAQAF}הִגְלֵ֥יתִי`.normalize('NFC');
+  const r = normalizeHebrewQuote(quote, JER_29_4_UHB);
+
+  assert.equal(r.status, 'ok');
+  assert.deepEqual(r.warnings, []);
+  assert.equal((r.quote.match(/\u05be/g) || []).length, 2, 'both maqafs survive in the output');
+  assert.ok(!r.quote.includes(' & '), 'maqaf-joined words are contiguous, not a discontinuity');
+});
+
+test('normalizeHebrewQuote matches NFC quotes against legacy-order UHB words', () => {
+  // Row qjok: כֹּ֥ה is dagesh-before-holam in the UHB, holam-before-dagesh in
+  // NFC. Before the fix neither side was NFC'd, so it silently dropped out
+  // (1 of 2 matched -> partial_match + hebrew_word_not_in_verse).
+  const quote = `${JER_29_4_UHB[0]} ${JER_29_4_UHB[1]}`.normalize('NFC');
+  const r = normalizeHebrewQuote(quote, JER_29_4_UHB);
+
+  assert.equal(r.status, 'ok');
+  assert.deepEqual(r.warnings.filter((w) => w.code === 'hebrew_word_not_in_verse'), []);
+});
+
+test('normalizeHebrewQuote handles a whole NFC verse-opening phrase', () => {
+  // Row b2dt: 6 words, 2 of which (כֹּ֥ה, יִשְׂרָאֵ֑ל) differ under NFC -> was 4 of 6.
+  const quote = JER_29_4_UHB.slice(0, 6).join(' ').normalize('NFC');
+  const r = normalizeHebrewQuote(quote, JER_29_4_UHB);
+
+  assert.equal(r.status, 'ok');
+  assert.deepEqual(r.warnings, []);
+  assert.ok(!r.quote.includes(' & '), 'six consecutive words have no gap');
+});
+
+test('normalizeHebrewQuote still inserts & at a real discontinuity', () => {
+  // Words 0 and 4 are not adjacent, so the joiner must survive the maqaf work.
+  const quote = `${JER_29_4_UHB[0]} ${JER_29_4_UHB[4]}`.normalize('NFC');
+  const r = normalizeHebrewQuote(quote, JER_29_4_UHB);
+
+  assert.equal(r.status, 'ok');
+  assert.equal((r.quote.match(/ & /g) || []).length, 1, 'gap > 1 still yields a & joiner');
+});
+
+test('normalizeHebrewQuote mixes maqaf pairs and discontinuity joiners', () => {
+  // "לְ⁠כָל־הַ֨⁠גּוֹלָ֔ה" (words 6-7) then "מִ⁠ירוּשָׁלִַ֖ם" (word 10): maqaf inside, & across.
+  const quote = `${JER_29_4_UHB[6]}${MAQAF}${JER_29_4_UHB[7]} ${JER_29_4_UHB[10]}`.normalize('NFC');
+  const r = normalizeHebrewQuote(quote, JER_29_4_UHB);
+
+  assert.equal(r.status, 'ok');
+  assert.equal((r.quote.match(/\u05be/g) || []).length, 1);
+  assert.equal((r.quote.match(/ & /g) || []).length, 1);
+});
+
+test('normalizeHebrewQuote still reports words that are genuinely absent', () => {
+  // The fix must not turn the validator into a rubber stamp.
+  const ABSENT = '\u05d6\u05d6\u05d6\u05d6'; // זזזז - not in JER 29:4
+  const r = normalizeHebrewQuote(`${JER_29_4_UHB[0]} ${ABSENT}`.normalize('NFC'), JER_29_4_UHB);
+  assert.equal(r.status, 'partial_match');
+  assert.equal(r.warnings.filter((w) => w.code === 'hebrew_word_not_in_verse').length, 1);
+
+  const none = normalizeHebrewQuote(`${ABSENT} ${ABSENT}`.normalize('NFC'), JER_29_4_UHB);
+  assert.equal(none.status, 'no_words_match');
 });

@@ -270,6 +270,26 @@ const PERMISSION_STALL_POLL_MS = 30 * 1000;
 // so the run hard-failed as a stall instead of getting the wall's retry budget).
 // #238 itself ran under 'auto' mode, not bypass, so its regression guard is
 // unaffected by this.
+//
+// The limit is EVIDENCE, not a trigger (JER 48, 2026-09-04 — issue #373). Reaching
+// it used to abort the query on the spot, and 30 days of run logs show what that
+// did: every align-all-parallel attempt on a bypass run was bimodal — either 0
+// denials and a 8–20min success, or exactly 2 denials ~35s in (the first two
+// sub-agent Bash calls after a 6-agent fan-out, hook fired 25x around them) and an
+// abort within a second. Letting those runs continue (#374) showed the denials
+// were not a startup burst but the first seconds of a session-wide wall caused by
+// BACKGROUND sub-agent spawns — see the spawn hook in buildOptions, which now
+// forces foreground spawns so the wall does not arise at all. EZK 33 needed 9
+// attempts, JER 43 five, JER 48 lost all six and the chapter failed, because a
+// retry only helped when the model happened to spawn in the foreground. The
+// count now only says WHICH kind of failure a stalled run is: the
+// abort itself still waits for the stall window (or the run's own end) with the
+// evidence unresolved, exactly like #238's time-based rule — see stallTimer and
+// hasPermissionWallEvidence. The trade: a genuine wall that is up from the start
+// now costs ~5min per probe instead of ~1s, and PERMISSION_WALL_RETRY_WINDOW_MS
+// counts those minutes, so it gets ~4 probes over ~30min rather than 6–7 over 20.
+// A wall that ends the run early (EZK 19: normal-looking result at 88s) is still
+// caught at once by the unresolved-evidence check on the result.
 const PERMISSION_WALL_DENIAL_LIMIT = Number(process.env.BP_PERMISSION_WALL_DENIALS) > 0
   ? Number(process.env.BP_PERMISSION_WALL_DENIALS)
   : 2;
@@ -335,6 +355,11 @@ function buildOptions({
   thinking,
   hooks,
   compaction,
+  // Force every Task/Agent spawn to the foreground (see the spawn hook below).
+  // Opt-in per call site because the evidence is per skill: align-all-parallel
+  // (#373). Default false leaves every other skill's spawns exactly as the
+  // model wrote them.
+  foregroundSubagents = false,
   // issue #293: an optional shared bag the caller (runClaudeOnce) creates and
   // reads back from. buildOptions has no other way to hand data out — it
   // returns only `options` — so the bypass allow-all hook below writes agent
@@ -521,17 +546,54 @@ function buildOptions({
         }
 
         const ti = input.tool_input;
-        if (!ti || typeof ti !== 'object' || typeof ti.model !== 'string') return {};
-        const resolved = resolveDifficultyModel('claude', ti.model);
-        const tierEffort = resolveDifficultyEffort(ti.model); // set effort only when spawn used a tier and caller didn't specify one
-        const modelChanged = resolved && resolved !== ti.model;
-        const effortChanged = tierEffort && ti.effort == null && ti.effort !== tierEffort;
-        if (!modelChanged && !effortChanged) return {};
+        if (!ti || typeof ti !== 'object') return {};
         const updatedInput = { ...ti };
-        if (modelChanged) updatedInput.model = resolved;
-        if (effortChanged) updatedInput.effort = tierEffort;
-        // Auditable: makes a per-run force/override + difficulty->effort observable in run logs.
-        console.log(`[model-select] ${tool} sub-agent ${ti.model}${modelChanged ? ` model->${resolved}` : ''}${effortChanged ? ` effort->${tierEffort}` : ''}${process.env.BP_FORCE_MODEL ? ' (forced)' : ''}`);
+        let changed = false;
+        // Background sub-agents ARE the "permission wall" (JER 48, 2026-09-04 —
+        // issue #373). 64 align-all-parallel runs over 30 days, no exception: every
+        // run whose spawns came back "Async agent launched successfully" was denied
+        // session-wide from ~35s on — children AND the coordinator's own re-wake
+        // turn, Read/Write/Glob/mcp alike, with the PreToolUse hooks never consulted
+        // — and every run whose spawns carried `run_in_background: false` ran its
+        // 8–20 minutes with zero denials. Whether the model omits the flag (CLI
+        // 2.1.250 then launches async) or sets it true is the coin flip that made
+        // the failures look transient. Upstream documents the mechanism: a
+        // background sub-agent "auto-denies anything not pre-approved" and does not
+        // inherit bypassPermissions (anthropics/claude-code#30693, #36042, #37442).
+        // Background alone is not the whole story: the same day's initial-pipeline
+        // run spawned 5 background agents (spaced minutes apart, coordinator
+        // polling TaskList and trading SendMessage with them) and finished 53
+        // minutes later with zero denials. What the align failures add is a
+        // coordinator that ends its turn seconds after a burst of background
+        // spawns ("All 6 agents are running, I'll verify when they report back" —
+        // result at +37s, first denial 16s later). A foreground spawn makes that
+        // early turn-end impossible. Scoped per call site (`foregroundSubagents`,
+        // set by the align-all-parallel runs in generate-pipeline) because that is
+        // where the evidence is; initial-pipeline's message-driven agents keep
+        // their background semantics untouched.
+        // Forced here, not in skill prose, for the same reason as the spawn pacing
+        // above: the hook is the only choke point before a spawn. Foreground spawns
+        // issued in one message still run concurrently, so nothing is lost.
+        // Kill switch: BP_ALLOW_BACKGROUND_SUBAGENTS=1.
+        if (foregroundSubagents && ti.run_in_background !== false && process.env.BP_ALLOW_BACKGROUND_SUBAGENTS !== '1') {
+          updatedInput.run_in_background = false;
+          changed = true;
+          console.log(`[spawn-foreground] ${tool} sub-agent "${ti.description || ''}" run_in_background ${ti.run_in_background === undefined ? 'unset' : String(ti.run_in_background)} -> false (background sub-agents are denied session-wide, #373)`);
+        }
+        if (typeof ti.model === 'string') {
+          const resolved = resolveDifficultyModel('claude', ti.model);
+          const tierEffort = resolveDifficultyEffort(ti.model); // set effort only when spawn used a tier and caller didn't specify one
+          const modelChanged = resolved && resolved !== ti.model;
+          const effortChanged = tierEffort && ti.effort == null && ti.effort !== tierEffort;
+          if (modelChanged) updatedInput.model = resolved;
+          if (effortChanged) updatedInput.effort = tierEffort;
+          if (modelChanged || effortChanged) {
+            changed = true;
+            // Auditable: makes a per-run force/override + difficulty->effort observable in run logs.
+            console.log(`[model-select] ${tool} sub-agent ${ti.model}${modelChanged ? ` model->${resolved}` : ''}${effortChanged ? ` effort->${tierEffort}` : ''}${process.env.BP_FORCE_MODEL ? ' (forced)' : ''}`);
+          }
+        }
+        if (!changed) return {};
         return { hookSpecificOutput: { hookEventName: 'PreToolUse', updatedInput } };
       } catch (err) {
         console.warn(`[claude-runner] model-resolver hook error: ${err.message}`);
@@ -738,7 +800,7 @@ function isPermissionWallEvidence(toolName, isBypassRun = false) {
 // closed > permission-denial > tool_use_error > tool_result. `state` fields:
 // consecutiveToolErrors, consecutiveTransportErrors, consecutivePermissionDenials,
 // totalPermissionDenials, stallStartAt, toolErrorSigs (Map).
-// `limits` = { transportLimit, wallLimit, isBypassRun }.
+// `limits` = { transportLimit, isBypassRun }.
 function applyRunnerUserMessage(state, sig, limits, guardrails, now = Date.now()) {
   if (sig.isTransportClosed) {
     state.consecutiveTransportErrors += 1;
@@ -760,16 +822,15 @@ function applyRunnerUserMessage(state, sig, limits, guardrails, now = Date.now()
     if (state.stallStartAt == null) state.stallStartAt = now;
     // Wall evidence accumulates only from denials that CANNOT be an allowlist miss
     // (see isPermissionWallEvidence / PERMISSION_WALL_DENIAL_LIMIT). Like the stall
-    // anchor, it clears on any productive tool result below, so the limit means
-    // "N such denials with nothing working in between" — a sustained wall, not a
-    // recoverable startup burst.
+    // anchor, it clears on any productive tool result below. It never aborts here:
+    // a healthy fan-out's startup burst looks identical to a wall's first second
+    // (JER 48, #373), so the decision is deferred to the moment waiting is over —
+    // the stall window elapsing (stallTimer) or the run ending (result handling) —
+    // and hasPermissionWallEvidence then says whether that stall was a wall.
     if (isPermissionWallEvidence(sig.deniedToolName, limits.isBypassRun)) {
       state.wallDenials = (state.wallDenials || 0) + 1;
-      if (limits.wallLimit > 0 && state.wallDenials >= limits.wallLimit) {
-        return { type: 'abort_permission_wall', wallDenials: state.wallDenials, tool: sig.deniedToolName };
-      }
     }
-    return { type: 'permission_denied' };
+    return { type: 'permission_denied', wallDenials: state.wallDenials || 0 };
   }
   if (sig.isToolError) {
     // A live tool-level error means the MCP transport is up again — and the agent
@@ -822,6 +883,16 @@ function assessPermissionStall(state, now, windowMs) {
   return { stalled: idleMs >= windowMs, idleMs };
 }
 
+// True when the UNRESOLVED denials since the last productive tool result amount
+// to an external wall (#271) rather than a plain stall: at least `wallLimit`
+// denials of wholesale-granted tools. Consulted only once the run has stopped
+// waiting — the stall window elapsed, or a result arrived with the anchor still
+// active — never mid-stream (JER 48, #373). `wallDenials` resets with the stall
+// anchor, so a true here always implies an active anchor.
+function hasPermissionWallEvidence(state, wallLimit) {
+  return wallLimit > 0 && (state.wallDenials || 0) >= wallLimit;
+}
+
 // True when a runner outcome indicates a permission-denial stall — either the runner
 // bailed before any result message (subtype 'permission_stall'), or the stall fired
 // after a result message had already been consumed (the SDK can emit the result while
@@ -854,6 +925,7 @@ async function runClaudeOnce({
   enableBash,
   bypassPermissions,
   skill,
+  foregroundSubagents,
   maxTurns,
   timeoutMs,
   appendSystemPrompt,
@@ -932,9 +1004,11 @@ async function runClaudeOnce({
   // and assessPermissionStall above): denials are benign unless followed by a whole
   // window with no productive tool result.
   let permissionStallFired = false;
-  // An external permission wall was detected (see PERMISSION_WALL_DENIAL_LIMIT).
-  // Bails immediately rather than waiting out the stall window, because the wall
-  // denies everything and the run can bank nothing while it is up.
+  // The stall watchdog fired AND the unresolved denials were wall evidence (see
+  // PERMISSION_WALL_DENIAL_LIMIT / hasPermissionWallEvidence): an external wall,
+  // routed to backoff-and-retry instead of the stall's hard failure. It shares the
+  // stall's window deliberately — bailing on the count alone killed healthy runs
+  // at sub-agent startup (JER 48, #373).
   let permissionWallFired = false;
 
   const timer = setTimeout(() => {
@@ -970,9 +1044,27 @@ async function runClaudeOnce({
   // check alone would never fire. Poll the pure assessment on a timer and abort once
   // a denial has gone PERMISSION_STALL_WINDOW_MS with no productive tool result.
   const stallTimer = setInterval(() => {
-    if (permissionStallFired) return;
+    if (permissionStallFired || permissionWallFired) return;
     const stall = assessPermissionStall(errorState, Date.now(), PERMISSION_STALL_WINDOW_MS);
     if (!stall.stalled) return;
+    // Same silence, two causes. Enough wholesale-granted denials left unresolved
+    // for the whole window is an external wall (#271): transient, so the caller
+    // backs off and retries. Anything less is the classic stall: an agent halted
+    // on the canned "STOP and wait" text, which a retry would only repeat.
+    if (hasPermissionWallEvidence(errorState, PERMISSION_WALL_DENIAL_LIMIT)) {
+      permissionWallFired = true;
+      console.error(
+        `${runnerPrefix} Aborting query — permission wall: ${errorState.wallDenials} denial(s) of ` +
+        `wholesale-granted tool(s) (${errorState.totalPermissionDenials} denial(s) total) and no ` +
+        `productive tool result for ${Math.round(stall.idleMs / 1000)}s (window ` +
+        `${PERMISSION_STALL_WINDOW_MS / 1000}s). These cannot be allowlist misses. Usual cause is a ` +
+        `sub-agent falling back to the load-degraded 'auto' classifier (issue #271, EZK 19, ZEC 12); ` +
+        `it can also be an account-level refusal above this process. Either way it is transient — ` +
+        `bailing so the caller can back off and retry.`
+      );
+      abortController.abort();
+      return;
+    }
     permissionStallFired = true;
     console.error(
       `${runnerPrefix} Aborting query — permission-denial stall: ` +
@@ -1004,6 +1096,7 @@ async function runClaudeOnce({
     thinking,
     hooks,
     compaction,
+    foregroundSubagents,
     agentAttribution,
   });
 
@@ -1142,7 +1235,6 @@ async function runClaudeOnce({
           sig,
           {
             transportLimit: MCP_TRANSPORT_ERROR_LIMIT,
-            wallLimit: PERMISSION_WALL_DENIAL_LIMIT,
             // issue #291: same distinction the startup log line above (`options.
             // permissionMode === 'bypassPermissions'`) already makes — reused
             // rather than recomputing BP_NO_BYPASS, which buildOptions already
@@ -1170,25 +1262,13 @@ async function runClaudeOnce({
             abortController.abort();
             break;
           }
-        } else if (action.type === 'abort_permission_wall') {
-          permissionWallFired = true;
-          console.error(
-            `${runnerPrefix} Aborting query — permission wall: ${action.wallDenials} denial(s) of ` +
-            `wholesale-granted tool(s) (latest: ${action.tool}, ${describeDenialAgent(sig)}) with no ` +
-            `productive tool result in between. These cannot be allowlist misses. Usual cause is a ` +
-            `sub-agent falling back to the load-degraded 'auto' classifier (issue #271, EZK 19, ZEC 12); ` +
-            `it can also be an account-level refusal above this process. Either way it is transient. ` +
-            `Bailing in seconds instead of waiting out the ${PERMISSION_STALL_WINDOW_MS / 1000}s stall ` +
-            `window, so the caller can back off and retry while the run has banked nothing.`
-          );
-          abortController.abort();
-          break;
         } else if (action.type === 'permission_denied') {
           console.warn(
             `${runnerPrefix} Tool call auto-denied ("STOP and wait") in headless auto mode ` +
-            `(${errorState.totalPermissionDenials} total this run, tool: ${sig.deniedToolName || 'unresolved'}, ` +
+            `(${errorState.totalPermissionDenials} total this run, ${action.wallDenials} unresolved ` +
+            `wall-evidence, tool: ${sig.deniedToolName || 'unresolved'}, ` +
             `${describeDenialAgent(sig)}${sig.denialSource ? `, source: ${sig.denialSource}` : ''}) — ` +
-            `benign if the agent switches to an allowed tool; aborts as a stall only after ` +
+            `benign if the agent switches to an allowed tool; aborts as a stall or wall only after ` +
             `${PERMISSION_STALL_WINDOW_MS / 1000}s with no productive tool result`
           );
         } else if (action.type === 'guardrail_stop') {
@@ -1284,14 +1364,18 @@ async function runClaudeOnce({
   };
 
   if (result) {
-    if (permissionWallFired) {
-      // The wall fired after a result message had already been consumed. Same stream
-      // ordering the stall branch below handles (#238/#268: the SDK can emit the
-      // result while trailing sub-agent messages are still streaming), and it must be
-      // handled here too or the wall is silently dropped — the post-loop
-      // permissionWallFired branch only runs when NO result was captured, so the
-      // backoff in runClaude() would never engage and generate-pipeline would
-      // misclassify a walled run as missing/degraded output and retry straight into it.
+    if (permissionWallFired || hasPermissionWallEvidence(errorState, PERMISSION_WALL_DENIAL_LIMIT)) {
+      // Either the wall fired after a result message had already been consumed (same
+      // stream ordering the stall branch below handles — #238/#268: the SDK can emit
+      // the result while trailing sub-agent messages are still streaming), or the run
+      // ENDED with wall evidence still unresolved — EZK 19's shape (#271): every call
+      // denied, then the coordinator returned a normal-looking result at 88s, well
+      // inside the stall window. Both must be handled here or the wall is silently
+      // dropped: the post-loop permissionWallFired branch only runs when NO result was
+      // captured, so the backoff in runClaude() would never engage and
+      // generate-pipeline would misclassify a walled run as missing/degraded output
+      // and retry straight into it. A healthy run never lands here: its next
+      // productive result clears the evidence within seconds of the burst (JER 48).
       //
       // Checked BEFORE the stall branches deliberately: a walled run also has an
       // active denial anchor, and annotating it as a stall would route it to a hard
@@ -1299,7 +1383,7 @@ async function runClaudeOnce({
       // wall-outranks-stall precedence the align step applies.
       result.permissionWallDetected = true;
       console.warn(
-        `${runnerPrefix} Result already received when the permission wall fired — returning result ` +
+        `${runnerPrefix} ${permissionWallFired ? 'Result already received when the permission wall fired' : 'Result arrived with unresolved permission-wall evidence'} — returning result ` +
         `annotated permissionWallDetected=true (wallDenials=${errorState.wallDenials}, ` +
         `${errorState.totalPermissionDenials} denial(s) total)`
       );
@@ -1750,6 +1834,7 @@ module.exports = {
   describeDenialAgent,
   applyRunnerUserMessage,
   assessPermissionStall,
+  hasPermissionWallEvidence,
   resultIndicatesPermissionStall,
   resultIndicatesPermissionWall,
   isPermissionWallEvidence,

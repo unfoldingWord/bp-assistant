@@ -19,6 +19,8 @@ const {
   _buildWriterPrompt,
   _maybeBuildProgrammaticNote,
   _normalizeAssembledNoteText,
+  _appendAlsoOccurs,
+  _buildSeeHowReference,
   substituteAT,
   applyHintsToPreparedNotes,
   normalizeQuote,
@@ -138,6 +140,42 @@ test('maybeBuildProgrammaticNote restores safe see how notes with provided AT', 
 
   assert.match(note, /See how you translated the similar expression/);
   assert.match(note, /Alternate translation: \[an improved rendering\]/);
+  // Canonical corpus link form, with PSA's three-digit padding on both parts.
+  assert.match(note, /\[35:5\]\(\.\.\/035\/005\.md\)/);
+});
+
+test('buildSeeHowReference emits the canonical [C:V](../CC/VV.md) form for same-book hints', () => {
+  assert.equal(
+    _buildSeeHowReference('see how 5', { book: 'ZEC', reference: '3:9' }),
+    'See how you translated the similar expression in [3:5](../03/05.md).'
+  );
+  assert.equal(
+    _buildSeeHowReference('see how 1:7', { book: 'ZEC', reference: '3:9' }),
+    'See how you translated the similar expression in [1:7](../01/07.md).'
+  );
+  assert.equal(
+    _buildSeeHowReference('see how 78:1', { book: 'PSA', reference: '79:3' }),
+    'See how you translated the similar expression in [78:1](../078/001.md).'
+  );
+});
+
+test('buildSeeHowReference writes cross-book hints as prose naming the book', () => {
+  assert.equal(
+    _buildSeeHowReference('see how ISA 36:3', { book: '2KI', reference: '18:18' }),
+    'See how you translated the similar expression in Isaiah 36:3.'
+  );
+});
+
+test('appendAlsoOccurs inserts the recurrence sentence before the AT clause and is idempotent', () => {
+  const base = 'The possessive form describes a message. Alternate translation: [a message]';
+  const once = _appendAlsoOccurs(base, ['5', '7']);
+  assert.equal(
+    once,
+    'The possessive form describes a message. This also occurs in verses 5 and 7. Alternate translation: [a message]'
+  );
+  assert.equal(_appendAlsoOccurs(once, ['5', '7']), once, 'second pass does not double-append');
+  assert.equal(_appendAlsoOccurs('A note with no AT.', ['5']), 'A note with no AT. This also occurs in verse 5.');
+  assert.equal(_appendAlsoOccurs('Untouched.', []), 'Untouched.');
 });
 
 test('prepareNotes writes a packetized item with deterministic template and policy fields', () => {
