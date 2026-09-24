@@ -6,7 +6,7 @@ const path = require('path');
 const { z } = require('zod');
 
 const { createQualityTools } = require('../src/workspace-tools');
-const { checkTnQuality } = require('../src/workspace-tools/quality-tools');
+const { checkTnQuality, normalizeHebrewQuote } = require('../src/workspace-tools/quality-tools');
 
 test('checkTnQuality uses at_required as the missing_at contract', async () => {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'quality-tools-'));
@@ -853,4 +853,98 @@ test('S10: tW and tA relative links in a see-how note are not flagged non-canoni
     (f) => f.category === 'seehow_noncanonical' && f.id === 'a1b2'
   );
   assert.deepEqual(nc, [], 'only verse links are inspected');
+});
+
+// --- normalizeHebrewQuote: maqaf splitting + NFC comparison (issue #401) ---
+//
+// JER 29:4 as the UHB stores it: one \w token per word, marks in the UHB's
+// legacy order. Written as \u escapes so an editor or a tool that NFC's the
+// file cannot silently destroy the very byte order these tests exercise.
+// 5 of these 12 words change under NFC; notes and bible-editor send NFC.
+const JER_29_4_UHB = [
+  '\u05db\u05bc\u05b9\u05a5\u05d4', // 0 כֹּ֥ה  (NFC differs)
+  '\u05d0\u05b8\u05de\u05b7\u059b\u05e8', // 1 אָמַ֛ר
+  '\u05d9\u05b0\u05d4\u05d5\u05b8\u05a5\u05d4', // 2 יְהוָ֥ה
+  '\u05e6\u05b0\u05d1\u05b8\u05d0\u0596\u05d5\u05b9\u05ea', // 3 צְבָא֖וֹת
+  '\u05d0\u05b1\u05dc\u05b9\u05d4\u05b5\u05a3\u05d9', // 4 אֱלֹהֵ֣י
+  '\u05d9\u05b4\u05e9\u05c2\u05b0\u05e8\u05b8\u05d0\u05b5\u0591\u05dc', // 5 יִשְׂרָאֵ֑ל  (NFC differs)
+  '\u05dc\u05b0\u2060\u05db\u05b8\u05dc', // 6 לְ⁠כָל
+  '\u05d4\u05b7\u05a8\u2060\u05d2\u05bc\u05d5\u05b9\u05dc\u05b8\u0594\u05d4', // 7 הַ֨⁠גּוֹלָ֔ה
+  '\u05d0\u05b2\u05e9\u05c1\u05b6\u05e8', // 8 אֲשֶׁר  (NFC differs)
+  '\u05d4\u05b4\u05d2\u05b0\u05dc\u05b5\u05a5\u05d9\u05ea\u05b4\u05d9', // 9 הִגְלֵ֥יתִי
+  '\u05de\u05b4\u2060\u05d9\u05e8\u05d5\u05bc\u05e9\u05c1\u05b8\u05dc\u05b7\u0596\u05b4\u05dd', // 10 מִ⁠ירוּשָׁלִַ֖ם  (NFC differs)
+  '\u05d1\u05bc\u05b8\u05d1\u05b6\u05bd\u05dc\u05b8\u2060\u05d4', // 11 בָּבֶֽלָ⁠ה  (NFC differs)
+];
+
+const MAQAF = '\u05be';
+
+test('normalizeHebrewQuote fixture really is the UHB legacy byte order', () => {
+  // Guards the premise of the NFC tests below: if this fixture ever gets
+  // NFC-normalized in place, the F2 regressions stop testing anything.
+  const differ = JER_29_4_UHB.filter((w) => w.normalize('NFC') !== w);
+  assert.equal(differ.length, 5, 'expected 5 of 12 JER 29:4 words to differ under NFC');
+});
+
+test('normalizeHebrewQuote matches maqaf-joined words and keeps the maqafs', () => {
+  // Row gjh8: two maqaf pairs. Before the fix, splitting on whitespace alone
+  // left "לְ⁠כָל־הַ֨⁠גּוֹלָ֔ה" as one token that HEBREW_CANT_RE glued into a word the
+  // verse does not contain -> 0 of 2 matched -> 422 hebrew_words_not_in_verse.
+  const quote = `לְ⁠כָל${MAQAF}הַ֨⁠גּוֹלָ֔ה אֲשֶׁר${MAQAF}הִגְלֵ֥יתִי`.normalize('NFC');
+  const r = normalizeHebrewQuote(quote, JER_29_4_UHB);
+
+  assert.equal(r.status, 'ok');
+  assert.deepEqual(r.warnings, []);
+  assert.equal((r.quote.match(/\u05be/g) || []).length, 2, 'both maqafs survive in the output');
+  assert.ok(!r.quote.includes(' & '), 'maqaf-joined words are contiguous, not a discontinuity');
+});
+
+test('normalizeHebrewQuote matches NFC quotes against legacy-order UHB words', () => {
+  // Row qjok: כֹּ֥ה is dagesh-before-holam in the UHB, holam-before-dagesh in
+  // NFC. Before the fix neither side was NFC'd, so it silently dropped out
+  // (1 of 2 matched -> partial_match + hebrew_word_not_in_verse).
+  const quote = `${JER_29_4_UHB[0]} ${JER_29_4_UHB[1]}`.normalize('NFC');
+  const r = normalizeHebrewQuote(quote, JER_29_4_UHB);
+
+  assert.equal(r.status, 'ok');
+  assert.deepEqual(r.warnings.filter((w) => w.code === 'hebrew_word_not_in_verse'), []);
+});
+
+test('normalizeHebrewQuote handles a whole NFC verse-opening phrase', () => {
+  // Row b2dt: 6 words, 2 of which (כֹּ֥ה, יִשְׂרָאֵ֑ל) differ under NFC -> was 4 of 6.
+  const quote = JER_29_4_UHB.slice(0, 6).join(' ').normalize('NFC');
+  const r = normalizeHebrewQuote(quote, JER_29_4_UHB);
+
+  assert.equal(r.status, 'ok');
+  assert.deepEqual(r.warnings, []);
+  assert.ok(!r.quote.includes(' & '), 'six consecutive words have no gap');
+});
+
+test('normalizeHebrewQuote still inserts & at a real discontinuity', () => {
+  // Words 0 and 4 are not adjacent, so the joiner must survive the maqaf work.
+  const quote = `${JER_29_4_UHB[0]} ${JER_29_4_UHB[4]}`.normalize('NFC');
+  const r = normalizeHebrewQuote(quote, JER_29_4_UHB);
+
+  assert.equal(r.status, 'ok');
+  assert.equal((r.quote.match(/ & /g) || []).length, 1, 'gap > 1 still yields a & joiner');
+});
+
+test('normalizeHebrewQuote mixes maqaf pairs and discontinuity joiners', () => {
+  // "לְ⁠כָל־הַ֨⁠גּוֹלָ֔ה" (words 6-7) then "מִ⁠ירוּשָׁלִַ֖ם" (word 10): maqaf inside, & across.
+  const quote = `${JER_29_4_UHB[6]}${MAQAF}${JER_29_4_UHB[7]} ${JER_29_4_UHB[10]}`.normalize('NFC');
+  const r = normalizeHebrewQuote(quote, JER_29_4_UHB);
+
+  assert.equal(r.status, 'ok');
+  assert.equal((r.quote.match(/\u05be/g) || []).length, 1);
+  assert.equal((r.quote.match(/ & /g) || []).length, 1);
+});
+
+test('normalizeHebrewQuote still reports words that are genuinely absent', () => {
+  // The fix must not turn the validator into a rubber stamp.
+  const ABSENT = '\u05d6\u05d6\u05d6\u05d6'; // זזזז - not in JER 29:4
+  const r = normalizeHebrewQuote(`${JER_29_4_UHB[0]} ${ABSENT}`.normalize('NFC'), JER_29_4_UHB);
+  assert.equal(r.status, 'partial_match');
+  assert.equal(r.warnings.filter((w) => w.code === 'hebrew_word_not_in_verse').length, 1);
+
+  const none = normalizeHebrewQuote(`${ABSENT} ${ABSENT}`.normalize('NFC'), JER_29_4_UHB);
+  assert.equal(none.status, 'no_words_match');
 });
