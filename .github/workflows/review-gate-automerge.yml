@@ -276,8 +276,62 @@ jobs:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
           FLY_APP_NAME: ${{ secrets.FLY_APP_NAME }}
           FLY_MACHINE_ID: ${{ steps.resolve.outputs.machine_id }}
+          HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
         run: |
           set -euo pipefail
+          # Only restore while the machine's config is still ours. The machine is
+          # shared with both repos' review-gate; by now one of them may have
+          # claimed it, and restoring unconditionally would rewrite RUN_MODE
+          # under that live claim so its run boots into an hourly pass (#398).
+          # - RUN_MODE=pr-reviewer for this run's SHA (or with no SHA): ours,
+          #   restore. A gate claim always writes RUN_MODE=pr-review in the same
+          #   update as its lease, so a PR_REVIEW_HEAD_SHA seen alongside
+          #   pr-reviewer is not a live claim and must not strand the machine.
+          # - pr-reviewer for a different SHA: another automerge run's, skip.
+          # - Otherwise any PR_REVIEW_HEAD_SHA is a gate's lease (this workflow
+          #   never sets PR_REVIEW_*), and any RUN_MODE other than hourly means
+          #   another workflow configured it: skip.
+          # The read and the update are separate calls, so a gate claim can land
+          # between them and have its RUN_MODE=pr-review overwritten (its lease
+          # survives, since we never touch PR_REVIEW_*). The re-read after the
+          # update catches that: a lease that appeared during the window gets
+          # RUN_MODE=pr-review written straight back. If the gate reads the
+          # config before that heal lands, its claim readback retries the
+          # claim, or its pre-start RUN_MODE check fails the run with a re-run
+          # message; either way it does not boot an hourly pass under its lease.
+          # An unreadable config skips the restore with a warning: we cannot
+          # tell whose config it is, and a manual reset is safer than
+          # clobbering a live claim.
+          read_config() {
+            local json=""
+            for _ in 1 2 3; do
+              if json="$(flyctl machines list --app "$FLY_APP_NAME" --json 2>/dev/null)"; then
+                printf '%s' "$json" | node -e "let s='';process.stdin.on('data',c=>s+=c);process.stdin.on('end',()=>{try{const j=JSON.parse(s);const m=Array.isArray(j)?j.find(x=>x&&x.id===process.argv[1]):null;if(!m){process.stdout.write('<unreadable>');return;}const e=(m.config&&m.config.env)||{};process.stdout.write([e.RUN_MODE,e.PR_REVIEW_HEAD_SHA,e.BP_REVIEWER_ONLY_SHA].map(v=>String(v||'')).join('|'));}catch{process.stdout.write('<unreadable>')}});" \
+                  "$FLY_MACHINE_ID" || printf '%s' '<unreadable>'
+                return 0
+              fi
+              sleep 5
+            done
+            printf '%s' '<unreadable>'
+          }
+          config="$(read_config)"
+          if [ "$config" = "<unreadable>" ]; then
+            echo "::warning::Could not read the reviewer machine's current config, so this run cannot tell whether it still owns it. Skipping restore; the machine may need a manual reset (set RUN_MODE=hourly and clear BP_REVIEWER_ONLY_*)."
+            exit 0
+          fi
+          IFS='|' read -r mode lease only_sha <<< "$config"
+          if [ "$mode" = "pr-reviewer" ]; then
+            if [ -n "$only_sha" ] && [ "$only_sha" != "$HEAD_SHA" ]; then
+              echo "::notice::Reviewer machine is configured for another automerge run ('${only_sha}'; this run is '${HEAD_SHA}'). Skipping restore so we do not clobber that run's config."
+              exit 0
+            fi
+          elif [ -n "$lease" ]; then
+            echo "::notice::Reviewer machine is leased to a review gate ('${lease}', RUN_MODE='${mode}'). Skipping restore so we do not clobber that run's config."
+            exit 0
+          elif [ -n "$mode" ] && [ "$mode" != "hourly" ]; then
+            echo "::notice::Reviewer machine's RUN_MODE is now '${mode}'; another workflow configured it. Skipping restore so we do not clobber that run's config."
+            exit 0
+          fi
           # Don't swallow restore failures. If this update fails the machine is
           # left in pr-reviewer mode and will misbehave on the next hourly run;
           # surfacing the error gives an explicit signal to fix it manually.
@@ -287,6 +341,24 @@ jobs:
             --env "BP_REVIEWER_ONLY_SHA="; then
             echo "::warning::Failed to restore reviewer machine to default mode; manual intervention may be required (set RUN_MODE=hourly and clear BP_REVIEWER_ONLY_*)." >&2
             exit 1
+          fi
+          # Self-heal a gate claim that landed between our read and update: a
+          # lease that is new since the read belongs to a gate whose
+          # RUN_MODE=pr-review we just overwrote. Write it back; the lease
+          # itself was never touched.
+          after="$(read_config)"
+          if [ "$after" = "<unreadable>" ]; then
+            echo "::notice::Could not re-read the reviewer machine's config after restoring, so a gate claim racing this restore could not be checked for."
+            exit 0
+          fi
+          IFS='|' read -r after_mode after_lease _ <<< "$after"
+          if [ -n "$after_lease" ] && [ "$after_lease" != "$lease" ] && [ "$after_mode" != "pr-review" ]; then
+            echo "::notice::A review gate claimed the reviewer machine ('${after_lease}') while this restore ran, and the restore overwrote its RUN_MODE. Writing RUN_MODE=pr-review back for that gate."
+            if ! flyctl machine update "$FLY_MACHINE_ID" --app "$FLY_APP_NAME" --yes --skip-start --restart no \
+              --env "RUN_MODE=pr-review"; then
+              echo "::warning::Failed to write RUN_MODE=pr-review back for the review gate that claimed the machine ('${after_lease}'); that gate run will fail its RUN_MODE check and need a re-run." >&2
+              exit 1
+            fi
           fi
 
       - name: Read automerge result from logs
