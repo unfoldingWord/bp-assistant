@@ -91,6 +91,7 @@ jobs:
       # so driving it means writing env vars, starting it, waiting for it to
       # exit, then reading the JSON marker out of the logs.
       - name: Acquire reviewer machine (claim + verify)
+        id: acquire
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
           FLY_APP_NAME: ${{ secrets.FLY_APP_NAME }}
@@ -136,7 +137,9 @@ jobs:
               --env "PR_REVIEW_NUMBER=${REVIEW_PR}" \
               --env "PR_REVIEW_BASE_SHA=${REVIEW_BASE}" \
               --env "PR_REVIEW_HEAD_SHA=${REVIEW_HEAD}" \
-              --env "PR_REVIEW_PROVIDER=${REVIEW_PROVIDER}"
+              --env "PR_REVIEW_PROVIDER=${REVIEW_PROVIDER}" \
+              --env "BP_REVIEWER_ONLY_PR=" \
+              --env "BP_REVIEWER_ONLY_SHA="
           }
           deadline=$((SECONDS + 1800))
           acquired=0
@@ -147,6 +150,9 @@ jobs:
               sleep 10
               continue
             fi
+            # Recorded before the first write, so the restore step runs for a
+            # run cancelled mid-claim but not for one cancelled while waiting.
+            echo "claimed=true" >> "$GITHUB_OUTPUT"
             if ! claim; then
               echo "Claim update failed (transient Fly API error); retrying..."
               sleep 10
@@ -283,7 +289,10 @@ jobs:
           fi
 
       - name: Restore machine to default mode
-        if: always() && steps.resolve.outputs.machine_id != ''
+        # Only a run that wrote a claim restores. A run that never got past
+        # waiting (cancelled, or failed earlier) leaves the machine alone: it
+        # may be running another review or an hourly pass.
+        if: always() && steps.acquire.outputs.claimed == 'true' && steps.resolve.outputs.machine_id != ''
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
           FLY_APP_NAME: ${{ secrets.FLY_APP_NAME }}
@@ -305,8 +314,8 @@ jobs:
           # calls, so a claim landing between them can still be hit. A gate
           # claimer notices: its claim readback retries, or its pre-start
           # RUN_MODE check fails the run with a re-run message. An automerge
-          # run's Configure step has no readback, so a hit there goes unnoticed
-          # and that run boots into an hourly pass and times out on its marker.
+          # run notices the same way: its acquire readback retries, or its
+          # pre-start config check fails the run (#408).
           # An unreadable config skips the restore with a warning: we cannot
           # tell whose config it is, and a manual reset is safer than
           # clobbering another run's fresh config.

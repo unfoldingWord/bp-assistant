@@ -22,8 +22,8 @@ jobs:
     # shared group between this workflow and review-gate would let a newly
     # arriving review-gate silently evict a pending automerge. Cross-workflow
     # serialization on the actual Fly machine is enforced by the
-    # "Wait for machine to be stopped" step below, which acts as a Fly-API
-    # level lock that doesn't have GitHub's pending-queue eviction quirk.
+    # "Acquire reviewer machine" step below, which acts as a Fly-API level
+    # lock that doesn't have GitHub's pending-queue eviction quirk.
     concurrency:
       group: review-gate-automerge-${{ github.event.workflow_run.head_sha }}
       cancel-in-progress: false
@@ -153,38 +153,17 @@ jobs:
 
       # Cross-workflow Fly-machine lock. Since we no longer share a concurrency
       # group with review-gate, the only place we serialize machine access is
-      # here: wait until the machine is in `stopped` state before reconfiguring
-      # it. If a review-gate run is still using the machine, this step blocks
-      # until it finishes. Cap at 30 minutes to avoid hangs on a wedged machine.
-      - name: Wait for machine to be stopped
-        if: ${{ steps.pr.outputs.skip != 'true' }}
-        env:
-          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
-          FLY_APP_NAME: ${{ secrets.FLY_APP_NAME }}
-          FLY_MACHINE_ID: ${{ steps.resolve.outputs.machine_id }}
-        run: |
-          set -euo pipefail
-          get_state() {
-            flyctl machines list --app "$FLY_APP_NAME" --json 2>/dev/null \
-              | node -e "let s=''; process.stdin.on('data',c=>s+=c); process.stdin.on('end',()=>{ try { const j=JSON.parse(s); const m=Array.isArray(j)?j.find(x=>x&&x.id===process.argv[1]):null; if (m) process.stdout.write(String(m.state||'')); } catch {} });" \
-                "$FLY_MACHINE_ID" \
-              || echo ""
-          }
-          deadline=$((SECONDS + 1800))
-          state=""
-          while [ "$SECONDS" -lt "$deadline" ]; do
-            state="$(get_state)"
-            if [ "$state" = "stopped" ]; then
-              break
-            fi
-            sleep 10
-          done
-          if [ "$state" != "stopped" ]; then
-            echo "Machine never reached stopped state (last: ${state:-<unknown>}); another workflow may be holding the machine." >&2
-            exit 1
-          fi
-
-      - name: Configure machine for PR auto-reviewer
+      # here. Fly has no compare-and-set, so this uses the same claim-and-verify
+      # pattern as review-gate.yml's "Acquire reviewer machine": wait until the
+      # machine is `stopped`, write our config, then read it back. We hold the
+      # machine only if the readback shows RUN_MODE=pr-reviewer, our SHA in
+      # BP_REVIEWER_ONLY_SHA, and no gate lease (PR_REVIEW_HEAD_SHA). Our write
+      # clears PR_REVIEW_*, so a lease in the readback is a gate claim that
+      # landed after our write, not a stale value (#408). Any mismatch means a
+      # racing writer: back off and retry the whole acquire. Cap at ~30 minutes
+      # to avoid hangs on a wedged machine.
+      - name: Acquire reviewer machine (configure + verify)
+        id: configure
         if: ${{ steps.pr.outputs.skip != 'true' }}
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
@@ -194,10 +173,71 @@ jobs:
           HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
         run: |
           set -euo pipefail
-          flyctl machine update "$FLY_MACHINE_ID" --app "$FLY_APP_NAME" --yes --skip-start --restart no \
-            --env "RUN_MODE=pr-reviewer" \
-            --env "BP_REVIEWER_ONLY_PR=${PR_REF}" \
-            --env "BP_REVIEWER_ONLY_SHA=${HEAD_SHA}"
+          get_state() {
+            flyctl machines list --app "$FLY_APP_NAME" --json 2>/dev/null \
+              | node -e "let s=''; process.stdin.on('data',c=>s+=c); process.stdin.on('end',()=>{ try { const j=JSON.parse(s); const m=Array.isArray(j)?j.find(x=>x&&x.id===process.argv[1]):null; if (m) process.stdout.write(String(m.state||'')); } catch {} });" \
+                "$FLY_MACHINE_ID" \
+              || echo ""
+          }
+          # Same helper as the restore step: RUN_MODE|PR_REVIEW_HEAD_SHA|BP_REVIEWER_ONLY_SHA.
+          read_config() {
+            local json=""
+            for _ in 1 2 3; do
+              if json="$(flyctl machines list --app "$FLY_APP_NAME" --json 2>/dev/null)"; then
+                printf '%s' "$json" | node -e "let s='';process.stdin.on('data',c=>s+=c);process.stdin.on('end',()=>{try{const j=JSON.parse(s);const m=Array.isArray(j)?j.find(x=>x&&x.id===process.argv[1]):null;if(!m){process.stdout.write('<unreadable>');return;}const e=(m.config&&m.config.env)||{};process.stdout.write([e.RUN_MODE,e.PR_REVIEW_HEAD_SHA,e.BP_REVIEWER_ONLY_SHA].map(v=>String(v||'')).join('|'));}catch{process.stdout.write('<unreadable>')}});" \
+                  "$FLY_MACHINE_ID" || printf '%s' '<unreadable>'
+                return 0
+              fi
+              sleep 5
+            done
+            printf '%s' '<unreadable>'
+          }
+          configure() {
+            flyctl machine update "$FLY_MACHINE_ID" --app "$FLY_APP_NAME" --yes --skip-start --restart no \
+              --env "RUN_MODE=pr-reviewer" \
+              --env "BP_REVIEWER_ONLY_PR=${PR_REF}" \
+              --env "BP_REVIEWER_ONLY_SHA=${HEAD_SHA}" \
+              --env "PR_REVIEW_REPO=" \
+              --env "PR_REVIEW_NUMBER=" \
+              --env "PR_REVIEW_BASE_SHA=" \
+              --env "PR_REVIEW_HEAD_SHA=" \
+              --env "PR_REVIEW_PROVIDER="
+          }
+          deadline=$((SECONDS + 1800))
+          acquired=0
+          config=""
+          while [ "$SECONDS" -lt "$deadline" ]; do
+            state="$(get_state)"
+            if [ "$state" != "stopped" ]; then
+              # A review gate (or the hourly cron) holds the machine; wait it out.
+              sleep 10
+              continue
+            fi
+            # Recorded before the first write, so the restore step runs for a
+            # run cancelled mid-write but not for one cancelled while waiting.
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+            if ! configure; then
+              echo "Configure update failed (transient Fly API error); retrying..."
+              sleep 10
+              continue
+            fi
+            # Let a racing writer's update propagate to the API before reading
+            # back; Fly's list is eventually consistent.
+            sleep 8
+            config="$(read_config)"
+            IFS='|' read -r mode lease only_sha <<< "$config"
+            if [ "$mode" = "pr-reviewer" ] && [ "$only_sha" = "$HEAD_SHA" ] && [ -z "$lease" ]; then
+              echo "Acquired reviewer machine for ${PR_REF} (${HEAD_SHA})."
+              acquired=1
+              break
+            fi
+            echo "Lost the machine to another writer (readback RUN_MODE|PR_REVIEW_HEAD_SHA|BP_REVIEWER_ONLY_SHA = '${config}'); backing off and retrying."
+            sleep 15
+          done
+          if [ "$acquired" != "1" ]; then
+            echo "Could not acquire the reviewer machine within ~30m (last readback: '${config:-<none>}'); another workflow may be holding it. Re-run this workflow to retry." >&2
+            exit 1
+          fi
 
       - name: Start machine and wait for completion
         if: ${{ steps.pr.outputs.skip != 'true' }}
@@ -221,17 +261,50 @@ jobs:
             exit 1
           fi
 
-          flyctl machine start "$FLY_MACHINE_ID" --app "$FLY_APP_NAME"
-
-          # Poll until the machine leaves stopped — confirms the Fly control plane
-          # accepted the start. A fixed sleep is unreliable when the plane is under
-          # load; require an actual state transition before watching for completion.
           get_state() {
             flyctl machines list --app "$FLY_APP_NAME" --json 2>/dev/null \
               | node -e "let s=''; process.stdin.on('data',c=>s+=c); process.stdin.on('end',()=>{ try { const j=JSON.parse(s); const m=Array.isArray(j)?j.find(x=>x&&x.id===process.argv[1]):null; if (m) process.stdout.write(String(m.state||'')); } catch {} });" \
                 "$FLY_MACHINE_ID" \
               || echo ""
           }
+          read_config() {
+            local json=""
+            for _ in 1 2 3; do
+              if json="$(flyctl machines list --app "$FLY_APP_NAME" --json 2>/dev/null)"; then
+                printf '%s' "$json" | node -e "let s='';process.stdin.on('data',c=>s+=c);process.stdin.on('end',()=>{try{const j=JSON.parse(s);const m=Array.isArray(j)?j.find(x=>x&&x.id===process.argv[1]):null;if(!m){process.stdout.write('<unreadable>');return;}const e=(m.config&&m.config.env)||{};process.stdout.write([e.RUN_MODE,e.PR_REVIEW_HEAD_SHA,e.BP_REVIEWER_ONLY_SHA].map(v=>String(v||'')).join('|'));}catch{process.stdout.write('<unreadable>')}});" \
+                  "$FLY_MACHINE_ID" || printf '%s' '<unreadable>'
+                return 0
+              fi
+              sleep 5
+            done
+            printf '%s' '<unreadable>'
+          }
+          # Fails the run unless the machine's config is still the one our
+          # acquire verified. A review gate's claim (or its restore) can land in
+          # the window since then; starting the machine would run the gate's
+          # review or an hourly pass, and our marker would never appear. An
+          # unreadable config is a transient Fly API error, not evidence either
+          # way (same rule as review-gate.yml's pre-start check).
+          check_owner() {
+            local when="$1" config mode lease only_sha
+            config="$(read_config)"
+            if [ "$config" = "<unreadable>" ]; then
+              echo "::warning::Could not read the reviewer machine's config ${when}; proceeding on the acquire step's readback."
+              return 0
+            fi
+            IFS='|' read -r mode lease only_sha <<< "$config"
+            if [ "$mode" != "pr-reviewer" ] || [ "$only_sha" != "$HEAD_SHA" ] || [ -n "$lease" ]; then
+              echo "Reviewer machine's config changed ${when} (RUN_MODE|PR_REVIEW_HEAD_SHA|BP_REVIEWER_ONLY_SHA = '${config}'; expected 'pr-reviewer||${HEAD_SHA}'). Another workflow wrote it after our acquire, so this run will not produce a result. Re-run this workflow." >&2
+              exit 1
+            fi
+          }
+
+          check_owner "before start"
+          flyctl machine start "$FLY_MACHINE_ID" --app "$FLY_APP_NAME"
+
+          # Poll until the machine leaves stopped — confirms the Fly control plane
+          # accepted the start. A fixed sleep is unreliable when the plane is under
+          # load; require an actual state transition before watching for completion.
 
           launch_deadline=$((SECONDS + 60))
           state=""
@@ -249,6 +322,12 @@ jobs:
             echo "Machine did not leave stopped state within 60s (last state: ${state:-<unknown>}); Fly control plane may be unresponsive." >&2
             exit 1
           fi
+
+          # Recheck now that the machine is running: nothing can claim a running
+          # machine, so this read is the config it actually booted with. It
+          # catches a write that landed between the pre-start check and the
+          # start, and fails fast instead of waiting 30 minutes for a marker.
+          check_owner "between the pre-start check and start"
 
           # Poll until the machine returns to stopped (entrypoint finished).
           deadline=$((SECONDS + 1800))
@@ -271,7 +350,10 @@ jobs:
           fi
 
       - name: Restore machine to default mode
-        if: always() && steps.resolve.outputs.machine_id != '' && steps.pr.outputs.skip != 'true'
+        # Only a run that wrote the machine's config restores it. A run that
+        # never got past waiting (cancelled, or failed earlier) leaves the
+        # machine alone: it may be running a gate's review or an hourly pass.
+        if: always() && steps.configure.outputs.configured == 'true' && steps.resolve.outputs.machine_id != '' && steps.pr.outputs.skip != 'true'
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
           FLY_APP_NAME: ${{ secrets.FLY_APP_NAME }}
@@ -289,7 +371,7 @@ jobs:
           #   pr-reviewer is not a live claim and must not strand the machine.
           # - pr-reviewer for a different SHA: another automerge run's, skip.
           # - Otherwise any PR_REVIEW_HEAD_SHA is a gate's lease (this workflow
-          #   never sets PR_REVIEW_*), and any RUN_MODE other than hourly means
+          #   only ever clears PR_REVIEW_*), and any RUN_MODE other than hourly means
           #   another workflow configured it: skip.
           # The read and the update are separate calls, so a gate claim can land
           # between them and have its RUN_MODE=pr-review overwritten (its lease
