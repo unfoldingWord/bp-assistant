@@ -4,7 +4,7 @@
 // Claude calls these as mcp__workspace-tools__<tool_name> — no shell needed.
 
 const {
-  fetchHebrewBible, fetchUlt, fetchUst, fetchMasterUlt, fetchMasterUst, fetchT4t, fetchDoor43,
+  fetchHebrewBible, fetchGreekNt, fetchUlt, fetchUst, fetchMasterUlt, fetchMasterUst, fetchT4t, fetchDoor43,
   fetchGlossary, fetchIssuesResolved, fetchTemplates,
 } = require('./fetch-tools');
 const { splitTsv, mergeTsvs, fixTrailingNewlines } = require('./tsv-tools');
@@ -41,6 +41,17 @@ function createWorkspaceTools(createSdkMcpServer, tool, z) {
         },
         async (args) => ({
           content: [{ type: 'text', text: await fetchHebrewBible(args) }],
+        })
+      ),
+      tool(
+        'fetch_greek_nt',
+        'Fetch Greek USFM source files from Door43 UGNT repository into data/greek_nt/. Greek NT counterpart of fetch_hebrew_bible; use it for the 27 New Testament books.',
+        {
+          books: z.array(z.string()).optional().describe('Specific book codes (e.g. ["LUK","ROM"]). Omit for all 27 NT books.'),
+          force: z.boolean().optional().describe('Force re-fetch even if cached today'),
+        },
+        async (args) => ({
+          content: [{ type: 'text', text: await fetchGreekNt(args) }],
         })
       ),
       tool(
