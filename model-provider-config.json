@@ -23,7 +23,8 @@
                 "claude-opus-5-5": {
                     "label": "Claude Opus 5.5",
                     "inputPer1M": 4.0,
-                    "outputPer1M": 20.0
+                    "outputPer1M": 20.0,
+                    "cacheReadPer1M": 0.2
                 },
                 "claude-opus-5": {
                     "label": "Claude Opus 5",

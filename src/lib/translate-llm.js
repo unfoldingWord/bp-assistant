@@ -336,6 +336,11 @@ async function callClaude({ model, system, user, thinking, apiKey, timeoutMs, si
   if (eff) {
     params.thinking = { type: 'adaptive' };
     params.output_config = { effort: eff };
+  } else if (thinking === 'none') {
+    // Claude Opus 5+ always thinks (omitting `thinking` runs adaptive at the
+    // model's default effort), so the lowest effort is how "none" is honored,
+    // e.g. by the truncation retry below.
+    params.output_config = { effort: 'low' };
   }
 
   // Streaming, not a plain create: the non-streaming endpoint rejects long
