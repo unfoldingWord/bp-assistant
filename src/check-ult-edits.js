@@ -6,7 +6,12 @@ const path = require('path');
 const https = require('https');
 const http = require('http');
 const { resolveOutputFile } = require('./pipeline-utils');
-const { parsePlainUsfmVersesFromText, glQuoteAnchorsInVerseText } = require('./workspace-tools/tn-tools');
+const {
+  parsePlainUsfmVersesFromText,
+  glQuoteAnchorsInVerseText,
+  detectIssuesTsvLayout,
+  extractIssuesTsvRow,
+} = require('./workspace-tools/tn-tools');
 
 const DOOR43_BASE = 'https://git.door43.org/unfoldingWord';
 
@@ -93,8 +98,11 @@ function normalizeWhitespace(text) {
  * segments split on "&" / ellipsis, words in order with a content-word
  * fallback. So a row reported here is one mechanical prep would also fail to
  * anchor (issue #186); punctuation-only or spacing-only differences are not
- * reported. Only canonical rows (Book, Reference, SupportReference, GLQuote,
- * ...) for this chapter are checked; rows with an empty GLQuote are ignored.
+ * reported. Columns are located with prepareNotes' own layout detection
+ * (tn-tools detectIssuesTsvLayout / extractIssuesTsvRow), so header-based and
+ * headerless non-canonical TSVs are read the same way mechanical prep reads
+ * them; the canonical 7-column layout keeps its positional path. Only rows for
+ * this chapter are checked; rows with an empty GLQuote are ignored.
  *
  * @returns {Array<{ ref: string, glQuote: string, row: number }>} row is the
  *   1-based line number in the issues TSV.
@@ -104,11 +112,24 @@ function findStaleIssueQuotes(issuesTsvText, masterChapterUsfm, chapter) {
   const verses = parsePlainUsfmVersesFromText(masterChapterUsfm);
   const misses = [];
   const lines = String(issuesTsvText || '').split('\n');
-  for (let i = 0; i < lines.length; i++) {
-    const cols = lines[i].split('\t');
-    if (cols.length < 4 || !/^[A-Z0-9]{3}$/i.test(cols[0].trim())) continue;
-    const ref = cols[1].trim();
-    const glQuote = cols[3].trim();
+  const nonBlank = [];
+  lines.forEach((line, i) => { if (line.trim()) nonBlank.push({ line, i }); });
+  const { colMap, skipFirstLine } = detectIssuesTsvLayout(nonBlank.map((x) => x.line));
+  for (let n = skipFirstLine ? 1 : 0; n < nonBlank.length; n++) {
+    const i = nonBlank[n].i;
+    const cols = nonBlank[n].line.split('\t');
+    let ref;
+    let glQuote;
+    if (!colMap) {
+      if (cols.length < 4 || !/^[A-Z0-9]{3}$/i.test(cols[0].trim())) continue;
+      ref = cols[1].trim();
+      glQuote = cols[3].trim();
+    } else {
+      while (cols.length < 7) cols.push('');
+      const row = extractIssuesTsvRow(cols, colMap, '');
+      ref = row.reference.trim();
+      glQuote = row.gl_quote.trim();
+    }
     if (!glQuote) continue;
     const m = ref.match(/^(\d+):(\d+)(?:-(\d+))?$/);
     if (!m || Number(m[1]) !== ch) continue;

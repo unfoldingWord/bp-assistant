@@ -526,6 +526,54 @@ test('findStaleIssueQuotes still flags a quote whose content word left the verse
   ]);
 });
 
+// Codex review of #405: non-canonical issue TSVs that prepareNotes accepts via
+// its header mapping must be read the same way here, not silently skipped.
+test('findStaleIssueQuotes reads a Reference/ULT_Quote header layout with "BOOK C:V" refs (#186)', () => {
+  const { findStaleIssueQuotes } = loadCheckUltEditsPure();
+  const tsv = [
+    'Reference\tIssue\tULT_Quote\tHint',
+    'ISA 53:3\tfigs-activepassive\tHe was despised\tpassive',
+    'ISA 53:2\tfigs-simile\tlike a root from dry ground\tstale',
+    '53:2\tfigs-simile\tlike a root from ground of dryness\tcurrent, bare C:V ref',
+  ].join('\n');
+  assert.deepEqual(findStaleIssueQuotes(tsv, ISA_53_MASTER, 53), [
+    { ref: '53:2', glQuote: 'like a root from dry ground', row: 3 },
+  ]);
+});
+
+test('findStaleIssueQuotes reads a Book/Reference/GLQuote header layout (#186)', () => {
+  const { findStaleIssueQuotes } = loadCheckUltEditsPure();
+  const header = 'Book\tReference\tSupportReference\tGLQuote\tGo?\tAT\tExplanation';
+  const stale = [header, 'ISA\t53:2\tfigs-simile\tlike a root from dry ground\t\t\tstale'].join('\n');
+  assert.deepEqual(findStaleIssueQuotes(stale, ISA_53_MASTER, 53), [
+    { ref: '53:2', glQuote: 'like a root from dry ground', row: 2 },
+  ]);
+  const current = [header, 'ISA\t53:2\tfigs-simile\tlike a root from ground of dryness\t\t\tok'].join('\n');
+  assert.deepEqual(findStaleIssueQuotes(current, ISA_53_MASTER, 53), []);
+});
+
+test('findStaleIssueQuotes reads a headerless "C:V first" layout the way prepareNotes does (#186)', () => {
+  const { findStaleIssueQuotes } = loadCheckUltEditsPure();
+  const tsv = [
+    '53:3\tfigs-activepassive\tHe was despised\tpassive',
+    '53:2\tfigs-simile\tlike a root from dry ground\tstale',
+  ].join('\n');
+  assert.deepEqual(findStaleIssueQuotes(tsv, ISA_53_MASTER, 53), [
+    { ref: '53:2', glQuote: 'like a root from dry ground', row: 2 },
+  ]);
+});
+
+test('findStaleIssueQuotes treats a TN-style Quote column as not a GLQuote, as prepareNotes does (#186)', () => {
+  // prepareNotes maps no gl_quote for this header ("Quote" is the Hebrew
+  // quote), so there is no English quote to check and nothing is flagged.
+  const { findStaleIssueQuotes } = loadCheckUltEditsPure();
+  const tsv = [
+    'Reference\tID\tTags\tSupportReference\tQuote\tOccurrence\tNote',
+    '53:2\tab12\t\trc://*/ta/man/translate/figs-simile\t\u05db\u05bc\u05b7\u05e9\u05bc\u05c1\u05b9\u05e8\u05b6\u05e9\u05c1\t1\tnote',
+  ].join('\n');
+  assert.deepEqual(findStaleIssueQuotes(tsv, ISA_53_MASTER, 53), []);
+});
+
 test('buildStaleQuotesHint and recordPostEditReviewContext carry the stale rows to post-edit-review (#186)', () => {
   const { buildStaleQuotesHint, recordPostEditReviewContext } = loadCheckUltEditsPure();
   const stale = [{ ref: '53:2', glQuote: 'like a root from dry ground', row: 4 }];
