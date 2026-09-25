@@ -9,7 +9,7 @@ const {
 } = require('./fetch-tools');
 const { splitTsv, mergeTsvs, fixTrailingNewlines } = require('./tsv-tools');
 const { extractUltEnglish, filterPsalms, curlyQuotes, checkUstPassives, createAlignedUsfm, repairAlignmentXContent, readUsfmChapter, mergeAlignedUsfm, planAlignmentBatchesTool, validateAlignmentJson, validateUltBrackets, checkUltVoiceMismatch } = require('./usfm-tools');
-const { buildStrongsIndex, buildTnIndex, buildUstIndex } = require('./index-tools');
+const { buildStrongsIndex, buildTnIndex, buildUstIndex, buildCrossBookSeeHowIndex } = require('./index-tools');
 const { checkTwHeadwords, compareUltUst, detectAbstractNouns } = require('./issue-tools');
 const { extractAlignmentData, fixHebrewQuotes, flagNarrowQuotes, generateIds, resolveGlQuotes, verifyAtFit, assembleNotes, updateNoteText, updatePreparedQuote, removeNote, prepareNotes, prepareAndValidate, fixUnicodeQuotes, verifyBoldMatches, fillTsvIds, fillOrigQuotes, prepareATContext, readPreparedNotes } = require('./tn-tools');
 const { validateTnTsv, checkTnQuality } = require('./quality-tools');
@@ -362,6 +362,10 @@ function createWorkspaceTools(createSdkMcpServer, tool, z) {
         lookup: z.string().optional().describe("Strong's number to look up"),
         stats: z.boolean().optional().describe('Return index build metadata (built date, file/alignment/Strong\'s counts) from the existing cache; if no cache exists yet the index is built first'),
       }, async (args) => ({ content: [{ type: 'text', text: await buildUstIndex(args) }] })),
+      tool('build_crossbook_seehow_index', 'Build the cross-book "see how you translated" index: which phrase already carries an explanatory note in which book, joined from published ULT alignment and published TN quotes. Consumed by see-how detection to emit cross-book pointers on a phrase\'s first occurrence in a book.', {
+        force: z.boolean().optional().describe('Rebuild even if the cached index was already built today'),
+        stats: z.boolean().optional().describe('Return index build metadata (built date, book/key/note-row counts) from the existing cache'),
+      }, async (args) => ({ content: [{ type: 'text', text: await buildCrossBookSeeHowIndex(args) }] })),
 
       // --- Issue identification ---
       tool('check_tw_headwords', 'Check terms against Translation Words headwords index', {

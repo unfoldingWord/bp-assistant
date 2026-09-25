@@ -8,6 +8,7 @@ const https = require('https');
 
 const { loadTemplateMap, resolveAtRequirement, _inspectOpeningBold, countCaseInsensitiveOccurrences } = require('./tn-tools');
 const { resolveWorkspacePath, resolveDoor43ReposPath } = require('./recurrence-index');
+const { BOOK_NAMES } = require('../api-runner/verse-data');
 
 const CSKILLBP_DIR = process.env.CSKILLBP_DIR || '/srv/bot/workspace';
 
@@ -611,6 +612,78 @@ function referencesCoverVerse(refs, chapter, verse) {
   return false;
 }
 
+// --- Cross-book see-how target resolution (check 26b) ---
+
+// English book name -> USFM code, for the prose cross-book pointer form
+// ("... in Isaiah 36:3.").
+const BOOK_CODE_BY_NAME = new Map(
+  Object.entries(BOOK_NAMES).map(([code, name]) => [name.toLowerCase(), code])
+);
+// Longest name first, so "Song of Songs" is not shadowed by a shorter
+// alternative that prefixes it.
+const BOOK_NAME_ALTERNATION = Object.values(BOOK_NAMES)
+  .slice()
+  .sort((a, b) => b.length - a.length)
+  .map((n) => n.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))
+  .join('|');
+
+// "in Isaiah 36:3." / "as you did in Genesis 10:2." — the prose form the
+// published corpus uses for cross-book pointers.
+const CROSS_BOOK_PROSE_RE = new RegExp(`\\bin\\s+(${BOOK_NAME_ALTERNATION})\\s+(\\d{1,3}):(\\d{1,3})\\b`, 'gi');
+// The rarer markdown form: ../../isa/36/03.md
+const CROSS_BOOK_LINK_RE = /\]\(\.\.\/\.\.\/([1-3a-z]{3})\/(\d{1,3})\/(\d{1,3})\.md\)/gi;
+
+/**
+ * Every cross-book target named in a see-how sentence, as {code, chapter, verse}.
+ * Both the prose form and the markdown form are recognised.
+ */
+function crossBookTargetsIn(seeHowText) {
+  const out = [];
+  let m;
+  CROSS_BOOK_PROSE_RE.lastIndex = 0;
+  while ((m = CROSS_BOOK_PROSE_RE.exec(seeHowText)) !== null) {
+    const code = BOOK_CODE_BY_NAME.get(m[1].toLowerCase());
+    if (code) out.push({ code, name: m[1], chapter: parseInt(m[2], 10), verse: parseInt(m[3], 10) });
+  }
+  CROSS_BOOK_LINK_RE.lastIndex = 0;
+  while ((m = CROSS_BOOK_LINK_RE.exec(seeHowText)) !== null) {
+    const code = m[1].toUpperCase();
+    if (BOOK_NAMES[code]) {
+      out.push({ code, name: BOOK_NAMES[code], chapter: parseInt(m[2], 10), verse: parseInt(m[3], 10) });
+    }
+  }
+  return out;
+}
+
+/**
+ * Reference column values of a published TN book, from data/published-tns/.
+ * Files there are named tn_CODE.tsv (curate-data's fetch), and may begin with a
+ * "# Fetched: <date>" comment before the header — so rather than assuming a
+ * fixed header offset, keep only ref-shaped first columns.
+ *
+ * Returns null when the corpus is not fetched, so the caller can warn rather
+ * than claim a target is missing. Memoised per call site.
+ */
+function makePublishedTnRefLoader() {
+  const cache = new Map();
+  return (code) => {
+    if (cache.has(code)) return cache.get(code);
+    let refs = null;
+    const file = path.join(CSKILLBP_DIR, 'data/published-tns', `tn_${code}.tsv`);
+    try {
+      if (fs.existsSync(file)) {
+        refs = [];
+        for (const line of fs.readFileSync(file, 'utf8').split('\n')) {
+          const ref = (line.split('\t')[0] || '').trim();
+          if (/^\d+:\d/.test(ref)) refs.push(ref);
+        }
+      }
+    } catch { refs = null; }
+    cache.set(code, refs);
+    return refs;
+  };
+}
+
 // --- check_tn_quality ---
 
 async function checkTnQuality({ tsvPath, preparedJson, ultUsfm, ustUsfm, book, hebrewUsfm, output, bookTsvRows, bookTsvPath }) {
@@ -707,6 +780,10 @@ async function checkTnQuality({ tsvPath, preparedJson, ultUsfm, ustUsfm, book, h
       }
     }
   }
+
+  // Cross-book see-how targets resolve against the published corpus, not the
+  // book being written (check 26b).
+  const publishedTnRefs = makePublishedTnRefLoader();
 
   const findings = [];
   const seenIds = new Set();
@@ -1295,6 +1372,26 @@ async function checkTnQuality({ tsvPath, preparedJson, ultUsfm, ustUsfm, book, h
         }
       }
 
+      // 26b (cross-book). A pointer into another book -- prose
+      // ("... in Isaiah 36:3.") or the rarer ../../isa/36/03.md link -- is
+      // resolved against data/published-tns/, since the book being written
+      // says nothing about another book's rows. The forward-pointer rule (26a)
+      // does not apply: the published corpus points across books in both
+      // canonical directions (2 Kings 18 -> Isaiah 36 and back).
+      for (const t of crossBookTargetsIn(seeHowText)) {
+        if (book && t.code === String(book).toUpperCase()) continue;
+        const refs = publishedTnRefs(t.code);
+        if (refs === null) {
+          addFinding(n.row, n.ref, n.id, 'warning', 'seehow_target_unverified',
+            `Cross-book see-how target ${t.name} ${t.chapter}:${t.verse} could not be verified — data/published-tns/ is not available`);
+          continue;
+        }
+        if (!referencesCoverVerse(refs, t.chapter, t.verse)) {
+          addFinding(n.row, n.ref, n.id, 'error', 'seehow_target_missing',
+            `Cross-book see-how target ${t.name} ${t.chapter}:${t.verse} has no matching row in the published ${t.name} notes`);
+        }
+      }
+
       // 26d. A "See how you translated" note whose link path isn't the
       // canonical ../CC/VV.md shape (e.g. the old ../../book/1/5.md format).
       {
@@ -1409,4 +1506,5 @@ module.exports = {
   hasSourceScript,
   parseReferenceRanges,
   referencesCoverVerse,
+  _crossBookTargetsIn: crossBookTargetsIn,
 };

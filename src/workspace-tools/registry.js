@@ -32,7 +32,7 @@ const {
   repairAlignmentXContent, readUsfmChapter, mergeAlignedUsfm, planAlignmentBatchesTool,
   validateAlignmentJson, validateUltBrackets, checkUltVoiceMismatch,
 } = require('./usfm-tools');
-const { buildStrongsIndex, buildTnIndex, buildUstIndex } = require('./index-tools');
+const { buildStrongsIndex, buildTnIndex, buildUstIndex, buildCrossBookSeeHowIndex } = require('./index-tools');
 const { checkTwHeadwords, compareUltUst, detectAbstractNouns } = require('./issue-tools');
 const {
   extractAlignmentData, fixHebrewQuotes, flagNarrowQuotes, generateIds, resolveGlQuotes,
@@ -116,6 +116,7 @@ const TOOLS = {
   build_strongs_index: { handler: buildStrongsIndex },
   build_tn_index: { handler: buildTnIndex },
   build_ust_index: { handler: buildUstIndex },
+  build_crossbook_seehow_index: { handler: buildCrossBookSeeHowIndex },
 
   // --- Issue identification ---
   check_tw_headwords: { handler: checkTwHeadwords },
