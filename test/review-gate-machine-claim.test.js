@@ -46,7 +46,8 @@ function extractStep(file, name) {
 
 // Stub flyctl. State file: { state, env, calls: {list, update, start}, events, log }.
 // An event { on, n, patch } merges patch.env into env and sets patch.state
-// after the nth call of `on`. After `start` the machine reads as `started`
+// (and patch.failLists, which makes every `machines list` exit 1) after the
+// nth call of `on`, so a patch on `list` shows from the next list call. After `start` the machine reads as `started`
 // for two list calls, then `stopped`; a patch to `started` lasts until a
 // later patch changes it.
 const FLYCTL_STUB = `#!/usr/bin/env node
@@ -59,8 +60,9 @@ const cmd = args[0] === 'machines' && args[1] === 'list' ? 'list'
   : args[0] === 'machine' && args[1] === 'start' ? 'start' : 'other';
 s.calls[cmd] = (s.calls[cmd] || 0) + 1;
 if (s.calls.list > 500) { fs.writeFileSync(file, JSON.stringify(s)); process.exit(3); }
+const failing = cmd === 'list' && s.failLists;
 let out = '';
-if (cmd === 'list') {
+if (cmd === 'list' && !failing) {
   if (s.state === 'started' && typeof s.runLeft === 'number') { s.runLeft -= 1; if (s.runLeft < 0) { s.state = 'stopped'; delete s.runLeft; } }
   out = JSON.stringify([{ id: '${MACHINE}', state: s.state, config: { env: s.env } }]);
 } else if (cmd === 'update') {
@@ -76,14 +78,16 @@ for (const e of s.events) {
   if (!e.done && e.on === cmd && e.n === s.calls[cmd]) {
     Object.assign(s.env, e.patch.env || {});
     if (e.patch.state) s.state = e.patch.state;
+    if ('failLists' in e.patch) s.failLists = e.patch.failLists;
     e.done = true;
   }
 }
 fs.writeFileSync(file, JSON.stringify(s));
+if (failing) process.exit(1);
 if (out) process.stdout.write(out);
 `;
 
-function runStep(file, name, { state = 'stopped', env = {}, events = [], stepEnv = {}, timeout = 20000 } = {}) {
+function runStep(file, name, { state = 'stopped', env = {}, events = [], failLists = false, stepEnv = {}, timeout = 20000 } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'machine-claim-'));
   const bin = path.join(dir, 'bin');
   fs.mkdirSync(bin);
@@ -92,7 +96,7 @@ function runStep(file, name, { state = 'stopped', env = {}, events = [], stepEnv
   // The automerge Start step's drift guard reads the PR head via `gh api`.
   fs.writeFileSync(path.join(bin, 'gh'), `#!/bin/sh\necho ${HEAD}\n`, { mode: 0o755 });
   const stateFile = path.join(dir, 'state.json');
-  fs.writeFileSync(stateFile, JSON.stringify({ state, env, calls: {}, events, log: [] }));
+  fs.writeFileSync(stateFile, JSON.stringify({ state, env, calls: {}, events, failLists, log: [] }));
   const outputFile = path.join(dir, 'output');
   fs.writeFileSync(outputFile, '');
   const scriptFile = path.join(dir, 'step.sh');
@@ -179,6 +183,22 @@ test('automerge acquire: cancelled while waiting never records configured', () =
   assert.equal(r.final.calls.update || 0, 0);
 });
 
+test('automerge acquire: a gate that started the machine before our write landed is detected', () => {
+  // Our write lands on a machine the gate already started; the gate's run
+  // stops it later and its restore puts it back to hourly.
+  const r = runStep(AUTOMERGE, AM_ACQUIRE, {
+    env: { RUN_MODE: 'hourly' },
+    events: [
+      { on: 'update', n: 1, patch: { state: 'started' } },
+      { on: 'list', n: 5, patch: { env: GATE_RESTORE, state: 'stopped' } },
+    ],
+    stepEnv: AM_ENV,
+  });
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(r.stdout, /Lost the machine to another writer/);
+  assert.equal(r.final.calls.update, 2);
+});
+
 test('automerge start: starts when the config is still ours', () => {
   const r = runStep(AUTOMERGE, AM_START, { env: { ...OURS }, stepEnv: AM_ENV });
   assert.equal(r.status, 0, r.stderr);
@@ -197,6 +217,26 @@ test('automerge start: a gate restore after acquire fails fast without starting'
   assert.equal(r.status, 1);
   assert.match(r.stderr, /config changed before start/);
   assert.equal(r.final.calls.start || 0, 0);
+});
+
+test('automerge start: an unreadable config before start fails without starting', () => {
+  const r = runStep(AUTOMERGE, AM_START, { env: { ...OURS }, failLists: true, stepEnv: AM_ENV });
+  assert.equal(r.status, 1);
+  assert.match(r.stderr, /Could not read the reviewer machine's config before start/);
+  assert.equal(r.final.calls.start || 0, 0);
+});
+
+test('automerge start: an unreadable config once running only warns', () => {
+  const r = runStep(AUTOMERGE, AM_START, {
+    env: { ...OURS },
+    events: [
+      { on: 'list', n: 2, patch: { failLists: true } },
+      { on: 'list', n: 5, patch: { failLists: false } },
+    ],
+    stepEnv: AM_ENV,
+  });
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(r.stdout, /continuing on the pre-start check/);
 });
 
 test('automerge start: a write between the pre-start check and start fails fast', () => {

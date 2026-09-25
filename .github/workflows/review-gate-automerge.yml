@@ -222,11 +222,13 @@ jobs:
               continue
             fi
             # Let a racing writer's update propagate to the API before reading
-            # back; Fly's list is eventually consistent.
+            # back; Fly's list is eventually consistent. The machine must also
+            # still be stopped: if a gate started it before our write landed,
+            # our config is not what it booted with.
             sleep 8
             config="$(read_config)"
             IFS='|' read -r mode lease only_sha <<< "$config"
-            if [ "$mode" = "pr-reviewer" ] && [ "$only_sha" = "$HEAD_SHA" ] && [ -z "$lease" ]; then
+            if [ "$mode" = "pr-reviewer" ] && [ "$only_sha" = "$HEAD_SHA" ] && [ -z "$lease" ] && [ "$(get_state)" = "stopped" ]; then
               echo "Acquired reviewer machine for ${PR_REF} (${HEAD_SHA})."
               acquired=1
               break
@@ -283,13 +285,19 @@ jobs:
           # acquire verified. A review gate's claim (or its restore) can land in
           # the window since then; starting the machine would run the gate's
           # review or an hourly pass, and our marker would never appear. An
-          # unreadable config is a transient Fly API error, not evidence either
-          # way (same rule as review-gate.yml's pre-start check).
+          # unreadable config fails the run before start (nothing is running
+          # yet, so a re-run is cheap) and only warns once the machine is
+          # running, since failing then would throw away a review that may be
+          # ours.
           check_owner() {
             local when="$1" config mode lease only_sha
             config="$(read_config)"
             if [ "$config" = "<unreadable>" ]; then
-              echo "::warning::Could not read the reviewer machine's config ${when}; proceeding on the acquire step's readback."
+              if [ "$when" = "before start" ]; then
+                echo "Could not read the reviewer machine's config before start, so this run cannot confirm it still owns the machine. Not starting it. Re-run this workflow." >&2
+                exit 1
+              fi
+              echo "::warning::Could not read the reviewer machine's config ${when}; continuing on the pre-start check."
               return 0
             fi
             IFS='|' read -r mode lease only_sha <<< "$config"
