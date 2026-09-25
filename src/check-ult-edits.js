@@ -6,11 +6,7 @@ const path = require('path');
 const https = require('https');
 const http = require('http');
 const { resolveOutputFile } = require('./pipeline-utils');
-const {
-  parsePlainUsfmVersesFromText,
-  _splitQuoteSegments: splitQuoteSegments,
-  _buildComparableIndex: buildComparableIndex,
-} = require('./workspace-tools/tn-tools');
+const { parsePlainUsfmVersesFromText, glQuoteAnchorsInVerseText } = require('./workspace-tools/tn-tools');
 
 const DOOR43_BASE = 'https://git.door43.org/unfoldingWord';
 
@@ -92,21 +88,24 @@ function normalizeWhitespace(text) {
 
 /**
  * Find issue rows whose GLQuote no longer occurs in the master ULT verse text.
- * Uses the comparable-text normalizer and discontinuous-quote splitter the notes
- * pipeline uses to locate a gl_quote inside a ULT verse (tn-tools
- * buildComparableIndex / splitQuoteSegments), so a row reported here is one
- * mechanical prep would also fail to anchor (issue #186). Only canonical rows
- * (Book, Reference, SupportReference, GLQuote, ...) for this chapter are
- * checked; rows with an empty GLQuote are ignored.
+ * Matching is tn-tools glQuoteAnchorsInVerseText, which mirrors the alignment
+ * anchor (resolveWithAlignment): punctuation and {supplied} words ignored,
+ * segments split on "&" / ellipsis, words in order with a content-word
+ * fallback. So a row reported here is one mechanical prep would also fail to
+ * anchor (issue #186); punctuation-only or spacing-only differences are not
+ * reported. Only canonical rows (Book, Reference, SupportReference, GLQuote,
+ * ...) for this chapter are checked; rows with an empty GLQuote are ignored.
  *
- * @returns {Array<{ ref: string, glQuote: string }>}
+ * @returns {Array<{ ref: string, glQuote: string, row: number }>} row is the
+ *   1-based line number in the issues TSV.
  */
 function findStaleIssueQuotes(issuesTsvText, masterChapterUsfm, chapter) {
   const ch = Number(chapter);
   const verses = parsePlainUsfmVersesFromText(masterChapterUsfm);
   const misses = [];
-  for (const line of String(issuesTsvText || '').split('\n')) {
-    const cols = line.split('\t');
+  const lines = String(issuesTsvText || '').split('\n');
+  for (let i = 0; i < lines.length; i++) {
+    const cols = lines[i].split('\t');
     if (cols.length < 4 || !/^[A-Z0-9]{3}$/i.test(cols[0].trim())) continue;
     const ref = cols[1].trim();
     const glQuote = cols[3].trim();
@@ -119,25 +118,50 @@ function findStaleIssueQuotes(issuesTsvText, masterChapterUsfm, chapter) {
     for (let v = first; v <= last; v++) {
       if (verses[`${ch}:${v}`]) verseText.push(verses[`${ch}:${v}`]);
     }
-    const hay = buildComparableIndex(verseText.join(' ')).text;
-    const found = Boolean(hay) && splitQuoteSegments(glQuote).every((seg) => {
-      const needle = buildComparableIndex(seg).text;
-      return !needle || hay.includes(needle);
-    });
-    if (!found) misses.push({ ref, glQuote });
+    const found = verseText.length > 0 && glQuoteAnchorsInVerseText(glQuote, verseText.join(' '));
+    if (!found) misses.push({ ref, glQuote, row: i + 1 });
   }
   return misses;
 }
 
 /**
+ * Compare the plain (pre-alignment) AI-ULT chapter with the master chapter,
+ * verse by verse, ignoring USFM markers and whitespace. Used when the aligned
+ * AI-ULT is unavailable; post-edit-review itself diffs the plain AI-ULT.
+ */
+function plainChapterDiffers(plainUsfm, masterChapterUsfm, chapter) {
+  const prefix = Number(chapter) + ':';
+  const pick = (usfm) => {
+    const out = {};
+    for (const [key, text] of Object.entries(parsePlainUsfmVersesFromText(usfm))) {
+      if (key.startsWith(prefix)) out[key] = normalizeWhitespace(text);
+    }
+    return out;
+  };
+  const plain = pick(extractChapter(plainUsfm, chapter) || plainUsfm);
+  const master = pick(stripAlignmentMarkers(masterChapterUsfm));
+  const keys = new Set([...Object.keys(plain), ...Object.keys(master)]);
+  for (const key of keys) {
+    if (plain[key] !== master[key]) return true;
+  }
+  return false;
+}
+
+function formatRefList(refs, max = 10) {
+  if (refs.length <= max) return refs.join(', ');
+  return refs.slice(0, max).join(', ') + ', +' + (refs.length - max) + ' more';
+}
+
+/**
  * Decide whether a chapter needs post-edit-review. It does when any of:
  *   - the Door43 master ULT chapter differs from the AI aligned USFM (ult_diff);
+ *     when the aligned file (or its chapter) is missing, the plain AI-ULT is
+ *     compared instead (ult_diff_plain);
  *   - an issues-TSV GLQuote is absent from its master ULT verse
  *     (stale_issue_quotes). This catches issues written against older ULT
  *     wording even when the aligned file already matches master (issue #186);
- *   - the aligned file or its chapter is missing, so no diff is possible
- *     (aligned_missing / aligned_chapter_missing). post-edit-review reads the
- *     plain AI-ULT and the master text, not the aligned file, so it still runs.
+ *   - neither the aligned nor the plain AI-ULT exists, so no diff is possible
+ *     (aligned_missing / aligned_chapter_missing, plus plain_missing).
  *
  * @param {object} opts
  * @param {string} opts.book          - 3-letter book code (e.g. 'PSA')
@@ -145,7 +169,10 @@ function findStaleIssueQuotes(issuesTsvText, masterChapterUsfm, chapter) {
  * @param {string} opts.workspaceDir  - absolute path to the workspace directory
  * @param {string} [opts.pipeDir]     - relative path to the pipeline dir (e.g. 'tmp/pipeline/PSA-036')
  * @param {string} [opts.issuesPath]  - issues TSV path (relative to workspaceDir, or absolute)
- * @returns {Promise<{ hasEdits: boolean, masterPath: string|null, reason: string|null, staleQuotes: Array<{ref: string, glQuote: string}> }>}
+ * @returns {Promise<{ hasEdits: boolean, masterPath: string|null, reason: string|null,
+ *   staleQuotes: Array<{ref: string, glQuote: string, row: number}>, masterChapter: string }>}
+ *   masterChapter is the raw Door43 master chapter USFM, kept for re-checking
+ *   stale quotes after post-edit-review.
  */
 async function checkUltEdits({ book, chapter, workspaceDir, pipeDir, issuesPath }) {
   const bookUpper = book.toUpperCase();
@@ -167,17 +194,30 @@ async function checkUltEdits({ book, chapter, workspaceDir, pipeDir, issuesPath 
   const chPadded = String(chapter).padStart(width, '0');
   const alignedName = 'output/AI-ULT/' + bookUpper + '/' + bookUpper + '-' + chPadded + '-aligned.usfm';
   const alignedRelPath = resolveOutputFile(alignedName, bookUpper);
+  let alignedProblem = null;
   if (!alignedRelPath) {
-    console.log('[check-ult-edits] Aligned file not found: ' + alignedName + ' — cannot diff, routing to post-edit-review');
-    reasons.push('aligned_missing');
+    alignedProblem = 'aligned_missing';
   } else {
     const alignedUsfm = fs.readFileSync(path.resolve(workspaceDir, alignedRelPath), 'utf8');
     const alignedChapter = extractChapter(alignedUsfm, chapter);
     if (!alignedChapter) {
-      console.log('[check-ult-edits] Chapter ' + chapter + ' not found in aligned file — cannot diff, routing to post-edit-review');
-      reasons.push('aligned_chapter_missing');
+      alignedProblem = 'aligned_chapter_missing';
     } else if (normalizeWhitespace(masterChapter) !== normalizeWhitespace(alignedChapter)) {
       reasons.push('ult_diff');
+    }
+  }
+  if (alignedProblem) {
+    // No aligned text to diff: fall back to the plain AI-ULT, which is what
+    // post-edit-review compares against master anyway.
+    const plainName = 'output/AI-ULT/' + bookUpper + '/' + bookUpper + '-' + chPadded + '.usfm';
+    const plainRelPath = resolveOutputFile(plainName, bookUpper);
+    if (!plainRelPath) {
+      console.log('[check-ult-edits] Neither aligned nor plain AI-ULT found (' + alignedName + ', ' + plainName + ') — cannot diff, routing to post-edit-review');
+      reasons.push(alignedProblem + ', plain_missing');
+    } else {
+      const plainUsfm = fs.readFileSync(path.resolve(workspaceDir, plainRelPath), 'utf8');
+      console.log('[check-ult-edits] ' + alignedProblem + ' — comparing plain AI-ULT ' + plainRelPath + ' against master instead');
+      if (plainChapterDiffers(plainUsfm, masterChapter, chapter)) reasons.push('ult_diff_plain');
     }
   }
 
@@ -188,7 +228,7 @@ async function checkUltEdits({ book, chapter, workspaceDir, pipeDir, issuesPath 
       staleQuotes = findStaleIssueQuotes(fs.readFileSync(issuesAbsPath, 'utf8'), masterChapter, chapter);
       if (staleQuotes.length) {
         reasons.push('stale_issue_quotes: ' + staleQuotes.length + ' GLQuote(s) not in master ULT ('
-          + staleQuotes.map((q) => q.ref).join(', ') + ')');
+          + formatRefList(staleQuotes.map((q) => q.ref)) + ')');
       }
     } else {
       console.log('[check-ult-edits] Issues TSV not found: ' + issuesPath + ' — skipping stale-quote check');
@@ -196,7 +236,7 @@ async function checkUltEdits({ book, chapter, workspaceDir, pipeDir, issuesPath 
   }
 
   if (!reasons.length) {
-    return { hasEdits: false, masterPath: null, reason: null, staleQuotes };
+    return { hasEdits: false, masterPath: null, reason: null, staleQuotes, masterChapter };
   }
   const reason = reasons.join('; ');
 
@@ -213,21 +253,55 @@ async function checkUltEdits({ book, chapter, workspaceDir, pipeDir, issuesPath 
     console.log('[check-ult-edits] Post-edit-review needed for ' + bookUpper + ' ' + chapter + ' (' + reason + ')');
   }
 
-  return { hasEdits: true, masterPath, reason, staleQuotes };
+  return { hasEdits: true, masterPath, reason, staleQuotes, masterChapter };
 }
 
 /**
  * System-prompt addendum for post-edit-review when stale issue quotes
  * triggered it. The skill's Diff Analyzer skips verses where AI-ULT and master
- * agree, which is exactly where stale quotes hide, so name those rows.
+ * agree, which is exactly where stale quotes hide, so name those rows. The same
+ * rows are written to context.json (postEditReview.staleIssueQuotes) so the
+ * skill can hand them to its reconciler sub-agent.
  */
 function buildStaleQuotesHint(staleQuotes) {
   if (!Array.isArray(staleQuotes) || !staleQuotes.length) return '';
-  const rows = staleQuotes.map((q) => '- ' + q.ref + ': "' + q.glQuote + '"').join('\n');
+  const rows = staleQuotes
+    .map((q) => '- ' + q.ref + (q.row ? ' (TSV row ' + q.row + ')' : '') + ': "' + q.glQuote + '"')
+    .join('\n');
   return 'These issue rows have a GLQuote that does not occur in the current master ULT verse '
     + '(the issues were written against older ULT wording). Reconcile each one against the master '
     + 'ULT text even if the AI-ULT and master agree for that verse: update the GLQuote to the '
-    + 'master wording, or drop the issue if it no longer applies.\n' + rows;
+    + 'master ULT wording; drop the issue only if it no longer exists in the text. '
+    + 'The same list is in context.json at postEditReview.staleIssueQuotes.\n' + rows;
+}
+
+/**
+ * Record the post-edit-review trigger in the pipeline context so the skill
+ * and its sub-agents read the stale rows from a file, not only from the
+ * orchestrator's system prompt.
+ */
+function recordPostEditReviewContext(ctx, diffResult) {
+  ctx.postEditReview = {
+    reason: diffResult.reason || null,
+    staleIssueQuotes: Array.isArray(diffResult.staleQuotes) ? diffResult.staleQuotes : [],
+  };
+  if (diffResult.masterPath) {
+    ctx.sources = ctx.sources || {};
+    ctx.sources.ultMasterPlain = diffResult.masterPath;
+  }
+  return ctx;
+}
+
+/**
+ * After post-edit-review: the issue rows whose GLQuote the anchor still cannot
+ * place in the master ULT. Diagnostic only (callers log, never fail). Returns
+ * null when the check cannot run.
+ */
+function findRemainingStaleQuotes({ issuesPath, workspaceDir, masterChapter, chapter }) {
+  if (!issuesPath || !masterChapter) return null;
+  const abs = path.resolve(workspaceDir, issuesPath);
+  if (!fs.existsSync(abs)) return null;
+  return findStaleIssueQuotes(fs.readFileSync(abs, 'utf8'), masterChapter, chapter);
 }
 
 // Primitives exported for reuse by the overnight Sensor (overnight-watcher.js):
@@ -237,6 +311,9 @@ module.exports = {
   checkUltEdits,
   findStaleIssueQuotes,
   buildStaleQuotesHint,
+  recordPostEditReviewContext,
+  findRemainingStaleQuotes,
+  plainChapterDiffers,
   extractChapter,
   stripAlignmentMarkers,
   normalizeWhitespace,

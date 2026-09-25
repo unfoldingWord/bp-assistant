@@ -30,7 +30,7 @@ const { setPendingMerge } = require('./pending-merges');
 const { mergeTsvs } = require('./workspace-tools/tsv-tools');
 const { getCheckpoint, setCheckpoint, clearCheckpoint, buildCheckpointKey } = require('./pipeline-checkpoints');
 const { buildNotesContext, updateContextArtifacts, readContext, writeContext } = require('./pipeline-context');
-const { checkUltEdits, buildStaleQuotesHint } = require('./check-ult-edits');
+const { checkUltEdits, buildStaleQuotesHint, recordPostEditReviewContext, findRemainingStaleQuotes } = require('./check-ult-edits');
 const { getVerseCount } = require('./verse-counts');
 const { publishAdminStatus } = require('./admin-status');
 const { dispatchSelfDiagnosis } = require('./self-diagnosis');
@@ -2730,16 +2730,17 @@ async function notesPipeline(route, message) {
         await status(`**${ref}**: No human edits detected — skipping post-edit-review.`);
       } else {
         console.log(`[notes] ${ref}: post-edit-review triggered (${diffResult.reason})`);
-        await status(`**${ref}**: AI artifacts found\u2192 post-edit-review path (${diffResult.reason})`);
+        await status(`**${ref}**: AI artifacts found \u2192 post-edit-review path (${diffResult.reason})`);
 
-        // Store the plain master chapter path in context so the skill can read it
-        if (diffResult.masterPath && contextPath && pipeDir) {
+        // Store the plain master chapter path and the stale GLQuote rows in
+        // context so the skill (and its reconciler sub-agent) can read them.
+        if (contextPath && pipeDir) {
           try {
             const ctx = readContext(pipeDir);
-            ctx.sources.ultMasterPlain = diffResult.masterPath;
+            recordPostEditReviewContext(ctx, diffResult);
             writeContext(pipeDir, ctx);
           } catch (err) {
-            console.warn(`[notes] Failed to update context with ultMasterPlain: ${err.message}`);
+            console.warn(`[notes] Failed to update context with post-edit-review inputs: ${err.message}`);
           }
         }
 
@@ -2751,6 +2752,9 @@ async function notesPipeline(route, message) {
           skipPreClean: true,   // expectedOutput is also the input — don't delete it
           model: 'medium',      // validation/reconciliation — Sonnet suffices at lower cost
           ops: 1,
+          staleRecheck: diffResult.masterChapter
+            ? { masterChapter: diffResult.masterChapter, before: (diffResult.staleQuotes || []).length }
+            : null,
         });
         issuesBackupPath = backupIssuesFile({ issuesPath, pipeDir });
       }
@@ -3521,6 +3525,20 @@ async function notesPipeline(route, message) {
               }
             } catch (e) {
               // Non-fatal — file may not exist yet if skill was skipped
+            }
+          }
+          // Diagnostic (#186): how many GLQuotes still miss the master ULT.
+          if (skill.name === 'post-edit-review' && issuesPath && skill.staleRecheck) {
+            try {
+              const remaining = findRemainingStaleQuotes({
+                issuesPath, workspaceDir: CSKILLBP_DIR, masterChapter: skill.staleRecheck.masterChapter, chapter: ch,
+              });
+              if (remaining) {
+                console.log(`[notes] ${ref}: after post-edit-review, ${remaining.length} stale GLQuote row(s) remain`
+                  + ` (was ${skill.staleRecheck.before})${remaining.length ? ': ' + remaining.map((q) => q.ref).slice(0, 10).join(', ') : ''}`);
+              }
+            } catch (err) {
+              console.warn(`[notes] stale GLQuote re-check failed (non-fatal): ${err.message}`);
             }
           }
         }

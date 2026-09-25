@@ -102,6 +102,45 @@ function tokenizeAlignmentEntryWords(text) {
     .filter(Boolean);
 }
 
+// GLQuote -> discontinuous segments, exactly as the alignment anchor
+// (resolveWithAlignment) splits them: {supplied} words dropped, split on "&".
+function splitAlignmentQuoteSegments(glQuote) {
+  const cleanGlq = String(glQuote || '').replace(/\{[^}]*\}/g, '').trim();
+  if (!cleanGlq) return [];
+  return cleanGlq.split(/\s*&\s*/);
+}
+
+function isOrderedSubsequence(words, haystack) {
+  let i = 0;
+  for (const word of haystack) {
+    if (word === words[i]) i++;
+    if (i === words.length) return true;
+  }
+  return i === words.length;
+}
+
+// Would the alignment anchor be able to place this GLQuote in this verse text?
+// Mirrors resolveWithAlignment's matching against plain verse words instead of
+// alignment entries: same segment split (plus ellipses), same tokenizer
+// (ALIGNMENT_PUNC_RE stripped, lowercased), each segment's words must occur in
+// order (gaps allowed), falling back to its content words. Used by the
+// post-edit-review gate (check-ult-edits) so it flags only quotes the
+// downstream anchor would also fail on (issue #186).
+function glQuoteAnchorsInVerseText(glQuote, verseText) {
+  const verseWords = tokenizeAlignmentEntryWords(verseText);
+  const segments = splitAlignmentQuoteSegments(glQuote)
+    .flatMap((seg) => seg.split(/\s*(?:\u2026|\.\.\.)\s*/));
+  for (const seg of segments) {
+    const words = tokenizeAlignmentQuote(seg);
+    if (!words.length) continue;
+    if (isOrderedSubsequence(words, verseWords)) continue;
+    const contentWords = words.filter((word) => !ALIGNMENT_STOP_WORDS.has(word));
+    const fallbackWords = contentWords.length ? contentWords : words;
+    if (!isOrderedSubsequence(fallbackWords, verseWords)) return false;
+  }
+  return true;
+}
+
 function compareAlignmentCandidates(left, right, words) {
   if (!left) return right;
   if (!right) return left;
@@ -2738,9 +2777,8 @@ function fillOrigQuotes({ preparedJson, alignmentJson, hebrewUsfm, masterUltUsfm
   }
 
   function resolveWithAlignment(glQuote, entries) {
-    const cleanGlq = glQuote.replace(/\{[^}]*\}/g, '').trim();
-    if (!cleanGlq) return null;
-    const segments = cleanGlq.split(/\s*&\s*/);
+    const segments = splitAlignmentQuoteSegments(glQuote);
+    if (!segments.length) return null;
 
     const usedIndices = new Set();
     const matches = [];
@@ -3383,6 +3421,5 @@ module.exports = {
   _stripAlternateTranslation: stripAlternateTranslation,
   _locateQuoteStart: locateQuoteStart,
   _comparableQuoteLength: comparableQuoteLength,
-  _splitQuoteSegments: splitQuoteSegments,
-  _buildComparableIndex: buildComparableIndex,
+  glQuoteAnchorsInVerseText,
 };
