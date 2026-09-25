@@ -48,7 +48,30 @@ test('raw-API claude paths resolve opus and the default to claude-opus-5-5', () 
   // Pinning Opus 5 explicitly still works.
   assert.strictEqual(assertProviderModel('claude', 'claude-opus-5'), 'claude-opus-5');
   const m = getProviderConfig('claude').models['claude-opus-5-5'];
-  assert.deepStrictEqual(m, { label: 'Claude Opus 5.5', inputPer1M: 4.0, outputPer1M: 20.0 });
+  assert.deepStrictEqual(m, { label: 'Claude Opus 5.5', inputPer1M: 4.0, outputPer1M: 20.0, cacheReadPer1M: 0.2 });
+});
+
+test('BP_MODEL_<TIER>=OPUS (any case) keeps the bare SDK alias', () => {
+  process.env.BP_MODEL_HIGH = 'OPUS';
+  try {
+    assert.strictEqual(resolveDifficultyModel('claude', 'high'), 'opus');
+  } finally {
+    delete process.env.BP_MODEL_HIGH;
+  }
+});
+
+test('claude estimateCost uses the per-model cache-read price for Opus 5.5', () => {
+  const { estimateCost } = require('../src/api-runner/providers/claude');
+  const cost = estimateCost('claude-opus-5-5', { inputTokens: 1_000_000, cacheReadTokens: 1_000_000, cacheCreateTokens: 0, outputTokens: 0 });
+  assert.ok(Math.abs(cost - 0.2) < 1e-9, `expected $0.20, got ${cost}`);
+});
+
+test('claude-runner maps thinking off to adaptive at low effort (Opus 5.5 rejects disabled)', () => {
+  const { resolveReasoning } = require('../src/claude-runner');
+  for (const off of [false, 'off', 'none']) {
+    assert.deepStrictEqual(resolveReasoning(off, 'opus'), { thinking: { type: 'adaptive' }, effort: 'low' });
+  }
+  assert.deepStrictEqual(resolveReasoning('off', 'claude-haiku-4-5-20251001'), {});
 });
 
 test('Agent SDK claude paths send the bare opus alias', () => {

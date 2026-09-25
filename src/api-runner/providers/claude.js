@@ -15,6 +15,8 @@ async function getAnthropicClass() {
 const DEFAULT_MODEL = getProviderConfig('claude').defaultModel;
 const MODELS = getProviderConfig('claude').models;
 
+const NO_FORCED_TOOL_CHOICE = new Set(['claude-opus-5-5', 'claude-fable-5-1']);
+
 const THINKING_MAP = {
   low: 'low',
   medium: 'medium',
@@ -107,7 +109,13 @@ async function sendRequest({ model, system, messages, tools, thinking, apiKey, t
     // tool_choice: auto → {type:"auto"}, required → {type:"any"}, none → {type:"none"}
     if (toolChoice) {
       const typeMap = { auto: 'auto', required: 'any', none: 'none' };
-      params.tool_choice = { type: typeMap[toolChoice] || 'auto' };
+      let type = typeMap[toolChoice] || 'auto';
+      // Opus 5.5 and Fable 5.1 reject forced tool use (`any`/`tool`) with a 400.
+      if (type === 'any' && NO_FORCED_TOOL_CHOICE.has(params.model)) {
+        console.warn(`[claude] ${params.model} does not support forced tool_choice; using auto`);
+        type = 'auto';
+      }
+      params.tool_choice = { type };
     }
   }
 
@@ -180,7 +188,9 @@ function estimateCost(model, usage) {
   const resolved = resolveProviderModel('claude', model || providerCfg.defaultModel);
   const m = providerCfg.models[resolved] || providerCfg.models[providerCfg.defaultModel];
   
-  const cacheReadCost = (usage.cacheReadTokens / 1_000_000) * (m.inputPer1M * 0.1); // 90% discount
+  // Per-model cache-read price when listed (Opus 5.5: $0.20 = 5%), else 90% discount.
+  const cacheReadPer1M = m.cacheReadPer1M != null ? m.cacheReadPer1M : m.inputPer1M * 0.1;
+  const cacheReadCost = (usage.cacheReadTokens / 1_000_000) * cacheReadPer1M;
   const cacheCreateCost = (usage.cacheCreateTokens / 1_000_000) * (m.inputPer1M * 1.25); // 25% premium
   const standardInputTokens = usage.inputTokens - usage.cacheReadTokens - usage.cacheCreateTokens;
   const standardInputCost = (Math.max(0, standardInputTokens) / 1_000_000) * m.inputPer1M;

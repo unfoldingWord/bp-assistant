@@ -84,11 +84,12 @@ const EFFORT_LEVELS = ['low', 'medium', 'high', 'xhigh', 'max'];
 // Fable); Haiku and others get no thinking option (effort would 400 there).
 function resolveReasoning(thinking, resolvedModel) {
   const supportsEffort = typeof resolvedModel === 'string' && /opus|sonnet|fable/i.test(resolvedModel);
-  // Explicit off — disable extended thinking. Only effort-capable models accept
-  // a `thinking` param; others must omit it entirely (matches prior behavior of
-  // returning null/setting nothing) to avoid a 400.
+  // Explicit off — as little thinking as the model allows. Opus 5.5 rejects
+  // `thinking: {type:'disabled'}` at every effort level (400), and `opus` now
+  // resolves to it, so "off" means adaptive at `low` effort on effort-capable
+  // models. Others must omit the param entirely to avoid a 400.
   if (thinking === false || thinking === 'off' || thinking === 'none') {
-    return supportsEffort ? { thinking: { type: 'disabled' } } : {};
+    return supportsEffort ? { thinking: { type: 'adaptive' }, effort: 'low' } : {};
   }
   // Explicit effort level (e.g. 'high', 'xhigh').
   if (typeof thinking === 'string') {

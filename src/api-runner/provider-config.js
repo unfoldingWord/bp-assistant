@@ -32,7 +32,7 @@ const DEFAULT_PROVIDER_CONFIGS = {
       max: 'opus',
     },
     models: {
-      'claude-opus-5-5': { label: 'Claude Opus 5.5', inputPer1M: 4.0, outputPer1M: 20.0 },
+      'claude-opus-5-5': { label: 'Claude Opus 5.5', inputPer1M: 4.0, outputPer1M: 20.0, cacheReadPer1M: 0.2 },
       'claude-opus-5': { label: 'Claude Opus 5', inputPer1M: 5.0, outputPer1M: 25.0 },
       'claude-opus-4-8': { label: 'Claude Opus 4.8', inputPer1M: 5.0, outputPer1M: 25.0 },
       'claude-opus-4-7': { label: 'Claude Opus 4.7', inputPer1M: 5.0, outputPer1M: 25.0 },
@@ -338,7 +338,7 @@ function resolveDifficultyModel(provider, requested) {
   try { cfg = getProviderConfig(provider); } catch { return requested; }
   // 'opus' maps to the top model (the bare SDK alias for claude), not the
   // raw-API concrete id in modelAliases.
-  const pin = (v) => (v === 'opus' ? topModel(cfg) : cfg.modelAliases?.[v] || v);
+  const pin = (v) => (v.toLowerCase() === 'opus' ? topModel(cfg) : cfg.modelAliases?.[v] || v);
   const force = process.env.BP_FORCE_MODEL;
   if (force) return pin(force);
   if (isDifficultyTier(requested)) {

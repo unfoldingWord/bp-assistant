@@ -571,6 +571,27 @@ test('claude adapter streams, maps effort and reads usage', async () => {
   assert.strictEqual(seen.messages.length, 1);
 });
 
+test('claude adapter sends effort low for thinking none (Opus 5.5 cannot disable thinking)', async () => {
+  let seen = null;
+  const client = {
+    messages: {
+      stream(params) {
+        seen = params;
+        return {
+          finalMessage: async () => ({
+            content: [{ type: 'text', text: wrapped('OUT') }],
+            usage: { input_tokens: 1, output_tokens: 1 },
+            stop_reason: 'end_turn',
+          }),
+        };
+      },
+    },
+  };
+  await runWithClient('claude', 'claude-opus-5-5', client, { thinking: 'none' });
+  assert.strictEqual(seen.thinking, undefined);
+  assert.deepStrictEqual(seen.output_config, { effort: 'low' });
+});
+
 test('openai adapter uses the Responses API and drops a rejected reasoning param', async () => {
   const bodies = [];
   const client = {
