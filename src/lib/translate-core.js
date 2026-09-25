@@ -335,6 +335,85 @@ function writeArticleFiles(workDir, index, { sourceMarkdown, packMarkdown, artic
   return { srcFile, packFile, taskFile, outputFile, nn };
 }
 
+const REUSE_IDENTITY_FILE = 'identity.json';
+
+function flattenIdentity(obj, prefix = '', out = {}) {
+  for (const [k, v] of Object.entries(obj || {})) {
+    const key = prefix ? `${prefix}.${k}` : k;
+    if (v && typeof v === 'object' && !Array.isArray(v)) flattenIdentity(v, key, out);
+    else out[key] = v;
+  }
+  return out;
+}
+
+// Key order must not decide cache identity, so sort on the way in and compare
+// the serialized form of the sorted object.
+function canonicalIdentity(identity) {
+  const out = {};
+  for (const key of Object.keys(identity || {}).sort()) {
+    const v = identity[key];
+    if (v === undefined) continue;
+    out[key] = v && typeof v === 'object' && !Array.isArray(v) ? canonicalIdentity(v) : v;
+  }
+  return out;
+}
+
+function identityDiffKeys(a, b) {
+  const fa = flattenIdentity(a);
+  const fb = flattenIdentity(b);
+  return [...new Set([...Object.keys(fa), ...Object.keys(fb)])]
+    .filter((k) => JSON.stringify(fa[k]) !== JSON.stringify(fb[k]))
+    .sort();
+}
+
+/**
+ * Gate batch reuse on the prompt inputs the work-dir name does NOT capture.
+ *
+ * The work dir alone is not a sufficient cache key. On the API route it is
+ * buildRunHash() over resourceType|sourceRef|contextRef|model|direction|selTag;
+ * for scripts/translate-dry-run.js it is just `--out`. Two inputs that change
+ * the rendered pack escape both:
+ *   - the four scripture refs rendered as "Scripture for these verses", so a
+ *     re-run with a different --literal/--simplified must not reuse batches;
+ *   - the pack CONTENT, because contextRef is hashed as a ref STRING --
+ *     `org/translation-context@master` at two different commits hashes the
+ *     same. The resolved pack.sha distinguishes them.
+ * We stamp the resolved values into <workDir>/identity.json and refuse reuse
+ * when they differ. Nothing here feeds buildRunHash(), so run hashes -- and
+ * therefore delivery branch names -- stay byte-identical for existing runs.
+ *
+ * A work dir with no identity.json predates this gate. Re-translating those
+ * from scratch would discard every in-flight batch of a resumed run for no
+ * safety gain, so it is grandfathered in and stamped for next time.
+ *
+ * Returns { reuse, changed, identity }.
+ */
+function reuseIdentityGate(workDir, identity) {
+  const file = path.join(workDir, REUSE_IDENTITY_FILE);
+  const current = canonicalIdentity(identity);
+  let raw = null;
+  try { raw = fs.readFileSync(file, 'utf8'); } catch { raw = null; }
+
+  let reuse = true;
+  let changed = [];
+  if (raw != null) {
+    let prev = null;
+    try { prev = canonicalIdentity(JSON.parse(raw)); } catch { prev = null; }
+    if (prev == null) {
+      // Corrupt identity stamp: we cannot prove the cached batches match, so don't reuse.
+      reuse = false;
+      changed = ['<unreadable identity.json>'];
+    } else if (JSON.stringify(prev) !== JSON.stringify(current)) {
+      reuse = false;
+      changed = identityDiffKeys(prev, current);
+    }
+  }
+
+  fs.mkdirSync(workDir, { recursive: true });
+  fs.writeFileSync(file, JSON.stringify(current, null, 2), 'utf8');
+  return { reuse, changed, identity: current };
+}
+
 /**
  * Read and structurally validate a TSV batch's skill output. Returns
  * { rows, checks }. `parse` + `checkOpts` (passThrough/translate columns)
@@ -509,6 +588,7 @@ module.exports = {
   selectExamples,
   writeBatchFiles,
   writeArticleFiles,
+  reuseIdentityGate,
   readBatchOutput,
   readArticleOutput,
   mergeChapterIntoBook,
