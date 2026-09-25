@@ -7,7 +7,7 @@ const { getDoor43Username, normalizeBookName, buildBranchName, discoverFreshOutp
 const { buildNotesContext, readContext, writeContext } = require('../pipeline-context');
 const { extractAlignmentData, prepareNotes, fillOrigQuotes, resolveGlQuotes, flagNarrowQuotes, generateIds, syncCanonicalHebrewQuotes } = require('../workspace-tools/tn-tools');
 const { createAlignedUsfm, validateAlignedUsfmMarkup, summarizeAlignedUsfmMarkupFindings } = require('../workspace-tools/usfm-tools');
-const { checkUltEdits } = require('../check-ult-edits');
+const { checkUltEdits, buildStaleQuotesHint, recordPostEditReviewContext, findRemainingStaleQuotes } = require('../check-ult-edits');
 const { getProviderSystemAppend } = require('./provider-nudges');
 
 const ALIGNMENT_VALIDATION_RETRIES = 2;
@@ -225,16 +225,30 @@ async function apiPipeline(route, message) {
           book, chapter,
           workspaceDir: path.resolve(CSKILLBP_DIR),
           pipeDir: dirPath,
+          issuesPath,
         });
         if (diffResult.hasEdits) {
+          console.log(`[api-pipeline] ${book} ${chapter}: post-edit-review triggered (${diffResult.reason})`);
           const ctx = readContext(dirPath);
-          ctx.sources.ultMasterPlain = diffResult.masterPath;
+          recordPostEditReviewContext(ctx, diffResult);
           writeContext(dirPath, ctx);
-          await reply(`AI artifacts found with human edits — running post-edit-review...`);
+          await reply(`AI artifacts found, post-edit-review needed (${diffResult.reason}) — running post-edit-review...`);
           issueResult = await runSkill('post-edit-review',
             `--issues ${issuesPath} --context ${contextPath}`,
-            { provider, runtime, model: 'sonnet', thinking: 'medium', maxTurns: 60, timeout: 20, cwd: selectedCwd });
+            { provider, runtime, model: 'sonnet', thinking: 'medium', maxTurns: 60, timeout: 20, cwd: selectedCwd,
+              systemAppend: buildStaleQuotesHint(diffResult.staleQuotes) || undefined });
           await reply(`post-edit-review done (turns: ${issueResult.turns}, cost: $${(issueResult.cost || 0).toFixed(4)}).`);
+          try {
+            const remaining = findRemainingStaleQuotes({
+              issuesPath, workspaceDir: path.resolve(CSKILLBP_DIR), masterChapter: diffResult.masterChapter, chapter,
+            });
+            if (remaining) {
+              console.log(`[api-pipeline] ${book} ${chapter}: after post-edit-review, ${remaining.length} stale GLQuote row(s) remain`
+                + ` (was ${(diffResult.staleQuotes || []).length})${remaining.length ? ': ' + remaining.map((q) => q.ref).slice(0, 10).join(', ') : ''}`);
+            }
+          } catch (err) {
+            console.warn(`[api-pipeline] stale GLQuote re-check failed (non-fatal): ${err.message}`);
+          }
         } else {
           await reply(`AI artifacts found, no human edits — using existing issues TSV.`);
         }

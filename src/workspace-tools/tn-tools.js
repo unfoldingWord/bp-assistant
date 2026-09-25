@@ -102,6 +102,45 @@ function tokenizeAlignmentEntryWords(text) {
     .filter(Boolean);
 }
 
+// GLQuote -> discontinuous segments, exactly as the alignment anchor
+// (resolveWithAlignment) splits them: {supplied} words dropped, split on "&".
+function splitAlignmentQuoteSegments(glQuote) {
+  const cleanGlq = String(glQuote || '').replace(/\{[^}]*\}/g, '').trim();
+  if (!cleanGlq) return [];
+  return cleanGlq.split(/\s*&\s*/);
+}
+
+function isOrderedSubsequence(words, haystack) {
+  let i = 0;
+  for (const word of haystack) {
+    if (word === words[i]) i++;
+    if (i === words.length) return true;
+  }
+  return i === words.length;
+}
+
+// Would the alignment anchor be able to place this GLQuote in this verse text?
+// Mirrors resolveWithAlignment's matching against plain verse words instead of
+// alignment entries: same segment split (plus ellipses), same tokenizer
+// (ALIGNMENT_PUNC_RE stripped, lowercased), each segment's words must occur in
+// order (gaps allowed), falling back to its content words. Used by the
+// post-edit-review gate (check-ult-edits) so it flags only quotes the
+// downstream anchor would also fail on (issue #186).
+function glQuoteAnchorsInVerseText(glQuote, verseText) {
+  const verseWords = tokenizeAlignmentEntryWords(verseText);
+  const segments = splitAlignmentQuoteSegments(glQuote)
+    .flatMap((seg) => seg.split(/\s*(?:\u2026|\.\.\.)\s*/));
+  for (const seg of segments) {
+    const words = tokenizeAlignmentQuote(seg);
+    if (!words.length) continue;
+    if (isOrderedSubsequence(words, verseWords)) continue;
+    const contentWords = words.filter((word) => !ALIGNMENT_STOP_WORDS.has(word));
+    const fallbackWords = contentWords.length ? contentWords : words;
+    if (!isOrderedSubsequence(fallbackWords, verseWords)) return false;
+  }
+  return true;
+}
+
 function compareAlignmentCandidates(left, right, words) {
   if (!left) return right;
   if (!right) return left;
@@ -1965,24 +2004,12 @@ function findSampleDataRow(lines) {
   return null;
 }
 
-function prepareNotes({ inputTsv, ultUsfm, ustUsfm, output, alignedUsfm, alignmentJson }) {
-  const inputPath = path.resolve(CSKILLBP_DIR, inputTsv);
-  const content = fs.readFileSync(inputPath, 'utf8');
-  const lines = content.split('\n').filter(l => l.trim());
-  const items = [];
-  const introRows = [];
-  let skippedInvalidRef = 0; // data rows dropped because their reference wasn't chapter:verse
-  const templateMap = loadTemplateMap();
-
-  // --- Detect TSV column format ---
-  // Canonical (old): Book  Reference  SRef  GLQuote  NeedsAT  AT  Explanation
-  // Various new formats have headers and different column orders.
-  // Detect format from first line, then map columns to canonical positions.
-  const fnM0 = path.basename(inputPath).match(/([A-Z0-9]+)-(\d+)/i);
-  const fileBook = fnM0 ? fnM0[1].toUpperCase() : '';
-  const fileChapter = fnM0 ? parseInt(fnM0[2], 10) : null;
-  const introIdSet = new Set();
-
+// Detect the column layout of an issues TSV (lines = its non-blank lines).
+// colMap null means the canonical positional layout
+// (Book, Reference, SupportReference, GLQuote, NeedsAT, AT, Explanation).
+// Shared by prepareNotes and the post-edit-review gate (check-ult-edits) so
+// both read the same columns.
+function detectIssuesTsvLayout(lines) {
   let colMap = null; // null = canonical positional mapping
   let skipFirstLine = false;
   let sampleDataCols = null; // representative non-intro data row, used for headerless format detection
@@ -2025,35 +2052,61 @@ function prepareNotes({ inputTsv, ultUsfm, ustUsfm, output, alignedUsfm, alignme
     }
     // else: canonical old format (Book, Ref, SRef, GLQuote, NeedsAT, AT, Explanation) — colMap stays null
   }
+  return { colMap, skipFirstLine };
+}
 
-  function extractRow(cols) {
-    if (!colMap) {
-      // Canonical old format: Book  Ref  SRef  GLQuote  NeedsAT  AT  Explanation
-      const rawRef = cols[1] || cols[0];
-      return {
-        book: (cols[0] || '').trim(),
-        reference: rawRef.includes(':') ? rawRef : `${cols[0]}:${cols[1]}`,
-        sref: cols[2] || '',
-        gl_quote: cols[3] || '',
-        needs_at: cols[4] || '',
-        at_provided: cols[5] || '',
-        explanation: cols[6] || '',
-      };
-    }
-    const get = (key) => (colMap[key] >= 0 && colMap[key] < cols.length) ? (cols[colMap[key]] || '').trim() : '';
-    let ref = get('reference');
-    // Strip book prefix from reference if present (e.g., "ZEC 2:1" → "2:1")
-    ref = ref.replace(/^[A-Z0-9]{2,3}\s+/i, '');
+// Map one issues-TSV row (split on tabs, padded to >= 7 cells) to canonical
+// fields using a layout from detectIssuesTsvLayout.
+function extractIssuesTsvRow(cols, colMap, fileBook) {
+  if (!colMap) {
+    // Canonical old format: Book  Ref  SRef  GLQuote  NeedsAT  AT  Explanation
+    const rawRef = cols[1] || cols[0];
     return {
-      book: get('book_col') || fileBook,
-      reference: ref,
-      sref: get('sref'),
-      gl_quote: get('gl_quote'),
-      needs_at: get('needs_at'),
-      at_provided: get('at_provided'),
-      explanation: get('explanation'),
+      book: (cols[0] || '').trim(),
+      reference: rawRef.includes(':') ? rawRef : `${cols[0]}:${cols[1]}`,
+      sref: cols[2] || '',
+      gl_quote: cols[3] || '',
+      needs_at: cols[4] || '',
+      at_provided: cols[5] || '',
+      explanation: cols[6] || '',
     };
   }
+  const get = (key) => (colMap[key] >= 0 && colMap[key] < cols.length) ? (cols[colMap[key]] || '').trim() : '';
+  let ref = get('reference');
+  // Strip book prefix from reference if present (e.g., "ZEC 2:1" → "2:1")
+  ref = ref.replace(/^[A-Z0-9]{2,3}\s+/i, '');
+  return {
+    book: get('book_col') || fileBook,
+    reference: ref,
+    sref: get('sref'),
+    gl_quote: get('gl_quote'),
+    needs_at: get('needs_at'),
+    at_provided: get('at_provided'),
+    explanation: get('explanation'),
+  };
+}
+
+function prepareNotes({ inputTsv, ultUsfm, ustUsfm, output, alignedUsfm, alignmentJson }) {
+  const inputPath = path.resolve(CSKILLBP_DIR, inputTsv);
+  const content = fs.readFileSync(inputPath, 'utf8');
+  const lines = content.split('\n').filter(l => l.trim());
+  const items = [];
+  const introRows = [];
+  let skippedInvalidRef = 0; // data rows dropped because their reference wasn't chapter:verse
+  const templateMap = loadTemplateMap();
+
+  // --- Detect TSV column format ---
+  // Canonical (old): Book  Reference  SRef  GLQuote  NeedsAT  AT  Explanation
+  // Various new formats have headers and different column orders.
+  // Detect format from first line, then map columns to canonical positions.
+  const fnM0 = path.basename(inputPath).match(/([A-Z0-9]+)-(\d+)/i);
+  const fileBook = fnM0 ? fnM0[1].toUpperCase() : '';
+  const fileChapter = fnM0 ? parseInt(fnM0[2], 10) : null;
+  const introIdSet = new Set();
+
+  const { colMap, skipFirstLine } = detectIssuesTsvLayout(lines);
+
+  const extractRow = (cols) => extractIssuesTsvRow(cols, colMap, fileBook);
 
   for (let li = skipFirstLine ? 1 : 0; li < lines.length; li++) {
     const line = lines[li];
@@ -2738,9 +2791,8 @@ function fillOrigQuotes({ preparedJson, alignmentJson, hebrewUsfm, masterUltUsfm
   }
 
   function resolveWithAlignment(glQuote, entries) {
-    const cleanGlq = glQuote.replace(/\{[^}]*\}/g, '').trim();
-    if (!cleanGlq) return null;
-    const segments = cleanGlq.split(/\s*&\s*/);
+    const segments = splitAlignmentQuoteSegments(glQuote);
+    if (!segments.length) return null;
 
     const usedIndices = new Set();
     const matches = [];
@@ -3383,4 +3435,7 @@ module.exports = {
   _stripAlternateTranslation: stripAlternateTranslation,
   _locateQuoteStart: locateQuoteStart,
   _comparableQuoteLength: comparableQuoteLength,
+  glQuoteAnchorsInVerseText,
+  detectIssuesTsvLayout,
+  extractIssuesTsvRow,
 };
