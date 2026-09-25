@@ -302,10 +302,14 @@ jobs:
           # under that live claim so its run boots into the wrong mode (#397).
           # Another SHA means another gate holds it; any other RUN_MODE means
           # another workflow configured it. The read and the update are separate
-          # calls, so a claim landing between them can still be hit; the
-          # claimer's readback sees that and retries. An unreadable config still
-          # restores: we cannot prove it moved, and skipping would strand the
-          # machine in pr-review mode for the next hourly cron.
+          # calls, so a claim landing between them can still be hit. A gate
+          # claimer notices: its claim readback retries, or its pre-start
+          # RUN_MODE check fails the run with a re-run message. An automerge
+          # run's Configure step has no readback, so a hit there goes unnoticed
+          # and that run boots into an hourly pass and times out on its marker.
+          # An unreadable config skips the restore with a warning: we cannot
+          # tell whose config it is, and a manual reset is safer than
+          # clobbering another run's fresh config.
           read_config() {
             local json=""
             for _ in 1 2 3; do
@@ -320,17 +324,17 @@ jobs:
           }
           config="$(read_config)"
           if [ "$config" = "<unreadable>" ]; then
-            echo "::warning::Could not read the reviewer machine's current config; restoring to default mode anyway."
-          else
-            IFS='|' read -r mode owner <<< "$config"
-            if [ -n "$owner" ] && [ "$owner" != "$REVIEW_HEAD" ]; then
-              echo "::notice::Reviewer machine is now leased to '${owner}' (this run claimed '${REVIEW_HEAD}'); another run owns it. Skipping restore so we do not clobber that run's config."
-              exit 0
-            fi
-            if [ -n "$mode" ] && [ "$mode" != "pr-review" ] && [ "$mode" != "hourly" ]; then
-              echo "::notice::Reviewer machine's RUN_MODE is now '${mode}'; another workflow configured it. Skipping restore so we do not clobber that run's config."
-              exit 0
-            fi
+            echo "::warning::Could not read the reviewer machine's current config, so this run cannot tell whether it still owns it. Skipping restore; the machine may need a manual reset (set RUN_MODE=hourly and clear PR_REVIEW_*)."
+            exit 0
+          fi
+          IFS='|' read -r mode owner <<< "$config"
+          if [ -n "$owner" ] && [ "$owner" != "$REVIEW_HEAD" ]; then
+            echo "::notice::Reviewer machine is now leased to '${owner}' (this run claimed '${REVIEW_HEAD}'); another run owns it. Skipping restore so we do not clobber that run's config."
+            exit 0
+          fi
+          if [ -n "$mode" ] && [ "$mode" != "pr-review" ] && [ "$mode" != "hourly" ]; then
+            echo "::notice::Reviewer machine's RUN_MODE is now '${mode}'; another workflow configured it. Skipping restore so we do not clobber that run's config."
+            exit 0
           fi
           # Don't swallow restore failures. If this update fails the machine is
           # left configured for pr-review mode and will misbehave on the next
