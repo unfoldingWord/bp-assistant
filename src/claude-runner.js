@@ -114,10 +114,17 @@ function resolveReasoning(thinking, resolvedModel) {
   return supportsEffort ? { thinking: { type: 'adaptive' }, effort: 'high' } : {};
 }
 
+// `TeamCreate`/`TeamDelete` are absent from these lists on purpose: the CLI
+// dropped both before 2.1.251, so naming them only produced "unknown tool" log
+// noise (#410). `TaskOutput` is NOT stale yet — it still exists in the SDK this
+// repo pins (0.3.251, exact in package-lock.json; every Dockerfile installs with
+// `npm ci`). It is removed in 2.1.282, so it comes out of these lists together
+// with the SDK bump in #409, not before: dropping it here first would make
+// `decideToolPermission` deny a live tool.
 const DEFAULT_ALLOWED_TOOLS = [
   'Read', 'Write', 'Edit', 'Glob', 'Grep',
   'Task', 'Skill', 'SendMessage',
-  'Agent', 'TeamCreate', 'TeamDelete',
+  'Agent',
   'TaskCreate', 'TaskUpdate', 'TaskList', 'TaskGet',
   'NotebookEdit', 'WebFetch', 'WebSearch',
 ];
@@ -126,7 +133,7 @@ const DEFAULT_ALLOWED_TOOLS = [
 const DEFAULT_RESTRICTED_TOOLS = [
   'Read', 'Write', 'Edit', 'Glob', 'Grep',
   'Task', 'TaskOutput', 'Skill', 'SendMessage',
-  'Agent', 'TeamCreate', 'TeamDelete',
+  'Agent',
   'TaskCreate', 'TaskUpdate', 'TaskList', 'TaskGet',
   'NotebookEdit', 'WebFetch', 'WebSearch',
 ];
@@ -168,13 +175,15 @@ function bashEnabled(enableBash) {
 // (issues #195/#235/#238/#242; isolated 2026-07-21 via live repros: identical
 // parallel Read-only children pass under light load and mass-deny under the
 // production fan-out). Registered as the SDK `canUseTool` callback, this
-// replaces the classifier with a pure allowlist so child permissions are
-// deterministic. Deny messages carry redirect guidance and never the CLI's
-// canned "STOP and wait" text that halts agents.
+// resolves every call that reaches it against a pure allowlist, so child
+// permissions are deterministic. It does not displace the CLI's own classifier:
+// the classifier runs first and `canUseTool` is the fallback for the calls it
+// leaves unresolved (#410 item 4). Deny messages carry redirect guidance and
+// never the CLI's canned "STOP and wait" text that halts agents.
 const SUBAGENT_TOOL_ALLOWLIST = new Set([
   'Read', 'Write', 'Edit', 'Glob', 'Grep',
   'Task', 'TaskOutput', 'TaskCreate', 'TaskUpdate', 'TaskList', 'TaskGet',
-  'Agent', 'Skill', 'SendMessage', 'TeamCreate', 'TeamDelete',
+  'Agent', 'Skill', 'SendMessage',
   'NotebookEdit', 'WebFetch', 'WebSearch',
 ]);
 

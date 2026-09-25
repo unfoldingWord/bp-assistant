@@ -38,13 +38,11 @@ const { dispatchSelfDiagnosis } = require('./self-diagnosis');
 const LOG_DIR = path.resolve(__dirname, '../logs');
 
 const POST_EDIT_REVIEW_HINT =
-  'Use Agent teams (TeamCreate + SendMessage) for the Diff Analyzer and Issue Reconciler if available. ' +
-  'If Agent teams are not available, fall back to Task subagents and poll with TaskGet until all complete. ' +
+  'Use Task subagents for the Diff Analyzer and Issue Reconciler, and poll with TaskGet until all complete. ' +
   'Do NOT output text without a tool call or the session will end prematurely.';
 
 const DEEP_ISSUE_ID_HINT =
-  'Use Agent teams (TeamCreate + SendMessage) for Wave 2 analysts and Wave 3 challenger if available. ' +
-  'If Agent teams are not available, fall back to Task subagents and poll with TaskGet in a loop until all tasks show completed status. ' +
+  'Use Task subagents for Wave 2 analysts and Wave 3 challenger, and poll with TaskGet in a loop until all tasks show completed status. ' +
   'Do NOT output text without a tool call or the session will end prematurely.';
 
 const TN_QUALITY_CHECK_HINT =
@@ -74,8 +72,6 @@ const TN_WRITER_TOOL_BLOCKLIST = [
   'TaskOutput',
   'SendMessage',
   'Agent',
-  'TeamCreate',
-  'TeamDelete',
   'TaskCreate',
   'TaskUpdate',
   'TaskList',
