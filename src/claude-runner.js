@@ -18,7 +18,26 @@ let _sdkCreateSdkMcpServer = null;
 let _sdkTool = null;
 let _z = null;
 
+// Test doubles for the two Agent-SDK handles runClaudeOnce needs (issue #375).
+// The SDK ships as pure ESM ("type":"module", sdk.mjs), so the `require.cache`
+// substitution the rest of test/ uses for heavy CJS modules cannot reach it —
+// ESM has its own registry. Without a seam, runClaudeOnce's stall watchdog and
+// its post-loop wall/stall annotation are unreachable from a test, and reordering
+// the wall/stall checks inside either one breaks nothing. Set only by
+// __setSdkTestDoubles below; nothing in src/ ever calls that.
+let _testQuery = null;
+let _testWorkspaceToolsServer = null;
+
+// Install (or, with no argument, remove) the SDK test doubles. Returns a restore
+// function so a test can install in a try and clear in a finally.
+function __setSdkTestDoubles({ query, workspaceToolsServer } = {}) {
+  _testQuery = query || null;
+  _testWorkspaceToolsServer = workspaceToolsServer || null;
+  return () => { _testQuery = null; _testWorkspaceToolsServer = null; };
+}
+
 async function getQuery() {
+  if (_testQuery) return _testQuery;
   if (!_query) {
     const sdk = await import('@anthropic-ai/claude-agent-sdk');
     _query = sdk.query;
@@ -30,6 +49,7 @@ async function getQuery() {
 // The SDK connects a transport to each instance; reusing one across parallel
 // runClaude() calls causes "Already connected to a transport" crashes.
 async function createFreshWorkspaceToolsServer(toolSet) {
+  if (_testWorkspaceToolsServer) return _testWorkspaceToolsServer;
   if (!_sdkCreateSdkMcpServer) {
     const sdk = await import('@anthropic-ai/claude-agent-sdk');
     _sdkCreateSdkMcpServer = sdk.createSdkMcpServer;
@@ -306,6 +326,50 @@ const PERMISSION_WALL_RETRY_WINDOW_MS = Number(process.env.BP_PERMISSION_WALL_WI
   : 20 * 60 * 1000;
 const PERMISSION_WALL_BASE_DELAY_MS = 60 * 1000;
 const PERMISSION_WALL_MAX_DELAY_MS = 5 * 60 * 1000;
+
+// That window is measured from the FIRST wall detection, NOT from the start of the run
+// (JER 16, 2026-09-08 — issue #380). It used to be compared against runClaude's whole
+// elapsed time, which conflated "how long we will wait out a wall" with "how long the
+// skill has been working" — so any run that did more than 20min of productive work
+// before walling got ZERO retries. deep-issue-id on JER 16 ran productively for over
+// 20min (84 tool calls at 10min, 163 at 20min), then walled; the stall window resolved
+// it at ~25.5min elapsed, already past the 20min mark, so the very first wall detection
+// went straight to the give-up branch and failed the chapter with ~124min of its 150min
+// timeout unused. The wall had never once been retried, which is why the templated
+// issue's "the refusal outlasted the runner's retry window" is misleading: the window
+// was spent on successful work, not on the wall. The transient path already guards this
+// exact shape with MIN_TRANSIENT_ATTEMPTS ("a single attempt that itself runs longer
+// than the window can't zero out retries entirely"); the wall path had no equivalent.
+// Anchoring on first detection makes the budget mean what its comment already claimed.
+//
+// Total run time is also capped, but only at retry-decision time: once runClaude has
+// been running this long, a wall is returned to the caller instead of retried. It is
+// NOT a deadline. Nothing wraps runClaude in an outer timer, and each retry is a fresh
+// runClaudeOnce with its own full per-attempt timeout (timeoutMs, up to MAX_TIMEOUT_MS
+// = 150min, pipeline-utils.js), so a retry started at 89min can still run to ~89+150min.
+// The ceiling bounds how many fresh attempts a late wall can start; it does not bound
+// the run's total length. (A tighter "elapsed + per-attempt timeout" check is not
+// possible here: timeoutMs IS the per-attempt budget, with no separate run budget.)
+const PERMISSION_WALL_RETRY_CEILING_MS = Number(process.env.BP_PERMISSION_WALL_CEILING_MS) > 0
+  ? Number(process.env.BP_PERMISSION_WALL_CEILING_MS)
+  : 90 * 60 * 1000;
+
+// Retry a wall while the WALL is inside its window and the run as a whole is inside the
+// ceiling. `wallElapsedMs` counts from the first wall detection; `totalElapsedMs` counts
+// from the start of runClaude.
+function shouldRetryPermissionWall(wallElapsedMs, totalElapsedMs) {
+  return wallElapsedMs < PERMISSION_WALL_RETRY_WINDOW_MS
+    && totalElapsedMs < PERMISSION_WALL_RETRY_CEILING_MS;
+}
+
+// The wall clock for the attempt that just ended. A walled attempt keeps the clock of
+// the wall it continues (or starts one now); any attempt that ends WITHOUT a wall (a
+// transient-error retry) clears it, so a later, separate wall gets its own full window
+// instead of inheriting an earlier wall's elapsed time.
+function nextWallStartedAt(prevWallStartedAt, attemptWalled, now) {
+  if (!attemptWalled) return null;
+  return prevWallStartedAt ?? now;
+}
 
 const TRANSIENT_RETRY_WINDOW_MS = 10 * 60 * 1000;
 // Floor so a single attempt that itself runs longer than the window (e.g. a hung
@@ -1609,6 +1673,9 @@ async function notifyAdminDowntime(text) {
 async function runClaude(args) {
   const startedAt = Date.now();
   let attempt = 0;
+  // Anchored on the first wall detection, not on startedAt, so the wall's recovery
+  // budget is not silently consumed by productive work that preceded the wall (#380).
+  let wallStartedAt = null;
   let lastTransientMessage = '';
   let firstDowntimeNoticeSent = false;
   // Job tag for the wrapper's own retry/backoff lines. Each runClaudeOnce()
@@ -1652,7 +1719,9 @@ async function runClaude(args) {
       // `paused_for_outage`, which nothing auto-resumes, so it would just relocate the
       // manual step. Returning it lets the caller record a correctly-labelled failure.
       if (resultIndicatesPermissionWall(result)) {
-        if (elapsed < PERMISSION_WALL_RETRY_WINDOW_MS) {
+        wallStartedAt = nextWallStartedAt(wallStartedAt, true, Date.now());
+        const wallElapsed = Date.now() - wallStartedAt;
+        if (shouldRetryPermissionWall(wallElapsed, elapsed)) {
           const delay = wallBackoffDelayMs(attempt);
           if (!firstDowntimeNoticeSent) {
             firstDowntimeNoticeSent = true;
@@ -1666,26 +1735,35 @@ async function runClaude(args) {
           }
           console.warn(
             `${labelPrefix} Permission wall — retrying in ${Math.round(delay / 1000)}s ` +
-            `(attempt ${attempt}, ${Math.round(elapsed / 1000)}s of ` +
-            `${Math.round(PERMISSION_WALL_RETRY_WINDOW_MS / 1000)}s window used)`
+            `(attempt ${attempt}, ${Math.round(wallElapsed / 1000)}s of ` +
+            `${Math.round(PERMISSION_WALL_RETRY_WINDOW_MS / 1000)}s wall window used; ` +
+            `${Math.round(elapsed / 1000)}s of ${Math.round(PERMISSION_WALL_RETRY_CEILING_MS / 1000)}s run ceiling)`
           );
           await sleep(delay);
           continue;
         }
+        const hitCeiling = elapsed >= PERMISSION_WALL_RETRY_CEILING_MS;
         await notifyAdminDowntime(
-          `[claude-runner] Permission wall did NOT clear after ${Math.round(elapsed / 60000)}min and ` +
-          `${attempt} attempts. Giving up so the caller can fail cleanly — this is a permission refusal, ` +
+          `[claude-runner] Permission wall did NOT clear after ${Math.round(wallElapsed / 60000)}min of ` +
+          `wall backoff and ${attempt} attempts` +
+          `${hitCeiling ? ` (stopped early: the run hit the ${Math.round(PERMISSION_WALL_RETRY_CEILING_MS / 60000)}min total ceiling)` : ''}. ` +
+          `Giving up so the caller can fail cleanly — this is a permission refusal, ` +
           `not a content/pipeline bug; nothing in the allowlists can fix it. Check the run log for ` +
           `CLAUDE_SDK_CAN_USE_TOOL_SHADOWED and whether the bypass PreToolUse allow-all hook fired.`
         );
         console.error(
-          `${labelPrefix} Permission wall persisted past the ${Math.round(PERMISSION_WALL_RETRY_WINDOW_MS / 60000)}min ` +
-          `window (${attempt} attempts) — returning permission_wall to the caller`
+          `${labelPrefix} Permission wall persisted past the ` +
+          `${hitCeiling
+            ? `${Math.round(PERMISSION_WALL_RETRY_CEILING_MS / 60000)}min total-run ceiling`
+            : `${Math.round(PERMISSION_WALL_RETRY_WINDOW_MS / 60000)}min wall window`} ` +
+          `(${attempt} attempts, ${Math.round(wallElapsed / 1000)}s walled of ${Math.round(elapsed / 1000)}s total) ` +
+          `— returning permission_wall to the caller`
         );
         return result;
       }
       if (isTransientSdkMessage(resultMsg) && shouldRetryTransient(attempt, elapsed)) {
         lastTransientMessage = resultMsg;
+        wallStartedAt = nextWallStartedAt(wallStartedAt, false, Date.now());
         if (!firstDowntimeNoticeSent) {
           firstDowntimeNoticeSent = true;
           await notifyAdminDowntime(
@@ -1717,6 +1795,7 @@ async function runClaude(args) {
       const elapsed = Date.now() - startedAt;
       if (isTransientSdkMessage(msg) && shouldRetryTransient(attempt, elapsed)) {
         lastTransientMessage = msg;
+        wallStartedAt = nextWallStartedAt(wallStartedAt, false, Date.now());
         if (!firstDowntimeNoticeSent) {
           firstDowntimeNoticeSent = true;
           await notifyAdminDowntime(
@@ -1820,6 +1899,11 @@ async function runClaudeStream({
 
 module.exports = {
   runClaude,
+  // Exported for test/runner-stall-timer.test.js (#375), which drives the stall
+  // watchdog and the post-loop wall/stall annotation directly. runClaude() wraps
+  // this in transient/wall retry loops that would mask both.
+  runClaudeOnce,
+  __setSdkTestDoubles,
   runClaudeStream,
   buildOptions,
   createFreshWorkspaceToolsServer,
@@ -1841,6 +1925,9 @@ module.exports = {
   PERMISSION_STALL_WINDOW_MS,
   PERMISSION_WALL_DENIAL_LIMIT,
   PERMISSION_WALL_RETRY_WINDOW_MS,
+  PERMISSION_WALL_RETRY_CEILING_MS,
+  shouldRetryPermissionWall,
+  nextWallStartedAt,
   shouldRetryTransient,
   isTransientSdkMessage,
   TRANSIENT_RETRY_WINDOW_MS,

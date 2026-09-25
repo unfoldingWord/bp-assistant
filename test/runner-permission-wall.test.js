@@ -47,6 +47,10 @@ const {
   resultIndicatesPermissionStall,
   PERMISSION_STALL_WINDOW_MS,
   PERMISSION_WALL_DENIAL_LIMIT,
+  PERMISSION_WALL_RETRY_WINDOW_MS,
+  PERMISSION_WALL_RETRY_CEILING_MS,
+  shouldRetryPermissionWall,
+  nextWallStartedAt,
 } = require('../src/claude-runner');
 
 const denialText = (toolUseId) =>
@@ -366,4 +370,64 @@ test('Gate 1: a guard-hook denial can never be counted as wall evidence', () => 
     applyRunnerUserMessage(state, sig, { transportLimit: 3, wallLimit: 2, isBypassRun: true }, null);
     assert.equal(hasPermissionWallEvidence(state, 2), false);
   }
+});
+
+// issue #380 — JER 16, 2026-09-08. The wall's recovery budget used to be compared
+// against runClaude's TOTAL elapsed time, so productive work done before the wall
+// silently ate the budget. deep-issue-id worked for >20min (84 tool calls at 10min,
+// 163 at 20min), then walled; the stall window resolved the wall at ~25.5min, already
+// past the 20min window, so the first wall detection went straight to the give-up
+// branch — zero retries, chapter failed, ~124min of its 150min timeout unused.
+// The budget now counts from the FIRST wall detection.
+test('#380 regression: a wall that appears after a long productive run still gets its full budget', () => {
+  const productiveMs = 25.5 * 60 * 1000; // JER 16's elapsed at the moment the wall resolved
+  assert.ok(productiveMs > PERMISSION_WALL_RETRY_WINDOW_MS,
+    'fixture must reproduce #380: the run outlived the wall window before walling');
+
+  // Old behavior, for contrast: total elapsed vs the wall window => no retry at all.
+  assert.equal(productiveMs < PERMISSION_WALL_RETRY_WINDOW_MS, false);
+
+  // New behavior: the wall has just been detected, so its own clock is at zero.
+  assert.equal(shouldRetryPermissionWall(0, productiveMs), true);
+});
+
+test('#380: the wall budget is spent by wall time, not by the run that preceded it', () => {
+  const total = 30 * 60 * 1000;
+  // Still inside the wall window -> keep retrying however long the run has been going.
+  assert.equal(shouldRetryPermissionWall(PERMISSION_WALL_RETRY_WINDOW_MS - 1000, total), true);
+  // Wall window genuinely exhausted -> give up, which is what the window is for.
+  assert.equal(shouldRetryPermissionWall(PERMISSION_WALL_RETRY_WINDOW_MS, total), false);
+  assert.equal(shouldRetryPermissionWall(PERMISSION_WALL_RETRY_WINDOW_MS + 1000, total), false);
+});
+
+test('#380: the total-run ceiling still stops a late wall from outliving the caller timeout', () => {
+  // Fresh wall (clock at 0) but the run as a whole is past the ceiling: stop anyway
+  // rather than start another full-length attempt. (This is a retry-decision check,
+  // not a deadline — an attempt already running is not cut short.)
+  assert.equal(shouldRetryPermissionWall(0, PERMISSION_WALL_RETRY_CEILING_MS), false);
+  assert.equal(shouldRetryPermissionWall(0, PERMISSION_WALL_RETRY_CEILING_MS - 1000), true);
+});
+
+test('#380: the wall ceiling leaves headroom under the 150min chapter timeout', () => {
+  assert.ok(PERMISSION_WALL_RETRY_CEILING_MS > PERMISSION_WALL_RETRY_WINDOW_MS,
+    'the ceiling must not be tighter than the window it bounds');
+  assert.ok(PERMISSION_WALL_RETRY_CEILING_MS + PERMISSION_WALL_RETRY_WINDOW_MS <= 150 * 60 * 1000,
+    'ceiling + one final wall window must fit inside MAX_TIMEOUT_MS (150min)');
+});
+
+// A wall -> transient-error retry -> new wall sequence must not let the second wall
+// inherit the first wall's clock: an attempt that ends without a wall resets it.
+test('#380: the wall clock resets when an attempt ends without a wall', () => {
+  const t0 = 1_000_000;
+  let wallStartedAt = null;
+  wallStartedAt = nextWallStartedAt(wallStartedAt, true, t0);            // first wall
+  assert.equal(wallStartedAt, t0);
+  wallStartedAt = nextWallStartedAt(wallStartedAt, true, t0 + 60_000);   // same wall, retried
+  assert.equal(wallStartedAt, t0, 'a continuing wall keeps its original clock');
+  wallStartedAt = nextWallStartedAt(wallStartedAt, false, t0 + 120_000); // transient retry
+  assert.equal(wallStartedAt, null);
+  const t1 = t0 + PERMISSION_WALL_RETRY_WINDOW_MS + 60_000;
+  wallStartedAt = nextWallStartedAt(wallStartedAt, true, t1);            // a new, separate wall
+  assert.equal(wallStartedAt, t1, 'the new wall starts its own clock');
+  assert.equal(shouldRetryPermissionWall(t1 - wallStartedAt, 30 * 60 * 1000), true);
 });
