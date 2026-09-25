@@ -265,8 +265,13 @@ function maskAtBracketContent(noteText) {
 }
 
 /**
- * Parse Hebrew USFM into a map of { "ch:vs": [wordToken, ...] }.
+ * Parse aligned source USFM into a map of { "ch:vs": [wordToken, ...] }.
  * Extracts \w word|...\w* tokens by verse.
+ *
+ * Despite the name this is script-agnostic: UGNT (el-x-koine_ugnt) marks words
+ * with the same `\w form|lemma=... strong=... x-morph=...\w*` shape as UHB, so
+ * the Greek NT parses with no change (verified against 43-LUK.usfm, #394). The
+ * name is kept because every existing caller passes a Hebrew path.
  */
 function parseHebrewVerseWords(hebrewUsfmPath) {
   if (!hebrewUsfmPath) return {};
@@ -314,19 +319,49 @@ const HEBREW_RTL_RE = /[֐-׿؀-ۿיִ-﷿ﹰ-﻿]/;
 const HEBREW_CANT_RE = /[֑-֯⁠־]/g;
 const HEBREW_MAQAF = '־';
 
+// Greek and Coptic (U+0370-03FF) plus Greek Extended (U+1F00-1FFF), where the
+// UGNT's precomposed accented forms live (e.g. the first letter of LUK 1:1's
+// ἐπειδήπερ is U+1F10).
+const GREEK_RE = /[\u0370-\u03FF\u1F00-\u1FFF]/;
+const COMBINING_RE = /[\u0300-\u036F]/g;
+
+/** True when the string carries characters of either source-language script. */
+function hasSourceScript(s) {
+  return HEBREW_RTL_RE.test(s) || GREEK_RE.test(s);
+}
+
 /**
- * Normalize a candidate Hebrew quote against the canonical verse word list
- * loaded from the UHB. Inserts ` & ` joiners at discontinuity gaps so the
- * returned string matches translation-note conventions.
+ * Fold a source-language token to the key used for comparison.
+ *
+ * Both sides are NFC-normalized first, so a decomposed quote still lines up
+ * with the precomposed source text. Each script then drops the marks it does
+ * not treat as distinguishing: Hebrew cantillation/taamim, Greek accents and
+ * breathings. Greek folds via NFD so the precomposed Greek Extended forms
+ * decompose into base letters plus combining marks that can be stripped; case
+ * is folded too, so a verse-initial Κύριος matches a quoted κύριος.
+ */
+function foldSourceToken(tok) {
+  const nfc = String(tok).normalize('NFC');
+  if (GREEK_RE.test(nfc)) {
+    return nfc.normalize('NFD').replace(COMBINING_RE, '').normalize('NFC').toLowerCase();
+  }
+  return nfc.replace(HEBREW_CANT_RE, '');
+}
+
+/**
+ * Normalize a candidate source-language quote against the canonical verse word
+ * list loaded from the UHB (Hebrew OT) or UGNT (Greek NT). Inserts ` & `
+ * joiners at discontinuity gaps so the returned string matches translation-note
+ * conventions.
  *
  * Returns { quote, status, warnings } where:
- *   quote    — normalized Hebrew (NFC, with ` & ` joiners where needed)
- *   status   — 'ok' | 'no_rtl' | 'no_words_match' | 'partial_match'
+ *   quote    — normalized source text (NFC, with ` & ` joiners where needed)
+ *   status   — 'ok' | 'no_source_script' | 'no_words_match' | 'partial_match'
  *   warnings — [{ code, detail }] zero or more soft issues
  *
- * Matching is cantillation/taamim-insensitive and Unicode-normalization-
- * insensitive. First occurrence wins when a verse repeats a word (refinement
- * candidate if mis-matches show up).
+ * Matching is diacritic-insensitive per script and Unicode-normalization-
+ * insensitive (see foldSourceToken). First occurrence wins when a verse
+ * repeats a word (refinement candidate if mis-matches show up).
  *
  * Two properties of the UHB drive the tokenizing and comparison here:
  *
@@ -344,10 +379,10 @@ const HEBREW_MAQAF = '־';
 function normalizeHebrewQuote(rawQuote, verseWords) {
   const warnings = [];
   if (!rawQuote || typeof rawQuote !== 'string') {
-    return { quote: '', status: 'no_rtl', warnings };
+    return { quote: '', status: 'no_source_script', warnings };
   }
-  if (!HEBREW_RTL_RE.test(rawQuote)) {
-    return { quote: rawQuote, status: 'no_rtl', warnings };
+  if (!hasSourceScript(rawQuote)) {
+    return { quote: rawQuote, status: 'no_source_script', warnings };
   }
 
   // Split on whitespace and ` & ` first, then on maqaf within each chunk.
@@ -367,22 +402,25 @@ function normalizeHebrewQuote(rawQuote, verseWords) {
     return { quote: rawQuote, status: 'no_words_match', warnings };
   }
 
+  // Folded once per verse rather than once per (token, word) pair: Greek
+  // folding runs two normalize() passes, which is not free over a long verse.
+  const words = Array.isArray(verseWords) ? verseWords : [];
+  const foldedWords = words.map(foldSourceToken);
+
   const matched = [];
   let matchCount = 0;
   for (const tok of tokens) {
-    const tokNfc = tok.text.normalize('NFC');
-    const tokStripped = tokNfc.replace(HEBREW_CANT_RE, '');
+    const tokFolded = foldSourceToken(tok.text);
     let pos = -1;
-    for (let i = 0; i < verseWords.length; i++) {
-      const w = verseWords[i];
-      if (w === tok.text) { pos = i; break; }
-      const wNfc = w.normalize('NFC');
-      if (wNfc === tokNfc || wNfc.replace(HEBREW_CANT_RE, '') === tokStripped) {
+    for (let i = 0; i < words.length; i++) {
+      if (words[i] === tok.text || foldedWords[i] === tokFolded) {
         pos = i;
         break;
       }
     }
     if (pos < 0) {
+      // Code name is historical and kept for wire compatibility; it now
+      // covers Greek (NT) source words as well as Hebrew.
       warnings.push({ code: 'hebrew_word_not_in_verse', detail: tok.text });
     } else {
       matchCount++;
@@ -1464,6 +1502,8 @@ module.exports = {
   resolveTemplateText,
   parseHebrewVerseWords,
   normalizeHebrewQuote,
+  foldSourceToken,
+  hasSourceScript,
   parseReferenceRanges,
   referencesCoverVerse,
   _crossBookTargetsIn: crossBookTargetsIn,

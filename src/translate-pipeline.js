@@ -428,6 +428,24 @@ async function translateChapters(params, { workDir, onProgress, runBatchImpl, ma
     scripture = null;
   }
 
+  // Reuse gate: the work dir does not encode the scripture refs or the pack's
+  // resolved sha, so a re-run with a different --literal (or the same branch
+  // ref at a new commit) would otherwise silently reuse batches translated
+  // under the old context. See core.reuseIdentityGate().
+  const reuseGate = core.reuseIdentityGate(workDir, {
+    contextRef: params.contextRef,
+    contextSha: pack.sha || null,
+    scriptureRefs: {
+      sourceLiteralRef: params.sourceLiteralRef || null,
+      sourceSimplifiedRef: params.sourceSimplifiedRef || null,
+      targetLiteralRef: params.targetLiteralRef || null,
+      targetSimplifiedRef: params.targetSimplifiedRef || null,
+    },
+  });
+  if (!reuseGate.reuse) {
+    progress(`inputs changed since the previous run in this work dir (${reuseGate.changed.join(', ')}) — re-translating every batch`);
+  }
+
   const batchMeta = [];
   const targetRows = [];
   const llm = newLlmUsage(params);
@@ -446,7 +464,7 @@ async function translateChapters(params, { workDir, onProgress, runBatchImpl, ma
     });
     let outRows = null;
     let attempts = 0;
-    if (fs.existsSync(files.outputFile)) {
+    if (reuseGate.reuse && fs.existsSync(files.outputFile)) {
       try {
         const prev = core.readBatchOutput(files.outputFile, batchRows, { parse: resource._codec.parse, checkOpts: resource.checkOpts });
         if (prev.checks.ok) { outRows = prev.rows; progress(`batch ${files.nn} reused from previous run (checks ok)`); }
@@ -577,6 +595,17 @@ async function translateArticles(params, { workDir, onProgress, resolveImpl, run
   // resolved.articleId (the canonical path-keyed id) must win over params.articleId
   // (null for URL-triggered runs) — spread params FIRST, then override.
   const rendered = core.renderArticlePack({ ...params, pack, articleId: resolved.articleId });
+  // Same reuse gate as translateChapters(): contextRef is hashed as a ref
+  // string, and the dry run keys its work dir on `--out` alone (whose default
+  // is per-language/resource, NOT per-article).
+  const reuseGate = core.reuseIdentityGate(workDir, {
+    articleId: resolved.articleId,
+    contextRef: params.contextRef,
+    contextSha: pack.sha || null,
+  });
+  if (!reuseGate.reuse) {
+    progress(`inputs changed since the previous run in this work dir (${reuseGate.changed.join(', ')}) — re-translating every file`);
+  }
   const outFiles = [];
   const fileMeta = [];
   const llm = newLlmUsage(params);
@@ -594,7 +623,7 @@ async function translateArticles(params, { workDir, onProgress, resolveImpl, run
     });
     files.path = filePath;
     let markdown = null; let checks = null; let attempts = 0;
-    if (fs.existsSync(files.outputFile)) {
+    if (reuseGate.reuse && fs.existsSync(files.outputFile)) {
       try {
         const prev = core.readArticleOutput(files.outputFile, sourceMarkdown, { articleId: resolved.articleId, path: filePath });
         if (prev.checks.ok) { markdown = prev.markdown; checks = prev.checks; progress(`${files.nn} (${filePath}) reused from previous run`); }
