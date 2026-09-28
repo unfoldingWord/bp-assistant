@@ -1031,3 +1031,81 @@ test('context-dependent target: the pointer ships where the same article was fla
   assert.equal(pointer.also_occurs_verses, undefined, 'v7 was never checked for a question');
   assert.equal(items.find((it) => it.id === 'aaaa').programmatic_note, undefined, 'the metaphor item is untouched');
 });
+
+// One-word euphemisms (JER 10:20 -> 30:5). "My sons ... are not" is a
+// euphemism for death on אַיִן; "there is no peace" in a later chapter is plain
+// negation and must not collect a figs-euphemism pointer back to it.
+const EIN = 'אֵ֣ין';
+const EIN_ALIGNED_BOOK = [
+  '\\id JER',
+  '\\c 1',
+  '\\p',
+  `\\v 1 ${alignedWord('H0369', EIN, ['are', 'not'])}`,
+  '\\c 3',
+  '\\p',
+  `\\v 2 ${alignedWord('H0369', EIN, ['there', 'is', 'no'])}`,
+  `\\v 5 ${alignedWord('H0369', EIN, ['there', 'is', 'no'])}`,
+  '',
+].join('\n');
+const EIN_HEBREW_BOOK = [
+  '\\id JER',
+  '\\c 3',
+  `\\v 2 \\w ${EIN}|lemma="אַיִן" strong="H0369"\\w*`,
+  `\\v 5 \\w ${EIN}|lemma="אַיִן" strong="H0369"\\w*`,
+  '',
+].join('\n');
+const tnEuphemismTsv = (quote) => [
+  'Reference\tID\tTags\tSupportReference\tQuote\tOccurrence\tNote',
+  `1:1\tabcd\t\trc://*/ta/man/translate/figs-euphemism\t${quote}\t1\tJeremiah says his children **are not** as a polite way to say they have died.`,
+  '',
+].join('\n');
+const einItem = (overrides) => item(Object.assign({
+  gl_quote: 'there is no', issue_span_gl_quote: 'there is no', orig_quote: EIN,
+}, overrides));
+
+test('single-word euphemism: nothing is injected at a later plain negation', async () => {
+  const dirPath = setupPipeDir({
+    book: 'JER', items: [], alignedBook: EIN_ALIGNED_BOOK, hebrewBook: EIN_HEBREW_BOOK,
+    alignmentData: {}, tnBookTsv: tnEuphemismTsv(EIN),
+  });
+  buildRecurrenceIndexFile({ pipeDir: dirPath });
+  const summary = await runSeeHowDetection({ pipeDir: dirPath, generateIdsFn: stubIds });
+
+  assert.deepEqual(readPrepared(dirPath).items, [], 'no synthesized figs-euphemism pointer');
+  assert.match(summary, /0 injected/);
+});
+
+test('single-word euphemism: the pointer ships where the issue pass flagged a euphemism again', async () => {
+  const dirPath = setupPipeDir({
+    book: 'JER',
+    items: [
+      einItem({ reference: '3:2', id: 'aaaa', sref: 'figs-abstractnouns' }),
+      einItem({ reference: '3:5', id: 'bbbb', index: 1, sref: 'figs-euphemism' }),
+    ],
+    alignedBook: EIN_ALIGNED_BOOK, hebrewBook: EIN_HEBREW_BOOK,
+    alignmentData: { '3:2': [{ heb: EIN, strong: 'H0369' }], '3:5': [{ heb: EIN, strong: 'H0369' }] },
+    tnBookTsv: tnEuphemismTsv(EIN),
+  });
+  buildRecurrenceIndexFile({ pipeDir: dirPath });
+  await runSeeHowDetection({ pipeDir: dirPath, generateIdsFn: stubIds });
+
+  const items = readPrepared(dirPath).items;
+  const pointer = items.find((it) => it.id === 'bbbb');
+  assert.match(pointer.programmatic_note, /\[1:1\]\(\.\.\/01\/01\.md\)/);
+  assert.equal(pointer.support_reference, 'figs-euphemism');
+  const plain = items.find((it) => it.id === 'aaaa');
+  assert.equal(plain.programmatic_note, undefined, 'the plain negation in v2 is untouched');
+  assert.equal(plain.also_occurs_verses, undefined);
+});
+
+test('multi-word euphemism: a fixed phrase is still injected at its next occurrence', async () => {
+  const dirPath = setupPipeDir({ items: [], hebrewBook: HEBREW_BOOK, tnBookTsv: tnEuphemismTsv(WORD_OF_YAHWEH) });
+  buildRecurrenceIndexFile({ pipeDir: dirPath });
+  const summary = await runSeeHowDetection({ pipeDir: dirPath, generateIdsFn: stubIds });
+
+  const prepared = readPrepared(dirPath);
+  assert.equal(prepared.items.length, 1);
+  assert.equal(prepared.items[0].reference, '3:2');
+  assert.equal(prepared.items[0].support_reference, 'figs-euphemism');
+  assert.match(summary, /1 injected/);
+});

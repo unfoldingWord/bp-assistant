@@ -53,6 +53,14 @@ const SEE_HOW_CONTEXT_DEPENDENT_SREFS = new Set([
   'figs-exclamations',
 ]);
 
+// Articles that are context-dependent only when the note sits on ONE word. A
+// one-word euphemism is an ordinary word used in a special sense, so its next
+// appearance is usually literal: JER 10:20 "my sons ... are not" (= dead) is a
+// euphemism on אַיִן, but JER 30:5 "there is no peace" is plain negation and
+// used to collect a figs-euphemism pointer back to 10:20. Multi-word
+// euphemisms ("slept with his fathers") are fixed phrases and keep injecting.
+const SEE_HOW_SINGLE_WORD_CONTEXT_DEPENDENT_SREFS = new Set(['figs-euphemism']);
+
 // Ultra-frequent lemmas that never earn a single-word pointer. Stored both as
 // Strong's numbers and as consonant-only Hebrew so either key form matches.
 // Strong's numbers are stored zero-padded to four digits, the form UHB and
@@ -350,10 +358,12 @@ function keyWordCount(key) {
 /**
  * True for articles whose applicability depends on the construction present at
  * the occurrence rather than on the repeated wording. See
- * SEE_HOW_CONTEXT_DEPENDENT_SREFS.
+ * SEE_HOW_CONTEXT_DEPENDENT_SREFS and SEE_HOW_SINGLE_WORD_CONTEXT_DEPENDENT_SREFS.
  */
-function isContextDependentSref(sref) {
-  return SEE_HOW_CONTEXT_DEPENDENT_SREFS.has(String(sref || ''));
+function isContextDependentSref(sref, key = '') {
+  const s = String(sref || '');
+  if (SEE_HOW_CONTEXT_DEPENDENT_SREFS.has(s)) return true;
+  return SEE_HOW_SINGLE_WORD_CONTEXT_DEPENDENT_SREFS.has(s) && keyWordCount(key) === 1;
 }
 
 function isSeeHowEligible(key, sref) {
@@ -1148,4 +1158,5 @@ module.exports = {
   SEE_HOW_NEVER_FOLD_SREFS,
   CROSS_BOOK_MAX_BOOKS,
   SEE_HOW_CONTEXT_DEPENDENT_SREFS,
+  SEE_HOW_SINGLE_WORD_CONTEXT_DEPENDENT_SREFS,
 };
