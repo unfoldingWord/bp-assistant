@@ -744,7 +744,7 @@ async function runSeeHowDetection({ pipeDir, contextPath, generateIdsFn = genera
     // A context-dependent article (a rhetorical question, say) is about the
     // construction at its own verse, so a repeat of the wording is not a
     // repeat of the note.
-    const foldsAnySref = isSeeHowEligible(key, lead.sref) && !isContextDependentSref(lead.sref);
+    const foldsAnySref = isSeeHowEligible(key, lead.sref) && !isContextDependentSref(lead.sref, key);
     const corpusHere = chapterCorpusOccs(key);
 
     let target = earlierNotedTarget(key);
@@ -763,7 +763,7 @@ async function runSeeHowDetection({ pipeDir, contextPath, generateIdsFn = genera
     // article here, and it stays on that item rather than moving to the
     // chapter's first occurrence of the wording. A cross-book target was
     // cleared for the book-first verse only, so its flagged item must sit there.
-    const ctxDependent = !!target && isContextDependentSref(target.sref);
+    const ctxDependent = !!target && isContextDependentSref(target.sref, key);
     const verifiedItem = ctxDependent
       ? (group.find((it) => String(it.sref || '') === String(target.sref || '')
         && (!target.crossBook || recurrenceVerseNumber(verseOf(it.reference)) === prospective)) || null)
@@ -831,7 +831,7 @@ async function runSeeHowDetection({ pipeDir, contextPath, generateIdsFn = genera
     // Nothing was prepared for this phrase here, so no one checked whether the
     // construction the target's note describes is present. Never synthesize a
     // pointer to a context-dependent article.
-    if (isContextDependentSref(target.sref)) continue;
+    if (isContextDependentSref(target.sref, key)) continue;
     const corpusHere = chapterCorpusOccs(key);
     if (!corpusHere.length) continue;
     const occ = corpusHere[0];
