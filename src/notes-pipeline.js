@@ -1132,6 +1132,7 @@ async function runPerNoteGeneration({ pipeDir, outputPath, status, book }) {
   }
 
   // Collect results
+  const failureReasons = [];
   for (const r of noteResults) {
     if (r.success) {
       results.success++;
@@ -1139,7 +1140,9 @@ async function runPerNoteGeneration({ pipeDir, outputPath, status, book }) {
       generatedNotes[r.id] = r.note;
     } else {
       results.failed++;
-      console.warn(`[notes] Note failed for ${r.id}: ${r.reason || 'unknown'}`);
+      const reason = r.reason || 'unknown';
+      if (failureReasons.length < 3 && !failureReasons.includes(reason)) failureReasons.push(reason);
+      console.warn(`[notes] Note failed for ${r.id}: ${reason}`);
     }
   }
 
@@ -1158,7 +1161,12 @@ async function runPerNoteGeneration({ pipeDir, outputPath, status, book }) {
 
   const summary = `${results.success}/${items.length} notes generated (${results.programmatic} programmatic, ${results.failed} failed)`;
   console.log(`[notes] Per-note generation complete: ${summary}`);
-  return { success: results.failed < items.length * 0.1, notesPath: outputPath, summary };
+  // Measure failures against the LLM-written items only. Programmatic pointers
+  // always "succeed", so counting them in the denominator let a chapter where
+  // every LLM call failed pass as long as pointers were plentiful (#415, JER 32).
+  const llmItems = items.filter(i => !i.programmatic_note).length;
+  const success = results.failed === 0 || results.failed < llmItems * 0.1;
+  return { success, notesPath: outputPath, summary, failed: results.failed, llmItems, failureReasons };
 }
 
 /**
@@ -1953,6 +1961,59 @@ function countNoteRows(notesPath) {
     count++;
   }
   return count;
+}
+
+const POINTER_NOTE_RE = /^\s*See how\b/i;
+
+/**
+ * Push-time content guard (#415). A chapter whose per-note LLM calls all failed
+ * still assembles a TSV of deterministic "See how you translated…" pointers, and
+ * insertTnRows then keeps the legacy rows for every verse the TSV omits (JER 32).
+ * Count written (non-pointer) verse notes and list the verses with no rows.
+ *
+ * ok=false when the TSV has no written notes at all; `warning` is set when the
+ * written count is far below the verse count (flag loudly, still push).
+ */
+function assessWrittenNoteCoverage(notesPath, { chapter, verseStart = null, verseEnd = null, verseCount = 0 } = {}) {
+  const absPath = path.resolve(CSKILLBP_DIR, notesPath);
+  const out = { ok: true, verseRows: 0, pointerRows: 0, writtenRows: 0, versesWithoutRows: [], reason: '', warning: '' };
+  if (!fs.existsSync(absPath)) {
+    out.ok = false;
+    out.reason = `notes file missing: ${notesPath}`;
+    return out;
+  }
+  const covered = new Set();
+  for (const line of fs.readFileSync(absPath, 'utf8').split('\n')) {
+    if (!line.trim()) continue;
+    const cols = line.split('\t');
+    const refCol = String(cols[0] || '').trim();
+    if (refCol.toLowerCase() === 'reference') continue;
+    const [chPart, vPart = ''] = refCol.split(':');
+    if (chapter != null && String(parseInt(chPart, 10)) !== String(chapter)) continue;
+    if (/^intro$/i.test(vPart) || !vPart) continue;
+    out.verseRows++;
+    const note = cols.length >= 7 ? cols[6] : cols[cols.length - 1];
+    if (POINTER_NOTE_RE.test(String(note || ''))) out.pointerRows++;
+    else out.writtenRows++;
+    const [a, b] = vPart.split('-').map((n) => parseInt(n, 10));
+    if (Number.isFinite(a)) {
+      for (let v = a; v <= (Number.isFinite(b) && b >= a ? b : a); v++) covered.add(v);
+    }
+  }
+  const lo = verseStart != null ? verseStart : 1;
+  const hi = verseEnd != null ? verseEnd : verseCount;
+  for (let v = lo; v <= hi; v++) if (!covered.has(v)) out.versesWithoutRows.push(v);
+
+  if (out.writtenRows === 0) {
+    out.ok = false;
+    out.reason = `0 written notes (${out.pointerRows} "See how" pointer row(s) only) — tn-writer output is empty`;
+  } else {
+    const span = hi >= lo ? hi - lo + 1 : 0;
+    if (span > 0 && out.writtenRows < span / 2) {
+      out.warning = `only ${out.writtenRows} written note(s) for ${span} verse(s)`;
+    }
+  }
+  return out;
 }
 
 function backupIssuesFile({ issuesPath, pipeDir }) {
@@ -3226,15 +3287,22 @@ async function notesPipeline(route, message) {
             status,
             book,
           });
-          usedPerNote = true;
           if (perNoteResult.success) {
+            usedPerNote = true;
             result = { subtype: 'success', num_turns: 0, duration_ms: 0, total_cost_usd: 0 };
             skill.resolvedOutput = perNoteResult.notesPath;
             await status(`**${ref}**: Per-note generation — ${perNoteResult.summary}`);
           } else {
-            console.warn(`[notes] Per-note generation had issues: ${perNoteResult.summary}`);
-            result = { subtype: 'success', num_turns: 0, duration_ms: 0, total_cost_usd: 0 };
-            skill.resolvedOutput = perNoteResult.notesPath;
+            // Too many written notes failed: the assembled TSV would ship mostly
+            // pointers and leave legacy rows in the gaps (#415). Discard it and
+            // fall back to Claude sessions, which fail the chapter on their own
+            // terms if the underlying problem persists.
+            const reasons = (perNoteResult.failureReasons || []).join('; ') || 'unknown';
+            console.warn(`[notes] Per-note generation failed for ${ref}: ${perNoteResult.summary}; reasons: ${reasons}`);
+            await status(`**${ref}**: Per-note generation failed — ${perNoteResult.summary}. First failure reason(s): ${reasons}. Falling back to Claude sessions.`);
+            if (perNoteResult.notesPath) {
+              try { fs.unlinkSync(path.resolve(CSKILLBP_DIR, perNoteResult.notesPath)); } catch (_) { /* already absent */ }
+            }
           }
         } catch (err) {
           console.error(`[notes] Per-note generation failed, falling back to Claude sessions: ${err.message}`);
@@ -3850,6 +3918,46 @@ async function notesPipeline(route, message) {
       continue;
     }
 
+    // Content guard (#415): refuse to push a chapter with no written notes
+    // (pointer-only output), and flag thin coverage — verses absent from the
+    // source keep their pre-existing (often legacy English-quote) rows.
+    {
+      let chVerseCount = 0;
+      if (!hasVerseRange) { try { chVerseCount = getVerseCount(book, ch); } catch { chVerseCount = 0; } }
+      const coverage = assessWrittenNoteCoverage(notesSource, {
+        chapter: ch,
+        verseStart: hasVerseRange ? verseStart : null,
+        verseEnd: hasVerseRange ? verseEnd : null,
+        verseCount: chVerseCount,
+      });
+      const gapText = coverage.versesWithoutRows.length
+        ? ` Verses with no new notes (existing rows kept): ${coverage.versesWithoutRows.join(', ')}.`
+        : '';
+      if (!coverage.ok) {
+        console.error(`[notes] Content guard refused push for ${ref}: ${coverage.reason}`);
+        totalFail++;
+        setCheckpoint(checkpointRef, {
+          state: 'failed',
+          totalSuccess,
+          totalFail,
+          skillOutputs,
+          current: { chapter: ch, skill: 'door43-push', status: 'failed', errorKind: 'no_written_notes', error: coverage.reason },
+          resume: { chapter: ch, skill: 'tn-writer' },
+        });
+        const guardFailEvent = await status(`**door43-push REFUSED** for ${ref}: ${coverage.reason}.${gapText}`);
+        fireDiagnosis(guardFailEvent, {
+          checkpoint: getCheckpoint(checkpointRef),
+          errorText: `Content guard refused push for ${ref}: ${coverage.reason}. Notes source: ${notesSource}.${gapText}`,
+        });
+        continue;
+      }
+      if (coverage.warning || coverage.versesWithoutRows.length) {
+        const msg = `${coverage.warning ? `${coverage.warning}.` : ''}${gapText}`.trim();
+        console.warn(`[notes] Content guard warning for ${ref}: ${msg}`);
+        await status(`**Warning** for ${ref}: ${msg}`);
+      }
+    }
+
     // If push is already deferred due to conflicting branches, collect and skip
     if (deferredPush) {
       deferredChapters.push({ ch, notesSource });
@@ -4153,6 +4261,8 @@ module.exports = {
   _appendIssueTagsToTsv: appendIssueTagsToTsv,
   _analyzeIssuesTsvShape: analyzeIssuesTsvShape,
   _countNoteRows: countNoteRows,
+  _assessWrittenNoteCoverage: assessWrittenNoteCoverage,
+  _runPerNoteGeneration: runPerNoteGeneration,
   _collectUnresolvedQuoteFindings: collectUnresolvedQuoteFindings,
   _isMalformedIssuesShape: isMalformedIssuesShape,
   _postProcessNotesTsv: postProcessNotesTsv,
