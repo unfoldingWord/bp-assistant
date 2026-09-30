@@ -436,6 +436,17 @@ function doFullChapter(bookRows, sourceRows, chapter, skipIntro, verseMap, log) 
     if (preservedRows.length) {
       log.push(`  Removed ${totalRemoved} existing rows for verses in source`);
       log.push(`  Preserving ${preservedRows.length} existing rows for verses not in source`);
+      // #415: make silently kept rows visible — a source missing whole verses
+      // leaves their old (possibly legacy English-quote) notes in place.
+      const keptRefs = [...new Set(preservedRows.map(getReference))];
+      log.push(`  Kept existing rows for: ${keptRefs.join(', ')}`);
+      const nonOrigQuote = preservedRows.filter((row) => {
+        const quote = (row.split('\t')[4] || '').trim();
+        return /\p{L}/u.test(quote) && !/[\u0590-\u05FF\u0370-\u03FF\u1F00-\u1FFF]/.test(quote);
+      });
+      if (nonOrigQuote.length) {
+        log.push(`  WARNING: ${nonOrigQuote.length} kept row(s) have a Quote that is not Hebrew/Greek: ${[...new Set(nonOrigQuote.map(getReference))].join(', ')}`);
+      }
     } else {
       log.push(`  Removed ${totalRemoved} existing rows for chapter ${chapter}`);
     }

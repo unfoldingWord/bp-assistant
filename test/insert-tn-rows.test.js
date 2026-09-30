@@ -244,3 +244,28 @@ test('insertTnRows orders TN rows by ULT alignment quote sequence', () => {
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+// ---------------------------------------------------------------------------
+// #415: verses absent from the source keep their old rows — log them loudly
+// ---------------------------------------------------------------------------
+
+test('insertTnRows logs kept verses and flags kept rows whose Quote is not Hebrew/Greek', () => {
+  const dir = makeTempDir();
+  try {
+    const bookFile = writeTsv(dir, 'en_tn_JER.tsv', TN_HEADER, [
+      '32:1\taaaa\t\trc://*/ta/man/translate/figs-idiom\tהַדָּבָר\t1\tOld note one',
+      '32:8\tbbbb\t\t\tthe son of my uncle\t1\tLegacy English-quote note',
+      '32:9\tcccc\t\trc://*/ta/man/translate/figs-metaphor\tיָד\t1\tOld Hebrew-quote note',
+    ]);
+    const sourceFile = writeTsv(dir, 'JER-32-source.tsv', TN_HEADER, [
+      '32:1\tdddd\t\t\tהַדָּבָר\t1\tSee how you translated this in [21:1](../21/01.md).',
+    ]);
+
+    const log = insertTnRows({ bookFile, sourceFile, chapter: 32 });
+
+    assert.match(log, /Kept existing rows for: 32:8, 32:9/);
+    assert.match(log, /WARNING: 1 kept row\(s\) have a Quote that is not Hebrew\/Greek: 32:8/);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
