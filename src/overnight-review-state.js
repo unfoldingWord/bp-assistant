@@ -235,9 +235,11 @@ function migrateLegacyStateFile(stateFile, legacyStateFile, {
   return 'migrated';
 }
 
-// Stable unit key for a merged PR: repo#prId@headSha.
-function prUnitKey(repo, prId, headSha) {
-  return `${repo}#${prId}@${String(headSha || '').slice(0, 12)}`;
+// Stable unit key for a merged PR: repo#prId@headSha[/BOOK]. The book suffix
+// keeps a multi-book PR (one unit per touched book, #421) idempotent per book.
+function prUnitKey(repo, prId, headSha, book) {
+  const base = `${repo}#${prId}@${String(headSha || '').slice(0, 12)}`;
+  return book ? `${base}/${book}` : base;
 }
 
 // Stable unit key for a live (unmerged) branch: repo:branch@tipSha.
