@@ -22,6 +22,7 @@ const { fillTsvIds, generateIds, prepareNotes, fillOrigQuotes, resolveGlQuotes, 
 const { checkTnQuality, detectSelfTalk, templateFirstPhrase, resolveTemplateText } = require('./workspace-tools/quality-tools');
 const { buildBookRecurrenceIndex, deriveRecurrenceKeys, buildSeeHowSentence, isSeeHowEligible, isContextDependentSref, dedupeAlsoOccursVerses, assignAlsoOccursVerses, resolveDoor43ReposPath, hebTokens, verseNumber: recurrenceVerseNumber, SEE_HOW_NEVER_FOLD_SREFS, CROSS_BOOK_MAX_BOOKS } = require('./workspace-tools/recurrence-index');
 const { normalizeIssuesFile, buildParallelismIntroHintArgs } = require('./issue-normalizer');
+const { runIssueRulesGate } = require('./issue-rules-gate');
 const { curlyQuotes } = require('./workspace-tools/usfm-tools');
 const { verifyRepoPush, verifyDcsToken, verifyRemoteContent } = require('./repo-verify');
 const { recordMetrics, getCumulativeTokens, recordRunSummary, getAdaptiveSkillGuardrails } = require('./usage-tracker');
@@ -1861,6 +1862,14 @@ function cleanupNotesArtifacts({ book, chapter, verseStart, verseEnd }) {
     `output/quality/${book}/${tag}-quality.md`,
     `output/quality/${book}/${tag}-quality.json`,
   ];
+  // issue-rules-gate outputs (named after the issues file: chapter, -vv or -v shard)
+  const gateBases = [tag, verseTag];
+  if (hasVerseRange) gateBases.push(`${tag}-v${verseStart}-${verseEnd}`);
+  for (const gb of gateBases) {
+    for (const suffix of ['-pre-rules-gate.tsv', '-rules-gate.md', '-rules-gate.json']) {
+      candidates.push(`output/review/${book.toUpperCase()}/${gb}${suffix}`);
+    }
+  }
 
   for (const rel of candidates) {
     removeIfExists(path.resolve(CSKILLBP_DIR, rel));
@@ -2663,12 +2672,15 @@ async function notesPipeline(route, message) {
   // we continue generating but defer all pushes until the user says "merged".
   let deferredPush = false;
   let deferredConflicts = [];   // [{ branch }]
-  const deferredChapters = [];  // [{ ch, notesSource }]
+  const deferredChapters = [];  // [{ ch, notesSource, body }]
   let abortForUsageLimit = false;
   let abortForOutage = false;
   let usageLimitTag = null;
   let resumeChapter = Number(existingCheckpoint?.resume?.chapter || startChapter);
   let resumeSkill = existingCheckpoint?.resume?.skill || null;
+  // A rules-gate pause records gatePending so the resumed chapter still runs
+  // the gate even when it resumes at a downstream skill such as tn-writer.
+  const resumeGatePending = !!existingCheckpoint?.resume?.gatePending;
   const skillOutputs = existingCheckpoint?.skillOutputs || {};
 
   const canResumeFromCheckpoint = (
@@ -2754,6 +2766,9 @@ async function notesPipeline(route, message) {
     const chapterStart = Date.now();
     let chapterIntroHintArgs = '';
     let issueNormalizationDone = false;
+    let issueRulesGateDone = false;
+    let issueRulesGateResult = null;
+    let issueRulesGatePaused = false;
 
     // --- Build pipeline context (fetch authoritative ULT/UST from Door43) ---
     let contextPath = null;
@@ -2964,13 +2979,82 @@ async function notesPipeline(route, message) {
         },
       });
       issueNormalizationDone = true;
+      let introSignal = result.introSignal;
 
-      if (withIntro) {
-        chapterIntroHintArgs = buildParallelismIntroHintArgs(result.introSignal);
+      // Issue rules gate: once per chapter, after normalization. Skipped when
+      // this chapter resumes at a downstream skill (the gate already ran, or
+      // the chapter was past it).
+      if (!issueRulesGateDone && !(isResumingThisChapter && downstreamResumeSkills.has(resumeSkill) && !resumeGatePending)) {
+        issueRulesGateDone = true;
+        let gateCtx = null;
+        try { gateCtx = pipeDir ? readContext(pipeDir) : null; } catch (_) { gateCtx = null; }
+        const gate = await runIssueRulesGate({
+          issuesPath,
+          book,
+          chapter: ch,
+          verseStart: hasVerseRange ? verseStart : undefined,
+          verseEnd: hasVerseRange ? verseEnd : undefined,
+          ctx: gateCtx,
+          hints,
+          config: config,
+          env: process.env,
+          dryRun: isDryRun,
+          model,
+          status,
+          runClaudeImpl: runClaude,
+        });
+        issueRulesGateResult = gate;
+        if (gate.pause) {
+          // Same handling as a usage-limit / outage pause in the skills loop:
+          // the issues file is untouched, so the chapter resumes and re-runs the gate.
+          issueRulesGatePaused = true;
+          const gateErr = gate.error || '';
+          if (isUsageLimitError(gateErr)) {
+            abortForUsageLimit = true;
+            usageLimitTag = buildUsageLimitResetTag(gateErr);
+            const when = usageLimitTag ? ` around ${usageLimitTag}` : ' after the limit resets';
+            await status(`**issue-rules-gate** paused for ${ref}: usage limit reached. Retry${when}.`);
+          } else {
+            abortForOutage = true;
+            await status(`**issue-rules-gate** paused for ${ref}: Claude transient outage (${gateErr}).`);
+          }
+          return;
+        }
+        if (gate.ran) {
+          const c = gate.counts;
+          await status(
+            `**${ref}**: issue rules check${gate.changed ? '' : ' (no changes)'}: kept ${c.kept}, dropped ${c.dropped}, ` +
+            `relabeled ${c.relabeled}, rescoped ${c.rescoped}, added ${c.added}` +
+            `${gate.reportPath ? ` (${gate.reportPath})` : ''}`
+          );
+        } else if (gate.reason === 'error') {
+          await status(`**${ref}**: issue rules check failed (non-fatal, issues left unchanged): ${gate.error}`);
+        } else if (gate.reason !== 'no_rules_file') {
+          // no_rules_file already posted its own warning from inside the gate
+          console.log(`[notes] issue-rules-gate ${ref} skipped: ${gate.reason}`);
+          if (!['mode_off', 'book_not_enabled', 'dry_run'].includes(gate.reason)) {
+            await status(`**${ref}**: issue rules check skipped (${gate.reason}).`);
+          }
+        }
+        if (gate.changed) {
+          const pass2 = normalizeIssuesFile({
+            issuesPath,
+            options: {
+              highParallelismThreshold: PARALLELISM_HIGH_THRESHOLD,
+              exceptionCap: PARALLELISM_EXCEPTION_CAP,
+              duplicateSimilarityThreshold: PARALLELISM_DUPLICATE_THRESHOLD,
+            },
+          });
+          introSignal = pass2.introSignal;
+        }
       }
 
-      if (pipeDir && result.introSignal) {
-        updateContextArtifacts(pipeDir, 'parallelism_signal', result.introSignal);
+      if (withIntro) {
+        chapterIntroHintArgs = buildParallelismIntroHintArgs(introSignal);
+      }
+
+      if (pipeDir && introSignal) {
+        updateContextArtifacts(pipeDir, 'parallelism_signal', introSignal);
       }
 
       const s = result.summary;
@@ -3001,6 +3085,12 @@ async function notesPipeline(route, message) {
     // If resuming after issue-producer stages, normalize before chapter-intro/tn-writer.
     if (issuesPath && skills[startSkillIndex] && !issueProducerSkillNames.has(skills[startSkillIndex].name)) {
       await runIssueNormalizationStage();
+      if (issueRulesGatePaused) {
+        // Rules gate paused (usage limit / outage): skip the skill loop; the
+        // failedSkill handler after it records the pause checkpoint.
+        failedSkill = skills[startSkillIndex].name;
+        startSkillIndex = skills.length;
+      }
     }
 
     // Mechanical prep flag — set true once runMechanicalPrep() completes in the skill loop.
@@ -3605,7 +3695,26 @@ async function notesPipeline(route, message) {
               break;
             }
           }
+          // Diagnostic (#186): how many GLQuotes still miss the master ULT.
+          // Runs before normalization and the rules gate so it measures post-edit-review only.
+          if (skill.name === 'post-edit-review' && issuesPath && skill.staleRecheck) {
+            try {
+              const remaining = findRemainingStaleQuotes({
+                issuesPath, workspaceDir: CSKILLBP_DIR, masterChapter: skill.staleRecheck.masterChapter, chapter: ch,
+              });
+              if (remaining) {
+                console.log(`[notes] ${ref}: after post-edit-review, ${remaining.length} stale GLQuote row(s) remain`
+                  + ` (was ${skill.staleRecheck.before})${remaining.length ? ': ' + remaining.map((q) => q.ref).slice(0, 10).join(', ') : ''}`);
+              }
+            } catch (err) {
+              console.warn(`[notes] stale GLQuote re-check failed (non-fatal): ${err.message}`);
+            }
+          }
           await runIssueNormalizationStage();
+          if (issueRulesGatePaused) {
+            failedSkill = skill.name;
+            break;
+          }
           // Sanity check: verify the issues TSV starts with an uppercase book code (not a row number)
           if (skill.name === 'post-edit-review' && issuesPath) {
             try {
@@ -3620,20 +3729,6 @@ async function notesPipeline(route, message) {
               }
             } catch (e) {
               // Non-fatal — file may not exist yet if skill was skipped
-            }
-          }
-          // Diagnostic (#186): how many GLQuotes still miss the master ULT.
-          if (skill.name === 'post-edit-review' && issuesPath && skill.staleRecheck) {
-            try {
-              const remaining = findRemainingStaleQuotes({
-                issuesPath, workspaceDir: CSKILLBP_DIR, masterChapter: skill.staleRecheck.masterChapter, chapter: ch,
-              });
-              if (remaining) {
-                console.log(`[notes] ${ref}: after post-edit-review, ${remaining.length} stale GLQuote row(s) remain`
-                  + ` (was ${skill.staleRecheck.before})${remaining.length ? ': ' + remaining.map((q) => q.ref).slice(0, 10).join(', ') : ''}`);
-              }
-            } catch (err) {
-              console.warn(`[notes] stale GLQuote re-check failed (non-fatal): ${err.message}`);
             }
           }
         }
@@ -3737,7 +3832,7 @@ async function notesPipeline(route, message) {
         totalSuccess,
         totalFail,
         skillOutputs,
-        resume: { chapter: ch, skill: failedSkill },
+        resume: { chapter: ch, skill: failedSkill, ...(issueRulesGatePaused ? { gatePending: true } : {}) },
       });
       const chapterFailEvent = await status(`Chapter ${ref} failed at **${failedSkill}** after ${chapterDuration}s`);
       if (abortForUsageLimit || abortForOutage) break;
@@ -3852,7 +3947,7 @@ async function notesPipeline(route, message) {
 
     // If push is already deferred due to conflicting branches, collect and skip
     if (deferredPush) {
-      deferredChapters.push({ ch, notesSource });
+      deferredChapters.push({ ch, notesSource, body: issueRulesGateResult?.prBody || '' });
       await status(`**door43-push deferred** for ${ref} (waiting for conflicting branches to be merged)`);
       totalSuccess++;
       continue;
@@ -3889,7 +3984,7 @@ async function notesPipeline(route, message) {
       if (conflicts.length > 0) {
         deferredPush = true;
         deferredConflicts = conflicts;
-        deferredChapters.push({ ch, notesSource });
+        deferredChapters.push({ ch, notesSource, body: issueRulesGateResult?.prBody || '' });
         await status(`**door43-push deferred** for ${ref}: conflicting branches found — ${conflicts.map(c => c.branch).join(', ')}`);
         totalSuccess++;
         continue;
@@ -3905,6 +4000,7 @@ async function notesPipeline(route, message) {
         type: 'tn', book, chapter: ch,
         username, branch: buildBranchName(book, ch),
         source: notesSource,
+        body: issueRulesGateResult?.prBody || '',
       });
       if (!pushResult.success) {
         console.error(`[notes] door43-push TN failed for ${ref}: ${pushResult.details}`);

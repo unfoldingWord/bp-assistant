@@ -165,5 +165,12 @@
     "rescueMaxPasses": 1,
     "qualityCheckMaxConsecutiveToolErrors": 6,
     "qualityCheckMaxRepeatedToolErrorSignature": 5
+  },
+  "rulesGate": {
+    "mode": "apply",
+    "books": "all",
+    "allowAdd": false,
+    "effort": "high",
+    "protectSrefs": ["figs-parallelism", "figs-activepassive"]
   }
 }

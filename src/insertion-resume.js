@@ -273,6 +273,7 @@ async function runNotesInsertPhase(completedChapters, username, book, notify) {
         type: 'tn', book, chapter: ch.ch,
         username, branch: buildBranchName(book, ch.ch),
         source: ch.notesSource || extractSourceFromPrompt(ch.repoInsertPrompt),
+        body: ch.body || '',
       });
       if (!pushResult.success) {
         console.error(`[insertion-resume] door43-push TN failed for ${book} ${ch.ch}: ${pushResult.details}`);
