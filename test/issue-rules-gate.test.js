@@ -13,6 +13,9 @@ function freshModule(workspaceDir) {
   for (const key of Object.keys(require.cache)) {
     if (key.startsWith(SRC_DIR)) delete require.cache[key];
   }
+  // Stub the usage tracker so test runs never append to data/metrics/usage.jsonl.
+  const trackerPath = require.resolve('../src/usage-tracker');
+  require.cache[trackerPath] = { id: trackerPath, filename: trackerPath, loaded: true, exports: { recordMetrics() {} } };
   return require('../src/issue-rules-gate');
 }
 
@@ -114,14 +117,13 @@ test('apply changes only the targeted columns; untouched rows stay byte-identica
     const runner = fakeRunner({
       overrides: {
         3: { action: 'relabel', sref: 'figs-metonymy', rule: 'D3', reason: 'royal metonymy' },
-        4: { action: 'rescope', quote: 'word of the LORD', reason: 'tighter' },
         7: { action: 'drop', reason: 'not an issue', rule: 'D2' },
       },
     });
     const res = await run({ runClaudeImpl: runner });
     assert.equal(res.ran, true);
     assert.equal(res.changed, true);
-    assert.deepEqual(res.counts, { kept: 4, dropped: 1, relabeled: 1, rescoped: 1, added: 0 });
+    assert.deepEqual(res.counts, { kept: 5, dropped: 1, relabeled: 1, rescoped: 0, added: 0 });
     assert.equal(res.rowsBefore, 9);
     assert.equal(res.rowsAfter, 8);
 
@@ -130,12 +132,11 @@ test('apply changes only the targeted columns; untouched rows stay byte-identica
     const after = out.split('\n');
     assert.equal(after.length, before.length - 1);
     assert.equal(after[3], 'JER\t3:1\tfigs-metonymy\tthe king\t\t\tking = Yahweh');
-    assert.equal(after[4], 'JER\t3:2\tfigs-idiom\tword of the LORD\t\t\tidiom here');
     // row 7 removed; everything else identical
-    const expected = before.filter((_, i) => i !== 7 && i !== 3 && i !== 4);
-    const actual = after.filter((_, i) => i !== 3 && i !== 4);
+    const expected = before.filter((_, i) => i !== 7 && i !== 3);
+    const actual = after.filter((_, i) => i !== 3);
     assert.deepEqual(actual, expected);
-    assert.match(res.prBody, /^Issue rules check: kept 4, dropped 1, relabeled 1, rescoped 1, added 0/);
+    assert.match(res.prBody, /^Issue rules check: kept 5, dropped 1, relabeled 1, rescoped 0, added 0/);
     assert.match(res.prBody, /3:3 drop figs-possession "the gate" \(D2: not an issue\)/);
     assert.ok(fs.existsSync(path.join(process.env.CSKILLBP_DIR, res.reportPath)));
     assert.ok(fs.existsSync(path.join(process.env.CSKILLBP_DIR, 'output/review/JER/JER-03-pre-rules-gate.tsv')));
@@ -542,5 +543,126 @@ test('by default the prompt carries no decision rows and states the G-rule requi
     const prompt = runner.calls[0].prompt;
     assert.ok(!prompt.includes('DECISION RULES'));
     assert.ok(prompt.includes('G-rule'));
+  });
+});
+
+
+// --- review-fix tests --------------------------------------------------------------
+
+test('a rescope on its own is applied and re-hashed by refreshGateSidecarOutputHash after an outside rewrite', async () => {
+  await ws(async ({ run, read, mod, abs, dir }) => {
+    const res = await run({ runClaudeImpl: fakeRunner({ overrides: { 4: { action: 'rescope', quote: 'word of the LORD' } } }) });
+    assert.equal(res.counts.rescoped, 1);
+    const scPath = path.join(dir, res.sidecarPath);
+    const before = JSON.parse(fs.readFileSync(scPath, 'utf8')).outputHash;
+    // simulate normalizer pass 2 rewriting the file
+    fs.writeFileSync(abs, read().replace('king = Yahweh', 'king is Yahweh'));
+    assert.equal(mod.refreshGateSidecarOutputHash({ issuesPath: 'output/issues/JER-03.tsv', book: 'JER' }), true);
+    const after = JSON.parse(fs.readFileSync(scPath, 'utf8')).outputHash;
+    assert.notEqual(after, before);
+    assert.equal(mod.readGateSidecar({ issuesPath: 'output/issues/JER-03.tsv', book: 'JER' }).outputHash, after);
+    // never throws, no sidecar
+    assert.equal(mod.refreshGateSidecarOutputHash({ issuesPath: 'output/issues/NOPE.tsv', book: 'JER' }), false);
+    assert.equal(mod.readGateSidecar({ issuesPath: 'output/issues/NOPE.tsv', book: 'JER' }), null);
+  });
+});
+
+test('rescope and add quotes containing an ellipsis are rejected', async () => {
+  await ws(async ({ run, read }) => {
+    const runner = fakeRunner({ overrides: { 4: { action: 'rescope', quote: 'the … LORD' }, 6: { action: 'rescope', quote: 'the ... city' } } });
+    const res = await run({ runClaudeImpl: runner });
+    assert.equal(res.counts.rescoped, 0);
+    assert.equal(read(), FILE_TEXT);
+  });
+});
+
+test('an is_error result pauses on a usage limit and is an error otherwise, file untouched', async () => {
+  await ws(async ({ run, read }) => {
+    const limit = await run({ runClaudeImpl: async () => ({ subtype: 'success', is_error: true, result: { text: 'You have hit your limit; resets at 5pm' } }) });
+    assert.equal(limit.pause, true);
+    assert.equal(limit.reason, 'paused');
+    const other = await run({ runClaudeImpl: async () => ({ subtype: 'success', is_error: true, result: { text: 'something odd happened' } }) });
+    assert.equal(other.pause, false);
+    assert.equal(other.reason, 'error');
+    assert.equal(other.ran, false);
+    assert.equal(read(), FILE_TEXT);
+  });
+});
+
+test('out-of-range rows do not break accounting: the drop applies and the stray row is byte-identical', async () => {
+  const lines = [...LINES, 'JER\t3:5\tfigs-metaphor\tPeace\t\t\tstray'];
+  await ws(async ({ run, read }) => {
+    // verseStart 1, verseEnd 3: only rows at verses 1-3 are in scope
+    const runner = fakeRunner({ overrides: { 7: { action: 'drop', reason: 'x', rule: 'D2' } } });
+    const res = await run({ runClaudeImpl: runner, verseStart: 1, verseEnd: 3 });
+    assert.equal(res.reason, 'applied');
+    assert.equal(res.counts.dropped, 1);
+    const out = read().split('\n');
+    assert.ok(!out.includes(LINES[7]));
+    assert.ok(out.includes(lines[12]));
+    assert.deepEqual(out.filter((l) => l !== LINES[7]), (lines.join('\n') + '\n').split('\n').filter((l) => l !== LINES[7]));
+  }, { lines });
+});
+
+test('readGateSidecar returns the sealed prBody', async () => {
+  await ws(async ({ run, mod }) => {
+    const first = await run({ runClaudeImpl: fakeRunner({ overrides: { 3: { action: 'relabel', sref: 'figs-metonymy' } } }) });
+    assert.equal(mod.readGateSidecar({ issuesPath: 'output/issues/JER-03.tsv', book: 'JER' }).prBody, first.prBody);
+  });
+});
+
+test('no ULT source text returns no_source_text before any model call', async () => {
+  await ws(async ({ run, read }) => {
+    const runner = fakeRunner();
+    const statuses = [];
+    const res = await run({ runClaudeImpl: runner, ctx: { sources: {} }, status: async (t) => { statuses.push(t); } });
+    assert.equal(res.ran, false);
+    assert.equal(res.reason, 'no_source_text');
+    assert.equal(runner.calls.length, 0);
+    assert.equal(statuses.length, 1);
+    assert.equal(read(), FILE_TEXT);
+  });
+});
+
+test('incomplete and accounting_violation results carry an empty prBody', async () => {
+  await ws(async ({ run }) => {
+    const res = await run({ runClaudeImpl: fakeRunner({ omit: [6], overrides: { 3: { action: 'drop', reason: 'x' } } }) });
+    assert.equal(res.reason, 'incomplete');
+    assert.equal(res.prBody, '');
+  });
+});
+
+test('the prompt tells the model whether adds are enabled', async () => {
+  await ws(async ({ run }) => {
+    const off = fakeRunner();
+    await run({ runClaudeImpl: off });
+    assert.match(off.calls[0].prompt, /Additions are disabled: leave adds empty\./);
+    const on = fakeRunner();
+    await run({ runClaudeImpl: on, config: { rulesGate: { ...CONFIG.rulesGate, allowAdd: true } } });
+    assert.match(on.calls[0].prompt, /Additions are enabled: you may list commonly missed issues in adds, each citing a G-rule\./);
+  });
+});
+
+test('relabel + rescope over 25% of gateable rows applies none; relabel to a protected slug is ignored', async () => {
+  await ws(async ({ run, read }) => {
+    const capped = await run({ runClaudeImpl: fakeRunner({ overrides: {
+      3: { action: 'relabel', sref: 'figs-metonymy' }, 4: { action: 'rescope', quote: 'word of the LORD' },
+    } }) });
+    assert.equal(capped.counts.relabeled + capped.counts.rescoped, 0);
+    assert.equal(read(), FILE_TEXT);
+    const prot = await run({ runClaudeImpl: fakeRunner({ overrides: { 3: { action: 'relabel', sref: 'figs-parallelism' } } }) });
+    assert.equal(prot.counts.relabeled, 0);
+    assert.equal(read(), FILE_TEXT);
+  });
+});
+
+test('books accepts a comma string and an array containing all', async () => {
+  await ws(async ({ mod }) => {
+    const on = (books, book) => mod.resolveSettings({ config: { rulesGate: { books } }, env: {}, book }).bookEnabled;
+    assert.equal(on('JER,EZK', 'ezk'), true);
+    assert.equal(on('JER,EZK', 'PSA'), false);
+    assert.equal(on(['JER', 'all'], 'PSA'), true);
+    assert.equal(on('all', 'PSA'), true);
+    assert.equal(on(['JER'], 'JER'), true);
   });
 });

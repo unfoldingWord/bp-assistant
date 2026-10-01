@@ -22,7 +22,7 @@ const { fillTsvIds, generateIds, prepareNotes, fillOrigQuotes, resolveGlQuotes, 
 const { checkTnQuality, detectSelfTalk, templateFirstPhrase, resolveTemplateText } = require('./workspace-tools/quality-tools');
 const { buildBookRecurrenceIndex, deriveRecurrenceKeys, buildSeeHowSentence, isSeeHowEligible, isContextDependentSref, dedupeAlsoOccursVerses, assignAlsoOccursVerses, resolveDoor43ReposPath, hebTokens, verseNumber: recurrenceVerseNumber, SEE_HOW_NEVER_FOLD_SREFS, CROSS_BOOK_MAX_BOOKS } = require('./workspace-tools/recurrence-index');
 const { normalizeIssuesFile, buildParallelismIntroHintArgs } = require('./issue-normalizer');
-const { runIssueRulesGate } = require('./issue-rules-gate');
+const { runIssueRulesGate, readGateSidecar, refreshGateSidecarOutputHash } = require('./issue-rules-gate');
 const { curlyQuotes } = require('./workspace-tools/usfm-tools');
 const { verifyRepoPush, verifyDcsToken, verifyRemoteContent } = require('./repo-verify');
 const { recordMetrics, getCumulativeTokens, recordRunSummary, getAdaptiveSkillGuardrails } = require('./usage-tracker');
@@ -1851,6 +1851,7 @@ function cleanupNotesArtifacts({ book, chapter, verseStart, verseEnd }) {
     `output/issues/${verseTag}.tsv`,
     `output/issues/${book}/${tag}.tsv`,
     `output/issues/${book}/${verseTag}.tsv`,
+    ...(hasVerseRange ? [`output/issues/${book}/${tag}-v${verseStart}-${verseEnd}.tsv`] : []),
     // notes
     `output/notes/${tag}.tsv`,
     `output/notes/${verseTag}.tsv`,
@@ -2687,7 +2688,8 @@ async function notesPipeline(route, message) {
     existingCheckpoint?.resume?.chapter != null &&
     (existingCheckpoint?.state === 'paused_for_outage' || existingCheckpoint?.state === 'paused_for_usage_limit' || existingCheckpoint?.state === 'failed' || existingCheckpoint?.state === 'running')
   );
-  if (!fresh && canResumeFromCheckpoint && resumeChapter >= startChapter) {
+  const resumingFromCheckpoint = !fresh && canResumeFromCheckpoint && resumeChapter >= startChapter;
+  if (resumingFromCheckpoint) {
     // The resume chapter was counted as failed in the previous run; undo that
     // so it isn't double-counted if it succeeds this time.
     if (totalFail > 0) totalFail--;
@@ -2702,7 +2704,7 @@ async function notesPipeline(route, message) {
     totalSuccess,
     totalFail,
     skillOutputs,
-    resume: { chapter: resumeChapter, skill: resumeSkill },
+    resume: { chapter: resumeChapter, skill: resumeSkill, ...(resumeGatePending && resumingFromCheckpoint ? { gatePending: true } : {}) },
   });
 
   // =========================================================================
@@ -2984,7 +2986,13 @@ async function notesPipeline(route, message) {
       // Issue rules gate: once per chapter, after normalization. Skipped when
       // this chapter resumes at a downstream skill (the gate already ran, or
       // the chapter was past it).
-      if (!issueRulesGateDone && !(isResumingThisChapter && downstreamResumeSkills.has(resumeSkill) && !resumeGatePending)) {
+      const gateSkippedForResume = isResumingThisChapter && downstreamResumeSkills.has(resumeSkill) && !resumeGatePending;
+      if (!issueRulesGateDone && gateSkippedForResume) {
+        // The gate ran in the earlier run; keep its PR summary for the push.
+        const sidecar = readGateSidecar({ issuesPath, book });
+        issueRulesGateResult = { prBody: sidecar?.prBody || '' };
+      }
+      if (!issueRulesGateDone && !gateSkippedForResume) {
         issueRulesGateDone = true;
         let gateCtx = null;
         try { gateCtx = pipeDir ? readContext(pipeDir) : null; } catch (_) { gateCtx = null; }
@@ -3020,7 +3028,9 @@ async function notesPipeline(route, message) {
           }
           return;
         }
-        if (gate.ran) {
+        if (gate.ran && (gate.reason === 'incomplete' || gate.reason === 'accounting_violation')) {
+          await status(`**${ref}**: issue rules check did not complete (${gate.reason}); issues left unchanged`);
+        } else if (gate.ran) {
           const c = gate.counts;
           await status(
             `**${ref}**: issue rules check${gate.changed ? '' : ' (no changes)'}: kept ${c.kept}, dropped ${c.dropped}, ` +
@@ -3046,6 +3056,8 @@ async function notesPipeline(route, message) {
             },
           });
           introSignal = pass2.introSignal;
+          // Pass 2 rewrote the file after the gate sealed its sidecar.
+          refreshGateSidecarOutputHash({ issuesPath, book });
         }
       }
 

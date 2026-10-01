@@ -65,9 +65,10 @@ function resolveSettings({ config, env, book }) {
     mode = 'off';
   }
   const bookUpper = String(book || '').toUpperCase();
-  let bookEnabled = false;
-  if (books === 'all' || (typeof books === 'string' && books.toLowerCase() === 'all')) bookEnabled = true;
-  else if (Array.isArray(books)) bookEnabled = books.some((b) => String(b).toUpperCase() === bookUpper);
+  // books: "all", "JER,EZK" (comma-separated string) or an array; "all" anywhere enables every book.
+  const bookNames = (Array.isArray(books) ? books : (typeof books === 'string' ? books.split(',') : []))
+    .map((b) => String(b).trim().toUpperCase()).filter(Boolean);
+  const bookEnabled = bookNames.includes('ALL') || bookNames.includes(bookUpper);
 
   const protectSrefs = new Set((Array.isArray(merged.protectSrefs) ? merged.protectSrefs : [])
     .map((s) => String(s).trim().toLowerCase()).filter(Boolean));
@@ -142,6 +143,15 @@ function copyMeta(from, to) {
 }
 
 const dataRows = (rows) => rows.filter((r) => !r.passthrough);
+
+/** Rows outside the chapter (or verse range) become passthrough: never judged, never counted. */
+function markOutOfScope(rows, chapter, range) {
+  for (const r of rows) {
+    if (r.passthrough) continue;
+    if (r.chapter !== Number(chapter) || (range && (r.verse < range.start || r.verse > range.end))) r.passthrough = true;
+  }
+  return rows;
+}
 
 function sha256(text) {
   return crypto.createHash('sha256').update(String(text)).digest('hex');
@@ -316,7 +326,7 @@ function chunkRows(rows, max = MAX_ROWS_PER_CHUNK) {
 
 // --- Prompt ------------------------------------------------------------------------
 
-function buildPrompt({ book, chapter, rules, verseText, rows, catalog, requireGRule = false }) {
+function buildPrompt({ book, chapter, rules, verseText, rows, catalog, requireGRule = false, allowAdd = false }) {
   const ruleLines = (rules || []).map((r) => {
     const phrase = r.phrase && r.phrase.toLowerCase() !== r.slug ? ` "${r.phrase}":` : '';
     return `${r.id} [${r.slug}] (${r.book}; ${r.context})${phrase} ${r.notes}`;
@@ -349,6 +359,9 @@ function buildPrompt({ book, chapter, rules, verseText, rows, catalog, requireGR
     'Return JSON only, no prose and no code fence, exactly in this shape. Give exactly one verdict for every row that is not [protected]:',
     '{"verdicts":[{"row":<number>,"action":"keep|drop|relabel|rescope","sref":"<slug, relabel only>","quote":"<GLQuote, rescope only>","reason":"<short>","rule":"<D-id|type-file|null>"}],"adds":[{"ref":"C:V","sref":"<slug>","quote":"<GLQuote verbatim from ULT>","explanation":"<1-10 words>","reason":"<short>","rule":"<id|null>"}]}',
     '"adds" may be an empty array.',
+    allowAdd
+      ? 'Additions are enabled: you may list commonly missed issues in adds, each citing a G-rule.'
+      : 'Additions are disabled: leave adds empty.',
   ].filter((l, i, a) => !(l === '' && a[i - 1] === '')).join('\n');
 }
 
@@ -487,13 +500,16 @@ function applyVerdicts(rows, verdicts, opts = {}) {
   const counts = { kept: 0, dropped: 0, relabeled: 0, rescoped: 0, added: 0 };
 
   const anchorsOk = (quote, verse) => {
-    if (!quote || /\{(?:…|\.\.\.)\}/.test(quote)) return false;
+    // The normalizer rewrites an ellipsis to " & ", which would change the file after the gate.
+    if (!quote || /…|\.\.\./.test(quote)) return false;
     const vt = ultVerses.get(verse);
     if (!vt) return false;
     try { return anchors(quote, vt) === true; } catch (_) { return false; }
   };
 
-  // Drop cap: judged on the whole chapter, so one wild response cannot thin it.
+  // Drop cap: wanted drops are compared with every gateable row of the chapter (or of the
+  // verse range, for a range run) across all chunks, not with one chunk's rows, so one
+  // wild response cannot thin the list. Rows outside the chapter or range are not counted.
   const wantedDrops = [...verdicts.values()].filter((v) => v.action === 'drop').length;
   const gateableTotal = opts.gateableTotal != null ? opts.gateableTotal : dataRows(rows).filter((r) => !r.protected).length;
   let dropsAllowed = true;
@@ -501,6 +517,15 @@ function applyVerdicts(rows, verdicts, opts = {}) {
     dropsAllowed = false;
     notes.push('drop_cap_exceeded');
   }
+
+  // Relabel + rescope cap, same denominator: past 25% none of them is applied.
+  const wantedEdits = [...verdicts.values()].filter((v) => v.action === 'relabel' || v.action === 'rescope').length;
+  let editsAllowed = true;
+  if (wantedEdits > 0 && gateableTotal > 0 && wantedEdits / gateableTotal > MAX_DROP_SHARE) {
+    editsAllowed = false;
+    notes.push('change_cap_exceeded');
+  }
+  const protectSrefs = opts.protectSrefs || new Set();
 
   const out = [];
   for (const row of rows) {
@@ -513,25 +538,33 @@ function applyVerdicts(rows, verdicts, opts = {}) {
     }
     if (v.action === 'relabel') {
       const slug = v.sref;
-      if (SREF_RE.test(slug) && catalog.has(slug) && slug !== String(row.sref).trim().toLowerCase()) {
+      if (!editsAllowed) {
+        // cap hit: row is kept
+      } else if (protectSrefs.has(slug)) {
+        notes.push(`relabel_ignored:protected_target:${row.index}`);
+      } else if (SREF_RE.test(slug) && catalog.has(slug) && slug !== String(row.sref).trim().toLowerCase()) {
         const cols = row.cols.slice();
         cols[2] = slug;
         out.push({ ...row, cols, sref: slug, raw: null });
         counts.relabeled++;
         changes.push({ index: row.index, ref: row.ref, action: 'relabel', sref: slug, fromSref: row.sref, before: row.sref, after: slug, quote: row.quote, reason: v.reason, rule: v.rule });
         continue;
+      } else {
+        notes.push(`relabel_ignored:${row.index}`);
       }
-      notes.push(`relabel_ignored:${row.index}`);
     } else if (v.action === 'rescope') {
-      if (v.quote !== row.quote && anchorsOk(v.quote, row.verse)) {
+      if (!editsAllowed) {
+        // cap hit: row is kept
+      } else if (v.quote !== row.quote && anchorsOk(v.quote, row.verse)) {
         const cols = row.cols.slice();
         cols[3] = v.quote;
         out.push({ ...row, cols, quote: v.quote, raw: null });
         counts.rescoped++;
         changes.push({ index: row.index, ref: row.ref, action: 'rescope', sref: row.sref, before: row.quote, after: v.quote, reason: v.reason, rule: v.rule });
         continue;
+      } else {
+        notes.push(`rescope_ignored:${row.index}`);
       }
-      notes.push(`rescope_ignored:${row.index}`);
     } else if (v.action === 'drop') {
       // cap hit: row is kept
     }
@@ -695,13 +728,9 @@ async function runIssueRulesGate({ issuesPath, book, chapter, verseStart, verseE
       }
     }
 
-    const rows = parseIssuesTsv(originalText);
+    const rows = markOutOfScope(parseIssuesTsv(originalText), chapter, range);
     for (const r of rows) {
       if (r.passthrough) continue;
-      if (r.chapter !== Number(chapter) || (range && (r.verse < range.start || r.verse > range.end))) {
-        r.passthrough = true;
-        continue;
-      }
       r.protected = settings.protectSrefs.has(String(r.sref || '').trim().toLowerCase()) || hintedVerses.has(r.verse);
     }
     const gateable = rows.filter((r) => !r.passthrough && !r.protected);
@@ -749,6 +778,13 @@ async function runIssueRulesGate({ issuesPath, book, chapter, verseStart, verseE
     const ustVerses = loadVerseMap(sources, ['ustPlain', 'ust'], chapter, range);
     const hebrewVerses = loadVerseMap(sources, ['hebrewPlain', 'hebrew'], chapter, range);
 
+    // No ULT text for any gateable verse: the model would judge rows blind.
+    const gateableVerses = new Set(gateable.map((r) => r.verse));
+    if (![...gateableVerses].some((v) => ultVerses.get(v))) {
+      await say(`Issue rules gate skipped for ${bookUpper} ${chapter}: no ULT verse text available, issue list left unchecked.`);
+      return skip('no_source_text');
+    }
+
     const runner = runClaudeImpl || require('./claude-runner').runClaude;
     const modelName = (env && env.BP_RULES_GATE_MODEL) || model || settings.model || undefined;
     const rowsForChunks = rows.filter((r) => !r.passthrough);
@@ -768,7 +804,7 @@ async function runIssueRulesGate({ issuesPath, book, chapter, verseStart, verseE
       const verseSet = [];
       for (let v = lo - 1; v <= hi + 1; v++) if (v >= 1) verseSet.push(v);
       const prompt = buildPrompt({
-        book: bookUpper, chapter, rules: decisionRules, catalog, requireGRule: settings.requireGRule,
+        book: bookUpper, chapter, rules: decisionRules, catalog, requireGRule: settings.requireGRule, allowAdd: settings.allowAdd,
         verseText: { verses: verseSet, hebrew: hebrewVerses, ult: ultVerses, ust: ustVerses },
         rows: chunk,
       });
@@ -793,8 +829,8 @@ async function runIssueRulesGate({ issuesPath, book, chapter, verseStart, verseE
         return failure(result, err, err && err.message);
       }
       if (res?.usage) usage = accumulateUsage(usage, res.usage);
-      if (res?.subtype !== 'success') {
-        const text = res?.error || (typeof res?.result === 'string' ? res.result : '') || res?.subtype || 'empty result';
+      if (res?.is_error === true || res?.subtype !== 'success') {
+        const text = res?.error || (typeof res?.result === 'string' ? res.result : '') || extractResultText(res) || res?.subtype || 'empty result';
         return failure(result, null, text);
       }
       const responseText = extractResultText(res);
@@ -836,6 +872,7 @@ async function runIssueRulesGate({ issuesPath, book, chapter, verseStart, verseE
     }
     const applied = applyVerdicts(rows, allVerdicts, {
       catalog, ultVerses, allowAdd: settings.allowAdd, adds: allAdds, protectedVerses, gateableTotal: gateable.length,
+      protectSrefs: settings.protectSrefs,
     });
     notes.push(...applied.notes);
     // Rows that were never reviewed (incomplete chunk) are not "kept".
@@ -849,7 +886,7 @@ async function runIssueRulesGate({ issuesPath, book, chapter, verseStart, verseE
     let reason = 'no_changes';
     if (changed) {
       const newText = serializeIssuesTsv(applied.rows);
-      const reparsed = parseIssuesTsv(newText);
+      const reparsed = markOutOfScope(parseIssuesTsv(newText), chapter, range);
       const afterCount = dataRows(reparsed).length;
       if (!accountingHolds(rows, reparsed, counts)) {
         // Checked before anything is written, so the original bytes are intact.
@@ -857,6 +894,7 @@ async function runIssueRulesGate({ issuesPath, book, chapter, verseStart, verseE
         result.reason = 'accounting_violation';
         result.rowsAfter = result.rowsBefore;
         result.counts = emptyCounts();
+        result.prBody = '';
         console.error(`[issue-rules-gate] ${bookUpper} ${chapter}: accounting violation (before=${result.rowsBefore}, after=${afterCount}, dropped=${counts.dropped}, added=${counts.added}); file left as it was`);
         return result;
       }
@@ -875,7 +913,7 @@ async function runIssueRulesGate({ issuesPath, book, chapter, verseStart, verseE
     result.ran = true;
     result.changed = changed;
     result.reason = incomplete > 0 ? 'incomplete' : reason;
-    result.prBody = buildPrBody({ counts, changes: applied.changes });
+    result.prBody = incomplete > 0 ? '' : buildPrBody({ counts, changes: applied.changes });
 
     try {
       fs.mkdirSync(reviewDir, { recursive: true });
@@ -891,6 +929,9 @@ async function runIssueRulesGate({ issuesPath, book, chapter, verseStart, verseE
           mode: settings.mode,
           model: modelName || null,
           rulesHash,
+          chapter: Number(chapter),
+          verseStart: range ? range.start : null,
+          verseEnd: range ? range.end : null,
           inputHash: hashNonIntroRows(rows),
           outputHash: hashNonIntroRows(outputRows),
           counts,
@@ -935,8 +976,45 @@ function failure(result, err, text) {
   return result;
 }
 
+function sidecarAbsPath({ issuesPath, book }) {
+  const base = path.basename(issuesPath, '.tsv');
+  return path.resolve(CSKILLBP_DIR, 'output/review', String(book || '').toUpperCase(), `${base}-rules-gate.json`);
+}
+
+/** Parsed sidecar for an issues file, or null when absent or unreadable. Never throws. */
+function readGateSidecar({ issuesPath, book } = {}) {
+  try {
+    const text = readIfExists(sidecarAbsPath({ issuesPath, book }));
+    return text ? JSON.parse(text) : null;
+  } catch (_) {
+    return null;
+  }
+}
+
+/**
+ * Re-seal the sidecar after something else (normalizer pass 2) rewrote the issues
+ * file: outputHash becomes the hash of the file's current non-intro rows. No-op
+ * when there is no sidecar. Never throws.
+ */
+function refreshGateSidecarOutputHash({ issuesPath, book } = {}) {
+  try {
+    const sc = readGateSidecar({ issuesPath, book });
+    if (!sc) return false;
+    const text = fs.readFileSync(path.resolve(CSKILLBP_DIR, issuesPath), 'utf8');
+    const range = sc.verseStart != null && sc.verseEnd != null ? { start: sc.verseStart, end: sc.verseEnd } : null;
+    const rows = sc.chapter != null ? markOutOfScope(parseIssuesTsv(text), sc.chapter, range) : parseIssuesTsv(text);
+    sc.outputHash = hashNonIntroRows(rows);
+    fs.writeFileSync(sidecarAbsPath({ issuesPath, book }), JSON.stringify(sc, null, 2));
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+
 module.exports = {
   runIssueRulesGate,
+  readGateSidecar,
+  refreshGateSidecarOutputHash,
   parseIssuesTsv,
   serializeIssuesTsv,
   loadDecisionRules,
