@@ -235,12 +235,18 @@ async function fetchPrFiles(get, repo, prNumber, token) {
 
 // Gitea reports a PR's base.sha as the CURRENT master tip and head.sha as the
 // CURRENT tip of its head branch (long-lived tC Create branches keep moving), so
-// neither says what the PR changed. On 2026-09-30, en_tn #7717's base.sha and
-// head.sha both resolved to today's master content (an empty diff), while its
-// merge commit against that commit's parent held 1515 added / 914 removed lines.
-// Diff the commit that landed on master against its first parent instead.
-async function landedCommitPair(get, repo, sha, token) {
+// neither says what the PR changed. Measured for en_tn #7717: base.sha and
+// head.sha both resolved to today's master content (an empty diff), while merge
+// commit 8a464d89 against its parent 99196cd1 changes 10 lines and removes 10
+// on tn_JER.tsv. Diff the commit that landed on master against its first parent
+// instead. A 404 (commit gone) returns null with a warning; other non-200
+// statuses throw so a transient failure is retried rather than skipped.
+async function landedCommitPair(get, repo, sha, token, prNumber) {
   const res = await get(`/repos/${ORG}/${repo}/git/commits/${sha}`, token);
+  if (res && res.status === 404) {
+    console.warn(`[overnight] commit not found: ${repo} PR #${prNumber} sha=${sha}`);
+    return null;
+  }
   if (!res || res.status !== 200) {
     throw new Error(`Gitea commit query failed for ${repo}@${sha}: status=${res && res.status}`);
   }
@@ -267,23 +273,30 @@ async function beExportUnit(get, { repo, resource }, pr, token, editorMap) {
   // editor map is still a human edit worth reviewing.
   const suffix = label.slice(idx + 4);
   if (!suffix || suffix.toLowerCase() === 'mechanical') return null;
-  const editors = suffix.split('-').filter(Boolean);
+  const editors = suffix.split('-').filter(Boolean)
+    .sort((a, b) => a.toLowerCase().localeCompare(b.toLowerCase()) || (a < b ? -1 : a > b ? 1 : 0));
   const file = resource === 'tn' ? tnFileForBook(book) : usfmFileForBook(book);
   if (!file) return null;
-  const since = new Date(new Date(pr.closed_at).getTime() - 2 * 3600 * 1000).toISOString();
-  const res = await get(`/repos/${ORG}/${repo}/commits?sha=master&path=${encodeURIComponent(file)}&since=${encodeURIComponent(since)}&limit=50`, token);
+  const closedMs = new Date(pr.closed_at).getTime();
+  const since = new Date(closedMs - 2 * 3600 * 1000).toISOString();
+  const until = new Date(closedMs + 2 * 3600 * 1000).toISOString();
+  const res = await get(`/repos/${ORG}/${repo}/commits?sha=master&path=${encodeURIComponent(file)}&since=${encodeURIComponent(since)}&until=${encodeURIComponent(until)}&limit=50`, token);
+  if (res && res.status === 404) {
+    console.warn(`[overnight] commits lookup 404: ${repo} PR #${pr.number} path=${file}`);
+    return null;
+  }
   if (!res || res.status !== 200) {
     throw new Error(`Gitea commits query failed for ${repo}: status=${res && res.status}`);
   }
   const landed = (Array.isArray(res.data) ? res.data : []).find((c) => {
-    const subject = String((c && c.commit && c.commit.message) || '').split('\n')[0];
+    const subject = String((c && c.commit && c.commit.message) || '').split(/\r?\n/)[0].trim();
     return subject.endsWith(`(#${pr.number})`);
   });
   if (!landed) return null;
   const parent = Array.isArray(landed.parents) && landed.parents[0] && landed.parents[0].sha;
   if (!landed.sha || !parent) return null; // cannot place the export's own diff
   return {
-    kind: 'be-export', repo, resource, book, editor: editors.join(','),
+    kind: 'be-export', repo, resource, book, editor: editors.join(','), editors,
     prId: pr.number,
     baseSha: parent,
     headSha: landed.sha,
@@ -341,8 +354,14 @@ async function enumerateUnits({ apiGetImpl, token, sinceIso, editorMap = {} }) {
         let baseSha = pr.base && pr.base.sha;
         let headSha = (pr.head && pr.head.sha) || pr.merge_commit_sha;
         if (pr.merge_commit_sha) {
-          const pair = await landedCommitPair(get, repo, pr.merge_commit_sha, token);
-          if (pair) ({ baseSha, headSha } = pair);
+          const pair = await landedCommitPair(get, repo, pr.merge_commit_sha, token, pr.number);
+          if (!pair) {
+            console.warn(`[overnight] skipping ${repo} PR #${pr.number}: merge commit ${pr.merge_commit_sha} unresolved; not falling back to live base/head shas`);
+            continue;
+          }
+          ({ baseSha, headSha } = pair);
+        } else {
+          console.warn(`[overnight] ${repo} PR #${pr.number} has no merge_commit_sha; falling back to live base/head shas`);
         }
         units.push({
           kind: 'merged-pr', repo, resource, book, editor: editor || author,
@@ -593,6 +612,8 @@ async function runOvernightReview({
     proposals.push(...rows);
     reviewTasks.push({
       repo: u.repo, resource: u.resource, book: u.book, editor: u.editor,
+      ...(u.editors ? { editors: u.editors } : {}),
+      baseSha: u.baseSha || null, headSha: u.headSha || null,
       kind: u.kind, prId: u.prId || null, branch: u.branch || null,
       changes: rows.length,
       chapters: [...new Set(rows.map((r) => r.chapter).filter(Boolean))],
