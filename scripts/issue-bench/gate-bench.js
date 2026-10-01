@@ -204,7 +204,7 @@ function runCodex(model, systemPrompt, prompt) {
 }
 
 const LIMITS_FILE = path.join(os.homedir(), '.cache/tmux-agent-indicator/claude-limits.json');
-const SDK_STOP_PCT = 97;
+const SDK_STOP_PCT = 98;
 function weeklyUsedPct() {
   try {
     const w = JSON.parse(fs.readFileSync(LIMITS_FILE, 'utf8')).windows.find((x) => x.window_minutes === 10080);
