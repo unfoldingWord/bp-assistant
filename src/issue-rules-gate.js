@@ -33,6 +33,11 @@ const DEFAULT_SETTINGS = {
   allowAdd: false,
   effort: 'high',
   protectSrefs: ['figs-parallelism', 'figs-activepassive'],
+  // Benchmark 2026-09-30 (EZK 1-5): drops citing issue_decisions.csv rows (LAM/HAB
+  // deletion statistics and broad 'drop when' add-ons) removed 39 notes editors kept
+  // for 7 they deleted. The gate therefore applies only curated G-rules by default.
+  useDecisionRows: false,
+  requireGRule: true,
 };
 
 // --- Settings ----------------------------------------------------------------------
@@ -67,7 +72,11 @@ function resolveSettings({ config, env, book }) {
   const protectSrefs = new Set((Array.isArray(merged.protectSrefs) ? merged.protectSrefs : [])
     .map((s) => String(s).trim().toLowerCase()).filter(Boolean));
 
-  return { mode, bookEnabled, allowAdd: allowAdd === true, effort: effort || 'high', model, protectSrefs };
+  const useDecisionRows = merged.useDecisionRows === true
+    || /^(1|true|yes|on)$/i.test(String(e.BP_RULES_GATE_DECISION_ROWS || '').trim());
+  const requireGRule = merged.requireGRule !== false
+    && !/^(0|false|no|off)$/i.test(String(e.BP_RULES_GATE_REQUIRE_G_RULE || '').trim());
+  return { mode, bookEnabled, allowAdd: allowAdd === true, effort: effort || 'high', model, protectSrefs, useDecisionRows, requireGRule };
 }
 
 // --- TSV parsing / serialization ---------------------------------------------------
@@ -307,7 +316,7 @@ function chunkRows(rows, max = MAX_ROWS_PER_CHUNK) {
 
 // --- Prompt ------------------------------------------------------------------------
 
-function buildPrompt({ book, chapter, rules, verseText, rows, catalog }) {
+function buildPrompt({ book, chapter, rules, verseText, rows, catalog, requireGRule = false }) {
   const ruleLines = (rules || []).map((r) => {
     const phrase = r.phrase && r.phrase.toLowerCase() !== r.slug ? ` "${r.phrase}":` : '';
     return `${r.id} [${r.slug}] (${r.book}; ${r.context})${phrase} ${r.notes}`;
@@ -326,8 +335,8 @@ function buildPrompt({ book, chapter, rules, verseText, rows, catalog }) {
   return [
     `Review the issue rows below for ${String(book).toUpperCase()} ${chapter} against the current rules.`,
     '',
-    'DECISION RULES (recorded editor decisions; cite the id in "rule"):',
-    ruleLines.length ? ruleLines.join('\n') : '(none for this book)',
+    ...(ruleLines.length ? ['DECISION RULES (recorded editor decisions; cite the id in "rule"):', ruleLines.join('\n'), ''] : []),
+    requireGRule ? 'Change a row only when a G-rule in your instructions requires it, and put that G-rule id in "rule". A drop, relabel or rescope without a G-rule id is ignored and the row is kept.' : '',
     '',
     'SOURCE TEXT:',
     sourceLines.join('\n') || '(none provided)',
@@ -703,12 +712,14 @@ async function runIssueRulesGate({ issuesPath, book, chapter, verseStart, verseE
       await say(`Issue rules gate skipped for ${bookUpper} ${chapter}: rules-gate.md is missing, issue list left unchecked.`);
       return skip('no_rules_file');
     }
-    const decisionRules = loadDecisionRules({ csvText: readIfExists(path.join(CSKILLBP_DIR, 'data/quick-ref/issue_decisions.csv')) || '', book });
+    const decisionRules = settings.useDecisionRows
+      ? loadDecisionRules({ csvText: readIfExists(path.join(CSKILLBP_DIR, 'data/quick-ref/issue_decisions.csv')) || '', book })
+      : [];
     const catalog = loadCatalog(readIfExists(path.join(CSKILLBP_DIR, 'data/translation-issues.csv')) || '');
     // Everything that changes what the gate may do is part of the hash, so a new
     // allowAdd value, protect list or catalog re-runs the gate instead of
     // reporting already_applied.
-    const settingsKey = JSON.stringify({ allowAdd: !!settings.allowAdd, protectSrefs: [...settings.protectSrefs].sort(), catalog: [...catalog].sort() });
+    const settingsKey = JSON.stringify({ allowAdd: !!settings.allowAdd, protectSrefs: [...settings.protectSrefs].sort(), catalog: [...catalog].sort(), useDecisionRows: settings.useDecisionRows, requireGRule: settings.requireGRule });
     const rulesHash = sha256(rulesText + '\n' + decisionRules.map((r) => [r.id, r.phrase, r.slug, r.book, r.context, r.notes].join('|')).join('\n') + '\n' + settingsKey);
 
     const base = path.basename(issuesPath, '.tsv');
@@ -757,7 +768,7 @@ async function runIssueRulesGate({ issuesPath, book, chapter, verseStart, verseE
       const verseSet = [];
       for (let v = lo - 1; v <= hi + 1; v++) if (v >= 1) verseSet.push(v);
       const prompt = buildPrompt({
-        book: bookUpper, chapter, rules: decisionRules, catalog,
+        book: bookUpper, chapter, rules: decisionRules, catalog, requireGRule: settings.requireGRule,
         verseText: { verses: verseSet, hebrew: hebrewVerses, ult: ultVerses, ust: ustVerses },
         rows: chunk,
       });
@@ -808,6 +819,20 @@ async function runIssueRulesGate({ issuesPath, book, chapter, verseStart, verseE
       allVerdicts.clear();
       allAdds.length = 0;
       notes.push(`${incomplete} chunk(s) incomplete: no changes applied; the next run retries the whole chapter`);
+    }
+    // Only curated G-rules may change a row (see DEFAULT_SETTINGS). A change that
+    // cites a D-row, the type file, or nothing is treated as keep.
+    if (settings.requireGRule) {
+      const isG = (rule) => /^G\d+$/i.test(String(rule || '').trim());
+      for (const [k, v] of allVerdicts) {
+        if (v.action !== 'keep' && !isG(v.rule)) {
+          allVerdicts.set(k, { ...v, action: 'keep' });
+          notes.push(`uncited_ignored:${k}:${v.action}:${v.rule || 'none'}`);
+        }
+      }
+      for (let i = allAdds.length - 1; i >= 0; i--) {
+        if (!isG(allAdds[i].rule)) { notes.push(`uncited_add_ignored:${allAdds[i].ref}`); allAdds.splice(i, 1); }
+      }
     }
     const applied = applyVerdicts(rows, allVerdicts, {
       catalog, ultVerses, allowAdd: settings.allowAdd, adds: allAdds, protectedVerses, gateableTotal: gateable.length,

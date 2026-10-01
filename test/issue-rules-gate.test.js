@@ -56,7 +56,10 @@ const GATEABLE = [3, 4, 6, 7, 8, 10, 11];
 const FILE_TEXT = LINES.join('\n') + '\n';
 
 const CONFIG = {
-  rulesGate: { mode: 'apply', books: 'all', allowAdd: false, effort: 'high', protectSrefs: ['figs-parallelism', 'figs-activepassive'] },
+  // The mechanics tests below use D-row and uncited verdicts, so they opt back in
+  // to decision rows and turn off the G-rule requirement; the defaults are tested
+  // separately at the end of the file.
+  rulesGate: { mode: 'apply', books: 'all', allowAdd: false, effort: 'high', protectSrefs: ['figs-parallelism', 'figs-activepassive'], useDecisionRows: true, requireGRule: false },
 };
 
 async function ws(fn, opts) {
@@ -506,5 +509,38 @@ test('parseVerdicts accepts a row number sent as a numeric string', async () => 
     const r = mod.parseVerdicts(JSON.stringify({ verdicts: [{ row: '3', action: 'keep' }, { row: 4, action: 'drop', reason: 'x' }] }), rows);
     assert.equal(r.complete, true);
     assert.equal(r.verdicts.get(3).action, 'keep');
+  });
+});
+
+// --- defaults from the 2026-09-30 benchmark: curated G-rules only ------------------
+
+test('by default the gate ignores changes that cite D-rows or no rule, and applies G-rule changes', async () => {
+  await ws(async ({ run, read }) => {
+    const before = read();
+    const runner = fakeRunner({
+      overrides: {
+        3: { action: 'drop', reason: 'stat rule', rule: 'D2' },
+        4: { action: 'relabel', sref: 'figs-metonymy', reason: 'no rule', rule: null },
+        6: { action: 'drop', reason: 'contrast already explicit', rule: 'G4' },
+      },
+    });
+    const defaults = { rulesGate: { mode: 'apply', books: 'all' } };
+    const res = await run({ runClaudeImpl: runner, config: defaults });
+    assert.equal(res.counts.dropped, 1);
+    assert.equal(res.counts.relabeled, 0);
+    const out = read();
+    assert.equal(lineOf(out, 3), lineOf(before, 3));
+    assert.equal(lineOf(out, 4), lineOf(before, 4));
+    assert.ok(!out.includes('JER\t3:3\tfigs-explicit\tthe city'));
+  });
+});
+
+test('by default the prompt carries no decision rows and states the G-rule requirement', async () => {
+  await ws(async ({ run }) => {
+    const runner = fakeRunner();
+    await run({ runClaudeImpl: runner, config: { rulesGate: { mode: 'apply', books: 'all' } } });
+    const prompt = runner.calls[0].prompt;
+    assert.ok(!prompt.includes('DECISION RULES'));
+    assert.ok(prompt.includes('G-rule'));
   });
 });
