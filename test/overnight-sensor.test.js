@@ -178,6 +178,78 @@ test('enumerateUnits derives book+editor from PR files when head.ref is stripped
   assert.equal(merged[0].editor, 'pjoakes');
 });
 
+// --- bible-editor exports (closed, unmerged, squash-committed) ---------------
+function beExportGet(pr, commits) {
+  return async (p) => {
+    const repo = (p.match(/repos\/unfoldingWord\/([^/]+)\//) || [])[1];
+    if (/\/pulls\?/.test(p)) return { status: 200, data: repo === 'en_tn' && /page=1/.test(p) ? [pr] : [] };
+    if (/\/commits\?/.test(p)) return typeof commits === 'function' ? commits(p) : commits;
+    return { status: 200, data: [] };
+  };
+}
+const bePr = (over = {}) => ({
+  number: 7796, title: 'bible-editor: JER tn \u2192 master', state: 'closed', merged: false,
+  closed_at: '2026-06-23T10:00:00Z',
+  head: { ref: 'refs/pull/7796/head', sha: 'h', label: 'JER-be-justplainjane47-pjoakes-Grant_Ailie' },
+  base: { sha: 'b' }, user: { login: 'deferredreward' }, ...over,
+});
+const squash = (n) => ({ status: 200, data: [{ commit: { message: `bible-editor: JER tn \u2192 master (#${n})\n\nbody` } }] });
+const beMap = { justplainjane47: 'jane', pjoakes: 'pjoakes' };
+const beSince = '2026-06-20T00:00:00Z';
+
+test('enumerateUnits turns a closed unmerged bible-editor PR with a squash commit into a be-export unit', async () => {
+  const units = await watcher.enumerateUnits({ apiGetImpl: beExportGet(bePr(), squash(7796)), sinceIso: beSince, editorMap: beMap });
+  const be = units.filter((u) => u.kind === 'be-export');
+  assert.equal(be.length, 1);
+  assert.equal(be[0].book, 'JER');
+  assert.equal(be[0].resource, 'tn');
+  assert.equal(be[0].editor, 'justplainjane47,pjoakes,Grant_Ailie'); // every contributor named in the label
+  assert.equal(be[0].mergedAt, '2026-06-23T10:00:00Z');
+  assert.equal(be[0].baseSha, 'b');
+  assert.equal(be[0].headSha, 'h');
+});
+
+test('enumerateUnits keeps a bible-editor export whose editors are missing from the editor map', async () => {
+  const pr = bePr({ head: { ref: 'refs/pull/7796/head', sha: 'h', label: 'EZK-be-bethoakes' }, title: 'bible-editor: EZK tn \u2192 master' });
+  const units = await watcher.enumerateUnits({ apiGetImpl: beExportGet(pr, squash(7796)), sinceIso: beSince, editorMap: {} });
+  const be = units.filter((u) => u.kind === 'be-export');
+  assert.equal(be.length, 1);
+  assert.equal(be[0].book, 'EZK');
+  assert.equal(be[0].editor, 'bethoakes');
+});
+
+test('enumerateUnits skips a -be-mechanical bible-editor export', async () => {
+  const pr = bePr({ head: { ref: 'refs/pull/7796/head', sha: 'h', label: 'JER-be-mechanical' } });
+  const units = await watcher.enumerateUnits({ apiGetImpl: beExportGet(pr, squash(7796)), sinceIso: beSince, editorMap: beMap });
+  assert.equal(units.filter((u) => u.kind === 'be-export').length, 0);
+});
+
+test('enumerateUnits skips a closed unmerged PR whose title is not a bible-editor export', async () => {
+  const units = await watcher.enumerateUnits({ apiGetImpl: beExportGet(bePr({ title: 'Fix typo' }), squash(7796)), sinceIso: beSince, editorMap: beMap });
+  assert.equal(units.filter((u) => u.kind === 'be-export').length, 0);
+});
+
+test('enumerateUnits skips a bible-editor export whose squash commit is not found', async () => {
+  const units = await watcher.enumerateUnits({ apiGetImpl: beExportGet(bePr(), squash(9999)), sinceIso: beSince, editorMap: beMap });
+  assert.equal(units.filter((u) => u.kind === 'be-export').length, 0);
+});
+
+test('enumerateUnits throws when the squash-commit lookup returns 500', async () => {
+  await assert.rejects(
+    () => watcher.enumerateUnits({ apiGetImpl: beExportGet(bePr(), { status: 500, data: {} }), sinceIso: beSince, editorMap: beMap }),
+    /commits query failed/,
+  );
+});
+
+test('enumerateUnits still handles merged PRs as merged-pr (not be-export)', async () => {
+  const merged = { number: 5, merged: true, merged_at: '2026-06-23T10:00:00Z', head: { ref: 'PSA-be-pjoakes', sha: 'h5' }, base: { sha: 'b5' }, user: { login: 'pjoakes' } };
+  const units = await watcher.enumerateUnits({ apiGetImpl: beExportGet(merged, () => { throw new Error('no commits lookup for merged PRs'); }), sinceIso: beSince, editorMap: beMap });
+  const prs = units.filter((u) => u.kind === 'merged-pr' || u.kind === 'be-export');
+  assert.equal(prs.length, 1);
+  assert.equal(prs[0].kind, 'merged-pr');
+  assert.equal(prs[0].editor, 'pjoakes');
+});
+
 test('runOvernightReview throws on a non-200 pulls response (does not silently advance state)', async () => {
   const badGet = async (p) => (/\/pulls\?/.test(p) ? { status: 403, data: { message: 'forbidden' } } : { status: 200, data: [] });
   await assert.rejects(

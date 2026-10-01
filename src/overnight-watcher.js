@@ -233,6 +233,47 @@ async function fetchPrFiles(get, repo, prNumber, token) {
   return res.data.map((f) => f && f.filename).filter(Boolean);
 }
 
+// bible-editor exports: Gitea Actions squash-commits the export onto master and
+// closes the PR UNMERGED, so `pr.merged` is false. Accept such a PR as an editor
+// unit only when the title says it is a bible-editor export for this repo's
+// resource AND a master commit ending in `(#<n>)` shows it landed. Returns the
+// unit, or null to skip. A non-200 commit lookup throws (never a silent skip).
+const BE_EXPORT_TITLE = /^bible-editor(?: export)?:\s*([A-Z0-9]{3})\s+(tn|ult|ust)\b/i;
+async function beExportUnit(get, { repo, resource }, pr, token, editorMap) {
+  const t = String(pr.title || '').match(BE_EXPORT_TITLE);
+  if (!t || t[2].toLowerCase() !== resource) return null;
+  const book = t[1].toUpperCase();
+  const label = String((pr.head && pr.head.label) || '');
+  const idx = label.indexOf('-be-');
+  if (idx < 0) return null;
+  // bible-editor names only human contributors after `-be-` (`-be-mechanical`
+  // when there were none), so keep every token: an editor missing from the
+  // editor map is still a human edit worth reviewing.
+  const suffix = label.slice(idx + 4);
+  if (!suffix || suffix.toLowerCase() === 'mechanical') return null;
+  const editors = suffix.split('-').filter(Boolean);
+  const file = resource === 'tn' ? tnFileForBook(book) : usfmFileForBook(book);
+  if (!file) return null;
+  const since = new Date(new Date(pr.closed_at).getTime() - 2 * 3600 * 1000).toISOString();
+  const res = await get(`/repos/${ORG}/${repo}/commits?sha=master&path=${encodeURIComponent(file)}&since=${encodeURIComponent(since)}&limit=50`, token);
+  if (!res || res.status !== 200) {
+    throw new Error(`Gitea commits query failed for ${repo}: status=${res && res.status}`);
+  }
+  const landed = (Array.isArray(res.data) ? res.data : []).some((c) => {
+    const subject = String((c && c.commit && c.commit.message) || '').split('\n')[0];
+    return subject.endsWith(`(#${pr.number})`);
+  });
+  if (!landed) return null;
+  return {
+    kind: 'be-export', repo, resource, book, editor: editors.join(','),
+    prId: pr.number,
+    baseSha: pr.base && pr.base.sha,
+    headSha: pr.head && pr.head.sha,
+    mergedAt: pr.closed_at,
+    author: (pr.user && pr.user.login) || null,
+  };
+}
+
 // --- enumeration -------------------------------------------------------------
 async function enumerateUnits({ apiGetImpl, token, sinceIso, editorMap = {} }) {
   const get = apiGetImpl || apiGet;
@@ -256,7 +297,14 @@ async function enumerateUnits({ apiGetImpl, token, sinceIso, editorMap = {} }) {
       const list = Array.isArray(res.data) ? res.data : [];
       if (list.length === 0) break;
       for (const pr of list) {
-        if (!pr || !pr.merged) continue;
+        if (!pr) continue;
+        if (!pr.merged) {
+          if (pr.state !== 'closed' || !pr.closed_at) continue;
+          if (sinceIso && pr.closed_at < sinceIso) continue;
+          const beUnit = await beExportUnit(get, { repo, resource }, pr, token, editorMap);
+          if (beUnit) units.push(beUnit);
+          continue;
+        }
         const mergedAt = pr.merged_at || pr.updated_at;
         if (sinceIso && mergedAt && mergedAt < sinceIso) { keepPaging = false; continue; }
         const author = (pr.user && pr.user.login) || null;
@@ -305,7 +353,7 @@ async function enumerateUnits({ apiGetImpl, token, sinceIso, editorMap = {} }) {
 }
 
 function unitKeyFor(u) {
-  return u.kind === 'merged-pr'
+  return u.kind === 'merged-pr' || u.kind === 'be-export'
     ? state.prUnitKey(u.repo, u.prId, u.headSha)
     : state.branchUnitKey(u.repo, u.branch, u.tipSha);
 }
@@ -327,9 +375,10 @@ async function fetchAllowMissing(fetch, url) {
 // failure so the orchestrator does not mark the unit reviewed.
 async function reviewUnit(u, { fetchTextImpl }) {
   const fetch = fetchTextImpl || fetchText;
-  const oldRef = u.kind === 'merged-pr' ? `commit/${u.baseSha}` : 'branch/master';
-  const newRef = u.kind === 'merged-pr' ? `commit/${u.headSha}` : `branch/${u.branch}`;
-  const headSha = u.kind === 'merged-pr' ? u.headSha : u.tipSha;
+  const isPr = u.kind === 'merged-pr' || u.kind === 'be-export';
+  const oldRef = isPr ? `commit/${u.baseSha}` : 'branch/master';
+  const newRef = isPr ? `commit/${u.headSha}` : `branch/${u.branch}`;
+  const headSha = isPr ? u.headSha : u.tipSha;
   if (u.resource === 'tn') {
     const file = tnFileForBook(u.book);
     const [oldTsv, newTsv] = await Promise.all([
