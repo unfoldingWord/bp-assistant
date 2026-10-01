@@ -233,6 +233,22 @@ async function fetchPrFiles(get, repo, prNumber, token) {
   return res.data.map((f) => f && f.filename).filter(Boolean);
 }
 
+// Gitea reports a PR's base.sha as the CURRENT master tip and head.sha as the
+// CURRENT tip of its head branch (long-lived tC Create branches keep moving), so
+// neither says what the PR changed. On 2026-09-30, en_tn #7717's base.sha and
+// head.sha both resolved to today's master content (an empty diff), while its
+// merge commit against that commit's parent held 1515 added / 914 removed lines.
+// Diff the commit that landed on master against its first parent instead.
+async function landedCommitPair(get, repo, sha, token) {
+  const res = await get(`/repos/${ORG}/${repo}/git/commits/${sha}`, token);
+  if (!res || res.status !== 200) {
+    throw new Error(`Gitea commit query failed for ${repo}@${sha}: status=${res && res.status}`);
+  }
+  const parents = (res.data && Array.isArray(res.data.parents)) ? res.data.parents : [];
+  const parent = parents[0] && parents[0].sha;
+  return parent ? { baseSha: parent, headSha: sha } : null;
+}
+
 // bible-editor exports: Gitea Actions squash-commits the export onto master and
 // closes the PR UNMERGED, so `pr.merged` is false. Accept such a PR as an editor
 // unit only when the title says it is a bible-editor export for this repo's
@@ -259,16 +275,18 @@ async function beExportUnit(get, { repo, resource }, pr, token, editorMap) {
   if (!res || res.status !== 200) {
     throw new Error(`Gitea commits query failed for ${repo}: status=${res && res.status}`);
   }
-  const landed = (Array.isArray(res.data) ? res.data : []).some((c) => {
+  const landed = (Array.isArray(res.data) ? res.data : []).find((c) => {
     const subject = String((c && c.commit && c.commit.message) || '').split('\n')[0];
     return subject.endsWith(`(#${pr.number})`);
   });
   if (!landed) return null;
+  const parent = Array.isArray(landed.parents) && landed.parents[0] && landed.parents[0].sha;
+  if (!landed.sha || !parent) return null; // cannot place the export's own diff
   return {
     kind: 'be-export', repo, resource, book, editor: editors.join(','),
     prId: pr.number,
-    baseSha: pr.base && pr.base.sha,
-    headSha: pr.head && pr.head.sha,
+    baseSha: parent,
+    headSha: landed.sha,
     mergedAt: pr.closed_at,
     author: (pr.user && pr.user.login) || null,
   };
@@ -320,11 +338,17 @@ async function enumerateUnits({ apiGetImpl, token, sinceIso, editorMap = {} }) {
           if (!book) continue; // PR didn't touch this resource's file
           editor = known;
         }
+        let baseSha = pr.base && pr.base.sha;
+        let headSha = (pr.head && pr.head.sha) || pr.merge_commit_sha;
+        if (pr.merge_commit_sha) {
+          const pair = await landedCommitPair(get, repo, pr.merge_commit_sha, token);
+          if (pair) ({ baseSha, headSha } = pair);
+        }
         units.push({
           kind: 'merged-pr', repo, resource, book, editor: editor || author,
           prId: pr.number,
-          baseSha: pr.base && pr.base.sha,
-          headSha: (pr.head && pr.head.sha) || pr.merge_commit_sha,
+          baseSha,
+          headSha,
           mergedAt,
           author,
         });

@@ -193,7 +193,7 @@ const bePr = (over = {}) => ({
   head: { ref: 'refs/pull/7796/head', sha: 'h', label: 'JER-be-justplainjane47-pjoakes-Grant_Ailie' },
   base: { sha: 'b' }, user: { login: 'deferredreward' }, ...over,
 });
-const squash = (n) => ({ status: 200, data: [{ commit: { message: `bible-editor: JER tn \u2192 master (#${n})\n\nbody` } }] });
+const squash = (n) => ({ status: 200, data: [{ sha: `sq${n}`, parents: [{ sha: `p${n}` }], commit: { message: `bible-editor: JER tn \u2192 master (#${n})\n\nbody` } }] });
 const beMap = { justplainjane47: 'jane', pjoakes: 'pjoakes' };
 const beSince = '2026-06-20T00:00:00Z';
 
@@ -205,8 +205,10 @@ test('enumerateUnits turns a closed unmerged bible-editor PR with a squash commi
   assert.equal(be[0].resource, 'tn');
   assert.equal(be[0].editor, 'justplainjane47,pjoakes,Grant_Ailie'); // every contributor named in the label
   assert.equal(be[0].mergedAt, '2026-06-23T10:00:00Z');
-  assert.equal(be[0].baseSha, 'b');
-  assert.equal(be[0].headSha, 'h');
+  // Diffed from the squash commit that landed and its parent, never pr.base/pr.head,
+  // which Gitea reports as today's branch tips.
+  assert.equal(be[0].baseSha, 'p7796');
+  assert.equal(be[0].headSha, 'sq7796');
 });
 
 test('enumerateUnits keeps a bible-editor export whose editors are missing from the editor map', async () => {
@@ -248,6 +250,25 @@ test('enumerateUnits still handles merged PRs as merged-pr (not be-export)', asy
   assert.equal(prs.length, 1);
   assert.equal(prs[0].kind, 'merged-pr');
   assert.equal(prs[0].editor, 'pjoakes');
+});
+
+test('enumerateUnits diffs a merged PR from its merge commit and that commit\'s parent', async () => {
+  const merged = { number: 5, merged: true, merged_at: '2026-06-23T10:00:00Z', merge_commit_sha: 'm5', head: { ref: 'PSA-be-pjoakes', sha: 'live-tip' }, base: { sha: 'live-master' }, user: { login: 'pjoakes' } };
+  const get = async (p) => {
+    if (/\/git\/commits\/m5$/.test(p)) return { status: 200, data: { sha: 'm5', parents: [{ sha: 'm5-parent' }] } };
+    return beExportGet(merged, { status: 200, data: [] })(p);
+  };
+  const units = await watcher.enumerateUnits({ apiGetImpl: get, sinceIso: beSince, editorMap: beMap });
+  const prs = units.filter((u) => u.kind === 'merged-pr');
+  assert.equal(prs.length, 1);
+  assert.equal(prs[0].baseSha, 'm5-parent');
+  assert.equal(prs[0].headSha, 'm5');
+});
+
+test('enumerateUnits throws when a merged PR\'s merge-commit lookup fails', async () => {
+  const merged = { number: 5, merged: true, merged_at: '2026-06-23T10:00:00Z', merge_commit_sha: 'm5', head: { ref: 'PSA-be-pjoakes', sha: 'h' }, base: { sha: 'b' }, user: { login: 'pjoakes' } };
+  const get = async (p) => (/\/git\/commits\//.test(p) ? { status: 502, data: {} } : beExportGet(merged, { status: 200, data: [] })(p));
+  await assert.rejects(() => watcher.enumerateUnits({ apiGetImpl: get, sinceIso: beSince, editorMap: beMap }), /commit query failed/);
 });
 
 test('runOvernightReview throws on a non-200 pulls response (does not silently advance state)', async () => {
