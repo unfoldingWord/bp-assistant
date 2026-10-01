@@ -703,7 +703,11 @@ async function runIssueRulesGate({ issuesPath, book, chapter, verseStart, verseE
     }
     const decisionRules = loadDecisionRules({ csvText: readIfExists(path.join(CSKILLBP_DIR, 'data/quick-ref/issue_decisions.csv')) || '', book });
     const catalog = loadCatalog(readIfExists(path.join(CSKILLBP_DIR, 'data/translation-issues.csv')) || '');
-    const rulesHash = sha256(rulesText + '\n' + decisionRules.map((r) => [r.id, r.phrase, r.slug, r.book, r.context, r.notes].join('|')).join('\n'));
+    // Everything that changes what the gate may do is part of the hash, so a new
+    // allowAdd value, protect list or catalog re-runs the gate instead of
+    // reporting already_applied.
+    const settingsKey = JSON.stringify({ allowAdd: !!settings.allowAdd, protectSrefs: [...settings.protectSrefs].sort(), catalog: [...catalog].sort() });
+    const rulesHash = sha256(rulesText + '\n' + decisionRules.map((r) => [r.id, r.phrase, r.slug, r.book, r.context, r.notes].join('|')).join('\n') + '\n' + settingsKey);
 
     const base = path.basename(issuesPath, '.tsv');
     const reviewRel = path.join('output/review', bookUpper);
@@ -795,6 +799,14 @@ async function runIssueRulesGate({ issuesPath, book, chapter, verseStart, verseE
     }
 
     const protectedVerses = hintedVerses;
+    // All or nothing: if any chunk went unanswered, change nothing. Applying the
+    // answered chunks alone would leave no sidecar, so a rerun could drop
+    // another 25% of an already-thinned list.
+    if (incomplete > 0) {
+      allVerdicts.clear();
+      allAdds.length = 0;
+      notes.push(`${incomplete} chunk(s) incomplete: no changes applied; the next run retries the whole chapter`);
+    }
     const applied = applyVerdicts(rows, allVerdicts, {
       catalog, ultVerses, allowAdd: settings.allowAdd, adds: allAdds, protectedVerses, gateableTotal: gateable.length,
     });
@@ -822,7 +834,9 @@ async function runIssueRulesGate({ issuesPath, book, chapter, verseStart, verseE
         return result;
       }
       fs.mkdirSync(reviewDir, { recursive: true });
-      fs.writeFileSync(path.resolve(CSKILLBP_DIR, preRel), originalText);
+      // Write-once: a later run under new rules must not replace the original list.
+      const preAbs = path.resolve(CSKILLBP_DIR, preRel);
+      if (!fs.existsSync(preAbs)) fs.writeFileSync(preAbs, originalText);
       writeFileAtomic(absIssues, newText);
       outputRows = reparsed;
       result.rowsAfter = afterCount;
@@ -833,7 +847,7 @@ async function runIssueRulesGate({ issuesPath, book, chapter, verseStart, verseE
 
     result.ran = true;
     result.changed = changed;
-    result.reason = reason;
+    result.reason = incomplete > 0 ? 'incomplete' : reason;
     result.prBody = buildPrBody({ counts, changes: applied.changes });
 
     try {

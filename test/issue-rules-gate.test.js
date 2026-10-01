@@ -451,3 +451,51 @@ test('serializeIssuesTsv round-trips bytes, including CRLF and no trailing newli
     }
   });
 });
+
+// --- review findings (PR #420): all-or-nothing, settings in the hash, write-once pre copy ----
+
+test('an incomplete chunk in a multi-chunk chapter applies nothing, and writes no sidecar', async () => {
+  const lines = ['JER\t3:intro\t\t\t\t\t# intro'];
+  for (let v = 1; v <= 5; v++) for (let k = 0; k < 9; k++) lines.push(`JER\t3:${v}\tfigs-metaphor\tthe king\t\t\trow ${v}.${k}`);
+  await ws(async ({ dir, run, read }) => {
+    const before = read();
+    let call = 0;
+    const runner = async (args) => {
+      call++;
+      const idx = [...args.prompt.matchAll(/^#(\d+) (?!\[protected\])/gm)].map((m) => Number(m[1]));
+      const verdicts = (call === 1 ? idx : idx.slice(1)).map((i, n) => ({ row: i, action: call === 1 && n === 0 ? 'drop' : 'keep', reason: 'r', rule: null }));
+      return { subtype: 'success', result: JSON.stringify({ verdicts, adds: [] }) };
+    };
+    const res = await run({ runClaudeImpl: runner });
+    assert.equal(call, 2);
+    assert.equal(res.changed, false);
+    assert.equal(res.reason, 'incomplete');
+    assert.equal(read(), before);
+    assert.equal(fs.existsSync(path.join(dir, 'output/review/JER/JER-03-rules-gate.json')), false);
+  }, { lines });
+});
+
+test('changing allowAdd re-runs the gate instead of reporting already_applied', async () => {
+  await ws(async ({ run }) => {
+    const first = fakeRunner();
+    const r1 = await run({ runClaudeImpl: first });
+    assert.equal(r1.ran, true);
+    const second = fakeRunner();
+    const cfg = { rulesGate: { ...CONFIG.rulesGate, allowAdd: true } };
+    const r2 = await run({ runClaudeImpl: second, config: cfg });
+    assert.notEqual(r2.reason, 'already_applied');
+    assert.ok(second.calls.length > 0);
+  });
+});
+
+test('the pre-gate copy is written once and survives a later run under new rules', async () => {
+  await ws(async ({ dir, run }) => {
+    const original = fs.readFileSync(path.join(dir, 'output/issues/JER-03.tsv'), 'utf8');
+    await run({ runClaudeImpl: fakeRunner({ overrides: { 7: { action: 'drop', reason: 'x', rule: 'D2' } } }) });
+    const preAbs = path.join(dir, 'output/review/JER/JER-03-pre-rules-gate.tsv');
+    assert.equal(fs.readFileSync(preAbs, 'utf8'), original);
+    fs.writeFileSync(path.join(dir, '.claude/skills/issue-identification/rules-gate.md'), '# Gate rules v2\nReview each row again.\n');
+    await run({ runClaudeImpl: fakeRunner({ overrides: { 6: { action: 'drop', reason: 'y', rule: 'D2' } } }) });
+    assert.equal(fs.readFileSync(preAbs, 'utf8'), original);
+  });
+});

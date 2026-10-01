@@ -3712,7 +3712,9 @@ async function notesPipeline(route, message) {
           }
           await runIssueNormalizationStage();
           if (issueRulesGatePaused) {
-            failedSkill = skill.name;
+            // Resume at the next skill, not the producer: its issue file is done,
+            // and resume.gatePending makes the resumed run apply the gate first.
+            failedSkill = (skills[si + 1] && skills[si + 1].name) || skill.name;
             break;
           }
           // Sanity check: verify the issues TSV starts with an uppercase book code (not a row number)
