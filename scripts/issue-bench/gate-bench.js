@@ -203,30 +203,68 @@ function runCodex(model, systemPrompt, prompt) {
   });
 }
 
+const LIMITS_FILE = path.join(os.homedir(), '.cache/tmux-agent-indicator/claude-limits.json');
+const SDK_STOP_PCT = 97;
+function weeklyUsedPct() {
+  try {
+    const w = JSON.parse(fs.readFileSync(LIMITS_FILE, 'utf8')).windows.find((x) => x.window_minutes === 10080);
+    return w ? w.used_percent : null;
+  } catch (_) { return null; }
+}
+
+// Claude Agent SDK, no tools, no MCP, no settings, one turn; effort 'high' like the bot.
+async function runSdk(model, systemPrompt, prompt) {
+  const used = weeklyUsedPct();
+  if (used == null || used >= SDK_STOP_PCT) throw new Error(`budget guard: weekly Claude usage ${used}% (stop at ${SDK_STOP_PCT}%)`);
+  const { query } = await import('@anthropic-ai/claude-agent-sdk');
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'gate-bench-sdk-'));
+  try {
+    const options = {
+      cwd, model, systemPrompt, tools: [], allowedTools: [], mcpServers: {}, strictMcpConfig: true,
+      settingSources: [], maxTurns: 1, persistSession: false,
+      thinking: { type: 'adaptive' }, effort: 'high',
+    };
+    let final = null;
+    for await (const msg of query({ prompt, options })) {
+      if (msg.type === 'result') final = msg;
+    }
+    if (!final) throw new Error('sdk: no result message');
+    if (final.is_error || final.subtype !== 'success') {
+      throw new Error(`sdk ${final.subtype}: ${String(final.result || (final.errors || []).join(' | ') || '').slice(0, 400)}`);
+    }
+    return { result: final.result || '', usage: final.usage };
+  } finally {
+    fs.rmSync(cwd, { recursive: true, force: true });
+  }
+}
+
 function makeAdapter({ model, apiKey, workDir, calls, maxUsd }) {
   let spent = 0;
-  const isCodex = model.startsWith('codex:');
+  const isCodex = model.startsWith('codex:') || model.startsWith('sdk:');
   return async function runClaudeImpl(opts) {
     if (isCodex) {
       const m = String(opts.label || '').match(/issue-rules-gate:([A-Z]+)-(\d+)/);
       const tag = m ? `${m[1]}-${String(m[2]).padStart(2, '0')}` : 'unknown';
       fs.appendFileSync(path.join(workDir, `${tag}.prompt.txt`), `=== ${opts.label} ===\n${opts.prompt}\n\n`);
       const t0 = Date.now();
-      let content = await runCodex(model.slice(6), opts.appendSystemPrompt, opts.prompt);
+      let content; let sdkUsage;
+      if (model.startsWith('sdk:')) ({ result: content, usage: sdkUsage } = await runSdk(model.slice(4), opts.appendSystemPrompt, opts.prompt));
+      else content = await runCodex(model.slice(6), opts.appendSystemPrompt, opts.prompt);
       const rawLen = content.length;
       if (content.trim() && !parsable(content)) {
         const first = firstBalancedObject(content);
         if (first && parsable(first)) content = first;
       }
       const rec = {
-        tag, label: opts.label, model, ms: Date.now() - t0, tokens_in: 0, tokens_out: 0, reasoning_tokens: 0,
+        tag, label: opts.label, model, ms: Date.now() - t0,
+        tokens_in: (sdkUsage && sdkUsage.input_tokens) || 0, tokens_out: (sdkUsage && sdkUsage.output_tokens) || 0, reasoning_tokens: 0,
         cost: 0, cost_computed: false, subscription: true, unknownPrice: false, finish_reason: null,
         empty: !content.trim(), parse_failed: !!content.trim() && !parsable(content),
       };
       calls.push(rec);
       fs.appendFileSync(path.join(workDir, `${tag}.raw.txt`),
         `=== ${opts.label} ${rec.empty ? 'EMPTY' : rec.parse_failed ? 'PARSE-FAILED' : 'ok'} (raw ${rawLen} chars) ===\n${content}\n\n`);
-      return { subtype: 'success', result: content };
+      return { subtype: 'success', result: content, usage: sdkUsage };
     }
     if (spent > maxUsd) throw new Error(`budget guard: model spend ${spent.toFixed(2)} exceeded ${maxUsd}`);
     const m = String(opts.label || '').match(/issue-rules-gate:([A-Z]+)-(\d+)/);
@@ -316,7 +354,7 @@ function buildTsv(items, book, tag) {
 
 async function runChild(args) {
   const { model, label, rulesRoot, allowAdd, maxModelUsd } = args;
-  const concurrency = model.startsWith('codex:') ? Math.min(2, args.concurrency) : args.concurrency;
+  const concurrency = (model.startsWith('codex:') || model.startsWith('sdk:')) ? Math.min(2, args.concurrency) : args.concurrency;
   const slug = slugModel(model);
   const workDir = path.join(S, 'bench/work', label, slug);
   fs.rmSync(path.join(workDir, 'output'), { recursive: true, force: true });
@@ -339,7 +377,7 @@ async function runChild(args) {
     process.exit(1);
   }
 
-  const apiKey = model.startsWith('codex:') ? null : loadApiKey();
+  const apiKey = (model.startsWith('codex:') || model.startsWith('sdk:')) ? null : loadApiKey();
   const calls = [];
   const adapter = makeAdapter({ model, apiKey, workDir, calls, maxUsd: maxModelUsd });
   const sources = {};
@@ -603,7 +641,7 @@ function renderSummary(args, scored) {
   L.push('| Model | rows | deleted (all/gateable) | drops | drop TP | drop recall (gateable/all) | drop precision | collateral (rate, gateable) | wrong drop of relabeled | relabels | relabel correct | relabel recall (gateable/all) | rescopes | rescope agree | adds | add hits | incomplete | parse fail | empty | errors | calls | tokens in/out | cost | wall |');
   L.push('|' + Array(24).fill('---').join('|') + '|');
   for (const s of scored) {
-    subModel = s.model.startsWith('codex:');
+    subModel = s.model.startsWith('codex:') || s.model.startsWith('sdk:');
     const p = s.pooled;
     L.push(`| ${s.model} | ${p.rows_matched} | ${p.deleted_total}/${p.deleted_gateable} | ${p.drops} | ${p.drop_TP} | ${pct(p.drop_recall_gateable)}/${pct(p.drop_recall)} | ${pct(p.drop_precision)} | ${p.collateral} (${pct(p.collateral_rate_gateable)}) | ${p.wrong_drop_relabeled} | ${p.relabels} | ${p.relabel_correct} | ${pct(p.relabel_recall_gateable)}/${pct(p.relabel_recall)} | ${p.rescopes} | ${p.rescope_agree} | ${p.adds} | ${p.add_hits} | ${p.incomplete_chunks} | ${p.parse_failures} | ${p.empty_responses} | ${p.errors} | ${p.calls} | ${p.tokens_in}/${p.tokens_out} | ${usd(p.cost_usd)} | ${mins(p.wall_ms)} |`);
   }
@@ -617,7 +655,7 @@ function renderSummary(args, scored) {
     L.push(`| ${s.model} | ${p.kept_total}/${p.kept_gateable} | ${p.relabeled_total}/${p.relabeled_gateable} | ${p.rescoped_total} | ${p.protected_rows} | ${p.unmatched} | ${p.drop_cap_chapters} | ${JSON.stringify(p.rescope_other)} | ${pct(p.collateral_rate)} | ${pct(p.relabel_precision)} | ${pct(p.add_precision)} | ${pct(p.add_recall)} |`);
   }
   for (const s of scored) {
-    subModel = s.model.startsWith('codex:');
+    subModel = s.model.startsWith('codex:') || s.model.startsWith('sdk:');
     L.push('');
     L.push(`## ${s.model}`);
     L.push('');
