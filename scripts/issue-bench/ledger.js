@@ -32,6 +32,17 @@ function parseArgs(argv) {
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 let lastFetch = 0;
 
+// Delay in ms before retrying an HTTP status, or null when it is not retryable.
+// 5xx and 429 retry; a numeric Retry-After (seconds, capped at 60) wins for 429.
+function retryDelayMs(status, retryAfter, attempt) {
+  if (status !== 429 && status < 500) return null;
+  const secs = Number(retryAfter);
+  if (status === 429 && retryAfter != null && retryAfter !== '' && Number.isFinite(secs) && secs >= 0) {
+    return Math.min(secs, 60) * 1000;
+  }
+  return 1000 * 2 ** attempt;
+}
+
 async function http(url) {
   let lastErr;
   for (let attempt = 0; attempt < 4; attempt++) {
@@ -40,7 +51,12 @@ async function http(url) {
     lastFetch = Date.now();
     try {
       const res = await fetch(url, { headers: { accept: '*/*' } });
-      if (res.status >= 500) throw new Error(`HTTP ${res.status}`);
+      const delay = retryDelayMs(res.status, res.headers.get('retry-after'), attempt);
+      if (delay !== null) {
+        const e = new Error(`HTTP ${res.status}`);
+        e.delayMs = delay;
+        throw e;
+      }
       if (!res.ok) {
         const e = new Error(`HTTP ${res.status} for ${url}`);
         e.fatal = true;
@@ -53,7 +69,7 @@ async function http(url) {
       if (e.fatal) throw e;
       lastErr = e;
       console.warn(`[retry] ${url.replace(API, '')} attempt ${attempt + 1}: ${e.message}`);
-      if (attempt < 3) await sleep(1000 * 2 ** attempt);
+      if (attempt < 3) await sleep(e.delayMs != null ? e.delayMs : 1000 * 2 ** attempt);
     }
   }
   throw new Error(`giving up on ${url}: ${lastErr && lastErr.message}`);
@@ -494,3 +510,5 @@ async function main() {
 if (require.main === module) {
   main().catch((e) => { console.error(e); process.exit(1); });
 }
+
+module.exports = { retryDelayMs };

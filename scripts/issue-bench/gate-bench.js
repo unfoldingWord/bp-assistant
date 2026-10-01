@@ -40,6 +40,9 @@ const KEPT_KINDS = new Set(['kept', 'kept-reid', 'reworded', 'rescoped']);
 
 const slugModel = (m) => m.replace(/[^A-Za-z0-9.]+/g, '-').replace(/^-|-$/g, '');
 
+// Accepts a bare slug or a full rc://*/ta/man/translate/<slug> reference.
+const isProtected = (sref) => PROTECT.includes(slugOf(sref).toLowerCase());
+
 function parseArgs(argv) {
   const a = { sources: 'ai-time', concurrency: 3, allowAdd: false, child: false, scoreOnly: false, maxModelUsd: 30 };
   for (let i = 0; i < argv.length; i++) {
@@ -51,7 +54,11 @@ function parseArgs(argv) {
     else if (k === '--rules-root') a.rulesRoot = path.resolve(val());
     else if (k === '--label') a.label = val();
     else if (k === '--concurrency') a.concurrency = Math.max(1, Number(val()) || 1);
-    else if (k === '--max-model-usd') a.maxModelUsd = Number(val());
+    else if (k === '--max-model-usd') {
+      const v = val();
+      a.maxModelUsd = v === undefined || String(v).trim() === '' ? NaN : Number(v);
+      if (!Number.isFinite(a.maxModelUsd) || a.maxModelUsd < 0) throw new Error(`usage: --max-model-usd must be a non-negative number, got "${v}"`);
+    }
     else if (k === '--sources') { a.sources = val(); if (!['ai-time', 'master'].includes(a.sources)) throw new Error('--sources must be ai-time|master'); }
     else if (k === '--allow-add') a.allowAdd = true;
     else if (k === '--child') a.child = true;
@@ -122,13 +129,20 @@ function loadApiKey() {
   return m[1].trim().replace(/^['"]|['"]$/g, '');
 }
 
+// Conservative USD per 1M tokens in/out for a model with no known price.
+const FALLBACK_PRICE = [10, 50];
+const warnedPrice = new Set();
+
 function costOf(model, usage) {
   if (usage && typeof usage.cost === 'number') return { cost: usage.cost, computed: false };
-  const p = PRICES[model];
-  if (!p) return { cost: 0, computed: true, unknownPrice: true };
+  const p = PRICES[model] || FALLBACK_PRICE;
+  if (!PRICES[model] && !warnedPrice.has(model)) {
+    warnedPrice.add(model);
+    console.warn(`[warn] no known price for ${model} and no usage.cost; charging fallback $${FALLBACK_PRICE[0]}/$${FALLBACK_PRICE[1]} per 1M in/out tokens`);
+  }
   const inT = (usage && usage.prompt_tokens) || 0;
   const outT = (usage && usage.completion_tokens) || 0;
-  return { cost: (inT * p[0] + outT * p[1]) / 1e6, computed: true };
+  return { cost: (inT * p[0] + outT * p[1]) / 1e6, computed: true, unknownPrice: !PRICES[model] };
 }
 
 function stripFence(t) {
@@ -317,7 +331,13 @@ async function runChild(args) {
   // The gate's best-effort metrics write into its own worktree; keep it read-only.
   const utPath = require.resolve(path.join(GATE_SRC, 'usage-tracker'));
   require.cache[utPath] = { id: utPath, filename: utPath, loaded: true, exports: { recordMetrics() {} } };
-  const { runIssueRulesGate } = require(path.join(GATE_SRC, 'issue-rules-gate.js'));
+  let runIssueRulesGate;
+  try {
+    ({ runIssueRulesGate } = require(path.join(GATE_SRC, 'issue-rules-gate.js')));
+  } catch (e) {
+    console.error(`issue-rules-gate.js not found under GATE_SRC=${GATE_SRC}; it ships in unfoldingWord/bp-assistant#420 - set GATE_SRC to a checkout of that branch's src/`);
+    process.exit(1);
+  }
 
   const apiKey = model.startsWith('codex:') ? null : loadApiKey();
   const calls = [];
@@ -476,7 +496,7 @@ function scoreChapter(run, runCalls) {
   const changesOut = [];
   m.rows = prep.items.length;
   m.wall_ms = run.ms || 0;
-  const isProt = (it) => PROTECT.includes(String(it.sref || '').trim().toLowerCase());
+  const isProt = (it) => isProtected(it.sref);
 
   for (const it of prep.items) {
     const rec = led.byId.get(it.id);
@@ -644,6 +664,7 @@ async function main() {
   if (!args.models || !args.chapters || !args.label || (!args.rulesRoot && !args.scoreOnly)) {
     throw new Error('usage: gate-bench.js --models a,b --chapters EZK-01,JER-23 --rules-root <dir> --label <name> [--allow-add] [--concurrency N] [--score-only]');
   }
+  let failedModels = [];
   if (!args.scoreOnly) {
     for (const rel of RULE_FILES) if (!fs.existsSync(path.join(args.rulesRoot, rel))) throw new Error(`rules root is missing ${rel}`);
     const books = [...new Set(args.chapters.map((t) => t.split('-')[0]))];
@@ -656,6 +677,8 @@ async function main() {
     console.log(`running ${args.models.length} model(s) x ${args.chapters.length} chapter(s), label=${args.label}`);
     const codes = await Promise.all(args.models.map((m) => spawnChild(args, m, sourcePaths)));
     codes.forEach((c, i) => { if (c !== 0) console.error(`child for ${args.models[i]} exited with ${c}`); });
+    failedModels = args.models.filter((m, i) => codes[i] !== 0);
+    if (failedModels.length) console.error(`FAILED MODELS: ${failedModels.join(', ')}`);
   }
   const resDir = path.join(S, 'bench/results', args.label);
   fs.mkdirSync(resDir, { recursive: true });
@@ -668,11 +691,13 @@ async function main() {
     scored.push(sc);
   }
   if (scored.length) {
-    fs.writeFileSync(path.join(resDir, 'summary.md'), renderSummary(args, scored));
+    const banner = failedModels.length ? `FAILED MODELS: ${failedModels.join(', ')}\n\n` : '';
+    fs.writeFileSync(path.join(resDir, 'summary.md'), banner + renderSummary(args, scored));
     const total = scored.reduce((a, s) => a + s.pooled.cost_usd, 0);
     console.log(`summary: ${path.join(resDir, 'summary.md')}  total cost ${usd(total)}`);
   }
+  if (failedModels.length) process.exitCode = 1;
 }
 
 if (require.main === module) main().catch((e) => { console.error(e.message); process.exit(1); });
-module.exports = { diffChanges, scoreChapter, parseArgs, slugModel };
+module.exports = { diffChanges, scoreChapter, parseArgs, slugModel, isProtected };

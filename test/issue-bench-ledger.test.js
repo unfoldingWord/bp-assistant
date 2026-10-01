@@ -154,3 +154,23 @@ test('usfmToVerses strips alignment markup and passiveCoverage counts', () => {
   assert.strictEqual(cov.passive_verses_with_note, 1);
   assert.strictEqual(cov.ap_rows, 1);
 });
+
+test('retryDelayMs retries 429 and 5xx, honors capped Retry-After, rejects other 4xx', () => {
+  const { retryDelayMs } = require('../scripts/issue-bench/ledger');
+  assert.strictEqual(retryDelayMs(404, null, 0), null);
+  assert.strictEqual(retryDelayMs(403, '5', 0), null);
+  assert.strictEqual(retryDelayMs(503, null, 2), 4000);
+  assert.strictEqual(retryDelayMs(429, null, 1), 2000);
+  assert.strictEqual(retryDelayMs(429, '7', 0), 7000);
+  assert.strictEqual(retryDelayMs(429, '9999', 0), 60000);
+  assert.strictEqual(retryDelayMs(429, 'Wed, 21 Oct 2026 07:28:00 GMT', 0), 1000);
+});
+
+test('isProtected matches bare and rc:// slugs', () => {
+  const { isProtected } = require('../scripts/issue-bench/gate-bench');
+  assert.ok(isProtected('figs-parallelism'));
+  assert.ok(isProtected('rc://*/ta/man/translate/figs-parallelism'));
+  assert.ok(isProtected(' FIGS-ActivePassive '));
+  assert.ok(!isProtected('figs-metaphor'));
+  assert.ok(!isProtected(undefined));
+});
