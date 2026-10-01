@@ -30,9 +30,12 @@ function normalizeIssueType(raw) {
 }
 
 function tokenize(text) {
+  // Unicode-aware so Hebrew/Greek quotes don't collapse to an empty token set
+  // (two empty sets score 1.0 and would be dropped as near-duplicates).
   return String(text || '')
+    .normalize('NFC')
     .toLowerCase()
-    .replace(/[^a-z0-9\s-]/g, ' ')
+    .replace(/[^\p{L}\p{M}\p{N}\s-]/gu, ' ')
     .split(/\s+/)
     .filter(Boolean);
 }

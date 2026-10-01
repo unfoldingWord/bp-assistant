@@ -50,6 +50,17 @@ test('normalizeIssueRows keeps every synonymous parallelism and marks repeats fo
   assert.equal(result.summary.dropped_parallelism_rows, 0);
 });
 
+test('normalizeIssueRows does not treat distinct Hebrew-only quotes as near-duplicates', () => {
+  const input = [
+    row({ ref: '35:1', quote: 'שִׁ֣ירוּ לַ⁠יהוָ֑ה', explanation: 'synonymous parallelism t: first instance' }),
+    row({ ref: '35:4', quote: 'בָּרְכ֣וּ שְׁמ֑⁠וֹ', explanation: 'synonymous parallelism' }),
+    row({ ref: '35:7', quote: 'בָּרְכ֣וּ שְׁמ֑⁠וֹ', explanation: 'synonymous parallelism' }),
+  ];
+  const result = normalizeIssueRows(input);
+  assert.deepEqual(parallelismCols(result.lines).map((c) => c[1]), ['35:1', '35:4']);
+  assert.equal(result.summary.dropped_duplicate_parallelism_rows, 1);
+});
+
 test('normalizeIssueRows replaces other template hints on repeat rows', () => {
   const input = [
     row({ ref: '35:1', quote: 'A; B', explanation: 'synonymous parallelism t: first instance' }),
