@@ -506,12 +506,37 @@ function parseExplanationDirectives(explanation) {
   };
 }
 
+// Templates the pipeline depends on that may not exist in the Google sheet yet.
+// Used only when the sheet has no row with the same issue type + type, and only
+// offered when a `t:` hint asks for it (hint_only), so it never displaces sheet
+// templates for unhinted rows.
+// figs-parallelism/parallelism-repeat: Issues Resolved 2026-02-25 simple template
+// for synonymous parallelisms after the first instance (set by issue-normalizer).
+const BUILTIN_TEMPLATES = [
+  {
+    issue_type: 'figs-parallelism',
+    type: 'parallelism-repeat',
+    template: 'See how your translation team has decided to represent pairs of clauses in Hebrew poetry that mean basically the same thing. Alternate translation: [text]',
+    hint_only: true,
+  },
+];
+
+function addBuiltinTemplates(map) {
+  for (const builtin of BUILTIN_TEMPLATES) {
+    const existing = map.get(builtin.issue_type) || [];
+    const wanted = normalizeTemplateType(builtin.type);
+    if (existing.some((t) => normalizeTemplateType(t.type) === wanted)) continue;
+    map.set(builtin.issue_type, [...existing, { ...builtin }]);
+  }
+  return map;
+}
+
 let _templateCache = null;
 function loadTemplateMap() {
   if (_templateCache) return _templateCache;
   const templatesPath = path.join(CSKILLBP_DIR, 'data/templates.csv');
   if (!fs.existsSync(templatesPath)) {
-    _templateCache = new Map();
+    _templateCache = addBuiltinTemplates(new Map());
     return _templateCache;
   }
   const rows = parseCSV(fs.readFileSync(templatesPath, 'utf8'));
@@ -525,7 +550,7 @@ function loadTemplateMap() {
     if (!map.has(issueType)) map.set(issueType, []);
     map.get(issueType).push({ issue_type: issueType, type, template });
   }
-  _templateCache = map;
+  _templateCache = addBuiltinTemplates(map);
   return _templateCache;
 }
 
@@ -600,8 +625,11 @@ function resolveTemplateSelection({
   selectorChoice = null,
 }) {
   const templates = Array.isArray(templateMap?.get?.(sref)) ? templateMap.get(sref) : [];
-  const candidates = templates.map((template, index) => toTemplateCandidate(template, sref, index));
   const normalizedHints = templateHints.map(normalizeTemplateType).filter(Boolean);
+  const candidates = templates
+    .map((template, index) => toTemplateCandidate(template, sref, index))
+    .filter((candidate) => !candidate._template?.hint_only
+      || normalizedHints.includes(normalizeTemplateType(candidate.type)));
   let filtered = candidates.slice();
   const fallbackReasons = [];
 
@@ -3420,6 +3448,7 @@ module.exports = {
   quoteFuzzyMatch,
   _parseExplanationDirectives: parseExplanationDirectives,
   _resolveTemplateSelection: resolveTemplateSelection,
+  _addBuiltinTemplates: addBuiltinTemplates,
   _deriveStyleProfile: deriveStyleProfile,
   _deriveAtRequirement: deriveAtRequirement,
   _resolveQuoteScopeSelection: resolveQuoteScopeSelection,

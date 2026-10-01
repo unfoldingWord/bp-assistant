@@ -2977,12 +2977,14 @@ async function notesPipeline(route, message) {
       const signal = result.introSignal?.parallelism_signal || 'none';
       await status(
         `**${ref}**: issue-normalizer kept ${s.kept_parallelism_rows}/${s.total_parallelism_rows} parallelism rows ` +
-        `(exceptions: ${s.kept_parallelism_exceptions}, dropped: ${s.dropped_parallelism_rows}), intro signal: ${signal}.`
+        `(exceptions: ${s.kept_parallelism_exceptions}, simple-template repeats: ${s.kept_parallelism_repeats}, ` +
+        `dropped: ${s.dropped_parallelism_rows}), intro signal: ${signal}.`
       );
       console.log(
         `[notes] issue-normalizer ${ref}: ` +
         `parallelism total=${s.total_parallelism_rows}, kept=${s.kept_parallelism_rows}, ` +
-        `exceptions=${s.kept_parallelism_exceptions}, dropped=${s.dropped_parallelism_rows}, signal=${signal}`
+        `exceptions=${s.kept_parallelism_exceptions}, repeats=${s.kept_parallelism_repeats}, ` +
+        `dropped=${s.dropped_parallelism_rows}, signal=${signal}`
       );
 
       // Keep downstream prompts pinned to normalized issues path and intro hint.

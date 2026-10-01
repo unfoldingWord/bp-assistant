@@ -13,6 +13,7 @@ const {
   _resolveGlQuotes,
   _parseExplanationDirectives,
   _resolveTemplateSelection,
+  _addBuiltinTemplates,
   _deriveStyleProfile,
   _deriveAtRequirement,
   _resolveQuoteScopeSelection,
@@ -53,6 +54,34 @@ test('resolveTemplateSelection locks a single exact template hint match', () => 
   assert.equal(selected.template_locked, true);
   assert.equal(selected.selected_template.type, 'request');
   assert.equal(selected.candidate_templates.length, 1);
+});
+
+test('parallelism-repeat hint selects the built-in simple template; unhinted rows never see it (#423)', () => {
+  const templateMap = _addBuiltinTemplates(new Map([
+    ['figs-parallelism', [
+      { issue_type: 'figs-parallelism', type: 'first instance', template: 'These two clauses mean basically the same thing. Alternate translation: [text]' },
+      { issue_type: 'figs-parallelism', type: 'combine', template: 'These two clauses mean basically the same thing. Combine. Alternate translation: [text]' },
+    ]],
+  ]));
+
+  const repeat = _resolveTemplateSelection({
+    sref: 'figs-parallelism',
+    templateHints: _parseExplanationDirectives('synonymous parallelism t: parallelism-repeat').template_hints,
+    templateMap,
+  });
+  assert.equal(repeat.template_locked, true);
+  assert.equal(repeat.selected_template.type, 'parallelism-repeat');
+  assert.match(repeat.selected_template.template, /^See how your translation team has decided to represent pairs of clauses in Hebrew poetry/);
+
+  const unhinted = _resolveTemplateSelection({ sref: 'figs-parallelism', templateHints: [], templateMap });
+  assert.equal(unhinted.candidate_templates.some((c) => c.type === 'parallelism-repeat'), false);
+
+  // A sheet row of the same type wins over the built-in.
+  const sheetMap = _addBuiltinTemplates(new Map([
+    ['figs-parallelism', [{ issue_type: 'figs-parallelism', type: 'parallelism-repeat', template: 'Sheet wording. Alternate translation: [text]' }]],
+  ]));
+  assert.equal(sheetMap.get('figs-parallelism').length, 1);
+  assert.equal(sheetMap.get('figs-parallelism')[0].template, 'Sheet wording. Alternate translation: [text]');
 });
 
 test('deriveStyleProfile keeps no-at style rule metadata without suppressing template AT requirements', () => {
