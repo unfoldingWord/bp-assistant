@@ -32,6 +32,8 @@ const DECISIONS = [
   'psa only,rc://*/ta/man/translate/figs-idiom,PSA,PSA 1,Psalms only.,2026-07-04,editor-history',
 ].join('\n') + '\n';
 
+const G_RULES = '- **G4 Keep this active rule**\n- **G5 This rule is (on hold)**\n';
+
 const ULT = [
   '\\c 3',
   '\\v 1 And the king said to the people a word.',
@@ -311,7 +313,7 @@ test('a transient outage pauses; any other failure is an error, not a pause', as
 
 test('adds are ignored when allowAdd is false and validated when true', async () => {
   const adds = [
-    { ref: '3:1', sref: 'figs-explicit', quote: 'the people', explanation: 'people = Israel', reason: 'missed', rule: null },
+    { ref: '3:1', sref: 'figs-explicit', quote: 'people', explanation: 'people = Israel', reason: 'missed', rule: null },
     { ref: '3:1', sref: 'figs-madeup', quote: 'the people', explanation: 'x', reason: '', rule: null },
     { ref: '3:1', sref: 'figs-explicit', quote: 'the queen', explanation: 'x', reason: '', rule: null },
     { ref: '3:5', sref: 'figs-explicit', quote: 'the house', explanation: 'protected verse', reason: '', rule: null },
@@ -332,14 +334,27 @@ test('adds are ignored when allowAdd is false and validated when true', async ()
     assert.equal(on.counts.added, 1);
     assert.equal(on.rowsAfter, on.rowsBefore + 1);
     const out = read().split('\n');
-    assert.equal(out[4], 'JER\t3:1\tfigs-explicit\tthe people\t\t\tpeople = Israel');
+    assert.equal(out[4], 'JER\t3:1\tfigs-explicit\tpeople\t\t\tpeople = Israel');
     assert.equal(out[3], LINES[3]);
     assert.equal(out.length, LINES.length + 2);
   });
   await ws(async ({ run, read }) => {
     const envOn = await run({ runClaudeImpl: fakeRunner({ adds: [adds[0]] }), env: { BP_RULES_GATE_ALLOW_ADD: '1' } });
     assert.equal(envOn.counts.added, 1);
-    assert.ok(read().includes('JER\t3:1\tfigs-explicit\tthe people'));
+    assert.ok(read().includes('JER\t3:1\tfigs-explicit\tpeople'));
+  });
+});
+
+test('adds with overlapping quotes are rejected across srefs in the same verse', async () => {
+  await ws(async ({ mod }) => {
+    const rows = mod.parseIssuesTsv('JER\t3:1\tfigs-idiom\tbehold me sending\t\t\tidiom\n');
+    const result = mod.applyVerdicts(rows, new Map(), {
+      catalog: new Set(['writing-foreground']), ultVerses: new Map([[1, 'Behold me sending']]),
+      anchors: () => true, allowAdd: true,
+      adds: [{ ref: '3:1', sref: 'writing-foreground', quote: 'Behold me', explanation: 'foreground', verses: [1] }],
+    });
+    assert.equal(result.counts.added, 0);
+    assert.deepEqual(result.notes, ['add_rejected:overlap:3:1']);
   });
 });
 
@@ -381,6 +396,7 @@ test('call options and prompt follow the spec', async () => {
     assert.match(a.prompt, /^D1 \[figs-abstractnouns\] \(ALL; LAM\+HAB overall, drop\) Over-flagged/m);
     assert.match(a.prompt, /^D2 \[figs-metonymy\] \(JER; JER 3 keep\)/m);
     assert.ok(!a.prompt.includes('Psalms only'));
+    assert.match(a.prompt, /"rule":"<D-id\|type-file\|null>"/);
     assert.match(a.prompt, /Verse 3:1\n {2}HEB: \(none\)\n {2}ULT: And the king said/);
   });
 });
@@ -533,7 +549,45 @@ test('by default the gate ignores changes that cite D-rows or no rule, and appli
     assert.equal(lineOf(out, 3), lineOf(before, 3));
     assert.equal(lineOf(out, 4), lineOf(before, 4));
     assert.ok(!out.includes('JER\t3:3\tfigs-explicit\tthe city'));
+  }, { rules: G_RULES });
+});
+
+test('activeGRuleIds excludes headings marked on hold', async () => {
+  await ws(async ({ mod }) => {
+    assert.deepEqual(mod.activeGRuleIds(G_RULES), new Set(['G4']));
   });
+});
+
+test('unknown and on-hold G-rules cannot support changes or adds', async () => {
+  await ws(async ({ run, read, dir }) => {
+    const before = read();
+    const runner = fakeRunner({
+      overrides: {
+        3: { action: 'drop', rule: 'G5' },
+        4: { action: 'relabel', sref: 'figs-metonymy', rule: 'G99' },
+        6: { action: 'rescope', quote: 'city', rule: 'G5' },
+        7: { action: 'drop', rule: 'G4' },
+      },
+      adds: [
+        { ref: '3:1', sref: 'figs-explicit', quote: 'the people', explanation: 'missed', rule: 'G5' },
+        { ref: '3:1', sref: 'figs-explicit', quote: 'the people', explanation: 'missed', rule: 'G99' },
+      ],
+    });
+    const res = await run({ runClaudeImpl: runner, config: { rulesGate: { mode: 'apply', books: 'all', allowAdd: true } } });
+    assert.equal(res.counts.dropped, 1);
+    assert.equal(res.counts.relabeled, 0);
+    assert.equal(res.counts.rescoped, 0);
+    assert.equal(res.counts.added, 0);
+    assert.equal(lineOf(read(), 3), lineOf(before, 3));
+    assert.equal(lineOf(read(), 4), lineOf(before, 4));
+    assert.equal(lineOf(read(), 6), lineOf(before, 6));
+    const report = fs.readFileSync(path.join(dir, res.reportPath), 'utf8');
+    assert.match(report, /uncited_ignored:3:drop:G5/);
+    assert.match(report, /uncited_ignored:4:relabel:G99/);
+    assert.match(report, /uncited_ignored:6:rescope:G5/);
+    assert.match(report, /uncited_ignored:3:1:add:G5/);
+    assert.match(report, /uncited_ignored:3:1:add:G99/);
+  }, { rules: G_RULES });
 });
 
 test('by default the prompt carries no decision rows and states the G-rule requirement', async () => {
@@ -543,6 +597,7 @@ test('by default the prompt carries no decision rows and states the G-rule requi
     const prompt = runner.calls[0].prompt;
     assert.ok(!prompt.includes('DECISION RULES'));
     assert.ok(prompt.includes('G-rule'));
+    assert.match(prompt, /"rule":"<G-rule id; null for keep>"/);
   });
 });
 

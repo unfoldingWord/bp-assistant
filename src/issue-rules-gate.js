@@ -215,6 +215,15 @@ function loadDecisionRules({ csvText, book }) {
   return out;
 }
 
+function activeGRuleIds(rulesText) {
+  const ids = new Set();
+  for (const line of String(rulesText || '').split(/\r?\n/)) {
+    const heading = line.match(/^\s*-\s+\*\*(G\d+)\b.*\*\*/i);
+    if (heading && !/\(on hold\)/i.test(line)) ids.add(heading[1].toUpperCase());
+  }
+  return ids;
+}
+
 function loadCatalog(csvText) {
   const rows = getParseCsv()(csvText || '');
   const set = new Set();
@@ -357,7 +366,7 @@ function buildPrompt({ book, chapter, rules, verseText, rows, catalog, requireGR
     catalogList ? `Allowed sref slugs: ${catalogList}` : '',
     '',
     'Return JSON only, no prose and no code fence, exactly in this shape. Give exactly one verdict for every row that is not [protected]:',
-    '{"verdicts":[{"row":<number>,"action":"keep|drop|relabel|rescope","sref":"<slug, relabel only>","quote":"<GLQuote, rescope only>","reason":"<short>","rule":"<D-id|type-file|null>"}],"adds":[{"ref":"C:V","sref":"<slug>","quote":"<GLQuote verbatim from ULT>","explanation":"<1-10 words>","reason":"<short>","rule":"<id|null>"}]}',
+    `{"verdicts":[{"row":<number>,"action":"keep|drop|relabel|rescope","sref":"<slug, relabel only>","quote":"<GLQuote, rescope only>","reason":"<short>","rule":"${requireGRule ? '<G-rule id; null for keep>' : '<D-id|type-file|null>'}"}],"adds":[{"ref":"C:V","sref":"<slug>","quote":"<GLQuote verbatim from ULT>","explanation":"<1-10 words>","reason":"<short>","rule":"<id|null>"}]}`,
     '"adds" may be an empty array.',
     allowAdd
       ? 'Additions are enabled: you may list commonly missed issues in adds, each citing a G-rule.'
@@ -584,9 +593,9 @@ function applyVerdicts(rows, verdicts, opts = {}) {
       if (protectedVerses.has(cv.verse)) { notes.push(`add_rejected:protected_verse:${a.ref}`); continue; }
       if (!catalog.has(a.sref)) { notes.push(`add_rejected:sref:${a.sref}`); continue; }
       if (!anchorsOk(a.quote, cv.verse)) { notes.push(`add_rejected:quote:${a.ref}`); continue; }
-      const dupe = working.some((r) => !r.passthrough && r.ref === a.ref
-        && String(r.sref).trim().toLowerCase() === a.sref && tokenOverlap(r.quote, a.quote) >= DUPLICATE_OVERLAP);
-      if (dupe) { notes.push(`add_rejected:duplicate:${a.ref}`); continue; }
+      const dupe = working.some((r) => !r.passthrough && r.chapter === cv.chapter && r.verse === cv.verse
+        && tokenOverlap(r.quote, a.quote) >= DUPLICATE_OVERLAP);
+      if (dupe) { notes.push(`add_rejected:overlap:${a.ref}`); continue; }
       let at = -1;
       working.forEach((r, i) => { if (!r.passthrough && r.chapter === cv.chapter && r.verse === cv.verse) at = i; });
       if (at < 0) { notes.push(`add_rejected:no_neighbor:${a.ref}`); continue; }
@@ -856,10 +865,10 @@ async function runIssueRulesGate({ issuesPath, book, chapter, verseStart, verseE
       allAdds.length = 0;
       notes.push(`${incomplete} chunk(s) incomplete: no changes applied; the next run retries the whole chapter`);
     }
-    // Only curated G-rules may change a row (see DEFAULT_SETTINGS). A change that
-    // cites a D-row, the type file, or nothing is treated as keep.
+    // Only active curated G-rules may change a row (see DEFAULT_SETTINGS).
     if (settings.requireGRule) {
-      const isG = (rule) => /^G\d+$/i.test(String(rule || '').trim());
+      const activeRules = activeGRuleIds(rulesText);
+      const isG = (rule) => activeRules.has(String(rule || '').trim().toUpperCase());
       for (const [k, v] of allVerdicts) {
         if (v.action !== 'keep' && !isG(v.rule)) {
           allVerdicts.set(k, { ...v, action: 'keep' });
@@ -867,7 +876,10 @@ async function runIssueRulesGate({ issuesPath, book, chapter, verseStart, verseE
         }
       }
       for (let i = allAdds.length - 1; i >= 0; i--) {
-        if (!isG(allAdds[i].rule)) { notes.push(`uncited_add_ignored:${allAdds[i].ref}`); allAdds.splice(i, 1); }
+        if (!isG(allAdds[i].rule)) {
+          notes.push(`uncited_ignored:${allAdds[i].ref}:add:${allAdds[i].rule || 'none'}`);
+          allAdds.splice(i, 1);
+        }
       }
     }
     const applied = applyVerdicts(rows, allVerdicts, {
@@ -1018,6 +1030,7 @@ module.exports = {
   parseIssuesTsv,
   serializeIssuesTsv,
   loadDecisionRules,
+  activeGRuleIds,
   buildPrompt,
   parseVerdicts,
   applyVerdicts,
