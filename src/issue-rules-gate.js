@@ -394,8 +394,10 @@ function parseVerdicts(text, rows) {
   const dup = new Set();
   for (const entry of list) {
     if (!entry || typeof entry !== 'object') { errors.push('verdict entry is not an object'); continue; }
-    const idx = entry.row;
-    const row = typeof idx === 'number' ? byIndex.get(idx) : undefined;
+    // Accept a row number sent as a numeric string ("12"); anything else is invalid.
+    const idx = typeof entry.row === 'number' ? entry.row
+      : (/^\s*\d+\s*$/.test(String(entry.row == null ? '' : entry.row)) ? Number(entry.row) : NaN);
+    const row = Number.isInteger(idx) ? byIndex.get(idx) : undefined;
     if (!row) { errors.push(`row ${idx} does not match a row in this chunk`); continue; }
     if (row.protected) continue;
     if (verdicts.has(idx) || dup.has(idx)) {

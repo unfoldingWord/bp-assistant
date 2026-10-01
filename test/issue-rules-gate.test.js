@@ -499,3 +499,12 @@ test('the pre-gate copy is written once and survives a later run under new rules
     assert.equal(fs.readFileSync(preAbs, 'utf8'), original);
   });
 });
+
+test('parseVerdicts accepts a row number sent as a numeric string', async () => {
+  await ws(async ({ mod }) => {
+    const rows = [{ index: 3, protected: false }, { index: 4, protected: false }];
+    const r = mod.parseVerdicts(JSON.stringify({ verdicts: [{ row: '3', action: 'keep' }, { row: 4, action: 'drop', reason: 'x' }] }), rows);
+    assert.equal(r.complete, true);
+    assert.equal(r.verdicts.get(3).action, 'keep');
+  });
+});
