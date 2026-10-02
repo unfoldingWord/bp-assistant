@@ -749,6 +749,16 @@ test('a run resumed at door43-push (no gate result) takes the PR body from the s
   const src = fs.readFileSync(path.resolve(__dirname, '../src/notes-pipeline.js'), 'utf8');
   assert.equal((src.match(/body: gatePrBodyForPush\(\{ gateResult: issueRulesGateResult, issuesPath, book \}\)/g) || []).length, 3);
   assert.ok(!/body: issueRulesGateResult\?\.prBody/.test(src));
+  // Every rules-gate helper the pipeline calls is imported (a stale call would throw at push time).
+  const imported = (src.match(/const \{([^}]*)\} = require\('\.\/issue-rules-gate'\)/) || [])[1] || '';
+  const importedNames = new Set(imported.split(',').map(s => s.trim()).filter(Boolean));
+  const gateSrc = fs.readFileSync(path.resolve(__dirname, '../src/issue-rules-gate.js'), 'utf8');
+  const exported = (gateSrc.match(/module\.exports = \{([^}]*)\}/) || [])[1] || '';
+  const exportNames = exported.split(',').map(s => s.trim()).filter(Boolean);
+  assert.ok(exportNames.includes('readGateSidecar'));
+  for (const name of exportNames) {
+    if (new RegExp(`\\b${name}\\(`).test(src)) assert.ok(importedNames.has(name), `${name} is called but not imported`);
+  }
 });
 
 test('gating twice under different rules keeps total drops within 25% of the first pre-gate list', async () => {
