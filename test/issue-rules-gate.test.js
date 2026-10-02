@@ -721,3 +721,11 @@ test('books accepts a comma string and an array containing all', async () => {
     assert.equal(on(['JER'], 'JER'), true);
   });
 });
+
+test('splitVerses gives every verse of a bridge the bridge text', () => {
+  const { splitVerses } = freshModule(fs.mkdtempSync(path.join(os.tmpdir(), "gate-bridge-")));
+  const map = splitVerses('\\c 3\n\\v 1-2 Both verses here.\n\\v 3 Third.');
+  assert.equal(map.get(1), 'Both verses here.');
+  assert.equal(map.get(2), 'Both verses here.');
+  assert.equal(map.get(3), 'Third.');
+});

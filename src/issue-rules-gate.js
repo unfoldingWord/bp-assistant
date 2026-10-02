@@ -267,17 +267,18 @@ function stripWordMarkup(usfm) {
 function splitVerses(usfm) {
   const text = stripWordMarkup(usfm).replace(/\\f\s[\s\S]*?\\f\*/g, ' ');
   const map = new Map();
-  const re = /\\v\s+(\d+)(?:-\d+)?\s*/g;
+  const re = /\\v\s+(\d+)(?:-(\d+))?\s*/g;
   const marks = [];
   let m;
-  while ((m = re.exec(text)) !== null) marks.push({ n: Number(m[1]), start: m.index, bodyStart: re.lastIndex });
+  while ((m = re.exec(text)) !== null) marks.push({ n: Number(m[1]), last: Number(m[2] || m[1]), start: m.index, bodyStart: re.lastIndex });
   marks.forEach((mk, i) => {
     const end = i + 1 < marks.length ? marks[i + 1].start : text.length;
     const body = text.slice(mk.bodyStart, end)
       .replace(/\\[a-z]+\d*\*?/gi, ' ')
       .replace(/\s+/g, ' ')
       .trim();
-    if (!map.has(mk.n)) map.set(mk.n, body);
+    // A bridge (\v 1-2) gives every verse in it the same text.
+    for (let n = mk.n; n <= Math.max(mk.n, mk.last); n++) if (!map.has(n)) map.set(n, body);
   });
   return map;
 }
