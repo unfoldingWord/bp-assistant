@@ -143,6 +143,7 @@ function copyMeta(from, to) {
 }
 
 const dataRows = (rows) => rows.filter((r) => !r.passthrough);
+const emptyCounts = () => ({ kept: 0, dropped: 0, relabeled: 0, rescoped: 0, added: 0, declined: 0 });
 
 /** Rows outside the chapter (or verse range) become passthrough: never judged, never counted. */
 function markOutOfScope(rows, chapter, range) {
@@ -497,8 +498,12 @@ function defaultAnchors(quote, verseText) {
  * list; the caller writes the file.
  *
  * opts: { catalog:Set, ultVerses:Map, anchors:(quote,text)=>bool, allowAdd,
- *         adds:[{...add, verses:[n]}], protectedVerses:Set, gateableTotal }
+ *         adds:[{...add, verses:[n]}], protectedVerses:Set, gateableTotal,
+ *         priorDrops, dropBaseline }
  * `verdicts` is a Map(row index -> verdict) from chunks that were complete.
+ * A verdict the gate declines to apply (off-catalog or protected relabel,
+ * non-anchoring rescope, a cap, or `declined: true` from the caller) counts as
+ * declined, not kept.
  */
 function applyVerdicts(rows, verdicts, opts = {}) {
   const catalog = opts.catalog || new Set();
@@ -507,7 +512,7 @@ function applyVerdicts(rows, verdicts, opts = {}) {
   const protectedVerses = opts.protectedVerses || new Set();
   const notes = [];
   const changes = [];
-  const counts = { kept: 0, dropped: 0, relabeled: 0, rescoped: 0, added: 0 };
+  const counts = emptyCounts();
 
   const anchorsOk = (quote, verse) => {
     // The normalizer rewrites an ellipsis to " & ", which would change the file after the gate.
@@ -520,10 +525,14 @@ function applyVerdicts(rows, verdicts, opts = {}) {
   // Drop cap: wanted drops are compared with every gateable row of the chapter (or of the
   // verse range, for a range run) across all chunks, not with one chunk's rows, so one
   // wild response cannot thin the list. Rows outside the chapter or range are not counted.
+  // The cap is cumulative across runs: `priorDrops` (rows already gone since the
+  // first pre-gate list) count against it, and `dropBaseline` is that list's size.
   const wantedDrops = [...verdicts.values()].filter((v) => v.action === 'drop').length;
   const gateableTotal = opts.gateableTotal != null ? opts.gateableTotal : dataRows(rows).filter((r) => !r.protected).length;
+  const priorDrops = Math.max(0, Number(opts.priorDrops) || 0);
+  const dropBaseline = Math.max(gateableTotal, Number(opts.dropBaseline) || 0);
   let dropsAllowed = true;
-  if (wantedDrops > 0 && gateableTotal > 0 && wantedDrops / gateableTotal > MAX_DROP_SHARE) {
+  if (wantedDrops > 0 && dropBaseline > 0 && (priorDrops + wantedDrops) / dropBaseline > MAX_DROP_SHARE) {
     dropsAllowed = false;
     notes.push('drop_cap_exceeded');
   }
@@ -541,6 +550,11 @@ function applyVerdicts(rows, verdicts, opts = {}) {
   for (const row of rows) {
     const v = row.passthrough || row.protected ? null : verdicts.get(row.index);
     if (!v) { out.push(row); continue; }
+    if (v.action === 'keep') {
+      if (v.declined) counts.declined++; else counts.kept++;
+      out.push(row);
+      continue;
+    }
     if (v.action === 'drop' && dropsAllowed) {
       counts.dropped++;
       changes.push({ index: row.index, ref: row.ref, action: 'drop', sref: row.sref, before: row.quote, after: '', reason: v.reason, rule: v.rule });
@@ -549,7 +563,7 @@ function applyVerdicts(rows, verdicts, opts = {}) {
     if (v.action === 'relabel') {
       const slug = v.sref;
       if (!editsAllowed) {
-        // cap hit: row is kept
+        notes.push(`relabel_ignored:cap:${row.index}`);
       } else if (protectSrefs.has(slug)) {
         notes.push(`relabel_ignored:protected_target:${row.index}`);
       } else if (SREF_RE.test(slug) && catalog.has(slug) && slug !== String(row.sref).trim().toLowerCase()) {
@@ -564,7 +578,7 @@ function applyVerdicts(rows, verdicts, opts = {}) {
       }
     } else if (v.action === 'rescope') {
       if (!editsAllowed) {
-        // cap hit: row is kept
+        notes.push(`rescope_ignored:cap:${row.index}`);
       } else if (v.quote !== row.quote && anchorsOk(v.quote, row.verse)) {
         const cols = row.cols.slice();
         cols[3] = v.quote;
@@ -576,9 +590,10 @@ function applyVerdicts(rows, verdicts, opts = {}) {
         notes.push(`rescope_ignored:${row.index}`);
       }
     } else if (v.action === 'drop') {
-      // cap hit: row is kept
+      notes.push(`drop_ignored:cap:${row.index}`);
     }
-    counts.kept++;
+    // The gate wanted to change this row but did not: the row stays, counted as declined.
+    counts.declined++;
     out.push(row);
   }
 
@@ -621,15 +636,26 @@ function truncate(text, n) {
   return t.length > n ? `${t.slice(0, n - 1)}…` : t;
 }
 
+// Model text goes into the Door43 PR body: a zero-width space after "@" keeps
+// "@name" from pinging a user.
+function noMentions(text) {
+  return String(text == null ? '' : text).replace(/@/g, '@\u200b');
+}
+
 function changeLine(c) {
   const q = c.action === 'relabel' ? c.quote : (c.action === 'rescope' ? c.after : (c.action === 'add' ? c.after : c.before));
   const sref = c.action === 'relabel' ? `${c.fromSref}→${c.sref}` : c.sref;
   const why = c.rule ? `${c.rule}: ${c.reason || ''}` : (c.reason || '');
-  return `- ${c.ref} ${c.action} ${sref} "${truncate(q, 40)}" (${why.trim()})`;
+  return noMentions(`- ${c.ref} ${c.action} ${sref} "${truncate(q, 40)}" (${why.trim()})`);
+}
+
+function countsLine(counts) {
+  return `kept ${counts.kept}, dropped ${counts.dropped}, relabeled ${counts.relabeled}, rescoped ${counts.rescoped}, added ${counts.added}`
+    + (counts.declined ? `, declined ${counts.declined}` : '');
 }
 
 function buildPrBody({ counts, changes }) {
-  const head = `Issue rules check: kept ${counts.kept}, dropped ${counts.dropped}, relabeled ${counts.relabeled}, rescoped ${counts.rescoped}, added ${counts.added}`;
+  const head = `Issue rules check: ${countsLine(counts)}`;
   const list = (changes || []).slice(0, PR_BODY_MAX_LINES).map(changeLine);
   const extra = (changes || []).length > PR_BODY_MAX_LINES ? [`- … and ${changes.length - PR_BODY_MAX_LINES} more`] : [];
   const body = [head, '', ...list, ...extra].join('\n');
@@ -640,14 +666,21 @@ function escapeMd(text) {
   return String(text == null ? '' : text).replace(/\|/g, '\\|').replace(/\n/g, ' ');
 }
 
-function renderReport({ book, chapter, mode, model, counts, changes, notes, rulesHash }) {
+function renderReport({ book, chapter, mode, model, counts, changes, notes, rulesHash, prePath, priorDrops }) {
   const lines = [];
   lines.push(`# Issue rules gate: ${String(book).toUpperCase()} ${chapter} (${mode})`);
   lines.push('');
-  lines.push(`Kept ${counts.kept}, dropped ${counts.dropped}, relabeled ${counts.relabeled}, rescoped ${counts.rescoped}, added ${counts.added}`);
+  const line = countsLine(counts);
+  lines.push(line.charAt(0).toUpperCase() + line.slice(1));
   lines.push('');
   lines.push(`Model: ${model || '(default)'}`);
   lines.push(`Rules hash: ${rulesHash}`);
+  if (prePath) {
+    // Written once by the first gate run and never replaced, so after a later
+    // producer rerun it is not the list from just before this run.
+    lines.push(`First pre-gate list: ${prePath} (from the first gate run on this file; not replaced by later runs)`);
+  }
+  if (priorDrops) lines.push(`Rows already gone since the first pre-gate list (count against the 25% drop cap): ${priorDrops}`);
   lines.push('');
   lines.push('| Ref | Action | Before | After | Reason | Rule |');
   lines.push('|---|---|---|---|---|---|');
@@ -705,8 +738,6 @@ function accountingHolds(beforeRows, afterRows, counts) {
   return pb.length === pa.length && pb.every((l, i) => l === pa[i]);
 }
 
-const emptyCounts = () => ({ kept: 0, dropped: 0, relabeled: 0, rescoped: 0, added: 0 });
-
 async function runIssueRulesGate({ issuesPath, book, chapter, verseStart, verseEnd, ctx, hints, config, env, dryRun, model, status, runClaudeImpl } = {}) {
   const result = {
     ran: false, reason: null, mode: null, counts: emptyCounts(), changed: false,
@@ -738,10 +769,11 @@ async function runIssueRulesGate({ issuesPath, book, chapter, verseStart, verseE
       }
     }
 
+    const isProtected = (r) => settings.protectSrefs.has(String(r.sref || '').trim().toLowerCase()) || hintedVerses.has(r.verse);
     const rows = markOutOfScope(parseIssuesTsv(originalText), chapter, range);
     for (const r of rows) {
       if (r.passthrough) continue;
-      r.protected = settings.protectSrefs.has(String(r.sref || '').trim().toLowerCase()) || hintedVerses.has(r.verse);
+      r.protected = isProtected(r);
     }
     const gateable = rows.filter((r) => !r.passthrough && !r.protected);
     if (!gateable.length) return skip('no_gateable_rows');
@@ -767,6 +799,7 @@ async function runIssueRulesGate({ issuesPath, book, chapter, verseStart, verseE
     const preRel = path.join(reviewRel, `${base}-pre-rules-gate.tsv`);
     const reportRel = path.join(reviewRel, `${base}-rules-gate.md`);
     const sidecarRel = path.join(reviewRel, `${base}-rules-gate.json`);
+    const preAbs = path.resolve(CSKILLBP_DIR, preRel);
 
     const prior = readIfExists(path.resolve(CSKILLBP_DIR, sidecarRel));
     if (prior) {
@@ -872,7 +905,7 @@ async function runIssueRulesGate({ issuesPath, book, chapter, verseStart, verseE
       const isG = (rule) => activeRules.has(String(rule || '').trim().toUpperCase());
       for (const [k, v] of allVerdicts) {
         if (v.action !== 'keep' && !isG(v.rule)) {
-          allVerdicts.set(k, { ...v, action: 'keep' });
+          allVerdicts.set(k, { ...v, action: 'keep', declined: true });
           notes.push(`uncited_ignored:${k}:${v.action}:${v.rule || 'none'}`);
         }
       }
@@ -883,14 +916,17 @@ async function runIssueRulesGate({ issuesPath, book, chapter, verseStart, verseE
         }
       }
     }
+    // The 25% drop cap is cumulative: measure it against the write-once first
+    // pre-gate list, so a rules edit, another verse range or a crash before the
+    // sidecar seal cannot grant a fresh 25% on an already-thinned list.
+    const { priorDrops, dropBaseline } = priorDropState(readIfExists(preAbs), rows, { chapter, range, isProtected });
     const applied = applyVerdicts(rows, allVerdicts, {
       catalog, ultVerses, allowAdd: settings.allowAdd, adds: allAdds, protectedVerses, gateableTotal: gateable.length,
-      protectSrefs: settings.protectSrefs,
+      protectSrefs: settings.protectSrefs, priorDrops, dropBaseline,
     });
     notes.push(...applied.notes);
-    // Rows that were never reviewed (incomplete chunk) are not "kept".
-    const reviewedKept = applied.counts.kept;
-    const counts = { ...applied.counts, kept: reviewedKept };
+    // Rows that were never reviewed (incomplete chunk) have no verdict and are not "kept".
+    const counts = { ...applied.counts };
     result.counts = counts;
     result.rowsBefore = dataRows(rows).length;
     const changed = applied.changes.length > 0;
@@ -913,7 +949,6 @@ async function runIssueRulesGate({ issuesPath, book, chapter, verseStart, verseE
       }
       fs.mkdirSync(reviewDir, { recursive: true });
       // Write-once: a later run under new rules must not replace the original list.
-      const preAbs = path.resolve(CSKILLBP_DIR, preRel);
       if (!fs.existsSync(preAbs)) fs.writeFileSync(preAbs, originalText);
       writeFileAtomic(absIssues, newText);
       outputRows = reparsed;
@@ -932,6 +967,7 @@ async function runIssueRulesGate({ issuesPath, book, chapter, verseStart, verseE
       fs.mkdirSync(reviewDir, { recursive: true });
       fs.writeFileSync(path.resolve(CSKILLBP_DIR, reportRel), renderReport({
         book: bookUpper, chapter, mode: settings.mode, model: modelName, counts, changes: applied.changes, notes, rulesHash,
+        prePath: fs.existsSync(preAbs) ? preRel : null, priorDrops,
       }));
       result.reportPath = reportRel;
       // Seal the run only when every chunk was answered, so a partly reviewed
@@ -974,6 +1010,21 @@ async function runIssueRulesGate({ issuesPath, book, chapter, verseStart, verseE
   }
 }
 
+/**
+ * Drops already taken since the first pre-gate list, for the cumulative drop cap.
+ * Both lists are scoped to the same chapter (and verse range). The gate never
+ * drops protected rows, so priorDrops is the shrink in in-scope rows, and
+ * dropBaseline is the first list's gateable count. A producer rerun or a
+ * normalizer merge that shrinks the list also counts, which only tightens the cap.
+ */
+function priorDropState(preText, rows, { chapter, range, isProtected }) {
+  if (!preText) return { priorDrops: 0, dropBaseline: 0 };
+  const pre = dataRows(markOutOfScope(parseIssuesTsv(preText), chapter, range));
+  const priorDrops = Math.max(0, pre.length - dataRows(rows).length);
+  const dropBaseline = pre.filter((r) => !isProtected(r)).length;
+  return { priorDrops, dropBaseline };
+}
+
 // A failed call leaves the file untouched. Usage limits and outages pause the
 // chapter so it can resume; anything else is reported as an error.
 function failure(result, err, text) {
@@ -1005,6 +1056,17 @@ function readGateSidecar({ issuesPath, book } = {}) {
 }
 
 /**
+ * PR summary for the Door43 push. A gate result from this run wins, even an
+ * empty one (incomplete run). With no result (the run resumed at door43-push,
+ * so the gate never ran), fall back to the sealed sidecar. Never throws.
+ */
+function gatePrBodyForPush({ gateResult, issuesPath, book } = {}) {
+  if (gateResult) return gateResult.prBody || '';
+  if (!issuesPath) return '';
+  return readGateSidecar({ issuesPath, book })?.prBody || '';
+}
+
+/**
  * Re-seal the sidecar after something else (normalizer pass 2) rewrote the issues
  * file: outputHash becomes the hash of the file's current non-intro rows. No-op
  * when there is no sidecar. Never throws.
@@ -1027,6 +1089,7 @@ function refreshGateSidecarOutputHash({ issuesPath, book } = {}) {
 module.exports = {
   runIssueRulesGate,
   readGateSidecar,
+  gatePrBodyForPush,
   refreshGateSidecarOutputHash,
   parseIssuesTsv,
   serializeIssuesTsv,

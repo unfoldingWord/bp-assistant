@@ -22,7 +22,7 @@ const { fillTsvIds, generateIds, prepareNotes, fillOrigQuotes, resolveGlQuotes, 
 const { checkTnQuality, detectSelfTalk, templateFirstPhrase, resolveTemplateText } = require('./workspace-tools/quality-tools');
 const { buildBookRecurrenceIndex, deriveRecurrenceKeys, buildSeeHowSentence, isSeeHowEligible, isContextDependentSref, dedupeAlsoOccursVerses, assignAlsoOccursVerses, resolveDoor43ReposPath, hebTokens, verseNumber: recurrenceVerseNumber, SEE_HOW_NEVER_FOLD_SREFS, CROSS_BOOK_MAX_BOOKS } = require('./workspace-tools/recurrence-index');
 const { normalizeIssuesFile, buildParallelismIntroHintArgs } = require('./issue-normalizer');
-const { runIssueRulesGate, readGateSidecar, refreshGateSidecarOutputHash } = require('./issue-rules-gate');
+const { runIssueRulesGate, gatePrBodyForPush, refreshGateSidecarOutputHash } = require('./issue-rules-gate');
 const { curlyQuotes } = require('./workspace-tools/usfm-tools');
 const { verifyRepoPush, verifyDcsToken, verifyRemoteContent } = require('./repo-verify');
 const { recordMetrics, getCumulativeTokens, recordRunSummary, getAdaptiveSkillGuardrails } = require('./usage-tracker');
@@ -2987,11 +2987,8 @@ async function notesPipeline(route, message) {
       // this chapter resumes at a downstream skill (the gate already ran, or
       // the chapter was past it).
       const gateSkippedForResume = isResumingThisChapter && downstreamResumeSkills.has(resumeSkill) && !resumeGatePending;
-      if (!issueRulesGateDone && gateSkippedForResume) {
-        // The gate ran in the earlier run; keep its PR summary for the push.
-        const sidecar = readGateSidecar({ issuesPath, book });
-        issueRulesGateResult = { prBody: sidecar?.prBody || '' };
-      }
+      // When the gate is skipped here, issueRulesGateResult stays null and the
+      // push reads the earlier run's PR summary from the sidecar (gatePrBodyForPush).
       if (!issueRulesGateDone && !gateSkippedForResume) {
         issueRulesGateDone = true;
         let gateCtx = null;
@@ -3035,14 +3032,16 @@ async function notesPipeline(route, message) {
           await status(
             `**${ref}**: issue rules check${gate.changed ? '' : ' (no changes)'}: kept ${c.kept}, dropped ${c.dropped}, ` +
             `relabeled ${c.relabeled}, rescoped ${c.rescoped}, added ${c.added}` +
+            `${c.declined ? `, declined ${c.declined}` : ''}` +
             `${gate.reportPath ? ` (${gate.reportPath})` : ''}`
           );
         } else if (gate.reason === 'error') {
           await status(`**${ref}**: issue rules check failed (non-fatal, issues left unchanged): ${gate.error}`);
-        } else if (gate.reason !== 'no_rules_file') {
-          // no_rules_file already posted its own warning from inside the gate
+        } else {
           console.log(`[notes] issue-rules-gate ${ref} skipped: ${gate.reason}`);
-          if (!['mode_off', 'book_not_enabled', 'dry_run'].includes(gate.reason)) {
+          // no_rules_file and no_source_text post their own warning from inside the
+          // gate; already_applied is the normal re-run case and needs no message.
+          if (!['mode_off', 'book_not_enabled', 'dry_run', 'already_applied', 'no_rules_file', 'no_source_text'].includes(gate.reason)) {
             await status(`**${ref}**: issue rules check skipped (${gate.reason}).`);
           }
         }
@@ -3959,15 +3958,12 @@ async function notesPipeline(route, message) {
       continue;
     }
 
-    // A resume at door43-push skips normalization, so the gate summary comes
-    // from the sidecar the earlier run sealed.
-    if (!issueRulesGateResult && issuesPath) {
-      issueRulesGateResult = { prBody: readGateSidecar({ issuesPath, book })?.prBody || '' };
-    }
+    // A resume at door43-push skips normalization; gatePrBodyForPush then reads
+    // the gate summary from the sidecar the earlier run sealed.
 
     // If push is already deferred due to conflicting branches, collect and skip
     if (deferredPush) {
-      deferredChapters.push({ ch, notesSource, body: issueRulesGateResult?.prBody || '' });
+      deferredChapters.push({ ch, notesSource, body: gatePrBodyForPush({ gateResult: issueRulesGateResult, issuesPath, book }) });
       await status(`**door43-push deferred** for ${ref} (waiting for conflicting branches to be merged)`);
       totalSuccess++;
       continue;
@@ -4004,7 +4000,7 @@ async function notesPipeline(route, message) {
       if (conflicts.length > 0) {
         deferredPush = true;
         deferredConflicts = conflicts;
-        deferredChapters.push({ ch, notesSource, body: issueRulesGateResult?.prBody || '' });
+        deferredChapters.push({ ch, notesSource, body: gatePrBodyForPush({ gateResult: issueRulesGateResult, issuesPath, book }) });
         await status(`**door43-push deferred** for ${ref}: conflicting branches found — ${conflicts.map(c => c.branch).join(', ')}`);
         totalSuccess++;
         continue;
@@ -4020,7 +4016,7 @@ async function notesPipeline(route, message) {
         type: 'tn', book, chapter: ch,
         username, branch: buildBranchName(book, ch),
         source: notesSource,
-        body: issueRulesGateResult?.prBody || '',
+        body: gatePrBodyForPush({ gateResult: issueRulesGateResult, issuesPath, book }),
       });
       if (!pushResult.success) {
         console.error(`[notes] door43-push TN failed for ${ref}: ${pushResult.details}`);

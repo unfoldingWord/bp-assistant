@@ -125,7 +125,7 @@ test('apply changes only the targeted columns; untouched rows stay byte-identica
     const res = await run({ runClaudeImpl: runner });
     assert.equal(res.ran, true);
     assert.equal(res.changed, true);
-    assert.deepEqual(res.counts, { kept: 5, dropped: 1, relabeled: 1, rescoped: 0, added: 0 });
+    assert.deepEqual(res.counts, { kept: 5, dropped: 1, relabeled: 1, rescoped: 0, added: 0, declined: 0 });
     assert.equal(res.rowsBefore, 9);
     assert.equal(res.rowsAfter, 8);
 
@@ -728,4 +728,123 @@ test('splitVerses gives every verse of a bridge the bridge text', () => {
   assert.equal(map.get(1), 'Both verses here.');
   assert.equal(map.get(2), 'Both verses here.');
   assert.equal(map.get(3), 'Third.');
+});
+
+// --- #432 follow-ups ---------------------------------------------------------------
+
+test('a run resumed at door43-push (no gate result) takes the PR body from the sidecar', async () => {
+  await ws(async ({ run, mod }) => {
+    const first = await run({ runClaudeImpl: fakeRunner({ overrides: { 3: { action: 'relabel', sref: 'figs-metonymy' } } }) });
+    assert.match(first.prBody, /^Issue rules check/);
+    const issuesPath = 'output/issues/JER-03.tsv';
+    // Resume at door43-push: the normalization stage never runs, so there is no gate result.
+    const body = mod.gatePrBodyForPush({ gateResult: null, issuesPath, book: 'JER' });
+    assert.match(body, /Issue rules check/);
+    assert.equal(body, first.prBody);
+    // A result from this run wins, even an empty one (an incomplete gate run).
+    assert.equal(mod.gatePrBodyForPush({ gateResult: { prBody: '' }, issuesPath, book: 'JER' }), '');
+    assert.equal(mod.gatePrBodyForPush({ gateResult: null, issuesPath: null, book: 'JER' }), '');
+  });
+  // Every Door43 push site in the pipeline goes through the fallback.
+  const src = fs.readFileSync(path.resolve(__dirname, '../src/notes-pipeline.js'), 'utf8');
+  assert.equal((src.match(/body: gatePrBodyForPush\(\{ gateResult: issueRulesGateResult, issuesPath, book \}\)/g) || []).length, 3);
+  assert.ok(!/body: issueRulesGateResult\?\.prBody/.test(src));
+  // Every rules-gate helper the pipeline calls is imported (a stale call would throw at push time).
+  const imported = (src.match(/const \{([^}]*)\} = require\('\.\/issue-rules-gate'\)/) || [])[1] || '';
+  const importedNames = new Set(imported.split(',').map(s => s.trim()).filter(Boolean));
+  const gateSrc = fs.readFileSync(path.resolve(__dirname, '../src/issue-rules-gate.js'), 'utf8');
+  const exported = (gateSrc.match(/module\.exports = \{([^}]*)\}/) || [])[1] || '';
+  const exportNames = exported.split(',').map(s => s.trim()).filter(Boolean);
+  assert.ok(exportNames.includes('readGateSidecar'));
+  for (const name of exportNames) {
+    if (new RegExp(`\\b${name}\\(`).test(src)) assert.ok(importedNames.has(name), `${name} is called but not imported`);
+  }
+});
+
+test('gating twice under different rules keeps total drops within 25% of the first pre-gate list', async () => {
+  await ws(async ({ dir, run, read }) => {
+    const rulesPath = path.join(dir, '.claude/skills/issue-identification/rules-gate.md');
+    // 7 gateable rows: one drop (14%) fits under the cap.
+    const r1 = await run({ runClaudeImpl: fakeRunner({ overrides: { 7: { action: 'drop', reason: 'x' } } }) });
+    assert.equal(r1.counts.dropped, 1);
+    const afterFirst = read();
+    // A wording edit changes rulesHash; a second drop would make 2/7 (29%) of the first list.
+    fs.writeFileSync(rulesPath, '# Gate rules v2\nReview each row again.\n');
+    const r2 = await run({ runClaudeImpl: fakeRunner({ overrides: { 6: { action: 'drop', reason: 'y' } } }) });
+    assert.equal(r2.counts.dropped, 0);
+    assert.equal(r2.counts.declined, 1);
+    assert.equal(read(), afterFirst);
+    const report = fs.readFileSync(path.join(dir, r2.reportPath), 'utf8');
+    assert.match(report, /drop_cap_exceeded/);
+    assert.match(report, /already gone since the first pre-gate list .*: 1/);
+    // A crash between the issues write and the sidecar seal: no sidecar, same cap.
+    fs.rmSync(path.join(dir, 'output/review/JER/JER-03-rules-gate.json'));
+    fs.writeFileSync(rulesPath, '# Gate rules v3\n');
+    const r3 = await run({ runClaudeImpl: fakeRunner({ overrides: { 4: { action: 'drop', reason: 'z' } } }) });
+    assert.equal(r3.counts.dropped, 0);
+    const pre = fs.readFileSync(path.join(dir, 'output/review/JER/JER-03-pre-rules-gate.tsv'), 'utf8');
+    const total = pre.split('\n').length - read().split('\n').length;
+    assert.ok(total <= Math.floor(GATEABLE.length * 0.25), `total drops ${total}`);
+  });
+});
+
+test('the report labels the pre-gate copy as the first pre-gate list', async () => {
+  await ws(async ({ dir, run }) => {
+    const res = await run({ runClaudeImpl: fakeRunner({ overrides: { 7: { action: 'drop', reason: 'x' } } }) });
+    const report = fs.readFileSync(path.join(dir, res.reportPath), 'utf8');
+    assert.match(report, /^First pre-gate list: output\/review\/JER\/JER-03-pre-rules-gate\.tsv \(from the first gate run/m);
+  });
+});
+
+test('already_applied, no_source_text and no_rules_file add no pipeline status of their own', async () => {
+  await ws(async ({ run }) => {
+    await run({ runClaudeImpl: fakeRunner() });
+    const statuses = [];
+    const again = await run({ runClaudeImpl: fakeRunner(), status: async (t) => { statuses.push(t); } });
+    assert.equal(again.reason, 'already_applied');
+    assert.equal(statuses.length, 0);
+  });
+  const src = fs.readFileSync(path.resolve(__dirname, '../src/notes-pipeline.js'), 'utf8');
+  const m = src.match(/if \(!\[([^\]]*)\]\.includes\(gate\.reason\)\)/);
+  assert.ok(m, 'skip-reason exclusion list not found');
+  for (const reason of ['already_applied', 'no_source_text', 'no_rules_file']) assert.ok(m[1].includes(`'${reason}'`), reason);
+});
+
+test('model text in the PR body cannot @-mention a user', async () => {
+  await ws(async ({ mod }) => {
+    const body = mod.buildPrBody({
+      counts: { kept: 1, dropped: 1, relabeled: 0, rescoped: 0, added: 0 },
+      changes: [{ ref: '3:1', action: 'drop', sref: 'figs-idiom', before: 'the king', reason: 'ask @someone', rule: 'G4' }],
+    });
+    assert.ok(!/@someone/.test(body));
+    assert.ok(body.includes('@​someone'));
+  });
+});
+
+test('relabels, rescopes and drops the gate declines are counted as declined, not kept', async () => {
+  await ws(async ({ run, read }) => {
+    // off-catalog relabel, non-anchoring rescope: 2 declined, 5 kept.
+    const res = await run({ runClaudeImpl: fakeRunner({ overrides: {
+      3: { action: 'relabel', sref: 'figs-madeup' },
+      4: { action: 'rescope', quote: 'the queen of the LORD' },
+    } }) });
+    assert.deepEqual(res.counts, { kept: 5, dropped: 0, relabeled: 0, rescoped: 0, added: 0, declined: 2 });
+    assert.equal(read(), FILE_TEXT);
+  });
+  await ws(async ({ run }) => {
+    // Cap: 3 of 7 drops is over 25%, so all 3 are declined.
+    const res = await run({ runClaudeImpl: fakeRunner({ overrides: { 4: { action: 'drop' }, 6: { action: 'drop' }, 7: { action: 'drop' } } }) });
+    assert.equal(res.counts.kept, 4);
+    assert.equal(res.counts.declined, 3);
+    assert.match(res.prBody, /, declined 3$/m);
+  });
+  await ws(async ({ run }) => {
+    // An uncited change under the default G-rule requirement is declined too.
+    const res = await run({
+      runClaudeImpl: fakeRunner({ overrides: { 3: { action: 'drop', reason: 'no rule', rule: null } } }),
+      config: { rulesGate: { mode: 'apply', books: 'all' } },
+    });
+    assert.equal(res.counts.declined, 1);
+    assert.equal(res.counts.kept, GATEABLE.length - 1);
+  }, { rules: G_RULES });
 });
