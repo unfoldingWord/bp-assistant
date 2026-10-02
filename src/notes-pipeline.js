@@ -3959,6 +3959,12 @@ async function notesPipeline(route, message) {
       continue;
     }
 
+    // A resume at door43-push skips normalization, so the gate summary comes
+    // from the sidecar the earlier run sealed.
+    if (!issueRulesGateResult && issuesPath) {
+      issueRulesGateResult = { prBody: readGateSidecar({ issuesPath, book })?.prBody || '' };
+    }
+
     // If push is already deferred due to conflicting branches, collect and skip
     if (deferredPush) {
       deferredChapters.push({ ch, notesSource, body: issueRulesGateResult?.prBody || '' });
