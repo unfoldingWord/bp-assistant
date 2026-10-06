@@ -503,3 +503,21 @@ test('keptIds: a cross-chapter kept row blocks a duplicate in its second chapter
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test('keptIds: support references compare without the rc:// prefix', () => {
+  const dir = makeTempDir();
+  try {
+    const bookFile = writeTsv(dir, 'en_tn_EZK.tsv', TN_HEADER, [
+      '40:5\tkp05\t\trc://en/ta/man/translate/figs-metaphor\tחוֹמָה\t1\tKept',
+    ]);
+    const sourceFile = writeTsv(dir, 'EZK-40-src.tsv', TN_HEADER, [
+      '40:5\tdu05\t\trc://*/ta/man/translate/figs-metaphor\tחוֹמָה\t1\tDuplicate',
+    ]);
+    insertTnRows({ bookFile, sourceFile, chapter: 40, keptIds: ['kp05'] });
+    const ids = readRows(bookFile).map((r) => r.split('\t')[1]);
+    assert.ok(ids.includes('kp05'));
+    assert.ok(!ids.includes('du05'));
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});

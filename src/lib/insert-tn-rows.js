@@ -144,6 +144,14 @@ function keptDedupKey(row) {
   return `${getReference(row)}\t${getSupportReference(row)}`;
 }
 
+// Editor-kept key tail: support reference without its rc:// prefix (as the
+// prepared-notes pass compares it) plus the normalized quote. A leading "K"
+// keeps these keys apart from the KEEP-tag (ref, sref) keys.
+function keptTail(row) {
+  const sref = getSupportReference(row).trim().replace(/^rc:\/\/[^/]+\/ta\/man\/translate\//, '');
+  return `\tK\t${sref}\t${getQuote(row)}`;
+}
+
 function buildKeepKeys(keepRows) {
   const keys = new Set();
   for (const row of keepRows) {
@@ -153,12 +161,12 @@ function buildKeepKeys(keepRows) {
       // Claim every verse the kept row covers, so a single-verse AI row inside
       // a kept 40:12-14 range is still caught.
       const ref = getReference(row);
-      const tail = `\t${getSupportReference(row)}\t${getQuote(row)}`;
+      const tail = keptTail(row);
       keys.add(`${ref}${tail}`);
       // A cross-chapter "40:48-42:2" covers verses in every chapter it spans.
       const m = ref.match(/^(\d+):\d+-(\d+):\d+$/);
       const first = m ? Number(m[1]) : getChapter(ref);
-      const last = m ? Math.min(Number(m[2]), first + 20) : first;
+      const last = m ? Math.min(Number(m[2]), 200) : first;
       for (let ch = first; ch <= last; ch++) {
         const span = keptRefVerseSpan(ref, ch);
         if (span) for (let v = span.lo; v <= span.hi && v - span.lo < 200; v++) keys.add(`${ch}:${v}${tail}`);
@@ -169,7 +177,7 @@ function buildKeepKeys(keepRows) {
 }
 
 function isClaimedByKeep(row, keepKeys) {
-  return keepKeys.has(keptDedupKey(row)) || keepKeys.has(`${keptDedupKey(row)}\t${getQuote(row)}`);
+  return keepKeys.has(keptDedupKey(row)) || keepKeys.has(`${getReference(row)}${keptTail(row)}`);
 }
 
 // --- Reference sorting ---
