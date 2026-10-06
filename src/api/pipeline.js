@@ -29,9 +29,11 @@ const {
   detectLandedOutputs,
 } = require('./pipeline-output');
 
-// Bumped from 4KB to fit up to 50 hints with full prose seeds. The
-// per-field caps on HintSchema below bound the worst case well under this.
-const MAX_BODY_BYTES = 32 * 1024;
+// Bumped from 4KB to fit up to 50 hints with full prose seeds, then to 1MB so
+// 300 `kept` entries fit even at every field's cap (~1.7KB each in ASCII, more
+// for multi-byte Hebrew quotes). The per-field caps on HintSchema and
+// KeptSchema below bound the worst case under this.
+const MAX_BODY_BYTES = 1024 * 1024;
 const RATE_LIMIT_RPM = 60;
 const RATE_LIMIT_WINDOW_MS = 60_000;
 
@@ -96,6 +98,19 @@ const HintSchema = z.object({
   },
 );
 
+// Editor-kept notes: rows the AI run must leave in place and not duplicate.
+// ref is "ch:verse", "ch:v1-v2" or "ch:intro"/"ch:front"; carried as strings
+// the editor already holds, so empty supportReference/quote/note are allowed.
+const KEPT_REF_RE = /^\d+:(\d+(-\d+)?|intro|front)$/;
+
+const KeptSchema = z.object({
+  rowId: z.string().regex(HINT_ROW_ID_RE),
+  ref: z.string().min(1).max(20).regex(KEPT_REF_RE, 'ref must look like 40:12, 40:12-14 or 40:intro'),
+  supportReference: z.string().max(200),
+  quote: z.string().max(1000),
+  note: z.string().max(400).optional(),
+}).strict();
+
 const OptionsSchema = z.object({
   // Common — currently a no-op on the wire (model is fixed per pipeline today),
   // but accepted for forward compatibility with the contract doc.
@@ -154,6 +169,9 @@ const OptionsSchema = z.object({
   // existing stub row in place by ID. Each hint must carry a non-empty quote
   // or seed (see HintSchema.refine).
   hints: z.array(HintSchema).max(50).optional(),
+  // Editor-kept notes (notes only). Unlike hints, multi-chapter scopes are fine
+  // because each entry carries its own chapter in ref.
+  kept: z.array(KeptSchema).max(300).optional(),
 }).strict();
 
 // Providers a translate run may be pointed at with a caller-supplied key. Kept
@@ -327,7 +345,7 @@ const StartBodySchema = z.object({
   }
   // notes-only flags must not appear on generate/tqs.
   if (body.pipelineType !== 'notes') {
-    for (const k of ['noIntro', 'pauseBeforeATs', 'hints']) {
+    for (const k of ['noIntro', 'pauseBeforeATs', 'hints', 'kept']) {
       if (o[k] !== undefined) {
         ctx.addIssue({
           code: z.ZodIssueCode.custom,

@@ -1511,6 +1511,11 @@ function buildApiSyntheticRoute(pipelineType, scope, options, ai) {
     ? options.hints
     : null;
 
+  // Editor-kept notes ride the same way (notes only; schema rejects others).
+  const kept = options && Array.isArray(options.kept) && options.kept.length > 0
+    ? options.kept
+    : null;
+
   // translate carries its per-run parameters structurally, like hints do —
   // they can't ride the stringly-typed message flags. translate-pipeline.js
   // reads route._translate; Zulip-origin runs parse the message instead.
@@ -1549,6 +1554,7 @@ function buildApiSyntheticRoute(pipelineType, scope, options, ai) {
     _verseStart: verseStart ?? null,
     _verseEnd: verseEnd ?? null,
     _hints: hints,
+    _kept: kept,
     _translate: translateOpts,
     _scopeText: rangeLabel.replace(/^\S+\s+/, ''),
     _apiOrigin: true,

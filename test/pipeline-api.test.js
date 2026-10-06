@@ -448,3 +448,80 @@ test('StartBodySchema — rejects unknown keys on hint object (strict)', () => {
   });
   assert.equal(r.success, false);
 });
+
+// ---------------------------------------------------------------------------
+// StartBodySchema — kept
+// ---------------------------------------------------------------------------
+
+const VALID_KEPT = {
+  rowId: 'kp01',
+  ref: '40:12',
+  supportReference: 'figs-metaphor',
+  quote: 'מֵרֵעֵהוּ',
+  note: 'A kept note.',
+};
+const keptBody = (kept, extra = {}) => ({
+  pipelineType: 'notes', book: 'EZK', startChapter: 40,
+  username: 'u', sessionKey: 'k',
+  options: { kept },
+  ...extra,
+});
+
+test('StartBodySchema — accepts options.kept (ranges, intro, empty strings, no note)', () => {
+  const r = StartBodySchema.safeParse(keptBody([
+    VALID_KEPT,
+    { rowId: 'kp02', ref: '40:12-14', supportReference: '', quote: '' },
+    { rowId: 'kp03', ref: '40:intro', supportReference: '', quote: '' },
+  ]));
+  assert.equal(r.success, true, JSON.stringify(r.error && r.error.issues));
+});
+
+test('StartBodySchema — accepts kept on a multi-chapter scope', () => {
+  const r = StartBodySchema.safeParse(keptBody([VALID_KEPT], { endChapter: 42 }));
+  assert.equal(r.success, true);
+});
+
+test('StartBodySchema — accepts 300 full-size kept entries, rejects 301', () => {
+  const mk = (n) => Array.from({ length: n }, (_, i) => ({
+    rowId: 'a' + String(i).padStart(3, '0'),
+    ref: '40:12-14',
+    supportReference: 's'.repeat(200),
+    quote: 'q'.repeat(1000),
+    note: 'n'.repeat(400),
+  }));
+  assert.equal(StartBodySchema.safeParse(keptBody(mk(300))).success, true);
+  assert.equal(StartBodySchema.safeParse(keptBody(mk(301))).success, false);
+});
+
+test('StartBodySchema — rejects malformed kept entries with a clear message', () => {
+  const bad = [
+    { ...VALID_KEPT, rowId: 'BAD!' },
+    { ...VALID_KEPT, rowId: '' },
+    { ...VALID_KEPT, ref: '' },
+    { ...VALID_KEPT, ref: 'abc' },
+    { ...VALID_KEPT, ref: '40:12-14-16' },
+    { ...VALID_KEPT, ref: '4'.repeat(21) },
+    { ...VALID_KEPT, supportReference: 's'.repeat(201) },
+    { ...VALID_KEPT, quote: 'q'.repeat(1001) },
+    { ...VALID_KEPT, note: 'n'.repeat(401) },
+    { ...VALID_KEPT, extra: 1 },
+  ];
+  for (const entry of bad) {
+    const r = StartBodySchema.safeParse(keptBody([entry]));
+    assert.equal(r.success, false, JSON.stringify(entry).slice(0, 80));
+    assert.ok(r.error.issues.some((i) => i.path[0] === 'options' && i.path[1] === 'kept'));
+  }
+  const r = StartBodySchema.safeParse(keptBody([{ ...VALID_KEPT, ref: 'abc' }]));
+  assert.match(r.error.issues[0].message, /ref must look like/);
+});
+
+test('StartBodySchema — rejects kept on generate and tqs pipelines', () => {
+  for (const pt of ['generate', 'tqs']) {
+    const r = StartBodySchema.safeParse({
+      pipelineType: pt, book: 'EZK', startChapter: 40,
+      username: 'u', sessionKey: 'k',
+      options: { kept: [VALID_KEPT] },
+    });
+    assert.equal(r.success, false, `${pt} should reject kept`);
+  }
+});

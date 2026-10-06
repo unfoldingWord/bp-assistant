@@ -18,7 +18,7 @@ const { createGuardHooks } = require('./guard-hooks');
 const { resolveAutoModel } = require('./api-runner/provider-config');
 const { getDoor43Username, emailToFallbackUsername, buildBranchName, resolveOutputFile, discoverFreshOutput, checkPrerequisites, calcSkillTimeout, calcVerseSpanTimeout, normalizeBookName, resolveConflictMention, parsePartialTsv, truncatePartialTsv, parseChunkRange, isUsageLimitError, CSKILLBP_DIR } = require('./pipeline-utils');
 const { splitTsv, fixTrailingNewlines } = require('./workspace-tools/tsv-tools');
-const { fillTsvIds, generateIds, prepareNotes, fillOrigQuotes, resolveGlQuotes, flagNarrowQuotes, extractAlignmentData, prepareATContext, substituteAT, fixUnicodeQuotes, verifyBoldMatches, syncCanonicalHebrewQuotes, applyHintsToPreparedNotes, parsePlainUsfmVersesFromText, detectIssuesTsvLayout, extractIssuesTsvRow, _stripAlternateTranslation: stripAlternateTranslation } = require('./workspace-tools/tn-tools');
+const { fillTsvIds, generateIds, prepareNotes, fillOrigQuotes, resolveGlQuotes, flagNarrowQuotes, extractAlignmentData, prepareATContext, substituteAT, fixUnicodeQuotes, verifyBoldMatches, syncCanonicalHebrewQuotes, applyHintsToPreparedNotes, applyKeptToPreparedNotes, parsePlainUsfmVersesFromText, detectIssuesTsvLayout, extractIssuesTsvRow, _stripAlternateTranslation: stripAlternateTranslation } = require('./workspace-tools/tn-tools');
 const { checkTnQuality, detectSelfTalk, templateFirstPhrase, resolveTemplateText } = require('./workspace-tools/quality-tools');
 const { buildBookRecurrenceIndex, deriveRecurrenceKeys, buildSeeHowSentence, isSeeHowEligible, isContextDependentSref, dedupeAlsoOccursVerses, assignAlsoOccursVerses, resolveDoor43ReposPath, hebTokens, verseNumber: recurrenceVerseNumber, SEE_HOW_NEVER_FOLD_SREFS, CROSS_BOOK_MAX_BOOKS } = require('./workspace-tools/recurrence-index');
 const { normalizeIssuesFile, buildParallelismIntroHintArgs } = require('./issue-normalizer');
@@ -1872,7 +1872,9 @@ function ultVerseNumbers(ultPlainText, chapter) {
   return nums;
 }
 
-function findEmptyVerses({ issuesText, ultPlainText, chapter, book = '' }) {
+// keptRefs: ref strings ("40:12", "40:12-14") of editor-kept notes. A verse they
+// cover already has a note in en_tn, so it is not empty for gap-fill.
+function findEmptyVerses({ issuesText, ultPlainText, chapter, book = '', keptRefs = [] }) {
   const wanted = ultVerseNumbers(ultPlainText, chapter);
   if (wanted.size === 0) return [];
   const { lines } = splitIssueRows(issuesText);
@@ -1880,6 +1882,13 @@ function findEmptyVerses({ issuesText, ultPlainText, chapter, book = '' }) {
   for (const r of issueRowRefs(lines, book, chapter)) {
     if (!r) continue;
     for (let v = r.start; v <= r.end && v - r.start < 200; v++) covered.add(v);
+  }
+  for (const kr of keptRefs || []) {
+    const m = String(kr || '').match(/^(\d+):(\d+)(?:-(\d+))?$/);
+    if (!m || Number(m[1]) !== Number(chapter)) continue;
+    const lo = Number(m[2]);
+    const hi = m[3] ? Number(m[3]) : lo;
+    for (let v = lo; v <= hi && v - lo < 200; v++) covered.add(v);
   }
   return [...wanted].filter((v) => !covered.has(v)).sort((a, b) => a - b);
 }
@@ -1928,7 +1937,7 @@ function mergeGapIssues({ chapterText, shardText, verses, chapter, book = '', kn
 
 async function fillIssueGaps({
   book, ch, issuesPath, contextPath, ctxFlag = '', ultPlainPath, pipeDir, model, status = async () => {},
-  userId, runClaudeImpl = runClaude, recordMetricsImpl = recordMetrics,
+  userId, runClaudeImpl = runClaude, recordMetricsImpl = recordMetrics, keptRefs = [],
 }) {
   const out = { empty: [], added: 0, remaining: [], pause: null, error: null };
   const ref = `${book} ${ch}`;
@@ -1962,7 +1971,7 @@ async function fillIssueGaps({
     }
     if (!fs.existsSync(issuesAbs)) { writeMarker(); return out; }
     const empty = findEmptyVerses({
-      issuesText: fs.readFileSync(issuesAbs, 'utf8'), ultPlainText: ultText, chapter: ch, book,
+      issuesText: fs.readFileSync(issuesAbs, 'utf8'), ultPlainText: ultText, chapter: ch, book, keptRefs,
     });
     out.empty = empty;
     out.remaining = empty;
@@ -2057,7 +2066,7 @@ async function fillIssueGaps({
     fs.writeFileSync(issuesAbs, merged.text);
     mergeWritten = true;
     out.added = merged.added;
-    const nowEmpty = findEmptyVerses({ issuesText: merged.text, ultPlainText: ultText, chapter: ch, book });
+    const nowEmpty = findEmptyVerses({ issuesText: merged.text, ultPlainText: ultText, chapter: ch, book, keptRefs });
     out.remaining = nowEmpty;
 
     if (merged.added === 0) {
@@ -2417,6 +2426,8 @@ function buildParsedNotesRequest(route, content) {
       // Zulip-triggered runs fall through to parseWriteNotesCommand and
       // never carry hints.
       hints: Array.isArray(route._hints) && route._hints.length > 0 ? route._hints : null,
+      // Editor-kept notes (API-origin only), same reasoning as hints.
+      kept: Array.isArray(route._kept) && route._kept.length > 0 ? route._kept : null,
     };
   }
   return parseWriteNotesCommand(content);
@@ -2924,6 +2935,9 @@ async function notesPipeline(route, message) {
   const { book, startChapter, endChapter, verseStart, verseEnd, withIntro, fresh, pauseBeforeATs } = parsed;
   // Editor-marked TN hints (API-origin only; null on Zulip path).
   const hints = parsed.hints || null;
+  const kept = parsed.kept || null;
+  // Plain array so it serializes into deferredChapters (insertion-resume).
+  const keptIds = kept ? kept.map((k) => k.rowId) : [];
   const sessionKey = stream ? `stream-${stream}-${topic}` : `dm-${message.sender_id}`;
   const checkpointRef = {
     sessionKey,
@@ -3300,6 +3314,7 @@ async function notesPipeline(route, message) {
         const gap = await fillIssueGaps({
           book, ch, issuesPath, contextPath, ctxFlag, ultPlainPath, pipeDir, model, status,
           userId: message.sender_id,
+          keptRefs: kept ? kept.map((k) => k.ref) : [],
         });
         if (gap.pause) {
           // Same abort handling as a usage-limit / outage in the skills loop: stop
@@ -3526,6 +3541,25 @@ async function notesPipeline(route, message) {
               console.error(`[notes] applyHintsToPreparedNotes failed (non-fatal): ${hintErr.message}`);
               await status(`**${ref}**: hint application failed — ${hintErr.message}. Continuing without hints.`);
             }
+          }
+
+          // Editor-kept notes stay in en_tn untouched, so drop prepared items
+          // that would duplicate one (nothing is injected for them).
+          if (Array.isArray(kept) && kept.length > 0) {
+            let dropped = 0;
+            try {
+              dropped = applyKeptToPreparedNotes({
+                preparedJson: readContext(pipeDir).runtime.preparedNotes,
+                kept,
+                chapter: ch,
+              }).itemsRemoved;
+            } catch (keptErr) {
+              console.error(`[notes] applyKeptToPreparedNotes failed (non-fatal): ${keptErr.message}`);
+            }
+            await status(
+              `**${ref}**: ${kept.length} kept notes from the editor will stay in place; ` +
+              `${dropped} AI notes dropped as duplicates of them`,
+            );
           }
 
           // Build the book-scoped recurrence index. Non-fatal: without it the
@@ -4342,7 +4376,7 @@ async function notesPipeline(route, message) {
 
     // If push is already deferred due to conflicting branches, collect and skip
     if (deferredPush) {
-      deferredChapters.push({ ch, notesSource, replaceChapter: !hasVerseRange, body: gatePrBodyForPush({ gateResult: issueRulesGateResult, issuesPath, book }) });
+      deferredChapters.push({ ch, notesSource, replaceChapter: !hasVerseRange, keptIds, body: gatePrBodyForPush({ gateResult: issueRulesGateResult, issuesPath, book }) });
       await status(`**door43-push deferred** for ${ref} (waiting for conflicting branches to be merged)`);
       totalSuccess++;
       continue;
@@ -4379,7 +4413,7 @@ async function notesPipeline(route, message) {
       if (conflicts.length > 0) {
         deferredPush = true;
         deferredConflicts = conflicts;
-        deferredChapters.push({ ch, notesSource, replaceChapter: !hasVerseRange, body: gatePrBodyForPush({ gateResult: issueRulesGateResult, issuesPath, book }) });
+        deferredChapters.push({ ch, notesSource, replaceChapter: !hasVerseRange, keptIds, body: gatePrBodyForPush({ gateResult: issueRulesGateResult, issuesPath, book }) });
         await status(`**door43-push deferred** for ${ref}: conflicting branches found — ${conflicts.map(c => c.branch).join(', ')}`);
         totalSuccess++;
         continue;
@@ -4397,6 +4431,7 @@ async function notesPipeline(route, message) {
         source: notesSource,
         // Whole-chapter run (no verse range): replace the whole chapter in en_tn.
         replaceChapter: !hasVerseRange,
+        keptIds,
         body: gatePrBodyForPush({ gateResult: issueRulesGateResult, issuesPath, book }),
       });
       if (!pushResult.success) {

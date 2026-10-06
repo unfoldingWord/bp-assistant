@@ -23,6 +23,7 @@ const {
   _buildSeeHowReference,
   substituteAT,
   applyHintsToPreparedNotes,
+  removePreparedItemsCoveredByKept,
   normalizeQuote,
   normalizeSupportReference,
   quoteFuzzyMatch,
@@ -2030,4 +2031,35 @@ test('parsePlainUsfmVersesFromText regression: plain \\v and \\c lines still beh
   assert.equal(verses['1:1'], 'In the beginning God created the heavens and the earth.');
   assert.equal(verses['1:2'], 'Now the earth was formless and empty.');
   assert.equal(verses['2:1'], 'Thus the heavens and the earth were finished.');
+});
+
+// ---------------------------------------------------------------------------
+// removePreparedItemsCoveredByKept
+// ---------------------------------------------------------------------------
+
+test('removePreparedItemsCoveredByKept — drops matching item, keeps non-matching and other-verse items', () => {
+  const prepared = {
+    book: 'EZK',
+    items: [
+      { id: 'a001', reference: '40:12', sref: 'rc://*/ta/man/translate/figs-metaphor', orig_quote: 'the gate of the east' },
+      { id: 'a002', reference: '40:12', sref: 'figs-simile', orig_quote: 'the gate of the east' },
+      { id: 'a003', reference: '40:13', sref: 'figs-metaphor', orig_quote: 'the gate of the east' },
+      { id: 'a004', reference: '40:12', sref: 'figs-metaphor', orig_quote: 'a totally different phrase here' },
+    ],
+  };
+  const kept = [{ rowId: 'kp01', ref: '40:12', supportReference: 'figs-metaphor', quote: 'the gate of the east' }];
+  const { prepared: out, removed } = removePreparedItemsCoveredByKept(prepared, kept, 40);
+  assert.equal(removed, 1);
+  assert.deepEqual(out.items.map((i) => i.id), ['a002', 'a003', 'a004']);
+});
+
+test('removePreparedItemsCoveredByKept — range ref covers each verse; other chapter and empty kept are no-ops', () => {
+  const prepared = { items: [
+    { id: 'a001', reference: '40:13', sref: 'figs-metaphor', orig_quote: 'x' },
+    { id: 'a002', reference: '41:13', sref: 'figs-metaphor', orig_quote: 'x' },
+  ] };
+  const kept = [{ rowId: 'kp01', ref: '40:12-14', supportReference: 'figs-metaphor', quote: 'x' }];
+  assert.deepEqual(removePreparedItemsCoveredByKept(prepared, kept, 40).prepared.items.map((i) => i.id), ['a002']);
+  assert.equal(removePreparedItemsCoveredByKept(prepared, kept, 41).removed, 0);
+  assert.equal(removePreparedItemsCoveredByKept(prepared, [], 40).removed, 0);
 });

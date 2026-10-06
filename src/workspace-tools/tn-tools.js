@@ -1792,6 +1792,55 @@ function applyHintsToPreparedNotes({ preparedJson, hints, chapter }) {
   return { hintsApplied: applied, itemsSuppressed: suppressed, hintsDropped: dropped, droppedReasons };
 }
 
+/**
+ * Drop prepared items already covered by an editor-kept note. Same match as the
+ * hint suppression pass (verse, normalized support reference, fuzzy quote), but
+ * nothing is injected: the kept note already exists in en_tn.
+ *
+ * A kept `ref` is "ch:v", "ch:v1-v2" (covers every verse in the range) or an
+ * intro ref (never matches a verse item). Entries for other chapters are
+ * ignored. An empty kept quote matches on (verse, support reference) only.
+ *
+ * @param {object} prepared - parsed prepared_notes.json ({ items: [...] })
+ * @param {Array}  kept     - options.kept entries
+ * @param {number} [chapter] - when given, only kept entries for this chapter apply
+ * @returns {{ prepared: object, removed: number }}
+ */
+function removePreparedItemsCoveredByKept(prepared, kept, chapter) {
+  const items = Array.isArray(prepared && prepared.items) ? prepared.items : [];
+  if (!Array.isArray(kept) || kept.length === 0) return { prepared, removed: 0 };
+  const entries = [];
+  for (const k of kept) {
+    const m = String(k.ref || '').match(/^(\d+):(\d+)(?:-(\d+))?$/);
+    if (!m) continue;
+    if (chapter != null && Number(m[1]) !== Number(chapter)) continue;
+    const lo = Number(m[2]);
+    const hi = m[3] ? Number(m[3]) : lo;
+    entries.push({ ch: Number(m[1]), lo, hi, sref: normalizeSupportReference(k.supportReference), quote: String(k.quote || '') });
+  }
+  const out = items.filter((item) => {
+    if (!item || item.fromHint) return true;
+    const v = verseFromReference(item.reference);
+    if (v == null) return true;
+    const itemCh = Number(String(item.reference).split(':')[0]);
+    const sref = normalizeSupportReference(item.sref);
+    const covered = entries.some((e) =>
+      e.ch === itemCh && v >= e.lo && v <= e.hi && sref === e.sref
+      && (!e.quote || quoteFuzzyMatch(String(item.orig_quote || ''), e.quote)));
+    return !covered;
+  });
+  return { prepared: { ...prepared, items: out }, removed: items.length - out.length };
+}
+
+/** File wrapper: read prepared_notes.json, drop covered items, write it back. */
+function applyKeptToPreparedNotes({ preparedJson, kept, chapter }) {
+  const absPath = path.resolve(CSKILLBP_DIR, preparedJson);
+  const data = JSON.parse(fs.readFileSync(absPath, 'utf8'));
+  const { prepared, removed } = removePreparedItemsCoveredByKept(data, kept, chapter);
+  if (removed > 0) fs.writeFileSync(absPath, JSON.stringify(prepared, null, 2));
+  return { itemsRemoved: removed };
+}
+
 function buildStrippedHebrewText(raw) {
   const stripped = [];
   const offsetMap = [];
@@ -3415,6 +3464,8 @@ module.exports = {
   resolveAtRequirement,
   // Hint expansion (used by notes-pipeline mechanical prep + tests):
   applyHintsToPreparedNotes,
+  removePreparedItemsCoveredByKept,
+  applyKeptToPreparedNotes,
   normalizeQuote,
   normalizeSupportReference,
   quoteFuzzyMatch,
