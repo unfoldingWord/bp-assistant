@@ -3006,6 +3006,7 @@ async function notesPipeline(route, message) {
   const tokensBefore = getCumulativeTokens();
   let totalSuccess = Number(existingCheckpoint?.totalSuccess || 0);
   let totalFail = Number(existingCheckpoint?.totalFail || 0);
+  let allKeptChapters = 0; // chapters that succeeded with nothing new to push
 
   // Conflict-deferred push state: when a user branch modifies the same file,
   // we continue generating but defer all pushes until the user says "merged".
@@ -3500,6 +3501,9 @@ async function notesPipeline(route, message) {
     // Quality mechanical prep flag — set true once runMechanicalQualityPrep() completes.
     let qualityPrepDone = false;
     let atGenerationDone = false;
+    // Set when the kept drop leaves no prepared items and no intro: every AI
+    // note duplicates an editor-kept note, so en_tn already holds this chapter's notes.
+    let allNotesKept = false;
 
     for (let si = startSkillIndex; si < skills.length; si++) {
       const skill = skills[si];
@@ -3582,11 +3586,14 @@ async function notesPipeline(route, message) {
           const keptHere = (kept || []).filter((k) => keptRefVerseSpan(k.ref, ch)).length;
           if (keptHere > 0) {
             try {
-              const dropped = applyKeptToPreparedNotes({
+              const keptResult = applyKeptToPreparedNotes({
                 preparedJson: readContext(pipeDir).runtime.preparedNotes,
                 kept,
                 chapter: ch,
-              }).itemsRemoved;
+              });
+              const dropped = keptResult.itemsRemoved;
+              // A new chapter intro (intro_rows) still has to be written and pushed.
+              allNotesKept = dropped > 0 && keptResult.itemsRemaining === 0 && keptResult.introRows === 0;
               await status(
                 `**${ref}**: ${keptHere} kept notes from the editor will stay in place; ` +
                 `${dropped} AI notes dropped as duplicates of them`,
@@ -3624,6 +3631,13 @@ async function notesPipeline(route, message) {
           await status(`**${ref}**: Mechanical prep failed — ${err.message}. Claude will run prep via MCP tools.`);
           // Non-fatal: tn-writer skill can still do prep via MCP tools (old path)
         }
+      }
+
+      // Nothing new to write: skip tn-writer, AT generation and the quality
+      // check. The chapter is counted as a success below, without a push.
+      if (allNotesKept) {
+        await status(`**${ref}**: every note in this chapter is already kept in the editor; nothing new to write.`);
+        break;
       }
 
       // --- AT generation: run between tn-writer and tn-quality-check ---
@@ -4309,6 +4323,25 @@ async function notesPipeline(route, message) {
       continue;
     }
 
+    // Every AI note duplicated an editor-kept note: en_tn is already correct,
+    // so there is nothing to push (an empty source would fail insertTnRows).
+    if (allNotesKept) {
+      totalSuccess++;
+      allKeptChapters++;
+      setCheckpoint(checkpointRef, {
+        state: 'running',
+        totalSuccess,
+        totalFail,
+        skillOutputs,
+        current: { chapter: ch, status: 'chapter_succeeded' },
+        resume: null,
+      });
+      if (chapterCount > 1) {
+        await reply(`**${ref}**: every note is already kept in the editor; nothing new to write (${chapterDuration}s)`);
+      }
+      continue;
+    }
+
     // --- Repo insert + verify inline so editor gets access immediately ---
     // Skip if resuming past this point on a future chapter
     const skipDoor43 = (ch === resumeChapter && resumeSkill === 'door43-push-done');
@@ -4681,7 +4714,9 @@ async function notesPipeline(route, message) {
 
     const tnPushLine = noPush
       ? 'Door43 push skipped via --no-push.'
-      : 'Content pushed to master on en_tn';
+      : (allKeptChapters > 0 && allKeptChapters === totalSuccess
+        ? 'Nothing new to push: every note is already kept in the editor.'
+        : 'Content pushed to master on en_tn');
     if (chapterCount === 1) {
       await reply(
         `Notes pipeline complete for **${rangeLabel}** (${totalDuration}s).\n` +
