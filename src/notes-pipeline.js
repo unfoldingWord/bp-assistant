@@ -449,7 +449,7 @@ const CROSS_BOOK_INDEX_REL = 'data/cache/crossbook_seehow_index.json';
  * @param {string} args.pipeDir - Pipeline working directory
  * @returns {Promise<string>} Summary of see-how detections
  */
-async function runSeeHowDetection({ pipeDir, contextPath, generateIdsFn = generateIds }) {
+async function runSeeHowDetection({ pipeDir, contextPath, generateIdsFn = generateIds, kept = null }) {
   const ctx = readContextAt(pipeDir, contextPath);
   const prepPath = path.resolve(CSKILLBP_DIR, ctx.runtime.preparedNotes);
   const prepared = JSON.parse(fs.readFileSync(prepPath, 'utf8'));
@@ -730,6 +730,15 @@ async function runSeeHowDetection({ pipeDir, contextPath, generateIdsFn = genera
   };
   const injections = [];
   const injectedAt = new Set();
+  // An editor-kept note already sits at its verse and quote in en_tn: claim
+  // those slots so no pointer is synthesized there (its repeats keep their own
+  // notes instead of folding into a pointer that would duplicate the kept one).
+  for (const k of kept || []) {
+    const m = String(k.ref || '').match(/^(\d+):(\d+)(?:-(\d+))?$/);
+    if (!m || Number(m[1]) !== chapter || !k.quote) continue;
+    const toks = hebTokens(k.quote).join('+');
+    for (let v = Number(m[2]); v <= Number(m[3] || m[2]); v++) injectedAt.add(`${chapter}:${v}|${toks}`);
+  }
 
   // Resolve every anchor -- prepared groups and standalone injections alike --
   // before assigning any corpus-derived verses: which key may list which verses
@@ -3552,29 +3561,11 @@ async function notesPipeline(route, message) {
             }
           }
 
-          // Build the book-scoped recurrence index. Non-fatal: without it the
-          // detector still folds same-chapter repeats, it just cannot point at
-          // earlier chapters.
-          try {
-            buildRecurrenceIndexFile({ pipeDir });
-          } catch (indexErr) {
-            console.warn(`[notes] Recurrence index build failed (non-fatal): ${indexErr.message}`);
-          }
-
-          // Run see-how detection after mechanical prep
-          try {
-            const seeHowSummary = await runSeeHowDetection({ pipeDir });
-            if (seeHowSummary !== SEE_HOW_ZERO_SUMMARY) {
-              await status(`**${ref}**: See-how detection — ${seeHowSummary}`);
-            }
-          } catch (seeHowErr) {
-            console.warn(`[notes] See-how detection failed (non-fatal): ${seeHowErr.message}`);
-          }
-
           // Editor-kept notes stay in en_tn untouched, so drop prepared items
-          // that duplicate one (nothing is injected for them). After see-how:
-          // a pointer elsewhere can still target the verse, where the kept note
-          // stays, and see-how cannot synthesize a new anchor note there.
+          // that duplicate one (nothing is injected for them). Before see-how,
+          // so see-how never folds other verses into a note that is then
+          // dropped; see-how gets the kept list so it does not synthesize a
+          // pointer at a kept note's verse and quote either.
           const keptHere = (kept || []).filter((k) => Number(String(k.ref).split(':')[0]) === Number(ch)).length;
           if (keptHere > 0) {
             try {
@@ -3595,6 +3586,26 @@ async function notesPipeline(route, message) {
               );
             }
           }
+
+          // Build the book-scoped recurrence index. Non-fatal: without it the
+          // detector still folds same-chapter repeats, it just cannot point at
+          // earlier chapters.
+          try {
+            buildRecurrenceIndexFile({ pipeDir });
+          } catch (indexErr) {
+            console.warn(`[notes] Recurrence index build failed (non-fatal): ${indexErr.message}`);
+          }
+
+          // Run see-how detection after mechanical prep
+          try {
+            const seeHowSummary = await runSeeHowDetection({ pipeDir, kept });
+            if (seeHowSummary !== SEE_HOW_ZERO_SUMMARY) {
+              await status(`**${ref}**: See-how detection — ${seeHowSummary}`);
+            }
+          } catch (seeHowErr) {
+            console.warn(`[notes] See-how detection failed (non-fatal): ${seeHowErr.message}`);
+          }
+
         } catch (err) {
           console.error(`[notes] Mechanical prep failed for ${ref}: ${err.message}`);
           await status(`**${ref}**: Mechanical prep failed — ${err.message}. Claude will run prep via MCP tools.`);
