@@ -9,6 +9,8 @@ const path = require('path');
 const https = require('https');
 const crypto = require('crypto');
 const { normalizeIntroRow } = require('../lib/insert-tn-rows');
+const { HEBREW_QUOTE_STRIP_RE, stripHebrewQuoteMarks, normalizeQuote } = require('../lib/quote-normalize');
+const { keptRefVerseSpan } = require('../lib/kept-notes');
 const { buildSeeHowSentence, formatAlsoOccurs } = require('./recurrence-index');
 const { BOOK_NAMES } = require('../api-runner/verse-data');
 
@@ -1553,12 +1555,6 @@ function removeNote({ id, generatedJson, tsvFile }) {
   return `remove_note: ${msgs.join('; ')}.`;
 }
 
-const HEBREW_QUOTE_STRIP_RE = /[\u0591-\u05AF\u2060\u05BD\u05C3]/g;
-
-function stripHebrewQuoteMarks(value) {
-  return String(value || '').replace(HEBREW_QUOTE_STRIP_RE, '');
-}
-
 // -- Hint helpers --------------------------------------------------------
 //
 // Used by applyHintsToPreparedNotes (and exposed for tests) to compare
@@ -1566,23 +1562,11 @@ function stripHebrewQuoteMarks(value) {
 // suppress duplicate notes and inject the hint as a synthetic prepared item.
 
 const SUPPORT_REF_RC_PREFIX_RE = /^rc:\/\/[^/]+\/ta\/man\/translate\//;
-// Word-joiner (U+2060), soft hyphen (U+00AD), Hebrew maqaf-like word
-// dividers (U+05BE) and the existing cantillation set above are stripped
-// from quotes so fuzzy match isn't confused by invisible joiners that the
-// human and AI tooling handle differently.
-const QUOTE_INVISIBLE_RE = /[\u2060\u00AD]/g;
+// Quote normalization (cantillation, word joiners, soft hyphens stripped) lives
+// in lib/quote-normalize.js so insert-tn-rows compares quotes the same way.
 
 function normalizeSupportReference(s) {
   return String(s || '').trim().replace(SUPPORT_REF_RC_PREFIX_RE, '');
-}
-
-function normalizeQuote(s) {
-  return stripHebrewQuoteMarks(String(s || ''))
-    .normalize('NFC')
-    .replace(QUOTE_INVISIBLE_RE, '')
-    .replace(/\s+/g, ' ')
-    .trim()
-    .toLowerCase();
 }
 
 function quoteFuzzyMatch(a, b) {
@@ -1790,6 +1774,54 @@ function applyHintsToPreparedNotes({ preparedJson, hints, chapter }) {
   data.items = items;
   fs.writeFileSync(absPath, JSON.stringify(data, null, 2));
   return { hintsApplied: applied, itemsSuppressed: suppressed, hintsDropped: dropped, droppedReasons };
+}
+
+/**
+ * Drop prepared items already covered by an editor-kept note: same verse,
+ * normalized support reference and normalized quote (exact after
+ * normalizeQuote, not fuzzy, so a note on a different phrase still lands).
+ * Nothing is injected: the kept note already exists in en_tn. The push-time
+ * dedup in insert-tn-rows uses the same key.
+ *
+ * Kept refs are read with keptRefVerseSpan (ranges and cross-chapter spans
+ * cover every verse in them; intro refs cover none).
+ *
+ * @param {object} prepared - parsed prepared_notes.json ({ items: [...] })
+ * @param {Array}  kept     - options.kept entries
+ * @param {number} [chapter] - when given, only items in this chapter are checked
+ * @returns {{ prepared: object, removed: number }}
+ */
+function removePreparedItemsCoveredByKept(prepared, kept, chapter) {
+  const items = Array.isArray(prepared && prepared.items) ? prepared.items : [];
+  if (!Array.isArray(kept) || kept.length === 0) return { prepared, removed: 0 };
+  const out = items.filter((item) => {
+    if (!item || item.fromHint) return true;
+    const v = verseFromReference(item.reference);
+    if (v == null) return true;
+    const itemCh = Number(String(item.reference).split(':')[0]);
+    if (chapter != null && itemCh !== Number(chapter)) return true;
+    const sref = normalizeSupportReference(item.sref);
+    const quote = normalizeQuote(item.orig_quote);
+    const covered = kept.some((k) => {
+      const span = keptRefVerseSpan(k.ref, itemCh);
+      return !!span && v >= span.lo && v <= span.hi
+        && sref === normalizeSupportReference(k.supportReference) && quote === normalizeQuote(k.quote);
+    });
+    return !covered;
+  });
+  const removed = items.length - out.length;
+  const next = { ...prepared, items: out };
+  if (removed > 0 && typeof prepared.item_count === 'number') next.item_count = out.length;
+  return { prepared: next, removed };
+}
+
+/** File wrapper: read prepared_notes.json, drop covered items, write it back. */
+function applyKeptToPreparedNotes({ preparedJson, kept, chapter }) {
+  const absPath = path.resolve(CSKILLBP_DIR, preparedJson);
+  const data = JSON.parse(fs.readFileSync(absPath, 'utf8'));
+  const { prepared, removed } = removePreparedItemsCoveredByKept(data, kept, chapter);
+  if (removed > 0) fs.writeFileSync(absPath, JSON.stringify(prepared, null, 2));
+  return { itemsRemoved: removed };
 }
 
 function buildStrippedHebrewText(raw) {
@@ -3415,6 +3447,9 @@ module.exports = {
   resolveAtRequirement,
   // Hint expansion (used by notes-pipeline mechanical prep + tests):
   applyHintsToPreparedNotes,
+  removePreparedItemsCoveredByKept,
+  keptRefVerseSpan,
+  applyKeptToPreparedNotes,
   normalizeQuote,
   normalizeSupportReference,
   quoteFuzzyMatch,

@@ -284,3 +284,18 @@ test('fillIssueGaps restores the chapter issues file when a failing run damaged 
     assert.equal(read(), HEADERLESS);
   });
 });
+
+test('findEmptyVerses: a verse covered only by a kept ref is not empty', () => {
+  const { _findEmptyVerses } = fresh(fs.mkdtempSync(path.join(os.tmpdir(), 'gap-')));
+  // Without kept refs 4, 8, 9 are empty. Kept 40:4 and 40:8-9 cover them; 41:4 does not count.
+  assert.deepEqual(_findEmptyVerses({
+    issuesText: HEADERLESS, ultPlainText: ULT, chapter: 40, keptRefs: ['40:4'],
+  }), [8, 9]);
+  assert.deepEqual(_findEmptyVerses({
+    issuesText: HEADERLESS, ultPlainText: ULT, chapter: 40, keptRefs: ['40:8-9', '41:4', '40:intro'],
+  }), [4]);
+  // A cross-chapter kept ref covers to the end of its first chapter.
+  assert.deepEqual(_findEmptyVerses({
+    issuesText: HEADERLESS, ultPlainText: ULT, chapter: 40, keptRefs: ['40:8-41:2'],
+  }), [4]);
+});

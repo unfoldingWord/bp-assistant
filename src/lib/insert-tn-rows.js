@@ -5,6 +5,8 @@
 
 const fs = require('fs');
 const { buildAlignmentMap, getSequenceSortKey } = require('./sequence-notes');
+const { normalizeQuote } = require('./quote-normalize');
+const { keptRefVerseSpan } = require('./kept-notes');
 
 // --- TSV field helpers ---
 
@@ -121,6 +123,63 @@ function hasKeepTag(row) {
   return tags.split(',').some(t => t.trim().toUpperCase() === 'KEEP');
 }
 
+// A row survives an AI run when it is KEEP-tagged or its ID (column 2) is in
+// keptIds — the editor's export blanks Tags, so it sends kept IDs instead.
+function isKeptRow(row, keptIds) {
+  if (hasKeepTag(row)) return true;
+  return !!keptIds && keptIds.size > 0 && keptIds.has(row.split('\t')[1]);
+}
+
+// Dedup keys for source rows against kept rows. A KEEP-tagged row claims its
+// (Reference, SupportReference); an editor-kept row claims only the same
+// (Reference, SupportReference, Quote), so a new note on a different phrase in
+// that verse still lands. Quotes compare through normalizeQuote, the same key
+// the prepared-notes pass uses.
+function getQuote(row) {
+  const parts = row.split('\t');
+  return parts.length > 4 ? normalizeQuote(parts[4]) : '';
+}
+
+function keptDedupKey(row) {
+  return `${getReference(row)}\t${getSupportReference(row)}`;
+}
+
+// Editor-kept key tail: support reference without its rc:// prefix (as the
+// prepared-notes pass compares it) plus the normalized quote. A leading "K"
+// keeps these keys apart from the KEEP-tag (ref, sref) keys.
+function keptTail(row) {
+  const sref = getSupportReference(row).trim().replace(/^rc:\/\/[^/]+\/ta\/man\/translate\//, '');
+  return `\tK\t${sref}\t${getQuote(row)}`;
+}
+
+function buildKeepKeys(keepRows) {
+  const keys = new Set();
+  for (const row of keepRows) {
+    if (hasKeepTag(row)) {
+      if (getSupportReference(row)) keys.add(keptDedupKey(row));
+    } else {
+      // Claim every verse the kept row covers, so a single-verse AI row inside
+      // a kept 40:12-14 range is still caught.
+      const ref = getReference(row);
+      const tail = keptTail(row);
+      keys.add(`${ref}${tail}`);
+      // A cross-chapter "40:48-42:2" covers verses in every chapter it spans.
+      const m = ref.match(/^(\d+):\d+-(\d+):\d+$/);
+      const first = m ? Number(m[1]) : getChapter(ref);
+      const last = m ? Math.min(Number(m[2]), 200) : first;
+      for (let ch = first; ch <= last; ch++) {
+        const span = keptRefVerseSpan(ref, ch);
+        if (span) for (let v = span.lo; v <= span.hi && v - span.lo < 200; v++) keys.add(`${ch}:${v}${tail}`);
+      }
+    }
+  }
+  return keys;
+}
+
+function isClaimedByKeep(row, keepKeys) {
+  return keepKeys.has(keptDedupKey(row)) || keepKeys.has(`${getReference(row)}${keptTail(row)}`);
+}
+
 // --- Reference sorting ---
 
 function parseReference(ref) {
@@ -224,11 +283,14 @@ function detectLineEnding(filepath) {
 
 // --- Per-reference replacement ---
 
-function doPerReference(bookRows, sourceGroups, verseMap, log) {
+function doPerReference(bookRows, sourceGroups, verseMap, log, keptIds = new Set()) {
   const newRows = [...bookRows];
   let totalRemoved = 0;
   let totalAdded = 0;
   let totalKept = 0;
+  // Editor-kept rows claim their verse span wherever they sit, so a kept
+  // 40:12-14 row also blocks a duplicate at 40:13.
+  const keptElsewhereKeys = buildKeepKeys(bookRows.filter((row) => !hasKeepTag(row) && isKeptRow(row, keptIds)));
 
   for (const [ref, newRefRows] of sourceGroups) {
     const refSortKey = parseReference(ref);
@@ -237,22 +299,16 @@ function doPerReference(bookRows, sourceGroups, verseMap, log) {
 
     for (let i = 0; i < newRows.length; i++) {
       if (getReference(newRows[i]) === ref) {
-        if (hasKeepTag(newRows[i])) keepRows.push(newRows[i]);
+        if (isKeptRow(newRows[i], keptIds)) keepRows.push(newRows[i]);
         else indicesToRemove.push(i);
       }
     }
 
     let dedupedSource = newRefRows;
-    if (keepRows.length) {
-      const keepKeys = new Set();
-      for (const row of keepRows) {
-        const sref = getSupportReference(row);
-        if (sref) keepKeys.add(`${ref}\t${sref}`);
-      }
+    if (keepRows.length || keptElsewhereKeys.size) {
+      const keepKeys = new Set([...buildKeepKeys(keepRows), ...keptElsewhereKeys]);
       if (keepKeys.size) {
-        dedupedSource = newRefRows.filter(row =>
-          !keepKeys.has(`${getReference(row)}\t${getSupportReference(row)}`)
-        );
+        dedupedSource = newRefRows.filter(row => !isClaimedByKeep(row, keepKeys));
         const dedupCount = newRefRows.length - dedupedSource.length;
         if (dedupCount) log.push(`  ${ref}: deduplicated ${dedupCount} source row(s) against KEEP notes`);
       }
@@ -264,7 +320,7 @@ function doPerReference(bookRows, sourceGroups, verseMap, log) {
       log.push(`  ${ref}: replacing ${indicesToRemove.length} existing rows with ${dedupedSource.length} new rows`);
       const keepIndices = [];
       for (let i = 0; i < newRows.length; i++) {
-        if (getReference(newRows[i]) === ref && hasKeepTag(newRows[i])) keepIndices.push(i);
+        if (getReference(newRows[i]) === ref && isKeptRow(newRows[i], keptIds)) keepIndices.push(i);
       }
       const allIndices = [...new Set([...indicesToRemove, ...keepIndices])].sort((a, b) => a - b);
       for (let j = allIndices.length - 1; j >= 0; j--) newRows.splice(allIndices[j], 1);
@@ -272,7 +328,7 @@ function doPerReference(bookRows, sourceGroups, verseMap, log) {
     } else if (keepRows.length) {
       const keepIndices = [];
       for (let i = 0; i < newRows.length; i++) {
-        if (getReference(newRows[i]) === ref && hasKeepTag(newRows[i])) keepIndices.push(i);
+        if (getReference(newRows[i]) === ref && isKeptRow(newRows[i], keptIds)) keepIndices.push(i);
       }
       insertPos = keepIndices.length ? keepIndices[0] : findInsertPosition(newRows, refSortKey[0], refSortKey[1]);
       for (let j = keepIndices.length - 1; j >= 0; j--) newRows.splice(keepIndices[j], 1);
@@ -308,7 +364,7 @@ function doPerReference(bookRows, sourceGroups, verseMap, log) {
 
 // --- Full-chapter replacement ---
 
-function doFullChapter(bookRows, sourceRows, chapter, skipIntro, verseMap, log, replaceChapter = false) {
+function doFullChapter(bookRows, sourceRows, chapter, skipIntro, verseMap, log, replaceChapter = false, keptIds = new Set()) {
   const newRows = [...bookRows];
 
   const sourceRefs = new Set();
@@ -342,8 +398,13 @@ function doFullChapter(bookRows, sourceRows, chapter, skipIntro, verseMap, log, 
 
   // Determine which intro rows to preserve
   let preserveIntro = [];
+  // An intro the editor kept (by ID) stays, like --skip-intro.
+  const introKept = keptIds.size > 0 && existingIntroRows.some((row) => keptIds.has(row.split('\t')[1]));
+  if (introKept) log.push(`Preserving existing ${chapter}:intro row (kept in the editor)`);
   if (skipIntro && existingIntroRows.length) {
     preserveIntro = existingIntroRows;
+  } else if (introKept) {
+    preserveIntro = existingIntroRows.filter((row) => keptIds.has(row.split('\t')[1]));
   } else if (!sourceHasIntro && existingIntroRows.length) {
     preserveIntro = existingIntroRows;
   }
@@ -362,25 +423,32 @@ function doFullChapter(bookRows, sourceRows, chapter, skipIntro, verseMap, log, 
   if (chapterStart !== null) {
     for (let i = chapterStart; i < chapterEnd; i++) {
       const ref = getReference(newRows[i]);
-      if (sourceRefs.has(ref) && hasKeepTag(newRows[i]) && !isIntroRef(ref)) {
+      if (sourceRefs.has(ref) && isKeptRow(newRows[i], keptIds) && !isIntroRef(ref)) {
         keepRows.push(newRows[i]);
       }
     }
   }
 
-  // Deduplicate source against KEEP rows
-  let dedupCount = 0;
-  if (keepRows.length) {
-    const keepKeys = new Set();
-    for (const row of keepRows) {
-      const sref = getSupportReference(row);
-      if (sref) keepKeys.add(`${getReference(row)}\t${sref}`);
+  // Deduplicate source against KEEP rows. Editor-kept rows anywhere in the
+  // chapter claim their whole verse span (a kept 40:12-14 blocks 40:13).
+  const dedupRows = [...keepRows];
+  if (keptIds.size > 0) {
+    // Whole file, not just this chapter's span: a cross-chapter kept row
+    // (40:48-41:2) sits in chapter 40 but also covers 41:1-2.
+    for (const row of newRows) {
+      const ref = getReference(row);
+      if (!sourceRefs.has(ref) && !isIntroRef(ref) && !hasKeepTag(row) && isKeptRow(row, keptIds)
+        && keptRefVerseSpan(ref, chapter)) {
+        dedupRows.push(row);
+      }
     }
+  }
+  let dedupCount = 0;
+  if (dedupRows.length) {
+    const keepKeys = buildKeepKeys(dedupRows);
     if (keepKeys.size) {
       const before = filteredSource.length;
-      filteredSource = filteredSource.filter(row =>
-        !keepKeys.has(`${getReference(row)}\t${getSupportReference(row)}`)
-      );
+      filteredSource = filteredSource.filter(row => !isClaimedByKeep(row, keepKeys));
       dedupCount = before - filteredSource.length;
     }
   }
@@ -396,7 +464,7 @@ function doFullChapter(bookRows, sourceRows, chapter, skipIntro, verseMap, log, 
     for (let i = chapterStart; i < chapterEnd; i++) {
       const ref = getReference(newRows[i]);
       if (sourceRefs.has(ref)) {
-        if (!hasKeepTag(newRows[i])) indicesToRemove.push(i);
+        if (!isKeptRow(newRows[i], keptIds)) indicesToRemove.push(i);
       } else if (isIntroRef(ref) && sourceRefs.has(ref)) {
         // dead branch kept for clarity
         indicesToRemove.push(i);
@@ -404,13 +472,13 @@ function doFullChapter(bookRows, sourceRows, chapter, skipIntro, verseMap, log, 
         // Orphaned multi-verse row: the source replaced this reference with a narrower
         // single-verse reference (e.g. existing 18:9-10 → source 18:9).  Remove it
         // unless it is explicitly KEEP-tagged.
-        if (hasKeepTag(newRows[i])) {
+        if (isKeptRow(newRows[i], keptIds)) {
           preservedRows.push(newRows[i]);
         } else {
           indicesToRemove.push(i);
           log.push(`  ${ref}: orphaned multi-verse row (anchor ${anchorVerse(ref)} covered by source)`);
         }
-      } else if (replaceChapter && getChapter(ref) === chapter && !isIntroRef(ref) && !hasKeepTag(newRows[i])) {
+      } else if (replaceChapter && getChapter(ref) === chapter && !isIntroRef(ref) && !isKeptRow(newRows[i], keptIds)) {
         // Whole-chapter replace: drop legacy rows in verses the source did not cover.
         // The chapter check keeps an out-of-order row from another chapter (or a
         // malformed Reference) that happens to sit inside the chapter span.
@@ -534,9 +602,11 @@ function doFullChapter(bookRows, sourceRows, chapter, skipIntro, verseMap, log, 
  * @param {boolean} [opts.replaceChapter=false] - Whole-chapter run: also remove existing
  *   non-intro, non-KEEP rows in verses absent from the source (default keeps them, for
  *   verse-range runs). KEEP-tagged rows and intro handling are unchanged.
+ * @param {Iterable<string>} [opts.keptIds] - Row IDs (column 2) to treat exactly like KEEP-tagged
+ *   rows (editor-preserved notes whose Tags column is blank).
  * @returns {string} Log output
  */
-function insertTnRows({ bookFile, sourceFile, chapter, skipIntro = false, ultFile, backup = false, replaceChapter = false }) {
+function insertTnRows({ bookFile, sourceFile, chapter, skipIntro = false, ultFile, backup = false, replaceChapter = false, keptIds = [] }) {
   const log = [];
   const lineEnding = detectLineEnding(bookFile);
 
@@ -564,7 +634,7 @@ function insertTnRows({ bookFile, sourceFile, chapter, skipIntro = false, ultFil
   if (skipIntro) log.push('Preserving existing intro row (--skip-intro)');
 
   const [newRows, totalRemoved, totalAdded] = doFullChapter(
-    bookRows, sourceRows, chapter, skipIntro, verseMap, log, replaceChapter
+    bookRows, sourceRows, chapter, skipIntro, verseMap, log, replaceChapter, new Set(keptIds || [])
   );
 
   log.push('');

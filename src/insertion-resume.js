@@ -276,6 +276,7 @@ async function runNotesInsertPhase(completedChapters, username, book, notify) {
         body: ch.body || '',
         // Carried from the original run; entries saved before this field existed resume as false.
         replaceChapter: ch.replaceChapter === true,
+        keptIds: Array.isArray(ch.keptIds) ? ch.keptIds : [],
       });
       if (!pushResult.success) {
         console.error(`[insertion-resume] door43-push TN failed for ${book} ${ch.ch}: ${pushResult.details}`);

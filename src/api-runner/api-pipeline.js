@@ -351,6 +351,7 @@ async function apiPipeline(route, message) {
           // This path always writes the whole chapter (it takes no verse range),
           // so the push replaces the whole chapter in en_tn (#435).
           replaceChapter: true,
+          keptIds: Array.isArray(route._kept) ? route._kept.map((k) => k.rowId) : [],
         });
         await reply(`door43-push TN: ${pushRes.branchUrl || pushRes.details || (pushRes.success ? 'ok' : 'failed')}`);
       }

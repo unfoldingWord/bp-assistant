@@ -29,9 +29,11 @@ const {
   detectLandedOutputs,
 } = require('./pipeline-output');
 
-// Bumped from 4KB to fit up to 50 hints with full prose seeds. The
-// per-field caps on HintSchema below bound the worst case well under this.
-const MAX_BODY_BYTES = 32 * 1024;
+// Bumped from 4KB to fit up to 50 hints with full prose seeds, then to 10MB for
+// `kept`: 3000 entries (a whole-book run) at every field's cap in 3-byte UTF-8
+// is ~8.4MB (100 + 500 + 300 chars, plus keys). Real entries are ~200 bytes.
+// The route is bearer-token authenticated and rate limited.
+const MAX_BODY_BYTES = 10 * 1024 * 1024;
 const RATE_LIMIT_RPM = 60;
 const RATE_LIMIT_WINDOW_MS = 60_000;
 
@@ -96,6 +98,28 @@ const HintSchema = z.object({
   },
 );
 
+// Editor-kept notes: rows the AI run must leave in place and not duplicate.
+// ref is "ch:verse", "ch:v1-v2", a cross-chapter "ch:v-ch:v", or
+// "ch:intro"/"ch:front"; carried as strings the editor already holds, so empty
+// supportReference/quote/note are allowed. Matching only uses same-chapter
+// refs; a cross-chapter row is still kept by its rowId.
+const KEPT_REF_RE = /^\d+:(\d+(-\d+(:\d+)?)?|intro|front)$/;
+
+const KeptSchema = z.object({
+  rowId: z.string().regex(HINT_ROW_ID_RE),
+  ref: z.string().min(1).max(20).regex(KEPT_REF_RE, 'ref must look like 40:12, 40:12-14, 40:48-41:2 or 40:intro')
+    .refine((ref) => {
+      const m = ref.match(/^(\d+):(\d+)-(?:(\d+):)?(\d+)$/);
+      if (!m) return true;
+      const c1 = Number(m[1]);
+      const c2 = m[3] ? Number(m[3]) : c1;
+      return c1 < c2 || (c1 === c2 && Number(m[2]) <= Number(m[4]));
+    }, 'ref range must not run backwards'),
+  supportReference: z.string().max(100).nullish().transform((v) => v ?? ''),
+  quote: z.string().max(500).nullish().transform((v) => v ?? ''),
+  note: z.string().max(300).nullish(),
+}).strict();
+
 const OptionsSchema = z.object({
   // Common — currently a no-op on the wire (model is fixed per pipeline today),
   // but accepted for forward compatibility with the contract doc.
@@ -154,6 +178,9 @@ const OptionsSchema = z.object({
   // existing stub row in place by ID. Each hint must carry a non-empty quote
   // or seed (see HintSchema.refine).
   hints: z.array(HintSchema).max(50).optional(),
+  // Editor-kept notes (notes only). Unlike hints, multi-chapter scopes are fine
+  // because each entry carries its own chapter in ref.
+  kept: z.array(KeptSchema).max(3000).optional(),
 }).strict();
 
 // Providers a translate run may be pointed at with a caller-supplied key. Kept
@@ -327,7 +354,7 @@ const StartBodySchema = z.object({
   }
   // notes-only flags must not appear on generate/tqs.
   if (body.pipelineType !== 'notes') {
-    for (const k of ['noIntro', 'pauseBeforeATs', 'hints']) {
+    for (const k of ['noIntro', 'pauseBeforeATs', 'hints', 'kept']) {
       if (o[k] !== undefined) {
         ctx.addIssue({
           code: z.ZodIssueCode.custom,
@@ -349,6 +376,34 @@ const StartBodySchema = z.object({
           code: z.ZodIssueCode.custom,
           path: ['options', 'hints', i, 'rowId'],
           message: `duplicate hint rowId "${id}"`,
+        });
+      }
+      if (id) seen.add(id);
+    }
+  }
+  // A row is either a hint the AI expands or a kept note it leaves alone.
+  if (Array.isArray(o.kept) && Array.isArray(o.hints) && o.kept.length && o.hints.length) {
+    const hintIds = new Set(o.hints.map((h) => h && h.rowId).filter(Boolean));
+    o.kept.forEach((k, i) => {
+      if (k && hintIds.has(k.rowId)) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['options', 'kept', i, 'rowId'],
+          message: `rowId "${k.rowId}" is both a hint and a kept note`,
+        });
+      }
+    });
+  }
+  // kept — same duplicate-rowId rule as hints.
+  if (Array.isArray(o.kept) && o.kept.length > 1) {
+    const seen = new Set();
+    for (let i = 0; i < o.kept.length; i++) {
+      const id = o.kept[i] && o.kept[i].rowId;
+      if (id && seen.has(id)) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['options', 'kept', i, 'rowId'],
+          message: `duplicate kept rowId "${id}"`,
         });
       }
       if (id) seen.add(id);

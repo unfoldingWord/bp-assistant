@@ -18,7 +18,7 @@ const { createGuardHooks } = require('./guard-hooks');
 const { resolveAutoModel } = require('./api-runner/provider-config');
 const { getDoor43Username, emailToFallbackUsername, buildBranchName, resolveOutputFile, discoverFreshOutput, checkPrerequisites, calcSkillTimeout, calcVerseSpanTimeout, normalizeBookName, resolveConflictMention, parsePartialTsv, truncatePartialTsv, parseChunkRange, isUsageLimitError, CSKILLBP_DIR } = require('./pipeline-utils');
 const { splitTsv, fixTrailingNewlines } = require('./workspace-tools/tsv-tools');
-const { fillTsvIds, generateIds, prepareNotes, fillOrigQuotes, resolveGlQuotes, flagNarrowQuotes, extractAlignmentData, prepareATContext, substituteAT, fixUnicodeQuotes, verifyBoldMatches, syncCanonicalHebrewQuotes, applyHintsToPreparedNotes, parsePlainUsfmVersesFromText, detectIssuesTsvLayout, extractIssuesTsvRow, _stripAlternateTranslation: stripAlternateTranslation } = require('./workspace-tools/tn-tools');
+const { fillTsvIds, generateIds, prepareNotes, fillOrigQuotes, resolveGlQuotes, flagNarrowQuotes, extractAlignmentData, prepareATContext, substituteAT, fixUnicodeQuotes, verifyBoldMatches, syncCanonicalHebrewQuotes, applyHintsToPreparedNotes, applyKeptToPreparedNotes, keptRefVerseSpan, parsePlainUsfmVersesFromText, detectIssuesTsvLayout, extractIssuesTsvRow, _stripAlternateTranslation: stripAlternateTranslation } = require('./workspace-tools/tn-tools');
 const { checkTnQuality, detectSelfTalk, templateFirstPhrase, resolveTemplateText } = require('./workspace-tools/quality-tools');
 const { buildBookRecurrenceIndex, deriveRecurrenceKeys, buildSeeHowSentence, isSeeHowEligible, isContextDependentSref, dedupeAlsoOccursVerses, assignAlsoOccursVerses, resolveDoor43ReposPath, hebTokens, verseNumber: recurrenceVerseNumber, SEE_HOW_NEVER_FOLD_SREFS, CROSS_BOOK_MAX_BOOKS } = require('./workspace-tools/recurrence-index');
 const { normalizeIssuesFile, buildParallelismIntroHintArgs } = require('./issue-normalizer');
@@ -396,7 +396,7 @@ function buildRecurrenceIndexFile({ pipeDir, contextPath }) {
  *
  * @returns {Promise<string|null>} the detection summary, or null on failure
  */
-async function runShardSeeHowDetection({ contextPath, issuesPath, status, generateIdsFn }) {
+async function runShardSeeHowDetection({ contextPath, issuesPath, status, generateIdsFn, kept = null, chapter = null }) {
   const noop = async () => {};
   try {
     await runMechanicalPrep({ issuesPath, contextPath, status: status || noop });
@@ -404,13 +404,23 @@ async function runShardSeeHowDetection({ contextPath, issuesPath, status, genera
     console.warn(`[notes] Shard mechanical prep failed (non-fatal): ${err.message}`);
     return null;
   }
+  // Same order as the whole-chapter path: drop kept duplicates before see-how.
+  if (Array.isArray(kept) && kept.length > 0) {
+    try {
+      const preparedJson = readContextAt(null, contextPath).runtime.preparedNotes;
+      const { itemsRemoved } = applyKeptToPreparedNotes({ preparedJson, kept, chapter });
+      if (itemsRemoved) console.log(`[notes] Shard ${contextPath}: ${itemsRemoved} AI notes dropped as duplicates of kept notes`);
+    } catch (err) {
+      console.warn(`[notes] Shard kept-duplicate drop failed (non-fatal): ${err.message}`);
+    }
+  }
   try {
     buildRecurrenceIndexFile({ contextPath });
   } catch (err) {
     console.warn(`[notes] Shard recurrence index failed (non-fatal): ${err.message}`);
   }
   try {
-    const summary = await runSeeHowDetection({ contextPath, generateIdsFn });
+    const summary = await runSeeHowDetection({ contextPath, generateIdsFn, kept });
     console.log(`[notes] Shard see-how (${contextPath}): ${summary}`);
     return summary;
   } catch (err) {
@@ -449,7 +459,7 @@ const CROSS_BOOK_INDEX_REL = 'data/cache/crossbook_seehow_index.json';
  * @param {string} args.pipeDir - Pipeline working directory
  * @returns {Promise<string>} Summary of see-how detections
  */
-async function runSeeHowDetection({ pipeDir, contextPath, generateIdsFn = generateIds }) {
+async function runSeeHowDetection({ pipeDir, contextPath, generateIdsFn = generateIds, kept = null }) {
   const ctx = readContextAt(pipeDir, contextPath);
   const prepPath = path.resolve(CSKILLBP_DIR, ctx.runtime.preparedNotes);
   const prepared = JSON.parse(fs.readFileSync(prepPath, 'utf8'));
@@ -730,6 +740,19 @@ async function runSeeHowDetection({ pipeDir, contextPath, generateIdsFn = genera
   };
   const injections = [];
   const injectedAt = new Set();
+  // An editor-kept note already sits at its verse and quote in en_tn: claim
+  // those slots so no pointer is synthesized there (its repeats keep their own
+  // notes instead of folding into a pointer that would duplicate the kept one).
+  for (const k of kept || []) {
+    const span = k.quote ? keptRefVerseSpan(k.ref, chapter) : null;
+    if (!span) continue;
+    // Claim both token forms of a discontinuous "a & b" quote: split on "&"
+    // (as recurrence keys are built) and as written.
+    const forms = new Set([String(k.quote).split('&').flatMap(hebTokens).join('+'), hebTokens(k.quote).join('+')]);
+    for (let v = span.lo; v <= span.hi && v - span.lo < 200; v++) {
+      for (const toks of forms) injectedAt.add(`${chapter}:${v}|${toks}`);
+    }
+  }
 
   // Resolve every anchor -- prepared groups and standalone injections alike --
   // before assigning any corpus-derived verses: which key may list which verses
@@ -1872,7 +1895,10 @@ function ultVerseNumbers(ultPlainText, chapter) {
   return nums;
 }
 
-function findEmptyVerses({ issuesText, ultPlainText, chapter, book = '' }) {
+// keptRefs: ref strings ("40:12", "40:12-14", "40:48-41:2") of editor-kept
+// notes. A verse they cover already has a note in en_tn, so it is not empty
+// for gap-fill.
+function findEmptyVerses({ issuesText, ultPlainText, chapter, book = '', keptRefs = [] }) {
   const wanted = ultVerseNumbers(ultPlainText, chapter);
   if (wanted.size === 0) return [];
   const { lines } = splitIssueRows(issuesText);
@@ -1880,6 +1906,11 @@ function findEmptyVerses({ issuesText, ultPlainText, chapter, book = '' }) {
   for (const r of issueRowRefs(lines, book, chapter)) {
     if (!r) continue;
     for (let v = r.start; v <= r.end && v - r.start < 200; v++) covered.add(v);
+  }
+  for (const kr of keptRefs || []) {
+    const span = keptRefVerseSpan(kr, chapter);
+    if (!span) continue;
+    for (let v = span.lo; v <= span.hi && v - span.lo < 200; v++) covered.add(v);
   }
   return [...wanted].filter((v) => !covered.has(v)).sort((a, b) => a - b);
 }
@@ -1928,7 +1959,7 @@ function mergeGapIssues({ chapterText, shardText, verses, chapter, book = '', kn
 
 async function fillIssueGaps({
   book, ch, issuesPath, contextPath, ctxFlag = '', ultPlainPath, pipeDir, model, status = async () => {},
-  userId, runClaudeImpl = runClaude, recordMetricsImpl = recordMetrics,
+  userId, runClaudeImpl = runClaude, recordMetricsImpl = recordMetrics, keptRefs = [],
 }) {
   const out = { empty: [], added: 0, remaining: [], pause: null, error: null };
   const ref = `${book} ${ch}`;
@@ -1962,7 +1993,7 @@ async function fillIssueGaps({
     }
     if (!fs.existsSync(issuesAbs)) { writeMarker(); return out; }
     const empty = findEmptyVerses({
-      issuesText: fs.readFileSync(issuesAbs, 'utf8'), ultPlainText: ultText, chapter: ch, book,
+      issuesText: fs.readFileSync(issuesAbs, 'utf8'), ultPlainText: ultText, chapter: ch, book, keptRefs,
     });
     out.empty = empty;
     out.remaining = empty;
@@ -2057,7 +2088,7 @@ async function fillIssueGaps({
     fs.writeFileSync(issuesAbs, merged.text);
     mergeWritten = true;
     out.added = merged.added;
-    const nowEmpty = findEmptyVerses({ issuesText: merged.text, ultPlainText: ultText, chapter: ch, book });
+    const nowEmpty = findEmptyVerses({ issuesText: merged.text, ultPlainText: ultText, chapter: ch, book, keptRefs });
     out.remaining = nowEmpty;
 
     if (merged.added === 0) {
@@ -2417,6 +2448,8 @@ function buildParsedNotesRequest(route, content) {
       // Zulip-triggered runs fall through to parseWriteNotesCommand and
       // never carry hints.
       hints: Array.isArray(route._hints) && route._hints.length > 0 ? route._hints : null,
+      // Editor-kept notes (API-origin only), same reasoning as hints.
+      kept: Array.isArray(route._kept) && route._kept.length > 0 ? route._kept : null,
     };
   }
   return parseWriteNotesCommand(content);
@@ -2627,7 +2660,7 @@ function appendIssueTagsToTsv(tsvRelPath, unresolvedFindings) {
 async function runParallelTnWriter({
   book, ch, tag, issuesPath, outputPath, ctxFlag, model,
   timeoutMs, appendSystemPrompt, checkpointRef, existingShards,
-  status, isDryRun, skillRef,
+  status, isDryRun, skillRef, kept = null,
 }) {
   // Split issues into chunks
   const chunkResult = splitTsv({ inputTsv: issuesPath, chunkSize: TN_WRITER_CHUNK_SIZE });
@@ -2749,7 +2782,7 @@ async function runParallelTnWriter({
       // the prepared notes the writer session reads are the post-detection ones.
       const shardContextRel = parseContextPathFlag(shardCtxFlag);
       if (shardContextRel) {
-        await runShardSeeHowDetection({ contextPath: shardContextRel, issuesPath: shard.chunkPath });
+        await runShardSeeHowDetection({ contextPath: shardContextRel, issuesPath: shard.chunkPath, kept, chapter: ch });
       }
 
       console.log(`[notes] tn-writer shard ${i}: ${prompt}`);
@@ -2924,6 +2957,9 @@ async function notesPipeline(route, message) {
   const { book, startChapter, endChapter, verseStart, verseEnd, withIntro, fresh, pauseBeforeATs } = parsed;
   // Editor-marked TN hints (API-origin only; null on Zulip path).
   const hints = parsed.hints || null;
+  let kept = parsed.kept || null;
+  // Plain array so it serializes into deferredChapters (insertion-resume).
+  let keptIds = kept ? kept.map((k) => k.rowId) : [];
   const sessionKey = stream ? `stream-${stream}-${topic}` : `dm-${message.sender_id}`;
   const checkpointRef = {
     sessionKey,
@@ -3001,11 +3037,20 @@ async function notesPipeline(route, message) {
     resumeChapter = startChapter;
     resumeSkill = null;
   }
+  // A resume that arrives without the kept list (a bare "resume" in the topic
+  // rebuilds the route from the checkpoint) reuses the list the run started
+  // with; otherwise a whole-chapter replace would delete the kept rows.
+  if (!kept && resumingFromCheckpoint && Array.isArray(existingCheckpoint?.kept) && existingCheckpoint.kept.length > 0) {
+    kept = existingCheckpoint.kept;
+    keptIds = kept.map((k) => k.rowId);
+    await status(`Using the ${kept.length} kept notes saved with this run's checkpoint.`);
+  }
   setCheckpoint(checkpointRef, {
     state: 'running',
     totalSuccess,
     totalFail,
     skillOutputs,
+    kept: kept || null,
     resume: { chapter: resumeChapter, skill: resumeSkill, ...(resumeGatePending && resumingFromCheckpoint ? { gatePending: true } : {}) },
   });
 
@@ -3300,6 +3345,7 @@ async function notesPipeline(route, message) {
         const gap = await fillIssueGaps({
           book, ch, issuesPath, contextPath, ctxFlag, ultPlainPath, pipeDir, model, status,
           userId: message.sender_id,
+          keptRefs: kept ? kept.map((k) => k.ref) : [],
         });
         if (gap.pause) {
           // Same abort handling as a usage-limit / outage in the skills loop: stop
@@ -3528,6 +3574,32 @@ async function notesPipeline(route, message) {
             }
           }
 
+          // Editor-kept notes stay in en_tn untouched, so drop prepared items
+          // that duplicate one (nothing is injected for them). Before see-how,
+          // so see-how never folds other verses into a note that is then
+          // dropped; see-how gets the kept list so it does not synthesize a
+          // pointer at a kept note's verse and quote either.
+          const keptHere = (kept || []).filter((k) => keptRefVerseSpan(k.ref, ch)).length;
+          if (keptHere > 0) {
+            try {
+              const dropped = applyKeptToPreparedNotes({
+                preparedJson: readContext(pipeDir).runtime.preparedNotes,
+                kept,
+                chapter: ch,
+              }).itemsRemoved;
+              await status(
+                `**${ref}**: ${keptHere} kept notes from the editor will stay in place; ` +
+                `${dropped} AI notes dropped as duplicates of them`,
+              );
+            } catch (keptErr) {
+              console.error(`[notes] applyKeptToPreparedNotes failed: ${keptErr.message}`);
+              await status(
+                `**${ref}**: ${keptHere} kept notes from the editor will stay in place, but the duplicate check failed ` +
+                `(${keptErr.message}); only exact duplicates are dropped at push.`,
+              );
+            }
+          }
+
           // Build the book-scoped recurrence index. Non-fatal: without it the
           // detector still folds same-chapter repeats, it just cannot point at
           // earlier chapters.
@@ -3539,13 +3611,14 @@ async function notesPipeline(route, message) {
 
           // Run see-how detection after mechanical prep
           try {
-            const seeHowSummary = await runSeeHowDetection({ pipeDir });
+            const seeHowSummary = await runSeeHowDetection({ pipeDir, kept });
             if (seeHowSummary !== SEE_HOW_ZERO_SUMMARY) {
               await status(`**${ref}**: See-how detection — ${seeHowSummary}`);
             }
           } catch (seeHowErr) {
             console.warn(`[notes] See-how detection failed (non-fatal): ${seeHowErr.message}`);
           }
+
         } catch (err) {
           console.error(`[notes] Mechanical prep failed for ${ref}: ${err.message}`);
           await status(`**${ref}**: Mechanical prep failed — ${err.message}. Claude will run prep via MCP tools.`);
@@ -3709,7 +3782,7 @@ async function notesPipeline(route, message) {
           const parallelResult = await runParallelTnWriter({
             book, ch, tag, issuesPath, outputPath: skill.expectedOutput, ctxFlag,
             model: model || skill.model, timeoutMs, appendSystemPrompt: skill.appendSystemPrompt,
-            checkpointRef, existingShards, status, isDryRun, skillRef,
+            checkpointRef, existingShards, status, isDryRun, skillRef, kept,
           });
           if (parallelResult) {
             // Parallel mode was used (chapter had enough verses to split)
@@ -4342,7 +4415,7 @@ async function notesPipeline(route, message) {
 
     // If push is already deferred due to conflicting branches, collect and skip
     if (deferredPush) {
-      deferredChapters.push({ ch, notesSource, replaceChapter: !hasVerseRange, body: gatePrBodyForPush({ gateResult: issueRulesGateResult, issuesPath, book }) });
+      deferredChapters.push({ ch, notesSource, replaceChapter: !hasVerseRange, keptIds, body: gatePrBodyForPush({ gateResult: issueRulesGateResult, issuesPath, book }) });
       await status(`**door43-push deferred** for ${ref} (waiting for conflicting branches to be merged)`);
       totalSuccess++;
       continue;
@@ -4379,7 +4452,7 @@ async function notesPipeline(route, message) {
       if (conflicts.length > 0) {
         deferredPush = true;
         deferredConflicts = conflicts;
-        deferredChapters.push({ ch, notesSource, replaceChapter: !hasVerseRange, body: gatePrBodyForPush({ gateResult: issueRulesGateResult, issuesPath, book }) });
+        deferredChapters.push({ ch, notesSource, replaceChapter: !hasVerseRange, keptIds, body: gatePrBodyForPush({ gateResult: issueRulesGateResult, issuesPath, book }) });
         await status(`**door43-push deferred** for ${ref}: conflicting branches found — ${conflicts.map(c => c.branch).join(', ')}`);
         totalSuccess++;
         continue;
@@ -4397,6 +4470,7 @@ async function notesPipeline(route, message) {
         source: notesSource,
         // Whole-chapter run (no verse range): replace the whole chapter in en_tn.
         replaceChapter: !hasVerseRange,
+        keptIds,
         body: gatePrBodyForPush({ gateResult: issueRulesGateResult, issuesPath, book }),
       });
       if (!pushResult.success) {
