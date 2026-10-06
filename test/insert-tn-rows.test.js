@@ -244,3 +244,64 @@ test('insertTnRows orders TN rows by ULT alignment quote sequence', () => {
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+// ---------------------------------------------------------------------------
+// Whole-chapter replace (replaceChapter) vs. default preservation (#435)
+// ---------------------------------------------------------------------------
+
+function wholeChapterFixture(dir) {
+  const bookFile = writeTsv(dir, 'en_tn_EZK.tsv', TN_HEADER, [
+    '39:1\tzzz1\t\t\t\t1\tOther chapter note',
+    '40:intro\tint1\t\t\t\t1\tOld intro',
+    '40:1\told1\t\t\tlegacy english\t1\tOld note covered by source',
+    '40:8\told8\t\t\tlegacy english\t1\tLegacy note in uncovered verse',
+    '40:11\tkp11\tKEEP\t\tlegacy english\t1\tKEEP note in uncovered verse',
+    '40:23\told9\t\t\tlegacy english\t1\tAnother legacy note',
+    '41:1\tzzz2\t\t\t\t1\tNext chapter note',
+  ]);
+  const sourceFile = writeTsv(dir, 'EZK-40-source.tsv', TN_HEADER, [
+    '40:intro\tni01\t\t\t\t1\tNew intro',
+    '40:1\tnew1\t\t\tnew quote\t1\tNew note',
+  ]);
+  return { bookFile, sourceFile };
+}
+
+test('replaceChapter removes non-KEEP rows in uncovered verses, keeps KEEP, intro, other chapters', () => {
+  const dir = makeTempDir();
+  try {
+    const { bookFile, sourceFile } = wholeChapterFixture(dir);
+    const log = insertTnRows({ bookFile, sourceFile, chapter: 40, replaceChapter: true });
+    const rows = readRows(bookFile);
+    const ids = rows.map((r) => r.split('\t')[1]);
+    assert.deepEqual(ids.sort(), ['kp11', 'ni01', 'new1', 'zzz1', 'zzz2'].sort());
+    assert.ok(log.includes('whole-chapter replace): 40:8, 40:23'), log);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('replaceChapter keeps the existing intro when skipIntro is set', () => {
+  const dir = makeTempDir();
+  try {
+    const { bookFile, sourceFile } = wholeChapterFixture(dir);
+    insertTnRows({ bookFile, sourceFile, chapter: 40, skipIntro: true, replaceChapter: true });
+    const ids = readRows(bookFile).map((r) => r.split('\t')[1]);
+    assert.ok(ids.includes('int1'), 'existing intro preserved');
+    assert.ok(!ids.includes('old8'), 'legacy row removed');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('default (replaceChapter false) preserves rows in uncovered verses as before', () => {
+  const dir = makeTempDir();
+  try {
+    const { bookFile, sourceFile } = wholeChapterFixture(dir);
+    const log = insertTnRows({ bookFile, sourceFile, chapter: 40 });
+    const ids = readRows(bookFile).map((r) => r.split('\t')[1]);
+    assert.deepEqual(ids.sort(), ['kp11', 'new1', 'ni01', 'old8', 'old9', 'zzz1', 'zzz2'].sort());
+    assert.ok(!log.includes('whole-chapter replace'));
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});

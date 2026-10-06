@@ -274,6 +274,8 @@ async function runNotesInsertPhase(completedChapters, username, book, notify) {
         username, branch: buildBranchName(book, ch.ch),
         source: ch.notesSource || extractSourceFromPrompt(ch.repoInsertPrompt),
         body: ch.body || '',
+        // Carried from the original run; entries saved before this field existed resume as false.
+        replaceChapter: ch.replaceChapter === true,
       });
       if (!pushResult.success) {
         console.error(`[insertion-resume] door43-push TN failed for ${book} ${ch.ch}: ${pushResult.details}`);
