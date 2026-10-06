@@ -16,9 +16,9 @@ const { sendMessage, sendDM, addReaction, removeReaction } = require('./zulip-cl
 const { runClaude, DEFAULT_RESTRICTED_TOOLS, isTransientOutageError, isGuardrailStop, resultIndicatesPermissionWall, resultIndicatesPermissionStall } = require('./claude-runner');
 const { createGuardHooks } = require('./guard-hooks');
 const { resolveAutoModel } = require('./api-runner/provider-config');
-const { getDoor43Username, emailToFallbackUsername, buildBranchName, resolveOutputFile, discoverFreshOutput, checkPrerequisites, calcSkillTimeout, normalizeBookName, resolveConflictMention, parsePartialTsv, truncatePartialTsv, parseChunkRange, isUsageLimitError, CSKILLBP_DIR } = require('./pipeline-utils');
+const { getDoor43Username, emailToFallbackUsername, buildBranchName, resolveOutputFile, discoverFreshOutput, checkPrerequisites, calcSkillTimeout, calcVerseSpanTimeout, normalizeBookName, resolveConflictMention, parsePartialTsv, truncatePartialTsv, parseChunkRange, isUsageLimitError, CSKILLBP_DIR } = require('./pipeline-utils');
 const { splitTsv, fixTrailingNewlines } = require('./workspace-tools/tsv-tools');
-const { fillTsvIds, generateIds, prepareNotes, fillOrigQuotes, resolveGlQuotes, flagNarrowQuotes, extractAlignmentData, prepareATContext, substituteAT, fixUnicodeQuotes, verifyBoldMatches, syncCanonicalHebrewQuotes, applyHintsToPreparedNotes, _stripAlternateTranslation: stripAlternateTranslation } = require('./workspace-tools/tn-tools');
+const { fillTsvIds, generateIds, prepareNotes, fillOrigQuotes, resolveGlQuotes, flagNarrowQuotes, extractAlignmentData, prepareATContext, substituteAT, fixUnicodeQuotes, verifyBoldMatches, syncCanonicalHebrewQuotes, applyHintsToPreparedNotes, parsePlainUsfmVersesFromText, detectIssuesTsvLayout, extractIssuesTsvRow, _stripAlternateTranslation: stripAlternateTranslation } = require('./workspace-tools/tn-tools');
 const { checkTnQuality, detectSelfTalk, templateFirstPhrase, resolveTemplateText } = require('./workspace-tools/quality-tools');
 const { buildBookRecurrenceIndex, deriveRecurrenceKeys, buildSeeHowSentence, isSeeHowEligible, isContextDependentSref, dedupeAlsoOccursVerses, assignAlsoOccursVerses, resolveDoor43ReposPath, hebTokens, verseNumber: recurrenceVerseNumber, SEE_HOW_NEVER_FOLD_SREFS, CROSS_BOOK_MAX_BOOKS } = require('./workspace-tools/recurrence-index');
 const { normalizeIssuesFile, buildParallelismIntroHintArgs } = require('./issue-normalizer');
@@ -1827,6 +1827,278 @@ function buildIssuesPath(book, tag, hasVerseRange, verseStart, verseEnd) {
   return `output/issues/${book}/${tag}-v${verseStart}-${verseEnd}.tsv`;
 }
 
+// --- Issue gap-fill -----------------------------------------------------------
+// A whole-chapter run can leave verses with zero issues (EZK 40: v8, 11, 23,
+// 25-37, ...), so tn-writer writes nothing there and legacy notes survive.
+// When 2+ verses are empty we re-run deep-issue-id over their span and merge
+// only the rows for the empty verses.
+
+// Parse an issues-TSV reference ("40:8", "EZK 40:8-9") into { start, end } for
+// the given chapter. Returns null for intro/front rows, other chapters, or junk.
+function parseIssueRefVerses(ref, chapter) {
+  const m = String(ref || '').trim().match(/^(?:[A-Za-z0-9]{2,3}\s+)?(\d+):(\d+)(?:-(\d+)(?![\d:]))?/);
+  if (!m || parseInt(m[1], 10) !== Number(chapter)) return null;
+  const start = parseInt(m[2], 10);
+  const end = m[3] ? parseInt(m[3], 10) : start;
+  return { start, end: Math.max(start, end) };
+}
+
+function splitIssueRows(text) {
+  const eol = String(text || '').includes('\r\n') ? '\r\n' : '\n';
+  const lines = String(text || '').split(/\r?\n/);
+  const trailing = lines.length > 0 && lines[lines.length - 1] === '';
+  if (trailing) lines.pop();
+  return { lines, eol, trailing };
+}
+
+function issueRowRefs(lines, book, chapter) {
+  const nonBlank = lines.filter((l) => l.trim());
+  const layout = detectIssuesTsvLayout(nonBlank);
+  const headerLine = layout.skipFirstLine ? nonBlank[0] : null;
+  return lines.map((line) => {
+    if (!line.trim() || line === headerLine) return null;
+    const row = extractIssuesTsvRow(line.split('\t'), layout.colMap, book);
+    return parseIssueRefVerses(row.reference, chapter);
+  });
+}
+
+function ultVerseNumbers(ultPlainText, chapter) {
+  const ultVerses = parsePlainUsfmVersesFromText(ultPlainText);
+  const nums = new Set();
+  for (const key of Object.keys(ultVerses)) {
+    const [c, v] = key.split(':').map(Number);
+    if (c === Number(chapter) && Number.isFinite(v)) nums.add(v);
+  }
+  return nums;
+}
+
+function findEmptyVerses({ issuesText, ultPlainText, chapter, book = '' }) {
+  const wanted = ultVerseNumbers(ultPlainText, chapter);
+  if (wanted.size === 0) return [];
+  const { lines } = splitIssueRows(issuesText);
+  const covered = new Set();
+  for (const r of issueRowRefs(lines, book, chapter)) {
+    if (!r) continue;
+    for (let v = r.start; v <= r.end && v - r.start < 200; v++) covered.add(v);
+  }
+  return [...wanted].filter((v) => !covered.has(v)).sort((a, b) => a - b);
+}
+
+function mergeGapIssues({ chapterText, shardText, verses, chapter, book = '', knownVerses = null }) {
+  const gap = new Set(verses || []);
+  const chapterRows = splitIssueRows(chapterText);
+  const shardRows = splitIssueRows(shardText);
+  const shardRefs = issueRowRefs(shardRows.lines, book, chapter);
+  const newRows = [];
+  shardRows.lines.forEach((line, i) => {
+    const r = shardRefs[i];
+    if (!r) return;
+    // Admit a row only when every verse in its range is a gap verse. A verse
+    // that is not its own ULT verse (the tail of a \v 6-7 bridge, keyed by 6)
+    // does not count against the row.
+    if (r.end - r.start >= 200) return;
+    let fillsGap = false;
+    for (let v = r.start; v <= r.end; v++) {
+      if (gap.has(v)) fillsGap = true;
+      else if (!(knownVerses && !knownVerses.has(v))) return;
+    }
+    if (!fillsGap) return;
+    newRows.push({ line, start: r.start });
+  });
+  if (newRows.length === 0) return { text: chapterText, added: 0 };
+
+  const lines = chapterRows.lines.slice();
+  for (const nr of newRows) {
+    const refs = issueRowRefs(lines, book, chapter);
+    let at = -1;
+    for (let i = 0; i < lines.length; i++) {
+      if (refs[i] && refs[i].start <= nr.start) at = i + 1;
+    }
+    if (at === -1) {
+      // Before the first existing verse row; after any header/intro rows.
+      const first = refs.findIndex((r) => r);
+      at = first === -1 ? lines.length : first;
+    }
+    lines.splice(at, 0, nr.line);
+  }
+  const eol = chapterRows.lines.length ? chapterRows.eol : shardRows.eol;
+  const trailing = chapterRows.lines.length ? chapterRows.trailing : true;
+  return { text: lines.join(eol) + (trailing ? eol : ''), added: newRows.length };
+}
+
+async function fillIssueGaps({
+  book, ch, issuesPath, contextPath, ctxFlag = '', ultPlainPath, pipeDir, model, status = async () => {},
+  userId, runClaudeImpl = runClaude, recordMetricsImpl = recordMetrics,
+}) {
+  const out = { empty: [], added: 0, remaining: [], pause: null, error: null };
+  const ref = `${book} ${ch}`;
+  const width = book.toUpperCase() === 'PSA' ? 3 : 2;
+  const tag = `${book}-${String(ch).padStart(width, '0')}`;
+  const pipeAbs = path.resolve(CSKILLBP_DIR, pipeDir || path.join('tmp', 'pipeline', tag));
+  let shardAbs = null;
+  let preexistingAside = null;
+  // Set once the chapter issues are snapshotted; the finally block restores the
+  // snapshot if the run damaged the file and we did not write the merge.
+  let issuesAbsForRestore = null;
+  let chapterSnapshot = null;
+  let mergeWritten = false;
+  const writeMarker = () => {
+    try {
+      fs.mkdirSync(pipeAbs, { recursive: true });
+      fs.writeFileSync(path.join(pipeAbs, 'gapfill-done.json'), JSON.stringify({
+        empty: out.empty, added: out.added, remaining: out.remaining, error: out.error, at: new Date().toISOString(),
+      }));
+    } catch (_) { /* marker is best-effort */ }
+  };
+  try {
+    const issuesAbs = path.resolve(CSKILLBP_DIR, issuesPath);
+    const ultAbs = ultPlainPath ? path.resolve(CSKILLBP_DIR, ultPlainPath) : null;
+    let ultText = '';
+    try { ultText = ultAbs ? fs.readFileSync(ultAbs, 'utf8') : ''; } catch (_) { ultText = ''; }
+    if (ultVerseNumbers(ultText, ch).size === 0) {
+      await status(`**${ref}**: issue gap-fill skipped: no ULT verse list`);
+      writeMarker();
+      return out;
+    }
+    if (!fs.existsSync(issuesAbs)) { writeMarker(); return out; }
+    const empty = findEmptyVerses({
+      issuesText: fs.readFileSync(issuesAbs, 'utf8'), ultPlainText: ultText, chapter: ch, book,
+    });
+    out.empty = empty;
+    out.remaining = empty;
+    if (empty.length < 2) { writeMarker(); return out; }
+    // Snapshot the chapter issues so the merge base cannot be changed by the run.
+    chapterSnapshot = fs.readFileSync(issuesAbs, 'utf8');
+    issuesAbsForRestore = issuesAbs;
+
+    const S = empty[0];
+    const E = empty[empty.length - 1];
+    const shardRel = buildIssuesPath(book, tag, true, S, E);
+    shardAbs = path.resolve(CSKILLBP_DIR, shardRel);
+    fs.mkdirSync(path.dirname(shardAbs), { recursive: true });
+    fs.mkdirSync(pipeAbs, { recursive: true });
+    // A real file already at the shard path belongs to someone else: park it and
+    // restore it when we finish.
+    if (fs.existsSync(shardAbs) && fs.statSync(shardAbs).size > 0) {
+      preexistingAside = path.join(pipeAbs, `gapfill-preexisting-v${S}-${E}.tsv`);
+      fs.copyFileSync(shardAbs, preexistingAside);
+    }
+    fs.writeFileSync(shardAbs, ''); // stub so Claude skips Read-before-Write
+
+    await status(`**${ref}**: ${empty.length} verses have no issues (${empty.join(', ')}); re-running issue finding over ${S}-${E}...`);
+
+    // Same per-verse-per-op idea as calcSkillTimeout, over the span (ops 3 as deep-issue-id).
+    const timeoutMs = calcVerseSpanTimeout(E - S + 1, 3);
+    const guardrails = buildSkillGuardrails({
+      pipeline: 'notes', skill: 'deep-issue-id', book, chapter: ch, issuesPath, contextPath,
+    });
+    const toolConfig = getSkillToolConfig('deep-issue-id');
+    let result = null;
+    let runErr = null;
+    try {
+      result = await runClaudeImpl({
+        prompt: `${book} ${ch} --verses ${S}-${E}${ctxFlag}`,
+        label: `${ref} deep-issue-id gap-fill`,
+        cwd: CSKILLBP_DIR,
+        // Same precedence as the main skill loop (no per-skill model here).
+        model: model || (process.env.BP_AUTO_MODEL === '1'
+          ? resolveAutoModel('claude', null, 'xhigh')
+          : undefined),
+        thinking: 'xhigh',
+        skill: 'deep-issue-id',
+        tools: toolConfig.tools,
+        disallowedTools: toolConfig.disallowedTools,
+        enableBash: toolConfig.enableBash,
+        bypassPermissions: true,
+        disableLocalSettings: true,
+        timeoutMs,
+        maxTurns: guardrails.maxTurns,
+        appendSystemPrompt: DEEP_ISSUE_ID_HINT,
+        mcpToolSet: 'issue-id',
+        guardrails,
+        hooks: process.env.BP_GUARD_HOOKS === '1'
+          ? createGuardHooks({ pipelineType: 'notes', scope: ref, publish: true })
+          : undefined,
+      });
+    } catch (err) {
+      runErr = err;
+    }
+    try {
+      recordMetricsImpl({
+        pipeline: 'notes', skill: 'deep-issue-id-gapfill', book, chapter: ch, result,
+        success: !runErr && result?.subtype === 'success', userId,
+      });
+    } catch (_) { /* metrics are best-effort */ }
+
+    const errText = runErr
+      ? (runErr.message || String(runErr))
+      : (!result ? 'timed out or was aborted (no result returned)'
+        : (result.subtype !== 'success' ? (result.error || result.result || `non-success subtype: "${result.subtype}"`) : null));
+    if (errText) {
+      out.error = errText;
+      if (runErr && isTransientOutageError(runErr)) out.pause = 'outage';
+      else if (isUsageLimitError(errText)) out.pause = 'usage_limit';
+      // The caller posts the pause message; only non-pause failures continue quietly.
+      if (!out.pause) {
+        await status(`**${ref}**: issue gap-fill failed (${errText}); continuing with the original issues.`);
+        writeMarker();
+      }
+      return out;
+    }
+
+    let shardText = '';
+    try { shardText = fs.readFileSync(shardAbs, 'utf8'); } catch (_) { shardText = ''; }
+    const merged = mergeGapIssues({
+      chapterText: chapterSnapshot, shardText, verses: empty, chapter: ch, book,
+      knownVerses: ultVerseNumbers(ultText, ch),
+    });
+    // Always write from the snapshot: deep-issue-id only writes its range file,
+    // but if it touched the chapter file this puts it back.
+    fs.writeFileSync(issuesAbs, merged.text);
+    mergeWritten = true;
+    out.added = merged.added;
+    const nowEmpty = findEmptyVerses({ issuesText: merged.text, ultPlainText: ultText, chapter: ch, book });
+    out.remaining = nowEmpty;
+
+    if (merged.added === 0) {
+      out.error = 'no rows for the empty verses';
+      await status(`**${ref}**: issue gap-fill found no new issues; verses still empty: ${nowEmpty.join(', ') || 'none'}.`);
+    } else {
+      await status(`**${ref}**: issue gap-fill added ${merged.added} row(s); verses still empty: ${nowEmpty.join(', ') || 'none'}.`);
+    }
+    writeMarker();
+    return out;
+  } catch (err) {
+    out.error = err.message;
+    console.warn(`[notes] issue gap-fill error (non-fatal): ${err.stack || err.message}`);
+    try { await status(`**${ref}**: issue gap-fill failed (${err.message}); continuing with the original issues.`); } catch (_) { /* ignore */ }
+    writeMarker();
+    return out;
+  } finally {
+    // The gap-fill's own shard/stub must never stay in output/issues/ (it would
+    // collide with splitTsv chunk names / checkPrerequisites). Keep a copy of
+    // any non-empty shard in the pipe dir for debugging.
+    if (shardAbs) {
+      try {
+        if (fs.existsSync(shardAbs) && fs.statSync(shardAbs).size > 0) {
+          fs.mkdirSync(pipeAbs, { recursive: true });
+          fs.copyFileSync(shardAbs, path.join(pipeAbs, `gapfill-${path.basename(shardAbs)}`));
+        }
+      } catch (e) { console.warn(`[notes] gap-fill shard copy failed (non-fatal): ${e.message}`); }
+      try { fs.unlinkSync(shardAbs); } catch (_) { /* already gone */ }
+      if (preexistingAside) {
+        try { fs.copyFileSync(preexistingAside, shardAbs); } catch (e) { console.warn(`[notes] restoring pre-existing shard failed: ${e.message}`); }
+      }
+    }
+    if (issuesAbsForRestore && !mergeWritten) {
+      try {
+        const now = fs.existsSync(issuesAbsForRestore) ? fs.readFileSync(issuesAbsForRestore, 'utf8') : null;
+        if (now !== chapterSnapshot) fs.writeFileSync(issuesAbsForRestore, chapterSnapshot);
+      } catch (e) { console.warn(`[notes] restoring chapter issues snapshot failed: ${e.message}`); }
+    }
+  }
+}
+
 function buildChapterIntroPrompt(skillRef, issuesPath, ctxFlag, introHintArgs = '') {
   return `${skillRef} --issues ${issuesPath}${ctxFlag}${introHintArgs || ''}`;
 }
@@ -2972,6 +3244,48 @@ async function notesPipeline(route, message) {
 
     async function runIssueNormalizationStage() {
       if (!issuesPath || issueNormalizationDone) return;
+
+      // Gap-fill: whole-chapter runs only, never dry-run, never when resuming at
+      // a downstream skill. Runs before normalization so new rows go through the
+      // normalizer and the issue-rules gate.
+      // Skip only when resuming AFTER tn-writer: a gap-fill pause resumes at
+      // tn-writer (gatePending) and must be retried. A marker from an earlier
+      // attempt skips a repeat on resume, unless the issue producer is being
+      // re-run (the issues file was regenerated). A fresh run archives pipeDir,
+      // so it never inherits an old marker.
+      const gapFillSkipResumeSkills = new Set(['tn-quality-check', 'door43-push', 'door43-push-done']);
+      const gapFillResumeMarker = isResumingThisChapter && !issueProducerSkillNames.has(resumeSkill) && pipeDir
+        && fs.existsSync(path.resolve(CSKILLBP_DIR, pipeDir, 'gapfill-done.json'));
+      // A resume at tn-writer reaches here only to re-run a pending gate; rows
+      // added now would otherwise skip the gate, so gap-fill only when it is pending.
+      const gapFillSkipForResume = isResumingThisChapter
+        && (gapFillSkipResumeSkills.has(resumeSkill) || (resumeSkill === 'tn-writer' && !resumeGatePending));
+      if (!hasVerseRange && !isDryRun && !gapFillSkipForResume && !gapFillResumeMarker && !pipeDir) {
+        await status(`**${ref}**: issue gap-fill skipped: no pipeline context`);
+      }
+      if (!hasVerseRange && !isDryRun && !gapFillSkipForResume && !gapFillResumeMarker && pipeDir) {
+        let ultPlainPath = null;
+        try { ultPlainPath = readContext(pipeDir).sources?.ultPlain || null; } catch (_) { ultPlainPath = null; }
+        const gap = await fillIssueGaps({
+          book, ch, issuesPath, contextPath, ctxFlag, ultPlainPath, pipeDir, model, status,
+          userId: message.sender_id,
+        });
+        if (gap.pause) {
+          // Same abort handling as a usage-limit / outage in the skills loop: stop
+          // spending into an outage. The issues file is unchanged.
+          issueRulesGatePaused = true;
+          if (gap.pause === 'usage_limit') {
+            abortForUsageLimit = true;
+            usageLimitTag = buildUsageLimitResetTag(gap.error);
+            const when = usageLimitTag ? ` around ${usageLimitTag}` : ' after the limit resets';
+            await status(`**issue gap-fill** paused for ${ref}: usage limit reached. Retry${when}.`);
+          } else {
+            abortForOutage = true;
+            await status(`**issue gap-fill** paused for ${ref}: Claude transient outage (${gap.error}).`);
+          }
+          return;
+        }
+      }
       const result = normalizeIssuesFile({
         issuesPath,
         options: {
@@ -4264,6 +4578,9 @@ module.exports = {
   buildChapterIntroPrompt,
   _applySkillSpecificGuardrails: applySkillSpecificGuardrails,
   _getSkillToolConfig: getSkillToolConfig,
+  _findEmptyVerses: findEmptyVerses,
+  _mergeGapIssues: mergeGapIssues,
+  _fillIssueGaps: fillIssueGaps,
   _appendIssueTagsToTsv: appendIssueTagsToTsv,
   _analyzeIssuesTsvShape: analyzeIssuesTsvShape,
   _countNoteRows: countNoteRows,
