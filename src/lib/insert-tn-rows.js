@@ -152,11 +152,16 @@ function buildKeepKeys(keepRows) {
     } else {
       // Claim every verse the kept row covers, so a single-verse AI row inside
       // a kept 40:12-14 range is still caught.
+      const ref = getReference(row);
       const tail = `\t${getSupportReference(row)}\t${getQuote(row)}`;
-      keys.add(`${getReference(row)}${tail}`);
-      const ch = getChapter(getReference(row));
-      const span = keptRefVerseSpan(getReference(row), ch);
-      if (span) for (let v = span.lo; v <= span.hi && v - span.lo < 200; v++) keys.add(`${ch}:${v}${tail}`);
+      keys.add(`${ref}${tail}`);
+      // A cross-chapter "40:48-41:2" covers verses in both chapters.
+      const m = ref.match(/^(\d+):\d+-(\d+):\d+$/);
+      const chapters = m ? [Number(m[1]), Number(m[2])] : [getChapter(ref)];
+      for (const ch of chapters) {
+        const span = keptRefVerseSpan(ref, ch);
+        if (span) for (let v = span.lo; v <= span.hi && v - span.lo < 200; v++) keys.add(`${ch}:${v}${tail}`);
+      }
     }
   }
   return keys;
@@ -416,11 +421,14 @@ function doFullChapter(bookRows, sourceRows, chapter, skipIntro, verseMap, log, 
   // Deduplicate source against KEEP rows. Editor-kept rows anywhere in the
   // chapter claim their whole verse span (a kept 40:12-14 blocks 40:13).
   const dedupRows = [...keepRows];
-  if (chapterStart !== null && keptIds.size > 0) {
-    for (let i = chapterStart; i < chapterEnd; i++) {
-      const ref = getReference(newRows[i]);
-      if (!sourceRefs.has(ref) && !isIntroRef(ref) && !hasKeepTag(newRows[i]) && isKeptRow(newRows[i], keptIds)) {
-        dedupRows.push(newRows[i]);
+  if (keptIds.size > 0) {
+    // Whole file, not just this chapter's span: a cross-chapter kept row
+    // (40:48-41:2) sits in chapter 40 but also covers 41:1-2.
+    for (const row of newRows) {
+      const ref = getReference(row);
+      if (!sourceRefs.has(ref) && !isIntroRef(ref) && !hasKeepTag(row) && isKeptRow(row, keptIds)
+        && keptRefVerseSpan(ref, chapter)) {
+        dedupRows.push(row);
       }
     }
   }

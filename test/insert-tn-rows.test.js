@@ -464,3 +464,24 @@ test('keptIds: a kept range row blocks a single-verse duplicate inside it', () =
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test('keptIds: a cross-chapter kept row blocks a duplicate in its second chapter', () => {
+  const dir = makeTempDir();
+  try {
+    const bookFile = writeTsv(dir, 'en_tn_EZK.tsv', TN_HEADER, [
+      '40:48-41:2\tkx48\t\tfigs-explicit\tשַׁעַר\t1\tKept cross-chapter note',
+      '41:3\told3\t\tfigs-idiom\tx\t1\tOld',
+    ]);
+    const sourceFile = writeTsv(dir, 'EZK-41-src.tsv', TN_HEADER, [
+      '41:1\tdu01\t\tfigs-explicit\tשַׁעַר\t1\tDuplicate',
+      '41:3\tne03\t\tfigs-idiom\ty\t1\tNew',
+    ]);
+    insertTnRows({ bookFile, sourceFile, chapter: 41, replaceChapter: true, keptIds: ['kx48'] });
+    const ids = readRows(bookFile).map((r) => r.split('\t')[1]);
+    assert.ok(ids.includes('kx48'));
+    assert.ok(!ids.includes('du01'));
+    assert.ok(ids.includes('ne03'));
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
