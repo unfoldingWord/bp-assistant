@@ -305,3 +305,23 @@ test('default (replaceChapter false) preserves rows in uncovered verses as befor
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test('replaceChapter keeps an out-of-order row from another chapter inside the chapter span', () => {
+  const dir = makeTempDir();
+  try {
+    const bookFile = writeTsv(dir, 'en_tn_EZK.tsv', TN_HEADER, [
+      '40:1\told1\t\t\tlegacy english\t1\tOld note covered by source',
+      '41:3\tstry\t\t\t\t1\tMisplaced next-chapter note',
+      '40:8\told8\t\t\tlegacy english\t1\tLegacy note in uncovered verse',
+    ]);
+    const sourceFile = writeTsv(dir, 'EZK-40-source.tsv', TN_HEADER, [
+      '40:1\tnew1\t\t\tnew quote\t1\tNew note',
+    ]);
+    const log = insertTnRows({ bookFile, sourceFile, chapter: 40, replaceChapter: true });
+    const ids = readRows(bookFile).map((r) => r.split('\t')[1]);
+    assert.deepEqual(ids.sort(), ['new1', 'stry'].sort());
+    assert.ok(log.includes('Removed 1 existing rows for verses in source'), log);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});

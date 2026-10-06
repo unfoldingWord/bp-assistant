@@ -410,8 +410,10 @@ function doFullChapter(bookRows, sourceRows, chapter, skipIntro, verseMap, log, 
           indicesToRemove.push(i);
           log.push(`  ${ref}: orphaned multi-verse row (anchor ${anchorVerse(ref)} covered by source)`);
         }
-      } else if (replaceChapter && !isIntroRef(ref) && !hasKeepTag(newRows[i])) {
+      } else if (replaceChapter && getChapter(ref) === chapter && !isIntroRef(ref) && !hasKeepTag(newRows[i])) {
         // Whole-chapter replace: drop legacy rows in verses the source did not cover.
+        // The chapter check keeps an out-of-order row from another chapter (or a
+        // malformed Reference) that happens to sit inside the chapter span.
         indicesToRemove.push(i);
         legacyRemovedRefs.push(ref);
       } else {
@@ -442,7 +444,7 @@ function doFullChapter(bookRows, sourceRows, chapter, skipIntro, verseMap, log, 
       log.push(`  Removed ${legacyRemovedRefs.length} legacy row(s) in verses not in source (whole-chapter replace): ${[...new Set(legacyRemovedRefs)].join(', ')}`);
     }
     if (preservedRows.length) {
-      log.push(`  Removed ${totalRemoved} existing rows for verses in source`);
+      log.push(`  Removed ${totalRemoved - legacyRemovedRefs.length} existing rows for verses in source`);
       log.push(`  Preserving ${preservedRows.length} existing rows for verses not in source`);
     } else {
       log.push(`  Removed ${totalRemoved} existing rows for chapter ${chapter}`);
