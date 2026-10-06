@@ -2935,9 +2935,9 @@ async function notesPipeline(route, message) {
   const { book, startChapter, endChapter, verseStart, verseEnd, withIntro, fresh, pauseBeforeATs } = parsed;
   // Editor-marked TN hints (API-origin only; null on Zulip path).
   const hints = parsed.hints || null;
-  const kept = parsed.kept || null;
+  let kept = parsed.kept || null;
   // Plain array so it serializes into deferredChapters (insertion-resume).
-  const keptIds = kept ? kept.map((k) => k.rowId) : [];
+  let keptIds = kept ? kept.map((k) => k.rowId) : [];
   const sessionKey = stream ? `stream-${stream}-${topic}` : `dm-${message.sender_id}`;
   const checkpointRef = {
     sessionKey,
@@ -3015,11 +3015,20 @@ async function notesPipeline(route, message) {
     resumeChapter = startChapter;
     resumeSkill = null;
   }
+  // A resume that arrives without the kept list (a bare "resume" in the topic
+  // rebuilds the route from the checkpoint) reuses the list the run started
+  // with; otherwise a whole-chapter replace would delete the kept rows.
+  if (!kept && resumingFromCheckpoint && Array.isArray(existingCheckpoint?.kept) && existingCheckpoint.kept.length > 0) {
+    kept = existingCheckpoint.kept;
+    keptIds = kept.map((k) => k.rowId);
+    await status(`Using the ${kept.length} kept notes saved with this run's checkpoint.`);
+  }
   setCheckpoint(checkpointRef, {
     state: 'running',
     totalSuccess,
     totalFail,
     skillOutputs,
+    kept: kept || null,
     resume: { chapter: resumeChapter, skill: resumeSkill, ...(resumeGatePending && resumingFromCheckpoint ? { gatePending: true } : {}) },
   });
 
@@ -3543,26 +3552,6 @@ async function notesPipeline(route, message) {
             }
           }
 
-          // Editor-kept notes stay in en_tn untouched, so drop prepared items
-          // that would duplicate one (nothing is injected for them).
-          if (Array.isArray(kept) && kept.length > 0) {
-            let dropped = 0;
-            try {
-              dropped = applyKeptToPreparedNotes({
-                preparedJson: readContext(pipeDir).runtime.preparedNotes,
-                kept,
-                chapter: ch,
-              }).itemsRemoved;
-            } catch (keptErr) {
-              console.error(`[notes] applyKeptToPreparedNotes failed (non-fatal): ${keptErr.message}`);
-            }
-            const keptHere = kept.filter((k) => Number(String(k.ref).split(':')[0]) === Number(ch)).length;
-            await status(
-              `**${ref}**: ${keptHere} kept notes from the editor will stay in place; ` +
-              `${dropped} AI notes dropped as duplicates of them`,
-            );
-          }
-
           // Build the book-scoped recurrence index. Non-fatal: without it the
           // detector still folds same-chapter repeats, it just cannot point at
           // earlier chapters.
@@ -3580,6 +3569,31 @@ async function notesPipeline(route, message) {
             }
           } catch (seeHowErr) {
             console.warn(`[notes] See-how detection failed (non-fatal): ${seeHowErr.message}`);
+          }
+
+          // Editor-kept notes stay in en_tn untouched, so drop prepared items
+          // that duplicate one (nothing is injected for them). After see-how:
+          // a pointer elsewhere can still target the verse, where the kept note
+          // stays, and see-how cannot synthesize a new anchor note there.
+          const keptHere = (kept || []).filter((k) => Number(String(k.ref).split(':')[0]) === Number(ch)).length;
+          if (keptHere > 0) {
+            try {
+              const dropped = applyKeptToPreparedNotes({
+                preparedJson: readContext(pipeDir).runtime.preparedNotes,
+                kept,
+                chapter: ch,
+              }).itemsRemoved;
+              await status(
+                `**${ref}**: ${keptHere} kept notes from the editor will stay in place; ` +
+                `${dropped} AI notes dropped as duplicates of them`,
+              );
+            } catch (keptErr) {
+              console.error(`[notes] applyKeptToPreparedNotes failed: ${keptErr.message}`);
+              await status(
+                `**${ref}**: ${keptHere} kept notes from the editor will stay in place, but the duplicate check failed ` +
+                `(${keptErr.message}); only exact duplicates are dropped at push.`,
+              );
+            }
           }
         } catch (err) {
           console.error(`[notes] Mechanical prep failed for ${ref}: ${err.message}`);

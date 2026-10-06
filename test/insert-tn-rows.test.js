@@ -403,3 +403,44 @@ test('keptIds: orphaned multi-verse kept row survives a narrowed source referenc
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test('keptIds: kept intro row is not replaced by the source intro', () => {
+  const dir = makeTempDir();
+  try {
+    const bookFile = writeTsv(dir, 'en_tn_EZK.tsv', TN_HEADER, [
+      '40:intro\tki01\t\t\t\t0\t# Kept intro',
+      '40:1\told1\t\tfigs-metaphor\tq\t1\tOld',
+    ]);
+    const sourceFile = writeTsv(dir, 'EZK-40-src.tsv', TN_HEADER, [
+      '40:intro\tnewi\t\t\t\t0\t# AI intro',
+      '40:1\tnew1\t\tfigs-metaphor\tq2\t1\tNew',
+    ]);
+    insertTnRows({ bookFile, sourceFile, chapter: 40, replaceChapter: true, keptIds: ['ki01'] });
+    const ids = readRows(bookFile).map((r) => r.split('\t')[1]);
+    assert.ok(ids.includes('ki01'));
+    assert.ok(!ids.includes('newi'));
+    assert.ok(ids.includes('new1'));
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('keptIds: kept row with blank SupportReference still blocks the same blank-sref quote; word joiners ignored', () => {
+  const dir = makeTempDir();
+  try {
+    const bookFile = writeTsv(dir, 'en_tn_EZK.tsv', TN_HEADER, [
+      '40:2\tkp02\t\t\tלֹא\t1\tKept, no support reference',
+    ]);
+    const sourceFile = writeTsv(dir, 'EZK-40-src.tsv', TN_HEADER, [
+      '40:2\tdup2\t\t\tלֹא\u2060\t1\tDuplicate',
+      '40:2\tnew2\t\tfigs-explicit\tלֹא\t1\tDifferent issue',
+    ]);
+    insertTnRows({ bookFile, sourceFile, chapter: 40, keptIds: ['kp02'] });
+    const ids = readRows(bookFile).map((r) => r.split('\t')[1]);
+    assert.ok(ids.includes('kp02'));
+    assert.ok(!ids.includes('dup2'));
+    assert.ok(ids.includes('new2'));
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});

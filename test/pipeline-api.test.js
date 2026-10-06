@@ -481,16 +481,25 @@ test('StartBodySchema — accepts kept on a multi-chapter scope', () => {
   assert.equal(r.success, true);
 });
 
-test('StartBodySchema — accepts 300 full-size kept entries, rejects 301', () => {
+test('StartBodySchema — accepts 5000 kept entries, rejects 5001', () => {
   const mk = (n) => Array.from({ length: n }, (_, i) => ({
-    rowId: 'a' + String(i).padStart(3, '0'),
+    rowId: 'a' + i.toString(36).padStart(3, '0'),
     ref: '40:12-14',
-    supportReference: 's'.repeat(200),
-    quote: 'q'.repeat(1000),
-    note: 'n'.repeat(400),
+    supportReference: 'figs-metaphor',
+    quote: 'מֵרֵעֵהוּ',
   }));
-  assert.equal(StartBodySchema.safeParse(keptBody(mk(300))).success, true);
-  assert.equal(StartBodySchema.safeParse(keptBody(mk(301))).success, false);
+  assert.equal(StartBodySchema.safeParse(keptBody(mk(5000))).success, true);
+  assert.equal(StartBodySchema.safeParse(keptBody(mk(5001))).success, false);
+});
+
+test('StartBodySchema — kept: cross-chapter ref accepted; backwards range and duplicate rowId rejected', () => {
+  assert.equal(StartBodySchema.safeParse(keptBody([{ ...VALID_KEPT, ref: '40:48-41:2' }])).success, true);
+  const back = StartBodySchema.safeParse(keptBody([{ ...VALID_KEPT, ref: '40:14-12' }]));
+  assert.equal(back.success, false);
+  assert.match(back.error.issues[0].message, /backwards/);
+  const dup = StartBodySchema.safeParse(keptBody([VALID_KEPT, { ...VALID_KEPT, ref: '40:13' }]));
+  assert.equal(dup.success, false);
+  assert.ok(dup.error.issues.some((i) => /duplicate kept rowId/.test(i.message)));
 });
 
 test('StartBodySchema — rejects malformed kept entries with a clear message', () => {

@@ -9,6 +9,7 @@ const path = require('path');
 const https = require('https');
 const crypto = require('crypto');
 const { normalizeIntroRow } = require('../lib/insert-tn-rows');
+const { HEBREW_QUOTE_STRIP_RE, stripHebrewQuoteMarks, normalizeQuote } = require('../lib/quote-normalize');
 const { buildSeeHowSentence, formatAlsoOccurs } = require('./recurrence-index');
 const { BOOK_NAMES } = require('../api-runner/verse-data');
 
@@ -1553,12 +1554,6 @@ function removeNote({ id, generatedJson, tsvFile }) {
   return `remove_note: ${msgs.join('; ')}.`;
 }
 
-const HEBREW_QUOTE_STRIP_RE = /[\u0591-\u05AF\u2060\u05BD\u05C3]/g;
-
-function stripHebrewQuoteMarks(value) {
-  return String(value || '').replace(HEBREW_QUOTE_STRIP_RE, '');
-}
-
 // -- Hint helpers --------------------------------------------------------
 //
 // Used by applyHintsToPreparedNotes (and exposed for tests) to compare
@@ -1566,23 +1561,11 @@ function stripHebrewQuoteMarks(value) {
 // suppress duplicate notes and inject the hint as a synthetic prepared item.
 
 const SUPPORT_REF_RC_PREFIX_RE = /^rc:\/\/[^/]+\/ta\/man\/translate\//;
-// Word-joiner (U+2060), soft hyphen (U+00AD), Hebrew maqaf-like word
-// dividers (U+05BE) and the existing cantillation set above are stripped
-// from quotes so fuzzy match isn't confused by invisible joiners that the
-// human and AI tooling handle differently.
-const QUOTE_INVISIBLE_RE = /[\u2060\u00AD]/g;
+// Quote normalization (cantillation, word joiners, soft hyphens stripped) lives
+// in lib/quote-normalize.js so insert-tn-rows compares quotes the same way.
 
 function normalizeSupportReference(s) {
   return String(s || '').trim().replace(SUPPORT_REF_RC_PREFIX_RE, '');
-}
-
-function normalizeQuote(s) {
-  return stripHebrewQuoteMarks(String(s || ''))
-    .normalize('NFC')
-    .replace(QUOTE_INVISIBLE_RE, '')
-    .replace(/\s+/g, ' ')
-    .trim()
-    .toLowerCase();
 }
 
 function quoteFuzzyMatch(a, b) {
@@ -1793,13 +1776,15 @@ function applyHintsToPreparedNotes({ preparedJson, hints, chapter }) {
 }
 
 /**
- * Drop prepared items already covered by an editor-kept note. Same match as the
- * hint suppression pass (verse, normalized support reference, fuzzy quote), but
- * nothing is injected: the kept note already exists in en_tn.
+ * Drop prepared items already covered by an editor-kept note: same verse,
+ * normalized support reference and normalized quote (exact after
+ * normalizeQuote, not fuzzy, so a note on a different phrase still lands).
+ * Nothing is injected: the kept note already exists in en_tn. The push-time
+ * dedup in insert-tn-rows uses the same key.
  *
  * A kept `ref` is "ch:v", "ch:v1-v2" (covers every verse in the range) or an
  * intro ref (never matches a verse item). Entries for other chapters are
- * ignored. An empty kept quote matches on (verse, support reference) only.
+ * ignored.
  *
  * @param {object} prepared - parsed prepared_notes.json ({ items: [...] })
  * @param {Array}  kept     - options.kept entries
@@ -1816,7 +1801,7 @@ function removePreparedItemsCoveredByKept(prepared, kept, chapter) {
     if (chapter != null && Number(m[1]) !== Number(chapter)) continue;
     const lo = Number(m[2]);
     const hi = m[3] ? Number(m[3]) : lo;
-    entries.push({ ch: Number(m[1]), lo, hi, sref: normalizeSupportReference(k.supportReference), quote: String(k.quote || '') });
+    entries.push({ ch: Number(m[1]), lo, hi, sref: normalizeSupportReference(k.supportReference), quote: normalizeQuote(k.quote) });
   }
   const out = items.filter((item) => {
     if (!item || item.fromHint) return true;
@@ -1824,12 +1809,15 @@ function removePreparedItemsCoveredByKept(prepared, kept, chapter) {
     if (v == null) return true;
     const itemCh = Number(String(item.reference).split(':')[0]);
     const sref = normalizeSupportReference(item.sref);
+    const quote = normalizeQuote(item.orig_quote);
     const covered = entries.some((e) =>
-      e.ch === itemCh && v >= e.lo && v <= e.hi && sref === e.sref
-      && (!e.quote || quoteFuzzyMatch(String(item.orig_quote || ''), e.quote)));
+      e.ch === itemCh && v >= e.lo && v <= e.hi && sref === e.sref && quote === e.quote);
     return !covered;
   });
-  return { prepared: { ...prepared, items: out }, removed: items.length - out.length };
+  const removed = items.length - out.length;
+  const next = { ...prepared, items: out };
+  if (removed > 0 && typeof prepared.item_count === 'number') next.item_count = out.length;
+  return { prepared: next, removed };
 }
 
 /** File wrapper: read prepared_notes.json, drop covered items, write it back. */

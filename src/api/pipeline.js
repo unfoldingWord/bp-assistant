@@ -29,11 +29,12 @@ const {
   detectLandedOutputs,
 } = require('./pipeline-output');
 
-// Bumped from 4KB to fit up to 50 hints with full prose seeds, then to 1MB so
-// 300 `kept` entries fit even at every field's cap (~1.7KB each in ASCII, more
-// for multi-byte Hebrew quotes). The per-field caps on HintSchema and
-// KeptSchema below bound the worst case under this.
-const MAX_BODY_BYTES = 1024 * 1024;
+// Bumped from 4KB to fit up to 50 hints with full prose seeds, then to 8MB for
+// `kept`: up to 5000 entries (a whole-book run) at every field's cap in
+// 3-byte UTF-8 (~4.8KB each) would not fit, but real entries (a short Hebrew
+// quote and a support reference, no note) are ~200 bytes, so 8MB leaves wide
+// room. The route is bearer-token authenticated and rate limited.
+const MAX_BODY_BYTES = 8 * 1024 * 1024;
 const RATE_LIMIT_RPM = 60;
 const RATE_LIMIT_WINDOW_MS = 60_000;
 
@@ -99,13 +100,19 @@ const HintSchema = z.object({
 );
 
 // Editor-kept notes: rows the AI run must leave in place and not duplicate.
-// ref is "ch:verse", "ch:v1-v2" or "ch:intro"/"ch:front"; carried as strings
-// the editor already holds, so empty supportReference/quote/note are allowed.
-const KEPT_REF_RE = /^\d+:(\d+(-\d+)?|intro|front)$/;
+// ref is "ch:verse", "ch:v1-v2", a cross-chapter "ch:v-ch:v", or
+// "ch:intro"/"ch:front"; carried as strings the editor already holds, so empty
+// supportReference/quote/note are allowed. Matching only uses same-chapter
+// refs; a cross-chapter row is still kept by its rowId.
+const KEPT_REF_RE = /^\d+:(\d+(-\d+(:\d+)?)?|intro|front)$/;
 
 const KeptSchema = z.object({
   rowId: z.string().regex(HINT_ROW_ID_RE),
-  ref: z.string().min(1).max(20).regex(KEPT_REF_RE, 'ref must look like 40:12, 40:12-14 or 40:intro'),
+  ref: z.string().min(1).max(20).regex(KEPT_REF_RE, 'ref must look like 40:12, 40:12-14, 40:48-41:2 or 40:intro')
+    .refine((ref) => {
+      const m = ref.match(/^\d+:(\d+)-(\d+)$/);
+      return !m || Number(m[1]) <= Number(m[2]);
+    }, 'ref range must not run backwards'),
   supportReference: z.string().max(200),
   quote: z.string().max(1000),
   note: z.string().max(400).optional(),
@@ -171,7 +178,7 @@ const OptionsSchema = z.object({
   hints: z.array(HintSchema).max(50).optional(),
   // Editor-kept notes (notes only). Unlike hints, multi-chapter scopes are fine
   // because each entry carries its own chapter in ref.
-  kept: z.array(KeptSchema).max(300).optional(),
+  kept: z.array(KeptSchema).max(5000).optional(),
 }).strict();
 
 // Providers a translate run may be pointed at with a caller-supplied key. Kept
@@ -367,6 +374,21 @@ const StartBodySchema = z.object({
           code: z.ZodIssueCode.custom,
           path: ['options', 'hints', i, 'rowId'],
           message: `duplicate hint rowId "${id}"`,
+        });
+      }
+      if (id) seen.add(id);
+    }
+  }
+  // kept — same duplicate-rowId rule as hints.
+  if (Array.isArray(o.kept) && o.kept.length > 1) {
+    const seen = new Set();
+    for (let i = 0; i < o.kept.length; i++) {
+      const id = o.kept[i] && o.kept[i].rowId;
+      if (id && seen.has(id)) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['options', 'kept', i, 'rowId'],
+          message: `duplicate kept rowId "${id}"`,
         });
       }
       if (id) seen.add(id);

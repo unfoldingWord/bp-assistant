@@ -5,6 +5,7 @@
 
 const fs = require('fs');
 const { buildAlignmentMap, getSequenceSortKey } = require('./sequence-notes');
+const { normalizeQuote } = require('./quote-normalize');
 
 // --- TSV field helpers ---
 
@@ -131,10 +132,11 @@ function isKeptRow(row, keptIds) {
 // Dedup keys for source rows against kept rows. A KEEP-tagged row claims its
 // (Reference, SupportReference); an editor-kept row claims only the same
 // (Reference, SupportReference, Quote), so a new note on a different phrase in
-// that verse still lands.
+// that verse still lands. Quotes compare through normalizeQuote, the same key
+// the prepared-notes pass uses.
 function getQuote(row) {
   const parts = row.split('\t');
-  return parts.length > 4 ? parts[4].trim().normalize('NFC') : '';
+  return parts.length > 4 ? normalizeQuote(parts[4]) : '';
 }
 
 function keptDedupKey(row) {
@@ -144,8 +146,11 @@ function keptDedupKey(row) {
 function buildKeepKeys(keepRows) {
   const keys = new Set();
   for (const row of keepRows) {
-    if (!getSupportReference(row)) continue;
-    keys.add(hasKeepTag(row) ? keptDedupKey(row) : `${keptDedupKey(row)}\t${getQuote(row)}`);
+    if (hasKeepTag(row)) {
+      if (getSupportReference(row)) keys.add(keptDedupKey(row));
+    } else {
+      keys.add(`${keptDedupKey(row)}\t${getQuote(row)}`);
+    }
   }
   return keys;
 }
@@ -369,7 +374,10 @@ function doFullChapter(bookRows, sourceRows, chapter, skipIntro, verseMap, log, 
 
   // Determine which intro rows to preserve
   let preserveIntro = [];
-  if (skipIntro && existingIntroRows.length) {
+  // An intro the editor kept (by ID) stays, like --skip-intro.
+  const introKept = keptIds.size > 0 && existingIntroRows.some((row) => keptIds.has(row.split('\t')[1]));
+  if (introKept) log.push(`Preserving existing ${chapter}:intro row (kept in the editor)`);
+  if ((skipIntro || introKept) && existingIntroRows.length) {
     preserveIntro = existingIntroRows;
   } else if (!sourceHasIntro && existingIntroRows.length) {
     preserveIntro = existingIntroRows;

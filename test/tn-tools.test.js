@@ -2063,3 +2063,16 @@ test('removePreparedItemsCoveredByKept — range ref covers each verse; other ch
   assert.equal(removePreparedItemsCoveredByKept(prepared, kept, 41).removed, 0);
   assert.equal(removePreparedItemsCoveredByKept(prepared, [], 40).removed, 0);
 });
+
+test('removePreparedItemsCoveredByKept — exact normalized quote, not fuzzy; keeps item_count in step', () => {
+  const prepared = { item_count: 3, items: [
+    { id: 'a001', reference: '40:3', sref: 'figs-explicit', orig_quote: 'לֹא⁠' },
+    { id: 'a002', reference: '40:3', sref: 'figs-explicit', orig_quote: 'וְלֹא יָדַע' },
+    { id: 'a003', reference: '40:3', sref: 'figs-explicit', orig_quote: 'יָדַע' },
+  ] };
+  const kept = [{ rowId: 'kp01', ref: '40:3', supportReference: 'figs-explicit', quote: 'לֹא' }];
+  const { prepared: out, removed } = removePreparedItemsCoveredByKept(prepared, kept, 40);
+  assert.equal(removed, 1, 'word joiner is ignored, a longer phrase containing the quote is not a duplicate');
+  assert.deepEqual(out.items.map((i) => i.id), ['a002', 'a003']);
+  assert.equal(out.item_count, 2);
+});
