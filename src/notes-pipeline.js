@@ -3556,8 +3556,9 @@ async function notesPipeline(route, message) {
             } catch (keptErr) {
               console.error(`[notes] applyKeptToPreparedNotes failed (non-fatal): ${keptErr.message}`);
             }
+            const keptHere = kept.filter((k) => Number(String(k.ref).split(':')[0]) === Number(ch)).length;
             await status(
-              `**${ref}**: ${kept.length} kept notes from the editor will stay in place; ` +
+              `**${ref}**: ${keptHere} kept notes from the editor will stay in place; ` +
               `${dropped} AI notes dropped as duplicates of them`,
             );
           }

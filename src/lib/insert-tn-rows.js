@@ -128,6 +128,32 @@ function isKeptRow(row, keptIds) {
   return !!keptIds && keptIds.size > 0 && keptIds.has(row.split('\t')[1]);
 }
 
+// Dedup keys for source rows against kept rows. A KEEP-tagged row claims its
+// (Reference, SupportReference); an editor-kept row claims only the same
+// (Reference, SupportReference, Quote), so a new note on a different phrase in
+// that verse still lands.
+function getQuote(row) {
+  const parts = row.split('\t');
+  return parts.length > 4 ? parts[4].trim().normalize('NFC') : '';
+}
+
+function keptDedupKey(row) {
+  return `${getReference(row)}\t${getSupportReference(row)}`;
+}
+
+function buildKeepKeys(keepRows) {
+  const keys = new Set();
+  for (const row of keepRows) {
+    if (!getSupportReference(row)) continue;
+    keys.add(hasKeepTag(row) ? keptDedupKey(row) : `${keptDedupKey(row)}\t${getQuote(row)}`);
+  }
+  return keys;
+}
+
+function isClaimedByKeep(row, keepKeys) {
+  return keepKeys.has(keptDedupKey(row)) || keepKeys.has(`${keptDedupKey(row)}\t${getQuote(row)}`);
+}
+
 // --- Reference sorting ---
 
 function parseReference(ref) {
@@ -251,15 +277,9 @@ function doPerReference(bookRows, sourceGroups, verseMap, log, keptIds = new Set
 
     let dedupedSource = newRefRows;
     if (keepRows.length) {
-      const keepKeys = new Set();
-      for (const row of keepRows) {
-        const sref = getSupportReference(row);
-        if (sref) keepKeys.add(`${ref}\t${sref}`);
-      }
+      const keepKeys = buildKeepKeys(keepRows);
       if (keepKeys.size) {
-        dedupedSource = newRefRows.filter(row =>
-          !keepKeys.has(`${getReference(row)}\t${getSupportReference(row)}`)
-        );
+        dedupedSource = newRefRows.filter(row => !isClaimedByKeep(row, keepKeys));
         const dedupCount = newRefRows.length - dedupedSource.length;
         if (dedupCount) log.push(`  ${ref}: deduplicated ${dedupCount} source row(s) against KEEP notes`);
       }
@@ -378,16 +398,10 @@ function doFullChapter(bookRows, sourceRows, chapter, skipIntro, verseMap, log, 
   // Deduplicate source against KEEP rows
   let dedupCount = 0;
   if (keepRows.length) {
-    const keepKeys = new Set();
-    for (const row of keepRows) {
-      const sref = getSupportReference(row);
-      if (sref) keepKeys.add(`${getReference(row)}\t${sref}`);
-    }
+    const keepKeys = buildKeepKeys(keepRows);
     if (keepKeys.size) {
       const before = filteredSource.length;
-      filteredSource = filteredSource.filter(row =>
-        !keepKeys.has(`${getReference(row)}\t${getSupportReference(row)}`)
-      );
+      filteredSource = filteredSource.filter(row => !isClaimedByKeep(row, keepKeys));
       dedupCount = before - filteredSource.length;
     }
   }

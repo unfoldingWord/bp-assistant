@@ -355,18 +355,20 @@ test('keptIds: blank-Tags kept row survives replaceChapter, source row at same r
   }
 });
 
-test('keptIds: kept row suppresses a source row with the same (Reference, SupportReference)', () => {
+test('keptIds: kept row suppresses a source row with the same (Reference, SupportReference, Quote) only', () => {
   const dir = makeTempDir();
   try {
     const { bookFile } = keptFixture(dir);
     const sourceFile = writeTsv(dir, 'EZK-40-dup.tsv', TN_HEADER, [
-      '40:1\tdup1\t\tfigs-simile\tdifferent quote\t1\tAI duplicate of the kept note',
+      '40:1\tdup1\t\tfigs-simile\tkept english\t1\tAI duplicate of the kept note',
+      '40:1\toth1\t\tfigs-simile\tdifferent quote\t1\tSame issue type, different phrase',
       '40:1\tnew1\t\tfigs-metaphor\tnew quote\t1\tNew note',
     ]);
     insertTnRows({ bookFile, sourceFile, chapter: 40, keptIds: ['kept'] });
     const ids = readRows(bookFile).map((r) => r.split('\t')[1]);
     assert.ok(ids.includes('kept'));
     assert.ok(!ids.includes('dup1'), 'duplicate source row must be suppressed');
+    assert.ok(ids.includes('oth1'), 'a different phrase with the same support reference still lands');
     assert.ok(ids.includes('new1'));
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
