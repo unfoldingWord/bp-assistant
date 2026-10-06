@@ -2237,6 +2237,15 @@ function countNoteRows(notesPath) {
   return count;
 }
 
+// True when an issues TSV has a `<chapter>:intro` row (column 2, or column 1
+// in a headered layout). chapter-intro may leave such a file unchanged.
+function issuesFileHasIntroRow(absPath, chapter) {
+  let text = '';
+  try { text = fs.readFileSync(absPath, 'utf8'); } catch (_) { return false; }
+  const introRef = new RegExp(`^(?:[A-Za-z0-9]{2,3}\\s+)?0*${Number(chapter)}:intro$`, 'i');
+  return text.split(/\r?\n/).some((line) => line.split('\t').slice(0, 2).some((col) => introRef.test(col.trim())));
+}
+
 function backupIssuesFile({ issuesPath, pipeDir }) {
   if (!issuesPath || !pipeDir) return null;
   const absIssues = path.resolve(CSKILLBP_DIR, issuesPath);
@@ -3947,6 +3956,10 @@ async function notesPipeline(route, message) {
             // post-edit-review can legitimately keep an unchanged issues TSV.
             // Reuse the existing file rather than hard-failing this chapter.
             await status(`**${skill.name}** for ${ref}: issues file unchanged in this run; reusing existing file (${resolved}).`);
+          } else if (skill.name === 'chapter-intro' && issuesFileHasIntroRow(absResolvedFreshness, ch)) {
+            // A rerun's issues file already carries an intro row; chapter-intro
+            // may keep it as is (EZK 40, #438). Without an intro row it must write.
+            await status(`**${skill.name}** for ${ref}: intro row already present and unchanged; keeping it (${resolved}).`);
           } else {
             failedSkill = skill.name;
             await status(`**${skill.name}** failed for ${ref} \u2014 output file is stale from an earlier run: ${resolved}`);
@@ -4581,6 +4594,7 @@ module.exports = {
   _findEmptyVerses: findEmptyVerses,
   _mergeGapIssues: mergeGapIssues,
   _fillIssueGaps: fillIssueGaps,
+  _issuesFileHasIntroRow: issuesFileHasIntroRow,
   _appendIssueTagsToTsv: appendIssueTagsToTsv,
   _analyzeIssuesTsvShape: analyzeIssuesTsvShape,
   _countNoteRows: countNoteRows,
