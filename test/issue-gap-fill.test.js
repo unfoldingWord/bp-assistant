@@ -147,7 +147,7 @@ test('fillIssueGaps runs once over min-max, merges, moves the shard out', async 
     const expl = read().split('\n').filter(Boolean).map((l) => l.split('\t')[6]);
     assert.deepEqual(expl, ['intro', 'a', 'b', 'c', 'new4', 'd', 'e', 'new9', 'f']);
     assert.equal(fs.existsSync(path.join(dir, 'output/issues/EZK/EZK-40-v4-9.tsv')), false);
-    assert.ok(fs.existsSync(path.join(dir, 'tmp/pipeline/EZK-40/gapfill-v4-9.tsv')));
+    assert.ok(fs.existsSync(path.join(dir, 'tmp/pipeline/EZK-40/gapfill-EZK-40-v4-9.tsv')));
     assert.ok(messages.some((m) => /added 2 row/.test(m) && /8/.test(m)));
   });
 });
@@ -263,6 +263,24 @@ test('fillIssueGaps restores the chapter issues file if the run rewrote it', asy
       runClaudeImpl: async () => { write('EZK\t40:1\tclobbered\t\t\t\tx\n'); return { subtype: 'success' }; },
     });
     assert.equal(res.added, 0);
+    assert.equal(read(), HEADERLESS);
+  });
+});
+
+test('mergeGapIssues: a row that fills no gap verse is dropped even if its verses are unknown to the ULT', () => {
+  const { _mergeGapIssues } = fresh(fs.mkdtempSync(path.join(os.tmpdir(), 'gap-')));
+  const known = new Set([1, 2, 3, 4, 5, 6, 8, 9]);
+  const shard = row('40:7', 'figs-metaphor', 'went', 'g') + '\n';
+  assert.equal(_mergeGapIssues({ chapterText: HEADERLESS, shardText: shard, verses: [4], chapter: 40, knownVerses: known }).added, 0);
+});
+
+test('fillIssueGaps restores the chapter issues file when a failing run damaged it', async () => {
+  await ws(async ({ mod, base, write, read }) => {
+    write(HEADERLESS);
+    await mod._fillIssueGaps({
+      ...base,
+      runClaudeImpl: async () => { write(''); throw new Error('boom'); },
+    });
     assert.equal(read(), HEADERLESS);
   });
 });

@@ -1897,9 +1897,12 @@ function mergeGapIssues({ chapterText, shardText, verses, chapter, book = '', kn
     // that is not its own ULT verse (the tail of a \v 6-7 bridge, keyed by 6)
     // does not count against the row.
     if (r.end - r.start >= 200) return;
+    let fillsGap = false;
     for (let v = r.start; v <= r.end; v++) {
-      if (!gap.has(v) && !(knownVerses && !knownVerses.has(v))) return;
+      if (gap.has(v)) fillsGap = true;
+      else if (!(knownVerses && !knownVerses.has(v))) return;
     }
+    if (!fillsGap) return;
     newRows.push({ line, start: r.start });
   });
   if (newRows.length === 0) return { text: chapterText, added: 0 };
@@ -1934,6 +1937,11 @@ async function fillIssueGaps({
   const pipeAbs = path.resolve(CSKILLBP_DIR, pipeDir || path.join('tmp', 'pipeline', tag));
   let shardAbs = null;
   let preexistingAside = null;
+  // Set once the chapter issues are snapshotted; the finally block restores the
+  // snapshot if the run damaged the file and we did not write the merge.
+  let issuesAbsForRestore = null;
+  let chapterSnapshot = null;
+  let mergeWritten = false;
   const writeMarker = () => {
     try {
       fs.mkdirSync(pipeAbs, { recursive: true });
@@ -1960,7 +1968,8 @@ async function fillIssueGaps({
     out.remaining = empty;
     if (empty.length < 2) { writeMarker(); return out; }
     // Snapshot the chapter issues so the merge base cannot be changed by the run.
-    const chapterSnapshot = fs.readFileSync(issuesAbs, 'utf8');
+    chapterSnapshot = fs.readFileSync(issuesAbs, 'utf8');
+    issuesAbsForRestore = issuesAbs;
 
     const S = empty[0];
     const E = empty[empty.length - 1];
@@ -2045,9 +2054,8 @@ async function fillIssueGaps({
     });
     // Always write from the snapshot: deep-issue-id only writes its range file,
     // but if it touched the chapter file this puts it back.
-    if (merged.added > 0 || fs.readFileSync(issuesAbs, 'utf8') !== chapterSnapshot) {
-      fs.writeFileSync(issuesAbs, merged.text);
-    }
+    fs.writeFileSync(issuesAbs, merged.text);
+    mergeWritten = true;
     out.added = merged.added;
     const nowEmpty = findEmptyVerses({ issuesText: merged.text, ultPlainText: ultText, chapter: ch, book });
     out.remaining = nowEmpty;
@@ -2073,15 +2081,20 @@ async function fillIssueGaps({
     if (shardAbs) {
       try {
         if (fs.existsSync(shardAbs) && fs.statSync(shardAbs).size > 0) {
-          const m = path.basename(shardAbs).match(/-v(\d+)-(\d+)\.tsv$/);
           fs.mkdirSync(pipeAbs, { recursive: true });
-          fs.copyFileSync(shardAbs, path.join(pipeAbs, `gapfill-v${m[1]}-${m[2]}.tsv`));
+          fs.copyFileSync(shardAbs, path.join(pipeAbs, `gapfill-${path.basename(shardAbs)}`));
         }
       } catch (e) { console.warn(`[notes] gap-fill shard copy failed (non-fatal): ${e.message}`); }
       try { fs.unlinkSync(shardAbs); } catch (_) { /* already gone */ }
       if (preexistingAside) {
         try { fs.copyFileSync(preexistingAside, shardAbs); } catch (e) { console.warn(`[notes] restoring pre-existing shard failed: ${e.message}`); }
       }
+    }
+    if (issuesAbsForRestore && !mergeWritten) {
+      try {
+        const now = fs.existsSync(issuesAbsForRestore) ? fs.readFileSync(issuesAbsForRestore, 'utf8') : null;
+        if (now !== chapterSnapshot) fs.writeFileSync(issuesAbsForRestore, chapterSnapshot);
+      } catch (e) { console.warn(`[notes] restoring chapter issues snapshot failed: ${e.message}`); }
     }
   }
 }
