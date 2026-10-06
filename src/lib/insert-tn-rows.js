@@ -401,8 +401,10 @@ function doFullChapter(bookRows, sourceRows, chapter, skipIntro, verseMap, log, 
   // An intro the editor kept (by ID) stays, like --skip-intro.
   const introKept = keptIds.size > 0 && existingIntroRows.some((row) => keptIds.has(row.split('\t')[1]));
   if (introKept) log.push(`Preserving existing ${chapter}:intro row (kept in the editor)`);
-  if ((skipIntro || introKept) && existingIntroRows.length) {
+  if (skipIntro && existingIntroRows.length) {
     preserveIntro = existingIntroRows;
+  } else if (introKept) {
+    preserveIntro = existingIntroRows.filter((row) => keptIds.has(row.split('\t')[1]));
   } else if (!sourceHasIntro && existingIntroRows.length) {
     preserveIntro = existingIntroRows;
   }

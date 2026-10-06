@@ -746,9 +746,12 @@ async function runSeeHowDetection({ pipeDir, contextPath, generateIdsFn = genera
   for (const k of kept || []) {
     const span = k.quote ? keptRefVerseSpan(k.ref, chapter) : null;
     if (!span) continue;
-    // Same token key as the corpus: a discontinuous "a & b" quote splits on "&".
-    const toks = String(k.quote).split('&').flatMap(hebTokens).join('+');
-    for (let v = span.lo; v <= span.hi && v - span.lo < 200; v++) injectedAt.add(`${chapter}:${v}|${toks}`);
+    // Claim both token forms of a discontinuous "a & b" quote: split on "&"
+    // (as recurrence keys are built) and as written.
+    const forms = new Set([String(k.quote).split('&').flatMap(hebTokens).join('+'), hebTokens(k.quote).join('+')]);
+    for (let v = span.lo; v <= span.hi && v - span.lo < 200; v++) {
+      for (const toks of forms) injectedAt.add(`${chapter}:${v}|${toks}`);
+    }
   }
 
   // Resolve every anchor -- prepared groups and standalone injections alike --
