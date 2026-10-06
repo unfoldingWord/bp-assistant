@@ -4,7 +4,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 
-const { _issuesFileHasIntroRow: hasIntro } = require('../src/notes-pipeline');
+const { _issuesFileHasIntroRow: hasIntro, _stripIntroRows: stripIntro } = require('../src/notes-pipeline');
 
 function tmpFile(text) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'intro-row-'));
@@ -36,4 +36,20 @@ test('intro row for another chapter does not count', () => {
 
 test('missing file', () => {
   assert.equal(hasIntro(path.join(os.tmpdir(), 'does-not-exist-intro.tsv'), 40), false);
+});
+
+test('strip removes only this chapter\'s intro row, keeping EOL and trailing newline', () => {
+  const text = 'EZK\t40:intro\t\t\t\t\t# old\r\nEZK\t40:1\tfigs-idiom\tq\t\t\tx\r\nEZK\t41:intro\t\t\t\t\t# 41\r\n';
+  const f = tmpFile(text);
+  assert.equal(stripIntro(f, 40), 1);
+  assert.equal(fs.readFileSync(f, 'utf8'), 'EZK\t40:1\tfigs-idiom\tq\t\t\tx\r\nEZK\t41:intro\t\t\t\t\t# 41\r\n');
+  assert.equal(hasIntro(f, 40), false);
+});
+
+test('strip leaves a file without an intro row untouched', () => {
+  const f = tmpFile('EZK\t40:1\tfigs-idiom\tq\t\t\tx\n');
+  const before = fs.statSync(f).mtimeMs;
+  assert.equal(stripIntro(f, 40), 0);
+  assert.equal(fs.statSync(f).mtimeMs, before);
+  assert.equal(stripIntro(path.join(os.tmpdir(), 'does-not-exist-intro.tsv'), 40), 0);
 });
