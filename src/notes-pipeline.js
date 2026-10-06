@@ -3963,7 +3963,7 @@ async function notesPipeline(route, message) {
 
     // If push is already deferred due to conflicting branches, collect and skip
     if (deferredPush) {
-      deferredChapters.push({ ch, notesSource, body: gatePrBodyForPush({ gateResult: issueRulesGateResult, issuesPath, book }) });
+      deferredChapters.push({ ch, notesSource, replaceChapter: !hasVerseRange, body: gatePrBodyForPush({ gateResult: issueRulesGateResult, issuesPath, book }) });
       await status(`**door43-push deferred** for ${ref} (waiting for conflicting branches to be merged)`);
       totalSuccess++;
       continue;
@@ -4000,7 +4000,7 @@ async function notesPipeline(route, message) {
       if (conflicts.length > 0) {
         deferredPush = true;
         deferredConflicts = conflicts;
-        deferredChapters.push({ ch, notesSource, body: gatePrBodyForPush({ gateResult: issueRulesGateResult, issuesPath, book }) });
+        deferredChapters.push({ ch, notesSource, replaceChapter: !hasVerseRange, body: gatePrBodyForPush({ gateResult: issueRulesGateResult, issuesPath, book }) });
         await status(`**door43-push deferred** for ${ref}: conflicting branches found — ${conflicts.map(c => c.branch).join(', ')}`);
         totalSuccess++;
         continue;
@@ -4016,6 +4016,8 @@ async function notesPipeline(route, message) {
         type: 'tn', book, chapter: ch,
         username, branch: buildBranchName(book, ch),
         source: notesSource,
+        // Whole-chapter run (no verse range): replace the whole chapter in en_tn.
+        replaceChapter: !hasVerseRange,
         body: gatePrBodyForPush({ gateResult: issueRulesGateResult, issuesPath, book }),
       });
       if (!pushResult.success) {

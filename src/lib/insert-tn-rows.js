@@ -308,7 +308,7 @@ function doPerReference(bookRows, sourceGroups, verseMap, log) {
 
 // --- Full-chapter replacement ---
 
-function doFullChapter(bookRows, sourceRows, chapter, skipIntro, verseMap, log) {
+function doFullChapter(bookRows, sourceRows, chapter, skipIntro, verseMap, log, replaceChapter = false) {
   const newRows = [...bookRows];
 
   const sourceRefs = new Set();
@@ -388,6 +388,7 @@ function doFullChapter(bookRows, sourceRows, chapter, skipIntro, verseMap, log) 
   // Identify rows to remove and rows to preserve
   let totalRemoved = 0;
   const preservedRows = [];
+  const legacyRemovedRefs = [];
   let insertPos;
 
   if (chapterStart !== null) {
@@ -409,6 +410,12 @@ function doFullChapter(bookRows, sourceRows, chapter, skipIntro, verseMap, log) 
           indicesToRemove.push(i);
           log.push(`  ${ref}: orphaned multi-verse row (anchor ${anchorVerse(ref)} covered by source)`);
         }
+      } else if (replaceChapter && getChapter(ref) === chapter && !isIntroRef(ref) && !hasKeepTag(newRows[i])) {
+        // Whole-chapter replace: drop legacy rows in verses the source did not cover.
+        // The chapter check keeps an out-of-order row from another chapter (or a
+        // malformed Reference) that happens to sit inside the chapter span.
+        indicesToRemove.push(i);
+        legacyRemovedRefs.push(ref);
       } else {
         if (!(isIntroRef(ref) && ref.split(':')[1] === 'intro')) {
           preservedRows.push(newRows[i]);
@@ -433,8 +440,11 @@ function doFullChapter(bookRows, sourceRows, chapter, skipIntro, verseMap, log) 
     newRows.splice(chapterStart, chapterEnd - chapterStart);
     insertPos = chapterStart;
 
+    if (legacyRemovedRefs.length) {
+      log.push(`  Removed ${legacyRemovedRefs.length} legacy row(s) in verses not in source (whole-chapter replace): ${[...new Set(legacyRemovedRefs)].join(', ')}`);
+    }
     if (preservedRows.length) {
-      log.push(`  Removed ${totalRemoved} existing rows for verses in source`);
+      log.push(`  Removed ${totalRemoved - legacyRemovedRefs.length} existing rows for verses in source`);
       log.push(`  Preserving ${preservedRows.length} existing rows for verses not in source`);
     } else {
       log.push(`  Removed ${totalRemoved} existing rows for chapter ${chapter}`);
@@ -521,9 +531,12 @@ function doFullChapter(bookRows, sourceRows, chapter, skipIntro, verseMap, log) 
  * @param {boolean} [opts.skipIntro=false] - Preserve existing intro
  * @param {string} [opts.ultFile] - Path to English ULT USFM for KEEP ordering
  * @param {boolean} [opts.backup=false] - Create .bak backup
+ * @param {boolean} [opts.replaceChapter=false] - Whole-chapter run: also remove existing
+ *   non-intro, non-KEEP rows in verses absent from the source (default keeps them, for
+ *   verse-range runs). KEEP-tagged rows and intro handling are unchanged.
  * @returns {string} Log output
  */
-function insertTnRows({ bookFile, sourceFile, chapter, skipIntro = false, ultFile, backup = false }) {
+function insertTnRows({ bookFile, sourceFile, chapter, skipIntro = false, ultFile, backup = false, replaceChapter = false }) {
   const log = [];
   const lineEnding = detectLineEnding(bookFile);
 
@@ -551,7 +564,7 @@ function insertTnRows({ bookFile, sourceFile, chapter, skipIntro = false, ultFil
   if (skipIntro) log.push('Preserving existing intro row (--skip-intro)');
 
   const [newRows, totalRemoved, totalAdded] = doFullChapter(
-    bookRows, sourceRows, chapter, skipIntro, verseMap, log
+    bookRows, sourceRows, chapter, skipIntro, verseMap, log, replaceChapter
   );
 
   log.push('');

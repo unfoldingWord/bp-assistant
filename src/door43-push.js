@@ -582,7 +582,7 @@ async function syncRepo(repoDir, repoName, branch, baseBranch = 'master', org = 
 // insertContent — run the appropriate Python insertion script
 // ---------------------------------------------------------------------------
 
-function insertContent({ type, book, chapter, source, verses, repoDir, repoFilename }) {
+function insertContent({ type, book, chapter, source, verses, repoDir, repoFilename, replaceChapter = false }) {
   const bookFilePath = path.join(repoDir, repoFilename);
   const sourcePath = path.resolve(CSKILLBP_DIR, source);
 
@@ -614,6 +614,7 @@ function insertContent({ type, book, chapter, source, verses, repoDir, repoFilen
       skipIntro: type === 'tn' && book.toUpperCase() === 'PSA',
       ultFile,
       backup: true,
+      replaceChapter: type === 'tn' && replaceChapter === true,
     });
     if (output.trim()) console.log(`${LOG_PREFIX} insert_tn_rows: ${output.trim()}`);
   } else {
@@ -895,6 +896,7 @@ async function commitAndPushFiles(repoDir, branch, filepaths, commitMsg, { force
  * @param {boolean} [opts.wholeFile] - source is the complete book file; copy it over the repo file instead of chapter-splicing
  * @param {number} [opts.endChapter] - last chapter written (for wholeFile multi-chapter runs); defaults to chapter. The CI gate blocks on errors in [chapter, endChapter].
  * @param {string} [opts.pipeline] - explicit X-AI-Pipeline commit trailer (notes|tqs|generate|translate); defaults from type
+ * @param {boolean} [opts.replaceChapter] - tn only: whole-chapter run (no verse range); also removes existing non-KEEP rows in verses the source has no notes for. Default false (verse-range behavior).
  * @param {string} [opts.body] - PR description (e.g. the interpretive-review summary); capped at PR_BODY_MAX, defaults to ''
  * @returns {{ success: boolean, details: string, prNumber?: number }}
  */
@@ -941,7 +943,7 @@ async function door43Push(opts) {
       console.log(`${LOG_PREFIX} Replacing whole file: ${source} → ${repoFilename}`);
       fs.copyFileSync(sourcePath, path.join(repoDir, repoFilename));
     } else {
-      insertContent({ type, book, chapter, source, verses, repoDir, repoFilename });
+      insertContent({ type, book, chapter, source, verses, repoDir, repoFilename, replaceChapter: opts.replaceChapter });
     }
 
     // Step 3b: Door43 CI validation gate (TN only)
