@@ -396,7 +396,7 @@ function buildRecurrenceIndexFile({ pipeDir, contextPath }) {
  *
  * @returns {Promise<string|null>} the detection summary, or null on failure
  */
-async function runShardSeeHowDetection({ contextPath, issuesPath, status, generateIdsFn }) {
+async function runShardSeeHowDetection({ contextPath, issuesPath, status, generateIdsFn, kept = null, chapter = null }) {
   const noop = async () => {};
   try {
     await runMechanicalPrep({ issuesPath, contextPath, status: status || noop });
@@ -404,13 +404,23 @@ async function runShardSeeHowDetection({ contextPath, issuesPath, status, genera
     console.warn(`[notes] Shard mechanical prep failed (non-fatal): ${err.message}`);
     return null;
   }
+  // Same order as the whole-chapter path: drop kept duplicates before see-how.
+  if (Array.isArray(kept) && kept.length > 0) {
+    try {
+      const preparedJson = readContextAt(null, contextPath).runtime.preparedNotes;
+      const { itemsRemoved } = applyKeptToPreparedNotes({ preparedJson, kept, chapter });
+      if (itemsRemoved) console.log(`[notes] Shard ${contextPath}: ${itemsRemoved} AI notes dropped as duplicates of kept notes`);
+    } catch (err) {
+      console.warn(`[notes] Shard kept-duplicate drop failed (non-fatal): ${err.message}`);
+    }
+  }
   try {
     buildRecurrenceIndexFile({ contextPath });
   } catch (err) {
     console.warn(`[notes] Shard recurrence index failed (non-fatal): ${err.message}`);
   }
   try {
-    const summary = await runSeeHowDetection({ contextPath, generateIdsFn });
+    const summary = await runSeeHowDetection({ contextPath, generateIdsFn, kept });
     console.log(`[notes] Shard see-how (${contextPath}): ${summary}`);
     return summary;
   } catch (err) {
@@ -736,7 +746,8 @@ async function runSeeHowDetection({ pipeDir, contextPath, generateIdsFn = genera
   for (const k of kept || []) {
     const span = k.quote ? keptRefVerseSpan(k.ref, chapter) : null;
     if (!span) continue;
-    const toks = hebTokens(k.quote).join('+');
+    // Same token key as the corpus: a discontinuous "a & b" quote splits on "&".
+    const toks = String(k.quote).split('&').flatMap(hebTokens).join('+');
     for (let v = span.lo; v <= span.hi && v - span.lo < 200; v++) injectedAt.add(`${chapter}:${v}|${toks}`);
   }
 
@@ -2646,7 +2657,7 @@ function appendIssueTagsToTsv(tsvRelPath, unresolvedFindings) {
 async function runParallelTnWriter({
   book, ch, tag, issuesPath, outputPath, ctxFlag, model,
   timeoutMs, appendSystemPrompt, checkpointRef, existingShards,
-  status, isDryRun, skillRef,
+  status, isDryRun, skillRef, kept = null,
 }) {
   // Split issues into chunks
   const chunkResult = splitTsv({ inputTsv: issuesPath, chunkSize: TN_WRITER_CHUNK_SIZE });
@@ -2768,7 +2779,7 @@ async function runParallelTnWriter({
       // the prepared notes the writer session reads are the post-detection ones.
       const shardContextRel = parseContextPathFlag(shardCtxFlag);
       if (shardContextRel) {
-        await runShardSeeHowDetection({ contextPath: shardContextRel, issuesPath: shard.chunkPath });
+        await runShardSeeHowDetection({ contextPath: shardContextRel, issuesPath: shard.chunkPath, kept, chapter: ch });
       }
 
       console.log(`[notes] tn-writer shard ${i}: ${prompt}`);
@@ -3768,7 +3779,7 @@ async function notesPipeline(route, message) {
           const parallelResult = await runParallelTnWriter({
             book, ch, tag, issuesPath, outputPath: skill.expectedOutput, ctxFlag,
             model: model || skill.model, timeoutMs, appendSystemPrompt: skill.appendSystemPrompt,
-            checkpointRef, existingShards, status, isDryRun, skillRef,
+            checkpointRef, existingShards, status, isDryRun, skillRef, kept,
           });
           if (parallelResult) {
             // Parallel mode was used (chapter had enough verses to split)

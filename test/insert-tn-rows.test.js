@@ -444,3 +444,23 @@ test('keptIds: kept row with blank SupportReference still blocks the same blank-
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test('keptIds: a kept range row blocks a single-verse duplicate inside it', () => {
+  const dir = makeTempDir();
+  try {
+    const bookFile = writeTsv(dir, 'en_tn_EZK.tsv', TN_HEADER, [
+      '40:12-14\tkr12\t\tfigs-explicit\tשַׁעַר\t1\tKept range note',
+    ]);
+    const sourceFile = writeTsv(dir, 'EZK-40-src.tsv', TN_HEADER, [
+      '40:13\tdu13\t\tfigs-explicit\tשַׁעַר\t1\tDuplicate inside the range',
+      '40:13\tne13\t\tfigs-idiom\tשַׁעַר\t1\tDifferent issue',
+    ]);
+    insertTnRows({ bookFile, sourceFile, chapter: 40, replaceChapter: true, keptIds: ['kr12'] });
+    const ids = readRows(bookFile).map((r) => r.split('\t')[1]);
+    assert.ok(ids.includes('kr12'));
+    assert.ok(!ids.includes('du13'));
+    assert.ok(ids.includes('ne13'));
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});

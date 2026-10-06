@@ -481,15 +481,15 @@ test('StartBodySchema — accepts kept on a multi-chapter scope', () => {
   assert.equal(r.success, true);
 });
 
-test('StartBodySchema — accepts 5000 kept entries, rejects 5001', () => {
+test('StartBodySchema — accepts 3000 kept entries, rejects 3001', () => {
   const mk = (n) => Array.from({ length: n }, (_, i) => ({
     rowId: 'a' + i.toString(36).padStart(3, '0'),
     ref: '40:12-14',
     supportReference: 'figs-metaphor',
     quote: 'מֵרֵעֵהוּ',
   }));
-  assert.equal(StartBodySchema.safeParse(keptBody(mk(5000))).success, true);
-  assert.equal(StartBodySchema.safeParse(keptBody(mk(5001))).success, false);
+  assert.equal(StartBodySchema.safeParse(keptBody(mk(3000))).success, true);
+  assert.equal(StartBodySchema.safeParse(keptBody(mk(3001))).success, false);
 });
 
 test('StartBodySchema — kept: cross-chapter ref accepted; backwards range and duplicate rowId rejected', () => {
@@ -502,6 +502,9 @@ test('StartBodySchema — kept: cross-chapter ref accepted; backwards range and 
   const bare = StartBodySchema.safeParse(keptBody([{ rowId: 'kp09', ref: '40:9' }]));
   assert.equal(bare.success, true, 'supportReference and quote may be omitted');
   assert.equal(bare.data.options.kept[0].quote, '');
+  const nulls = StartBodySchema.safeParse(keptBody([{ rowId: 'kp10', ref: '40:10', supportReference: null, quote: null }]));
+  assert.equal(nulls.success, true, 'null fields read as empty');
+  assert.equal(nulls.data.options.kept[0].supportReference, '');
   const dup = StartBodySchema.safeParse(keptBody([VALID_KEPT, { ...VALID_KEPT, ref: '40:13' }]));
   assert.equal(dup.success, false);
   assert.ok(dup.error.issues.some((i) => /duplicate kept rowId/.test(i.message)));
@@ -515,9 +518,9 @@ test('StartBodySchema — rejects malformed kept entries with a clear message', 
     { ...VALID_KEPT, ref: 'abc' },
     { ...VALID_KEPT, ref: '40:12-14-16' },
     { ...VALID_KEPT, ref: '4'.repeat(21) },
-    { ...VALID_KEPT, supportReference: 's'.repeat(201) },
-    { ...VALID_KEPT, quote: 'q'.repeat(1001) },
-    { ...VALID_KEPT, note: 'n'.repeat(401) },
+    { ...VALID_KEPT, supportReference: 's'.repeat(101) },
+    { ...VALID_KEPT, quote: 'q'.repeat(501) },
+    { ...VALID_KEPT, note: 'n'.repeat(301) },
     { ...VALID_KEPT, extra: 1 },
   ];
   for (const entry of bad) {

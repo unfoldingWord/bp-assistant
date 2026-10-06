@@ -6,6 +6,7 @@
 const fs = require('fs');
 const { buildAlignmentMap, getSequenceSortKey } = require('./sequence-notes');
 const { normalizeQuote } = require('./quote-normalize');
+const { keptRefVerseSpan } = require('./kept-notes');
 
 // --- TSV field helpers ---
 
@@ -149,7 +150,13 @@ function buildKeepKeys(keepRows) {
     if (hasKeepTag(row)) {
       if (getSupportReference(row)) keys.add(keptDedupKey(row));
     } else {
-      keys.add(`${keptDedupKey(row)}\t${getQuote(row)}`);
+      // Claim every verse the kept row covers, so a single-verse AI row inside
+      // a kept 40:12-14 range is still caught.
+      const tail = `\t${getSupportReference(row)}\t${getQuote(row)}`;
+      keys.add(`${getReference(row)}${tail}`);
+      const ch = getChapter(getReference(row));
+      const span = keptRefVerseSpan(getReference(row), ch);
+      if (span) for (let v = span.lo; v <= span.hi && v - span.lo < 200; v++) keys.add(`${ch}:${v}${tail}`);
     }
   }
   return keys;
@@ -267,6 +274,9 @@ function doPerReference(bookRows, sourceGroups, verseMap, log, keptIds = new Set
   let totalRemoved = 0;
   let totalAdded = 0;
   let totalKept = 0;
+  // Editor-kept rows claim their verse span wherever they sit, so a kept
+  // 40:12-14 row also blocks a duplicate at 40:13.
+  const keptElsewhereKeys = buildKeepKeys(bookRows.filter((row) => !hasKeepTag(row) && isKeptRow(row, keptIds)));
 
   for (const [ref, newRefRows] of sourceGroups) {
     const refSortKey = parseReference(ref);
@@ -281,8 +291,8 @@ function doPerReference(bookRows, sourceGroups, verseMap, log, keptIds = new Set
     }
 
     let dedupedSource = newRefRows;
-    if (keepRows.length) {
-      const keepKeys = buildKeepKeys(keepRows);
+    if (keepRows.length || keptElsewhereKeys.size) {
+      const keepKeys = new Set([...buildKeepKeys(keepRows), ...keptElsewhereKeys]);
       if (keepKeys.size) {
         dedupedSource = newRefRows.filter(row => !isClaimedByKeep(row, keepKeys));
         const dedupCount = newRefRows.length - dedupedSource.length;
@@ -403,10 +413,20 @@ function doFullChapter(bookRows, sourceRows, chapter, skipIntro, verseMap, log, 
     }
   }
 
-  // Deduplicate source against KEEP rows
+  // Deduplicate source against KEEP rows. Editor-kept rows anywhere in the
+  // chapter claim their whole verse span (a kept 40:12-14 blocks 40:13).
+  const dedupRows = [...keepRows];
+  if (chapterStart !== null && keptIds.size > 0) {
+    for (let i = chapterStart; i < chapterEnd; i++) {
+      const ref = getReference(newRows[i]);
+      if (!sourceRefs.has(ref) && !isIntroRef(ref) && !hasKeepTag(newRows[i]) && isKeptRow(newRows[i], keptIds)) {
+        dedupRows.push(newRows[i]);
+      }
+    }
+  }
   let dedupCount = 0;
-  if (keepRows.length) {
-    const keepKeys = buildKeepKeys(keepRows);
+  if (dedupRows.length) {
+    const keepKeys = buildKeepKeys(dedupRows);
     if (keepKeys.size) {
       const before = filteredSource.length;
       filteredSource = filteredSource.filter(row => !isClaimedByKeep(row, keepKeys));

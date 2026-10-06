@@ -29,12 +29,11 @@ const {
   detectLandedOutputs,
 } = require('./pipeline-output');
 
-// Bumped from 4KB to fit up to 50 hints with full prose seeds, then to 8MB for
-// `kept`: up to 5000 entries (a whole-book run) at every field's cap in
-// 3-byte UTF-8 (~4.8KB each) would not fit, but real entries (a short Hebrew
-// quote and a support reference, no note) are ~200 bytes, so 8MB leaves wide
-// room. The route is bearer-token authenticated and rate limited.
-const MAX_BODY_BYTES = 8 * 1024 * 1024;
+// Bumped from 4KB to fit up to 50 hints with full prose seeds, then to 10MB for
+// `kept`: 3000 entries (a whole-book run) at every field's cap in 3-byte UTF-8
+// is ~8.4MB (100 + 500 + 300 chars, plus keys). Real entries are ~200 bytes.
+// The route is bearer-token authenticated and rate limited.
+const MAX_BODY_BYTES = 10 * 1024 * 1024;
 const RATE_LIMIT_RPM = 60;
 const RATE_LIMIT_WINDOW_MS = 60_000;
 
@@ -116,9 +115,9 @@ const KeptSchema = z.object({
       const c2 = m[3] ? Number(m[3]) : c1;
       return c1 < c2 || (c1 === c2 && Number(m[2]) <= Number(m[4]));
     }, 'ref range must not run backwards'),
-  supportReference: z.string().max(200).default(''),
-  quote: z.string().max(1000).default(''),
-  note: z.string().max(400).optional(),
+  supportReference: z.string().max(100).nullish().transform((v) => v ?? ''),
+  quote: z.string().max(500).nullish().transform((v) => v ?? ''),
+  note: z.string().max(300).nullish(),
 }).strict();
 
 const OptionsSchema = z.object({
@@ -181,7 +180,7 @@ const OptionsSchema = z.object({
   hints: z.array(HintSchema).max(50).optional(),
   // Editor-kept notes (notes only). Unlike hints, multi-chapter scopes are fine
   // because each entry carries its own chapter in ref.
-  kept: z.array(KeptSchema).max(5000).optional(),
+  kept: z.array(KeptSchema).max(3000).optional(),
 }).strict();
 
 // Providers a translate run may be pointed at with a caller-supplied key. Kept
