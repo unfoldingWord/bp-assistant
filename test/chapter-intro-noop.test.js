@@ -41,15 +41,27 @@ test('missing file', () => {
 test('strip removes only this chapter\'s intro row, keeping EOL and trailing newline', () => {
   const text = 'EZK\t40:intro\t\t\t\t\t# old\r\nEZK\t40:1\tfigs-idiom\tq\t\t\tx\r\nEZK\t41:intro\t\t\t\t\t# 41\r\n';
   const f = tmpFile(text);
-  assert.equal(stripIntro(f, 40), 1);
+  assert.deepEqual(stripIntro(f, 40), { removed: 1, before: text });
   assert.equal(fs.readFileSync(f, 'utf8'), 'EZK\t40:1\tfigs-idiom\tq\t\t\tx\r\nEZK\t41:intro\t\t\t\t\t# 41\r\n');
   assert.equal(hasIntro(f, 40), false);
 });
 
 test('strip leaves a file without an intro row untouched', () => {
   const f = tmpFile('EZK\t40:1\tfigs-idiom\tq\t\t\tx\n');
-  const before = fs.statSync(f).mtimeMs;
-  assert.equal(stripIntro(f, 40), 0);
-  assert.equal(fs.statSync(f).mtimeMs, before);
-  assert.equal(stripIntro(path.join(os.tmpdir(), 'does-not-exist-intro.tsv'), 40), 0);
+  assert.deepEqual(stripIntro(f, 40), { removed: 0, before: null });
+  assert.equal(fs.readFileSync(f, 'utf8'), 'EZK\t40:1\tfigs-idiom\tq\t\t\tx\n');
+  assert.deepEqual(stripIntro(path.join(os.tmpdir(), 'does-not-exist-intro.tsv'), 40), { removed: 0, before: null });
+});
+
+test('strip keeps each line\'s own ending in a mixed-EOL file', () => {
+  const f = tmpFile('EZK\t40:intro\t\t\t\t\t# old\nEZK\t40:1\ta\r\nEZK\t40:2\tb\n');
+  assert.equal(stripIntro(f, 40).removed, 1);
+  assert.equal(fs.readFileSync(f, 'utf8'), 'EZK\t40:1\ta\r\nEZK\t40:2\tb\n');
+});
+
+test('intro row as the last line without a trailing newline', () => {
+  const f = tmpFile('EZK\t40:1\ta\nEZK\t40:intro\t\t\t\t\t# old');
+  assert.equal(hasIntro(f, 40), true);
+  assert.equal(stripIntro(f, 40).removed, 1);
+  assert.equal(fs.readFileSync(f, 'utf8'), 'EZK\t40:1\ta\n');
 });

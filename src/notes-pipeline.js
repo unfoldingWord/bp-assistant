@@ -2252,16 +2252,18 @@ function issuesFileHasIntroRow(absPath, chapter) {
 }
 
 // Remove the chapter's intro rows so chapter-intro has to write a fresh one.
-// Returns the number of rows removed; the file is only rewritten when it changes.
+// Each kept line keeps its own line ending. Returns { removed, before }, where
+// before is the original text (null when nothing was removed); the file is only
+// rewritten when it changes.
 function stripIntroRows(absPath, chapter) {
   let text = '';
-  try { text = fs.readFileSync(absPath, 'utf8'); } catch (_) { return 0; }
-  const eol = text.includes('\r\n') ? '\r\n' : '\n';
-  const lines = text.split(/\r?\n/);
-  const kept = lines.filter((line) => !isIntroRowLine(line, chapter));
+  try { text = fs.readFileSync(absPath, 'utf8'); } catch (_) { return { removed: 0, before: null }; }
+  const lines = text.split(/(?<=\n)/);
+  const kept = lines.filter((line) => !isIntroRowLine(line.replace(/\r?\n$/, ''), chapter));
   const removed = lines.length - kept.length;
-  if (removed > 0) fs.writeFileSync(absPath, kept.join(eol));
-  return removed;
+  if (removed === 0) return { removed: 0, before: null };
+  fs.writeFileSync(absPath, kept.join(''));
+  return { removed, before: text };
 }
 
 function backupIssuesFile({ issuesPath, pipeDir }) {
@@ -3064,6 +3066,7 @@ async function notesPipeline(route, message) {
     let issuesPath;
     let issuesBackupPath = null;
     let failedSkill = null;
+    let introBackup = null; // issues file before chapter-intro removed its earlier intro row
     const chapterStart = Date.now();
     let chapterIntroHintArgs = '';
     let issueNormalizationDone = false;
@@ -3633,9 +3636,14 @@ async function notesPipeline(route, message) {
       }
       // chapter-intro edits the issues file in place: drop an intro row left by
       // an earlier run so the check after the skill sees whether it wrote one.
-      if (skill.name === 'chapter-intro' && issuesPath) {
-        const strippedIntro = stripIntroRows(path.resolve(CSKILLBP_DIR, issuesPath), ch);
-        if (strippedIntro) console.log(`[notes] ${ref}: removed ${strippedIntro} earlier intro row(s) before chapter-intro`);
+      // If the step then fails, the failure handler puts the earlier file back.
+      if (skill.name === 'chapter-intro' && issuesPath && !isDryRun) {
+        const introAbs = path.resolve(CSKILLBP_DIR, issuesPath);
+        const stripped = stripIntroRows(introAbs, ch);
+        if (stripped.removed) {
+          introBackup = { abs: introAbs, text: stripped.before };
+          console.log(`[notes] ${ref}: removed ${stripped.removed} earlier intro row(s) before chapter-intro`);
+        }
       }
       const timeoutMs = calcSkillTimeout(book, ch, skill.ops);
       const guardrails = buildSkillGuardrails({
@@ -3993,7 +4001,7 @@ async function notesPipeline(route, message) {
             break;
           }
         }
-        if (skill.name === 'chapter-intro' && !issuesFileHasIntroRow(absResolvedFreshness, ch)) {
+        if (skill.name === 'chapter-intro' && !isDryRun && !issuesFileHasIntroRow(absResolvedFreshness, ch)) {
           failedSkill = skill.name;
           await status(`**${skill.name}** failed for ${ref} \u2014 no intro row was written to ${resolved}`);
           setCheckpoint(checkpointRef, {
@@ -4199,6 +4207,14 @@ async function notesPipeline(route, message) {
 
     if (failedSkill) {
       totalFail++;
+      // A failed chapter-intro must not cost the chapter its earlier intro.
+      if (failedSkill === 'chapter-intro' && introBackup && !issuesFileHasIntroRow(introBackup.abs, ch)) {
+        try {
+          fs.writeFileSync(introBackup.abs, introBackup.text);
+        } catch (err) {
+          console.warn(`[notes] ${ref}: could not restore the earlier intro row: ${err.message}`);
+        }
+      }
       setCheckpoint(checkpointRef, {
         state: abortForOutage ? 'paused_for_outage' : abortForUsageLimit ? 'paused_for_usage_limit' : 'failed',
         totalSuccess,
