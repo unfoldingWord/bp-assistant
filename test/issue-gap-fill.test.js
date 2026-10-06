@@ -235,3 +235,34 @@ test('missing ULT verse list posts one skipped warning', async () => {
     assert.equal(messages.filter((m) => /no ULT verse list/.test(m)).length, 1);
   });
 });
+
+test('marker is written when fewer than 2 verses are empty', async () => {
+  await ws(async ({ dir, mod, base, write, pipeDir }) => {
+    write(HEADERLESS + [row('40:4', 'a', 'q', 'x'), row('40:8', 'a', 'q', 'x')].join('\n') + '\n');
+    await mod._fillIssueGaps({ ...base, runClaudeImpl: async () => ({ subtype: 'success' }) });
+    assert.ok(fs.existsSync(path.join(dir, pipeDir, 'gapfill-done.json')));
+  });
+});
+
+test('mergeGapIssues: a bridge row whose tail is a ULT bridge verse is admitted', () => {
+  const { _mergeGapIssues } = fresh(fs.mkdtempSync(path.join(os.tmpdir(), 'gap-')));
+  // ULT keys `\v 6-7` as 6 only; gap is [6]; shard row 40:6-7 must be admitted.
+  const known = new Set([1, 2, 3, 4, 5, 6, 8, 9]);
+  const shard = row('40:6-7', 'translate-versebridge', 'went', 'g') + '\n';
+  const res = _mergeGapIssues({ chapterText: HEADERLESS, shardText: shard, verses: [6], chapter: 40, knownVerses: known });
+  assert.equal(res.added, 1);
+  // Without the ULT verse list the same row is rejected (7 is not a gap verse).
+  assert.equal(_mergeGapIssues({ chapterText: HEADERLESS, shardText: shard, verses: [6], chapter: 40 }).added, 0);
+});
+
+test('fillIssueGaps restores the chapter issues file if the run rewrote it', async () => {
+  await ws(async ({ mod, base, write, read }) => {
+    write(HEADERLESS);
+    const res = await mod._fillIssueGaps({
+      ...base,
+      runClaudeImpl: async () => { write('EZK\t40:1\tclobbered\t\t\t\tx\n'); return { subtype: 'success' }; },
+    });
+    assert.equal(res.added, 0);
+    assert.equal(read(), HEADERLESS);
+  });
+});

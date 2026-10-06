@@ -1884,7 +1884,7 @@ function findEmptyVerses({ issuesText, ultPlainText, chapter, book = '' }) {
   return [...wanted].filter((v) => !covered.has(v)).sort((a, b) => a - b);
 }
 
-function mergeGapIssues({ chapterText, shardText, verses, chapter, book = '' }) {
+function mergeGapIssues({ chapterText, shardText, verses, chapter, book = '', knownVerses = null }) {
   const gap = new Set(verses || []);
   const chapterRows = splitIssueRows(chapterText);
   const shardRows = splitIssueRows(shardText);
@@ -1893,9 +1893,12 @@ function mergeGapIssues({ chapterText, shardText, verses, chapter, book = '' }) 
   shardRows.lines.forEach((line, i) => {
     const r = shardRefs[i];
     if (!r) return;
-    // Admit a row only when every verse in its range is a gap verse.
+    // Admit a row only when every verse in its range is a gap verse. A verse
+    // that is not its own ULT verse (the tail of a \v 6-7 bridge, keyed by 6)
+    // does not count against the row.
+    if (r.end - r.start >= 200) return;
     for (let v = r.start; v <= r.end; v++) {
-      if (!gap.has(v)) return;
+      if (!gap.has(v) && !(knownVerses && !knownVerses.has(v))) return;
     }
     newRows.push({ line, start: r.start });
   });
@@ -1946,15 +1949,18 @@ async function fillIssueGaps({
     try { ultText = ultAbs ? fs.readFileSync(ultAbs, 'utf8') : ''; } catch (_) { ultText = ''; }
     if (ultVerseNumbers(ultText, ch).size === 0) {
       await status(`**${ref}**: issue gap-fill skipped: no ULT verse list`);
+      writeMarker();
       return out;
     }
-    if (!fs.existsSync(issuesAbs)) return out;
+    if (!fs.existsSync(issuesAbs)) { writeMarker(); return out; }
     const empty = findEmptyVerses({
       issuesText: fs.readFileSync(issuesAbs, 'utf8'), ultPlainText: ultText, chapter: ch, book,
     });
     out.empty = empty;
     out.remaining = empty;
-    if (empty.length < 2) return out;
+    if (empty.length < 2) { writeMarker(); return out; }
+    // Snapshot the chapter issues so the merge base cannot be changed by the run.
+    const chapterSnapshot = fs.readFileSync(issuesAbs, 'utf8');
 
     const S = empty[0];
     const E = empty[empty.length - 1];
@@ -2034,9 +2040,14 @@ async function fillIssueGaps({
     let shardText = '';
     try { shardText = fs.readFileSync(shardAbs, 'utf8'); } catch (_) { shardText = ''; }
     const merged = mergeGapIssues({
-      chapterText: fs.readFileSync(issuesAbs, 'utf8'), shardText, verses: empty, chapter: ch, book,
+      chapterText: chapterSnapshot, shardText, verses: empty, chapter: ch, book,
+      knownVerses: ultVerseNumbers(ultText, ch),
     });
-    if (merged.added > 0) fs.writeFileSync(issuesAbs, merged.text);
+    // Always write from the snapshot: deep-issue-id only writes its range file,
+    // but if it touched the chapter file this puts it back.
+    if (merged.added > 0 || fs.readFileSync(issuesAbs, 'utf8') !== chapterSnapshot) {
+      fs.writeFileSync(issuesAbs, merged.text);
+    }
     out.added = merged.added;
     const nowEmpty = findEmptyVerses({ issuesText: merged.text, ultPlainText: ultText, chapter: ch, book });
     out.remaining = nowEmpty;
@@ -3232,8 +3243,14 @@ async function notesPipeline(route, message) {
       const gapFillSkipResumeSkills = new Set(['tn-quality-check', 'door43-push', 'door43-push-done']);
       const gapFillResumeMarker = isResumingThisChapter && !issueProducerSkillNames.has(resumeSkill) && pipeDir
         && fs.existsSync(path.resolve(CSKILLBP_DIR, pipeDir, 'gapfill-done.json'));
-      if (!hasVerseRange && !isDryRun && !(isResumingThisChapter && gapFillSkipResumeSkills.has(resumeSkill))
-        && !gapFillResumeMarker && pipeDir) {
+      // A resume at tn-writer reaches here only to re-run a pending gate; rows
+      // added now would otherwise skip the gate, so gap-fill only when it is pending.
+      const gapFillSkipForResume = isResumingThisChapter
+        && (gapFillSkipResumeSkills.has(resumeSkill) || (resumeSkill === 'tn-writer' && !resumeGatePending));
+      if (!hasVerseRange && !isDryRun && !gapFillSkipForResume && !gapFillResumeMarker && !pipeDir) {
+        await status(`**${ref}**: issue gap-fill skipped: no pipeline context`);
+      }
+      if (!hasVerseRange && !isDryRun && !gapFillSkipForResume && !gapFillResumeMarker && pipeDir) {
         let ultPlainPath = null;
         try { ultPlainPath = readContext(pipeDir).sources?.ultPlain || null; } catch (_) { ultPlainPath = null; }
         const gap = await fillIssueGaps({
