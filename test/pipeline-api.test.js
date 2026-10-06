@@ -505,6 +505,10 @@ test('StartBodySchema — kept: cross-chapter ref accepted; backwards range and 
   const nulls = StartBodySchema.safeParse(keptBody([{ rowId: 'kp10', ref: '40:10', supportReference: null, quote: null }]));
   assert.equal(nulls.success, true, 'null fields read as empty');
   assert.equal(nulls.data.options.kept[0].supportReference, '');
+  const both = StartBodySchema.safeParse({ ...keptBody([VALID_KEPT]),
+    options: { kept: [VALID_KEPT], hints: [{ rowId: VALID_KEPT.rowId, verse: 12, quote: 'q', supportReference: null, seed: null }] } });
+  assert.equal(both.success, false);
+  assert.ok(both.error.issues.some((i) => /both a hint and a kept note/.test(i.message)));
   const dup = StartBodySchema.safeParse(keptBody([VALID_KEPT, { ...VALID_KEPT, ref: '40:13' }]));
   assert.equal(dup.success, false);
   assert.ok(dup.error.issues.some((i) => /duplicate kept rowId/.test(i.message)));

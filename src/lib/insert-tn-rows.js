@@ -155,10 +155,11 @@ function buildKeepKeys(keepRows) {
       const ref = getReference(row);
       const tail = `\t${getSupportReference(row)}\t${getQuote(row)}`;
       keys.add(`${ref}${tail}`);
-      // A cross-chapter "40:48-41:2" covers verses in both chapters.
+      // A cross-chapter "40:48-42:2" covers verses in every chapter it spans.
       const m = ref.match(/^(\d+):\d+-(\d+):\d+$/);
-      const chapters = m ? [Number(m[1]), Number(m[2])] : [getChapter(ref)];
-      for (const ch of chapters) {
+      const first = m ? Number(m[1]) : getChapter(ref);
+      const last = m ? Math.min(Number(m[2]), first + 20) : first;
+      for (let ch = first; ch <= last; ch++) {
         const span = keptRefVerseSpan(ref, ch);
         if (span) for (let v = span.lo; v <= span.hi && v - span.lo < 200; v++) keys.add(`${ch}:${v}${tail}`);
       }

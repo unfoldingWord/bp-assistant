@@ -381,6 +381,19 @@ const StartBodySchema = z.object({
       if (id) seen.add(id);
     }
   }
+  // A row is either a hint the AI expands or a kept note it leaves alone.
+  if (Array.isArray(o.kept) && Array.isArray(o.hints) && o.kept.length && o.hints.length) {
+    const hintIds = new Set(o.hints.map((h) => h && h.rowId).filter(Boolean));
+    o.kept.forEach((k, i) => {
+      if (k && hintIds.has(k.rowId)) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['options', 'kept', i, 'rowId'],
+          message: `rowId "${k.rowId}" is both a hint and a kept note`,
+        });
+      }
+    });
+  }
   // kept — same duplicate-rowId rule as hints.
   if (Array.isArray(o.kept) && o.kept.length > 1) {
     const seen = new Set();
