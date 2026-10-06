@@ -1862,17 +1862,22 @@ function issueRowRefs(lines, book, chapter) {
   });
 }
 
-function findEmptyVerses({ issuesText, ultPlainText, chapter }) {
+function ultVerseNumbers(ultPlainText, chapter) {
   const ultVerses = parsePlainUsfmVersesFromText(ultPlainText);
-  const wanted = new Set();
+  const nums = new Set();
   for (const key of Object.keys(ultVerses)) {
     const [c, v] = key.split(':').map(Number);
-    if (c === Number(chapter) && Number.isFinite(v)) wanted.add(v);
+    if (c === Number(chapter) && Number.isFinite(v)) nums.add(v);
   }
+  return nums;
+}
+
+function findEmptyVerses({ issuesText, ultPlainText, chapter, book = '' }) {
+  const wanted = ultVerseNumbers(ultPlainText, chapter);
   if (wanted.size === 0) return [];
   const { lines } = splitIssueRows(issuesText);
   const covered = new Set();
-  for (const r of issueRowRefs(lines, '', chapter)) {
+  for (const r of issueRowRefs(lines, book, chapter)) {
     if (!r) continue;
     for (let v = r.start; v <= r.end && v - r.start < 200; v++) covered.add(v);
   }
@@ -1888,9 +1893,11 @@ function mergeGapIssues({ chapterText, shardText, verses, chapter, book = '' }) 
   shardRows.lines.forEach((line, i) => {
     const r = shardRefs[i];
     if (!r) return;
+    // Admit a row only when every verse in its range is a gap verse.
     for (let v = r.start; v <= r.end; v++) {
-      if (gap.has(v)) { newRows.push({ line, start: r.start }); return; }
+      if (!gap.has(v)) return;
     }
+    newRows.push({ line, start: r.start });
   });
   if (newRows.length === 0) return { text: chapterText, added: 0 };
 
@@ -1919,14 +1926,31 @@ async function fillIssueGaps({
 }) {
   const out = { empty: [], added: 0, remaining: [], pause: null, error: null };
   const ref = `${book} ${ch}`;
+  const width = book.toUpperCase() === 'PSA' ? 3 : 2;
+  const tag = `${book}-${String(ch).padStart(width, '0')}`;
+  const pipeAbs = path.resolve(CSKILLBP_DIR, pipeDir || path.join('tmp', 'pipeline', tag));
+  let shardAbs = null;
+  let preexistingAside = null;
+  const writeMarker = () => {
+    try {
+      fs.mkdirSync(pipeAbs, { recursive: true });
+      fs.writeFileSync(path.join(pipeAbs, 'gapfill-done.json'), JSON.stringify({
+        empty: out.empty, added: out.added, remaining: out.remaining, error: out.error, at: new Date().toISOString(),
+      }));
+    } catch (_) { /* marker is best-effort */ }
+  };
   try {
     const issuesAbs = path.resolve(CSKILLBP_DIR, issuesPath);
     const ultAbs = ultPlainPath ? path.resolve(CSKILLBP_DIR, ultPlainPath) : null;
-    if (!fs.existsSync(issuesAbs) || !ultAbs || !fs.existsSync(ultAbs)) return out;
+    let ultText = '';
+    try { ultText = ultAbs ? fs.readFileSync(ultAbs, 'utf8') : ''; } catch (_) { ultText = ''; }
+    if (ultVerseNumbers(ultText, ch).size === 0) {
+      await status(`**${ref}**: issue gap-fill skipped: no ULT verse list`);
+      return out;
+    }
+    if (!fs.existsSync(issuesAbs)) return out;
     const empty = findEmptyVerses({
-      issuesText: fs.readFileSync(issuesAbs, 'utf8'),
-      ultPlainText: fs.readFileSync(ultAbs, 'utf8'),
-      chapter: ch,
+      issuesText: fs.readFileSync(issuesAbs, 'utf8'), ultPlainText: ultText, chapter: ch, book,
     });
     out.empty = empty;
     out.remaining = empty;
@@ -1934,12 +1958,17 @@ async function fillIssueGaps({
 
     const S = empty[0];
     const E = empty[empty.length - 1];
-    const width = book.toUpperCase() === 'PSA' ? 3 : 2;
-    const tag = `${book}-${String(ch).padStart(width, '0')}`;
     const shardRel = buildIssuesPath(book, tag, true, S, E);
-    const shardAbs = path.resolve(CSKILLBP_DIR, shardRel);
+    shardAbs = path.resolve(CSKILLBP_DIR, shardRel);
     fs.mkdirSync(path.dirname(shardAbs), { recursive: true });
-    fs.writeFileSync(shardAbs, ''); // stub so Claude skips Read-before-Write; also clears a stale shard
+    fs.mkdirSync(pipeAbs, { recursive: true });
+    // A real file already at the shard path belongs to someone else: park it and
+    // restore it when we finish.
+    if (fs.existsSync(shardAbs) && fs.statSync(shardAbs).size > 0) {
+      preexistingAside = path.join(pipeAbs, `gapfill-preexisting-v${S}-${E}.tsv`);
+      fs.copyFileSync(shardAbs, preexistingAside);
+    }
+    fs.writeFileSync(shardAbs, ''); // stub so Claude skips Read-before-Write
 
     await status(`**${ref}**: ${empty.length} verses have no issues (${empty.join(', ')}); re-running issue finding over ${S}-${E}...`);
 
@@ -1956,7 +1985,10 @@ async function fillIssueGaps({
         prompt: `${book} ${ch} --verses ${S}-${E}${ctxFlag}`,
         label: `${ref} deep-issue-id gap-fill`,
         cwd: CSKILLBP_DIR,
-        model,
+        // Same precedence as the main skill loop (no per-skill model here).
+        model: model || (process.env.BP_AUTO_MODEL === '1'
+          ? resolveAutoModel('claude', null, 'xhigh')
+          : undefined),
         thinking: 'xhigh',
         skill: 'deep-issue-id',
         tools: toolConfig.tools,
@@ -1969,6 +2001,9 @@ async function fillIssueGaps({
         appendSystemPrompt: DEEP_ISSUE_ID_HINT,
         mcpToolSet: 'issue-id',
         guardrails,
+        hooks: process.env.BP_GUARD_HOOKS === '1'
+          ? createGuardHooks({ pipelineType: 'notes', scope: ref, publish: true })
+          : undefined,
       });
     } catch (err) {
       runErr = err;
@@ -1988,7 +2023,11 @@ async function fillIssueGaps({
       out.error = errText;
       if (runErr && isTransientOutageError(runErr)) out.pause = 'outage';
       else if (isUsageLimitError(errText)) out.pause = 'usage_limit';
-      await status(`**${ref}**: issue gap-fill failed (${errText}); continuing with the original issues.`);
+      // The caller posts the pause message; only non-pause failures continue quietly.
+      if (!out.pause) {
+        await status(`**${ref}**: issue gap-fill failed (${errText}); continuing with the original issues.`);
+        writeMarker();
+      }
       return out;
     }
 
@@ -1999,24 +2038,8 @@ async function fillIssueGaps({
     });
     if (merged.added > 0) fs.writeFileSync(issuesAbs, merged.text);
     out.added = merged.added;
-    const nowEmpty = findEmptyVerses({
-      issuesText: merged.text,
-      ultPlainText: fs.readFileSync(ultAbs, 'utf8'),
-      chapter: ch,
-    });
+    const nowEmpty = findEmptyVerses({ issuesText: merged.text, ultPlainText: ultText, chapter: ch, book });
     out.remaining = nowEmpty;
-
-    // Move the shard out of output/issues/ so it cannot collide with splitTsv
-    // chunk names or checkPrerequisites.
-    try {
-      const dest = path.resolve(CSKILLBP_DIR, pipeDir || path.join('tmp', 'pipeline', tag), `gapfill-v${S}-${E}.tsv`);
-      fs.mkdirSync(path.dirname(dest), { recursive: true });
-      fs.copyFileSync(shardAbs, dest);
-      fs.unlinkSync(shardAbs);
-    } catch (err) {
-      console.warn(`[notes] gap-fill shard move failed (non-fatal): ${err.message}`);
-      try { fs.unlinkSync(shardAbs); } catch (_) { /* best effort */ }
-    }
 
     if (merged.added === 0) {
       out.error = 'no rows for the empty verses';
@@ -2024,12 +2047,31 @@ async function fillIssueGaps({
     } else {
       await status(`**${ref}**: issue gap-fill added ${merged.added} row(s); verses still empty: ${nowEmpty.join(', ') || 'none'}.`);
     }
+    writeMarker();
     return out;
   } catch (err) {
     out.error = err.message;
     console.warn(`[notes] issue gap-fill error (non-fatal): ${err.stack || err.message}`);
     try { await status(`**${ref}**: issue gap-fill failed (${err.message}); continuing with the original issues.`); } catch (_) { /* ignore */ }
+    writeMarker();
     return out;
+  } finally {
+    // The gap-fill's own shard/stub must never stay in output/issues/ (it would
+    // collide with splitTsv chunk names / checkPrerequisites). Keep a copy of
+    // any non-empty shard in the pipe dir for debugging.
+    if (shardAbs) {
+      try {
+        if (fs.existsSync(shardAbs) && fs.statSync(shardAbs).size > 0) {
+          const m = path.basename(shardAbs).match(/-v(\d+)-(\d+)\.tsv$/);
+          fs.mkdirSync(pipeAbs, { recursive: true });
+          fs.copyFileSync(shardAbs, path.join(pipeAbs, `gapfill-v${m[1]}-${m[2]}.tsv`));
+        }
+      } catch (e) { console.warn(`[notes] gap-fill shard copy failed (non-fatal): ${e.message}`); }
+      try { fs.unlinkSync(shardAbs); } catch (_) { /* already gone */ }
+      if (preexistingAside) {
+        try { fs.copyFileSync(preexistingAside, shardAbs); } catch (e) { console.warn(`[notes] restoring pre-existing shard failed: ${e.message}`); }
+      }
+    }
   }
 }
 
@@ -3182,7 +3224,16 @@ async function notesPipeline(route, message) {
       // Gap-fill: whole-chapter runs only, never dry-run, never when resuming at
       // a downstream skill. Runs before normalization so new rows go through the
       // normalizer and the issue-rules gate.
-      if (!hasVerseRange && !isDryRun && !(isResumingThisChapter && downstreamResumeSkills.has(resumeSkill)) && pipeDir) {
+      // Skip only when resuming AFTER tn-writer: a gap-fill pause resumes at
+      // tn-writer (gatePending) and must be retried. A marker from an earlier
+      // attempt skips a repeat on resume, unless the issue producer is being
+      // re-run (the issues file was regenerated). A fresh run archives pipeDir,
+      // so it never inherits an old marker.
+      const gapFillSkipResumeSkills = new Set(['tn-quality-check', 'door43-push', 'door43-push-done']);
+      const gapFillResumeMarker = isResumingThisChapter && !issueProducerSkillNames.has(resumeSkill) && pipeDir
+        && fs.existsSync(path.resolve(CSKILLBP_DIR, pipeDir, 'gapfill-done.json'));
+      if (!hasVerseRange && !isDryRun && !(isResumingThisChapter && gapFillSkipResumeSkills.has(resumeSkill))
+        && !gapFillResumeMarker && pipeDir) {
         let ultPlainPath = null;
         try { ultPlainPath = readContext(pipeDir).sources?.ultPlain || null; } catch (_) { ultPlainPath = null; }
         const gap = await fillIssueGaps({

@@ -180,3 +180,58 @@ test('fillIssueGaps: usage limit is reported as a pause', async () => {
     assert.equal(res.pause, 'usage_limit');
   });
 });
+
+test('mergeGapIssues: a bridge row touching a covered verse is dropped', () => {
+  const { _mergeGapIssues } = fresh(fs.mkdtempSync(path.join(os.tmpdir(), 'gap-')));
+  const shard = [row('40:8-9', 'figs-idiom', 'both', 'bridge ok'), row('40:4-5', 'figs-idiom', 'x', 'bridge touches 5')].join('\n') + '\n';
+  const res = _mergeGapIssues({ chapterText: HEADERLESS, shardText: shard, verses: [4, 8, 9], chapter: 40 });
+  assert.equal(res.added, 1);
+  assert.match(res.text, /bridge ok/);
+  assert.doesNotMatch(res.text, /bridge touches 5/);
+});
+
+const STUB = 'output/issues/EZK/EZK-40-v4-9.tsv';
+const MARKER = 'tmp/pipeline/EZK-40/gapfill-done.json';
+
+test('stub never remains in output/issues after throw, non-success, pause, or success; marker only on non-pause', async () => {
+  await ws(async ({ dir, mod, base, messages }) => {
+    const cases = [
+      ['throw', async () => { throw new Error('boom'); }, false],
+      ['non-success', async () => ({ subtype: 'error_max_turns' }), false],
+      ['pause', async () => { throw new Error("You've hit your usage limit"); }, true],
+      ['success', async (o) => {
+        fs.writeFileSync(path.join(dir, STUB), row('40:4', 'a', 'q', 'new4') + '\n');
+        return { subtype: 'success' };
+      }, false],
+    ];
+    for (const [name, runClaudeImpl, isPause] of cases) {
+      try { fs.unlinkSync(path.join(dir, MARKER)); } catch (_) { /* none */ }
+      messages.length = 0;
+      await mod._fillIssueGaps({ ...base, runClaudeImpl });
+      assert.equal(fs.existsSync(path.join(dir, STUB)), false, `${name}: stub removed`);
+      assert.equal(fs.existsSync(path.join(dir, MARKER)), !isPause, `${name}: marker`);
+      if (isPause) assert.ok(!messages.some((m) => /continuing with the original/.test(m)), 'pause posts no continuing status');
+      else if (name !== 'success') assert.ok(messages.some((m) => /continuing with the original/.test(m)));
+      // reset issues file for the next case
+      fs.writeFileSync(path.join(dir, 'output/issues/EZK/EZK-40.tsv'), HEADERLESS);
+    }
+  });
+});
+
+test('pre-existing non-empty shard is restored after the run', async () => {
+  await ws(async ({ dir, mod, base }) => {
+    fs.writeFileSync(path.join(dir, STUB), 'someone else\n');
+    await mod._fillIssueGaps({ ...base, runClaudeImpl: async () => ({ subtype: 'success' }) });
+    assert.equal(fs.readFileSync(path.join(dir, STUB), 'utf8'), 'someone else\n');
+    assert.ok(fs.existsSync(path.join(dir, 'tmp/pipeline/EZK-40/gapfill-preexisting-v4-9.tsv')));
+  });
+});
+
+test('missing ULT verse list posts one skipped warning', async () => {
+  await ws(async ({ mod, base, messages }) => {
+    let calls = 0;
+    await mod._fillIssueGaps({ ...base, ultPlainPath: 'tmp/nope.usfm', runClaudeImpl: async () => { calls++; return {}; } });
+    assert.equal(calls, 0);
+    assert.equal(messages.filter((m) => /no ULT verse list/.test(m)).length, 1);
+  });
+});
