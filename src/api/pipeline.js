@@ -110,11 +110,14 @@ const KeptSchema = z.object({
   rowId: z.string().regex(HINT_ROW_ID_RE),
   ref: z.string().min(1).max(20).regex(KEPT_REF_RE, 'ref must look like 40:12, 40:12-14, 40:48-41:2 or 40:intro')
     .refine((ref) => {
-      const m = ref.match(/^\d+:(\d+)-(\d+)$/);
-      return !m || Number(m[1]) <= Number(m[2]);
+      const m = ref.match(/^(\d+):(\d+)-(?:(\d+):)?(\d+)$/);
+      if (!m) return true;
+      const c1 = Number(m[1]);
+      const c2 = m[3] ? Number(m[3]) : c1;
+      return c1 < c2 || (c1 === c2 && Number(m[2]) <= Number(m[4]));
     }, 'ref range must not run backwards'),
-  supportReference: z.string().max(200),
-  quote: z.string().max(1000),
+  supportReference: z.string().max(200).default(''),
+  quote: z.string().max(1000).default(''),
   note: z.string().max(400).optional(),
 }).strict();
 

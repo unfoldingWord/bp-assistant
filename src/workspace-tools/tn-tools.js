@@ -1776,42 +1776,55 @@ function applyHintsToPreparedNotes({ preparedJson, hints, chapter }) {
 }
 
 /**
+ * Verses of `chapter` that a kept note's ref covers, as { lo, hi }, or null.
+ * "40:12" and "40:12-14" cover those verses; a cross-chapter "40:48-41:2"
+ * covers 40:48 to the end of 40 and 41:1-2. Intro/front refs cover none.
+ */
+function keptRefVerseSpan(ref, chapter) {
+  const m = String(ref || '').match(/^(\d+):(\d+)(?:-(?:(\d+):)?(\d+))?$/);
+  if (!m) return null;
+  const c1 = Number(m[1]);
+  const v1 = Number(m[2]);
+  const c2 = m[3] ? Number(m[3]) : c1;
+  const v2 = m[4] ? Number(m[4]) : v1;
+  const ch = Number(chapter);
+  if (ch < c1 || ch > c2) return null;
+  const lo = ch === c1 ? v1 : 1;
+  const hi = ch === c2 ? v2 : 999;
+  return lo <= hi ? { lo, hi } : null;
+}
+
+/**
  * Drop prepared items already covered by an editor-kept note: same verse,
  * normalized support reference and normalized quote (exact after
  * normalizeQuote, not fuzzy, so a note on a different phrase still lands).
  * Nothing is injected: the kept note already exists in en_tn. The push-time
  * dedup in insert-tn-rows uses the same key.
  *
- * A kept `ref` is "ch:v", "ch:v1-v2" (covers every verse in the range) or an
- * intro ref (never matches a verse item). Entries for other chapters are
- * ignored.
+ * Kept refs are read with keptRefVerseSpan (ranges and cross-chapter spans
+ * cover every verse in them; intro refs cover none).
  *
  * @param {object} prepared - parsed prepared_notes.json ({ items: [...] })
  * @param {Array}  kept     - options.kept entries
- * @param {number} [chapter] - when given, only kept entries for this chapter apply
+ * @param {number} [chapter] - when given, only items in this chapter are checked
  * @returns {{ prepared: object, removed: number }}
  */
 function removePreparedItemsCoveredByKept(prepared, kept, chapter) {
   const items = Array.isArray(prepared && prepared.items) ? prepared.items : [];
   if (!Array.isArray(kept) || kept.length === 0) return { prepared, removed: 0 };
-  const entries = [];
-  for (const k of kept) {
-    const m = String(k.ref || '').match(/^(\d+):(\d+)(?:-(\d+))?$/);
-    if (!m) continue;
-    if (chapter != null && Number(m[1]) !== Number(chapter)) continue;
-    const lo = Number(m[2]);
-    const hi = m[3] ? Number(m[3]) : lo;
-    entries.push({ ch: Number(m[1]), lo, hi, sref: normalizeSupportReference(k.supportReference), quote: normalizeQuote(k.quote) });
-  }
   const out = items.filter((item) => {
     if (!item || item.fromHint) return true;
     const v = verseFromReference(item.reference);
     if (v == null) return true;
     const itemCh = Number(String(item.reference).split(':')[0]);
+    if (chapter != null && itemCh !== Number(chapter)) return true;
     const sref = normalizeSupportReference(item.sref);
     const quote = normalizeQuote(item.orig_quote);
-    const covered = entries.some((e) =>
-      e.ch === itemCh && v >= e.lo && v <= e.hi && sref === e.sref && quote === e.quote);
+    const covered = kept.some((k) => {
+      const span = keptRefVerseSpan(k.ref, itemCh);
+      return !!span && v >= span.lo && v <= span.hi
+        && sref === normalizeSupportReference(k.supportReference) && quote === normalizeQuote(k.quote);
+    });
     return !covered;
   });
   const removed = items.length - out.length;
@@ -3453,6 +3466,7 @@ module.exports = {
   // Hint expansion (used by notes-pipeline mechanical prep + tests):
   applyHintsToPreparedNotes,
   removePreparedItemsCoveredByKept,
+  keptRefVerseSpan,
   applyKeptToPreparedNotes,
   normalizeQuote,
   normalizeSupportReference,

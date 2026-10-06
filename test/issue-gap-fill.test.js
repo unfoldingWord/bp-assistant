@@ -294,4 +294,8 @@ test('findEmptyVerses: a verse covered only by a kept ref is not empty', () => {
   assert.deepEqual(_findEmptyVerses({
     issuesText: HEADERLESS, ultPlainText: ULT, chapter: 40, keptRefs: ['40:8-9', '41:4', '40:intro'],
   }), [4]);
+  // A cross-chapter kept ref covers to the end of its first chapter.
+  assert.deepEqual(_findEmptyVerses({
+    issuesText: HEADERLESS, ultPlainText: ULT, chapter: 40, keptRefs: ['40:8-41:2'],
+  }), [4]);
 });

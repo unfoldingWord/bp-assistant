@@ -24,6 +24,7 @@ const {
   substituteAT,
   applyHintsToPreparedNotes,
   removePreparedItemsCoveredByKept,
+  keptRefVerseSpan,
   normalizeQuote,
   normalizeSupportReference,
   quoteFuzzyMatch,
@@ -2075,4 +2076,25 @@ test('removePreparedItemsCoveredByKept — exact normalized quote, not fuzzy; ke
   assert.equal(removed, 1, 'word joiner is ignored, a longer phrase containing the quote is not a duplicate');
   assert.deepEqual(out.items.map((i) => i.id), ['a002', 'a003']);
   assert.equal(out.item_count, 2);
+});
+
+test('keptRefVerseSpan — single, range, cross-chapter, intro', () => {
+  assert.deepEqual(keptRefVerseSpan('40:12', 40), { lo: 12, hi: 12 });
+  assert.deepEqual(keptRefVerseSpan('40:12-14', 40), { lo: 12, hi: 14 });
+  assert.equal(keptRefVerseSpan('40:12', 41), null);
+  assert.deepEqual(keptRefVerseSpan('40:48-41:2', 40), { lo: 48, hi: 999 });
+  assert.deepEqual(keptRefVerseSpan('40:48-41:2', 41), { lo: 1, hi: 2 });
+  assert.equal(keptRefVerseSpan('40:48-41:2', 42), null);
+  assert.equal(keptRefVerseSpan('40:intro', 40), null);
+});
+
+test('removePreparedItemsCoveredByKept — a cross-chapter kept ref covers its verses in both chapters', () => {
+  const prepared = { items: [
+    { id: 'a001', reference: '40:49', sref: 'figs-explicit', orig_quote: 'x' },
+    { id: 'a002', reference: '41:1', sref: 'figs-explicit', orig_quote: 'x' },
+    { id: 'a003', reference: '41:3', sref: 'figs-explicit', orig_quote: 'x' },
+  ] };
+  const kept = [{ rowId: 'kp01', ref: '40:48-41:2', supportReference: 'figs-explicit', quote: 'x' }];
+  assert.deepEqual(removePreparedItemsCoveredByKept(prepared, kept, 40).prepared.items.map((i) => i.id), ['a002', 'a003']);
+  assert.deepEqual(removePreparedItemsCoveredByKept(prepared, kept, 41).prepared.items.map((i) => i.id), ['a001', 'a003']);
 });

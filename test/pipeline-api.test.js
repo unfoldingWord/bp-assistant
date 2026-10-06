@@ -497,6 +497,11 @@ test('StartBodySchema — kept: cross-chapter ref accepted; backwards range and 
   const back = StartBodySchema.safeParse(keptBody([{ ...VALID_KEPT, ref: '40:14-12' }]));
   assert.equal(back.success, false);
   assert.match(back.error.issues[0].message, /backwards/);
+  const backX = StartBodySchema.safeParse(keptBody([{ ...VALID_KEPT, ref: '41:2-40:48' }]));
+  assert.equal(backX.success, false);
+  const bare = StartBodySchema.safeParse(keptBody([{ rowId: 'kp09', ref: '40:9' }]));
+  assert.equal(bare.success, true, 'supportReference and quote may be omitted');
+  assert.equal(bare.data.options.kept[0].quote, '');
   const dup = StartBodySchema.safeParse(keptBody([VALID_KEPT, { ...VALID_KEPT, ref: '40:13' }]));
   assert.equal(dup.success, false);
   assert.ok(dup.error.issues.some((i) => /duplicate kept rowId/.test(i.message)));

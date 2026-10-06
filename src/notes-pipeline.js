@@ -18,7 +18,7 @@ const { createGuardHooks } = require('./guard-hooks');
 const { resolveAutoModel } = require('./api-runner/provider-config');
 const { getDoor43Username, emailToFallbackUsername, buildBranchName, resolveOutputFile, discoverFreshOutput, checkPrerequisites, calcSkillTimeout, calcVerseSpanTimeout, normalizeBookName, resolveConflictMention, parsePartialTsv, truncatePartialTsv, parseChunkRange, isUsageLimitError, CSKILLBP_DIR } = require('./pipeline-utils');
 const { splitTsv, fixTrailingNewlines } = require('./workspace-tools/tsv-tools');
-const { fillTsvIds, generateIds, prepareNotes, fillOrigQuotes, resolveGlQuotes, flagNarrowQuotes, extractAlignmentData, prepareATContext, substituteAT, fixUnicodeQuotes, verifyBoldMatches, syncCanonicalHebrewQuotes, applyHintsToPreparedNotes, applyKeptToPreparedNotes, parsePlainUsfmVersesFromText, detectIssuesTsvLayout, extractIssuesTsvRow, _stripAlternateTranslation: stripAlternateTranslation } = require('./workspace-tools/tn-tools');
+const { fillTsvIds, generateIds, prepareNotes, fillOrigQuotes, resolveGlQuotes, flagNarrowQuotes, extractAlignmentData, prepareATContext, substituteAT, fixUnicodeQuotes, verifyBoldMatches, syncCanonicalHebrewQuotes, applyHintsToPreparedNotes, applyKeptToPreparedNotes, keptRefVerseSpan, parsePlainUsfmVersesFromText, detectIssuesTsvLayout, extractIssuesTsvRow, _stripAlternateTranslation: stripAlternateTranslation } = require('./workspace-tools/tn-tools');
 const { checkTnQuality, detectSelfTalk, templateFirstPhrase, resolveTemplateText } = require('./workspace-tools/quality-tools');
 const { buildBookRecurrenceIndex, deriveRecurrenceKeys, buildSeeHowSentence, isSeeHowEligible, isContextDependentSref, dedupeAlsoOccursVerses, assignAlsoOccursVerses, resolveDoor43ReposPath, hebTokens, verseNumber: recurrenceVerseNumber, SEE_HOW_NEVER_FOLD_SREFS, CROSS_BOOK_MAX_BOOKS } = require('./workspace-tools/recurrence-index');
 const { normalizeIssuesFile, buildParallelismIntroHintArgs } = require('./issue-normalizer');
@@ -734,10 +734,10 @@ async function runSeeHowDetection({ pipeDir, contextPath, generateIdsFn = genera
   // those slots so no pointer is synthesized there (its repeats keep their own
   // notes instead of folding into a pointer that would duplicate the kept one).
   for (const k of kept || []) {
-    const m = String(k.ref || '').match(/^(\d+):(\d+)(?:-(\d+))?$/);
-    if (!m || Number(m[1]) !== chapter || !k.quote) continue;
+    const span = k.quote ? keptRefVerseSpan(k.ref, chapter) : null;
+    if (!span) continue;
     const toks = hebTokens(k.quote).join('+');
-    for (let v = Number(m[2]); v <= Number(m[3] || m[2]); v++) injectedAt.add(`${chapter}:${v}|${toks}`);
+    for (let v = span.lo; v <= span.hi && v - span.lo < 200; v++) injectedAt.add(`${chapter}:${v}|${toks}`);
   }
 
   // Resolve every anchor -- prepared groups and standalone injections alike --
@@ -1881,8 +1881,9 @@ function ultVerseNumbers(ultPlainText, chapter) {
   return nums;
 }
 
-// keptRefs: ref strings ("40:12", "40:12-14") of editor-kept notes. A verse they
-// cover already has a note in en_tn, so it is not empty for gap-fill.
+// keptRefs: ref strings ("40:12", "40:12-14", "40:48-41:2") of editor-kept
+// notes. A verse they cover already has a note in en_tn, so it is not empty
+// for gap-fill.
 function findEmptyVerses({ issuesText, ultPlainText, chapter, book = '', keptRefs = [] }) {
   const wanted = ultVerseNumbers(ultPlainText, chapter);
   if (wanted.size === 0) return [];
@@ -1893,11 +1894,9 @@ function findEmptyVerses({ issuesText, ultPlainText, chapter, book = '', keptRef
     for (let v = r.start; v <= r.end && v - r.start < 200; v++) covered.add(v);
   }
   for (const kr of keptRefs || []) {
-    const m = String(kr || '').match(/^(\d+):(\d+)(?:-(\d+))?$/);
-    if (!m || Number(m[1]) !== Number(chapter)) continue;
-    const lo = Number(m[2]);
-    const hi = m[3] ? Number(m[3]) : lo;
-    for (let v = lo; v <= hi && v - lo < 200; v++) covered.add(v);
+    const span = keptRefVerseSpan(kr, chapter);
+    if (!span) continue;
+    for (let v = span.lo; v <= span.hi && v - span.lo < 200; v++) covered.add(v);
   }
   return [...wanted].filter((v) => !covered.has(v)).sort((a, b) => a - b);
 }
@@ -3566,7 +3565,7 @@ async function notesPipeline(route, message) {
           // so see-how never folds other verses into a note that is then
           // dropped; see-how gets the kept list so it does not synthesize a
           // pointer at a kept note's verse and quote either.
-          const keptHere = (kept || []).filter((k) => Number(String(k.ref).split(':')[0]) === Number(ch)).length;
+          const keptHere = (kept || []).filter((k) => keptRefVerseSpan(k.ref, ch)).length;
           if (keptHere > 0) {
             try {
               const dropped = applyKeptToPreparedNotes({
