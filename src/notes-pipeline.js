@@ -1957,6 +1957,24 @@ function mergeGapIssues({ chapterText, shardText, verses, chapter, book = '', kn
   return { text: lines.join(eol) + (trailing ? eol : ''), added: newRows.length };
 }
 
+// The --verses span runs from the first to the last empty verse, so it mostly
+// holds verses that already have issues. Without the target list the analysts
+// spend their rows there (thrown away by mergeGapIssues) and skip the empty
+// verses as "repeats": EZK 40 gap-fill over 8-47 kept 4 of 42 rows and left
+// 25-36 empty.
+function buildGapFillHint({ verses, issuesPath }) {
+  const list = verses.join(', ');
+  return DEEP_ISSUE_ID_HINT + '\n\n' +
+    `GAP-FILL RUN. Target verses: ${list}. The other verses in the --verses span are already covered (by rows ` +
+    `in ${issuesPath} or by editor-kept notes), and only rows for the target verses are kept; rows for any ` +
+    'other verse are discarded. Put the target verse list in every analyst and challenger prompt, and have ' +
+    'each analyst read every target verse closely. The skill\'s usual selectivity and challenger rules still ' +
+    `apply. The first-occurrence rule changes in one way: a phrase that already has a row in ${issuesPath} ` +
+    'with the same issue type is covered (the pipeline handles later occurrences), but a phrase with no such ' +
+    'row should be flagged in the first target verse where it occurs, even if an earlier non-target verse ' +
+    'has the same wording. A target verse may truly need no issue; do not invent one.';
+}
+
 async function fillIssueGaps({
   book, ch, issuesPath, contextPath, ctxFlag = '', ultPlainPath, pipeDir, model, status = async () => {},
   userId, runClaudeImpl = runClaude, recordMetricsImpl = recordMetrics, keptRefs = [],
@@ -2044,7 +2062,7 @@ async function fillIssueGaps({
         disableLocalSettings: true,
         timeoutMs,
         maxTurns: guardrails.maxTurns,
-        appendSystemPrompt: DEEP_ISSUE_ID_HINT,
+        appendSystemPrompt: buildGapFillHint({ verses: empty, issuesPath }),
         mcpToolSet: 'issue-id',
         guardrails,
         hooks: process.env.BP_GUARD_HOOKS === '1'

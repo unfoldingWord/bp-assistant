@@ -142,6 +142,10 @@ test('fillIssueGaps runs once over min-max, merges, moves the shard out', async 
     assert.equal(prompts[0].prompt, 'EZK 40 --verses 4-9');
     assert.equal(prompts[0].thinking, 'xhigh');
     assert.equal(prompts[0].mcpToolSet, 'issue-id');
+    // The run is told which verses in 4-9 are the gaps and where existing rows live.
+    assert.match(prompts[0].appendSystemPrompt, /Target verses: 4, 8, 9\./);
+    assert.match(prompts[0].appendSystemPrompt, /output\/issues\/EZK\/EZK-40\.tsv/);
+    assert.match(prompts[0].appendSystemPrompt, /Agent teams/);
     assert.equal(res.added, 2);
     assert.deepEqual(res.remaining, [8]);
     const expl = read().split('\n').filter(Boolean).map((l) => l.split('\t')[6]);
