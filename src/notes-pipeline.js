@@ -1957,6 +1957,23 @@ function mergeGapIssues({ chapterText, shardText, verses, chapter, book = '', kn
   return { text: lines.join(eol) + (trailing ? eol : ''), added: newRows.length };
 }
 
+// The --verses span runs from the first to the last empty verse, so it mostly
+// holds verses that already have issues. Without the target list the analysts
+// spend their rows there (thrown away by mergeGapIssues) and skip the empty
+// verses as "repeats": EZK 40 gap-fill over 8-47 kept 4 of 42 rows and left
+// 25-36 empty.
+function buildGapFillHint({ verses, issuesPath }) {
+  const list = verses.join(', ');
+  return DEEP_ISSUE_ID_HINT + '\n\n' +
+    `GAP-FILL RUN. Target verses: ${list}. Every other verse in the --verses span already has issues in ` +
+    `${issuesPath}, and only rows for the target verses are kept; rows for any other verse are discarded. ` +
+    'Put the target verse list in every analyst and challenger prompt, and have each analyst read every ' +
+    'target verse closely. Skip a phrase in a target verse only when the same wording already has a row in ' +
+    `${issuesPath} (later occurrences get "see how" pointers automatically). If a phrase has no row there, ` +
+    'flag it in the first target verse where it occurs, even when an earlier non-target verse has the same ' +
+    'wording. A target verse may truly need no issue; do not invent one.';
+}
+
 async function fillIssueGaps({
   book, ch, issuesPath, contextPath, ctxFlag = '', ultPlainPath, pipeDir, model, status = async () => {},
   userId, runClaudeImpl = runClaude, recordMetricsImpl = recordMetrics, keptRefs = [],
@@ -2044,7 +2061,7 @@ async function fillIssueGaps({
         disableLocalSettings: true,
         timeoutMs,
         maxTurns: guardrails.maxTurns,
-        appendSystemPrompt: DEEP_ISSUE_ID_HINT,
+        appendSystemPrompt: buildGapFillHint({ verses: empty, issuesPath }),
         mcpToolSet: 'issue-id',
         guardrails,
         hooks: process.env.BP_GUARD_HOOKS === '1'
