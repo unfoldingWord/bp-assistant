@@ -3610,12 +3610,12 @@ async function notesPipeline(route, message) {
                 kept,
                 chapter: ch,
               }).itemsRemoved;
-              // The gate's KEPT drops happened earlier, on the issue list. When the
-              // gate did not run here (resume, already_applied, off), those rows are
-              // already gone, so read the count from its sealed sidecar.
+              // The gate's KEPT drops (this run's and earlier runs' still gone) happened
+              // earlier, on the issue list. When the gate did not run here (resume,
+              // already_applied, off), read the count from its sealed sidecar.
               const gateKept = issueRulesGateResult && issueRulesGateResult.ran
-                ? (issueRulesGateResult.keptDrops || []).length
-                : ((readGateSidecar({ issuesPath, book })?.changes || []).filter((c) => c.kept).length);
+                ? (issueRulesGateResult.keptDropsTotal || 0)
+                : (readGateSidecar({ issuesPath, book })?.keptDropped || []).length;
               await status(
                 `**${ref}**: ${keptHere} kept notes from the editor will stay in place; ` +
                 `${dropped + gateKept} AI notes dropped as duplicates of kept notes ` +

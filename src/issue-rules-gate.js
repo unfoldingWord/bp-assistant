@@ -86,6 +86,12 @@ function resolveSettings({ config, env, book }) {
 
 // --- TSV parsing / serialization ---------------------------------------------------
 
+// Last verse of a row ref: "3:4-5" -> 5; "3:4" -> 4.
+function rowLastVerse(row) {
+  const m = String(row.ref || '').trim().match(/^\d+:\d+-(\d+)$/);
+  return m ? Math.max(row.verse, Number(m[1])) : row.verse;
+}
+
 function verseOfRef(ref) {
   const m = String(ref || '').trim().match(/^(\d+):(\d+)/);
   return m ? { chapter: Number(m[1]), verse: Number(m[2]) } : null;
@@ -473,10 +479,12 @@ function parseVerdicts(text, rows, opts = {}) {
       v.quote = sanitizeCell(entry.quote);
       if (!v.quote) { errors.push(`row ${idx}: rescope requires quote`); continue; }
     }
-    if (action === 'drop' && (String(v.rule || '').toUpperCase() === KEPT_RULE || (entry.kept != null && entry.kept !== ''))) {
+    // A drop citing another rule stays that kind of drop even if a stray "kept" field rides along.
+    if (action === 'drop' && (String(v.rule || '').toUpperCase() === KEPT_RULE || (!v.rule && entry.kept != null && entry.kept !== ''))) {
       const keptId = sanitizeCell(entry.kept);
       const k = keptById.get(keptId);
-      const why = !k ? `unknown kept note "${keptId}"` : (row.verse < k.span.lo || row.verse > k.span.hi ? `kept note ${keptId} is not at verse ${row.verse}` : null);
+      const rowHi = rowLastVerse(row);
+      const why = !k ? `unknown kept note "${keptId}"` : (rowHi < k.span.lo || row.verse > k.span.hi ? `kept note ${keptId} is not at verse ${row.ref}` : null);
       if (why) {
         keptRejected.push(`kept_rejected:${idx}:${why}`);
         verdicts.set(idx, { row: idx, action: 'keep', declined: true, reason: v.reason, rule: null });
@@ -581,7 +589,8 @@ function applyVerdicts(rows, verdicts, opts = {}) {
   }
   const protectSrefs = opts.protectSrefs || new Set();
 
-  // KEPT drops have their own cap: never more than the chapter's kept notes.
+  // KEPT drops have their own cap: never more than the chapter's kept notes, less
+  // the rows earlier runs already dropped as their duplicates (opts.keptTotal).
   const wantedKeptDrops = [...verdicts.values()].filter((v) => v.action === 'drop' && v.keptId).length;
   const keptDropsAllowed = wantedKeptDrops <= Math.max(0, Number(opts.keptTotal) || 0);
   if (wantedKeptDrops > 0 && !keptDropsAllowed) notes.push('kept_drop_cap_exceeded');
@@ -797,7 +806,7 @@ function accountingHolds(beforeRows, afterRows, counts) {
 
 async function runIssueRulesGate({ issuesPath, book, chapter, verseStart, verseEnd, ctx, hints, kept, config, env, dryRun, model, status, runClaudeImpl } = {}) {
   const result = {
-    ran: false, reason: null, mode: null, counts: emptyCounts(), keptDrops: [], changed: false,
+    ran: false, reason: null, mode: null, counts: emptyCounts(), keptDrops: [], keptDropsTotal: 0, changed: false,
     rowsBefore: 0, rowsAfter: 0, reportPath: null, sidecarPath: null, prBody: '', pause: false, error: null,
   };
   const say = async (text) => { try { if (status) await status(text); } catch (_) { /* never throw */ } };
@@ -861,7 +870,7 @@ async function runIssueRulesGate({ issuesPath, book, chapter, verseStart, verseE
     // reporting already_applied.
     // The kept list joins the key only when there is one, so a run without kept
     // notes keeps the hash (and the sidecar's already_applied) it had before #446.
-    const keptKey = chapterKept.length ? { kept: chapterKept.map((k) => [k.rowId, k.ref, k.sref, k.quote, sha256(k.note)].join('|')) } : {};
+    const keptKey = chapterKept.length ? { kept: chapterKept.map((k) => [k.rowId, k.ref, k.sref, k.quote, sha256(k.note)].join('|')).sort() } : {};
     const settingsKey = JSON.stringify({ allowAdd: !!settings.allowAdd, protectSrefs: [...settings.protectSrefs].sort(), catalog: [...catalog].sort(), useDecisionRows: settings.useDecisionRows, requireGRule: settings.requireGRule, ...keptKey });
     const rulesHash = sha256(rulesText + '\n' + decisionRules.map((r) => [r.id, r.phrase, r.slug, r.book, r.context, r.notes].join('|')).join('\n') + '\n' + settingsKey);
 
@@ -874,11 +883,12 @@ async function runIssueRulesGate({ issuesPath, book, chapter, verseStart, verseE
     const preAbs = path.resolve(CSKILLBP_DIR, preRel);
 
     const prior = readIfExists(path.resolve(CSKILLBP_DIR, sidecarRel));
-    let priorKeptDrops = 0;
+    // Rows earlier runs dropped as kept-note duplicates (sidecar `keptDropped`).
+    let priorKeptDropped = [];
     if (prior) {
       try {
         const sc = JSON.parse(prior);
-        priorKeptDrops = Math.max(0, Number(sc && sc.keptDropsTotal) || 0);
+        if (sc && Array.isArray(sc.keptDropped)) priorKeptDropped = sc.keptDropped.filter((d) => d && typeof d.line === 'string');
         if (sc && sc.mode === settings.mode && sc.rulesHash === rulesHash && sc.outputHash === hashNonIntroRows(rows)) {
           result.reason = 'already_applied';
           result.prBody = sc.prBody || '';
@@ -996,15 +1006,28 @@ async function runIssueRulesGate({ issuesPath, book, chapter, verseStart, verseE
     // The 25% drop cap is cumulative: measure it against the write-once first
     // pre-gate list, so a rules edit, another verse range or a crash before the
     // sidecar seal cannot grant a fresh 25% on an already-thinned list.
-    // Rows earlier runs dropped as kept-note duplicates do not count against the cap either.
-    const shrink = priorDropState(readIfExists(preAbs), rows, { chapter, range, isProtected });
-    const priorDrops = Math.max(0, shrink.priorDrops - priorKeptDrops);
+    // Rows earlier runs dropped as kept-note duplicates do not count against the cap
+    // either. Only those still gone count: in the first pre-gate list (in scope) and
+    // not in the current rows, so a producer rerun that restores them earns no credit.
+    const preText = readIfExists(preAbs);
+    const preLines = new Set(preText ? dataRows(markOutOfScope(parseIssuesTsv(preText), chapter, range)).map(rowToLine) : []);
+    const currentLines = new Set(dataRows(rows).map(rowToLine));
+    const stillGone = priorKeptDropped.filter((d) => preLines.has(d.line) && !currentLines.has(d.line));
+    const shrink = priorDropState(preText, rows, { chapter, range, isProtected });
+    const priorDrops = Math.max(0, shrink.priorDrops - stillGone.length);
     const { dropBaseline } = shrink;
     const applied = applyVerdicts(rows, allVerdicts, {
       catalog, ultVerses, allowAdd: settings.allowAdd, adds: allAdds, protectedVerses, gateableTotal: gateable.length,
-      protectSrefs: settings.protectSrefs, priorDrops, dropBaseline, keptTotal: chapterKept.length,
+      protectSrefs: settings.protectSrefs, priorDrops, dropBaseline,
+      keptTotal: Math.max(0, chapterKept.length - stillGone.length),
     });
+    const lineByIndex = new Map(dataRows(rows).map((r) => [r.index, rowToLine(r)]));
+    const keptDropped = [
+      ...stillGone,
+      ...applied.keptDrops.map((c) => ({ line: lineByIndex.get(c.index), ref: c.ref, sref: c.sref, kept: c.kept })),
+    ];
     result.keptDrops = applied.keptDrops.map((c) => ({ ref: c.ref, sref: c.sref, kept: c.kept, quote: c.before }));
+    result.keptDropsTotal = keptDropped.length;
     notes.push(...applied.notes);
     // Rows that were never reviewed (incomplete chunk) have no verdict and are not "kept".
     const counts = { ...applied.counts };
@@ -1025,6 +1048,7 @@ async function runIssueRulesGate({ issuesPath, book, chapter, verseStart, verseE
         result.rowsAfter = result.rowsBefore;
         result.counts = emptyCounts();
         result.keptDrops = [];
+        result.keptDropsTotal = 0;
         result.prBody = '';
         console.error(`[issue-rules-gate] ${bookUpper} ${chapter}: accounting violation (before=${result.rowsBefore}, after=${afterCount}, dropped=${counts.dropped}, added=${counts.added}); file left as it was`);
         return result;
@@ -1067,7 +1091,7 @@ async function runIssueRulesGate({ issuesPath, book, chapter, verseStart, verseE
           outputHash: hashNonIntroRows(outputRows),
           counts,
           changes: applied.changes,
-          ...(priorKeptDrops || applied.keptDrops.length ? { keptDropsTotal: priorKeptDrops + applied.keptDrops.length } : {}),
+          ...(keptDropped.length ? { keptDropped } : {}),
           prBody: result.prBody,
           at: new Date().toISOString(),
         }, null, 2));

@@ -1776,14 +1776,14 @@ function applyHintsToPreparedNotes({ preparedJson, hints, chapter }) {
   return { hintsApplied: applied, itemsSuppressed: suppressed, hintsDropped: dropped, droppedReasons };
 }
 
-// Kept-duplicate quote test (#446) on the words left after normalizeQuote
-// ("&" separators ignored): one quote's words contain the other's, or the
-// shared words are at least half of all distinct words (0.5, the issue rules
-// gate's DUPLICATE_OVERLAP). Measured over all words rather than the shorter
-// quote, so one shared word with a two-word kept quote is not enough on its own.
+// Kept-duplicate quote test (#446) on the words left after normalizeQuote,
+// split at spaces and maqaf ("&" separators ignored): one quote's words
+// contain all of the other's (so a one-word kept quote covers any longer quote
+// with that word, as #446 specifies), or the shared words are at least half of
+// all distinct words (0.5, the issue rules gate's DUPLICATE_OVERLAP).
 const KEPT_QUOTE_OVERLAP = 0.5;
 function keptQuotesOverlap(a, b) {
-  const words = (q) => new Set(normalizeQuote(q).split(' ').filter((w) => w && w !== '&'));
+  const words = (q) => new Set(normalizeQuote(q).split(/[\s\u05BE]+/).filter((w) => w && w !== '&'));
   const A = words(a);
   const B = words(b);
   if (!A.size || !B.size) return false;

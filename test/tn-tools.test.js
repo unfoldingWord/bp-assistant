@@ -2098,6 +2098,15 @@ test('removePreparedItemsCoveredByKept — overlapping quotes at the same verse 
   assert.deepEqual(out.items.map((i) => i.id), ['osrf', 'overs', 'low', 'low2']);
 });
 
+test('removePreparedItemsCoveredByKept — maqaf separates words for the overlap test (#446)', () => {
+  const kept = [{ rowId: 'kp08', ref: '40:8', supportReference: 'figs-explicit', quote: 'וְאֶל־הָעִיר' }];
+  const prepared = { items: [
+    { id: 'part', reference: '40:8', sref: 'figs-explicit', orig_quote: 'הָעִיר' },
+    { id: 'spc', reference: '40:8', sref: 'figs-explicit', orig_quote: 'וְאֶל הָעִיר הַגְּדוֹלָה' },
+  ] };
+  assert.equal(removePreparedItemsCoveredByKept(prepared, kept, 40).removed, 2);
+});
+
 test('keptRefVerseSpan — single, range, cross-chapter, intro', () => {
   assert.deepEqual(keptRefVerseSpan('40:12', 40), { lo: 12, hi: 12 });
   assert.deepEqual(keptRefVerseSpan('40:12-14', 40), { lo: 12, hi: 14 });

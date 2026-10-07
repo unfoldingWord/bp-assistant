@@ -914,8 +914,8 @@ test('kept notes: a KEPT drop naming an unknown rowId or a kept note at another 
     assert.equal(read(), FILE_TEXT);
     const report = fs.readFileSync(path.join(dir, res.reportPath), 'utf8');
     assert.match(report, /kept_rejected:3:unknown kept note "nope"/);
-    assert.match(report, /kept_rejected:6:kept note kp02 is not at verse 3/);
-    assert.match(report, /kept_rejected:4:kept note hk52 is not at verse 2/);
+    assert.match(report, /kept_rejected:6:kept note kp02 is not at verse 3:3/);
+    assert.match(report, /kept_rejected:4:kept note hk52 is not at verse 3:2/);
   }, { rules: G_RULES });
 });
 
@@ -956,7 +956,7 @@ test('kept notes: earlier KEPT drops do not count against the cumulative drop ca
     });
     assert.equal(first.counts.dropped, 1);
     const sc = JSON.parse(fs.readFileSync(path.join(dir, first.sidecarPath), 'utf8'));
-    assert.equal(sc.keptDropsTotal, 1);
+    assert.deepEqual(sc.keptDropped.map((d) => [d.line, d.kept]), [[LINES[6], 'hk52']]);
     // An edited kept note re-runs the gate. Against the first list's 7 rows, one more
     // G-rule drop is within 25% only if the earlier KEPT drop is not counted (2/7 > 25%).
     const second = await run({
@@ -966,7 +966,8 @@ test('kept notes: earlier KEPT drops do not count against the cumulative drop ca
     assert.equal(second.counts.dropped, 1);
     assert.ok(!read().includes(LINES[3]));
     const sc2 = JSON.parse(fs.readFileSync(path.join(dir, second.sidecarPath), 'utf8'));
-    assert.equal(sc2.keptDropsTotal, 1);
+    assert.equal(sc2.keptDropped.length, 1);
+    assert.equal(second.keptDropsTotal, 1);
   }, { rules: G_RULES });
 });
 
@@ -975,7 +976,7 @@ test('kept notes: without a kept list the prompt and rules hash are unchanged', 
     const runner = fakeRunner({ overrides: { 3: { action: 'relabel', sref: 'figs-metonymy' } } });
     const res = await run({ runClaudeImpl: runner, kept });
     const sc = JSON.parse(fs.readFileSync(path.join(dir, res.sidecarPath), 'utf8'));
-    return { prompt: runner.calls[0].prompt, hash: sc.rulesHash, hasTotal: 'keptDropsTotal' in sc };
+    return { prompt: runner.calls[0].prompt, hash: sc.rulesHash, hasTotal: 'keptDropped' in sc };
   });
   const none = await promptsAndHash(undefined);
   assert.ok(!none.prompt.includes('KEPT'));
@@ -999,4 +1000,53 @@ test('kept notes: a changed kept set re-runs the gate instead of reporting alrea
     assert.notEqual(changed.reason, 'already_applied');
     assert.equal(runner.calls.length, 2);
   });
+});
+
+test('kept notes: restored rows earn no cap credit, and earlier KEPT drops use up the KEPT cap', async () => {
+  await ws(async ({ run, abs }) => {
+    await run({ runClaudeImpl: fakeRunner({ overrides: { 6: { action: 'drop', rule: 'KEPT', kept: 'hk52' } } }), kept: KEPT, config: DEFAULTS });
+    // A producer rerun writes the full list back: the earlier KEPT drop is no longer gone.
+    fs.writeFileSync(abs, FILE_TEXT);
+    const res = await run({
+      runClaudeImpl: fakeRunner({ overrides: { 3: { action: 'drop', rule: 'G4' }, 4: { action: 'drop', rule: 'G4' } } }),
+      kept: [{ ...KEPT[0], note: 'Edited.' }, KEPT[1]], config: DEFAULTS,
+    });
+    assert.equal(res.counts.dropped, 0, '2 of 7 is over 25% with no credit for the restored row');
+    assert.equal(res.keptDropsTotal, 0);
+  }, { rules: G_RULES });
+  await ws(async ({ run }) => {
+    await run({ runClaudeImpl: fakeRunner({ overrides: { 6: { action: 'drop', rule: 'KEPT', kept: 'hk52' } } }), kept: [KEPT[0]], config: DEFAULTS });
+    // One kept note, already used by the first run: a second KEPT drop is over the cap.
+    const res = await run({
+      runClaudeImpl: fakeRunner({ overrides: { 7: { action: 'drop', rule: 'KEPT', kept: 'hk52' } } }),
+      kept: [{ ...KEPT[0], note: 'Edited.' }], config: DEFAULTS,
+    });
+    assert.equal(res.counts.dropped, 0);
+    assert.equal(res.keptDropsTotal, 1);
+  }, { rules: G_RULES });
+});
+
+test('kept notes: a G-rule drop with a stray kept field stays a G-rule drop; kept order does not change the hash', async () => {
+  await ws(async ({ run }) => {
+    const res = await run({ runClaudeImpl: fakeRunner({ overrides: { 6: { action: 'drop', rule: 'G4', kept: 'nope' } } }), kept: KEPT, config: DEFAULTS });
+    assert.equal(res.counts.dropped, 1);
+    assert.equal(res.keptDrops.length, 0);
+  }, { rules: G_RULES });
+  await ws(async ({ run }) => {
+    const runner = fakeRunner({ overrides: { 3: { action: 'relabel', sref: 'figs-metonymy' } } });
+    await run({ runClaudeImpl: runner, kept: KEPT });
+    const again = await run({ runClaudeImpl: runner, kept: [...KEPT].reverse() });
+    assert.equal(again.reason, 'already_applied');
+  });
+});
+
+test('kept notes: a range-ref issue row overlapping the kept span can be a KEPT drop', async () => {
+  const lines = [...LINES.slice(0, 8), 'JER\t3:3-4\tfigs-explicit\tthe gate\t\t\tspans two verses', ...LINES.slice(8)];
+  await ws(async ({ run }) => {
+    const res = await run({
+      runClaudeImpl: fakeRunner({ overrides: { 8: { action: 'drop', rule: 'KEPT', kept: 'kp02' } } }),
+      kept: KEPT, config: DEFAULTS,
+    });
+    assert.deepEqual(res.keptDrops.map((d) => [d.ref, d.kept]), [['3:3-4', 'kp02']]);
+  }, { rules: G_RULES, lines });
 });
