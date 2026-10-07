@@ -1067,26 +1067,124 @@ test('kept notes: a kept note at the end of a range-ref row is shown to that row
   }, { rules: G_RULES, lines });
 });
 
-test('kept notes: an earlier KEPT drop loses its cap credit when its kept note is gone', async () => {
-  await ws(async ({ run }) => {
-    await run({ runClaudeImpl: fakeRunner({ overrides: { 6: { action: 'drop', rule: 'KEPT', kept: 'hk52' } } }), kept: KEPT, config: DEFAULTS });
-    const res = await run({
-      runClaudeImpl: fakeRunner({ overrides: { 3: { action: 'drop', rule: 'G4' } } }),
-      kept: [KEPT[1]], config: DEFAULTS,
-    });
-    assert.equal(res.counts.dropped, 0, '1 earlier + 1 new of 7 is over 25% once hk52 is no longer kept');
+// --- Restoring KEPT drops when the kept note is removed (#448) ----------------------
+
+const dropRow6AsKept = (run, extra = {}) => run({
+  runClaudeImpl: fakeRunner({ overrides: { 6: { action: 'drop', rule: 'KEPT', kept: 'hk52' } } }), kept: KEPT, config: DEFAULTS, ...extra,
+});
+const sidecarOf = (dir, res) => JSON.parse(fs.readFileSync(path.join(dir, res.sidecarPath), 'utf8'));
+
+test('kept notes (#448): a KEPT drop comes back at its verse when the editor removes the kept note', async () => {
+  await ws(async ({ run, read, dir }) => {
+    const first = await dropRow6AsKept(run);
+    assert.ok(!read().includes(LINES[6]));
+    assert.equal(sidecarOf(dir, first).keptDropped.length, 1);
+    const runner = fakeRunner({ overrides: { 3: { action: 'drop', rule: 'G4' } } });
+    const res = await run({ runClaudeImpl: runner, kept: [KEPT[1]], config: DEFAULTS });
+    const out = read().split('\n');
+    // Back after the last row of 3:3, and reviewed again in this run.
+    assert.equal(out.indexOf(LINES[6]), out.indexOf(LINES[7]) + 1);
+    assert.equal(out.filter((l) => l === LINES[6]).length, 1);
+    assert.match(runner.calls[0].prompt, /^#\d+ 3:3 \| figs-explicit \| the city \|/m);
+    assert.deepEqual(res.keptRestored, [{ ref: '3:3', sref: 'figs-explicit', kept: 'hk52' }]);
     assert.equal(res.keptDropsTotal, 0);
+    assert.ok(!('keptDropped' in sidecarOf(dir, res)), 'the sidecar no longer lists the restored row');
+    // The restored row is not a prior drop any more: 1 new drop of 7 is within 25%.
+    assert.equal(res.counts.dropped, 1);
+    assert.ok(!read().includes(LINES[3]));
+    assert.equal(res.rowsBefore, 8);
+    assert.equal(res.rowsAfter, 8, '+1 restored, -1 dropped');
+    assert.match(res.prBody, /, restored 1$/m);
+    assert.match(res.prBody, /^- 3:3 figs-explicit restored: kept note hk52 no longer covers it$/m);
+    // A further run with the same inputs is already applied and restores nothing twice.
+    const again = await run({ runClaudeImpl: runner, kept: [KEPT[1]], config: DEFAULTS });
+    assert.equal(again.reason, 'already_applied');
   }, { rules: G_RULES });
 });
 
-test('kept notes: an earlier KEPT drop loses its cap credit when its kept note moves to another verse', async () => {
-  await ws(async ({ run }) => {
-    await run({ runClaudeImpl: fakeRunner({ overrides: { 6: { action: 'drop', rule: 'KEPT', kept: 'hk52' } } }), kept: KEPT, config: DEFAULTS });
+test('kept notes (#448): a KEPT drop comes back when its kept note moves to another verse', async () => {
+  await ws(async ({ run, read, dir }) => {
+    await dropRow6AsKept(run);
+    assert.ok(!read().includes(LINES[6]));
     const res = await run({
       runClaudeImpl: fakeRunner({ overrides: { 3: { action: 'drop', rule: 'G4' } } }),
       kept: [{ ...KEPT[0], ref: '3:5' }, KEPT[1]], config: DEFAULTS,
     });
-    assert.equal(res.counts.dropped, 0, 'hk52 no longer covers 3:3, so the 3:3 drop counts against the 25% cap');
+    assert.deepEqual(res.keptRestored, [{ ref: '3:3', sref: 'figs-explicit', kept: 'hk52' }], 'hk52 no longer covers 3:3');
+    assert.equal(read().split('\n').filter((l) => l === LINES[6]).length, 1);
     assert.equal(res.keptDropsTotal, 0);
+    assert.ok(!('keptDropped' in sidecarOf(dir, res)));
   }, { rules: G_RULES });
+});
+
+test('kept notes (#448): a restored row whose verse has no rows left goes where its verse sorts', async () => {
+  const lines = LINES.filter((_, i) => i !== 7);
+  await ws(async ({ run, read }) => {
+    await dropRow6AsKept(run);
+    assert.ok(!read().includes('JER\t3:3'));
+    const res = await run({ runClaudeImpl: fakeRunner(), kept: [], config: DEFAULTS });
+    assert.equal(res.reason, 'applied');
+    assert.equal(read(), lines.join('\n') + '\n');
+  }, { rules: G_RULES, lines });
+});
+
+test('kept notes (#448): no restore in a hinted verse, an incomplete run, or with the gate off', async () => {
+  await ws(async ({ run, read, dir }) => {
+    await dropRow6AsKept(run);
+    const after = read();
+    const res = await run({ runClaudeImpl: fakeRunner(), kept: [KEPT[1]], config: DEFAULTS, hints: [{ chapter: 3, verse: 3 }] });
+    assert.equal(read(), after);
+    assert.deepEqual(res.keptRestored, []);
+    assert.equal(res.keptDropsTotal, 0, 'no cap credit without the kept note');
+    assert.deepEqual(sidecarOf(dir, res).keptDropped.map((d) => d.line), [LINES[6]], 'still listed for a later run');
+    // Unhinted again: now it comes back.
+    await run({ runClaudeImpl: fakeRunner(), kept: [KEPT[1]], config: DEFAULTS });
+    assert.ok(read().includes(LINES[6]));
+  }, { rules: G_RULES });
+  await ws(async ({ run, read, dir }) => {
+    const first = await dropRow6AsKept(run);
+    const after = read();
+    const res = await run({ runClaudeImpl: fakeRunner({ omit: [3], overrides: { 1: { action: 'drop', rule: 'G4' } } }), kept: [KEPT[1]], config: DEFAULTS });
+    assert.equal(res.reason, 'incomplete');
+    assert.equal(res.changed, false);
+    assert.equal(read(), after);
+    assert.deepEqual(res.keptRestored, []);
+    assert.deepEqual(sidecarOf(dir, first).keptDropped.map((d) => d.line), [LINES[6]], 'unsealed: still listed for a later run');
+  }, { rules: G_RULES });
+  await ws(async ({ run, read }) => {
+    await dropRow6AsKept(run);
+    const after = read();
+    const res = await run({ runClaudeImpl: fakeRunner(), kept: [KEPT[1]], config: { rulesGate: { mode: 'off', books: 'all' } } });
+    assert.equal(res.reason, 'mode_off');
+    assert.equal(read(), after);
+  }, { rules: G_RULES });
+});
+
+test('kept notes (#448): a row the producer already wrote back is not inserted twice', async () => {
+  await ws(async ({ run, read, abs }) => {
+    await dropRow6AsKept(run);
+    fs.writeFileSync(abs, FILE_TEXT);
+    const res = await run({ runClaudeImpl: fakeRunner(), kept: [KEPT[1]], config: DEFAULTS });
+    assert.deepEqual(res.keptRestored, []);
+    assert.equal(read(), FILE_TEXT);
+  }, { rules: G_RULES });
+});
+
+test('kept notes (#448): a verse-range run keeps the KEPT drops outside its range listed', async () => {
+  await ws(async ({ run, read, dir }) => {
+    await dropRow6AsKept(run);
+    const res = await run({ runClaudeImpl: fakeRunner(), kept: [KEPT[1]], config: DEFAULTS, verseStart: 4, verseEnd: 5 });
+    assert.deepEqual(res.keptRestored, []);
+    assert.deepEqual(sidecarOf(dir, res).keptDropped.map((d) => d.line), [LINES[6]]);
+    await run({ runClaudeImpl: fakeRunner(), kept: [KEPT[1]], config: DEFAULTS });
+    assert.ok(read().includes(LINES[6]), 'the next whole-chapter run restores it');
+  }, { rules: G_RULES });
+});
+
+test('insertRowLines places a row after its verse, or before the first data row', async () => {
+  await ws(async ({ mod }) => {
+    const text = [LINES[0], LINES[1], LINES[4], LINES[8]].join('\n') + '\n';
+    const out = mod.insertRowLines(text, [LINES[3], LINES[6], 'JER\t4:1\tfigs-idiom\tx\t\t\ty']).split('\n');
+    assert.deepEqual(out, [LINES[0], LINES[1], LINES[3], LINES[4], LINES[6], LINES[8], 'JER\t4:1\tfigs-idiom\tx\t\t\ty', '']);
+  });
 });

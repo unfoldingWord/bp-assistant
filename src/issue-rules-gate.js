@@ -146,6 +146,30 @@ function serializeIssuesTsv(rows) {
   return meta.trailingNewline && rows.length ? text + meta.lineEnding : text;
 }
 
+/**
+ * Insert data-row lines into an issues TSV, each after the last row at or before
+ * its chapter:verse (so after the last row of its verse when there is one), or
+ * before the first data row when every row sorts after it.
+ */
+function insertRowLines(text, lines) {
+  const rows = parseIssuesTsv(text);
+  for (const line of lines) {
+    const row = parseIssuesTsv(line)[0];
+    if (!row || row.passthrough) continue;
+    const isData = (r) => r.cols && r.chapter != null;
+    let at = -1;
+    rows.forEach((r, i) => {
+      if (isData(r) && (r.chapter < row.chapter || (r.chapter === row.chapter && r.verse <= row.verse))) at = i;
+    });
+    if (at < 0) {
+      const first = rows.findIndex(isData);
+      at = (first < 0 ? rows.length : first) - 1;
+    }
+    rows.splice(at + 1, 0, row);
+  }
+  return serializeIssuesTsv(rows);
+}
+
 function copyMeta(from, to) {
   const meta = (from && from.__meta) || { lineEnding: '\n', trailingNewline: true };
   Object.defineProperty(to, '__meta', { value: meta, enumerable: false, writable: true });
@@ -722,9 +746,13 @@ function countsLine(counts, keptDrops = 0) {
     + (counts.declined ? `, declined ${counts.declined}` : '');
 }
 
-function buildPrBody({ counts, changes }) {
-  const head = `Issue rules check: ${countsLine(counts, (changes || []).filter((c) => c.kept).length)}`;
-  const list = (changes || []).slice(0, PR_BODY_MAX_LINES).map(changeLine);
+function buildPrBody({ counts, changes, restored = [] }) {
+  const head = `Issue rules check: ${countsLine(counts, (changes || []).filter((c) => c.kept).length)}`
+    + (restored.length ? `, restored ${restored.length}` : '');
+  const list = [
+    ...restored.map((d) => noMentions(`- ${d.ref} ${d.sref} restored: kept note ${d.kept} no longer covers it`)),
+    ...(changes || []),
+  ].slice(0, PR_BODY_MAX_LINES).map((c) => (typeof c === 'string' ? c : changeLine(c)));
   const extra = (changes || []).length > PR_BODY_MAX_LINES ? [`- … and ${changes.length - PR_BODY_MAX_LINES} more`] : [];
   const body = [head, '', ...list, ...extra].join('\n');
   return body.length > PR_BODY_MAX ? `${body.slice(0, PR_BODY_MAX - 1)}…` : body;
@@ -808,7 +836,7 @@ function accountingHolds(beforeRows, afterRows, counts) {
 
 async function runIssueRulesGate({ issuesPath, book, chapter, verseStart, verseEnd, ctx, hints, kept, config, env, dryRun, model, status, runClaudeImpl } = {}) {
   const result = {
-    ran: false, reason: null, mode: null, counts: emptyCounts(), keptDrops: [], keptDropsTotal: 0, changed: false,
+    ran: false, reason: null, mode: null, counts: emptyCounts(), keptDrops: [], keptDropsTotal: 0, keptRestored: [], changed: false,
     rowsBefore: 0, rowsAfter: 0, reportPath: null, sidecarPath: null, prBody: '', pause: false, error: null,
   };
   const say = async (text) => { try { if (status) await status(text); } catch (_) { /* never throw */ } };
@@ -838,13 +866,6 @@ async function runIssueRulesGate({ issuesPath, book, chapter, verseStart, verseE
     }
 
     const isProtected = (r) => settings.protectSrefs.has(String(r.sref || '').trim().toLowerCase()) || hintedVerses.has(r.verse);
-    const rows = markOutOfScope(parseIssuesTsv(originalText), chapter, range);
-    for (const r of rows) {
-      if (r.passthrough) continue;
-      r.protected = isProtected(r);
-    }
-    const gateable = rows.filter((r) => !r.passthrough && !r.protected);
-    if (!gateable.length) return skip('no_gateable_rows');
 
     // Editor-kept notes (#446) whose ref touches this chapter (and verse range).
     const chapterKept = [];
@@ -857,6 +878,55 @@ async function runIssueRulesGate({ issuesPath, book, chapter, verseStart, verseE
         quote: sanitizeCell(k.quote), note: sanitizeCell(k.note), span,
       });
     }
+    // A KEPT drop stays justified while its kept note is still kept and still
+    // touches the dropped row's verses; removed or moved off, it is not.
+    const keptNow = new Map(chapterKept.map((k) => [k.rowId, k]));
+    const stillCovered = (d) => {
+      const k = keptNow.get(d.kept);
+      const cv = verseOfRef(d.ref);
+      if (!k || !cv) return false;
+      const hi = rowLastVerse({ ref: d.ref, verse: cv.verse });
+      return cv.verse <= k.span.hi && hi >= k.span.lo;
+    };
+
+    const base = path.basename(issuesPath, '.tsv');
+    const reviewRel = path.join('output/review', bookUpper);
+    const reviewDir = path.resolve(CSKILLBP_DIR, reviewRel);
+    const preRel = path.join(reviewRel, `${base}-pre-rules-gate.tsv`);
+    const reportRel = path.join(reviewRel, `${base}-rules-gate.md`);
+    const sidecarRel = path.join(reviewRel, `${base}-rules-gate.json`);
+    const preAbs = path.resolve(CSKILLBP_DIR, preRel);
+
+    const prior = readIfExists(path.resolve(CSKILLBP_DIR, sidecarRel));
+    let priorSidecar = null;
+    if (prior) { try { priorSidecar = JSON.parse(prior); } catch (_) { /* unreadable sidecar: run the gate */ } }
+    // Rows earlier runs dropped as kept-note duplicates (sidecar `keptDropped`).
+    const priorKeptDropped = priorSidecar && Array.isArray(priorSidecar.keptDropped)
+      ? priorSidecar.keptDropped.filter((d) => d && typeof d.line === 'string')
+      : [];
+    // An earlier drop is still gone when its line is in the first pre-gate list (in
+    // scope) and not in the current rows, so a producer rerun that wrote it back earns
+    // nothing and is not restored twice.
+    const preText = readIfExists(preAbs);
+    const preLines = new Set(preText ? dataRows(markOutOfScope(parseIssuesTsv(preText), chapter, range)).map(rowToLine) : []);
+    const originalRows = markOutOfScope(parseIssuesTsv(originalText), chapter, range);
+    const originalLines = new Set(dataRows(originalRows).map(rowToLine));
+    const gone = priorKeptDropped.filter((d, i, all) => preLines.has(d.line) && !originalLines.has(d.line)
+      && all.findIndex((o) => o.line === d.line) === i);
+    // #448: a row dropped as the duplicate of a kept note the editor has since removed
+    // (or moved off the row's verses) goes back at its verse, so the note it duplicated is not simply lost. It is put
+    // back before the model review, so this run checks it like any other row. A
+    // protected row (hinted verse, protected sref) stays out and stays listed.
+    const toRestore = gone.filter((d) => !stillCovered(d) && !isProtected(parseIssuesTsv(d.line)[0]));
+    const restoredLines = new Set(toRestore.map((d) => d.line));
+    const workText = toRestore.length ? insertRowLines(originalText, toRestore.map((d) => d.line)) : originalText;
+    const rows = markOutOfScope(parseIssuesTsv(workText), chapter, range);
+    for (const r of rows) {
+      if (r.passthrough) continue;
+      r.protected = isProtected(r);
+    }
+    const gateable = rows.filter((r) => !r.passthrough && !r.protected);
+    if (!gateable.length) return skip('no_gateable_rows');
 
     const rulesText = readIfExists(path.join(CSKILLBP_DIR, '.claude/skills/issue-identification/rules-gate.md'));
     if (rulesText == null || !rulesText.trim()) {
@@ -876,29 +946,12 @@ async function runIssueRulesGate({ issuesPath, book, chapter, verseStart, verseE
     const settingsKey = JSON.stringify({ allowAdd: !!settings.allowAdd, protectSrefs: [...settings.protectSrefs].sort(), catalog: [...catalog].sort(), useDecisionRows: settings.useDecisionRows, requireGRule: settings.requireGRule, ...keptKey });
     const rulesHash = sha256(rulesText + '\n' + decisionRules.map((r) => [r.id, r.phrase, r.slug, r.book, r.context, r.notes].join('|')).join('\n') + '\n' + settingsKey);
 
-    const base = path.basename(issuesPath, '.tsv');
-    const reviewRel = path.join('output/review', bookUpper);
-    const reviewDir = path.resolve(CSKILLBP_DIR, reviewRel);
-    const preRel = path.join(reviewRel, `${base}-pre-rules-gate.tsv`);
-    const reportRel = path.join(reviewRel, `${base}-rules-gate.md`);
-    const sidecarRel = path.join(reviewRel, `${base}-rules-gate.json`);
-    const preAbs = path.resolve(CSKILLBP_DIR, preRel);
-
-    const prior = readIfExists(path.resolve(CSKILLBP_DIR, sidecarRel));
-    // Rows earlier runs dropped as kept-note duplicates (sidecar `keptDropped`).
-    let priorKeptDropped = [];
-    if (prior) {
-      try {
-        const sc = JSON.parse(prior);
-        if (sc && Array.isArray(sc.keptDropped)) priorKeptDropped = sc.keptDropped.filter((d) => d && typeof d.line === 'string');
-        if (sc && sc.mode === settings.mode && sc.rulesHash === rulesHash && sc.outputHash === hashNonIntroRows(rows)) {
-          result.reason = 'already_applied';
-          result.prBody = sc.prBody || '';
-          result.sidecarPath = sidecarRel;
-          result.reportPath = reportRel;
-          return result;
-        }
-      } catch (_) { /* unreadable sidecar: run the gate */ }
+    if (priorSidecar && priorSidecar.mode === settings.mode && priorSidecar.rulesHash === rulesHash && priorSidecar.outputHash === hashNonIntroRows(rows)) {
+      result.reason = 'already_applied';
+      result.prBody = priorSidecar.prBody || '';
+      result.sidecarPath = sidecarRel;
+      result.reportPath = reportRel;
+      return result;
     }
 
     // Source text for the prompt and for anchoring.
@@ -1010,22 +1063,15 @@ async function runIssueRulesGate({ issuesPath, book, chapter, verseStart, verseE
     // pre-gate list, so a rules edit, another verse range or a crash before the
     // sidecar seal cannot grant a fresh 25% on an already-thinned list.
     // Rows earlier runs dropped as kept-note duplicates do not count against the cap
-    // either. Only those still gone count: in the first pre-gate list (in scope) and
-    // not in the current rows, so a producer rerun that restores them earns no credit.
-    const preText = readIfExists(preAbs);
-    const preLines = new Set(preText ? dataRows(markOutOfScope(parseIssuesTsv(preText), chapter, range)).map(rowToLine) : []);
-    const currentLines = new Set(dataRows(rows).map(rowToLine));
-    // A drop whose kept note the editor has since removed, or moved off the
-    // dropped row's verses, loses its credit too.
-    const keptNow = new Map(chapterKept.map((k) => [k.rowId, k]));
-    const stillCovered = (d) => {
-      const k = keptNow.get(d.kept);
-      const cv = verseOfRef(d.ref);
-      if (!k || !cv) return false;
-      const hi = rowLastVerse({ ref: d.ref, verse: cv.verse });
-      return cv.verse <= k.span.hi && hi >= k.span.lo;
-    };
-    const stillGone = priorKeptDropped.filter((d) => preLines.has(d.line) && !currentLines.has(d.line) && stillCovered(d));
+    // either, while their kept note still covers them (`gone` is computed above). A
+    // restored row is back in `rows`, so the shrink no longer counts it.
+    const stillGone = gone.filter(stillCovered);
+    const pendingGone = gone.filter((d) => !stillCovered(d) && !restoredLines.has(d.line));
+    // A verse-range run rewrites the sidecar, so entries outside its range are carried as they are.
+    const outOfScope = priorKeptDropped.filter((d) => {
+      const r = parseIssuesTsv(d.line)[0];
+      return r && !r.passthrough && markOutOfScope([r], chapter, range)[0].passthrough;
+    });
     const shrink = priorDropState(preText, rows, { chapter, range, isProtected });
     const priorDrops = Math.max(0, shrink.priorDrops - stillGone.length);
     const { dropBaseline } = shrink;
@@ -1037,16 +1083,21 @@ async function runIssueRulesGate({ issuesPath, book, chapter, verseStart, verseE
     const lineByIndex = new Map(dataRows(rows).map((r) => [r.index, rowToLine(r)]));
     const keptDropped = [
       ...stillGone,
+      ...pendingGone,
+      ...outOfScope,
       ...applied.keptDrops.map((c) => ({ line: lineByIndex.get(c.index), ref: c.ref, sref: c.sref, kept: c.kept })),
     ];
     result.keptDrops = applied.keptDrops.map((c) => ({ ref: c.ref, sref: c.sref, kept: c.kept, quote: c.before }));
-    result.keptDropsTotal = keptDropped.length;
+    result.keptDropsTotal = stillGone.length + applied.keptDrops.length;
     notes.push(...applied.notes);
+    // A restore is a change too, but like every change it waits for a fully answered run.
+    const restoring = incomplete === 0 ? toRestore : [];
+    for (const d of restoring) notes.push(`kept_restored:${d.ref}:${d.sref}:kept note ${d.kept} no longer covers it`);
     // Rows that were never reviewed (incomplete chunk) have no verdict and are not "kept".
     const counts = { ...applied.counts };
     result.counts = counts;
-    result.rowsBefore = dataRows(rows).length;
-    const changed = applied.changes.length > 0;
+    result.rowsBefore = dataRows(originalRows).length;
+    const changed = applied.changes.length > 0 || restoring.length > 0;
 
     let outputRows = rows;
     let reason = 'no_changes';
@@ -1054,7 +1105,8 @@ async function runIssueRulesGate({ issuesPath, book, chapter, verseStart, verseE
       const newText = serializeIssuesTsv(applied.rows);
       const reparsed = markOutOfScope(parseIssuesTsv(newText), chapter, range);
       const afterCount = dataRows(reparsed).length;
-      if (!accountingHolds(rows, reparsed, counts)) {
+      // Measured against the file as read, so restored rows count like adds.
+      if (!accountingHolds(originalRows, reparsed, { ...counts, added: counts.added + restoring.length })) {
         // Checked before anything is written, so the original bytes are intact.
         result.ran = true;
         result.reason = 'accounting_violation';
@@ -1071,6 +1123,7 @@ async function runIssueRulesGate({ issuesPath, book, chapter, verseStart, verseE
       if (!fs.existsSync(preAbs)) fs.writeFileSync(preAbs, originalText);
       writeFileAtomic(absIssues, newText);
       outputRows = reparsed;
+      result.keptRestored = restoring.map((d) => ({ ref: d.ref, sref: d.sref, kept: d.kept }));
       result.rowsAfter = afterCount;
       reason = 'applied';
     } else {
@@ -1080,7 +1133,7 @@ async function runIssueRulesGate({ issuesPath, book, chapter, verseStart, verseE
     result.ran = true;
     result.changed = changed;
     result.reason = incomplete > 0 ? 'incomplete' : reason;
-    result.prBody = incomplete > 0 ? '' : buildPrBody({ counts, changes: applied.changes });
+    result.prBody = incomplete > 0 ? '' : buildPrBody({ counts, changes: applied.changes, restored: result.keptRestored });
 
     try {
       fs.mkdirSync(reviewDir, { recursive: true });
@@ -1213,6 +1266,7 @@ module.exports = {
   refreshGateSidecarOutputHash,
   parseIssuesTsv,
   serializeIssuesTsv,
+  insertRowLines,
   loadDecisionRules,
   activeGRuleIds,
   buildPrompt,
