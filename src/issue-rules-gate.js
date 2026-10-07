@@ -1015,9 +1015,17 @@ async function runIssueRulesGate({ issuesPath, book, chapter, verseStart, verseE
     const preText = readIfExists(preAbs);
     const preLines = new Set(preText ? dataRows(markOutOfScope(parseIssuesTsv(preText), chapter, range)).map(rowToLine) : []);
     const currentLines = new Set(dataRows(rows).map(rowToLine));
-    // A drop whose kept note the editor has since removed loses its credit too.
-    const keptIdsNow = new Set(chapterKept.map((k) => k.rowId));
-    const stillGone = priorKeptDropped.filter((d) => preLines.has(d.line) && !currentLines.has(d.line) && keptIdsNow.has(d.kept));
+    // A drop whose kept note the editor has since removed, or moved off the
+    // dropped row's verses, loses its credit too.
+    const keptNow = new Map(chapterKept.map((k) => [k.rowId, k]));
+    const stillCovered = (d) => {
+      const k = keptNow.get(d.kept);
+      const cv = verseOfRef(d.ref);
+      if (!k || !cv) return false;
+      const hi = rowLastVerse({ ref: d.ref, verse: cv.verse });
+      return cv.verse <= k.span.hi && hi >= k.span.lo;
+    };
+    const stillGone = priorKeptDropped.filter((d) => preLines.has(d.line) && !currentLines.has(d.line) && stillCovered(d));
     const shrink = priorDropState(preText, rows, { chapter, range, isProtected });
     const priorDrops = Math.max(0, shrink.priorDrops - stillGone.length);
     const { dropBaseline } = shrink;

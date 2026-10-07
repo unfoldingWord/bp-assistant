@@ -1078,3 +1078,15 @@ test('kept notes: an earlier KEPT drop loses its cap credit when its kept note i
     assert.equal(res.keptDropsTotal, 0);
   }, { rules: G_RULES });
 });
+
+test('kept notes: an earlier KEPT drop loses its cap credit when its kept note moves to another verse', async () => {
+  await ws(async ({ run }) => {
+    await run({ runClaudeImpl: fakeRunner({ overrides: { 6: { action: 'drop', rule: 'KEPT', kept: 'hk52' } } }), kept: KEPT, config: DEFAULTS });
+    const res = await run({
+      runClaudeImpl: fakeRunner({ overrides: { 3: { action: 'drop', rule: 'G4' } } }),
+      kept: [{ ...KEPT[0], ref: '3:5' }, KEPT[1]], config: DEFAULTS,
+    });
+    assert.equal(res.counts.dropped, 0, 'hk52 no longer covers 3:3, so the 3:3 drop counts against the 25% cap');
+    assert.equal(res.keptDropsTotal, 0);
+  }, { rules: G_RULES });
+});
