@@ -22,7 +22,7 @@ const { fillTsvIds, generateIds, prepareNotes, fillOrigQuotes, resolveGlQuotes, 
 const { checkTnQuality, detectSelfTalk, templateFirstPhrase, resolveTemplateText } = require('./workspace-tools/quality-tools');
 const { buildBookRecurrenceIndex, deriveRecurrenceKeys, buildSeeHowSentence, isSeeHowEligible, isContextDependentSref, dedupeAlsoOccursVerses, assignAlsoOccursVerses, resolveDoor43ReposPath, hebTokens, verseNumber: recurrenceVerseNumber, SEE_HOW_NEVER_FOLD_SREFS, CROSS_BOOK_MAX_BOOKS } = require('./workspace-tools/recurrence-index');
 const { normalizeIssuesFile, buildParallelismIntroHintArgs } = require('./issue-normalizer');
-const { runIssueRulesGate, gatePrBodyForPush, refreshGateSidecarOutputHash } = require('./issue-rules-gate');
+const { runIssueRulesGate, gatePrBodyForPush, refreshGateSidecarOutputHash, readGateSidecar } = require('./issue-rules-gate');
 const { curlyQuotes } = require('./workspace-tools/usfm-tools');
 const { verifyRepoPush, verifyDcsToken, verifyRemoteContent } = require('./repo-verify');
 const { recordMetrics, getCumulativeTokens, recordRunSummary, getAdaptiveSkillGuardrails } = require('./usage-tracker');
@@ -3410,6 +3410,7 @@ async function notesPipeline(route, message) {
           verseEnd: hasVerseRange ? verseEnd : undefined,
           ctx: gateCtx,
           hints,
+          kept,
           config: config,
           env: process.env,
           dryRun: isDryRun,
@@ -3444,6 +3445,10 @@ async function notesPipeline(route, message) {
             `${c.declined ? `, declined ${c.declined}` : ''}` +
             `${gate.reportPath ? ` (${gate.reportPath})` : ''}`
           );
+          if (gate.keptDrops && gate.keptDrops.length) {
+            const lines = gate.keptDrops.map((d) => `- ${d.ref} ${d.sref} dropped: duplicates kept note ${d.kept}`);
+            await status(`**${ref}**: issue rows dropped as duplicates of kept notes:\n${lines.join('\n')}`);
+          }
         } else if (gate.reason === 'error') {
           await status(`**${ref}**: issue rules check failed (non-fatal, issues left unchanged): ${gate.error}`);
         } else {
@@ -3605,9 +3610,16 @@ async function notesPipeline(route, message) {
                 kept,
                 chapter: ch,
               }).itemsRemoved;
+              // The gate's KEPT drops (this run's and earlier runs' still gone) happened
+              // earlier, on the issue list. When the gate did not run here (resume,
+              // already_applied, off), read the count from its sealed sidecar.
+              const gateKept = issueRulesGateResult && issueRulesGateResult.ran
+                ? (issueRulesGateResult.keptDropsTotal || 0)
+                : (readGateSidecar({ issuesPath, book })?.keptDropped || []).length;
               await status(
                 `**${ref}**: ${keptHere} kept notes from the editor will stay in place; ` +
-                `${dropped} AI notes dropped as duplicates of them`,
+                `${dropped + gateKept} AI notes dropped as duplicates of kept notes ` +
+                `(${dropped} exact/overlap, ${gateKept} judged by the rules gate)`,
               );
             } catch (keptErr) {
               console.error(`[notes] applyKeptToPreparedNotes failed: ${keptErr.message}`);

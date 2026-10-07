@@ -1776,12 +1776,32 @@ function applyHintsToPreparedNotes({ preparedJson, hints, chapter }) {
   return { hintsApplied: applied, itemsSuppressed: suppressed, hintsDropped: dropped, droppedReasons };
 }
 
+// Kept-duplicate quote test (#446) on the words left after normalizeQuote,
+// split at spaces and maqaf ("&" separators ignored): one quote's words
+// contain all of the other's (so a one-word kept quote covers any longer quote
+// with that word, as #446 specifies), or the shared words are at least half of
+// all distinct words (0.5). The gate's DUPLICATE_OVERLAP divides by the
+// shorter quote instead; dividing by all words here is stricter on purpose,
+// since no model checks these drops.
+const KEPT_QUOTE_OVERLAP = 0.5;
+function keptQuotesOverlap(a, b) {
+  const words = (q) => new Set(normalizeQuote(q).split(/[\s\u05BE]+/).filter((w) => w && w !== '&'));
+  const A = words(a);
+  const B = words(b);
+  if (!A.size || !B.size) return false;
+  let n = 0;
+  for (const w of A) if (B.has(w)) n++;
+  return n === A.size || n === B.size || n / (A.size + B.size - n) >= KEPT_QUOTE_OVERLAP;
+}
+
 /**
  * Drop prepared items already covered by an editor-kept note: same verse,
- * normalized support reference and normalized quote (exact after
- * normalizeQuote, not fuzzy, so a note on a different phrase still lands).
+ * same normalized support reference, and Hebrew quotes that overlap
+ * (keptQuotesOverlap; #446). A note on a different phrase, or with a different sref,
+ * still lands; the issue rules gate judges those cases with a model.
  * Nothing is injected: the kept note already exists in en_tn. The push-time
- * dedup in insert-tn-rows uses the same key.
+ * dedup in insert-tn-rows stays exact on purpose: it decides which en_tn rows
+ * a push deletes, not which notes get written.
  *
  * Kept refs are read with keptRefVerseSpan (ranges and cross-chapter spans
  * cover every verse in them; intro refs cover none).
@@ -1801,11 +1821,12 @@ function removePreparedItemsCoveredByKept(prepared, kept, chapter) {
     const itemCh = Number(String(item.reference).split(':')[0]);
     if (chapter != null && itemCh !== Number(chapter)) return true;
     const sref = normalizeSupportReference(item.sref);
-    const quote = normalizeQuote(item.orig_quote);
     const covered = kept.some((k) => {
       const span = keptRefVerseSpan(k.ref, itemCh);
       return !!span && v >= span.lo && v <= span.hi
-        && sref === normalizeSupportReference(k.supportReference) && quote === normalizeQuote(k.quote);
+        && sref === normalizeSupportReference(k.supportReference)
+        && (normalizeQuote(item.orig_quote) === normalizeQuote(k.quote)
+          || keptQuotesOverlap(item.orig_quote, k.quote));
     });
     return !covered;
   });
