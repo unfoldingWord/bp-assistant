@@ -18,7 +18,7 @@ const { createGuardHooks } = require('./guard-hooks');
 const { resolveAutoModel } = require('./api-runner/provider-config');
 const { getDoor43Username, emailToFallbackUsername, buildBranchName, resolveOutputFile, discoverFreshOutput, checkPrerequisites, calcSkillTimeout, calcVerseSpanTimeout, normalizeBookName, resolveConflictMention, parsePartialTsv, truncatePartialTsv, parseChunkRange, isUsageLimitError, CSKILLBP_DIR } = require('./pipeline-utils');
 const { splitTsv, fixTrailingNewlines } = require('./workspace-tools/tsv-tools');
-const { fillTsvIds, generateIds, prepareNotes, fillOrigQuotes, resolveGlQuotes, flagNarrowQuotes, extractAlignmentData, prepareATContext, substituteAT, fixUnicodeQuotes, verifyBoldMatches, syncCanonicalHebrewQuotes, applyHintsToPreparedNotes, applyKeptToPreparedNotes, keptRefVerseSpan, parsePlainUsfmVersesFromText, detectIssuesTsvLayout, extractIssuesTsvRow, _stripAlternateTranslation: stripAlternateTranslation } = require('./workspace-tools/tn-tools');
+const { fillTsvIds, generateIds, prepareNotes, fillOrigQuotes, resolveGlQuotes, flagNarrowQuotes, extractAlignmentData, prepareATContext, substituteAT, fixUnicodeQuotes, verifyBoldMatches, syncCanonicalHebrewQuotes, applyHintsToPreparedNotes, applyKeptToPreparedNotes, keptRefVerseSpan, parsePlainUsfmVersesFromText, detectIssuesTsvLayout, extractIssuesTsvRow, findVersesWithoutNotes, _stripAlternateTranslation: stripAlternateTranslation } = require('./workspace-tools/tn-tools');
 const { checkTnQuality, detectSelfTalk, templateFirstPhrase, resolveTemplateText } = require('./workspace-tools/quality-tools');
 const { buildBookRecurrenceIndex, deriveRecurrenceKeys, buildSeeHowSentence, isSeeHowEligible, isContextDependentSref, dedupeAlsoOccursVerses, assignAlsoOccursVerses, resolveDoor43ReposPath, hebTokens, verseNumber: recurrenceVerseNumber, SEE_HOW_NEVER_FOLD_SREFS, CROSS_BOOK_MAX_BOOKS } = require('./workspace-tools/recurrence-index');
 const { normalizeIssuesFile, buildParallelismIntroHintArgs } = require('./issue-normalizer');
@@ -2268,6 +2268,26 @@ function countNoteRows(notesPath) {
   return count;
 }
 
+// Verses that had prepared items but lost every note row (tn-writer "final
+// review" removals left JER 36:9 and 36:15 empty, #444). An empty verse reads
+// to editors as a skipped section, so name each one in the log and status line.
+async function reportVersesWithoutNotes({ pipeDir, notesPath, ref, stage, status }) {
+  if (!pipeDir || !notesPath) return [];
+  let lost = [];
+  try {
+    const preparedJson = readContext(pipeDir)?.runtime?.preparedNotes;
+    lost = findVersesWithoutNotes({ preparedJson, notesPath });
+  } catch (err) {
+    console.warn(`[notes] verse-coverage check failed for ${ref} (non-fatal): ${err.message}`);
+    return [];
+  }
+  if (lost.length) {
+    console.warn(`[notes] ${ref}: ${lost.length} verse(s) with prepared items have no note after ${stage}: ${lost.join(', ')}`);
+    await status(`⚠️ **${ref}**: ${lost.length} verse(s) had prepared notes but have **no note** after ${stage}: ${lost.join(', ')}. Editors will see these as skipped.`);
+  }
+  return lost;
+}
+
 // `<chapter>:intro` rows in an issues TSV (reference in column 1 or 2, with an
 // optional prefix of this book's code). chapter-intro edits the issues file in
 // place, so a rerun starts with the earlier run's intro row there (EZK 40, #438).
@@ -4233,6 +4253,7 @@ async function notesPipeline(route, message) {
           } catch (err) {
             console.warn(`[notes] fillTsvIds failed (non-fatal): ${err.message}`);
           }
+          await reportVersesWithoutNotes({ pipeDir, notesPath: skill.resolvedOutput || resolved, ref, stage: 'tn-writer', status });
           for (const s of skills) {
             if (s.name === 'tn-quality-check') {
               s.prompt = `${skillRef} --notes ${skill.resolvedOutput || resolved}`;
@@ -4386,6 +4407,9 @@ async function notesPipeline(route, message) {
       hebrewUsfm: ctxForSync?.sources?.hebrew,
     });
     console.log(`[notes] Final canonical Hebrew quote sync: ${finalQuoteSyncSummary}`);
+    if (qualityOutput) {
+      await reportVersesWithoutNotes({ pipeDir, notesPath: notesSource, ref, stage: 'tn-quality-check', status });
+    }
 
     setCheckpoint(checkpointRef, {
       state: 'running',

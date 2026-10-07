@@ -642,10 +642,11 @@ function createQualityTools(createSdkMcpServer, tool, z) {
         origQuote: z.string().optional().describe('New orig_quote'),
         sref: z.string().optional().describe('New support reference issue type — a valid slug from data/translation-issues.csv (e.g. writing-poetry). The rc:// prefix is stripped if present.'),
       }, async (args) => ({ content: [{ type: 'text', text: updatePreparedQuote(args) }] })),
-      tool('remove_note', 'Remove one note by id from generated_notes.json and/or directly from an assembled TSV row. Use for antithetical-parallelism or redundant notes.', {
+      tool('remove_note', 'Remove one redundant note by id from generated_notes.json and/or directly from an assembled TSV row. Refuses (no change) when the id is the only note left for its verse — a verse must not ship with no note; improve that note with update_note_text instead.', {
         id: z.string().describe('The note id to remove'),
         generatedJson: z.string().optional().describe('Path to generated_notes.json (runtime.generatedNotes)'),
         tsvFile: z.string().optional().describe('Path to the assembled TN TSV (removes the row whose ID column matches)'),
+        preparedJson: z.string().optional().describe('Path to prepared_notes.json (runtime.preparedNotes); defaults to the sibling of generatedJson. Used to find the note\'s verse.'),
       }, async (args) => ({ content: [{ type: 'text', text: removeNote(args) }] })),
       tool('check_duplicate_ids', 'ID gate for TN/TQ TSVs: format, uniqueness within/across files, optional collision vs published. First line starts OK:/FAIL:.', {
         files: z.array(z.string()), against: z.array(z.string()).optional(),
