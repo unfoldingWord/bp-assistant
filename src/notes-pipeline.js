@@ -1965,13 +1965,14 @@ function mergeGapIssues({ chapterText, shardText, verses, chapter, book = '', kn
 function buildGapFillHint({ verses, issuesPath }) {
   const list = verses.join(', ');
   return DEEP_ISSUE_ID_HINT + '\n\n' +
-    `GAP-FILL RUN. Target verses: ${list}. Every other verse in the --verses span already has issues in ` +
-    `${issuesPath}, and only rows for the target verses are kept; rows for any other verse are discarded. ` +
-    'Put the target verse list in every analyst and challenger prompt, and have each analyst read every ' +
-    'target verse closely. Skip a phrase in a target verse only when the same wording already has a row in ' +
-    `${issuesPath} (later occurrences get "see how" pointers automatically). If a phrase has no row there, ` +
-    'flag it in the first target verse where it occurs, even when an earlier non-target verse has the same ' +
-    'wording. A target verse may truly need no issue; do not invent one.';
+    `GAP-FILL RUN. Target verses: ${list}. The other verses in the --verses span are already covered (by rows ` +
+    `in ${issuesPath} or by editor-kept notes), and only rows for the target verses are kept; rows for any ` +
+    'other verse are discarded. Put the target verse list in every analyst and challenger prompt, and have ' +
+    'each analyst read every target verse closely. The skill\'s usual selectivity and challenger rules still ' +
+    `apply. The first-occurrence rule changes in one way: a phrase that already has a row in ${issuesPath} ` +
+    'with the same issue type is covered (the pipeline handles later occurrences), but a phrase with no such ' +
+    'row should be flagged in the first target verse where it occurs, even if an earlier non-target verse ' +
+    'has the same wording. A target verse may truly need no issue; do not invent one.';
 }
 
 async function fillIssueGaps({
