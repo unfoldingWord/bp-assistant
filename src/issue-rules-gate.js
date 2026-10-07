@@ -930,7 +930,8 @@ async function runIssueRulesGate({ issuesPath, book, chapter, verseStart, verseE
       const hi = Math.max(...chunkVersesList);
       const verseSet = [];
       for (let v = lo - 1; v <= hi + 1; v++) if (v >= 1) verseSet.push(v);
-      const chunkKept = chapterKept.filter((k) => chunkVersesList.some((v) => v >= k.span.lo && v <= k.span.hi));
+      // A range-ref row ("3:3-4") touches every verse in its range.
+      const chunkKept = chapterKept.filter((k) => chunk.some((r) => !r.protected && r.verse <= k.span.hi && rowLastVerse(r) >= k.span.lo));
       const prompt = buildPrompt({
         book: bookUpper, chapter, rules: decisionRules, catalog, requireGRule: settings.requireGRule, allowAdd: settings.allowAdd,
         verseText: { verses: verseSet, hebrew: hebrewVerses, ult: ultVerses, ust: ustVerses },
@@ -965,7 +966,7 @@ async function runIssueRulesGate({ issuesPath, book, chapter, verseStart, verseE
       if (!responseText) return failure(result, null, 'empty response');
 
       const parsed = parseVerdicts(responseText, chunk, { kept: chunkKept });
-      notes.push(...parsed.keptRejected);
+      if (parsed.complete) notes.push(...parsed.keptRejected);
       if (!parsed.complete) {
         incomplete++;
         notes.push(`chunk ${i + 1}: incomplete (${parsed.errors.slice(0, 3).join('; ')}); not applied`);
@@ -1012,7 +1013,9 @@ async function runIssueRulesGate({ issuesPath, book, chapter, verseStart, verseE
     const preText = readIfExists(preAbs);
     const preLines = new Set(preText ? dataRows(markOutOfScope(parseIssuesTsv(preText), chapter, range)).map(rowToLine) : []);
     const currentLines = new Set(dataRows(rows).map(rowToLine));
-    const stillGone = priorKeptDropped.filter((d) => preLines.has(d.line) && !currentLines.has(d.line));
+    // A drop whose kept note the editor has since removed loses its credit too.
+    const keptIdsNow = new Set(chapterKept.map((k) => k.rowId));
+    const stillGone = priorKeptDropped.filter((d) => preLines.has(d.line) && !currentLines.has(d.line) && keptIdsNow.has(d.kept));
     const shrink = priorDropState(preText, rows, { chapter, range, isProtected });
     const priorDrops = Math.max(0, shrink.priorDrops - stillGone.length);
     const { dropBaseline } = shrink;

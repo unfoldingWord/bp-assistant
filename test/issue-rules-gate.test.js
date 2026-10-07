@@ -1050,3 +1050,25 @@ test('kept notes: a range-ref issue row overlapping the kept span can be a KEPT 
     assert.deepEqual(res.keptDrops.map((d) => [d.ref, d.kept]), [['3:3-4', 'kp02']]);
   }, { rules: G_RULES, lines });
 });
+
+test('kept notes: a kept note at the end of a range-ref row is shown to that row\'s chunk', async () => {
+  const lines = [LINES[0], 'JER\t3:1-2\tfigs-explicit\tthe king said\t\t\tspans two verses'];
+  await ws(async ({ run }) => {
+    const runner = fakeRunner({ overrides: { 1: { action: 'drop', rule: 'KEPT', kept: 'kp22' } } });
+    const res = await run({ runClaudeImpl: runner, kept: [{ rowId: 'kp22', ref: '3:2', supportReference: 'figs-explicit', quote: 'הַדָּבָר', note: 'n' }], config: DEFAULTS });
+    assert.match(runner.calls[0].prompt, /^\[kp22\] 3:2 /m);
+    assert.deepEqual(res.keptDrops.map((d) => d.kept), ['kp22']);
+  }, { rules: G_RULES, lines });
+});
+
+test('kept notes: an earlier KEPT drop loses its cap credit when its kept note is gone', async () => {
+  await ws(async ({ run }) => {
+    await run({ runClaudeImpl: fakeRunner({ overrides: { 6: { action: 'drop', rule: 'KEPT', kept: 'hk52' } } }), kept: KEPT, config: DEFAULTS });
+    const res = await run({
+      runClaudeImpl: fakeRunner({ overrides: { 3: { action: 'drop', rule: 'G4' } } }),
+      kept: [KEPT[1]], config: DEFAULTS,
+    });
+    assert.equal(res.counts.dropped, 0, '1 earlier + 1 new of 7 is over 25% once hk52 is no longer kept');
+    assert.equal(res.keptDropsTotal, 0);
+  }, { rules: G_RULES });
+});

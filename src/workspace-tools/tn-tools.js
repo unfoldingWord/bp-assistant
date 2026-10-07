@@ -1780,7 +1780,9 @@ function applyHintsToPreparedNotes({ preparedJson, hints, chapter }) {
 // split at spaces and maqaf ("&" separators ignored): one quote's words
 // contain all of the other's (so a one-word kept quote covers any longer quote
 // with that word, as #446 specifies), or the shared words are at least half of
-// all distinct words (0.5, the issue rules gate's DUPLICATE_OVERLAP).
+// all distinct words (0.5). The gate's DUPLICATE_OVERLAP divides by the
+// shorter quote instead; dividing by all words here is stricter on purpose,
+// since no model checks these drops.
 const KEPT_QUOTE_OVERLAP = 0.5;
 function keptQuotesOverlap(a, b) {
   const words = (q) => new Set(normalizeQuote(q).split(/[\s\u05BE]+/).filter((w) => w && w !== '&'));
