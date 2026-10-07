@@ -1776,12 +1776,35 @@ function applyHintsToPreparedNotes({ preparedJson, hints, chapter }) {
   return { hintsApplied: applied, itemsSuppressed: suppressed, hintsDropped: dropped, droppedReasons };
 }
 
+// Word tokens of a normalized quote. Discontinuous parts ("&") split like
+// spaces; maqaf-joined words stay one token, so a shared particle (אֶל־) alone
+// does not make two different phrases overlap.
+function keptQuoteTokens(q) {
+  return new Set(normalizeQuote(q).split(/[\s&]+/).filter(Boolean));
+}
+
+// Same overlap test as the issue rules gate (DUPLICATE_OVERLAP): one token set
+// contains the other, or shared tokens / smaller set size >= 0.5.
+const KEPT_QUOTE_OVERLAP = 0.5;
+function keptQuotesOverlap(a, b) {
+  const A = keptQuoteTokens(a);
+  const B = keptQuoteTokens(b);
+  if (!A.size || !B.size) return false;
+  let shared = 0;
+  for (const t of A) if (B.has(t)) shared++;
+  if (shared === A.size || shared === B.size) return true;
+  return shared / Math.min(A.size, B.size) >= KEPT_QUOTE_OVERLAP;
+}
+
 /**
- * Drop prepared items already covered by an editor-kept note: same verse,
- * normalized support reference and normalized quote (exact after
- * normalizeQuote, not fuzzy, so a note on a different phrase still lands).
+ * Drop prepared items already covered by an editor-kept note: same verse
+ * (inside the kept span), same normalized support reference, and a Hebrew
+ * quote that overlaps the kept quote (equal, a superset, a subset, or at
+ * least half the words of the shorter one shared). A note with a different
+ * sref, or on a mostly different phrase, still lands; the issue rules gate
+ * judges those cases with a model.
  * Nothing is injected: the kept note already exists in en_tn. The push-time
- * dedup in insert-tn-rows uses the same key.
+ * dedup in insert-tn-rows stays exact on purpose (it guards deletes).
  *
  * Kept refs are read with keptRefVerseSpan (ranges and cross-chapter spans
  * cover every verse in them; intro refs cover none).
@@ -1804,8 +1827,8 @@ function removePreparedItemsCoveredByKept(prepared, kept, chapter) {
     const quote = normalizeQuote(item.orig_quote);
     const covered = kept.some((k) => {
       const span = keptRefVerseSpan(k.ref, itemCh);
-      return !!span && v >= span.lo && v <= span.hi
-        && sref === normalizeSupportReference(k.supportReference) && quote === normalizeQuote(k.quote);
+      if (!span || v < span.lo || v > span.hi || sref !== normalizeSupportReference(k.supportReference)) return false;
+      return quote === normalizeQuote(k.quote) || keptQuotesOverlap(quote, k.quote);
     });
     return !covered;
   });

@@ -3410,6 +3410,7 @@ async function notesPipeline(route, message) {
           verseEnd: hasVerseRange ? verseEnd : undefined,
           ctx: gateCtx,
           hints,
+          kept,
           config: config,
           env: process.env,
           dryRun: isDryRun,
@@ -3442,6 +3443,7 @@ async function notesPipeline(route, message) {
             `**${ref}**: issue rules check${gate.changed ? '' : ' (no changes)'}: kept ${c.kept}, dropped ${c.dropped}, ` +
             `relabeled ${c.relabeled}, rescoped ${c.rescoped}, added ${c.added}` +
             `${c.declined ? `, declined ${c.declined}` : ''}` +
+            `${gate.keptDropped ? ` (${gate.keptDropped} of the drops duplicate kept notes)` : ''}` +
             `${gate.reportPath ? ` (${gate.reportPath})` : ''}`
           );
         } else if (gate.reason === 'error') {
@@ -3605,9 +3607,13 @@ async function notesPipeline(route, message) {
                 kept,
                 chapter: ch,
               }).itemsRemoved;
+              // Rows the rules gate dropped as duplicates of kept notes (judged by
+              // the model) never reached prepared_notes, so they are counted here.
+              const judged = Number(issueRulesGateResult?.keptDropped) || 0;
               await status(
                 `**${ref}**: ${keptHere} kept notes from the editor will stay in place; ` +
-                `${dropped} AI notes dropped as duplicates of them`,
+                `${dropped + judged} AI notes dropped as duplicates of kept notes ` +
+                `(${dropped} exact/overlap, ${judged} judged by the rules gate)`,
               );
             } catch (keptErr) {
               console.error(`[notes] applyKeptToPreparedNotes failed: ${keptErr.message}`);

@@ -2065,7 +2065,7 @@ test('removePreparedItemsCoveredByKept — range ref covers each verse; other ch
   assert.equal(removePreparedItemsCoveredByKept(prepared, [], 40).removed, 0);
 });
 
-test('removePreparedItemsCoveredByKept — exact normalized quote, not fuzzy; keeps item_count in step', () => {
+test('removePreparedItemsCoveredByKept — word-level overlap, not substring; keeps item_count in step', () => {
   const prepared = { item_count: 3, items: [
     { id: 'a001', reference: '40:3', sref: 'figs-explicit', orig_quote: 'לֹא⁠' },
     { id: 'a002', reference: '40:3', sref: 'figs-explicit', orig_quote: 'וְלֹא יָדַע' },
@@ -2073,9 +2073,41 @@ test('removePreparedItemsCoveredByKept — exact normalized quote, not fuzzy; ke
   ] };
   const kept = [{ rowId: 'kp01', ref: '40:3', supportReference: 'figs-explicit', quote: 'לֹא' }];
   const { prepared: out, removed } = removePreparedItemsCoveredByKept(prepared, kept, 40);
-  assert.equal(removed, 1, 'word joiner is ignored, a longer phrase containing the quote is not a duplicate');
+  assert.equal(removed, 1, 'word joiner is ignored; a word that merely contains the quote as a substring is not a duplicate');
   assert.deepEqual(out.items.map((i) => i.id), ['a002', 'a003']);
   assert.equal(out.item_count, 2);
+});
+
+test('removePreparedItemsCoveredByKept — superset, subset and 50% overlap at the same verse and sref are dropped (#446)', () => {
+  const kept = [{ rowId: 'hk52', ref: '40:19', supportReference: 'rc://*/ta/man/translate/figs-ellipsis', quote: 'הַקָּדִים וְהַצָּפוֹן' }];
+  const prepared = { items: [
+    { id: 'sup1', reference: '40:19', sref: 'figs-ellipsis', orig_quote: 'הַקָּדִים וְהַצָּפוֹן מֵאָה' },
+    { id: 'sub1', reference: '40:19', sref: 'figs-ellipsis', orig_quote: 'הַקָּדִים' },
+    { id: 'half', reference: '40:19', sref: 'figs-ellipsis', orig_quote: 'וְהַצָּפוֹן אַמָּה' },
+    { id: 'disc', reference: '40:19', sref: 'figs-ellipsis', orig_quote: 'הַקָּדִים & אַמָּה' },
+  ] };
+  const { prepared: out, removed } = removePreparedItemsCoveredByKept(prepared, kept, 40);
+  assert.equal(removed, 4);
+  assert.deepEqual(out.items, []);
+});
+
+test('removePreparedItemsCoveredByKept — different sref, different verse or under 50% overlap is kept (#446)', () => {
+  const kept = [{ rowId: 'hk52', ref: '40:19', supportReference: 'figs-ellipsis', quote: 'הַקָּדִים וְהַצָּפוֹן מֵאָה' }];
+  const prepared = { items: [
+    { id: 'sref', reference: '40:19', sref: 'figs-explicit', orig_quote: 'הַקָּדִים וְהַצָּפוֹן מֵאָה' },
+    { id: 'vers', reference: '40:20', sref: 'figs-ellipsis', orig_quote: 'הַקָּדִים וְהַצָּפוֹן מֵאָה' },
+    { id: 'low1', reference: '40:19', sref: 'figs-ellipsis', orig_quote: 'מֵאָה אַמָּה רֹחַב הַשַּׁעַר' },
+    { id: 'none', reference: '40:19', sref: 'figs-ellipsis', orig_quote: 'אֶל־הַשַּׁעַר הַפְּנִימִי' },
+  ] };
+  const { prepared: out, removed } = removePreparedItemsCoveredByKept(prepared, kept, 40);
+  assert.equal(removed, 0);
+  assert.deepEqual(out.items.map((i) => i.id), ['sref', 'vers', 'low1', 'none']);
+});
+
+test('removePreparedItemsCoveredByKept — a shared maqaf particle alone is not overlap (#446)', () => {
+  const kept = [{ rowId: 'k1', ref: '40:2', supportReference: 'figs-explicit', quote: 'אֶל־הַבַּיִת' }];
+  const prepared = { items: [{ id: 'a1', reference: '40:2', sref: 'figs-explicit', orig_quote: 'אֶל־הָעִיר' }] };
+  assert.equal(removePreparedItemsCoveredByKept(prepared, kept, 40).removed, 0);
 });
 
 test('keptRefVerseSpan — single, range, cross-chapter, intro', () => {

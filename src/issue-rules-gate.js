@@ -16,6 +16,7 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const { CSKILLBP_DIR, isUsageLimitError } = require('./pipeline-utils');
+const { keptRefVerseSpan } = require('./lib/kept-notes');
 
 const MAX_DROP_SHARE = 0.25;
 const MAX_ROWS_PER_CHUNK = 40;
@@ -23,6 +24,8 @@ const MAX_ADDS_PER_CHAPTER = 10;
 const PR_BODY_MAX = 3500;
 const PR_BODY_MAX_LINES = 25;
 const DUPLICATE_OVERLAP = 0.5;
+const KEPT_RULE = 'KEPT';
+const KEPT_NOTE_MAX = 300;
 
 const SREF_RE = /^[a-z]+(-[a-z0-9]+)+$/;
 const ACTIONS = new Set(['keep', 'drop', 'relabel', 'rescope']);
@@ -335,9 +338,71 @@ function chunkRows(rows, max = MAX_ROWS_PER_CHUNK) {
   return chunks.filter((c) => c.some((r) => !r.protected));
 }
 
+// --- Kept notes --------------------------------------------------------------------
+
+function stripSrefPrefix(sref) {
+  return String(sref || '').trim().replace(/^rc:\/\/[^/]+\/ta\/man\/translate\//, '');
+}
+
+/**
+ * Editor-kept notes (options.kept) whose ref span covers at least one of
+ * `verses` in `chapter`, each with its span. Entries without a rowId or with a
+ * ref that covers no verse of the chapter are left out.
+ */
+function keptNotesForVerses(kept, chapter, verses) {
+  if (!Array.isArray(kept) || !kept.length) return [];
+  const want = [...new Set(verses || [])];
+  const out = [];
+  for (const k of kept) {
+    if (!k || !String(k.rowId || '').trim()) continue;
+    const span = keptRefVerseSpan(k.ref, chapter);
+    if (!span || !want.some((v) => v >= span.lo && v <= span.hi)) continue;
+    out.push({ ...k, rowId: String(k.rowId).trim(), span });
+  }
+  return out;
+}
+
+function keptNoteLine(k) {
+  const note = sanitizeCell(k.note);
+  return `[${sanitizeCell(k.rowId)}] ${sanitizeCell(k.ref)} | ${sanitizeCell(stripSrefPrefix(k.supportReference))} | ${sanitizeCell(k.quote)} | ${note.length > KEPT_NOTE_MAX ? note.slice(0, KEPT_NOTE_MAX) : note}`;
+}
+
+/** Hash input for the kept list: a changed kept set re-runs the gate. '' for none. */
+function keptHashKey(kept) {
+  if (!Array.isArray(kept) || !kept.length) return '';
+  return kept.map((k) => [k.rowId, k.ref, stripSrefPrefix(k.supportReference), k.quote, sha256(String(k.note || ''))].join('|')).sort().join('\n');
+}
+
+/**
+ * Check every KEPT drop of one chunk against the kept notes that chunk was
+ * shown. A KEPT drop stands only when `kept` names one of them and the row's
+ * verse lies in that note's span; anything else becomes a declined keep, so
+ * every doubt falls toward keeping the row. Valid ones get `keptRowId`.
+ * Mutates and returns `verdicts`.
+ */
+function checkKeptVerdicts(verdicts, rows, chunkKept, notes) {
+  const byIndex = new Map(rows.map((r) => [r.index, r]));
+  const byId = new Map((chunkKept || []).map((k) => [k.rowId, k]));
+  for (const [idx, v] of verdicts) {
+    if (v.action !== 'drop' || String(v.rule || '').trim().toUpperCase() !== KEPT_RULE) continue;
+    const row = byIndex.get(idx);
+    const k = byId.get(String(v.kept || '').trim());
+    if (!k) {
+      verdicts.set(idx, { ...v, action: 'keep', declined: true });
+      notes.push(`kept_drop_rejected:unknown_kept:${idx}:${v.kept || 'none'}`);
+    } else if (!row || row.verse < k.span.lo || row.verse > k.span.hi) {
+      verdicts.set(idx, { ...v, action: 'keep', declined: true });
+      notes.push(`kept_drop_rejected:verse:${idx}:${k.rowId}`);
+    } else {
+      verdicts.set(idx, { ...v, rule: KEPT_RULE, keptRowId: k.rowId });
+    }
+  }
+  return verdicts;
+}
+
 // --- Prompt ------------------------------------------------------------------------
 
-function buildPrompt({ book, chapter, rules, verseText, rows, catalog, requireGRule = false, allowAdd = false }) {
+function buildPrompt({ book, chapter, rules, verseText, rows, catalog, requireGRule = false, allowAdd = false, kept = null }) {
   const ruleLines = (rules || []).map((r) => {
     const phrase = r.phrase && r.phrase.toLowerCase() !== r.slug ? ` "${r.phrase}":` : '';
     return `${r.id} [${r.slug}] (${r.book}; ${r.context})${phrase} ${r.notes}`;
@@ -352,6 +417,17 @@ function buildPrompt({ book, chapter, rules, verseText, rows, catalog, requireGR
   }
   const rowLines = rows.map((r) => `#${r.index} ${r.protected ? '[protected] ' : ''}${r.ref} | ${r.sref} | ${r.quote} | ${r.explanation}`);
   const catalogList = catalog && catalog.size ? [...catalog].sort().join(', ') : '';
+  const keptList = Array.isArray(kept) ? kept : [];
+  const keptLines = keptList.length ? [
+    'KEPT NOTES (already in en_tn; a translator wrote or approved these; never write a second note on the same issue). Format: [id] ref | sref | Hebrew quote | note:',
+    keptList.map(keptNoteLine).join('\n'),
+    '',
+    `Drop a row with "rule":"${KEPT_RULE}" and "kept":"<id>" only when the note it would produce makes the same point as that kept note at an overlapping place. `
+      + 'That includes a different quote span (wider, narrower or partly overlapping) and a different sref for the same idea. '
+      + 'It does not include a different figure or issue on the same words, or the same sref on a different phrase. '
+      + `When unsure, keep the row. A ${KEPT_RULE} drop needs no other rule id.`,
+    '',
+  ] : [];
 
   return [
     `Review the issue rows below for ${String(book).toUpperCase()} ${chapter} against the current rules.`,
@@ -365,10 +441,11 @@ function buildPrompt({ book, chapter, rules, verseText, rows, catalog, requireGR
     'ISSUE ROWS (format: #row ref | sref | GLQuote | explanation). Rows marked [protected] are context only; give no verdict for them:',
     rowLines.join('\n'),
     '',
+    ...keptLines,
     catalogList ? `Allowed sref slugs: ${catalogList}` : '',
     '',
     'Return JSON only, no prose and no code fence, exactly in this shape. Give exactly one verdict for every row that is not [protected]:',
-    `{"verdicts":[{"row":<number>,"action":"keep|drop|relabel|rescope","sref":"<slug, relabel only>","quote":"<GLQuote, rescope only>","reason":"<short>","rule":"${requireGRule ? '<G-rule id; null for keep>' : '<D-id|type-file|null>'}"}],"adds":[{"ref":"C:V","sref":"<slug>","quote":"<GLQuote verbatim from ULT>","explanation":"<1-10 words>","reason":"<short>","rule":"<id|null>"}]}`,
+    `{"verdicts":[{"row":<number>,"action":"keep|drop|relabel|rescope","sref":"<slug, relabel only>","quote":"<GLQuote, rescope only>","reason":"<short>","rule":"${requireGRule ? '<G-rule id; null for keep>' : '<D-id|type-file|null>'}"${keptList.length ? `,"kept":"<kept note id, ${KEPT_RULE} drops only>"` : ''}}],"adds":[{"ref":"C:V","sref":"<slug>","quote":"<GLQuote verbatim from ULT>","explanation":"<1-10 words>","reason":"<short>","rule":"<id|null>"}]}`,
     '"adds" may be an empty array.',
     allowAdd
       ? 'Additions are enabled: you may list commonly missed issues in adds, each citing a G-rule.'
@@ -450,6 +527,7 @@ function parseVerdicts(text, rows) {
       v.quote = sanitizeCell(entry.quote);
       if (!v.quote) { errors.push(`row ${idx}: rescope requires quote`); continue; }
     }
+    if (entry.kept != null && entry.kept !== 'null') v.kept = sanitizeCell(entry.kept);
     verdicts.set(idx, v);
   }
 
@@ -513,6 +591,7 @@ function applyVerdicts(rows, verdicts, opts = {}) {
   const notes = [];
   const changes = [];
   const counts = emptyCounts();
+  let keptDropped = 0;
 
   const anchorsOk = (quote, verse) => {
     // The normalizer rewrites an ellipsis to " & ", which would change the file after the gate.
@@ -527,7 +606,17 @@ function applyVerdicts(rows, verdicts, opts = {}) {
   // wild response cannot thin the list. Rows outside the chapter or range are not counted.
   // The cap is cumulative across runs: `priorDrops` (rows already gone since the
   // first pre-gate list) count against it, and `dropBaseline` is that list's size.
-  const wantedDrops = [...verdicts.values()].filter((v) => v.action === 'drop').length;
+  // Drops of rows that duplicate an editor-kept note (checked by checkKeptVerdicts)
+  // are capped on their own: a chapter with many kept notes can lose many rows,
+  // but never more than it has kept notes (opts.keptCount).
+  const isKeptDrop = (v) => v.action === 'drop' && !!v.keptRowId;
+  const wantedKeptDrops = [...verdicts.values()].filter(isKeptDrop).length;
+  let keptDropsAllowed = true;
+  if (wantedKeptDrops > 0 && wantedKeptDrops > (Number(opts.keptCount) || 0)) {
+    keptDropsAllowed = false;
+    notes.push('kept_drop_cap_exceeded');
+  }
+  const wantedDrops = [...verdicts.values()].filter((v) => v.action === 'drop' && !isKeptDrop(v)).length;
   const gateableTotal = opts.gateableTotal != null ? opts.gateableTotal : dataRows(rows).filter((r) => !r.protected).length;
   const priorDrops = Math.max(0, Number(opts.priorDrops) || 0);
   const dropBaseline = Math.max(gateableTotal, Number(opts.dropBaseline) || 0);
@@ -555,7 +644,13 @@ function applyVerdicts(rows, verdicts, opts = {}) {
       out.push(row);
       continue;
     }
-    if (v.action === 'drop' && dropsAllowed) {
+    if (isKeptDrop(v) && keptDropsAllowed) {
+      counts.dropped++;
+      keptDropped++;
+      changes.push({ index: row.index, ref: row.ref, action: 'drop', sref: row.sref, before: row.quote, after: '', reason: v.reason, rule: KEPT_RULE, kept: v.keptRowId });
+      continue;
+    }
+    if (v.action === 'drop' && !isKeptDrop(v) && dropsAllowed) {
       counts.dropped++;
       changes.push({ index: row.index, ref: row.ref, action: 'drop', sref: row.sref, before: row.quote, after: '', reason: v.reason, rule: v.rule });
       continue;
@@ -589,6 +684,8 @@ function applyVerdicts(rows, verdicts, opts = {}) {
       } else {
         notes.push(`rescope_ignored:${row.index}`);
       }
+    } else if (isKeptDrop(v)) {
+      notes.push(`kept_drop_ignored:cap:${row.index}`);
     } else if (v.action === 'drop') {
       notes.push(`drop_ignored:cap:${row.index}`);
     }
@@ -626,7 +723,7 @@ function applyVerdicts(rows, verdicts, opts = {}) {
   }
 
   copyMeta(rows, working);
-  return { rows: working, changes, counts, notes };
+  return { rows: working, changes, counts, notes, keptDropped };
 }
 
 // --- PR body / report --------------------------------------------------------------
@@ -643,19 +740,22 @@ function noMentions(text) {
 }
 
 function changeLine(c) {
+  if (c.rule === KEPT_RULE && c.kept) {
+    return noMentions(`- ${c.ref} ${c.sref} dropped: duplicates kept note ${c.kept} "${truncate(c.before, 40)}"${c.reason ? ` (${c.reason})` : ''}`);
+  }
   const q = c.action === 'relabel' ? c.quote : (c.action === 'rescope' ? c.after : (c.action === 'add' ? c.after : c.before));
   const sref = c.action === 'relabel' ? `${c.fromSref}→${c.sref}` : c.sref;
   const why = c.rule ? `${c.rule}: ${c.reason || ''}` : (c.reason || '');
   return noMentions(`- ${c.ref} ${c.action} ${sref} "${truncate(q, 40)}" (${why.trim()})`);
 }
 
-function countsLine(counts) {
-  return `kept ${counts.kept}, dropped ${counts.dropped}, relabeled ${counts.relabeled}, rescoped ${counts.rescoped}, added ${counts.added}`
+function countsLine(counts, keptDropped = 0) {
+  return `kept ${counts.kept}, dropped ${counts.dropped}${keptDropped ? ` (${keptDropped} as duplicates of kept notes)` : ''}, relabeled ${counts.relabeled}, rescoped ${counts.rescoped}, added ${counts.added}`
     + (counts.declined ? `, declined ${counts.declined}` : '');
 }
 
-function buildPrBody({ counts, changes }) {
-  const head = `Issue rules check: ${countsLine(counts)}`;
+function buildPrBody({ counts, changes, keptDropped = 0 }) {
+  const head = `Issue rules check: ${countsLine(counts, keptDropped)}`;
   const list = (changes || []).slice(0, PR_BODY_MAX_LINES).map(changeLine);
   const extra = (changes || []).length > PR_BODY_MAX_LINES ? [`- … and ${changes.length - PR_BODY_MAX_LINES} more`] : [];
   const body = [head, '', ...list, ...extra].join('\n');
@@ -666,11 +766,11 @@ function escapeMd(text) {
   return String(text == null ? '' : text).replace(/\|/g, '\\|').replace(/\n/g, ' ');
 }
 
-function renderReport({ book, chapter, mode, model, counts, changes, notes, rulesHash, prePath, priorDrops }) {
+function renderReport({ book, chapter, mode, model, counts, changes, notes, rulesHash, prePath, priorDrops, keptDropped = 0 }) {
   const lines = [];
   lines.push(`# Issue rules gate: ${String(book).toUpperCase()} ${chapter} (${mode})`);
   lines.push('');
-  const line = countsLine(counts);
+  const line = countsLine(counts, keptDropped);
   lines.push(line.charAt(0).toUpperCase() + line.slice(1));
   lines.push('');
   lines.push(`Model: ${model || '(default)'}`);
@@ -685,7 +785,7 @@ function renderReport({ book, chapter, mode, model, counts, changes, notes, rule
   lines.push('| Ref | Action | Before | After | Reason | Rule |');
   lines.push('|---|---|---|---|---|---|');
   for (const c of changes) {
-    lines.push(`| ${escapeMd(c.ref)} | ${escapeMd(c.action)} | ${escapeMd(c.before)} | ${escapeMd(c.after)} | ${escapeMd(c.reason)} | ${escapeMd(c.rule || '')} |`);
+    lines.push(`| ${escapeMd(c.ref)} | ${escapeMd(c.action)} | ${escapeMd(c.before)} | ${escapeMd(c.after)} | ${escapeMd(c.reason)} | ${escapeMd(c.kept ? `${c.rule} ${c.kept}` : (c.rule || ''))} |`);
   }
   if (notes && notes.length) {
     lines.push('');
@@ -738,9 +838,9 @@ function accountingHolds(beforeRows, afterRows, counts) {
   return pb.length === pa.length && pb.every((l, i) => l === pa[i]);
 }
 
-async function runIssueRulesGate({ issuesPath, book, chapter, verseStart, verseEnd, ctx, hints, config, env, dryRun, model, status, runClaudeImpl } = {}) {
+async function runIssueRulesGate({ issuesPath, book, chapter, verseStart, verseEnd, ctx, hints, kept, config, env, dryRun, model, status, runClaudeImpl } = {}) {
   const result = {
-    ran: false, reason: null, mode: null, counts: emptyCounts(), changed: false,
+    ran: false, reason: null, mode: null, counts: emptyCounts(), keptDropped: 0, changed: false,
     rowsBefore: 0, rowsAfter: 0, reportPath: null, sidecarPath: null, prBody: '', pause: false, error: null,
   };
   const say = async (text) => { try { if (status) await status(text); } catch (_) { /* never throw */ } };
@@ -777,6 +877,9 @@ async function runIssueRulesGate({ issuesPath, book, chapter, verseStart, verseE
     }
     const gateable = rows.filter((r) => !r.passthrough && !r.protected);
     if (!gateable.length) return skip('no_gateable_rows');
+    // Editor-kept notes on the verses the gate can change. With none, the prompt,
+    // hash and verdict handling are exactly what they were without a kept list.
+    const keptInScope = keptNotesForVerses(kept, chapter, gateable.map((r) => r.verse));
 
     const rulesText = readIfExists(path.join(CSKILLBP_DIR, '.claude/skills/issue-identification/rules-gate.md'));
     if (rulesText == null || !rulesText.trim()) {
@@ -791,7 +894,10 @@ async function runIssueRulesGate({ issuesPath, book, chapter, verseStart, verseE
     // allowAdd value, protect list or catalog re-runs the gate instead of
     // reporting already_applied.
     const settingsKey = JSON.stringify({ allowAdd: !!settings.allowAdd, protectSrefs: [...settings.protectSrefs].sort(), catalog: [...catalog].sort(), useDecisionRows: settings.useDecisionRows, requireGRule: settings.requireGRule });
-    const rulesHash = sha256(rulesText + '\n' + decisionRules.map((r) => [r.id, r.phrase, r.slug, r.book, r.context, r.notes].join('|')).join('\n') + '\n' + settingsKey);
+    // A changed kept set re-runs the gate too; with no kept notes the hash is unchanged.
+    const keptKey = keptHashKey(keptInScope);
+    const rulesHash = sha256(rulesText + '\n' + decisionRules.map((r) => [r.id, r.phrase, r.slug, r.book, r.context, r.notes].join('|')).join('\n') + '\n' + settingsKey
+      + (keptKey ? `\nkept:${keptKey}` : ''));
 
     const base = path.basename(issuesPath, '.tsv');
     const reviewRel = path.join('output/review', bookUpper);
@@ -808,6 +914,7 @@ async function runIssueRulesGate({ issuesPath, book, chapter, verseStart, verseE
         if (sc && sc.mode === settings.mode && sc.rulesHash === rulesHash && sc.outputHash === hashNonIntroRows(rows)) {
           result.reason = 'already_applied';
           result.prBody = sc.prBody || '';
+          result.keptDropped = Number(sc.keptDropped) || 0;
           result.sidecarPath = sidecarRel;
           result.reportPath = reportRel;
           return result;
@@ -846,10 +953,13 @@ async function runIssueRulesGate({ issuesPath, book, chapter, verseStart, verseE
       const hi = Math.max(...chunkVersesList);
       const verseSet = [];
       for (let v = lo - 1; v <= hi + 1; v++) if (v >= 1) verseSet.push(v);
+      // Only kept notes on this chunk's own row verses, so the prompt stays bounded.
+      const chunkKept = keptNotesForVerses(keptInScope, chapter, chunk.filter((r) => !r.protected).map((r) => r.verse));
       const prompt = buildPrompt({
         book: bookUpper, chapter, rules: decisionRules, catalog, requireGRule: settings.requireGRule, allowAdd: settings.allowAdd,
         verseText: { verses: verseSet, hebrew: hebrewVerses, ult: ultVerses, ust: ustVerses },
         rows: chunk,
+        ...(chunkKept.length ? { kept: chunkKept } : {}),
       });
       const label = `issue-rules-gate:${bookUpper}-${chapter}${chunks.length > 1 ? `#${i + 1}` : ''}`;
 
@@ -886,6 +996,7 @@ async function runIssueRulesGate({ issuesPath, book, chapter, verseStart, verseE
         console.warn(`[issue-rules-gate] ${label} incomplete: ${parsed.errors.join('; ')}`);
         continue;
       }
+      if (keptInScope.length) checkKeptVerdicts(parsed.verdicts, chunk, chunkKept, notes);
       for (const [k, v] of parsed.verdicts) allVerdicts.set(k, v);
       for (const a of parsed.adds) allAdds.push({ ...a, verses: chunkVersesList });
     }
@@ -904,7 +1015,7 @@ async function runIssueRulesGate({ issuesPath, book, chapter, verseStart, verseE
       const activeRules = activeGRuleIds(rulesText);
       const isG = (rule) => activeRules.has(String(rule || '').trim().toUpperCase());
       for (const [k, v] of allVerdicts) {
-        if (v.action !== 'keep' && !isG(v.rule)) {
+        if (v.action !== 'keep' && !v.keptRowId && !isG(v.rule)) {
           allVerdicts.set(k, { ...v, action: 'keep', declined: true });
           notes.push(`uncited_ignored:${k}:${v.action}:${v.rule || 'none'}`);
         }
@@ -919,10 +1030,15 @@ async function runIssueRulesGate({ issuesPath, book, chapter, verseStart, verseE
     // The 25% drop cap is cumulative: measure it against the write-once first
     // pre-gate list, so a rules edit, another verse range or a crash before the
     // sidecar seal cannot grant a fresh 25% on an already-thinned list.
-    const { priorDrops, dropBaseline } = priorDropState(readIfExists(preAbs), rows, { chapter, range, isProtected });
+    // Earlier KEPT drops are counted apart from the 25% cap, so they come off priorDrops.
+    let priorKeptDrops = 0;
+    try { priorKeptDrops = Number(prior && JSON.parse(prior).keptDropsTotal) || 0; } catch (_) { priorKeptDrops = 0; }
+    const priorState = priorDropState(readIfExists(preAbs), rows, { chapter, range, isProtected });
+    const priorDrops = Math.max(0, priorState.priorDrops - priorKeptDrops);
+    const { dropBaseline } = priorState;
     const applied = applyVerdicts(rows, allVerdicts, {
       catalog, ultVerses, allowAdd: settings.allowAdd, adds: allAdds, protectedVerses, gateableTotal: gateable.length,
-      protectSrefs: settings.protectSrefs, priorDrops, dropBaseline,
+      protectSrefs: settings.protectSrefs, priorDrops, dropBaseline, keptCount: keptInScope.length,
     });
     notes.push(...applied.notes);
     // Rows that were never reviewed (incomplete chunk) have no verdict and are not "kept".
@@ -961,13 +1077,14 @@ async function runIssueRulesGate({ issuesPath, book, chapter, verseStart, verseE
     result.ran = true;
     result.changed = changed;
     result.reason = incomplete > 0 ? 'incomplete' : reason;
-    result.prBody = incomplete > 0 ? '' : buildPrBody({ counts, changes: applied.changes });
+    result.keptDropped = applied.keptDropped;
+    result.prBody = incomplete > 0 ? '' : buildPrBody({ counts, changes: applied.changes, keptDropped: applied.keptDropped });
 
     try {
       fs.mkdirSync(reviewDir, { recursive: true });
       fs.writeFileSync(path.resolve(CSKILLBP_DIR, reportRel), renderReport({
         book: bookUpper, chapter, mode: settings.mode, model: modelName, counts, changes: applied.changes, notes, rulesHash,
-        prePath: fs.existsSync(preAbs) ? preRel : null, priorDrops,
+        prePath: fs.existsSync(preAbs) ? preRel : null, priorDrops, keptDropped: applied.keptDropped,
       }));
       result.reportPath = reportRel;
       // Seal the run only when every chunk was answered, so a partly reviewed
@@ -986,6 +1103,7 @@ async function runIssueRulesGate({ issuesPath, book, chapter, verseStart, verseE
           counts,
           changes: applied.changes,
           prBody: result.prBody,
+          ...(applied.keptDropped || priorKeptDrops ? { keptDropped: applied.keptDropped, keptDropsTotal: priorKeptDrops + applied.keptDropped } : {}),
           at: new Date().toISOString(),
         }, null, 2));
         result.sidecarPath = sidecarRel;
@@ -1096,6 +1214,8 @@ module.exports = {
   loadDecisionRules,
   activeGRuleIds,
   buildPrompt,
+  keptNotesForVerses,
+  checkKeptVerdicts,
   parseVerdicts,
   applyVerdicts,
   buildPrBody,
