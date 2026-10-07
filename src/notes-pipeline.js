@@ -3449,6 +3449,10 @@ async function notesPipeline(route, message) {
             const lines = gate.keptDrops.map((d) => `- ${d.ref} ${d.sref} dropped: duplicates kept note ${d.kept}`);
             await status(`**${ref}**: issue rows dropped as duplicates of kept notes:\n${lines.join('\n')}`);
           }
+          if (gate.keptRestored && gate.keptRestored.length) {
+            const lines = gate.keptRestored.map((d) => `- ${d.ref} ${d.sref}: kept note ${d.kept} is no longer kept`);
+            await status(`**${ref}**: issue rows restored because the kept note they duplicated was removed:\n${lines.join('\n')}`);
+          }
         } else if (gate.reason === 'error') {
           await status(`**${ref}**: issue rules check failed (non-fatal, issues left unchanged): ${gate.error}`);
         } else {
@@ -3615,7 +3619,8 @@ async function notesPipeline(route, message) {
               // already_applied, off), read the count from its sealed sidecar.
               const gateKept = issueRulesGateResult && issueRulesGateResult.ran
                 ? (issueRulesGateResult.keptDropsTotal || 0)
-                : (readGateSidecar({ issuesPath, book })?.keptDropped || []).length;
+                : (readGateSidecar({ issuesPath, book })?.keptDropped || [])
+                  .filter((d) => (kept || []).some((k) => k && k.rowId === d.kept)).length;
               await status(
                 `**${ref}**: ${keptHere} kept notes from the editor will stay in place; ` +
                 `${dropped + gateKept} AI notes dropped as duplicates of kept notes ` +
