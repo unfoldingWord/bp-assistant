@@ -2078,6 +2078,26 @@ test('removePreparedItemsCoveredByKept — exact normalized quote, not fuzzy; ke
   assert.equal(out.item_count, 2);
 });
 
+test('removePreparedItemsCoveredByKept — overlapping quotes at the same verse and sref are duplicates (#446)', () => {
+  const kept = [
+    { rowId: 'hk52', ref: '40:19', supportReference: 'figs-ellipsis', quote: 'הַקָּדִים וְהַצָּפוֹן' },
+    { rowId: 'kp21', ref: '40:21', supportReference: 'figs-explicit', quote: 'וְתָאָיו שְׁלֹשָׁה מִפּוֹ' },
+  ];
+  const prepared = { items: [
+    { id: 'sup1', reference: '40:19', sref: 'figs-ellipsis', orig_quote: 'הַקָּדִים וְהַצָּפוֹן וַיָּמָד' }, // superset
+    { id: 'sub1', reference: '40:19', sref: 'figs-ellipsis', orig_quote: 'וְהַצָּפוֹן' }, // subset
+    { id: 'amp1', reference: '40:19', sref: 'figs-ellipsis', orig_quote: 'הַקָּדִים & וְהַצָּפוֹן' }, // "&" is not a word
+    { id: 'half', reference: '40:21', sref: 'figs-explicit', orig_quote: 'שְׁלֹשָׁה מִפּוֹ וּשְׁלֹשָׁה' }, // 2 shared of 4 words: 50%
+    { id: 'osrf', reference: '40:19', sref: 'figs-explicit', orig_quote: 'הַקָּדִים וְהַצָּפוֹן' }, // other sref
+    { id: 'overs', reference: '40:20', sref: 'figs-ellipsis', orig_quote: 'הַקָּדִים וְהַצָּפוֹן' }, // other verse
+    { id: 'low', reference: '40:19', sref: 'figs-ellipsis', orig_quote: 'הַקָּדִים מֵאָה' }, // 1 shared of 3 words
+    { id: 'low2', reference: '40:21', sref: 'figs-explicit', orig_quote: 'וְתָאָיו אֵילָו וְאֵלַמָּו' }, // 1 shared of 5 words
+  ] };
+  const { prepared: out, removed } = removePreparedItemsCoveredByKept(prepared, kept, 40);
+  assert.equal(removed, 4);
+  assert.deepEqual(out.items.map((i) => i.id), ['osrf', 'overs', 'low', 'low2']);
+});
+
 test('keptRefVerseSpan — single, range, cross-chapter, intro', () => {
   assert.deepEqual(keptRefVerseSpan('40:12', 40), { lo: 12, hi: 12 });
   assert.deepEqual(keptRefVerseSpan('40:12-14', 40), { lo: 12, hi: 14 });
