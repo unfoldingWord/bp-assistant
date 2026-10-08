@@ -59,6 +59,19 @@ function coveredNameSet(words) {
     .map((m) => String(m.term).toLowerCase()));
 }
 
+const allCovered = (words, covered) => words.every((w) => covered.has(w.toLowerCase()));
+
+/**
+ * True when `quote` (English) has at least one name word and every name word has a
+ * tW names article: the word test dropTwCoveredNameRows applies to a row. Used by
+ * see-how detection so it does not point back to a translate-names note for such a
+ * name. Throws when the headwords are unavailable; callers decide how to fail.
+ */
+function isTwCoveredName(quote) {
+  const words = nameWords(quote);
+  return words.length > 0 && allCovered(words, coveredNameSet(words));
+}
+
 /**
  * Remove translate-names rows whose name words all have a tW names article.
  * @param {{issuesPath: string}} args  issuesPath is relative to CSKILLBP_DIR.
@@ -83,7 +96,7 @@ function dropTwCoveredNameRows({ issuesPath }) {
     const covered = coveredNameSet(candidates.flatMap((c) => c.words));
     const dropIdx = new Set();
     for (const c of candidates) {
-      if (c.words.every((w) => covered.has(w.toLowerCase()))) {
+      if (allCovered(c.words, covered)) {
         dropIdx.add(c.i);
         dropped.push({ ref: c.cols[1], quote: c.cols[QUOTE_COL] });
       }
@@ -105,4 +118,4 @@ function dropTwCoveredNameRows({ issuesPath }) {
   }
 }
 
-module.exports = { dropTwCoveredNameRows, nameWords, isTranslateNames };
+module.exports = { dropTwCoveredNameRows, isTwCoveredName, nameWords, isTranslateNames };

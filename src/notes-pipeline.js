@@ -23,7 +23,7 @@ const { checkTnQuality, detectSelfTalk, templateFirstPhrase, resolveTemplateText
 const { buildBookRecurrenceIndex, deriveRecurrenceKeys, buildSeeHowSentence, isSeeHowEligible, isContextDependentSref, dedupeAlsoOccursVerses, assignAlsoOccursVerses, resolveDoor43ReposPath, hebTokens, verseNumber: recurrenceVerseNumber, SEE_HOW_NEVER_FOLD_SREFS, CROSS_BOOK_MAX_BOOKS } = require('./workspace-tools/recurrence-index');
 const { normalizeIssuesFile, buildParallelismIntroHintArgs } = require('./issue-normalizer');
 const { runIssueRulesGate, gatePrBodyForPush, refreshGateSidecarOutputHash, readGateSidecar } = require('./issue-rules-gate');
-const { dropTwCoveredNameRows } = require('./tw-names-gate');
+const { dropTwCoveredNameRows, isTwCoveredName, isTranslateNames } = require('./tw-names-gate');
 const { curlyQuotes } = require('./workspace-tools/usfm-tools');
 const { verifyRepoPush, verifyDcsToken, verifyRemoteContent } = require('./repo-verify');
 const { recordMetrics, getCumulativeTokens, recordRunSummary, getAdaptiveSkillGuardrails } = require('./usage-tracker');
@@ -430,7 +430,7 @@ async function runShardSeeHowDetection({ contextPath, issuesPath, status, genera
   }
 }
 
-const SEE_HOW_ZERO_SUMMARY = '0 see-how back-refs, 0 folded, 0 injected, 0 also-occurs lists, 0 skipped (inexact quote), 0 same-verse combinations, 0 cross-book';
+const SEE_HOW_ZERO_SUMMARY = '0 see-how back-refs, 0 folded, 0 injected, 0 also-occurs lists, 0 skipped (inexact quote), 0 same-verse combinations, 0 cross-book, 0 skipped (tW name)';
 
 // Corpus-wide index behind rule 3, rebuilt by build_crossbook_seehow_index.
 const CROSS_BOOK_INDEX_REL = 'data/cache/crossbook_seehow_index.json';
@@ -622,6 +622,27 @@ async function runSeeHowDetection({ pipeDir, contextPath, generateIdsFn = genera
     return m ? m[1].trim() : '';
   };
 
+  // A name with a tW article gets no translate-names note (tw-names-gate.js), so it
+  // gets no pointer back to an earlier one either (#457). The names are every bold
+  // span in the target note (a note on several names counts only if all have an
+  // article), else this chapter's wording. If the headwords cannot be read, the
+  // pointer is kept, as before this check existed.
+  const twNameMemo = new Map();
+  const pointsToTwCoveredName = (target, glQuote = '') => {
+    if (!target || !isTranslateNames(target.sref)) return false;
+    const bolds = [...String(target.note || '').matchAll(/\*\*([^*]+)\*\*/g)].map((m) => m[1].trim());
+    const english = bolds.join(', ') || String(glQuote || '').trim();
+    if (!english) return false;
+    if (!twNameMemo.has(english)) {
+      let covered = false;
+      try { covered = isTwCoveredName(english); } catch (err) {
+        console.warn(`[notes] see-how tW names check skipped for "${english}": ${err.message}`);
+      }
+      twNameMemo.set(english, covered);
+    }
+    return twNameMemo.get(english);
+  };
+
   const applyPointer = (item, key, target) => {
     const targetSref = target.sref || '';
     const bold = targetBoldQuote(target);
@@ -666,6 +687,7 @@ async function runSeeHowDetection({ pipeDir, contextPath, generateIdsFn = genera
   let alsoOccursCount = 0;
   let inexactSkipped = 0;
   let crossBookCount = 0;
+  let twNameSkipped = 0;
 
   // Hint-driven items carry their own framing (seed prose); leave them alone.
   const candidates = items.filter((it) => !it.fromHint && primaryKey(it));
@@ -782,6 +804,7 @@ async function runSeeHowDetection({ pipeDir, contextPath, generateIdsFn = genera
       ? recurrenceVerseNumber(corpusHere[0].verse)
       : recurrenceVerseNumber(verseOf(lead.reference));
     if (!target) target = crossBookTarget(key, prospective);
+    if (pointsToTwCoveredName(target, lead.gl_quote)) { target = null; twNameSkipped++; }
 
     // Same reason in the other direction: a pointer back to a context-dependent
     // note only ships where the issue pass independently flagged the same
@@ -859,6 +882,7 @@ async function runSeeHowDetection({ pipeDir, contextPath, generateIdsFn = genera
     if (isContextDependentSref(target.sref, key)) continue;
     const corpusHere = chapterCorpusOccs(key);
     if (!corpusHere.length) continue;
+    if (pointsToTwCoveredName(target)) { twNameSkipped++; continue; }
     const occ = corpusHere[0];
     // A phrase is registered under both its Strong's and its text key; dedupe on
     // the concrete verse + quote so it is only injected once.
@@ -1016,7 +1040,7 @@ async function runSeeHowDetection({ pipeDir, contextPath, generateIdsFn = genera
     fs.writeFileSync(prepPath, JSON.stringify(prepared, null, 2));
   }
 
-  const summary = `${seeHowCount} see-how back-refs, ${foldedCount} folded, ${injectedCount} injected, ${alsoOccursCount} also-occurs lists, ${inexactSkipped} skipped (inexact quote), ${combinedCount} same-verse combinations, ${crossBookCount} cross-book`;
+  const summary = `${seeHowCount} see-how back-refs, ${foldedCount} folded, ${injectedCount} injected, ${alsoOccursCount} also-occurs lists, ${inexactSkipped} skipped (inexact quote), ${combinedCount} same-verse combinations, ${crossBookCount} cross-book, ${twNameSkipped} skipped (tW name)`;
   console.log(`[notes] See-how detection: ${summary}`);
   return summary;
 }
