@@ -34,14 +34,23 @@ const row = (ref, sref, quote, hint = '') => ['JER', ref, sref, quote, '', '', h
 const { dropTwCoveredNameRows, nameWords } = require('../src/tw-names-gate');
 
 test('drops a translate-names row when every name word has a tW names article', () => {
+  const keep = row('4:1', 'figs-idiom', 'a hard saying', 'idiom');
   const { rel } = setup([
     row('35:11', 'translate-names', 'Nebuchadnezzar king of Babylon', 'name of a man and his kingdom'),
     row('7:1', 'translate-names', 'Ahaz', 'name of a man'),
+    keep,
   ]);
   const res = dropTwCoveredNameRows({ issuesPath: rel });
   assert.equal(res.ran, true);
   assert.deepEqual(res.dropped.map((d) => d.ref), ['35:11', '7:1']);
-  assert.equal(fs.readFileSync(path.join(ws, rel), 'utf8'), '');
+  assert.equal(fs.readFileSync(path.join(ws, rel), 'utf8'), keep.join('\t') + '\n');
+});
+
+test('never empties the issues file', () => {
+  const { rel, text } = setup([row('7:1', 'translate-names', 'Ahaz', 'name of a man')]);
+  const res = dropTwCoveredNameRows({ issuesPath: rel });
+  assert.deepEqual(res.dropped, []);
+  assert.equal(fs.readFileSync(path.join(ws, rel), 'utf8'), text);
 });
 
 test('keeps a row when any name word has no article', () => {

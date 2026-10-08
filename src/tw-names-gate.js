@@ -88,6 +88,11 @@ function dropTwCoveredNameRows({ issuesPath }) {
         dropped.push({ ref: c.cols[1], quote: c.cols[QUOTE_COL] });
       }
     }
+    // Never empty the file: downstream stages treat an issues file with no rows as
+    // a chapter with nothing to write.
+    if (dropIdx.size && lines.every((l, i) => !l.trim() || dropIdx.has(i))) {
+      return { ran: true, reason: 'would_empty', dropped: [] };
+    }
     if (dropIdx.size) {
       const tmp = `${absPath}.tw-names.tmp`;
       fs.writeFileSync(tmp, lines.filter((_, i) => !dropIdx.has(i)).join('\n'));
