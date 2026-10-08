@@ -21,6 +21,7 @@ const { splitTsv, fixTrailingNewlines } = require('./workspace-tools/tsv-tools')
 const { fillTsvIds, generateIds, prepareNotes, fillOrigQuotes, resolveGlQuotes, flagNarrowQuotes, extractAlignmentData, prepareATContext, substituteAT, fixUnicodeQuotes, verifyBoldMatches, syncCanonicalHebrewQuotes, applyHintsToPreparedNotes, applyKeptToPreparedNotes, keptRefVerseSpan, parsePlainUsfmVersesFromText, detectIssuesTsvLayout, extractIssuesTsvRow, _stripAlternateTranslation: stripAlternateTranslation } = require('./workspace-tools/tn-tools');
 const { checkTnQuality, detectSelfTalk, templateFirstPhrase, resolveTemplateText } = require('./workspace-tools/quality-tools');
 const { buildBookRecurrenceIndex, deriveRecurrenceKeys, buildSeeHowSentence, isSeeHowEligible, isContextDependentSref, dedupeAlsoOccursVerses, assignAlsoOccursVerses, resolveDoor43ReposPath, hebTokens, verseNumber: recurrenceVerseNumber, SEE_HOW_NEVER_FOLD_SREFS, CROSS_BOOK_MAX_BOOKS } = require('./workspace-tools/recurrence-index');
+const { loadCommonPhrases, buildIntroPointerSentence, phraseTextKey } = require('./workspace-tools/common-phrases');
 const { normalizeIssuesFile, buildParallelismIntroHintArgs } = require('./issue-normalizer');
 const { runIssueRulesGate, gatePrBodyForPush, refreshGateSidecarOutputHash, readGateSidecar } = require('./issue-rules-gate');
 const { curlyQuotes } = require('./workspace-tools/usfm-tools');
@@ -374,6 +375,7 @@ function buildRecurrenceIndexFile({ pipeDir, contextPath }) {
     tnBookTsv,
     preparedItems: prepared.items || [],
     alignmentData,
+    extraTextKeys: loadCommonPhrases(book, { baseDir: CSKILLBP_DIR, chapter }).flatMap((e) => e.keys),
   });
 
   const outRel = (ctx.runtime && ctx.runtime.recurrenceIndex) || `${pipeDir || path.posix.dirname(String(contextPath || ''))}/recurrence_index.json`;
@@ -666,8 +668,98 @@ async function runSeeHowDetection({ pipeDir, contextPath, generateIdsFn = genera
   let inexactSkipped = 0;
   let crossBookCount = 0;
 
+  // Partial-chapter runs (ctx.verseStart/verseEnd) must never anchor, inject,
+  // or list anything outside their own verse window.
+  const rangeStart = parseInt(ctx.verseStart, 10) || 0;
+  const rangeEnd = parseInt(ctx.verseEnd, 10) || 0;
+  const inRange = (verse) => {
+    if (!rangeStart && !rangeEnd) return true;
+    const n = recurrenceVerseNumber(verse);
+    if (rangeStart && n < rangeStart) return false;
+    if (rangeEnd && n > rangeEnd) return false;
+    return true;
+  };
+
+  // Common phrases (#453). A phrase on the book's list
+  // (data/book-reference/common_phrases.json) is explained in an intro, so the
+  // chapter gets exactly one note for it -- on its first occurrence, pointing
+  // to that intro -- and every other row for the phrase is dropped, whatever
+  // its SupportReference. The see-how rules below never see these items or keys.
+  const commonEntries = loadCommonPhrases(book, { baseDir: CSKILLBP_DIR, chapter });
+  const commonHandled = new Set();
+  const commonDropped = new Set();
+  const commonKeys = new Set();
+  const commonSlots = [];
+  const commonInjections = [];
+  let commonPointerCount = 0;
+
+  const applyIntroPointer = (item, entry) => {
+    let note = buildIntroPointerSentence({ book, scope: entry.scope, glQuote: item.gl_quote });
+    if (item.at_provided) note += ` Alternate translation: [${item.at_provided}]`;
+    item.programmatic_note = note;
+    item.note_type = (item.at_required && !item.at_provided) ? 'see_how_at' : 'see_how';
+    item.tags = '';
+    // The tA link goes on this note, not in the intro.
+    item.support_reference = entry.sref || item.sref || '';
+    item.common_phrase = entry.id;
+    delete item.also_occurs_verses;
+    item.writer_packet = Object.assign({}, item.writer_packet || {}, { programmatic_note: note });
+    item.prompt = `Return only this note exactly as written:\n${note}`;
+  };
+
+  const verseNumOf = (ref) => recurrenceVerseNumber(verseOf(ref));
+  for (const entry of commonEntries) {
+    const entryKeys = new Set(entry.keys);
+    for (const k of entry.keys) { commonKeys.add(k); commonKeys.add(canonicalKey(k)); }
+    const matches = items.filter((it) => !commonHandled.has(it) && entryKeys.has((keysFor.get(it) || {}).textKey || ''));
+    const aiMatches = matches.filter((it) => !it.fromHint).sort(sortByRef);
+    // The chapter's occurrences regardless of this run's verse window: a shard
+    // or partial run that does not hold the chapter's first occurrence writes
+    // nothing for the phrase.
+    const chapterOccs = entry.keys.flatMap((k) => occurrencesFor(k))
+      .filter((o) => o.source === 'corpus' && o.chapter === chapter)
+      .sort((a, b) => recurrenceVerseNumber(a.verse) - recurrenceVerseNumber(b.verse));
+    const firstVerse = Math.min(
+      ...[chapterOccs[0] && recurrenceVerseNumber(chapterOccs[0].verse), aiMatches[0] && verseNumOf(aiMatches[0].reference)]
+        .filter(Boolean)
+    );
+    if (!Number.isFinite(firstVerse)) continue;
+
+    // Already covered: seed prose from a hint, or an editor-kept note in this
+    // chapter on the phrase.
+    const covered = matches.some((it) => it.fromHint)
+      || (kept || []).some((k) => k.quote && keptRefVerseSpan(k.ref, chapter) && entryKeys.has(phraseTextKey(k.quote)))
+      || (rangeStart && firstVerse < rangeStart);
+
+    let anchor = null;
+    if (!covered) {
+      const atFirst = aiMatches.filter((it) => verseNumOf(it.reference) === firstVerse);
+      anchor = atFirst.find((it) => entry.sref && String(it.sref || '') === entry.sref) || atFirst[0] || null;
+      if (!anchor) {
+        const occ = chapterOccs.find((o) => recurrenceVerseNumber(o.verse) === firstVerse);
+        if (occ && entry.sref && occ.quote_exact !== false) {
+          commonSlots.push(`${occ.ref}|${hebTokens(occ.quote).join('+')}`);
+          commonInjections.push({
+            key: entry.keys[0], target: { sref: entry.sref }, occ, alsoVerses: [], foldItems: [],
+            intro: entry, fallback: aiMatches[0] || null,
+          });
+        } else {
+          // Nothing can be synthesized there (no tA article on the list entry,
+          // or a quote that would not match the source): a pointer on the
+          // earliest flagged verse beats none.
+          anchor = aiMatches[0] || null;
+        }
+      }
+    }
+    for (const it of aiMatches) {
+      commonHandled.add(it);
+      if (it !== anchor) commonDropped.add(it);
+    }
+    if (anchor) { applyIntroPointer(anchor, entry); commonPointerCount++; }
+  }
+
   // Hint-driven items carry their own framing (seed prose); leave them alone.
-  const candidates = items.filter((it) => !it.fromHint && primaryKey(it));
+  const candidates = items.filter((it) => !it.fromHint && primaryKey(it) && !commonHandled.has(it));
 
   // Same-verse duplicates keep the existing "combine" behaviour.
   const sameVerseGroups = new Map();
@@ -707,17 +799,6 @@ async function runSeeHowDetection({ pipeDir, contextPath, generateIdsFn = genera
     byKeyItems.get(key).push(item);
   }
 
-  // Partial-chapter runs (ctx.verseStart/verseEnd) must never anchor, inject,
-  // or list anything outside their own verse window.
-  const rangeStart = parseInt(ctx.verseStart, 10) || 0;
-  const rangeEnd = parseInt(ctx.verseEnd, 10) || 0;
-  const inRange = (verse) => {
-    if (!rangeStart && !rangeEnd) return true;
-    const n = recurrenceVerseNumber(verse);
-    if (rangeStart && n < rangeStart) return false;
-    if (rangeEnd && n > rangeEnd) return false;
-    return true;
-  };
   const chapterCorpusOccs = (key) => occurrencesFor(key)
     .filter((o) => o.source === 'corpus' && o.chapter === chapter && inRange(o.verse))
     .sort((a, b) => recurrenceVerseNumber(a.verse) - recurrenceVerseNumber(b.verse));
@@ -753,6 +834,7 @@ async function runSeeHowDetection({ pipeDir, contextPath, generateIdsFn = genera
       for (const toks of forms) injectedAt.add(`${chapter}:${v}|${toks}`);
     }
   }
+  for (const slot of commonSlots) injectedAt.add(slot);
 
   // Resolve every anchor -- prepared groups and standalone injections alike --
   // before assigning any corpus-derived verses: which key may list which verses
@@ -848,7 +930,7 @@ async function runSeeHowDetection({ pipeDir, contextPath, generateIdsFn = genera
   // groups, so it takes part in the coverage computation below instead of
   // assigning itself a list afterwards.
   for (const key of byCanonical.keys()) {
-    if (chapterKeys.has(key)) continue;
+    if (chapterKeys.has(key) || commonKeys.has(key)) continue;
     const target = earlierNotedTarget(key);
     if (!target) continue;
     if (!isSeeHowEligible(key, target.sref)) continue;
@@ -947,6 +1029,8 @@ async function runSeeHowDetection({ pipeDir, contextPath, generateIdsFn = genera
     });
   }
 
+  injections.push(...commonInjections);
+
   let newIds = [];
   if (injections.length > 0) {
     try {
@@ -967,9 +1051,18 @@ async function runSeeHowDetection({ pipeDir, contextPath, generateIdsFn = genera
   }
 
   for (let i = 0; i < injections.length; i++) {
-    const { key, target, occ, alsoVerses, foldItems } = injections[i];
+    const { key, target, occ, alsoVerses, foldItems, intro, fallback } = injections[i];
     const id = newIds[i] || '';
-    if (!id) continue;
+    if (!id) {
+      // The phrase's other rows are already dropped; without an id for the
+      // synthesized note, keep the earliest flagged row as the pointer instead.
+      if (intro && fallback) {
+        commonDropped.delete(fallback);
+        applyIntroPointer(fallback, intro);
+        commonPointerCount++;
+      }
+      continue;
+    }
     const item = {
       index: items.length,
       reference: occ.ref,
@@ -993,6 +1086,13 @@ async function runSeeHowDetection({ pipeDir, contextPath, generateIdsFn = genera
       hebrew_front_words: [],
       tcm_mode: false,
     };
+    if (intro) {
+      applyIntroPointer(item, intro);
+      items.push(item);
+      injectedCount++;
+      commonPointerCount++;
+      continue;
+    }
     if (!applyPointer(item, key, target)) continue;
     if (target.crossBook) crossBookCount++;
     if (setAlsoOccurs(item, alsoVerses)) alsoOccursCount++;
@@ -1002,8 +1102,8 @@ async function runSeeHowDetection({ pipeDir, contextPath, generateIdsFn = genera
     seeHowCount++;
   }
 
-  if (removed.size > 0) {
-    prepared.items = items.filter((it) => !removed.has(it));
+  if (removed.size > 0 || commonDropped.size > 0) {
+    prepared.items = items.filter((it) => !removed.has(it) && !commonDropped.has(it));
   } else {
     prepared.items = items;
   }
@@ -1011,11 +1111,17 @@ async function runSeeHowDetection({ pipeDir, contextPath, generateIdsFn = genera
 
   // alsoOccursCount matters here: a chapter can gain nothing but an "also
   // occurs" list, and that change still has to reach prepared_notes.json.
-  if (seeHowCount > 0 || combinedCount > 0 || foldedCount > 0 || injectedCount > 0 || alsoOccursCount > 0) {
+  if (seeHowCount > 0 || combinedCount > 0 || foldedCount > 0 || injectedCount > 0 || alsoOccursCount > 0
+    || commonPointerCount > 0 || commonDropped.size > 0) {
     fs.writeFileSync(prepPath, JSON.stringify(prepared, null, 2));
   }
 
-  const summary = `${seeHowCount} see-how back-refs, ${foldedCount} folded, ${injectedCount} injected, ${alsoOccursCount} also-occurs lists, ${inexactSkipped} skipped (inexact quote), ${combinedCount} same-verse combinations, ${crossBookCount} cross-book`;
+  let summary = `${seeHowCount} see-how back-refs, ${foldedCount} folded, ${injectedCount} injected, ${alsoOccursCount} also-occurs lists, ${inexactSkipped} skipped (inexact quote), ${combinedCount} same-verse combinations, ${crossBookCount} cross-book`;
+  // Only when the list applied, so a chapter without listed phrases keeps the
+  // zero summary the caller compares against.
+  if (commonPointerCount > 0 || commonDropped.size > 0) {
+    summary += `, ${commonPointerCount} common-phrase intro pointers (${commonDropped.size} dropped)`;
+  }
   console.log(`[notes] See-how detection: ${summary}`);
   return summary;
 }

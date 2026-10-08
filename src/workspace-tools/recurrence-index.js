@@ -720,6 +720,7 @@ function buildBookRecurrenceIndex({
   tnBookTsv = '',
   preparedItems = [],
   alignmentData = {},
+  extraTextKeys = [],
 } = {}) {
   const bookUpper = String(book || '').toUpperCase();
   const curChapter = parseInt(chapter, 10) || 0;
@@ -845,6 +846,13 @@ function buildBookRecurrenceIndex({
       source: 'prepared',
       id: item.id || '',
     });
+  }
+
+  // Phrases to locate even when no note row or item quotes them yet: the
+  // per-book common-phrase list (common-phrases.js) needs the chapter's first
+  // occurrence of each listed phrase.
+  for (const textKey of extraTextKeys || []) {
+    if (textKey) registerQuery('', String(textKey));
   }
 
   // 3. Corpus occurrences: scan every verse for each query key.
