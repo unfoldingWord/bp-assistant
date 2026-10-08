@@ -30,7 +30,7 @@ const FILLER_WORDS = new Set([
   'priest', 'land', 'city', 'river', 'valley', 'mount', 'mountain', 'sea',
 ]);
 
-// Issue hints saying the person is not the one the tW article describes (ZEC 6:10
+// Issue hints (names only) saying the person is not the one the tW article describes (ZEC 6:10
 // Josiah "different person from King Josiah"; JER 35:3 Jeremiah "this Jeremiah is
 // not the prophet"). A name's meaning is not a keep reason: Benjamin's call
 // 2026-10-08 is that the tW article covers it.
@@ -88,7 +88,7 @@ function dropTwCoveredRows({ issuesPath }) {
       const cols = line.split('\t');
       const rule = ruleFor(cols[SREF_COL]);
       if (!rule) return;
-      if (KEEP_HINT_RE.test(cols[HINT_COL] || '')) return;
+      if (rule === 'names' && KEEP_HINT_RE.test(cols[HINT_COL] || '')) return;
       const words = quoteWords(cols[QUOTE_COL]);
       if (words.length) candidates.push({ i, cols, rule, words });
     });

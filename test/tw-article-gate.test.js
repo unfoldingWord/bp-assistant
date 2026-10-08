@@ -87,7 +87,7 @@ test('keeps a row whose hint says it is a different person', () => {
 
 test('translate-unknown: drops a single word with a tW article of any category', () => {
   const { rel } = setup([
-    row('50:3', 'translate-unknown', 'sackcloth', 'cultural mourning garment'),
+    row('50:3', 'translate-unknown', 'sackcloth', 'not an ordinary garment'),
     row('9:9', 'translate-unknown', 'the Sackcloth', 'cultural mourning garment'),
     row('4:1', 'figs-idiom', 'a hard saying', 'idiom'),
   ]);
