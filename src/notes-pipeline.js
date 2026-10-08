@@ -3338,7 +3338,13 @@ async function notesPipeline(route, message) {
     else if (chOutputs['post-edit-review']) issuesPath = chOutputs['post-edit-review'];
 
     async function reportTwNameDrops(tw) {
+      if (!tw.ran) {
+        await status(`**${ref}**: tW names check skipped (${tw.reason}); translate-names rows left as they were`);
+        return;
+      }
       if (!tw.dropped.length) return;
+      // A chapter the rules gate already sealed must not look edited to its next run.
+      refreshGateSidecarOutputHash({ issuesPath, book });
       const list = tw.dropped.map((d) => `${d.ref} ${d.quote}`).join('; ');
       console.log(`[notes] tw-names-gate ${ref}: dropped ${tw.dropped.length} translate-names row(s) covered by a tW article: ${list}`);
       await status(`**${ref}**: tW names check: dropped ${tw.dropped.length} translate-names row(s) for names with a tW article (${list})`);

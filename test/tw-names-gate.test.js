@@ -53,7 +53,7 @@ test('keeps a row when any name word has no article', () => {
 
 test('only the names category counts: kt headwords do not drop a name row', () => {
   const { rel, text } = setup([
-    row('30:15', 'translate-names', 'Sin', 'city name, not the English word sin'),
+    row('30:15', 'translate-names', 'Sin', 'name of a city'),
     row('1:9', 'translate-names', 'God', 'El - a title/name for God'),
   ]);
   assert.deepEqual(dropTwCoveredNameRows({ issuesPath: rel }).dropped, []);
@@ -92,6 +92,24 @@ test('a missing headwords file leaves the issues file untouched and does not thr
   assert.equal(res.ran, false);
   assert.deepEqual(res.dropped, []);
   assert.equal(fs.readFileSync(path.join(ws, rel), 'utf8'), text);
+});
+
+test('keeps rows whose hint says the person is not the one the article describes', () => {
+  const { rel, text } = setup([
+    row('6:10', 'translate-names', 'Josiah', 'This Josiah was not King Josiah'),
+    row('6:11', 'translate-names', 'Josiah', 'another Josiah, son of Zephaniah'),
+    row('6:12', 'translate-names', 'Josiah', 'homonym of the king'),
+  ]);
+  assert.deepEqual(dropTwCoveredNameRows({ issuesPath: rel }).dropped, []);
+  assert.equal(fs.readFileSync(path.join(ws, rel), 'utf8'), text);
+});
+
+test('a quote with trailing punctuation or wrapping quotes still matches', () => {
+  const { rel } = setup([
+    row('7:1', 'translate-names', 'Ahaz.', 'name of a man'),
+    row('7:2', 'translate-names', '\u201CBabylon\u201D', 'name of a city'),
+  ]);
+  assert.equal(dropTwCoveredNameRows({ issuesPath: rel }).dropped.length, 2);
 });
 
 test('nameWords strips connectors, titles and possessives', () => {

@@ -31,7 +31,7 @@ const FILLER_WORDS = new Set([
 // "could mean my messenger") or the person is not the one the article describes
 // (ZEC 6:10 Josiah "different person from King Josiah"; JER 35:3 Jeremiah "this
 // Jeremiah is not the prophet").
-const KEEP_HINT_RE = /\b(mean|means|meaning|meaningful|symbolic|wordplay|pun|different|not the|variant|also called|alternate|other name)\b/i;
+const KEEP_HINT_RE = /\b(mean|means|meaning|meaningful|symbolic|wordplay|pun|different|not|another|other|rather than|homonym|namesake|distinct|same|variant|also called|alternate)\b/i;
 
 const SREF_COL = 2;
 const QUOTE_COL = 3;
@@ -45,7 +45,7 @@ function nameWords(quote) {
   return String(quote || '')
     .replace(/[{}(),;&]/g, ' ')
     .split(/\s+/)
-    .map((w) => w.replace(/['’]s$/i, '').trim())
+    .map((w) => w.replace(/^["'“”‘’(\[]+|["'“”‘’)\].:!?…-]+$/g, '').replace(/['’]s$/i, '').trim())
     .filter((w) => w && !FILLER_WORDS.has(w.toLowerCase()));
 }
 
@@ -89,7 +89,9 @@ function dropTwCoveredNameRows({ issuesPath }) {
       }
     }
     if (dropIdx.size) {
-      fs.writeFileSync(absPath, lines.filter((_, i) => !dropIdx.has(i)).join('\n'));
+      const tmp = `${absPath}.tw-names.tmp`;
+      fs.writeFileSync(tmp, lines.filter((_, i) => !dropIdx.has(i)).join('\n'));
+      fs.renameSync(tmp, absPath);
     }
     return { ran: true, dropped };
   } catch (err) {
