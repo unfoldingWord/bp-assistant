@@ -23,6 +23,7 @@ const { checkTnQuality, detectSelfTalk, templateFirstPhrase, resolveTemplateText
 const { buildBookRecurrenceIndex, deriveRecurrenceKeys, buildSeeHowSentence, isSeeHowEligible, isContextDependentSref, dedupeAlsoOccursVerses, assignAlsoOccursVerses, resolveDoor43ReposPath, hebTokens, verseNumber: recurrenceVerseNumber, SEE_HOW_NEVER_FOLD_SREFS, CROSS_BOOK_MAX_BOOKS } = require('./workspace-tools/recurrence-index');
 const { normalizeIssuesFile, buildParallelismIntroHintArgs } = require('./issue-normalizer');
 const { runIssueRulesGate, gatePrBodyForPush, refreshGateSidecarOutputHash, readGateSidecar } = require('./issue-rules-gate');
+const { dropTwCoveredNameRows } = require('./tw-names-gate');
 const { curlyQuotes } = require('./workspace-tools/usfm-tools');
 const { verifyRepoPush, verifyDcsToken, verifyRemoteContent } = require('./repo-verify');
 const { recordMetrics, getCumulativeTokens, recordRunSummary, getAdaptiveSkillGuardrails } = require('./usage-tracker');
@@ -3336,6 +3337,13 @@ async function notesPipeline(route, message) {
     if (chOutputs['deep-issue-id']) issuesPath = chOutputs['deep-issue-id'];
     else if (chOutputs['post-edit-review']) issuesPath = chOutputs['post-edit-review'];
 
+    async function reportTwNameDrops(tw) {
+      if (!tw.dropped.length) return;
+      const list = tw.dropped.map((d) => `${d.ref} ${d.quote}`).join('; ');
+      console.log(`[notes] tw-names-gate ${ref}: dropped ${tw.dropped.length} translate-names row(s) covered by a tW article: ${list}`);
+      await status(`**${ref}**: tW names check: dropped ${tw.dropped.length} translate-names row(s) for names with a tW article (${list})`);
+    }
+
     async function runIssueNormalizationStage() {
       if (!issuesPath || issueNormalizationDone) return;
 
@@ -3391,6 +3399,10 @@ async function notesPipeline(route, message) {
       });
       issueNormalizationDone = true;
       let introSignal = result.introSignal;
+
+      // tW names check: translate-names rows for names that already have a tW
+      // article are dropped here, before the rules gate spends a model pass on them.
+      await reportTwNameDrops(dropTwCoveredNameRows({ issuesPath }));
 
       // Issue rules gate: once per chapter, after normalization. Skipped when
       // this chapter resumes at a downstream skill (the gate already ran, or
@@ -3460,6 +3472,8 @@ async function notesPipeline(route, message) {
           }
         }
         if (gate.changed) {
+          // A relabel can produce a translate-names row; re-apply the tW names check.
+          await reportTwNameDrops(dropTwCoveredNameRows({ issuesPath }));
           const pass2 = normalizeIssuesFile({
             issuesPath,
             options: {
