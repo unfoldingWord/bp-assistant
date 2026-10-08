@@ -117,6 +117,7 @@ test('a quote with trailing punctuation or wrapping quotes still matches', () =>
   const { rel } = setup([
     row('7:1', 'translate-names', 'Ahaz.', 'name of a man'),
     row('7:2', 'translate-names', '\u201CBabylon\u201D', 'name of a city'),
+    row('4:1', 'figs-idiom', 'a hard saying', 'idiom'),
   ]);
   assert.equal(dropTwCoveredNameRows({ issuesPath: rel }).dropped.length, 2);
 });
