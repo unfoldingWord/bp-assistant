@@ -1335,11 +1335,15 @@ function generatedNotesJsonHasEntries(relPath) {
   }
 }
 
+// Reset (not delete) the generated-notes JSON: tools such as update_note_text
+// and assemble_notes read it with a bare readFileSync, so it has to exist and be
+// valid JSON. "{}" is also what mechanical prep writes, and AT generation treats
+// it as "nothing was produced by per-note generation".
 function discardGeneratedNotes(pipeDir) {
   try {
     const ctx = readContext(pipeDir);
-    fs.unlinkSync(path.resolve(CSKILLBP_DIR, ctx.runtime.generatedNotes));
-  } catch (_) { /* already absent */ }
+    fs.writeFileSync(path.resolve(CSKILLBP_DIR, ctx.runtime.generatedNotes), '{}');
+  } catch (_) { /* no context or path: nothing to reset */ }
 }
 
 async function runATGeneration({ notesPath, pipeDir, status }) {
@@ -2477,7 +2481,9 @@ function stripIntroRows(absPath, chapter, book) {
   return { removed, before: text };
 }
 
-const POINTER_NOTE_RE = /^\s*See how\b/i;
+// Programmatic pointers: 'See how you translated ...' and the common-phrase
+// intro pointer 'See the discussion of ... in ...' (common-phrases.js).
+const POINTER_NOTE_RE = /^\s*See (?:how|the discussion of)\b/i;
 
 /**
  * How many prepared items in scope need an LLM-written note (no programmatic
@@ -4057,11 +4063,13 @@ async function notesPipeline(route, message) {
             // reassembles the TSV from prepared items + that JSON, which would
             // overwrite the Claude-written TSV with AT-only cells.
             discardGeneratedNotes(pipeDir);
-            atGenerationDone = true;
           }
         } catch (err) {
           console.error(`[notes] Per-note generation failed, falling back to Claude sessions: ${err.message}`);
           usedPerNote = false; // Fall through to existing paths
+          // A throw after generated_notes.json was written leaves the same stale
+          // file the !success branch resets.
+          discardGeneratedNotes(pipeDir);
         }
       }
 

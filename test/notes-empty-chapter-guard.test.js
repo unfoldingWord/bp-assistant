@@ -195,7 +195,7 @@ test('countExpectedWrittenNotes counts only LLM-needed items, within the verse r
   }
 }));
 
-test('AT generation leaves the written TSV alone when the generated notes JSON is gone (F1)', withTempDir('at-stale-', async (tempDir) => {
+test('AT generation leaves the written TSV alone when the generated notes JSON was reset (F1)', withTempDir('at-stale-', async (tempDir) => {
   const pipeDir = writePipeDir(tempDir, makeItems({ pointers: 1, written: 2 }));
   const rel = 'output/notes/JER/JER-32.tsv';
   fs.mkdirSync(path.join(tempDir, 'output/notes/JER'), { recursive: true });
@@ -207,7 +207,7 @@ test('AT generation leaves the written TSV alone when the generated notes JSON i
   const { mod, restore } = loadPipeline(tempDir);
   try {
     mod._discardGeneratedNotes(pipeDir);
-    assert.equal(fs.existsSync(path.join(tempDir, genRel)), false);
+    assert.equal(fs.readFileSync(path.join(tempDir, genRel), 'utf8'), '{}');
     const summary = await mod._runATGeneration({ notesPath: rel, pipeDir, status: async () => {} });
     assert.match(summary, /0 ATs needed/);
     assert.equal(fs.readFileSync(path.join(tempDir, rel), 'utf8'), claudeTsv);
@@ -229,3 +229,20 @@ test('push pre-flight restores a missing source from .bak before the content gua
   assert.ok(restoreAt < guardAt, 'restore from .bak must come before the content guard');
   assert.match(src.slice(restoreAt, guardAt), /copyFileSync\(srcAbs \+ '\.bak', srcAbs\)/);
 });
+
+test('push guard treats a common-phrase intro pointer as a pointer, not a written note', withTempDir('push-guard-intro-pointer-', async (tempDir) => {
+  const rel = 'output/notes/JER/JER-32.tsv';
+  fs.mkdirSync(path.join(tempDir, 'output/notes/JER'), { recursive: true });
+  fs.writeFileSync(path.join(tempDir, rel), [
+    HEADER,
+    '32:1\tcd34\t\t\tהַדָּבָר\t1\tSee the discussion of **word** in the Introduction to this chapter.',
+  ].join('\n') + '\n');
+  const { mod, restore } = loadPipeline(tempDir);
+  try {
+    const coverage = mod._assessWrittenNoteCoverage(rel, { chapter: 32, verseCount: 1 });
+    assert.equal(coverage.writtenRows, 0);
+    assert.equal(coverage.pointerRows, 1);
+  } finally {
+    restore();
+  }
+}));
