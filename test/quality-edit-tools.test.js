@@ -208,3 +208,14 @@ test('findVersesWithoutNotes ignores a book-code prefix on TSV references (dry-r
   fs.writeFileSync(path.join(WORK, tsv), HDR + 'JER 36:9\t\t\t\t\t1\t[Stub note for dry run]\n');
   assert.deepEqual(findVersesWithoutNotes({ preparedJson: prep, notesPath: tsv }), []);
 });
+
+// #466 item 3: a stale TSV with no row for the id used to count as a coverage
+// check, so removing a generated note with no prepared entry gave no warning.
+test('removeNote warns that coverage was unchecked when the TSV has no row for the id', () => {
+  const gen = writeJson('stale-tsv/generated_notes.json', { zz9z: 'only note of 7:2' });
+  const tsv = 'stale-tsv/GEN-07.tsv';
+  fs.writeFileSync(path.join(WORK, tsv), HDR + '7:1\tab1c\t\t\tQ\t1\ta\n');
+  const out = removeNote({ id: 'zz9z', generatedJson: gen, tsvFile: tsv });
+  assert.match(out, /removed id "zz9z"/);
+  assert.match(out, /WARNING: verse coverage was not checked/);
+});

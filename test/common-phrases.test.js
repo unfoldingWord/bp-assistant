@@ -281,6 +281,25 @@ test('a partial run that ends before the chapter\'s first occurrence injects not
   assert.equal(readPrepared(flagged).items.filter(isNeum).length, 0);
 });
 
+// #466 item 4: without the recurrence index the first occurrence came from this
+// window's own rows only, so a shard after the real first occurrence (3:2)
+// wrote a second intro pointer for the chapter.
+test('a partial run without the recurrence index leaves the phrase to the normal rules (no intro pointer)', async () => {
+  const dirPath = setupPipeDir({
+    verseStart: 4,
+    verseEnd: 8,
+    items: [
+      neumItem({ reference: '3:5', id: 'bbbb', index: 0 }),
+      neumItem({ reference: '3:7', id: 'cccc', index: 1 }),
+    ],
+  });
+  await runSeeHowDetection({ pipeDir: dirPath, generateIdsFn: stubIds }); // index never built
+  const neum = readPrepared(dirPath).items.filter(isNeum);
+  assert.ok(neum.some((it) => it.id === 'bbbb'), 'the window\'s first row is kept');
+  assert.ok(neum.every((it) => !it.common_phrase && !/intro/i.test(String(it.programmatic_note || ''))),
+    'no intro pointer in a shard that cannot see the chapter');
+});
+
 test('an editor-kept note on the phrase in this chapter covers it: AI rows dropped, nothing injected', async () => {
   const dirPath = setupPipeDir({
     items: [neumItem({ reference: '3:2', id: 'aaaa' }), neumItem({ reference: '3:5', id: 'bbbb', index: 1 })],

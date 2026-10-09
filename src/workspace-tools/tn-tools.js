@@ -1801,9 +1801,12 @@ function removeNote({ id, generatedJson, tsvFile, preparedJson }) {
     tp = path.resolve(CSKILLBP_DIR, tsvFile);
     lines = fs.readFileSync(tp, 'utf8').split('\n');
     const rows = lines.slice(1).filter((l) => l.trim() !== '').map((l) => l.split('\t'));
-    verified = true;
     for (const cols of rows) {
-      if (cols[1] !== id || !isVerseNoteRef(cols[0])) continue;
+      if (cols[1] !== id) continue;
+      // Only a row for this id tells us its verse; a stale TSV without one
+      // checks nothing, so it must not suppress the unverified warning (#466).
+      verified = true;
+      if (!isVerseNoteRef(cols[0])) continue;
       const others = rows.filter((c) => c[1] !== id && isVerseNoteRef(c[0])).map((c) => c[0]);
       const empty = versesLeftEmpty(cols[0], others);
       if (empty.length) return lastRowRefusal(id, cols[0].trim(), tsvFile, empty);
@@ -1835,7 +1838,7 @@ function removeNote({ id, generatedJson, tsvFile, preparedJson }) {
     msgs.push(`removed ${removed} row(s) with id "${id}" from ${tsvFile}`);
   }
   const unverified = (verified || !removedFromGen) ? '' :
-    ' WARNING: verse coverage was not checked (no prepared_notes.json entry for this id and no tsvFile given); confirm the verse still has a note.';
+    ' WARNING: verse coverage was not checked (no prepared_notes.json entry for this id and no tsvFile row for it); confirm the verse still has a note.';
   return `remove_note: ${msgs.join('; ')}.${unverified}`;
 }
 

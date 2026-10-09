@@ -479,10 +479,11 @@ async function runSeeHowDetection({ pipeDir, contextPath, generateIdsFn = genera
   } catch { alignmentData = {}; }
 
   let index = { byKey: {} };
+  let indexLoaded = false;
   const indexRel = (ctx.runtime && ctx.runtime.recurrenceIndex) || `${pipeDir || path.posix.dirname(String(contextPath || ''))}/recurrence_index.json`;
   try {
     const parsed = JSON.parse(fs.readFileSync(path.resolve(CSKILLBP_DIR, indexRel), 'utf8'));
-    if (parsed && parsed.byKey) index = parsed;
+    if (parsed && parsed.byKey) { index = parsed; indexLoaded = true; }
   } catch { /* same-chapter behaviour still works without the index */ }
 
   // Rule 3's corpus index is optional: without it (not built, or the published
@@ -759,7 +760,14 @@ async function runSeeHowDetection({ pipeDir, contextPath, generateIdsFn = genera
   };
 
   const verseNumOf = (ref) => recurrenceVerseNumber(verseOf(ref));
-  for (const entry of commonEntries) {
+  // Without the index a partial run cannot tell whether the chapter's first
+  // occurrence lies outside its window, so it could write a second pointer in
+  // the wrong shard. Leave the phrase to the normal rules instead (#466).
+  const commonPhrasesUsable = indexLoaded || (!rangeStart && !rangeEnd);
+  if (!commonPhrasesUsable && commonEntries.length) {
+    console.warn('[notes] recurrence index unavailable on a partial run; common-phrase intro pointers skipped');
+  }
+  for (const entry of (commonPhrasesUsable ? commonEntries : [])) {
     const entryKeys = new Set(entry.keys);
     for (const k of entry.keys) { commonKeys.add(k); commonKeys.add(canonicalKey(k)); }
     const matches = items.filter((it) => !commonHandled.has(it) && entryKeys.has((keysFor.get(it) || {}).textKey || ''));
