@@ -128,6 +128,7 @@ async function runHarness({ items, introRows = [], verseRange = { start: 9, end:
     gatePrBodyForPush: () => '',
     refreshGateSidecarOutputHash: () => {},
     readGateSidecar: () => (gateKeptDropped ? { keptDropped: gateKeptDropped } : null),
+    keptDropsStillCovered: require('../src/issue-rules-gate').keptDropsStillCovered,
   });
   stub('workspace-tools/tn-tools', {
     ...realTnTools,
