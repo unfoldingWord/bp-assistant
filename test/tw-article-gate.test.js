@@ -150,3 +150,22 @@ test('a quote with trailing punctuation or wrapping quotes still matches', () =>
 test('quoteWords strips connectors, titles and possessives', () => {
   assert.deepEqual(quoteWords('the {land of} Babylon’s king Nebuchadnezzar, son of Josiah'), ['Babylon', 'Nebuchadnezzar', 'Josiah']);
 });
+
+test('isTwCoveredName: true only when every name word has a tW names article', () => {
+  setup([row('1:1', 'figs-idiom', 'x')]);
+  const { isTwCoveredName } = require('../src/tw-article-gate');
+  assert.equal(isTwCoveredName('Ahaz'), true);
+  assert.equal(isTwCoveredName('Nebuchadnezzar, Babylon'), true);
+  assert.equal(isTwCoveredName('Ahaz, Rezin'), false);
+  assert.equal(isTwCoveredName('sin'), false);
+  assert.equal(isTwCoveredName(''), false);
+});
+
+test('hasKeepHint: the hint wording dropTwCoveredRows keeps a translate-names row for', () => {
+  const { hasKeepHint } = require('../src/tw-article-gate');
+  assert.equal(hasKeepHint('a different person from King Josiah'), true);
+  assert.equal(hasKeepHint('this Jeremiah is not the prophet'), true);
+  assert.equal(hasKeepHint('name of a man'), false);
+  assert.equal(hasKeepHint(''), false);
+  assert.equal(hasKeepHint(undefined), false);
+});
