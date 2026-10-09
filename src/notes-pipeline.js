@@ -2713,6 +2713,27 @@ function buildParsedNotesRequest(route, content) {
   return parseWriteNotesCommand(content);
 }
 
+/**
+ * Count rules-gate kept-note drops (sidecar `keptDropped` entries) that belong to
+ * this chapter's run: the entry's ref has a verse inside the chapter (and inside the
+ * verse range, when the run has one), and its kept note is still in this run's list.
+ * The sidecar is per issues file, but may hold drops from an earlier run with a
+ * different range, so the count is filtered here.
+ */
+function scopedGateKeptCount({ drops, kept, chapter, verseStart, verseEnd }) {
+  if (!Array.isArray(drops) || !Array.isArray(kept) || kept.length === 0) return 0;
+  const keptIds = new Set(kept.map((k) => k && k.rowId).filter(Boolean));
+  let n = 0;
+  for (const d of drops) {
+    if (!d || !keptIds.has(d.kept)) continue;
+    const span = keptRefVerseSpan(d.ref, chapter);
+    if (!span) continue;
+    if (verseStart != null && verseEnd != null && (span.hi < verseStart || span.lo > verseEnd)) continue;
+    n++;
+  }
+  return n;
+}
+
 function buildAtGenerationCheckpoint({
   totalSuccess,
   totalFail,
@@ -3264,6 +3285,10 @@ async function notesPipeline(route, message) {
   const tokensBefore = getCumulativeTokens();
   let totalSuccess = Number(existingCheckpoint?.totalSuccess || 0);
   let totalFail = Number(existingCheckpoint?.totalFail || 0);
+  // Chapters that succeeded as a no-op: the editor's kept notes cover everything the
+  // run would write, so nothing was pushed. Saved in the checkpoint like totalSuccess,
+  // so a resumed run's final reply still describes the whole run.
+  let allKeptChapters = Math.min(Number(existingCheckpoint?.allKeptChapters || 0), totalSuccess);
 
   // Conflict-deferred push state: when a user branch modifies the same file,
   // we continue generating but defer all pushes until the user says "merged".
@@ -3309,6 +3334,7 @@ async function notesPipeline(route, message) {
     state: 'running',
     totalSuccess,
     totalFail,
+    allKeptChapters,
     skillOutputs,
     kept: Array.isArray(kept) ? kept : null,
     resume: { chapter: resumeChapter, skill: resumeSkill, ...(resumeGatePending && resumingFromCheckpoint ? { gatePending: true } : {}) },
@@ -3788,6 +3814,11 @@ async function notesPipeline(route, message) {
     // Quality mechanical prep flag — set true once runMechanicalQualityPrep() completes.
     let qualityPrepDone = false;
     let atGenerationDone = false;
+    // Set when the kept drops (tn-writer's and the rules gate's) leave no prepared
+    // items and no intro: every AI note duplicates an editor-kept note. The editor's
+    // kept notes win: the chapter ends as a no-op with no push, so any older
+    // non-kept AI rows already in en_tn are left as they are.
+    let allNotesKept = false;
 
     for (let si = startSkillIndex; si < skills.length; si++) {
       const skill = skills[si];
@@ -3870,17 +3901,27 @@ async function notesPipeline(route, message) {
           const keptHere = (kept || []).filter((k) => keptRefVerseSpan(k.ref, ch)).length;
           if (keptHere > 0) {
             try {
-              const dropped = applyKeptToPreparedNotes({
+              const keptResult = applyKeptToPreparedNotes({
                 preparedJson: readContext(pipeDir).runtime.preparedNotes,
                 kept,
                 chapter: ch,
-              }).itemsRemoved;
+              });
+              const dropped = keptResult.itemsRemoved;
               // The gate's KEPT drops (this run's and earlier runs' still gone) happened
               // earlier, on the issue list. When the gate did not run here (resume,
               // already_applied, off), read the count from its sealed sidecar.
               const gateKept = issueRulesGateResult && issueRulesGateResult.ran
                 ? (issueRulesGateResult.keptDropsTotal || 0)
                 : keptDropsStillCovered(readGateSidecar({ issuesPath, book })?.keptDropped, kept, ch).length;
+              // Gate drops that count here: sidecar entries for a kept note still in this
+              // run's list, on a verse inside this chapter's run range. A gate drop for
+              // another chapter or range, or for a kept note the editor removed, does not.
+              const gateKeptHere = scopedGateKeptCount({
+                drops: readGateSidecar({ issuesPath, book })?.keptDropped,
+                kept, chapter: ch, verseStart: hasVerseRange ? verseStart : null, verseEnd: hasVerseRange ? verseEnd : null,
+              });
+              // A new chapter intro (intro_rows) still has to be written and pushed.
+              allNotesKept = (dropped + gateKeptHere) > 0 && keptResult.itemsRemaining === 0 && keptResult.introRows === 0;
               await status(
                 `**${ref}**: ${keptHere} kept notes from the editor will stay in place; ` +
                 `${dropped + gateKept} AI notes dropped as duplicates of kept notes ` +
@@ -3919,6 +3960,13 @@ async function notesPipeline(route, message) {
           await status(`**${ref}**: Mechanical prep failed — ${err.message}. Claude will run prep via MCP tools.`);
           // Non-fatal: tn-writer skill can still do prep via MCP tools (old path)
         }
+      }
+
+      // Nothing new to write: skip tn-writer, AT generation and the quality
+      // check. The chapter is counted as a success below, without a push.
+      if (allNotesKept) {
+        await status(`**${ref}**: the editor's kept notes cover every note this run would write. They were left as is and nothing was pushed for this chapter; older AI rows already in en_tn were not touched.`);
+        break;
       }
 
       // --- AT generation: run between tn-writer and tn-quality-check ---
@@ -4619,6 +4667,27 @@ async function notesPipeline(route, message) {
       continue;
     }
 
+    // Every AI note duplicated an editor-kept note. The editor's kept notes win, so
+    // nothing is pushed (an empty source would fail insertTnRows, and a whole-chapter
+    // replace would delete older AI rows, which the editor's kept notes overrule here).
+    if (allNotesKept) {
+      totalSuccess++;
+      allKeptChapters++;
+      setCheckpoint(checkpointRef, {
+        state: 'running',
+        totalSuccess,
+        totalFail,
+        allKeptChapters,
+        skillOutputs,
+        current: { chapter: ch, status: 'chapter_succeeded' },
+        resume: null,
+      });
+      if (chapterCount > 1) {
+        await reply(`**${ref}**: the editor's kept notes were left as is; nothing was pushed (${chapterDuration}s)`);
+      }
+      continue;
+    }
+
     // --- Repo insert + verify inline so editor gets access immediately ---
     // Skip if resuming past this point on a future chapter
     const skipDoor43 = (ch === resumeChapter && resumeSkill === 'door43-push-done');
@@ -5035,7 +5104,11 @@ async function notesPipeline(route, message) {
 
     const tnPushLine = noPush
       ? 'Door43 push skipped via --no-push.'
-      : 'Content pushed to master on en_tn';
+      : (allKeptChapters > 0 && allKeptChapters >= totalSuccess
+        ? 'Nothing was pushed: the editor\'s kept notes were left as is.'
+        : 'Content pushed to master on en_tn' + (allKeptChapters > 0
+          ? ` (${allKeptChapters} chapter(s) had nothing pushed: the editor's kept notes were left as is)`
+          : ''));
     if (chapterCount === 1) {
       await reply(
         `Notes pipeline complete for **${rangeLabel}** (${totalDuration}s).\n` +
