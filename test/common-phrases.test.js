@@ -265,6 +265,22 @@ test('a partial run that does not hold the chapter\'s first occurrence writes no
   assert.equal(readPrepared(dirPath).items.filter(isNeum).length, 0);
 });
 
+test('a partial run that ends before the chapter\'s first occurrence injects nothing outside its window', async () => {
+  // The chapter's first occurrence is 3:2; the run covers verse 1 only.
+  const dirPath = setupPipeDir({ verseStart: 1, verseEnd: 1, items: [] });
+  await run(dirPath);
+  assert.equal(readPrepared(dirPath).items.filter(isNeum).length, 0);
+
+  // Flagged rows past the window are not turned into a pointer either.
+  const flagged = setupPipeDir({
+    verseStart: 1,
+    verseEnd: 1,
+    items: [neumItem({ reference: '3:5', id: 'bbbb' })],
+  });
+  await run(flagged);
+  assert.equal(readPrepared(flagged).items.filter(isNeum).length, 0);
+});
+
 test('an editor-kept note on the phrase in this chapter covers it: AI rows dropped, nothing injected', async () => {
   const dirPath = setupPipeDir({
     items: [neumItem({ reference: '3:2', id: 'aaaa' }), neumItem({ reference: '3:5', id: 'bbbb', index: 1 })],

@@ -726,11 +726,13 @@ async function runSeeHowDetection({ pipeDir, contextPath, generateIdsFn = genera
     );
     if (!Number.isFinite(firstVerse)) continue;
 
-    // Already covered: seed prose from a hint, or an editor-kept note in this
-    // chapter on the phrase.
+    // Already covered: seed prose from a hint, an editor-kept note in this
+    // chapter on the phrase, or a first occurrence outside this run's window
+    // (before it: an earlier run owns it; after it: nothing may land out of range).
     const covered = matches.some((it) => it.fromHint)
       || (kept || []).some((k) => k.quote && keptRefVerseSpan(k.ref, chapter) && entryKeys.has(phraseTextKey(k.quote)))
-      || (rangeStart && firstVerse < rangeStart);
+      || (rangeStart && firstVerse < rangeStart)
+      || (rangeEnd && firstVerse > rangeEnd);
 
     let anchor = null;
     if (!covered) {
