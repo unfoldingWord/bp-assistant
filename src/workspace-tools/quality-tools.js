@@ -588,8 +588,9 @@ function resolveTemplateText(prepItem, sref) {
   if (direct) return direct;
   const slug = sref ? (String(sref).match(/translate\/([^\s;,]+)/) || [])[1] : '';
   if (!slug) return '';
-  const tpls = loadTemplateMap().get(slug);
-  return tpls && tpls.length === 1 ? tpls[0].template : '';
+  // hint_only built-ins (parallelism-repeat) are never the issue's default template.
+  const tpls = (loadTemplateMap().get(slug) || []).filter((t) => !t.hint_only);
+  return tpls.length === 1 ? tpls[0].template : '';
 }
 
 function detectSelfTalk(noteText) {
@@ -1277,7 +1278,8 @@ async function checkTnQuality({ tsvPath, preparedJson, ultUsfm, ustUsfm, book, h
       let templateText = prepItem?.template_text || '';
       if (!templateText) {
         const srefSlug25 = n.sref ? (n.sref.match(/translate\/([^\s;,]+)/) || [])[1] : '';
-        const tpls25 = srefSlug25 ? _templateMap.get(srefSlug25) : null;
+        // hint_only built-ins (parallelism-repeat) are never the default template.
+        const tpls25 = srefSlug25 ? (_templateMap.get(srefSlug25) || []).filter((t) => !t.hint_only) : null;
         if (tpls25 && tpls25.length === 1) templateText = tpls25[0].template;
       }
       if (templateText) {
@@ -1299,6 +1301,12 @@ async function checkTnQuality({ tsvPath, preparedJson, ultUsfm, ustUsfm, book, h
           }
         }
       }
+    }
+
+    // 25a. The writer's skip token must never reach a published note.
+    if (/(?<![A-Za-z0-9])SKIP[_-]NOTE(?![A-Za-z0-9])/i.test(n.note)) {
+      addFinding(n.row, n.ref, n.id, 'error', 'skip_marker_leak',
+        'Note contains the writer skip marker SKIP_NOTE; a skipped note must be removed, not published');
     }
 
     // 25b. Contamination phrase detection

@@ -30,9 +30,12 @@ function normalizeIssueType(raw) {
 }
 
 function tokenize(text) {
+  // Unicode-aware so Hebrew/Greek quotes don't collapse to an empty token set
+  // (two empty sets score 1.0 and would be dropped as near-duplicates).
   return String(text || '')
+    .normalize('NFC')
     .toLowerCase()
-    .replace(/[^a-z0-9\s-]/g, ' ')
+    .replace(/[^\p{L}\p{M}\p{N}\s-]/gu, ' ')
     .split(/\s+/)
     .filter(Boolean);
 }
@@ -40,7 +43,8 @@ function tokenize(text) {
 function jaccardSimilarity(aText, bText) {
   const a = new Set(tokenize(aText));
   const b = new Set(tokenize(bText));
-  if (!a.size && !b.size) return 1;
+  // No tokens on either side means there is nothing to compare (for example a
+  // quote made only of punctuation): never report that as a duplicate.
   if (!a.size || !b.size) return 0;
   let inter = 0;
   for (const w of a) if (b.has(w)) inter++;
@@ -48,19 +52,55 @@ function jaccardSimilarity(aText, bText) {
 }
 
 function hasFirstInstanceTag(explanation) {
-  const txt = String(explanation || '');
-  return /\bt:\s*first\s+instance\b/i.test(txt) || /\bfirst\s+instance\b/i.test(txt);
+  // Only the `t: first instance` directive is a tag. A bare "first instance" in
+  // the prose of an explanation is just words and must not be read or stripped.
+  return /\bt:\s*first\s+instance\b/i.test(String(explanation || ''));
 }
 
 function stripFirstInstanceTag(explanation) {
   let txt = String(explanation || '');
   txt = txt
     .replace(/\b(?:;\s*)?t:\s*first\s+instance\b(?:\s*[-–—:]\s*)?/ig, ' ')
-    .replace(/\b(?:;\s*)?first\s+instance\b(?:\s*[-–—:]\s*)?/ig, ' ')
     .replace(/\s{2,}/g, ' ')
     .replace(/\s+([,.;:!?])/g, '$1')
     .trim();
   return txt;
+}
+
+// Template hint (templates.csv `type`) for the simple note used at repeated
+// synonymous parallelisms after the chapter's first instance. tn-tools reads
+// `t:` hints and ships a built-in fallback for this type.
+const PARALLELISM_REPEAT_HINT = 'parallelism-repeat';
+
+function markParallelismRepeat(explanation) {
+  // Drop any existing template hint (a `t:` value runs to the next i:/t: directive
+  // or end of text) so the repeat hint is the only one tn-tools sees.
+  // [heb:...] is a Hebrew hint for fillOrigQuotes, not a directive: lift it out
+  // so the t: strip cannot swallow it, then put it back before the repeat hint.
+  const hebHints = [];
+  const stripped = String(explanation || '')
+    .replace(/\s*\[heb:[^\]]*\]/g, (m) => { hebHints.push(m.trim()); return ' '; })
+    .replace(/(^|\s)t:[\s\S]*?(?=\s+[it]:|$)/g, ' ')
+    // The q:/reason: unique-parallelism markers only mean something on the
+    // exception path; on a repeat row they are leftover text, not writer input.
+    .replace(/(^|\s)q:\s*[a-z-]+/ig, ' ')
+    .replace(/(^|\s)reason:\s*[a-z-]+/ig, ' ')
+    .replace(/\s{2,}/g, ' ')
+    .trim();
+  return [stripped, ...hebHints, `t: ${PARALLELISM_REPEAT_HINT}`].filter(Boolean).join(' ');
+}
+
+const PARALLELISM_REPEAT_MARKER_RE = /(^|\s)t:\s*parallelism-repeat\b/i;
+
+function hasParallelismRepeatMarker(explanation) {
+  return PARALLELISM_REPEAT_MARKER_RE.test(String(explanation || ''));
+}
+
+function clearParallelismRepeat(explanation) {
+  return String(explanation || '')
+    .replace(new RegExp(PARALLELISM_REPEAT_MARKER_RE.source, 'ig'), ' ')
+    .replace(/\s{2,}/g, ' ')
+    .trim();
 }
 
 function extractUniqueReason(explanation, reasonCodes) {
@@ -70,11 +110,21 @@ function extractUniqueReason(explanation, reasonCodes) {
   return reasonCodes.has(code) ? code : null;
 }
 
+function parallelismSimilarity(a, b) {
+  if (String(a.quote || '').trim() && String(b.quote || '').trim()) {
+    return jaccardSimilarity(a.quote, b.quote);
+  }
+  return jaccardSimilarity(`${a.quote} ${a.explanation}`, `${b.quote} ${b.explanation}`);
+}
+
 function classifyParallelism(explanation) {
   const text = String(explanation || '').toLowerCase();
   if (/\bsynthetic\s+parallelism\b/.test(text)) return 'synthetic';
   if (/\bantithetical\s+parallelism\b/.test(text)) return 'antithetical';
-  return 'synonymous_or_unspecified';
+  // The skills tell the identifier to label the type. A row that says nothing
+  // about its type is still kept (as before); it just is not known to be synonymous.
+  if (/\bsynonymous\b/.test(text)) return 'synonymous';
+  return 'unspecified';
 }
 
 function buildIntroSignal(rawSynonymousCount, threshold) {
@@ -126,7 +176,50 @@ function normalizeExplanationStem(explanation) {
       .replace(/\bq:\s*[a-z-]+/ig, ' ')
       .replace(/\breason:\s*[a-z-]+/ig, ' ')
       .replace(/\bt:\s*first\s+instance\b/ig, ' ')
+      .replace(/\bt:\s*parallelism-repeat\b/ig, ' ')
   );
+}
+
+// Re-derive first instance vs repeat from the rows that are actually left.
+// A pass can start from a file an earlier pass (or the rules gate) changed: the
+// old first parallelism row may be gone, leaving the next row marked as a repeat
+// with no first-instance row in the chapter, or the first-instance tag may sit on
+// a later row. The first parallelism row left is always the first instance: it
+// never keeps the repeat marker, and when the chapter had a first-instance tag
+// (or a demoted first row) it carries `t: first instance` itself, with any
+// other first-instance tag removed from later rows (one per chapter). A first
+// row that already asks for another template (`t: combine`) keeps it, since two
+// t: hints on one row make the template choice ambiguous; then the existing tag
+// stays where it is. Idempotent.
+function finalizeFirstInstance(outLines, sawFirstInstanceTag, summary) {
+  const idx = [];
+  for (let i = 0; i < outLines.length; i++) {
+    const cols = parseTsvLine(outLines[i]);
+    if (cols[0].toLowerCase() === 'book' && String(cols[1] || '').toLowerCase() === 'reference') continue;
+    if (normalizeIssueType(cols[2]) === 'figs-parallelism') idx.push(i);
+  }
+  if (!idx.length) return;
+  const firstCols = parseTsvLine(outLines[idx[0]]);
+  const wasRepeat = hasParallelismRepeatMarker(firstCols[6]);
+  if (wasRepeat) firstCols[6] = clearParallelismRepeat(firstCols[6]);
+  const laterWithTag = idx.slice(1).filter((i) => hasFirstInstanceTag(parseTsvLine(outLines[i])[6]));
+  let changed = wasRepeat;
+  if (!hasFirstInstanceTag(firstCols[6])
+      && (wasRepeat || sawFirstInstanceTag || laterWithTag.length)
+      && !/(^|\s)t:\s*\S/i.test(firstCols[6])) {
+    firstCols[6] = [firstCols[6], 't: first instance'].filter(Boolean).join(' ');
+    summary.first_instance_restored++;
+    changed = true;
+  }
+  if (hasFirstInstanceTag(firstCols[6])) {
+    for (const i of laterWithTag) {
+      const cols = parseTsvLine(outLines[i]);
+      cols[6] = stripFirstInstanceTag(cols[6]);
+      outLines[i] = toTsvLine(cols);
+      summary.first_instance_tags_removed++;
+    }
+  }
+  if (changed) outLines[idx[0]] = toTsvLine(firstCols);
 }
 
 function normalizeIssueRows(lines, options = {}) {
@@ -144,12 +237,12 @@ function normalizeIssueRows(lines, options = {}) {
     raw_synonymous_parallelism_rows: 0,
     kept_parallelism_rows: 0,
     kept_parallelism_exceptions: 0,
+    kept_parallelism_repeats: 0,
+    kept_parallelism_repeats_unspecified_type: 0,
+    first_instance_restored: 0,
     dropped_parallelism_rows: 0,
     dropped_nonsynonymous_parallelism_rows: 0,
-    dropped_unqualified_parallelism_rows: 0,
     dropped_duplicate_parallelism_rows: 0,
-    dropped_exception_cap_parallelism_rows: 0,
-    dropped_invalid_reason_parallelism_rows: 0,
     first_instance_tags_removed: 0,
     dropped_braced_ellipsis_rows: 0,
     dropped_parallelism_overlap_doublets: 0,
@@ -161,6 +254,9 @@ function normalizeIssueRows(lines, options = {}) {
   const keptParallelismRows = [];
   let keptExceptionCount = 0;
   let firstInstanceAssigned = false;
+  // True once any kept row carried a first-instance tag, so the finalize step
+  // below knows the chapter is meant to have one.
+  let sawFirstInstanceTag = false;
 
   for (const line of lines) {
     if (!line.trim()) continue;
@@ -182,7 +278,7 @@ function normalizeIssueRows(lines, options = {}) {
     const explanation = cols[6] || '';
     const quote = cols[3] || '';
     const classification = classifyParallelism(explanation);
-    if (classification === 'synonymous_or_unspecified') {
+    if (classification === 'synonymous' || classification === 'unspecified') {
       summary.raw_synonymous_parallelism_rows++;
     }
 
@@ -191,6 +287,8 @@ function normalizeIssueRows(lines, options = {}) {
       summary.dropped_nonsynonymous_parallelism_rows++;
       continue;
     }
+
+    if (hasFirstInstanceTag(explanation)) sawFirstInstanceTag = true;
 
     if (!firstKeptParallelism) {
       firstKeptParallelism = { quote, explanation, ref: cols[1] };
@@ -203,51 +301,46 @@ function normalizeIssueRows(lines, options = {}) {
       continue;
     }
 
-    const hasUniqueQualifier = /\bq:\s*unique-parallelism\b/i.test(explanation);
-    const reasonCode = extractUniqueReason(explanation, cfg.uniqueReasonCodes);
-    if (!hasUniqueQualifier) {
-      summary.dropped_parallelism_rows++;
-      summary.dropped_unqualified_parallelism_rows++;
-      continue;
-    }
-
-    if (!reasonCode) {
-      summary.dropped_parallelism_rows++;
-      summary.dropped_invalid_reason_parallelism_rows++;
-      continue;
-    }
-
-    if (keptExceptionCount >= cfg.exceptionCap) {
-      summary.dropped_parallelism_rows++;
-      summary.dropped_exception_cap_parallelism_rows++;
-      continue;
-    }
-
-    const candidateText = `${quote} ${explanation}`;
-    const isNearDuplicate = keptParallelismRows.some((k) => {
-      const baseText = `${k.quote} ${k.explanation}`;
-      return jaccardSimilarity(baseText, candidateText) >= cfg.duplicateSimilarityThreshold;
-    });
+    // Near-duplicate = same span flagged twice. Compare quotes, since every row
+    // now reaches this check and boilerplate explanations would otherwise
+    // inflate similarity between different verses.
+    const isNearDuplicate = keptParallelismRows.some((k) => (
+      parallelismSimilarity(k, { quote, explanation }) >= cfg.duplicateSimilarityThreshold
+    ));
     if (isNearDuplicate) {
       summary.dropped_parallelism_rows++;
       summary.dropped_duplicate_parallelism_rows++;
       continue;
     }
 
-    if (hasFirstInstanceTag(explanation)) {
-      if (firstInstanceAssigned) {
-        cols[6] = stripFirstInstanceTag(explanation);
-        summary.first_instance_tags_removed++;
-      } else {
-        firstInstanceAssigned = true;
+    // Issues Resolved 2026-02-25: full note at the first instance, simple
+    // template at the remaining synonymous parallelisms. Rows carrying a valid
+    // unique-parallelism exception (up to exceptionCap) keep their own template;
+    // every other later row is kept and routed to the simple repeat template.
+    const hasUniqueQualifier = /\bq:\s*unique-parallelism\b/i.test(explanation);
+    const reasonCode = hasUniqueQualifier ? extractUniqueReason(explanation, cfg.uniqueReasonCodes) : null;
+    const isException = Boolean(reasonCode) && keptExceptionCount < cfg.exceptionCap;
+
+    if (isException) {
+      if (hasFirstInstanceTag(explanation)) {
+        if (firstInstanceAssigned) {
+          cols[6] = stripFirstInstanceTag(explanation);
+          summary.first_instance_tags_removed++;
+        } else {
+          firstInstanceAssigned = true;
+        }
       }
+      keptExceptionCount++;
+      summary.kept_parallelism_exceptions++;
+    } else {
+      if (hasFirstInstanceTag(explanation)) summary.first_instance_tags_removed++;
+      cols[6] = markParallelismRepeat(explanation);
+      summary.kept_parallelism_repeats++;
+      if (classification === 'unspecified') summary.kept_parallelism_repeats_unspecified_type++;
     }
 
-    const kept = { quote, explanation: cols[6] || '', ref: cols[1] };
-    keptParallelismRows.push(kept);
-    keptExceptionCount++;
+    keptParallelismRows.push({ quote, explanation, ref: cols[1] });
     summary.kept_parallelism_rows++;
-    summary.kept_parallelism_exceptions++;
     output.push(toTsvLine(cols));
   }
 
@@ -293,9 +386,15 @@ function normalizeIssueRows(lines, options = {}) {
     });
   }
 
+  // Only the first-instance / non-repeat parallelism rows may swallow a doublet.
+  // A repeat row may be skipped by the writer, and then the verse would end up
+  // with neither note. The first parallelism row left counts even if an earlier
+  // pass marked it as a repeat: it is the first instance now.
+  const firstParallelismRow = dataRows.find((r) => r.issueType === 'figs-parallelism' && !r.drop);
   const keptParallelismByRef = new Map();
   for (const row of dataRows) {
     if (row.issueType !== 'figs-parallelism' || row.drop) continue;
+    if (row !== firstParallelismRow && hasParallelismRepeatMarker(row.explanation)) continue;
     if (!keptParallelismByRef.has(row.ref)) keptParallelismByRef.set(row.ref, []);
     keptParallelismByRef.get(row.ref).push(row);
   }
@@ -340,6 +439,8 @@ function normalizeIssueRows(lines, options = {}) {
   for (const row of dataRows) {
     if (!row.drop) postProcessed.push(toTsvLine(row.cols));
   }
+
+  finalizeFirstInstance(postProcessed, sawFirstInstanceTag, summary);
 
   const introSignal = buildIntroSignal(
     summary.raw_synonymous_parallelism_rows,
@@ -479,4 +580,5 @@ module.exports = {
   normalizeIssueRows,
   normalizeIssuesFile,
   buildParallelismIntroHintArgs,
+  PARALLELISM_REPEAT_HINT,
 };

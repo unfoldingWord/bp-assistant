@@ -1,7 +1,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 
-const { normalizeIssueRows } = require('../src/issue-normalizer');
+const { normalizeIssueRows, PARALLELISM_REPEAT_HINT } = require('../src/issue-normalizer');
 
 function row({
   book = 'PSA',
@@ -13,6 +13,14 @@ function row({
   return [book, ref, sref, quote, '', '', explanation].join('\t');
 }
 
+function parallelismCols(lines) {
+  return lines
+    .map((line) => line.split('\t'))
+    .filter((cols) => String(cols[2] || '').toLowerCase().trim() === 'figs-parallelism');
+}
+
+const isRepeat = (cols) => /\bt:\s*parallelism-repeat\s*$/.test(cols[6] || '');
+
 function keptRefs(lines) {
   return lines
     .map((line) => line.split('\t'))
@@ -20,16 +28,85 @@ function keptRefs(lines) {
     .map((cols) => cols[1]);
 }
 
-test('normalizeIssueRows keeps only first synonymous parallelism by default', () => {
+test('normalizeIssueRows keeps every synonymous parallelism and marks repeats for the simple template (#423)', () => {
   const input = [
     row({ ref: '35:1', quote: 'A; B', explanation: 'synonymous parallelism t: first instance' }),
     row({ ref: '35:4', quote: 'C; D', explanation: 'synonymous parallelism' }),
     row({ ref: '35:7', quote: 'E; F', explanation: 'synonymous parallelism' }),
+    row({ ref: '35:9', quote: 'G; H', explanation: 'synonymous parallelism - same idea twice' }),
+    row({ ref: '35:11', quote: 'I; J', explanation: 'synonymous parallelism' }),
+    row({ ref: '35:14', quote: 'K; L', explanation: 'synonymous parallelism' }),
   ];
   const result = normalizeIssueRows(input);
-  assert.deepEqual(keptRefs(result.lines), ['35:1']);
-  assert.equal(result.summary.kept_parallelism_rows, 1);
-  assert.equal(result.summary.dropped_unqualified_parallelism_rows, 2);
+  const cols = parallelismCols(result.lines);
+  assert.equal(PARALLELISM_REPEAT_HINT, 'parallelism-repeat');
+  assert.deepEqual(cols.map((c) => c[1]), ['35:1', '35:4', '35:7', '35:9', '35:11', '35:14']);
+  assert.equal(cols[0][6], 'synonymous parallelism t: first instance');
+  assert.equal(isRepeat(cols[0]), false);
+  for (const c of cols.slice(1)) assert.equal(isRepeat(c), true, c[1]);
+  assert.equal(cols[3][6], 'synonymous parallelism - same idea twice t: parallelism-repeat');
+  assert.equal(result.summary.kept_parallelism_rows, 6);
+  assert.equal(result.summary.kept_parallelism_repeats, 5);
+  assert.equal(result.summary.dropped_parallelism_rows, 0);
+});
+
+test('normalizeIssueRows does not treat distinct Hebrew-only quotes as near-duplicates', () => {
+  const input = [
+    row({ ref: '35:1', quote: 'שִׁ֣ירוּ לַ⁠יהוָ֑ה', explanation: 'synonymous parallelism t: first instance' }),
+    row({ ref: '35:4', quote: 'בָּרְכ֣וּ שְׁמ֑⁠וֹ', explanation: 'synonymous parallelism' }),
+    row({ ref: '35:7', quote: 'בָּרְכ֣וּ שְׁמ֑⁠וֹ', explanation: 'synonymous parallelism' }),
+  ];
+  const result = normalizeIssueRows(input);
+  assert.deepEqual(parallelismCols(result.lines).map((c) => c[1]), ['35:1', '35:4']);
+  assert.equal(result.summary.dropped_duplicate_parallelism_rows, 1);
+});
+
+test('normalizeIssueRows replaces other template hints on repeat rows', () => {
+  const input = [
+    row({ ref: '35:1', quote: 'A; B', explanation: 'synonymous parallelism t: first instance' }),
+    row({ ref: '35:4', quote: 'C; D', explanation: 'synonymous parallelism t: combine i: keep both verbs' }),
+    row({ ref: '35:7', quote: 'E; F', explanation: 'synonymous parallelism t: first instance' }),
+  ];
+  const result = normalizeIssueRows(input);
+  const cols = parallelismCols(result.lines);
+  assert.equal(cols[1][6], 'synonymous parallelism i: keep both verbs t: parallelism-repeat');
+  assert.equal(cols[2][6], 'synonymous parallelism t: parallelism-repeat');
+  assert.equal(cols.filter((c) => /first instance/i.test(c[6])).length, 1);
+});
+
+test('normalizeIssueRows keeps the [heb:] hint when it follows a t: directive on a repeat row', () => {
+  const input = [
+    row({ ref: '35:1', quote: 'A; B', explanation: 'synonymous parallelism t: first instance' }),
+    row({ ref: '35:4', quote: 'C; D', explanation: 'synonymous parallelism t: combine [heb:חַסְדּוֹ]' }),
+    row({ ref: '35:7', quote: 'E; F', explanation: 'synonymous parallelism [heb:עוֹלָם]' }),
+  ];
+  const cols = parallelismCols(normalizeIssueRows(input).lines);
+  assert.equal(cols[1][6], 'synonymous parallelism [heb:חַסְדּוֹ] t: parallelism-repeat');
+  assert.equal(cols[2][6], 'synonymous parallelism [heb:עוֹלָם] t: parallelism-repeat');
+});
+
+test('normalizeIssueRows compares non-empty quotes only when finding near-duplicates', () => {
+  const longQuote = 'May they be ashamed and confounded and turned back and disappointed without cause';
+  const input = [
+    row({ ref: '35:1', quote: longQuote, explanation: 'synonymous parallelism t: first instance' }),
+    // One word different: still the same span, dropped.
+    row({ ref: '35:2', quote: longQuote.replace('without cause', 'without reason'), explanation: 'synonymous parallelism' }),
+    // Different quote with the same boilerplate explanation: kept.
+    row({ ref: '35:3', quote: 'Let them be as chaff before the wind', explanation: 'synonymous parallelism' }),
+  ];
+  const result = normalizeIssueRows(input);
+  assert.deepEqual(keptRefs(result.lines), ['35:1', '35:3']);
+  assert.equal(result.summary.dropped_duplicate_parallelism_rows, 1);
+});
+
+test('normalizeIssueRows compares quote and explanation when the quote is empty', () => {
+  const input = [
+    row({ ref: '35:1', quote: '', explanation: 'synonymous parallelism about shame and disgrace' }),
+    row({ ref: '35:2', quote: '', explanation: 'synonymous parallelism about shame and disgrace' }),
+    row({ ref: '35:3', quote: '', explanation: 'synonymous parallelism praising the king' }),
+  ];
+  const result = normalizeIssueRows(input);
+  assert.deepEqual(keptRefs(result.lines), ['35:1', '35:3']);
 });
 
 test('normalizeIssueRows allows one qualified unique parallelism with valid reason', () => {
@@ -46,18 +123,19 @@ test('normalizeIssueRows allows one qualified unique parallelism with valid reas
   assert.equal(result.summary.kept_parallelism_exceptions, 1);
 });
 
-test('normalizeIssueRows drops qualified unique parallelism with invalid reason', () => {
+test('normalizeIssueRows routes unique parallelism with invalid reason or over the cap to the simple template', () => {
   const input = [
     row({ ref: '35:1', quote: 'A; B', explanation: 'synonymous parallelism t: first instance' }),
-    row({
-      ref: '35:9',
-      quote: 'X; Y; Z',
-      explanation: 'synonymous parallelism q: unique-parallelism reason: vague',
-    }),
+    row({ ref: '35:9', quote: 'X; Y; Z', explanation: 'synonymous parallelism q: unique-parallelism reason: vague' }),
+    row({ ref: '35:10', quote: 'P; Q; R', explanation: 'synonymous parallelism q: unique-parallelism reason: tricola' }),
+    row({ ref: '35:12', quote: 'S; T; U', explanation: 'synonymous parallelism q: unique-parallelism reason: pivot' }),
   ];
   const result = normalizeIssueRows(input);
-  assert.deepEqual(keptRefs(result.lines), ['35:1']);
-  assert.equal(result.summary.dropped_invalid_reason_parallelism_rows, 1);
+  const cols = parallelismCols(result.lines);
+  assert.deepEqual(cols.map((c) => c[1]), ['35:1', '35:9', '35:10', '35:12']);
+  assert.deepEqual(cols.map(isRepeat), [false, true, false, true]);
+  assert.equal(result.summary.kept_parallelism_exceptions, 1);
+  assert.equal(result.summary.kept_parallelism_repeats, 2);
 });
 
 test('normalizeIssueRows drops synthetic and antithetical parallelism rows', () => {
@@ -150,4 +228,137 @@ test('normalizeIssueRows normalizes discontinuous quote ellipsis to ampersand sy
 
   assert.equal(cols[3], 'him & his hand');
   assert.equal(result.summary.normalized_discontinuous_quotes, 1);
+});
+
+// ---- #423 follow-ups: pass-2 re-derivation, marker hygiene, similarity edge case ----
+
+test('a second pass re-derives the first instance when the first row was dropped (rules gate)', () => {
+  // File as pass 1 left it, after the gate dropped R1: R2 and R3 still say "repeat".
+  const afterGate = [
+    row({ ref: '35:4', quote: 'C; D', explanation: 'synonymous parallelism t: parallelism-repeat' }),
+    row({ ref: '35:7', quote: 'E; F', explanation: 'synonymous parallelism t: parallelism-repeat' }),
+  ];
+  const result = normalizeIssueRows(afterGate);
+  const cols = parallelismCols(result.lines);
+  assert.equal(cols[0][6], 'synonymous parallelism t: first instance');
+  assert.equal(isRepeat(cols[0]), false);
+  assert.equal(isRepeat(cols[1]), true);
+  assert.equal(result.summary.first_instance_restored, 1);
+  // Running the pass again changes nothing.
+  const again = normalizeIssueRows(result.lines);
+  assert.deepEqual(again.lines, result.lines);
+});
+
+test('a first row relabeled by the gate leaves exactly one first instance and one repeat', () => {
+  // Gate relabeled R1 away; R2 carried the repeat hint, R3 (the old first-instance tag) is gone.
+  const first = normalizeIssueRows([
+    row({ ref: '35:1', quote: 'A; B', explanation: 'synonymous parallelism t: first instance' }),
+    row({ ref: '35:4', quote: 'C; D', explanation: 'synonymous parallelism' }),
+    row({ ref: '35:7', quote: 'E; F', explanation: 'synonymous parallelism' }),
+  ]).lines;
+  const gated = first.filter((l) => l.split('\t')[1] !== '35:1');
+  const second = normalizeIssueRows(gated);
+  const cols = parallelismCols(second.lines);
+  assert.deepEqual(cols.map((c) => c[1]), ['35:4', '35:7']);
+  assert.equal(cols.filter((c) => /t:\s*first instance/.test(c[6])).length, 1);
+  assert.match(cols[0][6], /t: first instance$/);
+  assert.equal(isRepeat(cols[1]), true);
+});
+
+test('repeat rows do not keep literal q:/reason: text from an overflow exception', () => {
+  const result = normalizeIssueRows([
+    row({ ref: '35:1', quote: 'A; B', explanation: 'synonymous parallelism t: first instance' }),
+    row({ ref: '35:4', quote: 'C; D', explanation: 'synonymous parallelism q: unique-parallelism reason: tricola' }),
+    row({ ref: '35:7', quote: 'E; F', explanation: 'synonymous parallelism q: unique-parallelism reason: pivot' }),
+  ]);
+  const cols = parallelismCols(result.lines);
+  assert.equal(cols[1][6], 'synonymous parallelism q: unique-parallelism reason: tricola');
+  assert.equal(cols[2][6], 'synonymous parallelism t: parallelism-repeat');
+  assert.doesNotMatch(cols[2][6], /\bq:|reason:/);
+});
+
+test('the words "first instance" in prose are not a tag and are not stripped', () => {
+  const result = normalizeIssueRows([
+    row({ ref: '35:1', quote: 'A; B', explanation: 'synonymous parallelism t: first instance' }),
+    row({ ref: '35:4', quote: 'C; D', explanation: 'synonymous parallelism; this is not the first instance of the pattern' }),
+  ]);
+  const cols = parallelismCols(result.lines);
+  assert.equal(cols[1][6], 'synonymous parallelism; this is not the first instance of the pattern t: parallelism-repeat');
+  assert.equal(result.summary.first_instance_tags_removed, 0);
+  // Prose alone does not make a row a first instance either: no tag anywhere stays untagged.
+  const noTag = normalizeIssueRows([
+    row({ ref: '35:1', quote: 'A; B', explanation: 'synonymous parallelism, the first instance in the psalm' }),
+  ]);
+  assert.equal(parallelismCols(noTag.lines)[0][6], 'synonymous parallelism, the first instance in the psalm');
+});
+
+test('quotes made only of punctuation are not treated as near-duplicates', () => {
+  const result = normalizeIssueRows([
+    row({ ref: '35:1', quote: 'A; B', explanation: 'synonymous parallelism t: first instance' }),
+    row({ ref: '35:4', quote: '...', explanation: 'synonymous parallelism' }),
+    row({ ref: '35:7', quote: '—', explanation: 'synonymous parallelism' }),
+  ]);
+  assert.equal(result.summary.dropped_duplicate_parallelism_rows, 0);
+  assert.deepEqual(keptRefs(result.lines), ['35:1', '35:4', '35:7']);
+});
+
+test('repeats whose explanation never says synonymous are counted as unspecified type and still routed to the writer', () => {
+  const result = normalizeIssueRows([
+    row({ ref: '35:1', quote: 'A; B', explanation: 'synonymous parallelism t: first instance' }),
+    row({ ref: '35:4', quote: 'C; D', explanation: 'synonymous parallelism' }),
+    row({ ref: '35:7', quote: 'E; F', explanation: 'two lines in parallel' }),
+    row({ ref: '35:9', quote: 'G; H', explanation: 'climactic parallelism' }),
+  ]);
+  const cols = parallelismCols(result.lines);
+  assert.equal(cols.slice(1).every(isRepeat), true);
+  assert.equal(result.summary.kept_parallelism_repeats, 3);
+  assert.equal(result.summary.kept_parallelism_repeats_unspecified_type, 2);
+});
+
+test('a repeat parallelism row does not swallow a doublet; the first-instance row still does (F2)', () => {
+  const result = normalizeIssueRows([
+    row({ ref: '35:1', quote: 'A; B', explanation: 'synonymous parallelism t: first instance' }),
+    row({ ref: '35:1', sref: 'figs-doublet', quote: 'A', explanation: 'doublet' }),
+    row({ ref: '35:4', quote: 'the king rose and the ruler stood', explanation: 'synonymous parallelism' }),
+    row({ ref: '35:4', sref: 'figs-doublet', quote: 'king rose', explanation: 'doublet' }),
+  ]);
+  const srefs = result.lines.map((l) => l.split('\t')).map((c) => `${c[1]} ${c[2]}`);
+  assert.deepEqual(srefs, ['35:1 figs-parallelism', '35:4 figs-parallelism', '35:4 figs-doublet']);
+  assert.equal(result.summary.dropped_parallelism_overlap_doublets, 1);
+});
+
+test('a first row demoted by an earlier pass still covers its doublet in the next pass', () => {
+  const result = normalizeIssueRows([
+    row({ ref: '35:4', quote: 'the king rose and the ruler stood', explanation: 'synonymous parallelism t: parallelism-repeat' }),
+    row({ ref: '35:4', sref: 'figs-doublet', quote: 'king rose', explanation: 'doublet' }),
+  ]);
+  assert.equal(result.summary.dropped_parallelism_overlap_doublets, 1);
+});
+
+test('restoring the first instance does not add a second t: hint to a row that has another one (F10)', () => {
+  // The skill tagged the second row as the first instance; the first row asks for another template.
+  const result = normalizeIssueRows([
+    row({ ref: '35:4', quote: 'C; D', explanation: 'synonymous parallelism t: combine' }),
+    row({ ref: '35:9', quote: 'E; F', explanation: 'synonymous parallelism t: first instance' }),
+  ]);
+  const cols = parallelismCols(result.lines);
+  assert.equal(cols[0][6], 'synonymous parallelism t: combine');
+  assert.equal(result.summary.first_instance_restored, 0);
+  assert.equal(isRepeat(cols[1]), true);
+});
+
+test('first-instance tag on a later exception row moves to the real first row; idempotent', () => {
+  // File as an earlier pass left it: first remaining row marked repeat, a later exception row still tagged.
+  const input = [
+    row({ ref: '35:4', quote: 'C; D', explanation: 'synonymous parallelism t: parallelism-repeat' }),
+    row({ ref: '35:9', quote: 'E; F; G', explanation: 'synonymous parallelism q: unique-parallelism reason: tricola t: first instance' }),
+  ];
+  const result = normalizeIssueRows(input);
+  const cols = parallelismCols(result.lines);
+  assert.equal(cols[0][6], 'synonymous parallelism t: first instance');
+  assert.equal(cols[1][6], 'synonymous parallelism q: unique-parallelism reason: tricola');
+  assert.equal(result.lines.filter((l) => /t:\s*first instance/.test(l)).length, 1);
+  assert.equal(result.lines.filter((l) => /parallelism-repeat/.test(l)).length, 0);
+  const again = normalizeIssueRows(result.lines);
+  assert.deepEqual(again.lines, result.lines);
 });

@@ -13,6 +13,7 @@ const {
   _resolveGlQuotes,
   _parseExplanationDirectives,
   _resolveTemplateSelection,
+  _addBuiltinTemplates,
   _deriveStyleProfile,
   _deriveAtRequirement,
   _resolveQuoteScopeSelection,
@@ -55,6 +56,34 @@ test('resolveTemplateSelection locks a single exact template hint match', () => 
   assert.equal(selected.template_locked, true);
   assert.equal(selected.selected_template.type, 'request');
   assert.equal(selected.candidate_templates.length, 1);
+});
+
+test('parallelism-repeat hint selects the built-in simple template; unhinted rows never see it (#423)', () => {
+  const templateMap = _addBuiltinTemplates(new Map([
+    ['figs-parallelism', [
+      { issue_type: 'figs-parallelism', type: 'first instance', template: 'These two clauses mean basically the same thing. Alternate translation: [text]' },
+      { issue_type: 'figs-parallelism', type: 'combine', template: 'These two clauses mean basically the same thing. Combine. Alternate translation: [text]' },
+    ]],
+  ]));
+
+  const repeat = _resolveTemplateSelection({
+    sref: 'figs-parallelism',
+    templateHints: _parseExplanationDirectives('synonymous parallelism t: parallelism-repeat').template_hints,
+    templateMap,
+  });
+  assert.equal(repeat.template_locked, true);
+  assert.equal(repeat.selected_template.type, 'parallelism-repeat');
+  assert.match(repeat.selected_template.template, /^See how your translation team has decided to represent pairs of clauses in Hebrew poetry/);
+
+  const unhinted = _resolveTemplateSelection({ sref: 'figs-parallelism', templateHints: [], templateMap });
+  assert.equal(unhinted.candidate_templates.some((c) => c.type === 'parallelism-repeat'), false);
+
+  // A sheet row of the same type wins over the built-in.
+  const sheetMap = _addBuiltinTemplates(new Map([
+    ['figs-parallelism', [{ issue_type: 'figs-parallelism', type: 'parallelism-repeat', template: 'Sheet wording. Alternate translation: [text]' }]],
+  ]));
+  assert.equal(sheetMap.get('figs-parallelism').length, 1);
+  assert.equal(sheetMap.get('figs-parallelism')[0].template, 'Sheet wording. Alternate translation: [text]');
 });
 
 test('deriveStyleProfile keeps no-at style rule metadata without suppressing template AT requirements', () => {
@@ -227,6 +256,37 @@ test('prepareNotes writes a packetized item with deterministic template and poli
   assert.match(item.prompt, /Quote scope mode:/);
   assert.match(item.prompt, /Do not add an alternate translation/);
   assert.doesNotMatch(item.prompt, /discern which particular template/i);
+});
+
+test('prepareNotes lets the writer skip only a parallelism-repeat row, and tells it how (#423)', () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tn-tools-skip-'));
+  const workspaceTmp = path.join('/srv/bot/workspace', 'tmp', path.basename(tempDir));
+  fs.mkdirSync(workspaceTmp, { recursive: true });
+  const issuesRel = path.join('tmp', path.basename(tempDir), 'PSA-035.tsv');
+  const ultRel = path.join('tmp', path.basename(tempDir), 'PSA-035.ult.usfm');
+  const ustRel = path.join('tmp', path.basename(tempDir), 'PSA-035.ust.usfm');
+  const outRel = path.join('tmp', path.basename(tempDir), 'prepared_notes.json');
+  fs.writeFileSync(path.join('/srv/bot/workspace', issuesRel), [
+    'Book\tReference\tSupportReference\tQuote\tOccurrence\tAT\tNote',
+    'PSA\t35:2\trc://*/ta/man/translate/figs-parallelism\tthe king spoke\tYes\t\tsynonymous parallelism t: parallelism-repeat',
+    'PSA\t35:2\trc://*/ta/man/translate/writing-background\tThen\tYes\t\tbackground',
+  ].join('\n'));
+  const usfm = '\\c 35\n\\v 2 Then the king spoke to the people.\n';
+  fs.writeFileSync(path.join('/srv/bot/workspace', ultRel), usfm);
+  fs.writeFileSync(path.join('/srv/bot/workspace', ustRel), usfm);
+
+  prepareNotes({ inputTsv: issuesRel, ultUsfm: ultRel, ustUsfm: ustRel, output: outRel });
+  const items = JSON.parse(fs.readFileSync(path.join('/srv/bot/workspace', outRel), 'utf8')).items;
+  const repeat = items.find((i) => i.sref === 'figs-parallelism');
+  const other = items.find((i) => i.sref === 'writing-background');
+
+  assert.equal(repeat.template_type, 'parallelism-repeat');
+  assert.equal(repeat.skip_allowed, true);
+  assert.equal(repeat.writer_packet.skip_allowed, true);
+  assert.match(repeat.prompt, /SKIP RULE/);
+  assert.match(repeat.prompt, /SKIP_NOTE: </);
+  assert.equal(other.skip_allowed, false);
+  assert.doesNotMatch(other.prompt, /SKIP RULE/);
 });
 
 test('prepareNotes parses headerless rows whose col0 is a book-prefixed reference (HOS 12 regression)', () => {

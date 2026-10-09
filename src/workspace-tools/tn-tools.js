@@ -508,12 +508,81 @@ function parseExplanationDirectives(explanation) {
   };
 }
 
+// Templates the pipeline depends on that may not exist in the Google sheet yet.
+// Used only when the sheet has no row with the same issue type + type, and only
+// offered when a `t:` hint asks for it (hint_only), so it never displaces sheet
+// templates for unhinted rows.
+// figs-parallelism/parallelism-repeat: Issues Resolved 2026-02-25 simple template
+// for synonymous parallelisms after the first instance (set by issue-normalizer).
+const BUILTIN_TEMPLATES = [
+  {
+    issue_type: 'figs-parallelism',
+    type: 'parallelism-repeat',
+    template: 'See how your translation team has decided to represent pairs of clauses in Hebrew poetry that mean basically the same thing. Alternate translation: [text]',
+    hint_only: true,
+  },
+];
+
+// Templates whose wording is only true for some rows. The writer may decline
+// such a row by returning the skip marker instead of a note; the pipeline then
+// drops the row and records it (applyWriterSkips). parallelism-repeat says the
+// clauses "mean basically the same thing", which holds only for synonymous
+// parallelism.
+const WRITER_SKIP_MARKER = 'SKIP_NOTE';
+const SKIPPABLE_TEMPLATES = new Set(['figs-parallelism/parallelism-repeat']);
+
+const WRITER_SKIP_INSTRUCTION =
+  'SKIP RULE: the selected template says the two clauses mean basically the same thing. ' +
+  'Write the note ONLY if the clauses in this verse really do mean basically the same thing (synonymous parallelism). ' +
+  'If the second clause adds to, completes, contrasts with, or builds on the first ' +
+  '(synthetic, antithetical, climactic, chiasm, emblematic, or any other type), do NOT write a note. ' +
+  `Instead output exactly one line: ${WRITER_SKIP_MARKER}: <one short sentence naming the type and why>`;
+
+function isSkippableTemplate(sref, templateType) {
+  return SKIPPABLE_TEMPLATES.has(`${normalizeTemplateType(sref)}/${normalizeTemplateType(templateType)}`);
+}
+
+// The skip token can arrive dressed up: **SKIP_NOTE**, `SKIP_NOTE:`, skip_note,
+// or after a sentence of preamble. A real note never contains the token, so it
+// counts as the marker wherever it appears. Returns the (sanitized) reason when
+// the text contains the marker, else null.
+const WRITER_SKIP_TOKEN_RE = /(?<![A-Za-z0-9])SKIP[_-]NOTE(?![A-Za-z0-9])/i;
+
+// Model-authored text that will be posted to chat: drop markup and mentions,
+// collapse whitespace, cap the length.
+function sanitizeSkipReason(text) {
+  const clean = String(text || '')
+    .replace(/[@#<>\[\]{}`*_|\\]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 160);
+  return clean;
+}
+
+function parseWriterSkip(noteText) {
+  const text = String(noteText == null ? '' : noteText);
+  const m = WRITER_SKIP_TOKEN_RE.exec(text);
+  if (!m) return null;
+  const after = text.slice(m.index + m[0].length).replace(/^[\s*`'"\u2018\u2019\u201C\u201D:\-\u2013\u2014]+/, '');
+  return sanitizeSkipReason(after);
+}
+
+function addBuiltinTemplates(map) {
+  for (const builtin of BUILTIN_TEMPLATES) {
+    const existing = map.get(builtin.issue_type) || [];
+    const wanted = normalizeTemplateType(builtin.type);
+    if (existing.some((t) => normalizeTemplateType(t.type) === wanted)) continue;
+    map.set(builtin.issue_type, [...existing, { ...builtin }]);
+  }
+  return map;
+}
+
 let _templateCache = null;
 function loadTemplateMap() {
   if (_templateCache) return _templateCache;
   const templatesPath = path.join(CSKILLBP_DIR, 'data/templates.csv');
   if (!fs.existsSync(templatesPath)) {
-    _templateCache = new Map();
+    _templateCache = addBuiltinTemplates(new Map());
     return _templateCache;
   }
   const rows = parseCSV(fs.readFileSync(templatesPath, 'utf8'));
@@ -527,7 +596,7 @@ function loadTemplateMap() {
     if (!map.has(issueType)) map.set(issueType, []);
     map.get(issueType).push({ issue_type: issueType, type, template });
   }
-  _templateCache = map;
+  _templateCache = addBuiltinTemplates(map);
   return _templateCache;
 }
 
@@ -604,8 +673,11 @@ function resolveTemplateSelection({
   selectorChoice = null,
 }) {
   const templates = Array.isArray(templateMap?.get?.(sref)) ? templateMap.get(sref) : [];
-  const candidates = templates.map((template, index) => toTemplateCandidate(template, sref, index));
   const normalizedHints = templateHints.map(normalizeTemplateType).filter(Boolean);
+  const candidates = templates
+    .map((template, index) => toTemplateCandidate(template, sref, index))
+    .filter((candidate) => !candidate._template?.hint_only
+      || normalizedHints.includes(normalizeTemplateType(candidate.type)));
   let filtered = candidates.slice();
   const fallbackReasons = [];
 
@@ -846,6 +918,9 @@ function buildWriterPacket(item) {
     at_provided: item.at_provided || '',
     prose_mode: 'template_plus_necessity',
     programmatic_note: item.programmatic_note || '',
+    skip_allowed: !!item.skip_allowed,
+    skip_marker: item.skip_allowed ? WRITER_SKIP_MARKER : '',
+    skip_instruction: item.skip_allowed ? WRITER_SKIP_INSTRUCTION : '',
   };
 }
 
@@ -872,6 +947,7 @@ function buildWriterPrompt(item) {
   ];
 
   if (packet.clean_explanation) lines.push(`Explanation context: ${packet.clean_explanation}`);
+  if (packet.skip_allowed) lines.push(packet.skip_instruction);
   if (packet.must_include.length) lines.push(`Must include: ${packet.must_include.join(' | ')}`);
   if (packet.style_rules.length) lines.push(`Style rules: ${packet.style_rules.join(', ')}`);
   if (packet.rule_overrides.length) lines.push(`Overrides: ${packet.rule_overrides.join(', ')}`);
@@ -1410,7 +1486,121 @@ function inspectOpeningBold({ noteText, prepItem = {}, ultVerse = '' }) {
   };
 }
 
+function writeFileAtomic(filePath, content) {
+  const tmp = `${filePath}.${process.pid}.tmp`;
+  fs.writeFileSync(tmp, content);
+  fs.renameSync(tmp, filePath);
+}
+
+// Writer declined some notes (returned SKIP_NOTE instead of a note). For an item
+// the template allows to be skipped (skip_allowed): remove the note from
+// generated_notes.json and the item from the prepared items, and record it in the
+// prepared file's `writer_skipped` list so the pipeline can report it. For any
+// other item the token is a failed generation, not a decision: the note is
+// removed (so assembly reports it missing) but the item stays, and it is listed
+// in `writer_skip_rejected`. Runs at the start of assembly so the AT, quality and
+// push stages never see a marker. Returns { skipped, rejected } added this call.
+//
+// Write order keeps every crash point recoverable: record first (items intact),
+// then drop the items, then the generated entries (a stale entry with no item is
+// ignored by assembly). Each file is replaced atomically.
+function applyWriterSkips({ preparedJson, generatedJson }) {
+  const prepPath = path.resolve(CSKILLBP_DIR, preparedJson);
+  const genPath = path.resolve(CSKILLBP_DIR, generatedJson);
+  const prepared = JSON.parse(fs.readFileSync(prepPath, 'utf8'));
+  const generated = JSON.parse(fs.readFileSync(genPath, 'utf8'));
+  const items = Array.isArray(prepared.items) ? prepared.items : [];
+  // A rejection record is stale once the item has a real note.
+  let clearedStale = false;
+  if (Array.isArray(prepared.writer_skip_rejected) && prepared.writer_skip_rejected.length) {
+    const keep = prepared.writer_skip_rejected.filter((r) => {
+      const text = generated[r.id];
+      return !(typeof text === 'string' && text.trim() && parseWriterSkip(text) === null);
+    });
+    if (keep.length !== prepared.writer_skip_rejected.length) {
+      prepared.writer_skip_rejected = keep;
+      clearedStale = true;
+    }
+  }
+  const skipped = [];
+  const rejected = [];
+  const dropItems = new Set();
+  const dropKeys = new Set();
+  for (const item of items) {
+    if (!item) continue;
+    // Same lookup order assembleNotes uses to find an item's note.
+    const keys = [
+      item.id,
+      item.id ? null : String(item.index),
+      item.reference,
+      item.reference && item.sref ? `${item.reference}:${item.sref}` : null,
+      item.reference && item.sref ? `${item.reference}_${item.sref}` : null,
+    ].filter((k) => k != null && k !== 'undefined');
+    const key = keys.find((k) => Object.prototype.hasOwnProperty.call(generated, k) && parseWriterSkip(generated[k]) !== null);
+    if (key === undefined) continue;
+    const record = {
+      id: item.id || `index:${item.index}`,
+      reference: item.reference || '',
+      sref: item.sref || '',
+      gl_quote: item.gl_quote || '',
+      reason: parseWriterSkip(generated[key]) || '(no reason given)',
+      skip_allowed: !!item.skip_allowed,
+    };
+    dropKeys.add(key);
+    if (item.skip_allowed) {
+      skipped.push(record);
+      dropItems.add(item);
+    } else {
+      rejected.push(record);
+    }
+  }
+  if (!skipped.length && !rejected.length) {
+    if (clearedStale) writeFileAtomic(prepPath, JSON.stringify(prepared, null, 2));
+    return { skipped, rejected };
+  }
+
+  const merge = (prior, added) => {
+    const ids = new Set(added.map((r) => r.id));
+    return [...(Array.isArray(prior) ? prior : []).filter((r) => !ids.has(r.id)), ...added];
+  };
+  if (skipped.length) prepared.writer_skipped = merge(prepared.writer_skipped, skipped);
+  if (rejected.length) prepared.writer_skip_rejected = merge(prepared.writer_skip_rejected, rejected);
+  writeFileAtomic(prepPath, JSON.stringify(prepared, null, 2));
+  if (dropItems.size) {
+    prepared.items = items.filter((it) => !dropItems.has(it));
+    prepared.item_count = prepared.items.length;
+    writeFileAtomic(prepPath, JSON.stringify(prepared, null, 2));
+  }
+  for (const k of dropKeys) delete generated[k];
+  writeFileAtomic(genPath, JSON.stringify(generated, null, 2) + '\n');
+  return { skipped, rejected };
+}
+
+// Per-note generation rejects a skip marker on a non-skippable item before the
+// text reaches generated_notes.json; record it so the post-writer report can warn.
+function recordWriterSkipRejected({ preparedJson, records }) {
+  if (!records || !records.length) return;
+  const prepPath = path.resolve(CSKILLBP_DIR, preparedJson);
+  const prepared = JSON.parse(fs.readFileSync(prepPath, 'utf8'));
+  const ids = new Set(records.map((r) => r.id));
+  prepared.writer_skip_rejected = [
+    ...(Array.isArray(prepared.writer_skip_rejected) ? prepared.writer_skip_rejected : []).filter((r) => !ids.has(r.id)),
+    ...records,
+  ];
+  writeFileAtomic(prepPath, JSON.stringify(prepared, null, 2));
+}
+
+function readWriterSkipped(preparedJson, field = 'writer_skipped') {
+  try {
+    const prepared = JSON.parse(fs.readFileSync(path.resolve(CSKILLBP_DIR, preparedJson), 'utf8'));
+    return Array.isArray(prepared[field]) ? prepared[field] : [];
+  } catch (_) {
+    return [];
+  }
+}
+
 function assembleNotes({ preparedJson, generatedJson, output }) {
+  const { skipped: writerSkipped, rejected: writerRejected } = applyWriterSkips({ preparedJson, generatedJson });
   const prepared = JSON.parse(fs.readFileSync(path.resolve(CSKILLBP_DIR, preparedJson), 'utf8'));
   const generated = JSON.parse(fs.readFileSync(path.resolve(CSKILLBP_DIR, generatedJson), 'utf8'));
   const outPath = path.resolve(CSKILLBP_DIR, output);
@@ -1476,6 +1666,12 @@ function assembleNotes({ preparedJson, generatedJson, output }) {
   fs.writeFileSync(outPath, lines.join('\n') + '\n');
   const res = [`Assembled ${rows.length} notes to ${outPath}`];
   if (missing.length) res.push(`Missing: ${missing.length}`);
+  if (writerSkipped.length) {
+    res.push(`Writer skipped: ${writerSkipped.length} (${writerSkipped.map((r) => `${r.id} ${r.reference}`).join(', ')})`);
+  }
+  if (writerRejected.length) {
+    res.push(`Writer skip marker on non-skippable item(s), treated as failed: ${writerRejected.map((r) => `${r.id} ${r.reference}`).join(', ')}`);
+  }
   res.push(outPath);
   return res.join('\n');
 }
@@ -2404,6 +2600,7 @@ function prepareNotes({ inputTsv, ultUsfm, ustUsfm, output, alignedUsfm, alignme
     item.chosen_template_has_at_slot = !!templateSelection.selected_template_has_at_slot;
     item.template_type = normalizeWhitespace(templateSelection.selected_template?.type || '') || 'generic';
     item.template_text = stripAlternateTranslation(templateSelection.selected_template?.template || '');
+    item.skip_allowed = isSkippableTemplate(item.sref, item.template_type);
     item.candidate_templates = templateSelection.candidate_templates;
     item.at_policy = styleProfile.at_policy;
     item.at_required = !!styleProfile.at_required;
@@ -3596,6 +3793,13 @@ module.exports = {
   quoteFuzzyMatch,
   _parseExplanationDirectives: parseExplanationDirectives,
   _resolveTemplateSelection: resolveTemplateSelection,
+  _addBuiltinTemplates: addBuiltinTemplates,
+  parseWriterSkip,
+  sanitizeSkipReason,
+  applyWriterSkips,
+  readWriterSkipped,
+  recordWriterSkipRejected,
+  WRITER_SKIP_MARKER,
   _deriveStyleProfile: deriveStyleProfile,
   _deriveAtRequirement: deriveAtRequirement,
   _resolveQuoteScopeSelection: resolveQuoteScopeSelection,

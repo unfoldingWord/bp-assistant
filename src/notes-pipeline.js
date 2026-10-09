@@ -18,7 +18,7 @@ const { createGuardHooks } = require('./guard-hooks');
 const { resolveAutoModel } = require('./api-runner/provider-config');
 const { getDoor43Username, emailToFallbackUsername, buildBranchName, resolveOutputFile, discoverFreshOutput, checkPrerequisites, calcSkillTimeout, calcVerseSpanTimeout, normalizeBookName, resolveConflictMention, parsePartialTsv, truncatePartialTsv, parseChunkRange, isUsageLimitError, CSKILLBP_DIR } = require('./pipeline-utils');
 const { splitTsv, fixTrailingNewlines } = require('./workspace-tools/tsv-tools');
-const { fillTsvIds, generateIds, prepareNotes, fillOrigQuotes, resolveGlQuotes, flagNarrowQuotes, extractAlignmentData, prepareATContext, substituteAT, fixUnicodeQuotes, verifyBoldMatches, syncCanonicalHebrewQuotes, applyHintsToPreparedNotes, applyKeptToPreparedNotes, keptRefVerseSpan, parsePlainUsfmVersesFromText, detectIssuesTsvLayout, extractIssuesTsvRow, findVersesWithoutNotes, _stripAlternateTranslation: stripAlternateTranslation } = require('./workspace-tools/tn-tools');
+const { fillTsvIds, generateIds, prepareNotes, fillOrigQuotes, resolveGlQuotes, flagNarrowQuotes, extractAlignmentData, prepareATContext, substituteAT, fixUnicodeQuotes, verifyBoldMatches, syncCanonicalHebrewQuotes, applyHintsToPreparedNotes, applyKeptToPreparedNotes, keptRefVerseSpan, parsePlainUsfmVersesFromText, detectIssuesTsvLayout, extractIssuesTsvRow, findVersesWithoutNotes, readWriterSkipped, recordWriterSkipRejected, parseWriterSkip, sanitizeSkipReason, _stripAlternateTranslation: stripAlternateTranslation } = require('./workspace-tools/tn-tools');
 const { checkTnQuality, detectSelfTalk, templateFirstPhrase, resolveTemplateText } = require('./workspace-tools/quality-tools');
 const { buildBookRecurrenceIndex, deriveRecurrenceKeys, buildSeeHowSentence, isSeeHowEligible, isContextDependentSref, dedupeAlsoOccursVerses, assignAlsoOccursVerses, resolveDoor43ReposPath, hebTokens, verseNumber: recurrenceVerseNumber, SEE_HOW_NEVER_FOLD_SREFS, CROSS_BOOK_MAX_BOOKS } = require('./workspace-tools/recurrence-index');
 const { loadCommonPhrases, buildIntroPointerSentence, phraseTextKey } = require('./workspace-tools/common-phrases');
@@ -69,6 +69,9 @@ const TN_WRITER_HINT =
   'read_prepared_notes (summaryOnly:true first, then bounded slices) — never the raw Read tool on prepared_notes.json. ' +
   'AT generation is a separate pipeline step that runs after note writing, so write only the explanatory note text ' +
   'and do not generate alternate translations or run AT-fit verification here. ' +
+  'If an item\'s writer_packet has skip_allowed: true and its skip_instruction says the note does not apply, ' +
+  'record the skip by writing the value "SKIP_NOTE: <short reason>" for that item id in generated_notes.json instead of a note, ' +
+  'then run assemble_notes as usual: it drops the row and the pipeline reports it. Never write SKIP_NOTE for an item without skip_allowed. ' +
   'If an Edit returns "string to replace not found", do not retry it: re-Read once or use the structured tool, ' +
   'then tag the row unresolved and move on if it still cannot be matched.';
 
@@ -1243,6 +1246,7 @@ async function runPerNoteGeneration({ pipeDir, outputPath, status, book }) {
     'Follow the template exactly. Fill in only the variable parts.',
     'Output ONLY the note text, nothing else. Do not use any tools.',
     'Do NOT include an alternate translation — that is handled separately.',
+    'Exception: when the item includes a SKIP RULE, follow it and output the skip line instead of a note when the rule says to.',
     '',
     '--- NOTE STYLE GUIDE ---',
     styleGuide,
@@ -1253,7 +1257,7 @@ async function runPerNoteGeneration({ pipeDir, outputPath, status, book }) {
   console.log(`[notes] Per-note generation: ${items.length} items`);
 
   const CONCURRENCY = 10;
-  const results = { success: 0, failed: 0, programmatic: 0 };
+  const results = { success: 0, failed: 0, programmatic: 0, skipped: 0 };
   const generatedNotes = {};
 
   async function generateOneNote(item) {
@@ -1274,6 +1278,7 @@ async function runPerNoteGeneration({ pipeDir, outputPath, status, book }) {
       (packet.must_include || []).length ? `MUST INCLUDE: ${packet.must_include.join(' | ')}` : '',
       (packet.style_rules || []).length ? `STYLE RULES: ${packet.style_rules.join(', ')}` : '',
       (packet.rule_overrides || []).length ? `OVERRIDES: ${packet.rule_overrides.join(', ')}` : '',
+      packet.skip_allowed && packet.skip_instruction ? packet.skip_instruction : '',
       '',
       'Write the note text. Output ONLY the note text, nothing else.',
       'Do NOT include an alternate translation.',
@@ -1304,6 +1309,25 @@ async function runPerNoteGeneration({ pipeDir, outputPath, status, book }) {
 
       if (!noteText) {
         return { id: item.id, success: false, reason: 'empty response' };
+      }
+      if (parseWriterSkip(noteText) !== null) {
+        // The skip marker is only a valid answer for items the template allows to be skipped.
+        if (!packet.skip_allowed) {
+          return {
+            id: item.id,
+            success: false,
+            reason: 'skip marker returned for an item that cannot be skipped',
+            rejectedSkip: {
+              id: item.id,
+              reference: item.reference || '',
+              sref: packet.sref || item.sref || '',
+              gl_quote: packet.gl_quote || item.gl_quote || '',
+              reason: sanitizeSkipReason(parseWriterSkip(noteText)) || '(no reason given)',
+              skip_allowed: false,
+            },
+          };
+        }
+        return { id: item.id, success: true, note: noteText, skipped: true };
       }
       return { id: item.id, success: true, note: noteText };
     } catch (err) {
@@ -1338,6 +1362,7 @@ async function runPerNoteGeneration({ pipeDir, outputPath, status, book }) {
     if (r.success) {
       results.success++;
       if (r.programmatic) results.programmatic++;
+      if (r.skipped) results.skipped++;
       generatedNotes[r.id] = r.note;
     } else {
       results.failed++;
@@ -1360,7 +1385,7 @@ async function runPerNoteGeneration({ pipeDir, outputPath, status, book }) {
     output: outputPath,
   });
 
-  const summary = `${results.success}/${items.length} notes generated (${results.programmatic} programmatic, ${results.failed} failed)`;
+  const summary = `${results.success}/${items.length} notes generated (${results.programmatic} programmatic, ${results.skipped} skipped by writer, ${results.failed} failed)`;
   console.log(`[notes] Per-note generation complete: ${summary}`);
   // Measure failures against the LLM-written items only. Programmatic pointers
   // always "succeed", so counting them in the denominator let a chapter where
@@ -2517,6 +2542,58 @@ async function reportVersesWithoutNotes({ pipeDir, notesPath, ref, stage, status
     await status(`⚠️ **${ref}**: ${lost.length} verse(s) had prepared notes but have **no note** after ${stage}: ${lost.join(', ')}. Editors will see these as skipped.`);
   }
   return lost;
+}
+
+// Notes the writer declined with SKIP_NOTE (a parallelism-repeat row whose
+// clauses are not really synonymous). assembleNotes already dropped each row and
+// recorded it in the prepared JSON; name them here so the drop is never silent.
+// Checks the chapter's prepared file and any shard prepared files beside it.
+async function reportWriterSkippedNotes({ pipeDir, ref, tag, since, status }) {
+  if (!pipeDir) return [];
+  const skipped = [];
+  const rejected = [];
+  try {
+    const preparedJson = readContext(pipeDir)?.runtime?.preparedNotes;
+    if (!preparedJson) return [];
+    // The chapter's prepared file, plus this run's shard prepared files only:
+    // shard files from an earlier run of the same chapter are stale.
+    const files = new Set([preparedJson]);
+    const shardDir = path.join(path.dirname(preparedJson), 'shards');
+    const absShardDir = path.resolve(CSKILLBP_DIR, shardDir);
+    if (fs.existsSync(absShardDir)) {
+      for (const f of fs.readdirSync(absShardDir)) {
+        if (!/prepared_notes\.json$/.test(f)) continue;
+        if (tag && !f.startsWith(`${tag}-v`)) continue;
+        if (since && fs.statSync(path.join(absShardDir, f)).mtimeMs < since) continue;
+        files.add(path.join(shardDir, f));
+      }
+    }
+    const seen = new Set();
+    for (const f of files) {
+      for (const r of readWriterSkipped(f)) {
+        if (!seen.has(`s:${r.id}`)) { seen.add(`s:${r.id}`); skipped.push(r); }
+      }
+      for (const r of readWriterSkipped(f, 'writer_skip_rejected')) {
+        if (!seen.has(`r:${r.id}`)) { seen.add(`r:${r.id}`); rejected.push(r); }
+      }
+    }
+  } catch (err) {
+    console.warn(`[notes] writer-skip report failed for ${ref} (non-fatal): ${err.message}`);
+    return [];
+  }
+  // Reasons are model-written: sanitize again before they go to chat.
+  const line = (r) => `- ${String(r.reference).replace(/[^\w:.\-, ]/g, '')} ${String(r.sref).replace(/[^\w:.\-]/g, '')}: ${sanitizeSkipReason(r.reason)}`;
+  if (skipped.length) {
+    const lines = skipped.map(line);
+    console.warn(`[notes] ${ref}: writer skipped ${skipped.length} note(s):\n${lines.join('\n')}`);
+    await status(`**${ref}**: tn-writer skipped ${skipped.length} note(s) because the clauses are not really synonymous (no note shipped for these):\n${lines.join('\n')}`);
+  }
+  if (rejected.length) {
+    const lines = rejected.map(line);
+    console.warn(`[notes] ${ref}: writer returned the skip marker for ${rejected.length} item(s) that cannot be skipped:\n${lines.join('\n')}`);
+    await status(`⚠️ **${ref}**: tn-writer returned the skip marker for ${rejected.length} item(s) that cannot be skipped; treated as failed notes (missing from output):\n${lines.join('\n')}`);
+  }
+  return skipped;
 }
 
 // `<chapter>:intro` rows in an issues TSV (reference in column 1 or 2, with an
@@ -3845,12 +3922,14 @@ async function notesPipeline(route, message) {
       const signal = result.introSignal?.parallelism_signal || 'none';
       await status(
         `**${ref}**: issue-normalizer kept ${s.kept_parallelism_rows}/${s.total_parallelism_rows} parallelism rows ` +
-        `(exceptions: ${s.kept_parallelism_exceptions}, dropped: ${s.dropped_parallelism_rows}), intro signal: ${signal}.`
+        `(exceptions: ${s.kept_parallelism_exceptions}, simple-template repeats: ${s.kept_parallelism_repeats}, ` +
+        `dropped: ${s.dropped_parallelism_rows}), intro signal: ${signal}.`
       );
       console.log(
         `[notes] issue-normalizer ${ref}: ` +
         `parallelism total=${s.total_parallelism_rows}, kept=${s.kept_parallelism_rows}, ` +
-        `exceptions=${s.kept_parallelism_exceptions}, dropped=${s.dropped_parallelism_rows}, signal=${signal}`
+        `exceptions=${s.kept_parallelism_exceptions}, repeats=${s.kept_parallelism_repeats}, ` +
+        `dropped=${s.dropped_parallelism_rows}, signal=${signal}`
       );
 
       // Keep downstream prompts pinned to normalized issues path and intro hint.
@@ -4159,6 +4238,17 @@ async function notesPipeline(route, message) {
       // --- Per-note generation: direct API calls per note (replaces Claude Code sessions) ---
       let usedPerNote = false;
       if (skill.name === 'tn-writer' && USE_PER_NOTE_GENERATION && !hasVerseRange && !isDryRun) {
+        // assembleNotes drops skipped items from prepared_notes.json; a fallback
+        // writer must see every item, so keep the pre-run file to restore on failure.
+        let preparedSnapshot = null;
+        let preparedSnapshotPath = null;
+        try {
+          const prepRel = readContext(pipeDir)?.runtime?.preparedNotes;
+          if (prepRel) {
+            preparedSnapshotPath = path.resolve(CSKILLBP_DIR, prepRel);
+            preparedSnapshot = fs.readFileSync(preparedSnapshotPath, 'utf8');
+          }
+        } catch (_) { preparedSnapshot = null; }
         try {
           await status(`**${ref}**: Using per-note generation (direct API calls)...`);
           const perNoteResult = await runPerNoteGeneration({
@@ -4191,6 +4281,11 @@ async function notesPipeline(route, message) {
         } catch (err) {
           console.error(`[notes] Per-note generation failed, falling back to Claude sessions: ${err.message}`);
           usedPerNote = false; // Fall through to existing paths
+          if (preparedSnapshot !== null) {
+            try { fs.writeFileSync(preparedSnapshotPath, preparedSnapshot); } catch (e) {
+              console.warn(`[notes] could not restore prepared notes after per-note failure: ${e.message}`);
+            }
+          }
           // A throw after generated_notes.json was written leaves the same stale
           // file the !success branch resets.
           discardGeneratedNotes(pipeDir);
@@ -4658,6 +4753,7 @@ async function notesPipeline(route, message) {
           } catch (err) {
             console.warn(`[notes] fillTsvIds failed (non-fatal): ${err.message}`);
           }
+          await reportWriterSkippedNotes({ pipeDir, ref, tag, since: skillStart, status });
           await reportVersesWithoutNotes({ pipeDir, notesPath: skill.resolvedOutput || resolved, ref, stage: 'tn-writer', status });
           for (const s of skills) {
             if (s.name === 'tn-quality-check') {
