@@ -948,3 +948,8 @@ test('normalizeHebrewQuote still reports words that are genuinely absent', () =>
   const none = normalizeHebrewQuote(`${ABSENT} ${ABSENT}`.normalize('NFC'), JER_29_4_UHB);
   assert.equal(none.status, 'no_words_match');
 });
+
+test('resolveTemplateText never returns the hint_only parallelism-repeat built-in as the default template', () => {
+  const { resolveTemplateText } = require('../src/workspace-tools/quality-tools');
+  assert.equal(resolveTemplateText({}, 'rc://*/ta/man/translate/figs-parallelism'), '');
+});

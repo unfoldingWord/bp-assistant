@@ -563,8 +563,9 @@ function resolveTemplateText(prepItem, sref) {
   if (direct) return direct;
   const slug = sref ? (String(sref).match(/translate\/([^\s;,]+)/) || [])[1] : '';
   if (!slug) return '';
-  const tpls = loadTemplateMap().get(slug);
-  return tpls && tpls.length === 1 ? tpls[0].template : '';
+  // hint_only built-ins (parallelism-repeat) are never the issue's default template.
+  const tpls = (loadTemplateMap().get(slug) || []).filter((t) => !t.hint_only);
+  return tpls.length === 1 ? tpls[0].template : '';
 }
 
 function detectSelfTalk(noteText) {
