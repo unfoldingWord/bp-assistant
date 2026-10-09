@@ -16,12 +16,14 @@ const { sendMessage, sendDM, addReaction, removeReaction } = require('./zulip-cl
 const { runClaude, DEFAULT_RESTRICTED_TOOLS, isTransientOutageError, isGuardrailStop, resultIndicatesPermissionWall, resultIndicatesPermissionStall } = require('./claude-runner');
 const { createGuardHooks } = require('./guard-hooks');
 const { resolveAutoModel } = require('./api-runner/provider-config');
-const { getDoor43Username, emailToFallbackUsername, buildBranchName, resolveOutputFile, discoverFreshOutput, checkPrerequisites, calcSkillTimeout, normalizeBookName, resolveConflictMention, parsePartialTsv, truncatePartialTsv, parseChunkRange, isUsageLimitError, CSKILLBP_DIR } = require('./pipeline-utils');
+const { getDoor43Username, emailToFallbackUsername, buildBranchName, resolveOutputFile, discoverFreshOutput, checkPrerequisites, calcSkillTimeout, calcVerseSpanTimeout, normalizeBookName, resolveConflictMention, parsePartialTsv, truncatePartialTsv, parseChunkRange, isUsageLimitError, CSKILLBP_DIR } = require('./pipeline-utils');
 const { splitTsv, fixTrailingNewlines } = require('./workspace-tools/tsv-tools');
-const { fillTsvIds, generateIds, prepareNotes, fillOrigQuotes, resolveGlQuotes, flagNarrowQuotes, extractAlignmentData, prepareATContext, substituteAT, fixUnicodeQuotes, verifyBoldMatches, syncCanonicalHebrewQuotes, applyHintsToPreparedNotes, _stripAlternateTranslation: stripAlternateTranslation } = require('./workspace-tools/tn-tools');
+const { fillTsvIds, generateIds, prepareNotes, fillOrigQuotes, resolveGlQuotes, flagNarrowQuotes, extractAlignmentData, prepareATContext, substituteAT, fixUnicodeQuotes, verifyBoldMatches, syncCanonicalHebrewQuotes, applyHintsToPreparedNotes, applyKeptToPreparedNotes, keptRefVerseSpan, parsePlainUsfmVersesFromText, detectIssuesTsvLayout, extractIssuesTsvRow, _stripAlternateTranslation: stripAlternateTranslation } = require('./workspace-tools/tn-tools');
 const { checkTnQuality, detectSelfTalk, templateFirstPhrase, resolveTemplateText } = require('./workspace-tools/quality-tools');
 const { buildBookRecurrenceIndex, deriveRecurrenceKeys, buildSeeHowSentence, isSeeHowEligible, isContextDependentSref, dedupeAlsoOccursVerses, assignAlsoOccursVerses, resolveDoor43ReposPath, hebTokens, verseNumber: recurrenceVerseNumber, SEE_HOW_NEVER_FOLD_SREFS, CROSS_BOOK_MAX_BOOKS } = require('./workspace-tools/recurrence-index');
 const { normalizeIssuesFile, buildParallelismIntroHintArgs } = require('./issue-normalizer');
+const { runIssueRulesGate, gatePrBodyForPush, refreshGateSidecarOutputHash, readGateSidecar } = require('./issue-rules-gate');
+const { dropTwCoveredRows } = require('./tw-article-gate');
 const { curlyQuotes } = require('./workspace-tools/usfm-tools');
 const { verifyRepoPush, verifyDcsToken, verifyRemoteContent } = require('./repo-verify');
 const { recordMetrics, getCumulativeTokens, recordRunSummary, getAdaptiveSkillGuardrails } = require('./usage-tracker');
@@ -395,7 +397,7 @@ function buildRecurrenceIndexFile({ pipeDir, contextPath }) {
  *
  * @returns {Promise<string|null>} the detection summary, or null on failure
  */
-async function runShardSeeHowDetection({ contextPath, issuesPath, status, generateIdsFn }) {
+async function runShardSeeHowDetection({ contextPath, issuesPath, status, generateIdsFn, kept = null, chapter = null }) {
   const noop = async () => {};
   try {
     await runMechanicalPrep({ issuesPath, contextPath, status: status || noop });
@@ -403,13 +405,23 @@ async function runShardSeeHowDetection({ contextPath, issuesPath, status, genera
     console.warn(`[notes] Shard mechanical prep failed (non-fatal): ${err.message}`);
     return null;
   }
+  // Same order as the whole-chapter path: drop kept duplicates before see-how.
+  if (Array.isArray(kept) && kept.length > 0) {
+    try {
+      const preparedJson = readContextAt(null, contextPath).runtime.preparedNotes;
+      const { itemsRemoved } = applyKeptToPreparedNotes({ preparedJson, kept, chapter });
+      if (itemsRemoved) console.log(`[notes] Shard ${contextPath}: ${itemsRemoved} AI notes dropped as duplicates of kept notes`);
+    } catch (err) {
+      console.warn(`[notes] Shard kept-duplicate drop failed (non-fatal): ${err.message}`);
+    }
+  }
   try {
     buildRecurrenceIndexFile({ contextPath });
   } catch (err) {
     console.warn(`[notes] Shard recurrence index failed (non-fatal): ${err.message}`);
   }
   try {
-    const summary = await runSeeHowDetection({ contextPath, generateIdsFn });
+    const summary = await runSeeHowDetection({ contextPath, generateIdsFn, kept });
     console.log(`[notes] Shard see-how (${contextPath}): ${summary}`);
     return summary;
   } catch (err) {
@@ -448,7 +460,7 @@ const CROSS_BOOK_INDEX_REL = 'data/cache/crossbook_seehow_index.json';
  * @param {string} args.pipeDir - Pipeline working directory
  * @returns {Promise<string>} Summary of see-how detections
  */
-async function runSeeHowDetection({ pipeDir, contextPath, generateIdsFn = generateIds }) {
+async function runSeeHowDetection({ pipeDir, contextPath, generateIdsFn = generateIds, kept = null }) {
   const ctx = readContextAt(pipeDir, contextPath);
   const prepPath = path.resolve(CSKILLBP_DIR, ctx.runtime.preparedNotes);
   const prepared = JSON.parse(fs.readFileSync(prepPath, 'utf8'));
@@ -729,6 +741,19 @@ async function runSeeHowDetection({ pipeDir, contextPath, generateIdsFn = genera
   };
   const injections = [];
   const injectedAt = new Set();
+  // An editor-kept note already sits at its verse and quote in en_tn: claim
+  // those slots so no pointer is synthesized there (its repeats keep their own
+  // notes instead of folding into a pointer that would duplicate the kept one).
+  for (const k of kept || []) {
+    const span = k.quote ? keptRefVerseSpan(k.ref, chapter) : null;
+    if (!span) continue;
+    // Claim both token forms of a discontinuous "a & b" quote: split on "&"
+    // (as recurrence keys are built) and as written.
+    const forms = new Set([String(k.quote).split('&').flatMap(hebTokens).join('+'), hebTokens(k.quote).join('+')]);
+    for (let v = span.lo; v <= span.hi && v - span.lo < 200; v++) {
+      for (const toks of forms) injectedAt.add(`${chapter}:${v}|${toks}`);
+    }
+  }
 
   // Resolve every anchor -- prepared groups and standalone injections alike --
   // before assigning any corpus-derived verses: which key may list which verses
@@ -1834,6 +1859,304 @@ function buildIssuesPath(book, tag, hasVerseRange, verseStart, verseEnd) {
   return `output/issues/${book}/${tag}-v${verseStart}-${verseEnd}.tsv`;
 }
 
+// --- Issue gap-fill -----------------------------------------------------------
+// A whole-chapter run can leave verses with zero issues (EZK 40: v8, 11, 23,
+// 25-37, ...), so tn-writer writes nothing there and legacy notes survive.
+// When 2+ verses are empty we re-run deep-issue-id over their span and merge
+// only the rows for the empty verses.
+
+// Parse an issues-TSV reference ("40:8", "EZK 40:8-9") into { start, end } for
+// the given chapter. Returns null for intro/front rows, other chapters, or junk.
+function parseIssueRefVerses(ref, chapter) {
+  const m = String(ref || '').trim().match(/^(?:[A-Za-z0-9]{2,3}\s+)?(\d+):(\d+)(?:-(\d+)(?![\d:]))?/);
+  if (!m || parseInt(m[1], 10) !== Number(chapter)) return null;
+  const start = parseInt(m[2], 10);
+  const end = m[3] ? parseInt(m[3], 10) : start;
+  return { start, end: Math.max(start, end) };
+}
+
+function splitIssueRows(text) {
+  const eol = String(text || '').includes('\r\n') ? '\r\n' : '\n';
+  const lines = String(text || '').split(/\r?\n/);
+  const trailing = lines.length > 0 && lines[lines.length - 1] === '';
+  if (trailing) lines.pop();
+  return { lines, eol, trailing };
+}
+
+function issueRowRefs(lines, book, chapter) {
+  const nonBlank = lines.filter((l) => l.trim());
+  const layout = detectIssuesTsvLayout(nonBlank);
+  const headerLine = layout.skipFirstLine ? nonBlank[0] : null;
+  return lines.map((line) => {
+    if (!line.trim() || line === headerLine) return null;
+    const row = extractIssuesTsvRow(line.split('\t'), layout.colMap, book);
+    return parseIssueRefVerses(row.reference, chapter);
+  });
+}
+
+function ultVerseNumbers(ultPlainText, chapter) {
+  const ultVerses = parsePlainUsfmVersesFromText(ultPlainText);
+  const nums = new Set();
+  for (const key of Object.keys(ultVerses)) {
+    const [c, v] = key.split(':').map(Number);
+    if (c === Number(chapter) && Number.isFinite(v)) nums.add(v);
+  }
+  return nums;
+}
+
+// keptRefs: ref strings ("40:12", "40:12-14", "40:48-41:2") of editor-kept
+// notes. A verse they cover already has a note in en_tn, so it is not empty
+// for gap-fill.
+function findEmptyVerses({ issuesText, ultPlainText, chapter, book = '', keptRefs = [] }) {
+  const wanted = ultVerseNumbers(ultPlainText, chapter);
+  if (wanted.size === 0) return [];
+  const { lines } = splitIssueRows(issuesText);
+  const covered = new Set();
+  for (const r of issueRowRefs(lines, book, chapter)) {
+    if (!r) continue;
+    for (let v = r.start; v <= r.end && v - r.start < 200; v++) covered.add(v);
+  }
+  for (const kr of keptRefs || []) {
+    const span = keptRefVerseSpan(kr, chapter);
+    if (!span) continue;
+    for (let v = span.lo; v <= span.hi && v - span.lo < 200; v++) covered.add(v);
+  }
+  return [...wanted].filter((v) => !covered.has(v)).sort((a, b) => a - b);
+}
+
+function mergeGapIssues({ chapterText, shardText, verses, chapter, book = '', knownVerses = null }) {
+  const gap = new Set(verses || []);
+  const chapterRows = splitIssueRows(chapterText);
+  const shardRows = splitIssueRows(shardText);
+  const shardRefs = issueRowRefs(shardRows.lines, book, chapter);
+  const newRows = [];
+  shardRows.lines.forEach((line, i) => {
+    const r = shardRefs[i];
+    if (!r) return;
+    // Admit a row only when every verse in its range is a gap verse. A verse
+    // that is not its own ULT verse (the tail of a \v 6-7 bridge, keyed by 6)
+    // does not count against the row.
+    if (r.end - r.start >= 200) return;
+    let fillsGap = false;
+    for (let v = r.start; v <= r.end; v++) {
+      if (gap.has(v)) fillsGap = true;
+      else if (!(knownVerses && !knownVerses.has(v))) return;
+    }
+    if (!fillsGap) return;
+    newRows.push({ line, start: r.start });
+  });
+  if (newRows.length === 0) return { text: chapterText, added: 0 };
+
+  const lines = chapterRows.lines.slice();
+  for (const nr of newRows) {
+    const refs = issueRowRefs(lines, book, chapter);
+    let at = -1;
+    for (let i = 0; i < lines.length; i++) {
+      if (refs[i] && refs[i].start <= nr.start) at = i + 1;
+    }
+    if (at === -1) {
+      // Before the first existing verse row; after any header/intro rows.
+      const first = refs.findIndex((r) => r);
+      at = first === -1 ? lines.length : first;
+    }
+    lines.splice(at, 0, nr.line);
+  }
+  const eol = chapterRows.lines.length ? chapterRows.eol : shardRows.eol;
+  const trailing = chapterRows.lines.length ? chapterRows.trailing : true;
+  return { text: lines.join(eol) + (trailing ? eol : ''), added: newRows.length };
+}
+
+// The --verses span runs from the first to the last empty verse, so it mostly
+// holds verses that already have issues. Without the target list the analysts
+// spend their rows there (thrown away by mergeGapIssues) and skip the empty
+// verses as "repeats": EZK 40 gap-fill over 8-47 kept 4 of 42 rows and left
+// 25-36 empty.
+function buildGapFillHint({ verses, issuesPath }) {
+  const list = verses.join(', ');
+  return DEEP_ISSUE_ID_HINT + '\n\n' +
+    `GAP-FILL RUN. Target verses: ${list}. The other verses in the --verses span are already covered (by rows ` +
+    `in ${issuesPath} or by editor-kept notes), and only rows for the target verses are kept; rows for any ` +
+    'other verse are discarded. Put the target verse list in every analyst and challenger prompt, and have ' +
+    'each analyst read every target verse closely. The skill\'s usual selectivity and challenger rules still ' +
+    `apply. The first-occurrence rule changes in one way: a phrase that already has a row in ${issuesPath} ` +
+    'with the same issue type is covered (the pipeline handles later occurrences), but a phrase with no such ' +
+    'row should be flagged in the first target verse where it occurs, even if an earlier non-target verse ' +
+    'has the same wording. A target verse may truly need no issue; do not invent one.';
+}
+
+async function fillIssueGaps({
+  book, ch, issuesPath, contextPath, ctxFlag = '', ultPlainPath, pipeDir, model, status = async () => {},
+  userId, runClaudeImpl = runClaude, recordMetricsImpl = recordMetrics, keptRefs = [],
+}) {
+  const out = { empty: [], added: 0, remaining: [], pause: null, error: null };
+  const ref = `${book} ${ch}`;
+  const width = book.toUpperCase() === 'PSA' ? 3 : 2;
+  const tag = `${book}-${String(ch).padStart(width, '0')}`;
+  const pipeAbs = path.resolve(CSKILLBP_DIR, pipeDir || path.join('tmp', 'pipeline', tag));
+  let shardAbs = null;
+  let preexistingAside = null;
+  // Set once the chapter issues are snapshotted; the finally block restores the
+  // snapshot if the run damaged the file and we did not write the merge.
+  let issuesAbsForRestore = null;
+  let chapterSnapshot = null;
+  let mergeWritten = false;
+  const writeMarker = () => {
+    try {
+      fs.mkdirSync(pipeAbs, { recursive: true });
+      fs.writeFileSync(path.join(pipeAbs, 'gapfill-done.json'), JSON.stringify({
+        empty: out.empty, added: out.added, remaining: out.remaining, error: out.error, at: new Date().toISOString(),
+      }));
+    } catch (_) { /* marker is best-effort */ }
+  };
+  try {
+    const issuesAbs = path.resolve(CSKILLBP_DIR, issuesPath);
+    const ultAbs = ultPlainPath ? path.resolve(CSKILLBP_DIR, ultPlainPath) : null;
+    let ultText = '';
+    try { ultText = ultAbs ? fs.readFileSync(ultAbs, 'utf8') : ''; } catch (_) { ultText = ''; }
+    if (ultVerseNumbers(ultText, ch).size === 0) {
+      await status(`**${ref}**: issue gap-fill skipped: no ULT verse list`);
+      writeMarker();
+      return out;
+    }
+    if (!fs.existsSync(issuesAbs)) { writeMarker(); return out; }
+    const empty = findEmptyVerses({
+      issuesText: fs.readFileSync(issuesAbs, 'utf8'), ultPlainText: ultText, chapter: ch, book, keptRefs,
+    });
+    out.empty = empty;
+    out.remaining = empty;
+    if (empty.length < 2) { writeMarker(); return out; }
+    // Snapshot the chapter issues so the merge base cannot be changed by the run.
+    chapterSnapshot = fs.readFileSync(issuesAbs, 'utf8');
+    issuesAbsForRestore = issuesAbs;
+
+    const S = empty[0];
+    const E = empty[empty.length - 1];
+    const shardRel = buildIssuesPath(book, tag, true, S, E);
+    shardAbs = path.resolve(CSKILLBP_DIR, shardRel);
+    fs.mkdirSync(path.dirname(shardAbs), { recursive: true });
+    fs.mkdirSync(pipeAbs, { recursive: true });
+    // A real file already at the shard path belongs to someone else: park it and
+    // restore it when we finish.
+    if (fs.existsSync(shardAbs) && fs.statSync(shardAbs).size > 0) {
+      preexistingAside = path.join(pipeAbs, `gapfill-preexisting-v${S}-${E}.tsv`);
+      fs.copyFileSync(shardAbs, preexistingAside);
+    }
+    fs.writeFileSync(shardAbs, ''); // stub so Claude skips Read-before-Write
+
+    await status(`**${ref}**: ${empty.length} verses have no issues (${empty.join(', ')}); re-running issue finding over ${S}-${E}...`);
+
+    // Same per-verse-per-op idea as calcSkillTimeout, over the span (ops 3 as deep-issue-id).
+    const timeoutMs = calcVerseSpanTimeout(E - S + 1, 3);
+    const guardrails = buildSkillGuardrails({
+      pipeline: 'notes', skill: 'deep-issue-id', book, chapter: ch, issuesPath, contextPath,
+    });
+    const toolConfig = getSkillToolConfig('deep-issue-id');
+    let result = null;
+    let runErr = null;
+    try {
+      result = await runClaudeImpl({
+        prompt: `${book} ${ch} --verses ${S}-${E}${ctxFlag}`,
+        label: `${ref} deep-issue-id gap-fill`,
+        cwd: CSKILLBP_DIR,
+        // Same precedence as the main skill loop (no per-skill model here).
+        model: model || (process.env.BP_AUTO_MODEL === '1'
+          ? resolveAutoModel('claude', null, 'xhigh')
+          : undefined),
+        thinking: 'xhigh',
+        skill: 'deep-issue-id',
+        tools: toolConfig.tools,
+        disallowedTools: toolConfig.disallowedTools,
+        enableBash: toolConfig.enableBash,
+        bypassPermissions: true,
+        disableLocalSettings: true,
+        timeoutMs,
+        maxTurns: guardrails.maxTurns,
+        appendSystemPrompt: buildGapFillHint({ verses: empty, issuesPath }),
+        mcpToolSet: 'issue-id',
+        guardrails,
+        hooks: process.env.BP_GUARD_HOOKS === '1'
+          ? createGuardHooks({ pipelineType: 'notes', scope: ref, publish: true })
+          : undefined,
+      });
+    } catch (err) {
+      runErr = err;
+    }
+    try {
+      recordMetricsImpl({
+        pipeline: 'notes', skill: 'deep-issue-id-gapfill', book, chapter: ch, result,
+        success: !runErr && result?.subtype === 'success', userId,
+      });
+    } catch (_) { /* metrics are best-effort */ }
+
+    const errText = runErr
+      ? (runErr.message || String(runErr))
+      : (!result ? 'timed out or was aborted (no result returned)'
+        : (result.subtype !== 'success' ? (result.error || result.result || `non-success subtype: "${result.subtype}"`) : null));
+    if (errText) {
+      out.error = errText;
+      if (runErr && isTransientOutageError(runErr)) out.pause = 'outage';
+      else if (isUsageLimitError(errText)) out.pause = 'usage_limit';
+      // The caller posts the pause message; only non-pause failures continue quietly.
+      if (!out.pause) {
+        await status(`**${ref}**: issue gap-fill failed (${errText}); continuing with the original issues.`);
+        writeMarker();
+      }
+      return out;
+    }
+
+    let shardText = '';
+    try { shardText = fs.readFileSync(shardAbs, 'utf8'); } catch (_) { shardText = ''; }
+    const merged = mergeGapIssues({
+      chapterText: chapterSnapshot, shardText, verses: empty, chapter: ch, book,
+      knownVerses: ultVerseNumbers(ultText, ch),
+    });
+    // Always write from the snapshot: deep-issue-id only writes its range file,
+    // but if it touched the chapter file this puts it back.
+    fs.writeFileSync(issuesAbs, merged.text);
+    mergeWritten = true;
+    out.added = merged.added;
+    const nowEmpty = findEmptyVerses({ issuesText: merged.text, ultPlainText: ultText, chapter: ch, book, keptRefs });
+    out.remaining = nowEmpty;
+
+    if (merged.added === 0) {
+      out.error = 'no rows for the empty verses';
+      await status(`**${ref}**: issue gap-fill found no new issues; verses still empty: ${nowEmpty.join(', ') || 'none'}.`);
+    } else {
+      await status(`**${ref}**: issue gap-fill added ${merged.added} row(s); verses still empty: ${nowEmpty.join(', ') || 'none'}.`);
+    }
+    writeMarker();
+    return out;
+  } catch (err) {
+    out.error = err.message;
+    console.warn(`[notes] issue gap-fill error (non-fatal): ${err.stack || err.message}`);
+    try { await status(`**${ref}**: issue gap-fill failed (${err.message}); continuing with the original issues.`); } catch (_) { /* ignore */ }
+    writeMarker();
+    return out;
+  } finally {
+    // The gap-fill's own shard/stub must never stay in output/issues/ (it would
+    // collide with splitTsv chunk names / checkPrerequisites). Keep a copy of
+    // any non-empty shard in the pipe dir for debugging.
+    if (shardAbs) {
+      try {
+        if (fs.existsSync(shardAbs) && fs.statSync(shardAbs).size > 0) {
+          fs.mkdirSync(pipeAbs, { recursive: true });
+          fs.copyFileSync(shardAbs, path.join(pipeAbs, `gapfill-${path.basename(shardAbs)}`));
+        }
+      } catch (e) { console.warn(`[notes] gap-fill shard copy failed (non-fatal): ${e.message}`); }
+      try { fs.unlinkSync(shardAbs); } catch (_) { /* already gone */ }
+      if (preexistingAside) {
+        try { fs.copyFileSync(preexistingAside, shardAbs); } catch (e) { console.warn(`[notes] restoring pre-existing shard failed: ${e.message}`); }
+      }
+    }
+    if (issuesAbsForRestore && !mergeWritten) {
+      try {
+        const now = fs.existsSync(issuesAbsForRestore) ? fs.readFileSync(issuesAbsForRestore, 'utf8') : null;
+        if (now !== chapterSnapshot) fs.writeFileSync(issuesAbsForRestore, chapterSnapshot);
+      } catch (e) { console.warn(`[notes] restoring chapter issues snapshot failed: ${e.message}`); }
+    }
+  }
+}
+
 function buildChapterIntroPrompt(skillRef, issuesPath, ctxFlag, introHintArgs = '') {
   return `${skillRef} --issues ${issuesPath}${ctxFlag}${introHintArgs || ''}`;
 }
@@ -1858,6 +2181,7 @@ function cleanupNotesArtifacts({ book, chapter, verseStart, verseEnd }) {
     `output/issues/${verseTag}.tsv`,
     `output/issues/${book}/${tag}.tsv`,
     `output/issues/${book}/${verseTag}.tsv`,
+    ...(hasVerseRange ? [`output/issues/${book}/${tag}-v${verseStart}-${verseEnd}.tsv`] : []),
     // notes
     `output/notes/${tag}.tsv`,
     `output/notes/${verseTag}.tsv`,
@@ -1869,6 +2193,14 @@ function cleanupNotesArtifacts({ book, chapter, verseStart, verseEnd }) {
     `output/quality/${book}/${tag}-quality.md`,
     `output/quality/${book}/${tag}-quality.json`,
   ];
+  // issue-rules-gate outputs (named after the issues file: chapter, -vv or -v shard)
+  const gateBases = [tag, verseTag];
+  if (hasVerseRange) gateBases.push(`${tag}-v${verseStart}-${verseEnd}`);
+  for (const gb of gateBases) {
+    for (const suffix of ['-pre-rules-gate.tsv', '-rules-gate.md', '-rules-gate.json']) {
+      candidates.push(`output/review/${book.toUpperCase()}/${gb}${suffix}`);
+    }
+  }
 
   for (const rel of candidates) {
     removeIfExists(path.resolve(CSKILLBP_DIR, rel));
@@ -1961,6 +2293,36 @@ function countNoteRows(notesPath) {
     count++;
   }
   return count;
+}
+
+// `<chapter>:intro` rows in an issues TSV (reference in column 1 or 2, with an
+// optional prefix of this book's code). chapter-intro edits the issues file in
+// place, so a rerun starts with the earlier run's intro row there (EZK 40, #438).
+function isIntroRowLine(line, chapter, book) {
+  const bookCode = String(book || '').replace(/[^A-Za-z0-9]/g, '');
+  const introRef = new RegExp(`^(?:${bookCode}\\s+)?0*${Number(chapter)}:intro$`, 'i');
+  return line.split('\t').slice(0, 2).some((col) => introRef.test(col.trim()));
+}
+
+function issuesFileHasIntroRow(absPath, chapter, book) {
+  let text = '';
+  try { text = fs.readFileSync(absPath, 'utf8'); } catch (_) { return false; }
+  return text.split(/\r?\n/).some((line) => isIntroRowLine(line, chapter, book));
+}
+
+// Remove the chapter's intro rows so chapter-intro has to write a fresh one.
+// Each kept line keeps its own line ending. Returns { removed, before }, where
+// before is the original text (null when nothing was removed); the file is only
+// rewritten when it changes.
+function stripIntroRows(absPath, chapter, book) {
+  let text = '';
+  try { text = fs.readFileSync(absPath, 'utf8'); } catch (_) { return { removed: 0, before: null }; }
+  const lines = text.split(/(?<=\n)/);
+  const kept = lines.filter((line) => !isIntroRowLine(line.replace(/\r?\n$/, ''), chapter, book));
+  const removed = lines.length - kept.length;
+  if (removed === 0) return { removed: 0, before: null };
+  fs.writeFileSync(absPath, kept.join(''));
+  return { removed, before: text };
 }
 
 const POINTER_NOTE_RE = /^\s*See how\b/i;
@@ -2166,6 +2528,8 @@ function buildParsedNotesRequest(route, content) {
       // Zulip-triggered runs fall through to parseWriteNotesCommand and
       // never carry hints.
       hints: Array.isArray(route._hints) && route._hints.length > 0 ? route._hints : null,
+      // Editor-kept notes (API-origin only), same reasoning as hints.
+      kept: Array.isArray(route._kept) && route._kept.length > 0 ? route._kept : null,
     };
   }
   return parseWriteNotesCommand(content);
@@ -2376,7 +2740,7 @@ function appendIssueTagsToTsv(tsvRelPath, unresolvedFindings) {
 async function runParallelTnWriter({
   book, ch, tag, issuesPath, outputPath, ctxFlag, model,
   timeoutMs, appendSystemPrompt, checkpointRef, existingShards,
-  status, isDryRun, skillRef,
+  status, isDryRun, skillRef, kept = null,
 }) {
   // Split issues into chunks
   const chunkResult = splitTsv({ inputTsv: issuesPath, chunkSize: TN_WRITER_CHUNK_SIZE });
@@ -2498,7 +2862,7 @@ async function runParallelTnWriter({
       // the prepared notes the writer session reads are the post-detection ones.
       const shardContextRel = parseContextPathFlag(shardCtxFlag);
       if (shardContextRel) {
-        await runShardSeeHowDetection({ contextPath: shardContextRel, issuesPath: shard.chunkPath });
+        await runShardSeeHowDetection({ contextPath: shardContextRel, issuesPath: shard.chunkPath, kept, chapter: ch });
       }
 
       console.log(`[notes] tn-writer shard ${i}: ${prompt}`);
@@ -2673,6 +3037,9 @@ async function notesPipeline(route, message) {
   const { book, startChapter, endChapter, verseStart, verseEnd, withIntro, fresh, pauseBeforeATs } = parsed;
   // Editor-marked TN hints (API-origin only; null on Zulip path).
   const hints = parsed.hints || null;
+  let kept = parsed.kept || null;
+  // Plain array so it serializes into deferredChapters (insertion-resume).
+  let keptIds = kept ? kept.map((k) => k.rowId) : [];
   const sessionKey = stream ? `stream-${stream}-${topic}` : `dm-${message.sender_id}`;
   const checkpointRef = {
     sessionKey,
@@ -2724,19 +3091,23 @@ async function notesPipeline(route, message) {
   // we continue generating but defer all pushes until the user says "merged".
   let deferredPush = false;
   let deferredConflicts = [];   // [{ branch }]
-  const deferredChapters = [];  // [{ ch, notesSource }]
+  const deferredChapters = [];  // [{ ch, notesSource, body }]
   let abortForUsageLimit = false;
   let abortForOutage = false;
   let usageLimitTag = null;
   let resumeChapter = Number(existingCheckpoint?.resume?.chapter || startChapter);
   let resumeSkill = existingCheckpoint?.resume?.skill || null;
+  // A rules-gate pause records gatePending so the resumed chapter still runs
+  // the gate even when it resumes at a downstream skill such as tn-writer.
+  const resumeGatePending = !!existingCheckpoint?.resume?.gatePending;
   const skillOutputs = existingCheckpoint?.skillOutputs || {};
 
   const canResumeFromCheckpoint = (
     existingCheckpoint?.resume?.chapter != null &&
     (existingCheckpoint?.state === 'paused_for_outage' || existingCheckpoint?.state === 'paused_for_usage_limit' || existingCheckpoint?.state === 'failed' || existingCheckpoint?.state === 'running')
   );
-  if (!fresh && canResumeFromCheckpoint && resumeChapter >= startChapter) {
+  const resumingFromCheckpoint = !fresh && canResumeFromCheckpoint && resumeChapter >= startChapter;
+  if (resumingFromCheckpoint) {
     // The resume chapter was counted as failed in the previous run; undo that
     // so it isn't double-counted if it succeeds this time.
     if (totalFail > 0) totalFail--;
@@ -2746,12 +3117,21 @@ async function notesPipeline(route, message) {
     resumeChapter = startChapter;
     resumeSkill = null;
   }
+  // A resume that arrives without the kept list (a bare "resume" in the topic
+  // rebuilds the route from the checkpoint) reuses the list the run started
+  // with; otherwise a whole-chapter replace would delete the kept rows.
+  if (!kept && resumingFromCheckpoint && Array.isArray(existingCheckpoint?.kept) && existingCheckpoint.kept.length > 0) {
+    kept = existingCheckpoint.kept;
+    keptIds = kept.map((k) => k.rowId);
+    await status(`Using the ${kept.length} kept notes saved with this run's checkpoint.`);
+  }
   setCheckpoint(checkpointRef, {
     state: 'running',
     totalSuccess,
     totalFail,
     skillOutputs,
-    resume: { chapter: resumeChapter, skill: resumeSkill },
+    kept: kept || null,
+    resume: { chapter: resumeChapter, skill: resumeSkill, ...(resumeGatePending && resumingFromCheckpoint ? { gatePending: true } : {}) },
   });
 
   // =========================================================================
@@ -2812,9 +3192,13 @@ async function notesPipeline(route, message) {
     let issuesPath;
     let issuesBackupPath = null;
     let failedSkill = null;
+    let introBackup = null; // issues file before chapter-intro removed its earlier intro row
     const chapterStart = Date.now();
     let chapterIntroHintArgs = '';
     let issueNormalizationDone = false;
+    let issueRulesGateDone = false;
+    let issueRulesGateResult = null;
+    let issueRulesGatePaused = false;
 
     // --- Build pipeline context (fetch authoritative ULT/UST from Door43) ---
     let contextPath = null;
@@ -3014,8 +3398,64 @@ async function notesPipeline(route, message) {
     if (chOutputs['deep-issue-id']) issuesPath = chOutputs['deep-issue-id'];
     else if (chOutputs['post-edit-review']) issuesPath = chOutputs['post-edit-review'];
 
+    async function reportTwDrops(tw) {
+      if (!tw.ran) {
+        await status(`**${ref}**: tW article check skipped (${tw.reason}); rows left as they were`);
+        return;
+      }
+      if (!tw.dropped.length) return;
+      // A chapter the rules gate already sealed must not look edited to its next run.
+      refreshGateSidecarOutputHash({ issuesPath, book });
+      const list = tw.dropped.map((d) => `${d.ref} ${d.quote}`).join('; ');
+      console.log(`[notes] tw-article-gate ${ref}: dropped ${tw.dropped.length} translate-names/translate-unknown row(s) covered by a tW article: ${list}`);
+      await status(`**${ref}**: tW article check: dropped ${tw.dropped.length} translate-names/translate-unknown row(s) for terms with a tW article (${list})`);
+    }
+
     async function runIssueNormalizationStage() {
       if (!issuesPath || issueNormalizationDone) return;
+
+      // Gap-fill: whole-chapter runs only, never dry-run, never when resuming at
+      // a downstream skill. Runs before normalization so new rows go through the
+      // normalizer and the issue-rules gate.
+      // Skip only when resuming AFTER tn-writer: a gap-fill pause resumes at
+      // tn-writer (gatePending) and must be retried. A marker from an earlier
+      // attempt skips a repeat on resume, unless the issue producer is being
+      // re-run (the issues file was regenerated). A fresh run archives pipeDir,
+      // so it never inherits an old marker.
+      const gapFillSkipResumeSkills = new Set(['tn-quality-check', 'door43-push', 'door43-push-done']);
+      const gapFillResumeMarker = isResumingThisChapter && !issueProducerSkillNames.has(resumeSkill) && pipeDir
+        && fs.existsSync(path.resolve(CSKILLBP_DIR, pipeDir, 'gapfill-done.json'));
+      // A resume at tn-writer reaches here only to re-run a pending gate; rows
+      // added now would otherwise skip the gate, so gap-fill only when it is pending.
+      const gapFillSkipForResume = isResumingThisChapter
+        && (gapFillSkipResumeSkills.has(resumeSkill) || (resumeSkill === 'tn-writer' && !resumeGatePending));
+      if (!hasVerseRange && !isDryRun && !gapFillSkipForResume && !gapFillResumeMarker && !pipeDir) {
+        await status(`**${ref}**: issue gap-fill skipped: no pipeline context`);
+      }
+      if (!hasVerseRange && !isDryRun && !gapFillSkipForResume && !gapFillResumeMarker && pipeDir) {
+        let ultPlainPath = null;
+        try { ultPlainPath = readContext(pipeDir).sources?.ultPlain || null; } catch (_) { ultPlainPath = null; }
+        const gap = await fillIssueGaps({
+          book, ch, issuesPath, contextPath, ctxFlag, ultPlainPath, pipeDir, model, status,
+          userId: message.sender_id,
+          keptRefs: kept ? kept.map((k) => k.ref) : [],
+        });
+        if (gap.pause) {
+          // Same abort handling as a usage-limit / outage in the skills loop: stop
+          // spending into an outage. The issues file is unchanged.
+          issueRulesGatePaused = true;
+          if (gap.pause === 'usage_limit') {
+            abortForUsageLimit = true;
+            usageLimitTag = buildUsageLimitResetTag(gap.error);
+            const when = usageLimitTag ? ` around ${usageLimitTag}` : ' after the limit resets';
+            await status(`**issue gap-fill** paused for ${ref}: usage limit reached. Retry${when}.`);
+          } else {
+            abortForOutage = true;
+            await status(`**issue gap-fill** paused for ${ref}: Claude transient outage (${gap.error}).`);
+          }
+          return;
+        }
+      }
       const result = normalizeIssuesFile({
         issuesPath,
         options: {
@@ -3025,13 +3465,102 @@ async function notesPipeline(route, message) {
         },
       });
       issueNormalizationDone = true;
+      let introSignal = result.introSignal;
 
-      if (withIntro) {
-        chapterIntroHintArgs = buildParallelismIntroHintArgs(result.introSignal);
+      // tW article check: translate-names / translate-unknown rows for terms that already
+      // have a tW article are dropped here, before the rules gate spends a model pass on them.
+      await reportTwDrops(dropTwCoveredRows({ issuesPath }));
+
+      // Issue rules gate: once per chapter, after normalization. Skipped when
+      // this chapter resumes at a downstream skill (the gate already ran, or
+      // the chapter was past it).
+      const gateSkippedForResume = isResumingThisChapter && downstreamResumeSkills.has(resumeSkill) && !resumeGatePending;
+      // When the gate is skipped here, issueRulesGateResult stays null and the
+      // push reads the earlier run's PR summary from the sidecar (gatePrBodyForPush).
+      if (!issueRulesGateDone && !gateSkippedForResume) {
+        issueRulesGateDone = true;
+        let gateCtx = null;
+        try { gateCtx = pipeDir ? readContext(pipeDir) : null; } catch (_) { gateCtx = null; }
+        const gate = await runIssueRulesGate({
+          issuesPath,
+          book,
+          chapter: ch,
+          verseStart: hasVerseRange ? verseStart : undefined,
+          verseEnd: hasVerseRange ? verseEnd : undefined,
+          ctx: gateCtx,
+          hints,
+          kept,
+          config: config,
+          env: process.env,
+          dryRun: isDryRun,
+          model,
+          status,
+          runClaudeImpl: runClaude,
+        });
+        issueRulesGateResult = gate;
+        if (gate.pause) {
+          // Same handling as a usage-limit / outage pause in the skills loop:
+          // the issues file is untouched, so the chapter resumes and re-runs the gate.
+          issueRulesGatePaused = true;
+          const gateErr = gate.error || '';
+          if (isUsageLimitError(gateErr)) {
+            abortForUsageLimit = true;
+            usageLimitTag = buildUsageLimitResetTag(gateErr);
+            const when = usageLimitTag ? ` around ${usageLimitTag}` : ' after the limit resets';
+            await status(`**issue-rules-gate** paused for ${ref}: usage limit reached. Retry${when}.`);
+          } else {
+            abortForOutage = true;
+            await status(`**issue-rules-gate** paused for ${ref}: Claude transient outage (${gateErr}).`);
+          }
+          return;
+        }
+        if (gate.ran && (gate.reason === 'incomplete' || gate.reason === 'accounting_violation')) {
+          await status(`**${ref}**: issue rules check did not complete (${gate.reason}); issues left unchanged`);
+        } else if (gate.ran) {
+          const c = gate.counts;
+          await status(
+            `**${ref}**: issue rules check${gate.changed ? '' : ' (no changes)'}: kept ${c.kept}, dropped ${c.dropped}, ` +
+            `relabeled ${c.relabeled}, rescoped ${c.rescoped}, added ${c.added}` +
+            `${c.declined ? `, declined ${c.declined}` : ''}` +
+            `${gate.reportPath ? ` (${gate.reportPath})` : ''}`
+          );
+          if (gate.keptDrops && gate.keptDrops.length) {
+            const lines = gate.keptDrops.map((d) => `- ${d.ref} ${d.sref} dropped: duplicates kept note ${d.kept}`);
+            await status(`**${ref}**: issue rows dropped as duplicates of kept notes:\n${lines.join('\n')}`);
+          }
+        } else if (gate.reason === 'error') {
+          await status(`**${ref}**: issue rules check failed (non-fatal, issues left unchanged): ${gate.error}`);
+        } else {
+          console.log(`[notes] issue-rules-gate ${ref} skipped: ${gate.reason}`);
+          // no_rules_file and no_source_text post their own warning from inside the
+          // gate; already_applied is the normal re-run case and needs no message.
+          if (!['mode_off', 'book_not_enabled', 'dry_run', 'already_applied', 'no_rules_file', 'no_source_text'].includes(gate.reason)) {
+            await status(`**${ref}**: issue rules check skipped (${gate.reason}).`);
+          }
+        }
+        if (gate.changed) {
+          // A relabel can produce a translate-names row; re-apply the tW article check.
+          await reportTwDrops(dropTwCoveredRows({ issuesPath }));
+          const pass2 = normalizeIssuesFile({
+            issuesPath,
+            options: {
+              highParallelismThreshold: PARALLELISM_HIGH_THRESHOLD,
+              exceptionCap: PARALLELISM_EXCEPTION_CAP,
+              duplicateSimilarityThreshold: PARALLELISM_DUPLICATE_THRESHOLD,
+            },
+          });
+          introSignal = pass2.introSignal;
+          // Pass 2 rewrote the file after the gate sealed its sidecar.
+          refreshGateSidecarOutputHash({ issuesPath, book });
+        }
       }
 
-      if (pipeDir && result.introSignal) {
-        updateContextArtifacts(pipeDir, 'parallelism_signal', result.introSignal);
+      if (withIntro) {
+        chapterIntroHintArgs = buildParallelismIntroHintArgs(introSignal);
+      }
+
+      if (pipeDir && introSignal) {
+        updateContextArtifacts(pipeDir, 'parallelism_signal', introSignal);
       }
 
       const s = result.summary;
@@ -3062,6 +3591,12 @@ async function notesPipeline(route, message) {
     // If resuming after issue-producer stages, normalize before chapter-intro/tn-writer.
     if (issuesPath && skills[startSkillIndex] && !issueProducerSkillNames.has(skills[startSkillIndex].name)) {
       await runIssueNormalizationStage();
+      if (issueRulesGatePaused) {
+        // Rules gate paused (usage limit / outage): skip the skill loop; the
+        // failedSkill handler after it records the pause checkpoint.
+        failedSkill = skills[startSkillIndex].name;
+        startSkillIndex = skills.length;
+      }
     }
 
     // Mechanical prep flag — set true once runMechanicalPrep() completes in the skill loop.
@@ -3143,6 +3678,39 @@ async function notesPipeline(route, message) {
             }
           }
 
+          // Editor-kept notes stay in en_tn untouched, so drop prepared items
+          // that duplicate one (nothing is injected for them). Before see-how,
+          // so see-how never folds other verses into a note that is then
+          // dropped; see-how gets the kept list so it does not synthesize a
+          // pointer at a kept note's verse and quote either.
+          const keptHere = (kept || []).filter((k) => keptRefVerseSpan(k.ref, ch)).length;
+          if (keptHere > 0) {
+            try {
+              const dropped = applyKeptToPreparedNotes({
+                preparedJson: readContext(pipeDir).runtime.preparedNotes,
+                kept,
+                chapter: ch,
+              }).itemsRemoved;
+              // The gate's KEPT drops (this run's and earlier runs' still gone) happened
+              // earlier, on the issue list. When the gate did not run here (resume,
+              // already_applied, off), read the count from its sealed sidecar.
+              const gateKept = issueRulesGateResult && issueRulesGateResult.ran
+                ? (issueRulesGateResult.keptDropsTotal || 0)
+                : (readGateSidecar({ issuesPath, book })?.keptDropped || []).length;
+              await status(
+                `**${ref}**: ${keptHere} kept notes from the editor will stay in place; ` +
+                `${dropped + gateKept} AI notes dropped as duplicates of kept notes ` +
+                `(${dropped} exact/overlap, ${gateKept} judged by the rules gate)`,
+              );
+            } catch (keptErr) {
+              console.error(`[notes] applyKeptToPreparedNotes failed: ${keptErr.message}`);
+              await status(
+                `**${ref}**: ${keptHere} kept notes from the editor will stay in place, but the duplicate check failed ` +
+                `(${keptErr.message}); only exact duplicates are dropped at push.`,
+              );
+            }
+          }
+
           // Build the book-scoped recurrence index. Non-fatal: without it the
           // detector still folds same-chapter repeats, it just cannot point at
           // earlier chapters.
@@ -3154,13 +3722,14 @@ async function notesPipeline(route, message) {
 
           // Run see-how detection after mechanical prep
           try {
-            const seeHowSummary = await runSeeHowDetection({ pipeDir });
+            const seeHowSummary = await runSeeHowDetection({ pipeDir, kept });
             if (seeHowSummary !== SEE_HOW_ZERO_SUMMARY) {
               await status(`**${ref}**: See-how detection — ${seeHowSummary}`);
             }
           } catch (seeHowErr) {
             console.warn(`[notes] See-how detection failed (non-fatal): ${seeHowErr.message}`);
           }
+
         } catch (err) {
           console.error(`[notes] Mechanical prep failed for ${ref}: ${err.message}`);
           await status(`**${ref}**: Mechanical prep failed — ${err.message}. Claude will run prep via MCP tools.`);
@@ -3250,6 +3819,17 @@ async function notesPipeline(route, message) {
           try { fs.unlinkSync(path.resolve(CSKILLBP_DIR, preClean)); } catch (_) { /* fine if missing */ }
         }
       }
+      // chapter-intro edits the issues file in place: drop an intro row left by
+      // an earlier run so the check after the skill sees whether it wrote one.
+      // If the step then fails, the failure handler puts the earlier file back.
+      if (skill.name === 'chapter-intro' && issuesPath && !isDryRun) {
+        const introAbs = path.resolve(CSKILLBP_DIR, issuesPath);
+        const stripped = stripIntroRows(introAbs, ch, book);
+        if (stripped.removed) {
+          introBackup = { abs: introAbs, text: stripped.before };
+          console.log(`[notes] ${ref}: removed ${stripped.removed} earlier intro row(s) before chapter-intro`);
+        }
+      }
       const timeoutMs = calcSkillTimeout(book, ch, skill.ops);
       const guardrails = buildSkillGuardrails({
         pipeline: 'notes',
@@ -3320,7 +3900,7 @@ async function notesPipeline(route, message) {
           const parallelResult = await runParallelTnWriter({
             book, ch, tag, issuesPath, outputPath: skill.expectedOutput, ctxFlag,
             model: model || skill.model, timeoutMs, appendSystemPrompt: skill.appendSystemPrompt,
-            checkpointRef, existingShards, status, isDryRun, skillRef,
+            checkpointRef, existingShards, status, isDryRun, skillRef, kept,
           });
           if (parallelResult) {
             // Parallel mode was used (chapter had enough verses to split)
@@ -3613,6 +4193,20 @@ async function notesPipeline(route, message) {
             break;
           }
         }
+        // Check the file the later steps read (issuesPath), not just the discovered output.
+        if (skill.name === 'chapter-intro' && !isDryRun
+          && !issuesFileHasIntroRow(issuesPath ? path.resolve(CSKILLBP_DIR, issuesPath) : absResolvedFreshness, ch, book)) {
+          failedSkill = skill.name;
+          await status(`**${skill.name}** failed for ${ref} \u2014 no intro row was written to ${resolved}`);
+          setCheckpoint(checkpointRef, {
+            state: 'failed',
+            totalSuccess,
+            totalFail,
+            current: { chapter: ch, skill: skill.name, status: 'failed', errorKind: 'missing_output', outputStatus: 'missing', outputPath: resolved },
+            resume: { chapter: ch, skill: skill.name },
+          });
+          break;
+        }
         skill.resolvedOutput = resolved;
         if (!skillOutputs[ch]) skillOutputs[ch] = {};
         skillOutputs[ch][skill.name] = resolved;
@@ -3673,7 +4267,28 @@ async function notesPipeline(route, message) {
               break;
             }
           }
+          // Diagnostic (#186): how many GLQuotes still miss the master ULT.
+          // Runs before normalization and the rules gate so it measures post-edit-review only.
+          if (skill.name === 'post-edit-review' && issuesPath && skill.staleRecheck) {
+            try {
+              const remaining = findRemainingStaleQuotes({
+                issuesPath, workspaceDir: CSKILLBP_DIR, masterChapter: skill.staleRecheck.masterChapter, chapter: ch,
+              });
+              if (remaining) {
+                console.log(`[notes] ${ref}: after post-edit-review, ${remaining.length} stale GLQuote row(s) remain`
+                  + ` (was ${skill.staleRecheck.before})${remaining.length ? ': ' + remaining.map((q) => q.ref).slice(0, 10).join(', ') : ''}`);
+              }
+            } catch (err) {
+              console.warn(`[notes] stale GLQuote re-check failed (non-fatal): ${err.message}`);
+            }
+          }
           await runIssueNormalizationStage();
+          if (issueRulesGatePaused) {
+            // Resume at the next skill, not the producer: its issue file is done,
+            // and resume.gatePending makes the resumed run apply the gate first.
+            failedSkill = (skills[si + 1] && skills[si + 1].name) || skill.name;
+            break;
+          }
           // Sanity check: verify the issues TSV starts with an uppercase book code (not a row number)
           if (skill.name === 'post-edit-review' && issuesPath) {
             try {
@@ -3688,20 +4303,6 @@ async function notesPipeline(route, message) {
               }
             } catch (e) {
               // Non-fatal — file may not exist yet if skill was skipped
-            }
-          }
-          // Diagnostic (#186): how many GLQuotes still miss the master ULT.
-          if (skill.name === 'post-edit-review' && issuesPath && skill.staleRecheck) {
-            try {
-              const remaining = findRemainingStaleQuotes({
-                issuesPath, workspaceDir: CSKILLBP_DIR, masterChapter: skill.staleRecheck.masterChapter, chapter: ch,
-              });
-              if (remaining) {
-                console.log(`[notes] ${ref}: after post-edit-review, ${remaining.length} stale GLQuote row(s) remain`
-                  + ` (was ${skill.staleRecheck.before})${remaining.length ? ': ' + remaining.map((q) => q.ref).slice(0, 10).join(', ') : ''}`);
-              }
-            } catch (err) {
-              console.warn(`[notes] stale GLQuote re-check failed (non-fatal): ${err.message}`);
             }
           }
         }
@@ -3800,12 +4401,21 @@ async function notesPipeline(route, message) {
 
     if (failedSkill) {
       totalFail++;
+      // A failed chapter-intro must not cost the chapter its earlier intro, nor
+      // leave a half-written new one in its place.
+      if (failedSkill === 'chapter-intro' && introBackup) {
+        try {
+          fs.writeFileSync(introBackup.abs, introBackup.text);
+        } catch (err) {
+          console.warn(`[notes] ${ref}: could not restore the earlier intro row: ${err.message}`);
+        }
+      }
       setCheckpoint(checkpointRef, {
         state: abortForOutage ? 'paused_for_outage' : abortForUsageLimit ? 'paused_for_usage_limit' : 'failed',
         totalSuccess,
         totalFail,
         skillOutputs,
-        resume: { chapter: ch, skill: failedSkill },
+        resume: { chapter: ch, skill: failedSkill, ...(issueRulesGatePaused ? { gatePending: true } : {}) },
       });
       const chapterFailEvent = await status(`Chapter ${ref} failed at **${failedSkill}** after ${chapterDuration}s`);
       if (abortForUsageLimit || abortForOutage) break;
@@ -3958,9 +4568,12 @@ async function notesPipeline(route, message) {
       }
     }
 
+    // A resume at door43-push skips normalization; gatePrBodyForPush then reads
+    // the gate summary from the sidecar the earlier run sealed.
+
     // If push is already deferred due to conflicting branches, collect and skip
     if (deferredPush) {
-      deferredChapters.push({ ch, notesSource });
+      deferredChapters.push({ ch, notesSource, replaceChapter: !hasVerseRange, keptIds, body: gatePrBodyForPush({ gateResult: issueRulesGateResult, issuesPath, book }) });
       await status(`**door43-push deferred** for ${ref} (waiting for conflicting branches to be merged)`);
       totalSuccess++;
       continue;
@@ -3997,7 +4610,7 @@ async function notesPipeline(route, message) {
       if (conflicts.length > 0) {
         deferredPush = true;
         deferredConflicts = conflicts;
-        deferredChapters.push({ ch, notesSource });
+        deferredChapters.push({ ch, notesSource, replaceChapter: !hasVerseRange, keptIds, body: gatePrBodyForPush({ gateResult: issueRulesGateResult, issuesPath, book }) });
         await status(`**door43-push deferred** for ${ref}: conflicting branches found — ${conflicts.map(c => c.branch).join(', ')}`);
         totalSuccess++;
         continue;
@@ -4013,6 +4626,10 @@ async function notesPipeline(route, message) {
         type: 'tn', book, chapter: ch,
         username, branch: buildBranchName(book, ch),
         source: notesSource,
+        // Whole-chapter run (no verse range): replace the whole chapter in en_tn.
+        replaceChapter: !hasVerseRange,
+        keptIds,
+        body: gatePrBodyForPush({ gateResult: issueRulesGateResult, issuesPath, book }),
       });
       if (!pushResult.success) {
         console.error(`[notes] door43-push TN failed for ${ref}: ${pushResult.details}`);
@@ -4258,6 +4875,11 @@ module.exports = {
   buildChapterIntroPrompt,
   _applySkillSpecificGuardrails: applySkillSpecificGuardrails,
   _getSkillToolConfig: getSkillToolConfig,
+  _findEmptyVerses: findEmptyVerses,
+  _mergeGapIssues: mergeGapIssues,
+  _fillIssueGaps: fillIssueGaps,
+  _issuesFileHasIntroRow: issuesFileHasIntroRow,
+  _stripIntroRows: stripIntroRows,
   _appendIssueTagsToTsv: appendIssueTagsToTsv,
   _analyzeIssuesTsvShape: analyzeIssuesTsvShape,
   _countNoteRows: countNoteRows,

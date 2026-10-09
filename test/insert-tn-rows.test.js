@@ -269,3 +269,280 @@ test('insertTnRows logs kept verses and flags kept rows whose Quote is not Hebre
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+// ---------------------------------------------------------------------------
+// Whole-chapter replace (replaceChapter) vs. default preservation (#435)
+// ---------------------------------------------------------------------------
+
+function wholeChapterFixture(dir) {
+  const bookFile = writeTsv(dir, 'en_tn_EZK.tsv', TN_HEADER, [
+    '39:1\tzzz1\t\t\t\t1\tOther chapter note',
+    '40:intro\tint1\t\t\t\t1\tOld intro',
+    '40:1\told1\t\t\tlegacy english\t1\tOld note covered by source',
+    '40:8\told8\t\t\tlegacy english\t1\tLegacy note in uncovered verse',
+    '40:11\tkp11\tKEEP\t\tlegacy english\t1\tKEEP note in uncovered verse',
+    '40:23\told9\t\t\tlegacy english\t1\tAnother legacy note',
+    '41:1\tzzz2\t\t\t\t1\tNext chapter note',
+  ]);
+  const sourceFile = writeTsv(dir, 'EZK-40-source.tsv', TN_HEADER, [
+    '40:intro\tni01\t\t\t\t1\tNew intro',
+    '40:1\tnew1\t\t\tnew quote\t1\tNew note',
+  ]);
+  return { bookFile, sourceFile };
+}
+
+test('replaceChapter removes non-KEEP rows in uncovered verses, keeps KEEP, intro, other chapters', () => {
+  const dir = makeTempDir();
+  try {
+    const { bookFile, sourceFile } = wholeChapterFixture(dir);
+    const log = insertTnRows({ bookFile, sourceFile, chapter: 40, replaceChapter: true });
+    const rows = readRows(bookFile);
+    const ids = rows.map((r) => r.split('\t')[1]);
+    assert.deepEqual(ids.sort(), ['kp11', 'ni01', 'new1', 'zzz1', 'zzz2'].sort());
+    assert.ok(log.includes('whole-chapter replace): 40:8, 40:23'), log);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('replaceChapter keeps the existing intro when skipIntro is set', () => {
+  const dir = makeTempDir();
+  try {
+    const { bookFile, sourceFile } = wholeChapterFixture(dir);
+    insertTnRows({ bookFile, sourceFile, chapter: 40, skipIntro: true, replaceChapter: true });
+    const ids = readRows(bookFile).map((r) => r.split('\t')[1]);
+    assert.ok(ids.includes('int1'), 'existing intro preserved');
+    assert.ok(!ids.includes('old8'), 'legacy row removed');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('default (replaceChapter false) preserves rows in uncovered verses as before', () => {
+  const dir = makeTempDir();
+  try {
+    const { bookFile, sourceFile } = wholeChapterFixture(dir);
+    const log = insertTnRows({ bookFile, sourceFile, chapter: 40 });
+    const ids = readRows(bookFile).map((r) => r.split('\t')[1]);
+    assert.deepEqual(ids.sort(), ['kp11', 'new1', 'ni01', 'old8', 'old9', 'zzz1', 'zzz2'].sort());
+    assert.ok(!log.includes('whole-chapter replace'));
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('replaceChapter keeps an out-of-order row from another chapter inside the chapter span', () => {
+  const dir = makeTempDir();
+  try {
+    const bookFile = writeTsv(dir, 'en_tn_EZK.tsv', TN_HEADER, [
+      '40:1\told1\t\t\tlegacy english\t1\tOld note covered by source',
+      '41:3\tstry\t\t\t\t1\tMisplaced next-chapter note',
+      '40:8\told8\t\t\tlegacy english\t1\tLegacy note in uncovered verse',
+    ]);
+    const sourceFile = writeTsv(dir, 'EZK-40-source.tsv', TN_HEADER, [
+      '40:1\tnew1\t\t\tnew quote\t1\tNew note',
+    ]);
+    const log = insertTnRows({ bookFile, sourceFile, chapter: 40, replaceChapter: true });
+    const ids = readRows(bookFile).map((r) => r.split('\t')[1]);
+    assert.deepEqual(ids.sort(), ['new1', 'stry'].sort());
+    assert.ok(log.includes('Removed 1 existing rows for verses in source'), log);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// keptIds: editor-kept rows (blank Tags) are treated like KEEP-tagged rows
+// ---------------------------------------------------------------------------
+
+function keptFixture(dir) {
+  const bookFile = writeTsv(dir, 'en_tn_EZK.tsv', TN_HEADER, [
+    '40:1\told1\t\tfigs-metaphor\tlegacy english\t1\tOld note covered by source',
+    '40:1\tkept\t\tfigs-simile\tkept english\t1\tEditor-kept note, Tags blank',
+    '40:8\tkp08\t\t\tlegacy english\t1\tEditor-kept note in uncovered verse',
+    '40:9\told9\t\t\tlegacy english\t1\tUncovered, not kept',
+  ]);
+  const sourceFile = writeTsv(dir, 'EZK-40-source.tsv', TN_HEADER, [
+    '40:1\tnew1\t\tfigs-metaphor\tnew quote\t1\tNew note',
+  ]);
+  return { bookFile, sourceFile };
+}
+
+test('keptIds: blank-Tags kept row survives replaceChapter, source row at same ref, and uncovered verse', () => {
+  const dir = makeTempDir();
+  try {
+    const { bookFile, sourceFile } = keptFixture(dir);
+    insertTnRows({ bookFile, sourceFile, chapter: 40, replaceChapter: true, keptIds: ['kept', 'kp08'] });
+    const ids = readRows(bookFile).map((r) => r.split('\t')[1]);
+    assert.deepEqual(ids.sort(), ['kept', 'kp08', 'new1'].sort());
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('keptIds: kept row suppresses a source row with the same (Reference, SupportReference, Quote) only', () => {
+  const dir = makeTempDir();
+  try {
+    const { bookFile } = keptFixture(dir);
+    const sourceFile = writeTsv(dir, 'EZK-40-dup.tsv', TN_HEADER, [
+      '40:1\tdup1\t\tfigs-simile\tkept english\t1\tAI duplicate of the kept note',
+      '40:1\toth1\t\tfigs-simile\tdifferent quote\t1\tSame issue type, different phrase',
+      '40:1\tnew1\t\tfigs-metaphor\tnew quote\t1\tNew note',
+    ]);
+    insertTnRows({ bookFile, sourceFile, chapter: 40, keptIds: ['kept'] });
+    const ids = readRows(bookFile).map((r) => r.split('\t')[1]);
+    assert.ok(ids.includes('kept'));
+    assert.ok(!ids.includes('dup1'), 'duplicate source row must be suppressed');
+    assert.ok(ids.includes('oth1'), 'a different phrase with the same support reference still lands');
+    assert.ok(ids.includes('new1'));
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('keptIds empty: same output as before (kept-ID row is replaced like any other)', () => {
+  const dir = makeTempDir();
+  try {
+    const { bookFile, sourceFile } = keptFixture(dir);
+    insertTnRows({ bookFile, sourceFile, chapter: 40, replaceChapter: true });
+    const ids = readRows(bookFile).map((r) => r.split('\t')[1]);
+    assert.deepEqual(ids, ['new1']);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('keptIds: orphaned multi-verse kept row survives a narrowed source reference', () => {
+  const dir = makeTempDir();
+  try {
+    const bookFile = writeTsv(dir, 'en_tn_PSA.tsv', TN_HEADER, [
+      '18:9-10\tqw0f\t\t\t\t1\tEditor-kept multi-verse note',
+    ]);
+    const sourceFile = writeTsv(dir, 'PSA-018-source.tsv', TN_HEADER, [
+      '18:9\tnewx\t\t\t\t1\tNew single-verse note',
+    ]);
+    insertTnRows({ bookFile, sourceFile, chapter: 18, keptIds: ['qw0f'] });
+    const refs = readRows(bookFile).map((r) => r.split('\t')[0]);
+    assert.ok(refs.includes('18:9-10'));
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('keptIds: kept intro row is not replaced by the source intro', () => {
+  const dir = makeTempDir();
+  try {
+    const bookFile = writeTsv(dir, 'en_tn_EZK.tsv', TN_HEADER, [
+      '40:intro\tki01\t\t\t\t0\t# Kept intro',
+      '40:1\told1\t\tfigs-metaphor\tq\t1\tOld',
+    ]);
+    const sourceFile = writeTsv(dir, 'EZK-40-src.tsv', TN_HEADER, [
+      '40:intro\tnewi\t\t\t\t0\t# AI intro',
+      '40:1\tnew1\t\tfigs-metaphor\tq2\t1\tNew',
+    ]);
+    insertTnRows({ bookFile, sourceFile, chapter: 40, replaceChapter: true, keptIds: ['ki01'] });
+    const ids = readRows(bookFile).map((r) => r.split('\t')[1]);
+    assert.ok(ids.includes('ki01'));
+    assert.ok(!ids.includes('newi'));
+    assert.ok(ids.includes('new1'));
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('keptIds: kept row with blank SupportReference still blocks the same blank-sref quote; word joiners ignored', () => {
+  const dir = makeTempDir();
+  try {
+    const bookFile = writeTsv(dir, 'en_tn_EZK.tsv', TN_HEADER, [
+      '40:2\tkp02\t\t\tלֹא\t1\tKept, no support reference',
+    ]);
+    const sourceFile = writeTsv(dir, 'EZK-40-src.tsv', TN_HEADER, [
+      '40:2\tdup2\t\t\tלֹא\u2060\t1\tDuplicate',
+      '40:2\tnew2\t\tfigs-explicit\tלֹא\t1\tDifferent issue',
+    ]);
+    insertTnRows({ bookFile, sourceFile, chapter: 40, keptIds: ['kp02'] });
+    const ids = readRows(bookFile).map((r) => r.split('\t')[1]);
+    assert.ok(ids.includes('kp02'));
+    assert.ok(!ids.includes('dup2'));
+    assert.ok(ids.includes('new2'));
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('keptIds: a kept range row blocks a single-verse duplicate inside it', () => {
+  const dir = makeTempDir();
+  try {
+    const bookFile = writeTsv(dir, 'en_tn_EZK.tsv', TN_HEADER, [
+      '40:12-14\tkr12\t\tfigs-explicit\tשַׁעַר\t1\tKept range note',
+    ]);
+    const sourceFile = writeTsv(dir, 'EZK-40-src.tsv', TN_HEADER, [
+      '40:13\tdu13\t\tfigs-explicit\tשַׁעַר\t1\tDuplicate inside the range',
+      '40:13\tne13\t\tfigs-idiom\tשַׁעַר\t1\tDifferent issue',
+    ]);
+    insertTnRows({ bookFile, sourceFile, chapter: 40, replaceChapter: true, keptIds: ['kr12'] });
+    const ids = readRows(bookFile).map((r) => r.split('\t')[1]);
+    assert.ok(ids.includes('kr12'));
+    assert.ok(!ids.includes('du13'));
+    assert.ok(ids.includes('ne13'));
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('keptIds: a kept row spanning three chapters claims the middle one', () => {
+  const dir = makeTempDir();
+  try {
+    const bookFile = writeTsv(dir, 'en_tn_EZK.tsv', TN_HEADER, [
+      '40:48-42:2\tkx40\t\tfigs-explicit\tשַׁעַר\t1\tKept long span',
+    ]);
+    const sourceFile = writeTsv(dir, 'EZK-41-src.tsv', TN_HEADER, [
+      '41:7\tdu07\t\tfigs-explicit\tשַׁעַר\t1\tDuplicate',
+    ]);
+    insertTnRows({ bookFile, sourceFile, chapter: 41, replaceChapter: true, keptIds: ['kx40'] });
+    const ids = readRows(bookFile).map((r) => r.split('\t')[1]);
+    assert.ok(ids.includes('kx40'));
+    assert.ok(!ids.includes('du07'));
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('keptIds: a cross-chapter kept row blocks a duplicate in its second chapter', () => {
+  const dir = makeTempDir();
+  try {
+    const bookFile = writeTsv(dir, 'en_tn_EZK.tsv', TN_HEADER, [
+      '40:48-41:2\tkx48\t\tfigs-explicit\tשַׁעַר\t1\tKept cross-chapter note',
+      '41:3\told3\t\tfigs-idiom\tx\t1\tOld',
+    ]);
+    const sourceFile = writeTsv(dir, 'EZK-41-src.tsv', TN_HEADER, [
+      '41:1\tdu01\t\tfigs-explicit\tשַׁעַר\t1\tDuplicate',
+      '41:3\tne03\t\tfigs-idiom\ty\t1\tNew',
+    ]);
+    insertTnRows({ bookFile, sourceFile, chapter: 41, replaceChapter: true, keptIds: ['kx48'] });
+    const ids = readRows(bookFile).map((r) => r.split('\t')[1]);
+    assert.ok(ids.includes('kx48'));
+    assert.ok(!ids.includes('du01'));
+    assert.ok(ids.includes('ne03'));
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('keptIds: support references compare without the rc:// prefix', () => {
+  const dir = makeTempDir();
+  try {
+    const bookFile = writeTsv(dir, 'en_tn_EZK.tsv', TN_HEADER, [
+      '40:5\tkp05\t\trc://en/ta/man/translate/figs-metaphor\tחוֹמָה\t1\tKept',
+    ]);
+    const sourceFile = writeTsv(dir, 'EZK-40-src.tsv', TN_HEADER, [
+      '40:5\tdu05\t\trc://*/ta/man/translate/figs-metaphor\tחוֹמָה\t1\tDuplicate',
+    ]);
+    insertTnRows({ bookFile, sourceFile, chapter: 40, keptIds: ['kp05'] });
+    const ids = readRows(bookFile).map((r) => r.split('\t')[1]);
+    assert.ok(ids.includes('kp05'));
+    assert.ok(!ids.includes('du05'));
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});

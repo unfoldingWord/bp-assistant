@@ -1109,3 +1109,28 @@ test('multi-word euphemism: a fixed phrase is still injected at its next occurre
   assert.equal(prepared.items[0].support_reference, 'figs-euphemism');
   assert.match(summary, /1 injected/);
 });
+
+test('kept: no pointer is synthesized at a kept note\'s verse and quote; the flagged repeat keeps its own note', async () => {
+  // Learn the quote see-how would inject at 3:2.
+  const probe = setupPipeDir({ items: [], hebrewBook: HEBREW_BOOK });
+  buildRecurrenceIndexFile({ pipeDir: probe });
+  await runSeeHowDetection({ pipeDir: probe, generateIdsFn: stubIds });
+  const quote = readPrepared(probe).items[0].orig_quote;
+  const kept = [{ rowId: 'kp32', ref: '3:2', supportReference: 'figs-idiom', quote }];
+
+  const empty = setupPipeDir({ items: [], hebrewBook: HEBREW_BOOK });
+  buildRecurrenceIndexFile({ pipeDir: empty });
+  await runSeeHowDetection({ pipeDir: empty, generateIdsFn: stubIds, kept });
+  assert.equal(readPrepared(empty).items.length, 0, 'phase 3 injects nothing at the kept slot');
+
+  const flagged = setupPipeDir({
+    items: [item({ reference: '3:5', id: 'bbbb' })],
+    alignmentData: { '3:5': ALIGNMENT_DATA['3:5'] },
+    hebrewBook: HEBREW_BOOK,
+  });
+  buildRecurrenceIndexFile({ pipeDir: flagged });
+  await runSeeHowDetection({ pipeDir: flagged, generateIdsFn: stubIds, kept });
+  const items = readPrepared(flagged).items;
+  assert.deepEqual(items.map((i) => i.reference), ['3:5'], 'the 3:5 item is not folded into a pointer at 3:2');
+  assert.notEqual(items[0].injected_see_how, true);
+});
