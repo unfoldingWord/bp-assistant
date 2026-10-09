@@ -261,25 +261,28 @@ async function enumerateUnits({ apiGetImpl, token, sinceIso, editorMap = {} }) {
         if (sinceIso && mergedAt && mergedAt < sinceIso) { keepPaging = false; continue; }
         const author = (pr.user && pr.user.login) || null;
         const be = parseBeRef(pr.head && pr.head.ref);
-        let book = be && be.book;
+        let books = be && be.book ? [be.book] : [];
         let editor = be && be.editor;
-        if (!book) {
+        if (books.length === 0) {
           // Fallback path (deleted branch): require a known editor + a touched resource file.
           const known = attributeKnownEditor(editorMap, author);
           if (!known || isBotAuthor(author)) continue;
           const files = await fetchPrFiles(get, repo, pr.number, token);
-          book = files.map((f) => bookFromFilename(f, resource)).find(Boolean);
-          if (!book) continue; // PR didn't touch this resource's file
+          // One unit per touched book file (#421) — a merged PR can span several books.
+          books = [...new Set(files.map((f) => bookFromFilename(f, resource)).filter(Boolean))];
+          if (books.length === 0) continue; // PR didn't touch this resource's file
           editor = known;
         }
-        units.push({
-          kind: 'merged-pr', repo, resource, book, editor: editor || author,
-          prId: pr.number,
-          baseSha: pr.base && pr.base.sha,
-          headSha: (pr.head && pr.head.sha) || pr.merge_commit_sha,
-          mergedAt,
-          author,
-        });
+        for (const book of books) {
+          units.push({
+            kind: 'merged-pr', repo, resource, book, editor: editor || author,
+            prId: pr.number,
+            baseSha: pr.base && pr.base.sha,
+            headSha: (pr.head && pr.head.sha) || pr.merge_commit_sha,
+            mergedAt,
+            author,
+          });
+        }
       }
       // recentupdate desc — once we pass the cutoff we can stop.
       if (sinceIso && list.some((pr) => (pr.merged_at || pr.updated_at || '') < sinceIso)) keepPaging = false;
@@ -306,8 +309,15 @@ async function enumerateUnits({ apiGetImpl, token, sinceIso, editorMap = {} }) {
 
 function unitKeyFor(u) {
   return u.kind === 'merged-pr'
-    ? state.prUnitKey(u.repo, u.prId, u.headSha)
+    ? state.prUnitKey(u.repo, u.prId, u.headSha, u.book)
     : state.branchUnitKey(u.repo, u.branch, u.tipSha);
+}
+
+// A merged-PR unit recorded under the pre-#421 key (no book suffix) was already
+// reviewed by an older build; honour it so a deploy does not re-emit proposals.
+function isUnitReviewed(st, u) {
+  if (state.isReviewed(st, unitKeyFor(u))) return true;
+  return u.kind === 'merged-pr' && state.isReviewed(st, state.prUnitKey(u.repo, u.prId, u.headSha));
 }
 
 // Fetch that tolerates a genuinely-absent file (HTTP 404 -> '') but RE-THROWS
@@ -493,7 +503,7 @@ async function runOvernightReview({
     log(`[overnight] COLD START — OVERNIGHT_REVIEW_COLD_START is set: reviewing ${allKeys.length} enumerated unit(s) instead of priming them past. This will attempt to review the entire accumulated backlog.`);
   }
 
-  const fresh = units.filter((u) => !state.isReviewed(st, unitKeyFor(u)) && !isBotAuthor(u.author));
+  const fresh = units.filter((u) => !isUnitReviewed(st, u) && !isBotAuthor(u.author));
   // #OVERNIGHT-BOUNDED: take at most maxUnitsPerRun this run. A non-positive or
   // non-finite cap means "no cap" (opt-out for a big-memory host). Order is
   // enumeration order, which is stable across runs, so successive runs walk

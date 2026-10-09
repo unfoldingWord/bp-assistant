@@ -452,6 +452,70 @@ test('the default (reviewColdStart omitted) on a cold start still primes, not re
   assert.equal(proposalsWrite, undefined, 'no feed should be written when priming (default)');
 });
 
+test('a merged PR touching two tn files (stripped head.ref) yields one unit per book, both reviewed (#421)', async () => {
+  const writes = [];
+  const initState = JSON.stringify({ version: 1, initialized: true, lastRun: '2026-06-20T00:00:00Z', reviewed: {}, branchTips: {} });
+  const get = async (p) => {
+    const repo = (p.match(/repos\/unfoldingWord\/([^/]+)\//) || [])[1];
+    if (/\/pulls\/7779\/files/.test(p)) return { status: 200, data: [{ filename: 'tn_1CO.tsv' }, { filename: 'tn_GAL.tsv' }, { filename: 'README.md' }] };
+    if (/\/pulls\?/.test(p)) {
+      const data = (repo === 'en_tn' && /page=1/.test(p))
+        ? [{ number: 7779, merged: true, merged_at: '2026-06-23T10:00:00Z', head: { sha: 'newhead' }, base: { sha: 'oldbase' }, user: { login: 'pjoakes' } }]
+        : [];
+      return { status: 200, data };
+    }
+    return { status: 200, data: [] };
+  };
+  const editorMap = { pjoakes: 'pjoakes' };
+  const units = (await watcher.enumerateUnits({ apiGetImpl: get, sinceIso: '2026-06-20T00:00:00Z', editorMap }))
+    .filter((u) => u.kind === 'merged-pr');
+  assert.deepEqual(units.map((u) => u.book), ['1CO', 'GAL']);
+  assert.ok(units.every((u) => u.prId === 7779 && u.baseSha === 'oldbase' && u.headSha === 'newhead'));
+  const keys = units.map(watcher.unitKeyFor);
+  assert.equal(new Set(keys).size, 2);
+
+  const tsv = (note) => [TN_HEADER, `1:1\ta\t\tfigs-metaphor\tx\t1\t${note}`].join('\n');
+  const fetched = [];
+  const res = await watcher.runOvernightReview({
+    skillsRepo: '/skills', now: new Date('2026-06-24T07:00:00Z'),
+    deps: {
+      readFileSync: () => initState,
+      writeFileSync: (pth, content) => writes.push({ pth, content }),
+      mkdirSync: () => {},
+      apiGetImpl: get,
+      editorMap,
+      fetchTextImpl: async (url) => { fetched.push(url); return /commit\/oldbase/.test(url) ? tsv('old note') : tsv('rewritten note'); },
+      log: () => {},
+    },
+  });
+  assert.equal(res.reviewed, 2);
+  assert.equal(res.proposals, 2);
+  assert.ok(fetched.some((u) => /tn_1CO\.tsv$/.test(u)));
+  assert.ok(fetched.some((u) => /tn_GAL\.tsv$/.test(u)));
+  const rows = writes.find((w) => /proposals\.jsonl$/.test(w.pth)).content.trim().split('\n').map(JSON.parse);
+  assert.deepEqual(rows.map((r) => r.book).sort(), ['1CO', 'GAL']);
+  const saved = JSON.parse(writes.filter((w) => /state\.json$/.test(w.pth)).pop().content);
+  assert.ok(keys.every((k) => k in saved.reviewed));
+});
+
+test('a merged PR reviewed under the pre-#421 key (no book suffix) is not re-reviewed', async () => {
+  const legacyKey = stateLib.prUnitKey('en_tn', 9, 'newhead');
+  const initState = JSON.stringify({ version: 1, initialized: true, lastRun: '2026-06-20T00:00:00Z', reviewed: { [legacyKey]: '2026-06-21T00:00:00Z' }, branchTips: {} });
+  const prs = { en_tn: [{ number: 9, merged: true, merged_at: '2026-06-23T22:00:00Z', head: { ref: 'PSA-be-pjoakes', sha: 'newhead' }, base: { sha: 'oldbase' }, user: { login: 'pjoakes' } }] };
+  const res = await watcher.runOvernightReview({
+    skillsRepo: '/skills', now: new Date('2026-06-24T07:00:00Z'),
+    deps: {
+      readFileSync: () => initState,
+      writeFileSync: () => {},
+      mkdirSync: () => {},
+      apiGetImpl: fakeApiGet(prs, {}),
+      fetchTextImpl: async () => { throw new Error('should not fetch'); },
+      log: () => {},
+    },
+  });
+  assert.equal(res.reviewed, 0);
+});
+
 test('runOvernightReview reviews a fresh merged TN PR and emits proposals', async () => {
   const writes = [];
   const initState = JSON.stringify({ version: 1, initialized: true, lastRun: '2026-06-20T00:00:00Z', reviewed: {}, branchTips: {} });
