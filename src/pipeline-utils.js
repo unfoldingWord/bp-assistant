@@ -256,6 +256,18 @@ function calcSkillTimeout(book, chapters, ops) {
 }
 
 /**
+ * Timeout for a skill run over an explicit verse span (not a whole chapter).
+ * Same per-verse-per-op idea and bounds as calcSkillTimeout.
+ * @param {number} verseCount - verses in the span
+ * @param {number} ops - number of operations
+ * @returns {number} timeout in ms
+ */
+function calcVerseSpanTimeout(verseCount, ops) {
+  const total = Math.max(0, verseCount) * ops * MS_PER_VERSE_OP;
+  return Math.min(Math.max(total, MIN_TIMEOUT_MS), MAX_TIMEOUT_MS);
+}
+
+/**
  * Build a standardized AI branch name for repo-insert.
  * Single chapter: AI-PSA-030, AI-ISA-33
  * Range: AI-PSA-030-031, AI-ISA-33-34
@@ -541,6 +553,7 @@ module.exports = {
   discoverFreshOutput,
   checkPrerequisites,
   calcSkillTimeout,
+  calcVerseSpanTimeout,
   normalizeBookName,
   isValidBook,
   resolveConflictMention,
