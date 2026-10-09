@@ -23,7 +23,7 @@ const { checkTnQuality, detectSelfTalk, templateFirstPhrase, resolveTemplateText
 const { buildBookRecurrenceIndex, deriveRecurrenceKeys, buildSeeHowSentence, isSeeHowEligible, isContextDependentSref, dedupeAlsoOccursVerses, assignAlsoOccursVerses, resolveDoor43ReposPath, hebTokens, verseNumber: recurrenceVerseNumber, SEE_HOW_NEVER_FOLD_SREFS, CROSS_BOOK_MAX_BOOKS } = require('./workspace-tools/recurrence-index');
 const { normalizeIssuesFile, buildParallelismIntroHintArgs } = require('./issue-normalizer');
 const { runIssueRulesGate, gatePrBodyForPush, refreshGateSidecarOutputHash, readGateSidecar } = require('./issue-rules-gate');
-const { dropTwCoveredNameRows, isTwCoveredName, isTranslateNames } = require('./tw-names-gate');
+const { dropTwCoveredRows, isTwCoveredName, ruleFor: twRuleFor } = require('./tw-article-gate');
 const { curlyQuotes } = require('./workspace-tools/usfm-tools');
 const { verifyRepoPush, verifyDcsToken, verifyRemoteContent } = require('./repo-verify');
 const { recordMetrics, getCumulativeTokens, recordRunSummary, getAdaptiveSkillGuardrails } = require('./usage-tracker');
@@ -622,14 +622,14 @@ async function runSeeHowDetection({ pipeDir, contextPath, generateIdsFn = genera
     return m ? m[1].trim() : '';
   };
 
-  // A name with a tW article gets no translate-names note (tw-names-gate.js), so it
+  // A name with a tW article gets no translate-names note (tw-article-gate.js), so it
   // gets no pointer back to an earlier one either (#457). The names are every bold
   // span in the target note (a note on several names counts only if all have an
   // article), else this chapter's wording. If the headwords cannot be read, the
   // pointer is kept, as before this check existed.
   const twNameMemo = new Map();
   const pointsToTwCoveredName = (target, glQuote = '') => {
-    if (!target || !isTranslateNames(target.sref)) return false;
+    if (!target || twRuleFor(target.sref) !== 'names') return false;
     const bolds = [...String(target.note || '').matchAll(/\*\*([^*]+)\*\*/g)].map((m) => m[1].trim());
     const english = bolds.join(', ') || String(glQuote || '').trim();
     if (!english) return false;
@@ -3361,17 +3361,17 @@ async function notesPipeline(route, message) {
     if (chOutputs['deep-issue-id']) issuesPath = chOutputs['deep-issue-id'];
     else if (chOutputs['post-edit-review']) issuesPath = chOutputs['post-edit-review'];
 
-    async function reportTwNameDrops(tw) {
+    async function reportTwDrops(tw) {
       if (!tw.ran) {
-        await status(`**${ref}**: tW names check skipped (${tw.reason}); translate-names rows left as they were`);
+        await status(`**${ref}**: tW article check skipped (${tw.reason}); rows left as they were`);
         return;
       }
       if (!tw.dropped.length) return;
       // A chapter the rules gate already sealed must not look edited to its next run.
       refreshGateSidecarOutputHash({ issuesPath, book });
       const list = tw.dropped.map((d) => `${d.ref} ${d.quote}`).join('; ');
-      console.log(`[notes] tw-names-gate ${ref}: dropped ${tw.dropped.length} translate-names row(s) covered by a tW article: ${list}`);
-      await status(`**${ref}**: tW names check: dropped ${tw.dropped.length} translate-names row(s) for names with a tW article (${list})`);
+      console.log(`[notes] tw-article-gate ${ref}: dropped ${tw.dropped.length} translate-names/translate-unknown row(s) covered by a tW article: ${list}`);
+      await status(`**${ref}**: tW article check: dropped ${tw.dropped.length} translate-names/translate-unknown row(s) for terms with a tW article (${list})`);
     }
 
     async function runIssueNormalizationStage() {
@@ -3430,9 +3430,9 @@ async function notesPipeline(route, message) {
       issueNormalizationDone = true;
       let introSignal = result.introSignal;
 
-      // tW names check: translate-names rows for names that already have a tW
-      // article are dropped here, before the rules gate spends a model pass on them.
-      await reportTwNameDrops(dropTwCoveredNameRows({ issuesPath }));
+      // tW article check: translate-names / translate-unknown rows for terms that already
+      // have a tW article are dropped here, before the rules gate spends a model pass on them.
+      await reportTwDrops(dropTwCoveredRows({ issuesPath }));
 
       // Issue rules gate: once per chapter, after normalization. Skipped when
       // this chapter resumes at a downstream skill (the gate already ran, or
@@ -3502,8 +3502,8 @@ async function notesPipeline(route, message) {
           }
         }
         if (gate.changed) {
-          // A relabel can produce a translate-names row; re-apply the tW names check.
-          await reportTwNameDrops(dropTwCoveredNameRows({ issuesPath }));
+          // A relabel can produce a translate-names row; re-apply the tW article check.
+          await reportTwDrops(dropTwCoveredRows({ issuesPath }));
           const pass2 = normalizeIssuesFile({
             issuesPath,
             options: {

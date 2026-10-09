@@ -448,7 +448,7 @@ function createMcpServer() {
     'curate_published_data',
     'Fetch/update published Bible translation data from Door43 and Google, extract unaligned English, resolve GL quotes, and rebuild search indexes. Use step="setup" for initial population on a new host, step="check" for dry-run, or omit step for a normal update.',
     {
-      step: z.enum(['check', 'setup', 'fetch-door43', 'fetch-google', 'extract-english', 'resolve-quotes', 'build-indexes']).optional().describe('Run a specific step, or omit for full run. "setup" = force-fetch everything (initial population). "check" = dry-run report.'),
+      step: z.enum(['check', 'setup', 'fetch-door43', 'fetch-google', 'fetch-tw', 'extract-english', 'resolve-quotes', 'build-indexes']).optional().describe('Run a specific step, or omit for full run. "setup" = force-fetch everything (initial population). "check" = dry-run report.'),
       force: z.boolean().optional().describe('Ignore cache and refetch everything (default: false)'),
     },
     async ({ step, force }) => {

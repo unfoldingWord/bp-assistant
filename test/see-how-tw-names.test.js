@@ -1,6 +1,6 @@
 // See-how pointers skip names that have a tW article (issue #457).
 //
-// The tW names check (tw-names-gate.js) drops translate-names rows for names with
+// The tW names check (tw-article-gate.js) drops translate-names rows for names with
 // a tW names article. Pointer injection reads the published notes instead, so it
 // must apply the same test: no "See how you translated this name" back to a
 // translate-names note on such a name. A name without an article keeps its pointer.
