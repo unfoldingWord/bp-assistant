@@ -144,3 +144,20 @@ test('push guard rejects a chapter TSV containing only "See how" rows', withTemp
     restore();
   }
 }));
+
+test('push guard does not count a blank Note cell as a written note', withTempDir('push-guard-blank-', async (tempDir) => {
+  const rel = 'output/notes/JER/JER-32.tsv';
+  fs.mkdirSync(path.join(tempDir, 'output/notes/JER'), { recursive: true });
+  fs.writeFileSync(path.join(tempDir, rel), [
+    HEADER,
+    '32:1\tcd34\t\trc://*/ta/man/translate/figs-idiom\tהַדָּבָר\t1\t',
+  ].join('\n') + '\n');
+  const { mod, restore } = loadPipeline(tempDir);
+  try {
+    const coverage = mod._assessWrittenNoteCoverage(rel, { chapter: 32, verseCount: 1 });
+    assert.equal(coverage.writtenRows, 0);
+    assert.equal(coverage.ok, false);
+  } finally {
+    restore();
+  }
+}));

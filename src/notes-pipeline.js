@@ -2356,7 +2356,7 @@ function assessWrittenNoteCoverage(notesPath, { chapter, verseStart = null, vers
     out.verseRows++;
     const note = cols.length >= 7 ? cols[6] : cols[cols.length - 1];
     if (POINTER_NOTE_RE.test(String(note || ''))) out.pointerRows++;
-    else out.writtenRows++;
+    else if (String(note || '').trim()) out.writtenRows++;
     const [a, b] = vPart.split('-').map((n) => parseInt(n, 10));
     if (Number.isFinite(a)) {
       for (let v = a; v <= (Number.isFinite(b) && b >= a ? b : a); v++) covered.add(v);
