@@ -166,19 +166,253 @@ function compareUltUst({ ultFile, ustFile, chapter, format }) {
   return [header, ...rows].join('\n');
 }
 
+// --- Abstract-noun lexicon -------------------------------------------------
+//
+// The team's word list lives in the skills checkout:
+//   data/abstract_nouns.txt          one word/phrase per line (CRLF)
+//   data/abstract_nouns_review.csv   per-word team rulings (team_decision column)
+//   .claude/skills/issue-identification/figs-abstractnouns.md
+//                                    "NOT figs-abstractnouns" communication words
+// Suffix matching is only a low-confidence fallback for words not on the list.
+
+const ABSTRACT_WORDLIST_REL = path.join('data', 'abstract_nouns.txt');
+const ABSTRACT_REVIEW_REL = path.join('data', 'abstract_nouns_review.csv');
+const ABSTRACT_DOC_REL = path.join('.claude', 'skills', 'issue-identification', 'figs-abstractnouns.md');
+
+// Fallback suffixes. -ure and -ment are left out: they mostly hit concrete
+// nouns (treasure, pasture, creature, garment, ornament); the abstract ones
+// (judgment, punishment, pleasure, measure...) are on the word list.
+const ABSTRACT_FALLBACK_SUFFIXES = ['ness', 'tion', 'sion', 'ity', 'ance', 'ence', 'dom', 'ship', 'hood', 'ism'];
+
+// Used only if figs-abstractnouns.md is missing or its list can't be parsed.
+const COMMUNICATION_WORDS_FALLBACK = [
+  'commandment', 'statute', 'precept', 'ordinance', 'decree', 'testimony', 'law', 'rule',
+  'regulation', 'word', 'saying', 'promise', 'declaration', 'instruction', 'charge', 'covenant', 'oath',
+];
+
+function parseCsvLine(line) {
+  const out = [];
+  let cur = '';
+  let inQ = false;
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    if (inQ) {
+      if (ch === '"' && line[i + 1] === '"') { cur += '"'; i++; }
+      else if (ch === '"') inQ = false;
+      else cur += ch;
+    } else if (ch === '"') inQ = true;
+    else if (ch === ',') { out.push(cur); cur = ''; }
+    else cur += ch;
+  }
+  out.push(cur);
+  return out;
+}
+
+/** Singular/base candidates for a lower-case word (simple plural fold). */
+function nounCandidates(w) {
+  const c = [w];
+  if (w.endsWith('ies') && w.length > 4) c.push(w.slice(0, -3) + 'y');
+  if (w.endsWith('ves') && w.length > 4) c.push(w.slice(0, -3) + 'f', w.slice(0, -3) + 'fe');
+  if (w.endsWith('es') && w.length > 3) c.push(w.slice(0, -2));
+  if (w.endsWith('s') && !w.endsWith('ss') && w.length > 3) c.push(w.slice(0, -1));
+  return c;
+}
+
+/** Parse the communication-word bullets from figs-abstractnouns.md. */
+function parseCommunicationWords(md) {
+  const lines = md.split(/\r?\n/);
+  const idx = lines.findIndex(l => /spoken or written communication/i.test(l));
+  if (idx < 0) return null;
+  const words = new Set();
+  for (let i = idx + 1; i < lines.length; i++) {
+    const l = lines[i].trim();
+    if (!l.startsWith('-')) break;
+    for (const m of l.matchAll(/"([^"]+)"/g)) {
+      for (const part of m[1].split('/')) {
+        const base = part.replace(/\(s\)$/i, '').trim().toLowerCase();
+        if (base) words.add(base);
+      }
+    }
+  }
+  return words.size ? words : null;
+}
+
+function normalizeDecision(raw) {
+  const d = String(raw || '').trim().toLowerCase();
+  if (!d) return '';
+  if (/^not[\s_-]*abstract$/.test(d) || d === 'no') return 'not abstract';
+  if (d.startsWith('context')) return 'context';
+  if (d === 'abstract' || d === 'yes') return 'abstract';
+  return '';
+}
+
+const lexiconCache = { key: null, value: null };
+
+function fileStamp(p) {
+  try { const st = fs.statSync(p); return `${st.mtimeMs}:${st.size}`; } catch (_) { return 'missing'; }
+}
+
 /**
- * Detect abstract nouns in alignment data.
+ * Load the abstract-noun lexicon from the skills checkout. Cached by mtime.
+ * @returns {{ words: Set<string>, phrases: Map<string,string>, maxPhraseLen: number,
+ *   decisions: Map<string,string>, pending: Set<string>, communication: Set<string>,
+ *   hasWordList: boolean }}
+ */
+function loadAbstractNounLexicon(skillsDir = CSKILLBP_DIR) {
+  const listPath = path.join(skillsDir, ABSTRACT_WORDLIST_REL);
+  const reviewPath = path.join(skillsDir, ABSTRACT_REVIEW_REL);
+  const docPath = path.join(skillsDir, ABSTRACT_DOC_REL);
+  const key = [skillsDir, fileStamp(listPath), fileStamp(reviewPath), fileStamp(docPath)].join('|');
+  if (lexiconCache.key === key) return lexiconCache.value;
+
+  const words = new Set();
+  const phrases = new Map();
+  let maxPhraseLen = 1;
+  let hasWordList = false;
+  if (fs.existsSync(listPath)) {
+    hasWordList = true;
+    for (const raw of fs.readFileSync(listPath, 'utf8').split(/\r?\n/)) {
+      const entry = raw.trim().toLowerCase().replace(/\s+/g, ' ');
+      if (!entry || entry.startsWith('#')) continue;
+      if (entry.includes(' ')) {
+        phrases.set(entry, entry);
+        maxPhraseLen = Math.max(maxPhraseLen, entry.split(' ').length);
+      } else {
+        words.add(entry);
+      }
+    }
+  } else {
+    console.warn(`[detect_abstract_nouns] word list not found at ${listPath}; using suffix fallback only`);
+  }
+
+  // Team rulings. An explicit team_decision wins over the list and the doc.
+  // A borderline/hold/conflict row with no decision yet is pending: not flagged.
+  const decisions = new Map();
+  const pending = new Set();
+  if (fs.existsSync(reviewPath)) {
+    const rows = fs.readFileSync(reviewPath, 'utf8').split(/\r?\n/).filter(l => l.trim());
+    const header = rows.length ? parseCsvLine(rows[0]).map(h => h.trim().toLowerCase()) : [];
+    const wordCol = header.indexOf('english_word');
+    const statusCol = header.indexOf('status');
+    const decisionCol = header.indexOf('team_decision');
+    if (wordCol >= 0) {
+      for (const row of rows.slice(1)) {
+        const cols = parseCsvLine(row);
+        const word = (cols[wordCol] || '').trim().toLowerCase();
+        if (!word) continue;
+        const decision = decisionCol >= 0 ? normalizeDecision(cols[decisionCol]) : '';
+        const status = statusCol >= 0 ? (cols[statusCol] || '').trim().toLowerCase() : '';
+        if (decision) decisions.set(word, decision);
+        else if (/^(borderline|hold|conflict)\b/.test(status)) pending.add(word);
+      }
+    }
+  }
+
+  let communication = null;
+  if (fs.existsSync(docPath)) communication = parseCommunicationWords(fs.readFileSync(docPath, 'utf8'));
+  if (!communication) communication = new Set(COMMUNICATION_WORDS_FALLBACK);
+
+  const value = { words, phrases, maxPhraseLen, decisions, pending, communication, hasWordList };
+  lexiconCache.key = key;
+  lexiconCache.value = value;
+  return value;
+}
+
+/**
+ * Classify one entry (single word or space-joined phrase).
+ * @returns {null | { match: string, source: 'team'|'list'|'suffix', confidence: string, reason: string }}
+ */
+function classifyAbstract(entry, lex, { allowSuffix = true } = {}) {
+  const w = entry.toLowerCase();
+  const cands = nounCandidates(w);
+  for (const c of cands) {
+    const d = lex.decisions.get(c);
+    if (!d) continue;
+    if (d === 'not abstract') return null;
+    if (d === 'abstract') return { match: c, source: 'team', confidence: 'medium', reason: 'team ruled abstract (abstract_nouns_review.csv)' };
+    if (d === 'context') return { match: c, source: 'team', confidence: 'low', reason: 'team ruled context-dependent (abstract_nouns_review.csv)' };
+  }
+  if (cands.some(c => lex.communication.has(c))) return null;
+  if (cands.some(c => lex.pending.has(c))) return null;
+  const dict = w.includes(' ') ? lex.phrases : lex.words;
+  for (const c of cands) {
+    if (dict.has(c)) return { match: c, source: 'list', confidence: 'medium', reason: 'on abstract_nouns.txt' };
+  }
+  if (allowSuffix && !w.includes(' ')) {
+    const suf = ABSTRACT_FALLBACK_SUFFIXES.find(s => w.endsWith(s) && w.length > s.length + 2);
+    if (suf) return { match: w, source: 'suffix', confidence: 'low', reason: `abstract noun suffix -${suf} (not on word list)` };
+  }
+  return null;
+}
+
+/** Find abstract nouns in a run of English text (phrases first, then words). */
+function findAbstractInText(text, lex) {
+  const tokens = (text.match(/[A-Za-z]+(?:['’][A-Za-z]+)*/g) || [])
+    .map(t => ({ raw: t, norm: t.toLowerCase().replace(/['’]s$/, '') }));
+  const hits = [];
+  for (let i = 0; i < tokens.length; i++) {
+    let matched = false;
+    for (let n = Math.min(lex.maxPhraseLen, tokens.length - i); n >= 2; n--) {
+      const slice = tokens.slice(i, i + n);
+      const hit = classifyAbstract(slice.map(t => t.norm).join(' '), lex, { allowSuffix: false });
+      if (hit) {
+        hits.push({ word: slice.map(t => t.raw).join(' '), ...hit });
+        i += n - 1;
+        matched = true;
+        break;
+      }
+    }
+    if (matched) continue;
+    const hit = classifyAbstract(tokens[i].norm, lex);
+    if (hit) hits.push({ word: tokens[i].raw, ...hit });
+  }
+  return hits;
+}
+
+const USFM_HEADER_MARKERS = /^\\(id|ide|usfm|h|toc\d*|toca\d*|mt\d*|mte\d*|rem|sts)\b.*$/gm;
+
+/** Split USFM (or plain text) into [{ ref, text }] segments keyed by \c / \v. */
+function splitUsfmVerses(usfm) {
+  const clean = String(usfm)
+    .replace(USFM_HEADER_MARKERS, ' ')
+    .replace(/\\f\s[\s\S]*?\\f\*/g, ' ')
+    .replace(/\\x\s[\s\S]*?\\x\*/g, ' ')
+    .replace(/\\\+?w\s+([^|\\]*?)(?:\|[^\\]*)?\\\+?w\*/g, '$1')
+    .replace(/\\zaln-[se][^\\]*\\\*/g, '')
+    .replace(/\\[a-z0-9-]+\*/gi, '');
+  const segments = [];
+  let chapter = '';
+  let verse = '';
+  const re = /\\([cv])\s+(\d+[a-z]?(?:-\d+[a-z]?)?)/g;
+  let last = 0;
+  const push = (txt) => {
+    const t = txt.replace(/\\[a-z0-9-]+\s?/gi, ' ');
+    if (!t.trim()) return;
+    const ref = chapter ? `${chapter}:${verse || '0'}` : verse;
+    segments.push({ ref, text: t });
+  };
+  let m;
+  while ((m = re.exec(clean))) {
+    push(clean.slice(last, m.index));
+    if (m[1] === 'c') { chapter = m[2]; verse = ''; } else verse = m[2];
+    last = re.lastIndex;
+  }
+  push(clean.slice(last));
+  return segments;
+}
+
+/**
+ * Detect abstract nouns in alignment data or ULT text.
+ *
+ * Matches the team's word list (data/abstract_nouns.txt) as whole words,
+ * case-insensitive, with a simple plural fold; applies team rulings from
+ * data/abstract_nouns_review.csv; skips the communication words that
+ * figs-abstractnouns.md lists as not abstract; and falls back to English
+ * suffixes at low confidence for words not on the list.
  */
 function detectAbstractNouns({ alignmentJson, text, format }) {
   const fmt = format || 'json';
-
-  // Hardcoded abstract noun list (common suffixes)
-  const ABSTRACT_SUFFIXES = ['ness', 'tion', 'sion', 'ment', 'ity', 'ance', 'ence', 'dom', 'ship', 'hood', 'ure', 'ism'];
-
-  function isAbstract(word) {
-    const w = word.toLowerCase();
-    return ABSTRACT_SUFFIXES.some(s => w.endsWith(s) && w.length > s.length + 2);
-  }
+  const lex = loadAbstractNounLexicon();
 
   function isSrcNoun(morph) {
     if (!morph) return false;
@@ -188,37 +422,37 @@ function detectAbstractNouns({ alignmentJson, text, format }) {
     if (!morph) return false;
     return morph.startsWith('He,A') || morph.startsWith('Gr,A') || morph.split(',')[1] === 'A';
   }
-
-  let data;
-  if (alignmentJson) {
-    const fpath = path.resolve(CSKILLBP_DIR, alignmentJson);
-    data = JSON.parse(fs.readFileSync(fpath, 'utf8'));
-  } else if (text) {
-    // Simple word-level check
-    const words = text.split(/\s+/);
-    const found = words.filter(isAbstract);
-    return JSON.stringify(found.map(w => ({ english_word: w, issue_type: 'figs-abstractnouns', confidence: 'medium', reason: 'word has abstract noun suffix' })));
-  } else {
-    return 'Provide alignmentJson or text parameter';
-  }
+  function bump(conf) { return conf === 'low' ? 'medium' : 'high'; }
 
   const results = [];
-  const alignments = data.alignments || [];
-  for (const a of alignments) {
-    const engWords = a.englishWords || (a.english ? a.english.split(/\s+/) : []);
-    for (const word of engWords) {
-      if (!isAbstract(word)) continue;
+  if (alignmentJson) {
+    const fpath = path.resolve(CSKILLBP_DIR, alignmentJson);
+    const data = JSON.parse(fs.readFileSync(fpath, 'utf8'));
+    const alignments = data.alignments || [];
+    for (const a of alignments) {
+      const engText = a.englishWords ? a.englishWords.join(' ') : (a.english || '');
       const morph = a.source ? a.source.morph : '';
-      let confidence = 'medium';
-      let reason = 'word has abstract noun suffix';
-      if (isSrcNoun(morph)) { confidence = 'high'; reason += '; source is noun'; }
-      if (isSrcAdj(morph)) { confidence = 'high'; reason += '; source adjective translated as noun'; }
-
-      results.push({
-        ref: a.ref, english_word: word, source_word: a.source ? a.source.word : '',
-        morph, issue_type: 'figs-abstractnouns', confidence, reason,
-      });
+      for (const hit of findAbstractInText(engText, lex)) {
+        let { confidence, reason } = hit;
+        if (isSrcNoun(morph)) { confidence = bump(confidence); reason += '; source is noun'; }
+        else if (isSrcAdj(morph)) { confidence = bump(confidence); reason += '; source adjective translated as noun'; }
+        results.push({
+          ref: a.ref, english_word: hit.word, source_word: a.source ? a.source.word : '',
+          morph, issue_type: 'figs-abstractnouns', confidence, reason,
+        });
+      }
     }
+  } else if (text) {
+    for (const seg of splitUsfmVerses(text)) {
+      for (const hit of findAbstractInText(seg.text, lex)) {
+        results.push({
+          ref: seg.ref, english_word: hit.word, source_word: '', morph: '',
+          issue_type: 'figs-abstractnouns', confidence: hit.confidence, reason: hit.reason,
+        });
+      }
+    }
+  } else {
+    return 'Provide alignmentJson or text parameter';
   }
 
   if (fmt === 'json') return JSON.stringify(results, null, 2);
@@ -227,4 +461,8 @@ function detectAbstractNouns({ alignmentJson, text, format }) {
   return [header, ...rows].join('\n');
 }
 
-module.exports = { checkTwHeadwords, compareUltUst, detectAbstractNouns };
+module.exports = {
+  checkTwHeadwords, compareUltUst, detectAbstractNouns,
+  // exported for tests
+  loadAbstractNounLexicon, splitUsfmVerses,
+};
