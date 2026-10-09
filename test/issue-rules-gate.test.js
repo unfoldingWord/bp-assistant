@@ -1181,6 +1181,68 @@ test('kept notes (#448): a verse-range run keeps the KEPT drops outside its rang
   }, { rules: G_RULES });
 });
 
+test('kept notes (#448): a KEPT drop in the same run as a restore is recorded with its own line', async () => {
+  await ws(async ({ run, read, dir }) => {
+    await dropRow6AsKept(run);
+    // hk52 is gone (row 6 comes back); kp02 still covers 3:4, whose row is dropped by prompt number.
+    const pick = (prompt) => Number(prompt.match(/^#(\d+) 3:4 \| figs-metonymy /m)[1]);
+    const runner = async (args) => fakeRunner({ overrides: { [pick(args.prompt)]: { action: 'drop', rule: 'KEPT', kept: 'kp02' } } })(args);
+    const res = await run({ runClaudeImpl: runner, kept: [KEPT[1]], config: DEFAULTS });
+    assert.deepEqual(res.keptRestored, [{ ref: '3:3', sref: 'figs-explicit', kept: 'hk52' }]);
+    assert.ok(read().includes(LINES[6]));
+    assert.ok(!read().includes(LINES[8]));
+    assert.deepEqual(sidecarOf(dir, res).keptDropped.map((d) => [d.line, d.kept]), [[LINES[8], 'kp02']]);
+  }, { rules: G_RULES });
+});
+
+test('kept notes (#448): a sidecar KEPT drop with an empty or unparseable line is skipped, not fatal', async () => {
+  await ws(async ({ run, read, dir }) => {
+    const first = await dropRow6AsKept(run);
+    const scPath = path.join(dir, first.sidecarPath);
+    const sc = sidecarOf(dir, first);
+    sc.keptDropped.push({ line: '', ref: '3:3', sref: 'figs-explicit', kept: 'hk52' }, { line: 'garbage', ref: '3:3', sref: 'x', kept: 'hk52' });
+    fs.writeFileSync(scPath, JSON.stringify(sc));
+    const res = await run({ runClaudeImpl: fakeRunner(), kept: [KEPT[1]], config: DEFAULTS });
+    assert.equal(res.reason, 'applied');
+    assert.deepEqual(res.keptRestored, [{ ref: '3:3', sref: 'figs-explicit', kept: 'hk52' }]);
+    assert.equal(read().split('\n').filter((l) => l === LINES[6]).length, 1);
+  }, { rules: G_RULES });
+});
+
+test('kept notes (#448): an incomplete run writes nothing and reports the file as read', async () => {
+  await ws(async ({ run, read }) => {
+    await dropRow6AsKept(run);
+    const after = read();
+    const res = await run({ runClaudeImpl: fakeRunner({ omit: [3] }), kept: [KEPT[1]], config: DEFAULTS });
+    assert.equal(res.reason, 'incomplete');
+    assert.equal(read(), after);
+    assert.equal(res.rowsBefore, res.rowsAfter);
+    assert.equal(res.rowsBefore, after.split('\n').filter((l) => /^JER\t3:\d/.test(l)).length);
+  }, { rules: G_RULES });
+});
+
+test('buildPrBody counts restored rows and changes together in its "... and N more"', async () => {
+  await ws(async ({ mod }) => {
+    const restored = Array.from({ length: 25 }, (_, i) => ({ ref: `3:${i + 1}`, sref: 'figs-explicit', kept: 'hk52' }));
+    const changes = [{ ref: '3:30', action: 'drop', sref: 'figs-idiom', before: 'q', reason: 'r', rule: 'G4' }];
+    const body = mod.buildPrBody({ counts: { kept: 1, dropped: 1, relabeled: 0, rescoped: 0, added: 0 }, changes, restored });
+    const lines = body.split('\n').filter((l) => l.startsWith('- '));
+    assert.equal(lines.length, 26);
+    assert.equal(lines[25], '- … and 1 more');
+  });
+});
+
+test('keptDropsStillCovered drops entries whose kept note moved off their verses or is gone', async () => {
+  await ws(async ({ mod }) => {
+    const drops = [{ line: LINES[6], ref: '3:3', sref: 'figs-explicit', kept: 'hk52' }];
+    assert.equal(mod.keptDropsStillCovered(drops, KEPT, 3).length, 1);
+    assert.equal(mod.keptDropsStillCovered(drops, [{ ...KEPT[0], ref: '3:5' }], 3).length, 0, 'moved, same row ID');
+    assert.equal(mod.keptDropsStillCovered(drops, [{ ...KEPT[0], ref: '4:1' }], 3).length, 0, 'moved to another chapter');
+    assert.equal(mod.keptDropsStillCovered(drops, [KEPT[1]], 3).length, 0, 'removed');
+    assert.equal(mod.keptDropsStillCovered(undefined, KEPT, 3).length, 0);
+  });
+});
+
 test('insertRowLines places a row after its verse, or before the first data row', async () => {
   await ws(async ({ mod }) => {
     const text = [LINES[0], LINES[1], LINES[4], LINES[8]].join('\n') + '\n';

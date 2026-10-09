@@ -22,7 +22,7 @@ const { fillTsvIds, generateIds, prepareNotes, fillOrigQuotes, resolveGlQuotes, 
 const { checkTnQuality, detectSelfTalk, templateFirstPhrase, resolveTemplateText } = require('./workspace-tools/quality-tools');
 const { buildBookRecurrenceIndex, deriveRecurrenceKeys, buildSeeHowSentence, isSeeHowEligible, isContextDependentSref, dedupeAlsoOccursVerses, assignAlsoOccursVerses, resolveDoor43ReposPath, hebTokens, verseNumber: recurrenceVerseNumber, SEE_HOW_NEVER_FOLD_SREFS, CROSS_BOOK_MAX_BOOKS } = require('./workspace-tools/recurrence-index');
 const { normalizeIssuesFile, buildParallelismIntroHintArgs } = require('./issue-normalizer');
-const { runIssueRulesGate, gatePrBodyForPush, refreshGateSidecarOutputHash, readGateSidecar } = require('./issue-rules-gate');
+const { runIssueRulesGate, gatePrBodyForPush, refreshGateSidecarOutputHash, readGateSidecar, keptDropsStillCovered } = require('./issue-rules-gate');
 const { dropTwCoveredRows } = require('./tw-article-gate');
 const { curlyQuotes } = require('./workspace-tools/usfm-tools');
 const { verifyRepoPush, verifyDcsToken, verifyRemoteContent } = require('./repo-verify');
@@ -3639,8 +3639,7 @@ async function notesPipeline(route, message) {
               // already_applied, off), read the count from its sealed sidecar.
               const gateKept = issueRulesGateResult && issueRulesGateResult.ran
                 ? (issueRulesGateResult.keptDropsTotal || 0)
-                : (readGateSidecar({ issuesPath, book })?.keptDropped || [])
-                  .filter((d) => (kept || []).some((k) => k && k.rowId === d.kept)).length;
+                : keptDropsStillCovered(readGateSidecar({ issuesPath, book })?.keptDropped, kept, ch).length;
               await status(
                 `**${ref}**: ${keptHere} kept notes from the editor will stay in place; ` +
                 `${dropped + gateKept} AI notes dropped as duplicates of kept notes ` +

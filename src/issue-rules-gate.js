@@ -97,6 +97,26 @@ function verseOfRef(ref) {
   return m ? { chapter: Number(m[1]), verse: Number(m[2]) } : null;
 }
 
+// Does a KEPT-dropped row (sidecar entry with `ref`) still touch a kept note's verse span?
+function dropOverlapsSpan(d, span) {
+  const cv = verseOfRef(d.ref);
+  if (!cv || !span) return false;
+  const hi = rowLastVerse({ ref: d.ref, verse: cv.verse });
+  return cv.verse <= span.hi && hi >= span.lo;
+}
+
+/**
+ * The sidecar's KEPT drops whose kept note is still in the kept list and still touches
+ * the dropped row's verses (a moved or removed note no longer justifies the drop).
+ */
+function keptDropsStillCovered(drops, kept, chapter) {
+  const spans = new Map();
+  for (const k of Array.isArray(kept) ? kept : []) {
+    if (k && k.rowId) spans.set(sanitizeCell(k.rowId), keptRefVerseSpan(k.ref, chapter));
+  }
+  return (Array.isArray(drops) ? drops : []).filter((d) => d && dropOverlapsSpan(d, spans.get(d.kept)));
+}
+
 /**
  * Parse an issues TSV into rows. Header lines, blank lines, `:intro` rows and
  * rows with fewer than 4 columns are passthrough: they round-trip unchanged
@@ -749,11 +769,12 @@ function countsLine(counts, keptDrops = 0) {
 function buildPrBody({ counts, changes, restored = [] }) {
   const head = `Issue rules check: ${countsLine(counts, (changes || []).filter((c) => c.kept).length)}`
     + (restored.length ? `, restored ${restored.length}` : '');
-  const list = [
+  const all = [
     ...restored.map((d) => noMentions(`- ${d.ref} ${d.sref} restored: kept note ${d.kept} no longer covers it`)),
     ...(changes || []),
-  ].slice(0, PR_BODY_MAX_LINES).map((c) => (typeof c === 'string' ? c : changeLine(c)));
-  const extra = (changes || []).length > PR_BODY_MAX_LINES ? [`- … and ${changes.length - PR_BODY_MAX_LINES} more`] : [];
+  ];
+  const list = all.slice(0, PR_BODY_MAX_LINES).map((c) => (typeof c === 'string' ? c : changeLine(c)));
+  const extra = all.length > PR_BODY_MAX_LINES ? [`- … and ${all.length - PR_BODY_MAX_LINES} more`] : [];
   const body = [head, '', ...list, ...extra].join('\n');
   return body.length > PR_BODY_MAX ? `${body.slice(0, PR_BODY_MAX - 1)}…` : body;
 }
@@ -883,10 +904,7 @@ async function runIssueRulesGate({ issuesPath, book, chapter, verseStart, verseE
     const keptNow = new Map(chapterKept.map((k) => [k.rowId, k]));
     const stillCovered = (d) => {
       const k = keptNow.get(d.kept);
-      const cv = verseOfRef(d.ref);
-      if (!k || !cv) return false;
-      const hi = rowLastVerse({ ref: d.ref, verse: cv.verse });
-      return cv.verse <= k.span.hi && hi >= k.span.lo;
+      return !!k && dropOverlapsSpan(d, k.span);
     };
 
     const base = path.basename(issuesPath, '.tsv');
@@ -1267,6 +1285,7 @@ module.exports = {
   parseIssuesTsv,
   serializeIssuesTsv,
   insertRowLines,
+  keptDropsStillCovered,
   loadDecisionRules,
   activeGRuleIds,
   buildPrompt,
