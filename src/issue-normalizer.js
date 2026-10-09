@@ -199,7 +199,10 @@ function finalizeFirstInstance(outLines, sawFirstInstanceTag, summary) {
   const wasRepeat = hasParallelismRepeatMarker(firstCols[6]);
   if (wasRepeat) firstCols[6] = clearParallelismRepeat(firstCols[6]);
   const anyTag = idx.some((i) => hasFirstInstanceTag(parseTsvLine(outLines[i])[6])) || hasFirstInstanceTag(firstCols[6]);
-  if (!anyTag && (wasRepeat || sawFirstInstanceTag)) {
+  // A row that already asks for another template (`t: combine`) keeps it: two
+  // t: hints on one row make the template choice ambiguous.
+  const hasOtherTemplateHint = /(^|\s)t:\s*\S/i.test(firstCols[6]);
+  if (!anyTag && !hasOtherTemplateHint && (wasRepeat || sawFirstInstanceTag)) {
     firstCols[6] = [firstCols[6], 't: first instance'].filter(Boolean).join(' ');
     summary.first_instance_restored++;
   } else if (!wasRepeat) {
@@ -372,9 +375,15 @@ function normalizeIssueRows(lines, options = {}) {
     });
   }
 
+  // Only the first-instance / non-repeat parallelism rows may swallow a doublet.
+  // A repeat row may be skipped by the writer, and then the verse would end up
+  // with neither note. The first parallelism row left counts even if an earlier
+  // pass marked it as a repeat: it is the first instance now.
+  const firstParallelismRow = dataRows.find((r) => r.issueType === 'figs-parallelism' && !r.drop);
   const keptParallelismByRef = new Map();
   for (const row of dataRows) {
     if (row.issueType !== 'figs-parallelism' || row.drop) continue;
+    if (row !== firstParallelismRow && hasParallelismRepeatMarker(row.explanation)) continue;
     if (!keptParallelismByRef.has(row.ref)) keptParallelismByRef.set(row.ref, []);
     keptParallelismByRef.get(row.ref).push(row);
   }

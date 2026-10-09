@@ -35,7 +35,16 @@ test('parseWriterSkip recognises the marker and returns its reason; ordinary not
   assert.equal(parseWriterSkip('  SKIP_NOTE - climactic\n'), 'climactic');
   assert.equal(parseWriterSkip('SKIP_NOTE'), '');
   assert.equal(parseWriterSkip('See how your translation team has decided to represent pairs of clauses'), null);
-  assert.equal(parseWriterSkip('The note says SKIP_NOTE: later in the text'), null);
+  // Dressed-up variants all count.
+  assert.equal(parseWriterSkip('**SKIP_NOTE**: antithetical'), 'antithetical');
+  assert.equal(parseWriterSkip('`SKIP_NOTE: chiasm`'), 'chiasm');
+  assert.equal(parseWriterSkip('"SKIP_NOTE" - climactic'), 'climactic');
+  assert.equal(parseWriterSkip('skip_note: synthetic'), 'synthetic');
+  assert.equal(parseWriterSkip('Skip-Note: synthetic'), 'synthetic');
+  assert.equal(parseWriterSkip('These lines differ in meaning.\nSKIP_NOTE: synthetic'), 'synthetic');
+  assert.equal(parseWriterSkip('The note says SKIP_NOTE: later in the text'), 'later in the text');
+  // Words that merely contain it do not.
+  assert.equal(parseWriterSkip('Do not SKIP_NOTES here'), null);
   assert.equal(parseWriterSkip(''), null);
   assert.equal(parseWriterSkip(undefined), null);
 });
@@ -81,7 +90,8 @@ test('applyWriterSkips drops the marked note from generated + prepared and recor
     i2: 'SKIP_NOTE: synthetic, the second line adds a result',
     i3: 'See how your translation team has decided to represent pairs of clauses in Hebrew poetry that mean basically the same thing.',
   });
-  const skipped = applyWriterSkips({ preparedJson: prep, generatedJson: gen });
+  const { skipped, rejected } = applyWriterSkips({ preparedJson: prep, generatedJson: gen });
+  assert.deepEqual(rejected, []);
   assert.equal(skipped.length, 1);
   assert.equal(skipped[0].id, 'i2');
   assert.equal(skipped[0].reference, '35:4');
@@ -92,7 +102,7 @@ test('applyWriterSkips drops the marked note from generated + prepared and recor
   assert.equal(after.item_count, 2);
   assert.deepEqual(readWriterSkipped(prep).map((r) => r.id), ['i2']);
   // Idempotent: a second run finds nothing and keeps the record.
-  assert.deepEqual(applyWriterSkips({ preparedJson: prep, generatedJson: gen }), []);
+  assert.deepEqual(applyWriterSkips({ preparedJson: prep, generatedJson: gen }), { skipped: [], rejected: [] });
   assert.deepEqual(readWriterSkipped(prep).map((r) => r.id), ['i2']);
 });
 
@@ -114,4 +124,53 @@ test('assembleNotes leaves no row for a skipped note and says so in its result',
   assert.match(result, /Assembled 1 notes/);
   assert.match(result, /Writer skipped: 1 \(k2 35:4\)/);
   assert.doesNotMatch(result, /Missing/);
+});
+
+test('model-written skip reasons are stripped of markup and mentions and truncated', () => {
+  const r = parseWriterSkip('SKIP_NOTE: <@U123> @everyone **antithetical** [link](http://x) ' + 'y'.repeat(400));
+  assert.doesNotMatch(r, /[@<>\[\]*]/);
+  assert.ok(r.length <= 160);
+  assert.match(r, /antithetical/);
+});
+
+test('a skip marker on an item that is not skip_allowed is a failed note: removed, item kept, flagged', () => {
+  const prep = writeJson('c/prepared_notes.json', {
+    book: 'PSA', chapter: '35',
+    items: [
+      { id: 'm1', reference: '35:1', sref: 'figs-metaphor', orig_quote: 'q1', gl_quote: 'A', ult_verse: 'A' },
+      { id: 'm2', reference: '35:2', sref: 'figs-parallelism', orig_quote: 'q2', gl_quote: 'B', ult_verse: 'B', skip_allowed: true },
+    ],
+  });
+  const gen = writeJson('c/generated_notes.json', { m1: '**SKIP_NOTE**: nothing to say', m2: 'skip_note: synthetic' });
+  const result = assembleNotes({ preparedJson: prep, generatedJson: gen, output: 'c/out.tsv' });
+  const tsv = fs.readFileSync(path.join(WORK, 'c/out.tsv'), 'utf8');
+  assert.doesNotMatch(tsv, /skip_note/i);
+  assert.equal(tsv.trim().split('\n').length, 1, 'header only: neither row ships');
+  assert.match(result, /Missing: 1/);
+  assert.match(result, /non-skippable item\(s\), treated as failed: m1 35:1/);
+  assert.match(result, /Writer skipped: 1 \(m2 35:2\)/);
+  const after = readJson(prep);
+  assert.deepEqual(after.items.map((i) => i.id), ['m1'], 'the rejected item stays in prepared');
+  assert.deepEqual(readWriterSkipped(prep, 'writer_skip_rejected').map((r) => r.id), ['m1']);
+  assert.deepEqual(readWriterSkipped(prep).map((r) => r.id), ['m2']);
+});
+
+test('id-less items with a marker under a reference key are handled', () => {
+  const prep = writeJson('d/prepared_notes.json', {
+    book: 'PSA', chapter: '35',
+    items: [{ index: 0, reference: '35:4', sref: 'figs-parallelism', gl_quote: 'C', skip_allowed: true }],
+  });
+  const gen = writeJson('d/generated_notes.json', { '35:4': '`SKIP_NOTE: antithetical`' });
+  const { skipped } = applyWriterSkips({ preparedJson: prep, generatedJson: gen });
+  assert.equal(skipped.length, 1);
+  assert.equal(skipped[0].id, 'index:0');
+  assert.deepEqual(readJson(gen), {});
+  assert.deepEqual(readJson(prep).items, []);
+});
+
+test('applyWriterSkips leaves no temp files behind', () => {
+  const prep = writeJson('e/prepared_notes.json', { items: [{ id: 'z1', reference: '1:1', sref: 'figs-parallelism', skip_allowed: true }] });
+  const gen = writeJson('e/generated_notes.json', { z1: 'SKIP_NOTE: x' });
+  applyWriterSkips({ preparedJson: prep, generatedJson: gen });
+  assert.deepEqual(fs.readdirSync(path.join(WORK, 'e')).sort(), ['generated_notes.json', 'prepared_notes.json']);
 });

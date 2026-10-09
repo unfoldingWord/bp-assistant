@@ -314,3 +314,35 @@ test('repeats whose explanation never says synonymous are counted as unspecified
   assert.equal(result.summary.kept_parallelism_repeats, 3);
   assert.equal(result.summary.kept_parallelism_repeats_unspecified_type, 2);
 });
+
+test('a repeat parallelism row does not swallow a doublet; the first-instance row still does (F2)', () => {
+  const result = normalizeIssueRows([
+    row({ ref: '35:1', quote: 'A; B', explanation: 'synonymous parallelism t: first instance' }),
+    row({ ref: '35:1', sref: 'figs-doublet', quote: 'A', explanation: 'doublet' }),
+    row({ ref: '35:4', quote: 'the king rose and the ruler stood', explanation: 'synonymous parallelism' }),
+    row({ ref: '35:4', sref: 'figs-doublet', quote: 'king rose', explanation: 'doublet' }),
+  ]);
+  const srefs = result.lines.map((l) => l.split('\t')).map((c) => `${c[1]} ${c[2]}`);
+  assert.deepEqual(srefs, ['35:1 figs-parallelism', '35:4 figs-parallelism', '35:4 figs-doublet']);
+  assert.equal(result.summary.dropped_parallelism_overlap_doublets, 1);
+});
+
+test('a first row demoted by an earlier pass still covers its doublet in the next pass', () => {
+  const result = normalizeIssueRows([
+    row({ ref: '35:4', quote: 'the king rose and the ruler stood', explanation: 'synonymous parallelism t: parallelism-repeat' }),
+    row({ ref: '35:4', sref: 'figs-doublet', quote: 'king rose', explanation: 'doublet' }),
+  ]);
+  assert.equal(result.summary.dropped_parallelism_overlap_doublets, 1);
+});
+
+test('restoring the first instance does not add a second t: hint to a row that has another one (F10)', () => {
+  // The skill tagged the second row as the first instance; the first row asks for another template.
+  const result = normalizeIssueRows([
+    row({ ref: '35:4', quote: 'C; D', explanation: 'synonymous parallelism t: combine' }),
+    row({ ref: '35:9', quote: 'E; F', explanation: 'synonymous parallelism t: first instance' }),
+  ]);
+  const cols = parallelismCols(result.lines);
+  assert.equal(cols[0][6], 'synonymous parallelism t: combine');
+  assert.equal(result.summary.first_instance_restored, 0);
+  assert.equal(isRepeat(cols[1]), true);
+});

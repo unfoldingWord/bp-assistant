@@ -542,10 +542,29 @@ function isSkippableTemplate(sref, templateType) {
   return SKIPPABLE_TEMPLATES.has(`${normalizeTemplateType(sref)}/${normalizeTemplateType(templateType)}`);
 }
 
-// Reason string when a writer's output is the skip marker, else null.
+// The skip token can arrive dressed up: **SKIP_NOTE**, `SKIP_NOTE:`, skip_note,
+// or after a sentence of preamble. A real note never contains the token, so it
+// counts as the marker wherever it appears. Returns the (sanitized) reason when
+// the text contains the marker, else null.
+const WRITER_SKIP_TOKEN_RE = /(?<![A-Za-z0-9])SKIP[_-]NOTE(?![A-Za-z0-9])/i;
+
+// Model-authored text that will be posted to chat: drop markup and mentions,
+// collapse whitespace, cap the length.
+function sanitizeSkipReason(text) {
+  const clean = String(text || '')
+    .replace(/[@#<>\[\]{}`*_|\\]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 160);
+  return clean;
+}
+
 function parseWriterSkip(noteText) {
-  const m = String(noteText == null ? '' : noteText).match(/^\s*SKIP_NOTE\b\s*[:\-\u2013\u2014]?\s*([\s\S]*)$/);
-  return m ? m[1].replace(/\s+/g, ' ').trim() : null;
+  const text = String(noteText == null ? '' : noteText);
+  const m = WRITER_SKIP_TOKEN_RE.exec(text);
+  if (!m) return null;
+  const after = text.slice(m.index + m[0].length).replace(/^[\s*`'"\u2018\u2019\u201C\u201D:\-\u2013\u2014]+/, '');
+  return sanitizeSkipReason(after);
 }
 
 function addBuiltinTemplates(map) {
@@ -1467,11 +1486,24 @@ function inspectOpeningBold({ noteText, prepItem = {}, ultVerse = '' }) {
   };
 }
 
-// Writer declined some notes (returned SKIP_NOTE instead of a note): remove each
-// from generated_notes.json and from the prepared items, and record it in the
-// prepared file's `writer_skipped` list so the pipeline can report it. Runs at
-// the start of assembly so the AT, quality and push stages never see the row.
-// Returns the list of records added this call.
+function writeFileAtomic(filePath, content) {
+  const tmp = `${filePath}.${process.pid}.tmp`;
+  fs.writeFileSync(tmp, content);
+  fs.renameSync(tmp, filePath);
+}
+
+// Writer declined some notes (returned SKIP_NOTE instead of a note). For an item
+// the template allows to be skipped (skip_allowed): remove the note from
+// generated_notes.json and the item from the prepared items, and record it in the
+// prepared file's `writer_skipped` list so the pipeline can report it. For any
+// other item the token is a failed generation, not a decision: the note is
+// removed (so assembly reports it missing) but the item stays, and it is listed
+// in `writer_skip_rejected`. Runs at the start of assembly so the AT, quality and
+// push stages never see a marker. Returns { skipped, rejected } added this call.
+//
+// Write order keeps every crash point recoverable: record first (items intact),
+// then drop the items, then the generated entries (a stale entry with no item is
+// ignored by assembly). Each file is replaced atomically.
 function applyWriterSkips({ preparedJson, generatedJson }) {
   const prepPath = path.resolve(CSKILLBP_DIR, preparedJson);
   const genPath = path.resolve(CSKILLBP_DIR, generatedJson);
@@ -1479,42 +1511,67 @@ function applyWriterSkips({ preparedJson, generatedJson }) {
   const generated = JSON.parse(fs.readFileSync(genPath, 'utf8'));
   const items = Array.isArray(prepared.items) ? prepared.items : [];
   const skipped = [];
+  const rejected = [];
+  const dropItems = new Set();
+  const dropKeys = new Set();
   for (const item of items) {
-    if (!item || !item.id || !Object.prototype.hasOwnProperty.call(generated, item.id)) continue;
-    const reason = parseWriterSkip(generated[item.id]);
-    if (reason === null) continue;
-    skipped.push({
-      id: item.id,
+    if (!item) continue;
+    // Same lookup order assembleNotes uses to find an item's note.
+    const keys = [
+      item.id,
+      item.id ? null : String(item.index),
+      item.reference,
+      item.reference && item.sref ? `${item.reference}:${item.sref}` : null,
+      item.reference && item.sref ? `${item.reference}_${item.sref}` : null,
+    ].filter((k) => k != null && k !== 'undefined');
+    const key = keys.find((k) => Object.prototype.hasOwnProperty.call(generated, k) && parseWriterSkip(generated[k]) !== null);
+    if (key === undefined) continue;
+    const record = {
+      id: item.id || `index:${item.index}`,
       reference: item.reference || '',
       sref: item.sref || '',
       gl_quote: item.gl_quote || '',
-      reason: reason || '(no reason given)',
+      reason: parseWriterSkip(generated[key]) || '(no reason given)',
       skip_allowed: !!item.skip_allowed,
-    });
+    };
+    dropKeys.add(key);
+    if (item.skip_allowed) {
+      skipped.push(record);
+      dropItems.add(item);
+    } else {
+      rejected.push(record);
+    }
   }
-  if (!skipped.length) return skipped;
-  const ids = new Set(skipped.map((r) => r.id));
-  for (const id of ids) delete generated[id];
-  prepared.items = items.filter((it) => !(it && ids.has(it.id)));
-  prepared.item_count = prepared.items.length;
-  const prior = Array.isArray(prepared.writer_skipped) ? prepared.writer_skipped : [];
-  prepared.writer_skipped = [...prior.filter((r) => !ids.has(r.id)), ...skipped];
-  fs.writeFileSync(genPath, JSON.stringify(generated, null, 2) + '\n');
-  fs.writeFileSync(prepPath, JSON.stringify(prepared, null, 2));
-  return skipped;
+  if (!skipped.length && !rejected.length) return { skipped, rejected };
+
+  const merge = (prior, added) => {
+    const ids = new Set(added.map((r) => r.id));
+    return [...(Array.isArray(prior) ? prior : []).filter((r) => !ids.has(r.id)), ...added];
+  };
+  if (skipped.length) prepared.writer_skipped = merge(prepared.writer_skipped, skipped);
+  if (rejected.length) prepared.writer_skip_rejected = merge(prepared.writer_skip_rejected, rejected);
+  writeFileAtomic(prepPath, JSON.stringify(prepared, null, 2));
+  if (dropItems.size) {
+    prepared.items = items.filter((it) => !dropItems.has(it));
+    prepared.item_count = prepared.items.length;
+    writeFileAtomic(prepPath, JSON.stringify(prepared, null, 2));
+  }
+  for (const k of dropKeys) delete generated[k];
+  writeFileAtomic(genPath, JSON.stringify(generated, null, 2) + '\n');
+  return { skipped, rejected };
 }
 
-function readWriterSkipped(preparedJson) {
+function readWriterSkipped(preparedJson, field = 'writer_skipped') {
   try {
     const prepared = JSON.parse(fs.readFileSync(path.resolve(CSKILLBP_DIR, preparedJson), 'utf8'));
-    return Array.isArray(prepared.writer_skipped) ? prepared.writer_skipped : [];
+    return Array.isArray(prepared[field]) ? prepared[field] : [];
   } catch (_) {
     return [];
   }
 }
 
 function assembleNotes({ preparedJson, generatedJson, output }) {
-  const writerSkipped = applyWriterSkips({ preparedJson, generatedJson });
+  const { skipped: writerSkipped, rejected: writerRejected } = applyWriterSkips({ preparedJson, generatedJson });
   const prepared = JSON.parse(fs.readFileSync(path.resolve(CSKILLBP_DIR, preparedJson), 'utf8'));
   const generated = JSON.parse(fs.readFileSync(path.resolve(CSKILLBP_DIR, generatedJson), 'utf8'));
   const outPath = path.resolve(CSKILLBP_DIR, output);
@@ -1582,6 +1639,9 @@ function assembleNotes({ preparedJson, generatedJson, output }) {
   if (missing.length) res.push(`Missing: ${missing.length}`);
   if (writerSkipped.length) {
     res.push(`Writer skipped: ${writerSkipped.length} (${writerSkipped.map((r) => `${r.id} ${r.reference}`).join(', ')})`);
+  }
+  if (writerRejected.length) {
+    res.push(`Writer skip marker on non-skippable item(s), treated as failed: ${writerRejected.map((r) => `${r.id} ${r.reference}`).join(', ')}`);
   }
   res.push(outPath);
   return res.join('\n');
@@ -3702,6 +3762,7 @@ module.exports = {
   _resolveTemplateSelection: resolveTemplateSelection,
   _addBuiltinTemplates: addBuiltinTemplates,
   parseWriterSkip,
+  sanitizeSkipReason,
   applyWriterSkips,
   readWriterSkipped,
   WRITER_SKIP_MARKER,

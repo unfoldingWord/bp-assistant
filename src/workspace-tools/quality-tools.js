@@ -1303,6 +1303,12 @@ async function checkTnQuality({ tsvPath, preparedJson, ultUsfm, ustUsfm, book, h
       }
     }
 
+    // 25a. The writer's skip token must never reach a published note.
+    if (/(?<![A-Za-z0-9])SKIP[_-]NOTE(?![A-Za-z0-9])/i.test(n.note)) {
+      addFinding(n.row, n.ref, n.id, 'error', 'skip_marker_leak',
+        'Note contains the writer skip marker SKIP_NOTE; a skipped note must be removed, not published');
+    }
+
     // 25b. Contamination phrase detection
     {
       const CONTAMINATION_PHRASES = [

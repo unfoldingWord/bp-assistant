@@ -438,6 +438,27 @@ test('checkTnQuality template fallback never uses the hint_only parallelism-repe
   assert.deepEqual(builtinDeviations, []);
 });
 
+test('checkTnQuality errors if the writer skip token reaches a note (F1)', async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'quality-skiptoken-'));
+  const relRoot = path.join('tmp', path.basename(tempDir));
+  fs.mkdirSync(path.join('/srv/bot/workspace', relRoot), { recursive: true });
+  const tsvRel = path.join(relRoot, 'tn.tsv');
+  const prepRel = path.join(relRoot, 'prepared_notes.json');
+  const findingsRel = path.join(relRoot, 'findings.json');
+  const refs = ['**SKIP_NOTE**: antithetical', 'skip_note: chiasm', 'A fine note about the king.'];
+  fs.writeFileSync(path.join('/srv/bot/workspace', tsvRel), [
+    'Reference\tID\tTags\tSupportReference\tQuote\tOccurrence\tNote',
+    ...refs.map((note, i) => `1:${i + 1}\tsk0${i}\t\trc://*/ta/man/translate/figs-metaphor\tמֶלֶךְ\t1\t${note}`),
+  ].join('\n'));
+  fs.writeFileSync(path.join('/srv/bot/workspace', prepRel), JSON.stringify({
+    items: refs.map((_, i) => ({ id: `sk0${i}`, reference: `1:${i + 1}`, sref: 'figs-metaphor', gl_quote: 'king', issue_span_gl_quote: 'king', ult_verse: 'The king.' })),
+  }, null, 2));
+  await checkTnQuality({ tsvPath: tsvRel, preparedJson: prepRel, output: findingsRel });
+  const leaks = readFindings(findingsRel).filter((f) => f.category === 'skip_marker_leak');
+  assert.deepEqual(leaks.map((f) => f.id), ['sk00', 'sk01']);
+  assert.ok(leaks.every((f) => f.severity === 'error'));
+});
+
 test('checkTnQuality missing_at exemption requires a genuine see-how note, not a mid-text mention', async () => {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'quality-seehow-mid-'));
   const relRoot = path.join('tmp', path.basename(tempDir));
