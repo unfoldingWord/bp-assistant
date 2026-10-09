@@ -2127,3 +2127,20 @@ test('removePreparedItemsCoveredByKept — a cross-chapter kept ref covers its v
   assert.deepEqual(removePreparedItemsCoveredByKept(prepared, kept, 40).prepared.items.map((i) => i.id), ['a002', 'a003']);
   assert.deepEqual(removePreparedItemsCoveredByKept(prepared, kept, 41).prepared.items.map((i) => i.id), ['a001', 'a003']);
 });
+
+test('quote scope selector keeps grammar-connect-logic quotes on the connector, not the whole verse (#463)', () => {
+  const selection = _resolveQuoteScopeSelection({
+    sref: 'grammar-connect-logic-result',
+    glQuote: 'for',
+    ultVerse: 'So you, do not be afraid, for I am about to save you.',
+  });
+  assert.equal(selection.scope_mode, 'focused_span');
+  assert.equal(selection.selected_span, 'for');
+
+  const timeSelection = _resolveQuoteScopeSelection({
+    sref: 'grammar-connect-time-background',
+    glQuote: 'when',
+    ultVerse: 'when the king spoke, they listened.',
+  });
+  assert.equal(timeSelection.scope_mode, 'full_restructure_region');
+});

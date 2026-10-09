@@ -55,8 +55,8 @@ const UHB_ISA = [
   '',
 ].join('\n');
 const ALIGNMENT_DATA = {
-  '7:1': [{ heb: AHAZ, strong: AHAZ_STRONG }, { heb: REZIN, strong: REZIN_STRONG }],
-  '9:4': [{ heb: AHAZ, strong: AHAZ_STRONG }, { heb: REZIN, strong: REZIN_STRONG }],
+  '7:1': [{ heb: AHAZ, strong: AHAZ_STRONG, eng: 'Ahaz' }, { heb: REZIN, strong: REZIN_STRONG, eng: 'Rezin' }],
+  '9:4': [{ heb: AHAZ, strong: AHAZ_STRONG, eng: 'Ahaz' }, { heb: REZIN, strong: REZIN_STRONG, eng: 'Rezin' }],
 };
 
 const TN_ISA = [
@@ -161,4 +161,37 @@ test('T4: a note that also names someone without an article keeps its pointer', 
 
   const targets = items.filter((it) => it.see_how_target === '7:1');
   assert.equal(targets.length, 2, 'Ahaz is kept because its note also explains Rezin');
+});
+
+test('T5: a tW name whose issue hint says it is a different person keeps its pointer', async () => {
+  writeHeadwords();
+  const { items } = await run([
+    nameItem({ id: 'ahz1', explanation: 'a different person from King Ahaz' }),
+  ]);
+
+  const ahaz = items.find((it) => it.id === 'ahz1');
+  assert.equal(ahaz.note_type, 'see_how', 'same exception dropTwCoveredRows applies');
+  assert.equal(ahaz.see_how_target, '7:1');
+});
+
+test('T5b: the same item without the hint is still not rewritten', async () => {
+  writeHeadwords();
+  const { items } = await run([nameItem({ id: 'ahz1', explanation: 'name of a man' })]);
+
+  const ahaz = items.find((it) => it.id === 'ahz1');
+  assert.equal(ahaz.note_type, 'given_at');
+  assert.equal(ahaz.see_how_target, undefined);
+});
+
+test('T6: an earlier note with no bold name is judged by this chapter\'s English wording', async () => {
+  writeHeadwords();
+  const tn = TN_ISA
+    .replace('The word **Ahaz** is the name', 'The name Ahaz is the name')
+    .replace('The word **Rezin** is the name', 'The name Rezin is the name');
+  const { items, summary } = await run([], tn);
+
+  const targets = items.filter((it) => it.see_how_target === '7:1');
+  assert.equal(targets.length, 1, 'Ahaz (tW article) skipped, Rezin (none) injected');
+  assert.equal(targets[0].orig_quote, REZIN);
+  assert.match(summary, /1 skipped \(tW name\)/);
 });

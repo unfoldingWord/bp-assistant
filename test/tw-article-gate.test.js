@@ -160,3 +160,12 @@ test('isTwCoveredName: true only when every name word has a tW names article', (
   assert.equal(isTwCoveredName('sin'), false);
   assert.equal(isTwCoveredName(''), false);
 });
+
+test('hasKeepHint: the hint wording dropTwCoveredRows keeps a translate-names row for', () => {
+  const { hasKeepHint } = require('../src/tw-article-gate');
+  assert.equal(hasKeepHint('a different person from King Josiah'), true);
+  assert.equal(hasKeepHint('this Jeremiah is not the prophet'), true);
+  assert.equal(hasKeepHint('name of a man'), false);
+  assert.equal(hasKeepHint(''), false);
+  assert.equal(hasKeepHint(undefined), false);
+});

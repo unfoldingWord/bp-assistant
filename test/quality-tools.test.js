@@ -948,3 +948,37 @@ test('normalizeHebrewQuote still reports words that are genuinely absent', () =>
   const none = normalizeHebrewQuote(`${ABSENT} ${ABSENT}`.normalize('NFC'), JER_29_4_UHB);
   assert.equal(none.status, 'no_words_match');
 });
+
+test('checkTnQuality flags over-long quotes whose AT mostly copies the quote, exempting parallelism and infostructure', async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'quality-tools-overlong-'));
+  const relRoot = path.join('tmp', path.basename(tempDir));
+  const absRoot = path.join('/srv/bot/workspace', relRoot);
+  fs.mkdirSync(absRoot, { recursive: true });
+
+  const tsvRel = path.join(relRoot, 'tn.tsv');
+  const prepRel = path.join(relRoot, 'prepared_notes.json');
+  const findingsRel = path.join(relRoot, 'findings.json');
+
+  const verse = 'So you, do not be afraid, my servant Jacob, and do not be dismayed, Israel, for behold, I am about to save you from far away.';
+  const copiedAt = 'So you, do not be afraid, my servant Jacob, and do not be dismayed, Israel, because behold, I am about to save you from far away';
+  const shortVerse = 'and do not be dismayed, Israel';
+  fs.writeFileSync(path.join('/srv/bot/workspace', tsvRel), [
+    'Reference\tID\tTags\tSupportReference\tQuote\tOccurrence\tNote',
+    `30:10\tol01\t\trc://*/ta/man/translate/grammar-connect-logic-result\tכִּי\t1\tThe word **for** introduces a reason. Alternate translation: [${copiedAt}]`,
+    `30:10\tol02\t\trc://*/ta/man/translate/figs-parallelism\tכִּי\t1\tThese two phrases mean the same thing. Alternate translation: [${copiedAt}]`,
+    `30:10\tol03\t\trc://*/ta/man/translate/figs-infostructure\tכִּי\t1\tYou could reorder these phrases. Alternate translation: [${copiedAt}]`,
+    '30:10\tol04\t\trc://*/ta/man/translate/grammar-connect-logic-result\tכִּי\t1\tThe word **for** introduces a reason. Alternate translation: [because]',
+    '30:10\tol05\t\trc://*/ta/man/translate/figs-explicit\tכִּי\t1\tThe implied meaning could be stated. Alternate translation: [and do not be terrified, people of Israel]',
+  ].join('\n'));
+
+  const item = (id, glQuote) => ({ id, reference: '30:10', at_required: true, gl_quote: glQuote, issue_span_gl_quote: glQuote, ult_verse: verse, ust_verse: 'Do not fear.' });
+  fs.writeFileSync(path.join('/srv/bot/workspace', prepRel), JSON.stringify({
+    items: [item('ol01', verse), item('ol02', verse), item('ol03', verse), item('ol04', 'for'), item('ol05', shortVerse)],
+  }, null, 2));
+
+  await checkTnQuality({ tsvPath: tsvRel, preparedJson: prepRel, output: findingsRel });
+
+  const findings = JSON.parse(fs.readFileSync(path.join('/srv/bot/workspace', findingsRel), 'utf8')).findings || [];
+  const flagged = findings.filter((f) => f.category === 'overlong_quote').map((f) => f.id);
+  assert.deepEqual(flagged, ['ol01']);
+});

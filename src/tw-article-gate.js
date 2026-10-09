@@ -36,6 +36,13 @@ const FILLER_WORDS = new Set([
 // 2026-10-08 is that the tW article covers it.
 const KEEP_HINT_RE = /\b(different|not|another|other|rather than|homonym|namesake|distinct|same|variant|also called|alternate)\b/i;
 
+// True when an issue hint says the name is not the one its tW article describes. A
+// translate-names row with such a hint is kept by dropTwCoveredRows, and see-how
+// detection keeps the pointer for the same item.
+function hasKeepHint(hint) {
+  return KEEP_HINT_RE.test(String(hint || ''));
+}
+
 const SREF_COL = 2;
 const QUOTE_COL = 3;
 const HINT_COL = 6;
@@ -99,7 +106,7 @@ function dropTwCoveredRows({ issuesPath }) {
       const cols = line.split('\t');
       const rule = ruleFor(cols[SREF_COL]);
       if (!rule) return;
-      if (rule === 'names' && KEEP_HINT_RE.test(cols[HINT_COL] || '')) return;
+      if (rule === 'names' && hasKeepHint(cols[HINT_COL])) return;
       const words = quoteWords(cols[QUOTE_COL]);
       if (words.length) candidates.push({ i, cols, rule, words });
     });
@@ -130,4 +137,4 @@ function dropTwCoveredRows({ issuesPath }) {
   }
 }
 
-module.exports = { dropTwCoveredRows, isTwCoveredName, quoteWords, ruleFor };
+module.exports = { dropTwCoveredRows, isTwCoveredName, hasKeepHint, quoteWords, ruleFor };
