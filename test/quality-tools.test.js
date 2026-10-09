@@ -415,6 +415,29 @@ test('checkTnQuality template_deviation compares only the resolved template, not
   assert.deepEqual(deviationIds, ['a2b3']);
 });
 
+test('checkTnQuality template fallback never uses the hint_only parallelism-repeat built-in (#423)', async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'quality-tpl-hint-'));
+  const relRoot = path.join('tmp', path.basename(tempDir));
+  fs.mkdirSync(path.join('/srv/bot/workspace', relRoot), { recursive: true });
+  const tsvRel = path.join(relRoot, 'tn.tsv');
+  const prepRel = path.join(relRoot, 'prepared_notes.json');
+  const findingsRel = path.join(relRoot, 'findings.json');
+  fs.writeFileSync(path.join('/srv/bot/workspace', tsvRel), [
+    'Reference\tID\tTags\tSupportReference\tQuote\tOccurrence\tNote',
+    '1:1\tp1q2\t\trc://*/ta/man/translate/figs-parallelism\tמֶלֶךְ\t1\tThese two clauses mean the same thing. Alternate translation: [x]',
+  ].join('\n'));
+  // No template_text on the prepared item, so check 25 falls back to the sref's templates.
+  fs.writeFileSync(path.join('/srv/bot/workspace', prepRel), JSON.stringify({
+    items: [{ id: 'p1q2', reference: '1:1', sref: 'figs-parallelism', gl_quote: 'king', issue_span_gl_quote: 'king', ult_verse: 'The king.' }],
+  }, null, 2));
+
+  await checkTnQuality({ tsvPath: tsvRel, preparedJson: prepRel, output: findingsRel });
+
+  const builtinDeviations = readFindings(findingsRel)
+    .filter((f) => f.category === 'template_deviation' && /See how your translation team/.test(f.message));
+  assert.deepEqual(builtinDeviations, []);
+});
+
 test('checkTnQuality missing_at exemption requires a genuine see-how note, not a mid-text mention', async () => {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'quality-seehow-mid-'));
   const relRoot = path.join('tmp', path.basename(tempDir));

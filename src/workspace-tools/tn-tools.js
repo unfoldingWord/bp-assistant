@@ -523,6 +523,31 @@ const BUILTIN_TEMPLATES = [
   },
 ];
 
+// Templates whose wording is only true for some rows. The writer may decline
+// such a row by returning the skip marker instead of a note; the pipeline then
+// drops the row and records it (applyWriterSkips). parallelism-repeat says the
+// clauses "mean basically the same thing", which holds only for synonymous
+// parallelism.
+const WRITER_SKIP_MARKER = 'SKIP_NOTE';
+const SKIPPABLE_TEMPLATES = new Set(['figs-parallelism/parallelism-repeat']);
+
+const WRITER_SKIP_INSTRUCTION =
+  'SKIP RULE: the selected template says the two clauses mean basically the same thing. ' +
+  'Write the note ONLY if the clauses in this verse really do mean basically the same thing (synonymous parallelism). ' +
+  'If the second clause adds to, completes, contrasts with, or builds on the first ' +
+  '(synthetic, antithetical, climactic, chiasm, emblematic, or any other type), do NOT write a note. ' +
+  `Instead output exactly one line: ${WRITER_SKIP_MARKER}: <one short sentence naming the type and why>`;
+
+function isSkippableTemplate(sref, templateType) {
+  return SKIPPABLE_TEMPLATES.has(`${normalizeTemplateType(sref)}/${normalizeTemplateType(templateType)}`);
+}
+
+// Reason string when a writer's output is the skip marker, else null.
+function parseWriterSkip(noteText) {
+  const m = String(noteText == null ? '' : noteText).match(/^\s*SKIP_NOTE\b\s*[:\-\u2013\u2014]?\s*([\s\S]*)$/);
+  return m ? m[1].replace(/\s+/g, ' ').trim() : null;
+}
+
 function addBuiltinTemplates(map) {
   for (const builtin of BUILTIN_TEMPLATES) {
     const existing = map.get(builtin.issue_type) || [];
@@ -874,6 +899,9 @@ function buildWriterPacket(item) {
     at_provided: item.at_provided || '',
     prose_mode: 'template_plus_necessity',
     programmatic_note: item.programmatic_note || '',
+    skip_allowed: !!item.skip_allowed,
+    skip_marker: item.skip_allowed ? WRITER_SKIP_MARKER : '',
+    skip_instruction: item.skip_allowed ? WRITER_SKIP_INSTRUCTION : '',
   };
 }
 
@@ -900,6 +928,7 @@ function buildWriterPrompt(item) {
   ];
 
   if (packet.clean_explanation) lines.push(`Explanation context: ${packet.clean_explanation}`);
+  if (packet.skip_allowed) lines.push(packet.skip_instruction);
   if (packet.must_include.length) lines.push(`Must include: ${packet.must_include.join(' | ')}`);
   if (packet.style_rules.length) lines.push(`Style rules: ${packet.style_rules.join(', ')}`);
   if (packet.rule_overrides.length) lines.push(`Overrides: ${packet.rule_overrides.join(', ')}`);
@@ -1438,7 +1467,54 @@ function inspectOpeningBold({ noteText, prepItem = {}, ultVerse = '' }) {
   };
 }
 
+// Writer declined some notes (returned SKIP_NOTE instead of a note): remove each
+// from generated_notes.json and from the prepared items, and record it in the
+// prepared file's `writer_skipped` list so the pipeline can report it. Runs at
+// the start of assembly so the AT, quality and push stages never see the row.
+// Returns the list of records added this call.
+function applyWriterSkips({ preparedJson, generatedJson }) {
+  const prepPath = path.resolve(CSKILLBP_DIR, preparedJson);
+  const genPath = path.resolve(CSKILLBP_DIR, generatedJson);
+  const prepared = JSON.parse(fs.readFileSync(prepPath, 'utf8'));
+  const generated = JSON.parse(fs.readFileSync(genPath, 'utf8'));
+  const items = Array.isArray(prepared.items) ? prepared.items : [];
+  const skipped = [];
+  for (const item of items) {
+    if (!item || !item.id || !Object.prototype.hasOwnProperty.call(generated, item.id)) continue;
+    const reason = parseWriterSkip(generated[item.id]);
+    if (reason === null) continue;
+    skipped.push({
+      id: item.id,
+      reference: item.reference || '',
+      sref: item.sref || '',
+      gl_quote: item.gl_quote || '',
+      reason: reason || '(no reason given)',
+      skip_allowed: !!item.skip_allowed,
+    });
+  }
+  if (!skipped.length) return skipped;
+  const ids = new Set(skipped.map((r) => r.id));
+  for (const id of ids) delete generated[id];
+  prepared.items = items.filter((it) => !(it && ids.has(it.id)));
+  prepared.item_count = prepared.items.length;
+  const prior = Array.isArray(prepared.writer_skipped) ? prepared.writer_skipped : [];
+  prepared.writer_skipped = [...prior.filter((r) => !ids.has(r.id)), ...skipped];
+  fs.writeFileSync(genPath, JSON.stringify(generated, null, 2) + '\n');
+  fs.writeFileSync(prepPath, JSON.stringify(prepared, null, 2));
+  return skipped;
+}
+
+function readWriterSkipped(preparedJson) {
+  try {
+    const prepared = JSON.parse(fs.readFileSync(path.resolve(CSKILLBP_DIR, preparedJson), 'utf8'));
+    return Array.isArray(prepared.writer_skipped) ? prepared.writer_skipped : [];
+  } catch (_) {
+    return [];
+  }
+}
+
 function assembleNotes({ preparedJson, generatedJson, output }) {
+  const writerSkipped = applyWriterSkips({ preparedJson, generatedJson });
   const prepared = JSON.parse(fs.readFileSync(path.resolve(CSKILLBP_DIR, preparedJson), 'utf8'));
   const generated = JSON.parse(fs.readFileSync(path.resolve(CSKILLBP_DIR, generatedJson), 'utf8'));
   const outPath = path.resolve(CSKILLBP_DIR, output);
@@ -1504,6 +1580,9 @@ function assembleNotes({ preparedJson, generatedJson, output }) {
   fs.writeFileSync(outPath, lines.join('\n') + '\n');
   const res = [`Assembled ${rows.length} notes to ${outPath}`];
   if (missing.length) res.push(`Missing: ${missing.length}`);
+  if (writerSkipped.length) {
+    res.push(`Writer skipped: ${writerSkipped.length} (${writerSkipped.map((r) => `${r.id} ${r.reference}`).join(', ')})`);
+  }
   res.push(outPath);
   return res.join('\n');
 }
@@ -2428,6 +2507,7 @@ function prepareNotes({ inputTsv, ultUsfm, ustUsfm, output, alignedUsfm, alignme
     item.chosen_template_has_at_slot = !!templateSelection.selected_template_has_at_slot;
     item.template_type = normalizeWhitespace(templateSelection.selected_template?.type || '') || 'generic';
     item.template_text = stripAlternateTranslation(templateSelection.selected_template?.template || '');
+    item.skip_allowed = isSkippableTemplate(item.sref, item.template_type);
     item.candidate_templates = templateSelection.candidate_templates;
     item.at_policy = styleProfile.at_policy;
     item.at_required = !!styleProfile.at_required;
@@ -3621,6 +3701,10 @@ module.exports = {
   _parseExplanationDirectives: parseExplanationDirectives,
   _resolveTemplateSelection: resolveTemplateSelection,
   _addBuiltinTemplates: addBuiltinTemplates,
+  parseWriterSkip,
+  applyWriterSkips,
+  readWriterSkipped,
+  WRITER_SKIP_MARKER,
   _deriveStyleProfile: deriveStyleProfile,
   _deriveAtRequirement: deriveAtRequirement,
   _resolveQuoteScopeSelection: resolveQuoteScopeSelection,

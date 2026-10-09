@@ -18,7 +18,7 @@ const { createGuardHooks } = require('./guard-hooks');
 const { resolveAutoModel } = require('./api-runner/provider-config');
 const { getDoor43Username, emailToFallbackUsername, buildBranchName, resolveOutputFile, discoverFreshOutput, checkPrerequisites, calcSkillTimeout, calcVerseSpanTimeout, normalizeBookName, resolveConflictMention, parsePartialTsv, truncatePartialTsv, parseChunkRange, isUsageLimitError, CSKILLBP_DIR } = require('./pipeline-utils');
 const { splitTsv, fixTrailingNewlines } = require('./workspace-tools/tsv-tools');
-const { fillTsvIds, generateIds, prepareNotes, fillOrigQuotes, resolveGlQuotes, flagNarrowQuotes, extractAlignmentData, prepareATContext, substituteAT, fixUnicodeQuotes, verifyBoldMatches, syncCanonicalHebrewQuotes, applyHintsToPreparedNotes, applyKeptToPreparedNotes, keptRefVerseSpan, parsePlainUsfmVersesFromText, detectIssuesTsvLayout, extractIssuesTsvRow, findVersesWithoutNotes, _stripAlternateTranslation: stripAlternateTranslation } = require('./workspace-tools/tn-tools');
+const { fillTsvIds, generateIds, prepareNotes, fillOrigQuotes, resolveGlQuotes, flagNarrowQuotes, extractAlignmentData, prepareATContext, substituteAT, fixUnicodeQuotes, verifyBoldMatches, syncCanonicalHebrewQuotes, applyHintsToPreparedNotes, applyKeptToPreparedNotes, keptRefVerseSpan, parsePlainUsfmVersesFromText, detectIssuesTsvLayout, extractIssuesTsvRow, findVersesWithoutNotes, readWriterSkipped, parseWriterSkip, _stripAlternateTranslation: stripAlternateTranslation } = require('./workspace-tools/tn-tools');
 const { checkTnQuality, detectSelfTalk, templateFirstPhrase, resolveTemplateText } = require('./workspace-tools/quality-tools');
 const { buildBookRecurrenceIndex, deriveRecurrenceKeys, buildSeeHowSentence, isSeeHowEligible, isContextDependentSref, dedupeAlsoOccursVerses, assignAlsoOccursVerses, resolveDoor43ReposPath, hebTokens, verseNumber: recurrenceVerseNumber, SEE_HOW_NEVER_FOLD_SREFS, CROSS_BOOK_MAX_BOOKS } = require('./workspace-tools/recurrence-index');
 const { loadCommonPhrases, buildIntroPointerSentence, phraseTextKey } = require('./workspace-tools/common-phrases');
@@ -1175,6 +1175,7 @@ async function runPerNoteGeneration({ pipeDir, outputPath, status, book }) {
     'Follow the template exactly. Fill in only the variable parts.',
     'Output ONLY the note text, nothing else. Do not use any tools.',
     'Do NOT include an alternate translation — that is handled separately.',
+    'Exception: when the item includes a SKIP RULE, follow it and output the skip line instead of a note when the rule says to.',
     '',
     '--- NOTE STYLE GUIDE ---',
     styleGuide,
@@ -1185,7 +1186,7 @@ async function runPerNoteGeneration({ pipeDir, outputPath, status, book }) {
   console.log(`[notes] Per-note generation: ${items.length} items`);
 
   const CONCURRENCY = 10;
-  const results = { success: 0, failed: 0, programmatic: 0 };
+  const results = { success: 0, failed: 0, programmatic: 0, skipped: 0 };
   const generatedNotes = {};
 
   async function generateOneNote(item) {
@@ -1206,6 +1207,7 @@ async function runPerNoteGeneration({ pipeDir, outputPath, status, book }) {
       (packet.must_include || []).length ? `MUST INCLUDE: ${packet.must_include.join(' | ')}` : '',
       (packet.style_rules || []).length ? `STYLE RULES: ${packet.style_rules.join(', ')}` : '',
       (packet.rule_overrides || []).length ? `OVERRIDES: ${packet.rule_overrides.join(', ')}` : '',
+      packet.skip_allowed && packet.skip_instruction ? packet.skip_instruction : '',
       '',
       'Write the note text. Output ONLY the note text, nothing else.',
       'Do NOT include an alternate translation.',
@@ -1269,6 +1271,7 @@ async function runPerNoteGeneration({ pipeDir, outputPath, status, book }) {
     if (r.success) {
       results.success++;
       if (r.programmatic) results.programmatic++;
+      if (parseWriterSkip(r.note) !== null) results.skipped++;
       generatedNotes[r.id] = r.note;
     } else {
       results.failed++;
@@ -1289,7 +1292,7 @@ async function runPerNoteGeneration({ pipeDir, outputPath, status, book }) {
     output: outputPath,
   });
 
-  const summary = `${results.success}/${items.length} notes generated (${results.programmatic} programmatic, ${results.failed} failed)`;
+  const summary = `${results.success}/${items.length} notes generated (${results.programmatic} programmatic, ${results.skipped} skipped by writer, ${results.failed} failed)`;
   console.log(`[notes] Per-note generation complete: ${summary}`);
   return { success: results.failed < items.length * 0.1, notesPath: outputPath, summary };
 }
@@ -2413,6 +2416,45 @@ async function reportVersesWithoutNotes({ pipeDir, notesPath, ref, stage, status
     await status(`⚠️ **${ref}**: ${lost.length} verse(s) had prepared notes but have **no note** after ${stage}: ${lost.join(', ')}. Editors will see these as skipped.`);
   }
   return lost;
+}
+
+// Notes the writer declined with SKIP_NOTE (a parallelism-repeat row whose
+// clauses are not really synonymous). assembleNotes already dropped each row and
+// recorded it in the prepared JSON; name them here so the drop is never silent.
+// Checks the chapter's prepared file and any shard prepared files beside it.
+async function reportWriterSkippedNotes({ pipeDir, ref, status }) {
+  if (!pipeDir) return [];
+  let skipped = [];
+  try {
+    const preparedJson = readContext(pipeDir)?.runtime?.preparedNotes;
+    if (!preparedJson) return [];
+    const dir = path.dirname(preparedJson);
+    const files = new Set([preparedJson]);
+    for (const d of [dir, path.join(dir, 'shards')]) {
+      const abs = path.resolve(CSKILLBP_DIR, d);
+      if (!fs.existsSync(abs)) continue;
+      for (const f of fs.readdirSync(abs)) {
+        if (/prepared_notes\.json$/.test(f)) files.add(path.join(d, f));
+      }
+    }
+    const seen = new Set();
+    for (const f of files) {
+      for (const r of readWriterSkipped(f)) {
+        if (seen.has(r.id)) continue;
+        seen.add(r.id);
+        skipped.push(r);
+      }
+    }
+  } catch (err) {
+    console.warn(`[notes] writer-skip report failed for ${ref} (non-fatal): ${err.message}`);
+    return [];
+  }
+  if (skipped.length) {
+    const lines = skipped.map((r) => `- ${r.reference} ${r.sref}: ${r.reason}`);
+    console.warn(`[notes] ${ref}: writer skipped ${skipped.length} note(s):\n${lines.join('\n')}`);
+    await status(`**${ref}**: tn-writer skipped ${skipped.length} note(s) because the clauses are not really synonymous (no note shipped for these):\n${lines.join('\n')}`);
+  }
+  return skipped;
 }
 
 // `<chapter>:intro` rows in an issues TSV (reference in column 1 or 2, with an
@@ -4413,6 +4455,7 @@ async function notesPipeline(route, message) {
           } catch (err) {
             console.warn(`[notes] fillTsvIds failed (non-fatal): ${err.message}`);
           }
+          await reportWriterSkippedNotes({ pipeDir, ref, status });
           await reportVersesWithoutNotes({ pipeDir, notesPath: skill.resolvedOutput || resolved, ref, stage: 'tn-writer', status });
           for (const s of skills) {
             if (s.name === 'tn-quality-check') {

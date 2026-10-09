@@ -229,3 +229,88 @@ test('normalizeIssueRows normalizes discontinuous quote ellipsis to ampersand sy
   assert.equal(cols[3], 'him & his hand');
   assert.equal(result.summary.normalized_discontinuous_quotes, 1);
 });
+
+// ---- #423 follow-ups: pass-2 re-derivation, marker hygiene, similarity edge case ----
+
+test('a second pass re-derives the first instance when the first row was dropped (rules gate)', () => {
+  // File as pass 1 left it, after the gate dropped R1: R2 and R3 still say "repeat".
+  const afterGate = [
+    row({ ref: '35:4', quote: 'C; D', explanation: 'synonymous parallelism t: parallelism-repeat' }),
+    row({ ref: '35:7', quote: 'E; F', explanation: 'synonymous parallelism t: parallelism-repeat' }),
+  ];
+  const result = normalizeIssueRows(afterGate);
+  const cols = parallelismCols(result.lines);
+  assert.equal(cols[0][6], 'synonymous parallelism t: first instance');
+  assert.equal(isRepeat(cols[0]), false);
+  assert.equal(isRepeat(cols[1]), true);
+  assert.equal(result.summary.first_instance_restored, 1);
+  // Running the pass again changes nothing.
+  const again = normalizeIssueRows(result.lines);
+  assert.deepEqual(again.lines, result.lines);
+});
+
+test('a first row relabeled by the gate leaves exactly one first instance and one repeat', () => {
+  // Gate relabeled R1 away; R2 carried the repeat hint, R3 (the old first-instance tag) is gone.
+  const first = normalizeIssueRows([
+    row({ ref: '35:1', quote: 'A; B', explanation: 'synonymous parallelism t: first instance' }),
+    row({ ref: '35:4', quote: 'C; D', explanation: 'synonymous parallelism' }),
+    row({ ref: '35:7', quote: 'E; F', explanation: 'synonymous parallelism' }),
+  ]).lines;
+  const gated = first.filter((l) => l.split('\t')[1] !== '35:1');
+  const second = normalizeIssueRows(gated);
+  const cols = parallelismCols(second.lines);
+  assert.deepEqual(cols.map((c) => c[1]), ['35:4', '35:7']);
+  assert.equal(cols.filter((c) => /t:\s*first instance/.test(c[6])).length, 1);
+  assert.match(cols[0][6], /t: first instance$/);
+  assert.equal(isRepeat(cols[1]), true);
+});
+
+test('repeat rows do not keep literal q:/reason: text from an overflow exception', () => {
+  const result = normalizeIssueRows([
+    row({ ref: '35:1', quote: 'A; B', explanation: 'synonymous parallelism t: first instance' }),
+    row({ ref: '35:4', quote: 'C; D', explanation: 'synonymous parallelism q: unique-parallelism reason: tricola' }),
+    row({ ref: '35:7', quote: 'E; F', explanation: 'synonymous parallelism q: unique-parallelism reason: pivot' }),
+  ]);
+  const cols = parallelismCols(result.lines);
+  assert.equal(cols[1][6], 'synonymous parallelism q: unique-parallelism reason: tricola');
+  assert.equal(cols[2][6], 'synonymous parallelism t: parallelism-repeat');
+  assert.doesNotMatch(cols[2][6], /\bq:|reason:/);
+});
+
+test('the words "first instance" in prose are not a tag and are not stripped', () => {
+  const result = normalizeIssueRows([
+    row({ ref: '35:1', quote: 'A; B', explanation: 'synonymous parallelism t: first instance' }),
+    row({ ref: '35:4', quote: 'C; D', explanation: 'synonymous parallelism; this is not the first instance of the pattern' }),
+  ]);
+  const cols = parallelismCols(result.lines);
+  assert.equal(cols[1][6], 'synonymous parallelism; this is not the first instance of the pattern t: parallelism-repeat');
+  assert.equal(result.summary.first_instance_tags_removed, 0);
+  // Prose alone does not make a row a first instance either: no tag anywhere stays untagged.
+  const noTag = normalizeIssueRows([
+    row({ ref: '35:1', quote: 'A; B', explanation: 'synonymous parallelism, the first instance in the psalm' }),
+  ]);
+  assert.equal(parallelismCols(noTag.lines)[0][6], 'synonymous parallelism, the first instance in the psalm');
+});
+
+test('quotes made only of punctuation are not treated as near-duplicates', () => {
+  const result = normalizeIssueRows([
+    row({ ref: '35:1', quote: 'A; B', explanation: 'synonymous parallelism t: first instance' }),
+    row({ ref: '35:4', quote: '...', explanation: 'synonymous parallelism' }),
+    row({ ref: '35:7', quote: '—', explanation: 'synonymous parallelism' }),
+  ]);
+  assert.equal(result.summary.dropped_duplicate_parallelism_rows, 0);
+  assert.deepEqual(keptRefs(result.lines), ['35:1', '35:4', '35:7']);
+});
+
+test('repeats whose explanation never says synonymous are counted as unspecified type and still routed to the writer', () => {
+  const result = normalizeIssueRows([
+    row({ ref: '35:1', quote: 'A; B', explanation: 'synonymous parallelism t: first instance' }),
+    row({ ref: '35:4', quote: 'C; D', explanation: 'synonymous parallelism' }),
+    row({ ref: '35:7', quote: 'E; F', explanation: 'two lines in parallel' }),
+    row({ ref: '35:9', quote: 'G; H', explanation: 'climactic parallelism' }),
+  ]);
+  const cols = parallelismCols(result.lines);
+  assert.equal(cols.slice(1).every(isRepeat), true);
+  assert.equal(result.summary.kept_parallelism_repeats, 3);
+  assert.equal(result.summary.kept_parallelism_repeats_unspecified_type, 2);
+});

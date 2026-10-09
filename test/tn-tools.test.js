@@ -258,6 +258,37 @@ test('prepareNotes writes a packetized item with deterministic template and poli
   assert.doesNotMatch(item.prompt, /discern which particular template/i);
 });
 
+test('prepareNotes lets the writer skip only a parallelism-repeat row, and tells it how (#423)', () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tn-tools-skip-'));
+  const workspaceTmp = path.join('/srv/bot/workspace', 'tmp', path.basename(tempDir));
+  fs.mkdirSync(workspaceTmp, { recursive: true });
+  const issuesRel = path.join('tmp', path.basename(tempDir), 'PSA-035.tsv');
+  const ultRel = path.join('tmp', path.basename(tempDir), 'PSA-035.ult.usfm');
+  const ustRel = path.join('tmp', path.basename(tempDir), 'PSA-035.ust.usfm');
+  const outRel = path.join('tmp', path.basename(tempDir), 'prepared_notes.json');
+  fs.writeFileSync(path.join('/srv/bot/workspace', issuesRel), [
+    'Book\tReference\tSupportReference\tQuote\tOccurrence\tAT\tNote',
+    'PSA\t35:2\trc://*/ta/man/translate/figs-parallelism\tthe king spoke\tYes\t\tsynonymous parallelism t: parallelism-repeat',
+    'PSA\t35:2\trc://*/ta/man/translate/writing-background\tThen\tYes\t\tbackground',
+  ].join('\n'));
+  const usfm = '\\c 35\n\\v 2 Then the king spoke to the people.\n';
+  fs.writeFileSync(path.join('/srv/bot/workspace', ultRel), usfm);
+  fs.writeFileSync(path.join('/srv/bot/workspace', ustRel), usfm);
+
+  prepareNotes({ inputTsv: issuesRel, ultUsfm: ultRel, ustUsfm: ustRel, output: outRel });
+  const items = JSON.parse(fs.readFileSync(path.join('/srv/bot/workspace', outRel), 'utf8')).items;
+  const repeat = items.find((i) => i.sref === 'figs-parallelism');
+  const other = items.find((i) => i.sref === 'writing-background');
+
+  assert.equal(repeat.template_type, 'parallelism-repeat');
+  assert.equal(repeat.skip_allowed, true);
+  assert.equal(repeat.writer_packet.skip_allowed, true);
+  assert.match(repeat.prompt, /SKIP RULE/);
+  assert.match(repeat.prompt, /SKIP_NOTE: </);
+  assert.equal(other.skip_allowed, false);
+  assert.doesNotMatch(other.prompt, /SKIP RULE/);
+});
+
 test('prepareNotes parses headerless rows whose col0 is a book-prefixed reference (HOS 12 regression)', () => {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tn-tools-hos12-'));
   const dir = path.join('tmp', path.basename(tempDir));

@@ -1278,7 +1278,8 @@ async function checkTnQuality({ tsvPath, preparedJson, ultUsfm, ustUsfm, book, h
       let templateText = prepItem?.template_text || '';
       if (!templateText) {
         const srefSlug25 = n.sref ? (n.sref.match(/translate\/([^\s;,]+)/) || [])[1] : '';
-        const tpls25 = srefSlug25 ? _templateMap.get(srefSlug25) : null;
+        // hint_only built-ins (parallelism-repeat) are never the default template.
+        const tpls25 = srefSlug25 ? (_templateMap.get(srefSlug25) || []).filter((t) => !t.hint_only) : null;
         if (tpls25 && tpls25.length === 1) templateText = tpls25[0].template;
       }
       if (templateText) {
