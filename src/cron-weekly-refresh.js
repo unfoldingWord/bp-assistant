@@ -32,7 +32,8 @@ async function runWeeklyRefresh(curate) {
   console.log('[weekly-refresh] Starting full Door43 + Google refresh...');
   try {
     // No `step` -> every step in CURATE_STEPS runs: fetch-door43, fetch-google,
-    // extract-english, resolve-quotes, build-indexes. `force` ignores the
+    // fetch-tw (en_tw + tw_headwords.json, #456), extract-english,
+    // resolve-quotes, build-indexes. `force` ignores the
     // per-file cache so the coordinated repo set is refetched as a unit.
     const result = await run({ force: true });
     console.log('[weekly-refresh] Done:', (result.messages || []).join(' | '));

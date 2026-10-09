@@ -215,6 +215,31 @@ function compareNormalizedSpanText(text) {
     .trim();
 }
 
+// Check 16b thresholds, measured on DAN/AMO/JER editor history: 6 of 13
+// editor-shortened quotes flagged, 3.0% of kept notes (bp-assistant#463).
+const OVERLONG_QUOTE_MIN_COPIED = 10;
+const OVERLONG_QUOTE_MIN_RATIO = 0.8;
+const OVERLONG_QUOTE_EXEMPT_SREFS = ['figs-parallelism', 'figs-infostructure'];
+
+function tokenizeForOverlap(text) {
+  const normalized = normalizeComparableAtText(text);
+  return normalized ? normalized.split(' ') : [];
+}
+
+// Length of the longest common token subsequence (words copied in order).
+function lcsLength(a, b) {
+  if (!a.length || !b.length) return 0;
+  let prev = new Array(b.length + 1).fill(0);
+  for (let i = 1; i <= a.length; i++) {
+    const cur = new Array(b.length + 1).fill(0);
+    for (let j = 1; j <= b.length; j++) {
+      cur[j] = a[i - 1] === b[j - 1] ? prev[j - 1] + 1 : Math.max(prev[j], cur[j - 1]);
+    }
+    prev = cur;
+  }
+  return prev[b.length];
+}
+
 /**
  * Extract AT texts from after "Alternate translation:" lines.
  * Returns array of strings (contents of [...] brackets).
@@ -1058,6 +1083,23 @@ async function checkTnQuality({ tsvPath, preparedJson, ultUsfm, ustUsfm, book, h
       const verseWords = ultVerse.trim().split(/\s+/).filter(Boolean);
       if (glqWords.length < 4 && verseWords.length > 8) {
         addFinding(n.row, n.ref, n.id, 'warning', 'narrow_parallelism_quote', `Parallelism gl_quote has only ${glqWords.length} words but verse has ${verseWords.length}`);
+      }
+    }
+
+    // 16b. Over-long quote: the AT copies most of the quote word for word, so
+    // the quote is wider than the issue (bp-assistant#463). Flag only; the
+    // tn-quality-check skill (step 3i) decides how to narrow it.
+    if (glQuote && ats.length && !OVERLONG_QUOTE_EXEMPT_SREFS.some((slug) => (n.sref || '').includes(slug))) {
+      const quoteTokens = tokenizeForOverlap(flattenBraces(glQuote));
+      for (const at of ats) {
+        const atTokens = tokenizeForOverlap(at);
+        if (!atTokens.length) continue;
+        const copied = lcsLength(atTokens, quoteTokens);
+        if (copied >= OVERLONG_QUOTE_MIN_COPIED && copied / atTokens.length >= OVERLONG_QUOTE_MIN_RATIO) {
+          addFinding(n.row, n.ref, n.id, 'warning', 'overlong_quote',
+            `AT copies ${copied} of its ${atTokens.length} words from the quote in order; narrow the quote to the words the AT changes and trim the AT to match`);
+          break;
+        }
       }
     }
 
