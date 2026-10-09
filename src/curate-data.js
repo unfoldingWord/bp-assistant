@@ -75,18 +75,22 @@ const STOP_WORDS = new Set([
 // ── HTTP ───────────────────────────────────────────────────────────────────
 
 function httpFetch(url, maxRedirects) {
+  return httpFetchBuffer(url, maxRedirects).then(function (buf) { return buf.toString('utf-8'); });
+}
+
+function httpFetchBuffer(url, maxRedirects) {
   if (maxRedirects === undefined) maxRedirects = 5;
   return new Promise(function (resolve, reject) {
     var client = url.startsWith('https') ? https : http;
     var req = client.get(url, { headers: { 'User-Agent': 'curate-data/1.0' } }, function (res) {
       if ((res.statusCode === 301 || res.statusCode === 302 || res.statusCode === 303 || res.statusCode === 307 || res.statusCode === 308) && res.headers.location) {
         if (maxRedirects <= 0) return reject(new Error('Too many redirects'));
-        return resolve(httpFetch(res.headers.location, maxRedirects - 1));
+        return resolve(httpFetchBuffer(res.headers.location, maxRedirects - 1));
       }
       if (res.statusCode !== 200) { res.resume(); return reject(new Error('HTTP ' + res.statusCode + ' for ' + url)); }
       var chunks = [];
       res.on('data', function (c) { chunks.push(c); });
-      res.on('end', function () { resolve(Buffer.concat(chunks).toString('utf-8')); });
+      res.on('end', function () { resolve(Buffer.concat(chunks)); });
     });
     req.on('error', reject);
     req.setTimeout(30000, function () { req.destroy(); reject(new Error('Timeout: ' + url)); });
@@ -285,6 +289,24 @@ function writeFetchStatus(fetchErrors) {
     errors: fetchErrors,
   };
   fs.writeFileSync(FETCH_STATUS_PATH, JSON.stringify(status, null, 2));
+}
+
+// ── Step 4b: Fetch Translation Words ───────────────────────────────────────
+
+// en_tw and tw_headwords.json feed check_tw_headwords and the tW names gate.
+// A failure is recorded in .fetch-status.json and the previous files are kept
+// (see tw-headwords.js), so a Door43 outage never empties the index (#456).
+async function fetchTranslationWords(force, log, fetchErrors) {
+  try {
+    var result = await require('./tw-headwords').refreshTranslationWords({
+      dataDir: DATA_DIR, fetchBuffer: httpFetchBuffer, force: force,
+      isStale: shouldRefreshWeekly, log: log,
+    });
+    if (result.skipped) log('Translation Words: fresh, skipped');
+  } catch (err) {
+    fetchErrors.push({ file: 'tw_headwords.json', message: err.message, attemptedAt: new Date().toISOString() });
+    log('Warning: tw_headwords.json: ' + err.message + ' (kept previous en_tw and tw_headwords.json)');
+  }
 }
 
 // ── Step 5: Extract unaligned English via usfm-js ──────────────────────────
@@ -605,7 +627,7 @@ async function buildAllIndexes(log) {
 // The valid `step` values, shared by every surface that exposes curation so a
 // typo is rejected rather than silently running nothing.
 const CURATE_STEPS = [
-  'check', 'setup', 'fetch-door43', 'fetch-google',
+  'check', 'setup', 'fetch-door43', 'fetch-google', 'fetch-tw',
   'extract-english', 'resolve-quotes', 'build-indexes',
 ];
 
@@ -614,7 +636,7 @@ const CURATE_STEPS = [
 /**
  * Run curation pipeline. Returns { success, messages, release, books, newBooks }.
  * @param {Object} opts
- * @param {string} [opts.step] - null for full run, or: check, fetch-door43, fetch-google, extract-english, resolve-quotes, build-indexes, setup
+ * @param {string} [opts.step] - null for full run, or: check, fetch-door43, fetch-google, fetch-tw, extract-english, resolve-quotes, build-indexes, setup
  * @param {boolean} [opts.force] - ignore cache, refetch everything
  * @param {Function} [opts.onProgress] - called with progress messages
  */
@@ -668,6 +690,13 @@ async function curatePublishedData(opts) {
   var fetchErrors = [];
   if (runStep('fetch-google')) {
     await fetchGoogleData(force, log, fetchErrors);
+  }
+  if (runStep('fetch-tw')) {
+    await fetchTranslationWords(force, log, fetchErrors);
+  }
+  // .fetch-status.json tracks the Google sources' lastSuccess, so only a run
+  // that fetched them may write it; a full run carries the tW error too.
+  if (runStep('fetch-google')) {
     writeFetchStatus(fetchErrors);
   }
 
