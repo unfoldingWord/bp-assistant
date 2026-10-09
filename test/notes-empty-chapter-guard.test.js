@@ -83,11 +83,10 @@ test('runPerNoteGeneration reports failure when every LLM call throws, even with
     assert.deepEqual(result.failureReasons, ['simulated API outage']);
 
     // The assembled TSV is pointer-only, and the push guard refuses it.
-    const coverage = mod._assessWrittenNoteCoverage('output/notes/JER/JER-32.tsv', { chapter: 32, verseCount: 64 });
+    const coverage = mod._assessWrittenNoteCoverage('output/notes/JER/JER-32.tsv', { chapter: 32 });
     assert.equal(coverage.ok, false);
     assert.equal(coverage.writtenRows, 0);
     assert.equal(coverage.pointerRows, 58);
-    assert.deepEqual(coverage.versesWithoutRows, [59, 60, 61, 62, 63, 64]);
   } finally {
     restore();
   }
@@ -102,11 +101,10 @@ test('runPerNoteGeneration still succeeds when LLM calls succeed', withTempDir('
     });
     assert.equal(result.success, true);
     assert.equal(result.failed, 0);
-    const coverage = mod._assessWrittenNoteCoverage('output/notes/JER/JER-32.tsv', { chapter: 32, verseCount: 6 });
+    const coverage = mod._assessWrittenNoteCoverage('output/notes/JER/JER-32.tsv', { chapter: 32 });
     assert.equal(coverage.ok, true);
     assert.equal(coverage.writtenRows, 4);
     assert.equal(coverage.pointerRows, 2);
-    assert.equal(coverage.warning, '');
   } finally {
     restore();
   }
@@ -123,23 +121,25 @@ test('push guard rejects a chapter TSV containing only "See how" rows', withTemp
   ].join('\n') + '\n');
   const { mod, restore } = loadPipeline(tempDir);
   try {
-    const coverage = mod._assessWrittenNoteCoverage(rel, { chapter: 32, verseCount: 5 });
+    const coverage = mod._assessWrittenNoteCoverage(rel, { chapter: 32 });
     assert.equal(coverage.ok, false);
     assert.match(coverage.reason, /0 written notes/);
     assert.equal(coverage.pointerRows, 2);
-    assert.deepEqual(coverage.versesWithoutRows, [4, 5]);
 
-    // One written note flips it to ok, but thin coverage is flagged.
+    // F4: a legitimately pointer-only chapter (no LLM-needed items) passes.
+    assert.equal(mod._assessWrittenNoteCoverage(rel, { chapter: 32, expectedWritten: 0 }).ok, true);
+    // ... but not when LLM-written notes were expected.
+    const expected = mod._assessWrittenNoteCoverage(rel, { chapter: 32, expectedWritten: 6 });
+    assert.equal(expected.ok, false);
+    assert.match(expected.reason, /6 item\(s\) needed/);
+
+    // F3: one written note passes, and sparse coverage is not flagged.
     fs.appendFileSync(path.join(tempDir, rel), '32:4\tgh78\t\trc://*/ta/man/translate/figs-metaphor\tיָד\t1\tHere **hand** represents power.\n');
-    const thin = mod._assessWrittenNoteCoverage(rel, { chapter: 32, verseCount: 5 });
+    const thin = mod._assessWrittenNoteCoverage(rel, { chapter: 32, expectedWritten: 6 });
     assert.equal(thin.ok, true);
     assert.equal(thin.writtenRows, 1);
-    assert.match(thin.warning, /only 1 written note/);
-    assert.deepEqual(thin.versesWithoutRows, [5]);
-
-    // Verse-range runs measure coverage only within the range.
-    const ranged = mod._assessWrittenNoteCoverage(rel, { chapter: 32, verseStart: 3, verseEnd: 4 });
-    assert.deepEqual(ranged.versesWithoutRows, []);
+    assert.equal(thin.warning, undefined);
+    assert.equal(thin.versesWithoutRows, undefined);
   } finally {
     restore();
   }
@@ -154,10 +154,78 @@ test('push guard does not count a blank Note cell as a written note', withTempDi
   ].join('\n') + '\n');
   const { mod, restore } = loadPipeline(tempDir);
   try {
-    const coverage = mod._assessWrittenNoteCoverage(rel, { chapter: 32, verseCount: 1 });
+    const coverage = mod._assessWrittenNoteCoverage(rel, { chapter: 32 });
     assert.equal(coverage.writtenRows, 0);
     assert.equal(coverage.ok, false);
   } finally {
     restore();
   }
 }));
+
+test('push guard accepts a book-prefixed Reference column (F5)', withTempDir('push-guard-prefix-', async (tempDir) => {
+  const rel = 'output/notes/JER/JER-32.tsv';
+  fs.mkdirSync(path.join(tempDir, 'output/notes/JER'), { recursive: true });
+  fs.writeFileSync(path.join(tempDir, rel), [
+    HEADER,
+    'JER 32:intro\tab12\t\t\t\t\t# Jeremiah 32 General Notes',
+    'JER 32:1\tcd34\t\trc://*/ta/man/translate/figs-idiom\tהַדָּבָר\t1\tHere **word** means the message.',
+    'JER 33:1\tzz99\t\t\t\t1\tWrong chapter note.',
+  ].join('\n') + '\n');
+  const { mod, restore } = loadPipeline(tempDir);
+  try {
+    const coverage = mod._assessWrittenNoteCoverage(rel, { chapter: 32 });
+    assert.equal(coverage.writtenRows, 1);
+    assert.equal(coverage.verseRows, 1);
+    assert.equal(coverage.ok, true);
+  } finally {
+    restore();
+  }
+}));
+
+test('countExpectedWrittenNotes counts only LLM-needed items, within the verse range', withTempDir('expected-written-', async (tempDir) => {
+  const pipeDir = writePipeDir(tempDir, makeItems({ pointers: 3, written: 3 })); // pointers 32:1-3, written 32:4-6
+  const { mod, restore } = loadPipeline(tempDir);
+  try {
+    assert.equal(mod._countExpectedWrittenNotes(pipeDir), 3);
+    assert.equal(mod._countExpectedWrittenNotes(pipeDir, { verseStart: 1, verseEnd: 3 }), 0);
+    assert.equal(mod._countExpectedWrittenNotes(pipeDir, { verseStart: 5, verseEnd: 6 }), 2);
+    assert.equal(mod._countExpectedWrittenNotes('tmp/does-not-exist'), null);
+  } finally {
+    restore();
+  }
+}));
+
+test('AT generation leaves the written TSV alone when the generated notes JSON is gone (F1)', withTempDir('at-stale-', async (tempDir) => {
+  const pipeDir = writePipeDir(tempDir, makeItems({ pointers: 1, written: 2 }));
+  const rel = 'output/notes/JER/JER-32.tsv';
+  fs.mkdirSync(path.join(tempDir, 'output/notes/JER'), { recursive: true });
+  const claudeTsv = `${HEADER}\n32:4\tw1\t\t\tדָּבָר\t1\tClaude-written note. Alternate translation: [x]\n`;
+  fs.writeFileSync(path.join(tempDir, rel), claudeTsv);
+  const genRel = `${pipeDir}/generated_notes.json`;
+  // Stale output of a failed per-note run: failed items are absent/empty.
+  fs.writeFileSync(path.join(tempDir, genRel), JSON.stringify({ p1: 'See how you translated this.' }));
+  const { mod, restore } = loadPipeline(tempDir);
+  try {
+    mod._discardGeneratedNotes(pipeDir);
+    assert.equal(fs.existsSync(path.join(tempDir, genRel)), false);
+    const summary = await mod._runATGeneration({ notesPath: rel, pipeDir, status: async () => {} });
+    assert.match(summary, /0 ATs needed/);
+    assert.equal(fs.readFileSync(path.join(tempDir, rel), 'utf8'), claudeTsv);
+
+    // An empty "{}" (what mechanical prep writes) is treated the same way.
+    fs.writeFileSync(path.join(tempDir, genRel), '{}');
+    await mod._runATGeneration({ notesPath: rel, pipeDir, status: async () => {} });
+    assert.equal(fs.readFileSync(path.join(tempDir, rel), 'utf8'), claudeTsv);
+  } finally {
+    restore();
+  }
+}));
+
+test('push pre-flight restores a missing source from .bak before the content guard runs (F2)', () => {
+  const src = fs.readFileSync(path.join(__dirname, '../src/notes-pipeline.js'), 'utf8');
+  const restoreAt = src.indexOf('Restore a wiped source from its .bak first');
+  const guardAt = src.indexOf('assessWrittenNoteCoverage(notesSource');
+  assert.ok(restoreAt > 0 && guardAt > 0);
+  assert.ok(restoreAt < guardAt, 'restore from .bak must come before the content guard');
+  assert.match(src.slice(restoreAt, guardAt), /copyFileSync\(srcAbs \+ '\.bak', srcAbs\)/);
+});

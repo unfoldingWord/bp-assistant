@@ -1326,8 +1326,32 @@ function classifyRunClaudeEmpty(result, phase) {
   return `non_success_${phase}:${result.subtype || 'unknown'}`;
 }
 
+function generatedNotesJsonHasEntries(relPath) {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(path.resolve(CSKILLBP_DIR, relPath), 'utf8'));
+    return Object.keys(parsed || {}).length > 0;
+  } catch (_) {
+    return false;
+  }
+}
+
+function discardGeneratedNotes(pipeDir) {
+  try {
+    const ctx = readContext(pipeDir);
+    fs.unlinkSync(path.resolve(CSKILLBP_DIR, ctx.runtime.generatedNotes));
+  } catch (_) { /* already absent */ }
+}
+
 async function runATGeneration({ notesPath, pipeDir, status }) {
   const ctx = readContext(pipeDir);
+
+  // No generated-notes JSON means the notes were not produced by per-note
+  // generation (e.g. a Claude writer session after a failed per-note run).
+  // Assembling from it would overwrite the written TSV, so leave it alone.
+  if (!generatedNotesJsonHasEntries(ctx.runtime.generatedNotes)) {
+    console.log('[notes] AT generation: no generated notes JSON; leaving the written notes as they are');
+    return '0 ATs needed (no generated notes JSON)';
+  }
 
   // Build AT context packets
   const atCtxResult = prepareATContext({
@@ -2456,27 +2480,57 @@ function stripIntroRows(absPath, chapter, book) {
 const POINTER_NOTE_RE = /^\s*See how\b/i;
 
 /**
- * Push-time content guard (#415). A chapter whose per-note LLM calls all failed
- * still assembles a TSV of deterministic "See how you translated…" pointers, and
- * insertTnRows then keeps the legacy rows for every verse the TSV omits (JER 32).
- * Count written (non-pointer) verse notes and list the verses with no rows.
- *
- * ok=false when the TSV has no written notes at all; `warning` is set when the
- * written count is far below the verse count (flag loudly, still push).
+ * How many prepared items in scope need an LLM-written note (no programmatic
+ * pointer). Returns null when the prepared file cannot be read. A chapter or
+ * verse-range shard whose items are all pointers (or that has no items, intro
+ * only) legitimately produces zero written notes (#415).
  */
-function assessWrittenNoteCoverage(notesPath, { chapter, verseStart = null, verseEnd = null, verseCount = 0 } = {}) {
+function countExpectedWrittenNotes(pipeDir, { verseStart = null, verseEnd = null } = {}) {
+  try {
+    const ctx = readContext(pipeDir);
+    const prepared = JSON.parse(fs.readFileSync(path.resolve(CSKILLBP_DIR, ctx.runtime.preparedNotes), 'utf8'));
+    let n = 0;
+    for (const item of (prepared.items || [])) {
+      if (item.programmatic_note) continue;
+      if (verseStart != null && verseEnd != null) {
+        const v = parseInt(String(item.reference || '').split(':')[1], 10);
+        if (Number.isFinite(v) && (v < verseStart || v > verseEnd)) continue;
+      }
+      n++;
+    }
+    return n;
+  } catch (_) {
+    return null;
+  }
+}
+
+/**
+ * Push-time content guard (#415). A chapter whose per-note LLM calls all failed
+ * assembles a TSV of deterministic "See how you translated..." pointers only.
+ * Count written (non-pointer) verse notes; ok=false when there are none while
+ * the chapter was expected to have some.
+ *
+ * `expectedWritten` is the number of prepared items that need an LLM-written
+ * note. When it is 0, a pointer-only or intro-only TSV is legitimate and passes.
+ * When it is null/undefined (unknown), zero written notes is refused.
+ *
+ * Deliberately no "thin coverage" or "verses without rows" checks: TN does not
+ * cover every verse, and the push replaces the whole chapter (#435), so a sparse
+ * chapter is normal.
+ */
+function assessWrittenNoteCoverage(notesPath, { chapter, expectedWritten = null } = {}) {
   const absPath = path.resolve(CSKILLBP_DIR, notesPath);
-  const out = { ok: true, verseRows: 0, pointerRows: 0, writtenRows: 0, versesWithoutRows: [], reason: '', warning: '' };
+  const out = { ok: true, verseRows: 0, pointerRows: 0, writtenRows: 0, reason: '' };
   if (!fs.existsSync(absPath)) {
     out.ok = false;
     out.reason = `notes file missing: ${notesPath}`;
     return out;
   }
-  const covered = new Set();
   for (const line of fs.readFileSync(absPath, 'utf8').split('\n')) {
     if (!line.trim()) continue;
     const cols = line.split('\t');
-    const refCol = String(cols[0] || '').trim();
+    // Reference may carry a book prefix ("JER 32:1"), like isIntroRowLine accepts.
+    const refCol = String(cols[0] || '').trim().replace(/^[A-Za-z0-9]{3}\s+(?=\d)/, '');
     if (refCol.toLowerCase() === 'reference') continue;
     const [chPart, vPart = ''] = refCol.split(':');
     if (chapter != null && String(parseInt(chPart, 10)) !== String(chapter)) continue;
@@ -2485,23 +2539,11 @@ function assessWrittenNoteCoverage(notesPath, { chapter, verseStart = null, vers
     const note = cols.length >= 7 ? cols[6] : cols[cols.length - 1];
     if (POINTER_NOTE_RE.test(String(note || ''))) out.pointerRows++;
     else if (String(note || '').trim()) out.writtenRows++;
-    const [a, b] = vPart.split('-').map((n) => parseInt(n, 10));
-    if (Number.isFinite(a)) {
-      for (let v = a; v <= (Number.isFinite(b) && b >= a ? b : a); v++) covered.add(v);
-    }
   }
-  const lo = verseStart != null ? verseStart : 1;
-  const hi = verseEnd != null ? verseEnd : verseCount;
-  for (let v = lo; v <= hi; v++) if (!covered.has(v)) out.versesWithoutRows.push(v);
 
-  if (out.writtenRows === 0) {
+  if (out.writtenRows === 0 && expectedWritten !== 0) {
     out.ok = false;
-    out.reason = `0 written notes (${out.pointerRows} "See how" pointer row(s) only) — tn-writer output is empty`;
-  } else {
-    const span = hi >= lo ? hi - lo + 1 : 0;
-    if (span > 0 && out.writtenRows < span / 2) {
-      out.warning = `only ${out.writtenRows} written note(s) for ${span} verse(s)`;
-    }
+    out.reason = `0 written notes (${out.pointerRows} "See how" pointer row(s) only)${expectedWritten ? ` but ${expectedWritten} item(s) needed an LLM-written note` : ''} — tn-writer output is empty`;
   }
   return out;
 }
@@ -4011,6 +4053,11 @@ async function notesPipeline(route, message) {
             if (perNoteResult.notesPath) {
               try { fs.unlinkSync(path.resolve(CSKILLBP_DIR, perNoteResult.notesPath)); } catch (_) { /* already absent */ }
             }
+            // Also drop the failed run's generated_notes.json. AT generation
+            // reassembles the TSV from prepared items + that JSON, which would
+            // overwrite the Claude-written TSV with AT-only cells.
+            discardGeneratedNotes(pipeDir);
+            atGenerationDone = true;
           }
         } catch (err) {
           console.error(`[notes] Per-note generation failed, falling back to Claude sessions: ${err.message}`);
@@ -4660,21 +4707,27 @@ async function notesPipeline(route, message) {
       continue;
     }
 
-    // Content guard (#415): refuse to push a chapter with no written notes
-    // (pointer-only output), and flag thin coverage — verses absent from the
-    // source keep their pre-existing (often legacy English-quote) rows.
+    // Restore a wiped source from its .bak first, so the content guard below
+    // judges the real file rather than failing on a missing one. A source that
+    // is missing with no backup is reported by the pre-flight further down.
     {
-      let chVerseCount = 0;
-      if (!hasVerseRange) { try { chVerseCount = getVerseCount(book, ch); } catch { chVerseCount = 0; } }
-      const coverage = assessWrittenNoteCoverage(notesSource, {
-        chapter: ch,
-        verseStart: hasVerseRange ? verseStart : null,
-        verseEnd: hasVerseRange ? verseEnd : null,
-        verseCount: chVerseCount,
-      });
-      const gapText = coverage.versesWithoutRows.length
-        ? ` Verses with no new notes (existing rows kept): ${coverage.versesWithoutRows.join(', ')}.`
-        : '';
+      const srcAbs = path.resolve(CSKILLBP_DIR, notesSource);
+      if (!fs.existsSync(srcAbs) && fs.existsSync(srcAbs + '.bak')) {
+        fs.copyFileSync(srcAbs + '.bak', srcAbs);
+        console.log(`[notes] Restored notes from backup: ${srcAbs}.bak`);
+        await status(`Restored notes from backup for ${ref}.`);
+      }
+    }
+
+    // Content guard (#415): refuse to push a chapter whose prepared items needed
+    // LLM-written notes but whose TSV holds only "See how" pointers (every
+    // per-note call failed). A legitimately pointer-only or intro-only chapter or
+    // shard (no LLM-needed items) passes. Sparse coverage is normal and not checked.
+    if (fs.existsSync(path.resolve(CSKILLBP_DIR, notesSource))) {
+      const expectedWritten = pipeDir
+        ? countExpectedWrittenNotes(pipeDir, hasVerseRange ? { verseStart, verseEnd } : {})
+        : null;
+      const coverage = assessWrittenNoteCoverage(notesSource, { chapter: ch, expectedWritten });
       if (!coverage.ok) {
         console.error(`[notes] Content guard refused push for ${ref}: ${coverage.reason}`);
         totalFail++;
@@ -4686,17 +4739,12 @@ async function notesPipeline(route, message) {
           current: { chapter: ch, skill: 'door43-push', status: 'failed', errorKind: 'no_written_notes', error: coverage.reason },
           resume: { chapter: ch, skill: 'tn-writer' },
         });
-        const guardFailEvent = await status(`**door43-push REFUSED** for ${ref}: ${coverage.reason}.${gapText}`);
+        const guardFailEvent = await status(`**door43-push REFUSED** for ${ref}: ${coverage.reason}.`);
         fireDiagnosis(guardFailEvent, {
           checkpoint: getCheckpoint(checkpointRef),
-          errorText: `Content guard refused push for ${ref}: ${coverage.reason}. Notes source: ${notesSource}.${gapText}`,
+          errorText: `Content guard refused push for ${ref}: ${coverage.reason}. Notes source: ${notesSource}.`,
         });
         continue;
-      }
-      if (coverage.warning || coverage.versesWithoutRows.length) {
-        const msg = `${coverage.warning ? `${coverage.warning}.` : ''}${gapText}`.trim();
-        console.warn(`[notes] Content guard warning for ${ref}: ${msg}`);
-        await status(`**Warning** for ${ref}: ${msg}`);
       }
     }
 
@@ -5016,6 +5064,9 @@ module.exports = {
   _analyzeIssuesTsvShape: analyzeIssuesTsvShape,
   _countNoteRows: countNoteRows,
   _assessWrittenNoteCoverage: assessWrittenNoteCoverage,
+  _countExpectedWrittenNotes: countExpectedWrittenNotes,
+  _discardGeneratedNotes: discardGeneratedNotes,
+  _runATGeneration: runATGeneration,
   _runPerNoteGeneration: runPerNoteGeneration,
   _collectUnresolvedQuoteFindings: collectUnresolvedQuoteFindings,
   _isMalformedIssuesShape: isMalformedIssuesShape,
