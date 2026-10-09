@@ -13,9 +13,9 @@ const path = require('path');
 const zlib = require('zlib');
 
 const {
-  refreshTranslationWords, parseTar, headwordsFromTitle, TW_ARCHIVE_URL,
+  refreshTranslationWords, parseTar, headwordsFromTitle, TW_ARCHIVE_URL, FETCHED_MARKER,
 } = require('../src/tw-headwords');
-const { CURATE_STEPS } = require('../src/curate-data');
+const { CURATE_STEPS, nextFetchStatus } = require('../src/curate-data');
 
 function tarEntry(name, body, type) {
   const data = Buffer.from(body || '');
@@ -134,4 +134,90 @@ test('a non-forced run skips a fresh index and refetches a stale one', async () 
 
 test('fetch-tw is a curation step, so the weekly full run includes it', () => {
   assert.ok(CURATE_STEPS.includes('fetch-tw'));
+});
+
+// #466 1(a): en_tw used to be swapped in, already carrying a fresh .fetched
+// marker, before tw_headwords.json was. A crash between the two left new
+// articles beside the old index, and the marker made the next weekly run skip.
+test('the .fetched marker is written only after both en_tw and tw_headwords.json are swapped in', async () => {
+  const dataDir = tmpData();
+  const hwPath = path.join(dataDir, 'tw_headwords.json');
+  const marker = path.join(dataDir, 'en_tw', FETCHED_MARKER);
+  const seen = [];
+  const realRename = fs.renameSync;
+  fs.renameSync = (from, to) => {
+    if (to === hwPath) seen.push(fs.existsSync(marker));
+    return realRename(from, to);
+  };
+  try {
+    await refreshTranslationWords({ dataDir, force: true, fetchBuffer: async () => archive(ARTICLES) });
+  } finally {
+    fs.renameSync = realRename;
+  }
+  assert.deepEqual(seen, [false], 'no marker exists while the index is still the old one');
+  assert.match(fs.readFileSync(marker, 'utf8'), /^\d{4}-\d{2}-\d{2}\n$/);
+});
+
+test('a failed index swap puts the previous en_tw back beside the previous index', async () => {
+  const dataDir = tmpData();
+  const hwPath = path.join(dataDir, 'tw_headwords.json');
+  const prev = [{ twarticle: 'old', file: 'names/old.md', category: 'names', headwords: ['Old'] }];
+  fs.writeFileSync(hwPath, JSON.stringify(prev));
+  fs.mkdirSync(path.join(dataDir, 'en_tw', 'names'), { recursive: true });
+  fs.writeFileSync(path.join(dataDir, 'en_tw', 'names', 'old.md'), '# Old\n');
+  fs.writeFileSync(path.join(dataDir, 'en_tw', FETCHED_MARKER), '2026-01-01\n');
+
+  const realRename = fs.renameSync;
+  fs.renameSync = (from, to) => {
+    if (to === hwPath) throw new Error('simulated crash at index swap');
+    return realRename(from, to);
+  };
+  try {
+    await assert.rejects(
+      refreshTranslationWords({ dataDir, force: true, fetchBuffer: async () => archive(ARTICLES) }),
+      /simulated crash/);
+  } finally {
+    fs.renameSync = realRename;
+  }
+  assert.deepEqual(JSON.parse(fs.readFileSync(hwPath, 'utf8')), prev);
+  assert.deepEqual(fs.readdirSync(path.join(dataDir, 'en_tw', 'names')), ['old.md']);
+  assert.equal(fs.readFileSync(path.join(dataDir, 'en_tw', FETCHED_MARKER), 'utf8'), '2026-01-01\n');
+  assert.deepEqual(fs.readdirSync(dataDir).sort(), ['en_tw', 'tw_headwords.json'], 'no scratch files left');
+});
+
+test('an archive over the download or unpacked size cap is refused and the previous files kept', async () => {
+  const dataDir = tmpData();
+  const hwPath = path.join(dataDir, 'tw_headwords.json');
+  fs.writeFileSync(hwPath, '[]');
+  const bomb = zlib.gzipSync(Buffer.alloc(64 * 1024)); // ~100 bytes gzipped, 64 KiB unpacked
+  await assert.rejects(
+    refreshTranslationWords({ dataDir, force: true, maxTarBytes: 32 * 1024, fetchBuffer: async () => bomb }),
+    /unpacks to more than 32768 bytes/);
+  await assert.rejects(
+    refreshTranslationWords({ dataDir, force: true, maxArchiveBytes: 16, fetchBuffer: async () => bomb }),
+    /over the 16-byte cap/);
+  assert.equal(fs.readFileSync(hwPath, 'utf8'), '[]');
+  assert.deepEqual(fs.readdirSync(dataDir), ['tw_headwords.json']);
+});
+
+// #466 1(b): only a run that included fetch-google wrote .fetch-status.json, so
+// an operator `step=fetch-tw` failure never reached /health/data-freshness.
+test('a fetch-tw-only run records or clears its own error without moving the Google timestamps', () => {
+  const googleErr = { file: 'templates.csv', message: 'HTTP 500' };
+  const twErr = { file: 'tw_headwords.json', message: 'HTTP 502' };
+  const prev = { lastRun: '2026-10-01T00:00:00Z', lastSuccess: '2026-09-24T00:00:00Z', errors: [googleErr] };
+  const now = '2026-10-09T00:00:00Z';
+
+  const failed = nextFetchStatus(prev, [twErr], { google: false, tw: true }, now);
+  assert.deepEqual(failed, { lastRun: prev.lastRun, lastSuccess: prev.lastSuccess, errors: [googleErr, twErr] });
+
+  const cleared = nextFetchStatus(failed, [], { google: false, tw: true }, now);
+  assert.deepEqual(cleared, prev, 'a later tW success clears only the tW error');
+
+  const googleOnly = nextFetchStatus(failed, [], { google: true, tw: false }, now);
+  assert.deepEqual(googleOnly, { lastRun: now, lastSuccess: now, errors: [twErr] },
+    'a Google-only run keeps the unresolved tW error');
+
+  const full = nextFetchStatus(failed, [], { google: true, tw: true }, now);
+  assert.deepEqual(full, { lastRun: now, lastSuccess: now, errors: [] });
 });
