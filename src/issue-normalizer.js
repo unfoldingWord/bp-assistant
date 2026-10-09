@@ -74,11 +74,15 @@ const PARALLELISM_REPEAT_HINT = 'parallelism-repeat';
 function markParallelismRepeat(explanation) {
   // Drop any existing template hint (a `t:` value runs to the next i:/t: directive
   // or end of text) so the repeat hint is the only one tn-tools sees.
+  // [heb:...] is a Hebrew hint for fillOrigQuotes, not a directive: lift it out
+  // so the t: strip cannot swallow it, then put it back before the repeat hint.
+  const hebHints = [];
   const stripped = String(explanation || '')
+    .replace(/\s*\[heb:[^\]]*\]/g, (m) => { hebHints.push(m.trim()); return ' '; })
     .replace(/(^|\s)t:[\s\S]*?(?=\s+[it]:|$)/g, ' ')
     .replace(/\s{2,}/g, ' ')
     .trim();
-  return `${stripped} t: ${PARALLELISM_REPEAT_HINT}`.trim();
+  return [stripped, ...hebHints, `t: ${PARALLELISM_REPEAT_HINT}`].filter(Boolean).join(' ');
 }
 
 function extractUniqueReason(explanation, reasonCodes) {

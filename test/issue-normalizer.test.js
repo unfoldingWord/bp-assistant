@@ -74,6 +74,41 @@ test('normalizeIssueRows replaces other template hints on repeat rows', () => {
   assert.equal(cols.filter((c) => /first instance/i.test(c[6])).length, 1);
 });
 
+test('normalizeIssueRows keeps the [heb:] hint when it follows a t: directive on a repeat row', () => {
+  const input = [
+    row({ ref: '35:1', quote: 'A; B', explanation: 'synonymous parallelism t: first instance' }),
+    row({ ref: '35:4', quote: 'C; D', explanation: 'synonymous parallelism t: combine [heb:חַסְדּוֹ]' }),
+    row({ ref: '35:7', quote: 'E; F', explanation: 'synonymous parallelism [heb:עוֹלָם]' }),
+  ];
+  const cols = parallelismCols(normalizeIssueRows(input).lines);
+  assert.equal(cols[1][6], 'synonymous parallelism [heb:חַסְדּוֹ] t: parallelism-repeat');
+  assert.equal(cols[2][6], 'synonymous parallelism [heb:עוֹלָם] t: parallelism-repeat');
+});
+
+test('normalizeIssueRows compares non-empty quotes only when finding near-duplicates', () => {
+  const longQuote = 'May they be ashamed and confounded and turned back and disappointed without cause';
+  const input = [
+    row({ ref: '35:1', quote: longQuote, explanation: 'synonymous parallelism t: first instance' }),
+    // One word different: still the same span, dropped.
+    row({ ref: '35:2', quote: longQuote.replace('without cause', 'without reason'), explanation: 'synonymous parallelism' }),
+    // Different quote with the same boilerplate explanation: kept.
+    row({ ref: '35:3', quote: 'Let them be as chaff before the wind', explanation: 'synonymous parallelism' }),
+  ];
+  const result = normalizeIssueRows(input);
+  assert.deepEqual(keptRefs(result.lines), ['35:1', '35:3']);
+  assert.equal(result.summary.dropped_duplicate_parallelism_rows, 1);
+});
+
+test('normalizeIssueRows compares quote and explanation when the quote is empty', () => {
+  const input = [
+    row({ ref: '35:1', quote: '', explanation: 'synonymous parallelism about shame and disgrace' }),
+    row({ ref: '35:2', quote: '', explanation: 'synonymous parallelism about shame and disgrace' }),
+    row({ ref: '35:3', quote: '', explanation: 'synonymous parallelism praising the king' }),
+  ];
+  const result = normalizeIssueRows(input);
+  assert.deepEqual(keptRefs(result.lines), ['35:1', '35:3']);
+});
+
 test('normalizeIssueRows allows one qualified unique parallelism with valid reason', () => {
   const input = [
     row({ ref: '35:1', quote: 'A; B', explanation: 'synonymous parallelism t: first instance' }),
