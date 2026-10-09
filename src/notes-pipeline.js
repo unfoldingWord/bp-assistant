@@ -23,7 +23,7 @@ const { checkTnQuality, detectSelfTalk, templateFirstPhrase, resolveTemplateText
 const { buildBookRecurrenceIndex, deriveRecurrenceKeys, buildSeeHowSentence, isSeeHowEligible, isContextDependentSref, dedupeAlsoOccursVerses, assignAlsoOccursVerses, resolveDoor43ReposPath, hebTokens, verseNumber: recurrenceVerseNumber, SEE_HOW_NEVER_FOLD_SREFS, CROSS_BOOK_MAX_BOOKS } = require('./workspace-tools/recurrence-index');
 const { loadCommonPhrases, buildIntroPointerSentence, phraseTextKey } = require('./workspace-tools/common-phrases');
 const { normalizeIssuesFile, buildParallelismIntroHintArgs } = require('./issue-normalizer');
-const { runIssueRulesGate, gatePrBodyForPush, refreshGateSidecarOutputHash, readGateSidecar } = require('./issue-rules-gate');
+const { runIssueRulesGate, gatePrBodyForPush, refreshGateSidecarOutputHash, readGateSidecar, keptDropsStillCovered } = require('./issue-rules-gate');
 const { dropTwCoveredRows } = require('./tw-article-gate');
 const { curlyQuotes } = require('./workspace-tools/usfm-tools');
 const { verifyRepoPush, verifyDcsToken, verifyRemoteContent } = require('./repo-verify');
@@ -2704,8 +2704,10 @@ function buildParsedNotesRequest(route, content) {
       // Zulip-triggered runs fall through to parseWriteNotesCommand and
       // never carry hints.
       hints: Array.isArray(route._hints) && route._hints.length > 0 ? route._hints : null,
-      // Editor-kept notes (API-origin only), same reasoning as hints.
-      kept: Array.isArray(route._kept) && route._kept.length > 0 ? route._kept : null,
+      // Editor-kept notes (API-origin only), same reasoning as hints. An empty
+      // array stays an array: "the editor has no kept notes" is a different fact
+      // from null, "no list was supplied" (Zulip runs, a bare resume).
+      kept: Array.isArray(route._kept) ? route._kept : null,
     };
   }
   return parseWriteNotesCommand(content);
@@ -3321,10 +3323,12 @@ async function notesPipeline(route, message) {
   // A resume that arrives without the kept list (a bare "resume" in the topic
   // rebuilds the route from the checkpoint) reuses the list the run started
   // with; otherwise a whole-chapter replace would delete the kept rows.
-  if (!kept && resumingFromCheckpoint && Array.isArray(existingCheckpoint?.kept) && existingCheckpoint.kept.length > 0) {
+  // The checkpoint keeps an empty list as [] and "never supplied" as null, so a
+  // resume restores exactly what the run started with.
+  if (kept == null && resumingFromCheckpoint && Array.isArray(existingCheckpoint?.kept)) {
     kept = existingCheckpoint.kept;
     keptIds = kept.map((k) => k.rowId);
-    await status(`Using the ${kept.length} kept notes saved with this run's checkpoint.`);
+    if (kept.length > 0) await status(`Using the ${kept.length} kept notes saved with this run's checkpoint.`);
   }
   setCheckpoint(checkpointRef, {
     state: 'running',
@@ -3332,7 +3336,7 @@ async function notesPipeline(route, message) {
     totalFail,
     allKeptChapters,
     skillOutputs,
-    kept: kept || null,
+    kept: Array.isArray(kept) ? kept : null,
     resume: { chapter: resumeChapter, skill: resumeSkill, ...(resumeGatePending && resumingFromCheckpoint ? { gatePending: true } : {}) },
   });
 
@@ -3730,6 +3734,10 @@ async function notesPipeline(route, message) {
             const lines = gate.keptDrops.map((d) => `- ${d.ref} ${d.sref} dropped: duplicates kept note ${d.kept}`);
             await status(`**${ref}**: issue rows dropped as duplicates of kept notes:\n${lines.join('\n')}`);
           }
+          if (gate.keptRestored && gate.keptRestored.length) {
+            const lines = gate.keptRestored.map((d) => `- ${d.ref} ${d.sref}: kept note ${d.kept} no longer covers it`);
+            await status(`**${ref}**: issue rows restored because the kept note they duplicated was removed or moved:\n${lines.join('\n')}`);
+          }
         } else if (gate.reason === 'error') {
           await status(`**${ref}**: issue rules check failed (non-fatal, issues left unchanged): ${gate.error}`);
         } else {
@@ -3904,7 +3912,7 @@ async function notesPipeline(route, message) {
               // already_applied, off), read the count from its sealed sidecar.
               const gateKept = issueRulesGateResult && issueRulesGateResult.ran
                 ? (issueRulesGateResult.keptDropsTotal || 0)
-                : (readGateSidecar({ issuesPath, book })?.keptDropped || []).length;
+                : keptDropsStillCovered(readGateSidecar({ issuesPath, book })?.keptDropped, kept, ch).length;
               // Gate drops that count here: sidecar entries for a kept note still in this
               // run's list, on a verse inside this chapter's run range. A gate drop for
               // another chapter or range, or for a kept note the editor removed, does not.

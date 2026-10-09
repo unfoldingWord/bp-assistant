@@ -1512,9 +1512,9 @@ function buildApiSyntheticRoute(pipelineType, scope, options, ai) {
     : null;
 
   // Editor-kept notes ride the same way (notes only; schema rejects others).
-  const kept = options && Array.isArray(options.kept) && options.kept.length > 0
-    ? options.kept
-    : null;
+  // An empty array is kept: it says the editor has no kept notes. null means the
+  // caller did not send a list, which the rules gate must not read as "none".
+  const kept = options && Array.isArray(options.kept) ? options.kept : null;
 
   // translate carries its per-run parameters structurally, like hints do —
   // they can't ride the stringly-typed message flags. translate-pipeline.js

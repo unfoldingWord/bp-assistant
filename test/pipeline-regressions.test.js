@@ -1021,3 +1021,14 @@ test('see-how: buildRuntimePaths exposes recurrenceIndex and preCreateStubs seed
     delete require.cache[modulePath];
   }
 });
+
+test('options.kept: an empty list stays empty from the API route to the parsed request; a missing list stays null (#448)', () => {
+  const { buildApiSyntheticRoute } = require('../src/router');
+  const scope = { book: 'JER', startChapter: 3, endChapter: 3, verseStart: null, verseEnd: null };
+  const kept = [{ rowId: 'hk52', ref: '3:3', supportReference: '', quote: '', note: '' }];
+  const parsedFor = (options) => buildParsedNotesRequest(buildApiSyntheticRoute('notes', scope, options), 'write notes JER 3');
+  assert.deepEqual(parsedFor({ kept }).kept, kept);
+  assert.deepEqual(parsedFor({ kept: [] }).kept, [], 'supplied and empty is not "unknown"');
+  assert.equal(parsedFor({}).kept, null);
+  assert.equal(parsedFor({ hints: undefined }).kept, null);
+});
