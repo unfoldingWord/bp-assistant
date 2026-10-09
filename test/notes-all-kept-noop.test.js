@@ -288,7 +288,7 @@ test('an AI note that is not kept still goes to tn-writer', async () => {
       preparedItem('c333', '38:11', 'rc://*/ta/man/translate/figs-simile', 'כְּסוּס'),
     ],
   });
-  assert.ok(!calls.statuses.some((s) => s.includes('nothing new to write')));
+  assert.ok(!calls.statuses.some((s) => s.includes('nothing was pushed for this chapter')));
   assert.equal(calls.runClaude, 1, 'tn-writer should run for the remaining note');
 });
 
@@ -297,6 +297,6 @@ test('a chapter intro left after the kept drop is still written', async () => {
     items: [preparedItem('a111', '38:9', 'rc://*/ta/man/translate/figs-metaphor', 'אֶבֶן')],
     introRows: [['38:intro', 'i111', '', '', '', '', '# Isaiah 38']],
   });
-  assert.ok(!calls.statuses.some((s) => s.includes('nothing new to write')));
+  assert.ok(!calls.statuses.some((s) => s.includes('nothing was pushed for this chapter')));
   assert.equal(calls.runClaude, 1, 'tn-writer should run to write the intro');
 });
