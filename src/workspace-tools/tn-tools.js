@@ -2147,13 +2147,17 @@ function removePreparedItemsCoveredByKept(prepared, kept, chapter) {
   return { prepared: next, removed };
 }
 
-/** File wrapper: read prepared_notes.json, drop covered items, write it back. */
+/** File wrapper: read prepared_notes.json, drop covered items, write it back. Returns removed and remaining item counts and the intro row count. */
 function applyKeptToPreparedNotes({ preparedJson, kept, chapter }) {
   const absPath = path.resolve(CSKILLBP_DIR, preparedJson);
   const data = JSON.parse(fs.readFileSync(absPath, 'utf8'));
   const { prepared, removed } = removePreparedItemsCoveredByKept(data, kept, chapter);
   if (removed > 0) fs.writeFileSync(absPath, JSON.stringify(prepared, null, 2));
-  return { itemsRemoved: removed };
+  return {
+    itemsRemoved: removed,
+    itemsRemaining: Array.isArray(prepared.items) ? prepared.items.length : 0,
+    introRows: Array.isArray(prepared.intro_rows) ? prepared.intro_rows.length : 0,
+  };
 }
 
 function buildStrippedHebrewText(raw) {
