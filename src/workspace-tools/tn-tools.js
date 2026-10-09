@@ -541,8 +541,10 @@ const ISSUE_SCOPE_MODE_BY_SLUG = {
   'figs-parallelism': 'full_parallelism',
 };
 
+// grammar-connect-logic-* is deliberately absent: those quotes anchor on the
+// connector itself (tn_decisions.csv 2026-09-24; bp-assistant#463). Widening
+// them to the whole verse produced over-long quotes editors cut back to one word.
 const ISSUE_SCOPE_MODE_BY_PREFIX = [
-  ['grammar-connect-logic-', 'full_restructure_region'],
   ['grammar-connect-time-', 'full_restructure_region'],
 ];
 
