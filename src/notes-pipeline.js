@@ -18,7 +18,7 @@ const { createGuardHooks } = require('./guard-hooks');
 const { resolveAutoModel } = require('./api-runner/provider-config');
 const { getDoor43Username, emailToFallbackUsername, buildBranchName, resolveOutputFile, discoverFreshOutput, checkPrerequisites, calcSkillTimeout, calcVerseSpanTimeout, normalizeBookName, resolveConflictMention, parsePartialTsv, truncatePartialTsv, parseChunkRange, isUsageLimitError, CSKILLBP_DIR } = require('./pipeline-utils');
 const { splitTsv, fixTrailingNewlines } = require('./workspace-tools/tsv-tools');
-const { fillTsvIds, generateIds, prepareNotes, fillOrigQuotes, resolveGlQuotes, flagNarrowQuotes, extractAlignmentData, prepareATContext, substituteAT, fixUnicodeQuotes, verifyBoldMatches, syncCanonicalHebrewQuotes, applyHintsToPreparedNotes, applyKeptToPreparedNotes, keptRefVerseSpan, parsePlainUsfmVersesFromText, detectIssuesTsvLayout, extractIssuesTsvRow, findVersesWithoutNotes, readWriterSkipped, parseWriterSkip, sanitizeSkipReason, _stripAlternateTranslation: stripAlternateTranslation } = require('./workspace-tools/tn-tools');
+const { fillTsvIds, generateIds, prepareNotes, fillOrigQuotes, resolveGlQuotes, flagNarrowQuotes, extractAlignmentData, prepareATContext, substituteAT, fixUnicodeQuotes, verifyBoldMatches, syncCanonicalHebrewQuotes, applyHintsToPreparedNotes, applyKeptToPreparedNotes, keptRefVerseSpan, parsePlainUsfmVersesFromText, detectIssuesTsvLayout, extractIssuesTsvRow, findVersesWithoutNotes, readWriterSkipped, recordWriterSkipRejected, parseWriterSkip, sanitizeSkipReason, _stripAlternateTranslation: stripAlternateTranslation } = require('./workspace-tools/tn-tools');
 const { checkTnQuality, detectSelfTalk, templateFirstPhrase, resolveTemplateText } = require('./workspace-tools/quality-tools');
 const { buildBookRecurrenceIndex, deriveRecurrenceKeys, buildSeeHowSentence, isSeeHowEligible, isContextDependentSref, dedupeAlsoOccursVerses, assignAlsoOccursVerses, resolveDoor43ReposPath, hebTokens, verseNumber: recurrenceVerseNumber, SEE_HOW_NEVER_FOLD_SREFS, CROSS_BOOK_MAX_BOOKS } = require('./workspace-tools/recurrence-index');
 const { loadCommonPhrases, buildIntroPointerSentence, phraseTextKey } = require('./workspace-tools/common-phrases');
@@ -69,6 +69,9 @@ const TN_WRITER_HINT =
   'read_prepared_notes (summaryOnly:true first, then bounded slices) — never the raw Read tool on prepared_notes.json. ' +
   'AT generation is a separate pipeline step that runs after note writing, so write only the explanatory note text ' +
   'and do not generate alternate translations or run AT-fit verification here. ' +
+  'If an item\'s writer_packet has skip_allowed: true and its skip_instruction says the note does not apply, ' +
+  'record the skip by writing the value "SKIP_NOTE: <short reason>" for that item id in generated_notes.json instead of a note, ' +
+  'then run assemble_notes as usual: it drops the row and the pipeline reports it. Never write SKIP_NOTE for an item without skip_allowed. ' +
   'If an Edit returns "string to replace not found", do not retry it: re-Read once or use the structured tool, ' +
   'then tag the row unresolved and move on if it still cannot be matched.';
 
@@ -1242,7 +1245,19 @@ async function runPerNoteGeneration({ pipeDir, outputPath, status, book }) {
       if (parseWriterSkip(noteText) !== null) {
         // The skip marker is only a valid answer for items the template allows to be skipped.
         if (!packet.skip_allowed) {
-          return { id: item.id, success: false, reason: 'skip marker returned for an item that cannot be skipped' };
+          return {
+            id: item.id,
+            success: false,
+            reason: 'skip marker returned for an item that cannot be skipped',
+            rejectedSkip: {
+              id: item.id,
+              reference: item.reference || '',
+              sref: packet.sref || item.sref || '',
+              gl_quote: packet.gl_quote || item.gl_quote || '',
+              reason: sanitizeSkipReason(parseWriterSkip(noteText)) || '(no reason given)',
+              skip_allowed: false,
+            },
+          };
         }
         return { id: item.id, success: true, note: noteText, skipped: true };
       }
@@ -4099,6 +4114,17 @@ async function notesPipeline(route, message) {
       // --- Per-note generation: direct API calls per note (replaces Claude Code sessions) ---
       let usedPerNote = false;
       if (skill.name === 'tn-writer' && USE_PER_NOTE_GENERATION && !hasVerseRange && !isDryRun) {
+        // assembleNotes drops skipped items from prepared_notes.json; a fallback
+        // writer must see every item, so keep the pre-run file to restore on failure.
+        let preparedSnapshot = null;
+        let preparedSnapshotPath = null;
+        try {
+          const prepRel = readContext(pipeDir)?.runtime?.preparedNotes;
+          if (prepRel) {
+            preparedSnapshotPath = path.resolve(CSKILLBP_DIR, prepRel);
+            preparedSnapshot = fs.readFileSync(preparedSnapshotPath, 'utf8');
+          }
+        } catch (_) { preparedSnapshot = null; }
         try {
           await status(`**${ref}**: Using per-note generation (direct API calls)...`);
           const perNoteResult = await runPerNoteGeneration({
@@ -4131,6 +4157,11 @@ async function notesPipeline(route, message) {
         } catch (err) {
           console.error(`[notes] Per-note generation failed, falling back to Claude sessions: ${err.message}`);
           usedPerNote = false; // Fall through to existing paths
+          if (preparedSnapshot !== null) {
+            try { fs.writeFileSync(preparedSnapshotPath, preparedSnapshot); } catch (e) {
+              console.warn(`[notes] could not restore prepared notes after per-note failure: ${e.message}`);
+            }
+          }
           // A throw after generated_notes.json was written leaves the same stale
           // file the !success branch resets.
           discardGeneratedNotes(pipeDir);

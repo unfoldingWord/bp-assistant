@@ -1510,6 +1510,18 @@ function applyWriterSkips({ preparedJson, generatedJson }) {
   const prepared = JSON.parse(fs.readFileSync(prepPath, 'utf8'));
   const generated = JSON.parse(fs.readFileSync(genPath, 'utf8'));
   const items = Array.isArray(prepared.items) ? prepared.items : [];
+  // A rejection record is stale once the item has a real note.
+  let clearedStale = false;
+  if (Array.isArray(prepared.writer_skip_rejected) && prepared.writer_skip_rejected.length) {
+    const keep = prepared.writer_skip_rejected.filter((r) => {
+      const text = generated[r.id];
+      return !(typeof text === 'string' && text.trim() && parseWriterSkip(text) === null);
+    });
+    if (keep.length !== prepared.writer_skip_rejected.length) {
+      prepared.writer_skip_rejected = keep;
+      clearedStale = true;
+    }
+  }
   const skipped = [];
   const rejected = [];
   const dropItems = new Set();
@@ -1542,7 +1554,10 @@ function applyWriterSkips({ preparedJson, generatedJson }) {
       rejected.push(record);
     }
   }
-  if (!skipped.length && !rejected.length) return { skipped, rejected };
+  if (!skipped.length && !rejected.length) {
+    if (clearedStale) writeFileAtomic(prepPath, JSON.stringify(prepared, null, 2));
+    return { skipped, rejected };
+  }
 
   const merge = (prior, added) => {
     const ids = new Set(added.map((r) => r.id));
@@ -1559,6 +1574,20 @@ function applyWriterSkips({ preparedJson, generatedJson }) {
   for (const k of dropKeys) delete generated[k];
   writeFileAtomic(genPath, JSON.stringify(generated, null, 2) + '\n');
   return { skipped, rejected };
+}
+
+// Per-note generation rejects a skip marker on a non-skippable item before the
+// text reaches generated_notes.json; record it so the post-writer report can warn.
+function recordWriterSkipRejected({ preparedJson, records }) {
+  if (!records || !records.length) return;
+  const prepPath = path.resolve(CSKILLBP_DIR, preparedJson);
+  const prepared = JSON.parse(fs.readFileSync(prepPath, 'utf8'));
+  const ids = new Set(records.map((r) => r.id));
+  prepared.writer_skip_rejected = [
+    ...(Array.isArray(prepared.writer_skip_rejected) ? prepared.writer_skip_rejected : []).filter((r) => !ids.has(r.id)),
+    ...records,
+  ];
+  writeFileAtomic(prepPath, JSON.stringify(prepared, null, 2));
 }
 
 function readWriterSkipped(preparedJson, field = 'writer_skipped') {
@@ -3765,6 +3794,7 @@ module.exports = {
   sanitizeSkipReason,
   applyWriterSkips,
   readWriterSkipped,
+  recordWriterSkipRejected,
   WRITER_SKIP_MARKER,
   _deriveStyleProfile: deriveStyleProfile,
   _deriveAtRequirement: deriveAtRequirement,

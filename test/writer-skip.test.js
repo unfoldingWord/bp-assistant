@@ -174,3 +174,18 @@ test('applyWriterSkips leaves no temp files behind', () => {
   applyWriterSkips({ preparedJson: prep, generatedJson: gen });
   assert.deepEqual(fs.readdirSync(path.join(WORK, 'e')).sort(), ['generated_notes.json', 'prepared_notes.json']);
 });
+
+test('recordWriterSkipRejected stores a record that survives assembly, and it clears once the item has a real note', () => {
+  const { recordWriterSkipRejected } = require('../src/workspace-tools/tn-tools');
+  const prep = writeJson('f/prepared_notes.json', {
+    items: [{ id: 'r1', reference: '1:1', sref: 'figs-metaphor', orig_quote: 'q', gl_quote: 'A', ult_verse: 'A' }],
+  });
+  const gen = writeJson('f/generated_notes.json', {});
+  recordWriterSkipRejected({ preparedJson: prep, records: [{ id: 'r1', reference: '1:1', sref: 'figs-metaphor', reason: 'x', skip_allowed: false }] });
+  assembleNotes({ preparedJson: prep, generatedJson: gen, output: 'f/out.tsv' });
+  assert.deepEqual(readWriterSkipped(prep, 'writer_skip_rejected').map((r) => r.id), ['r1']);
+  // A later (fallback) writer produces a real note: the stale record goes away.
+  writeJson('f/generated_notes.json', { r1: 'A real note.' });
+  assembleNotes({ preparedJson: prep, generatedJson: gen, output: 'f/out.tsv' });
+  assert.deepEqual(readWriterSkipped(prep, 'writer_skip_rejected'), []);
+});

@@ -183,10 +183,14 @@ function normalizeExplanationStem(explanation) {
 // Re-derive first instance vs repeat from the rows that are actually left.
 // A pass can start from a file an earlier pass (or the rules gate) changed: the
 // old first parallelism row may be gone, leaving the next row marked as a repeat
-// with no first-instance row in the chapter. The first parallelism row left is
-// always the first instance: it never keeps the repeat marker, and when the
-// chapter had a first-instance tag (or a demoted first row) that no row carries
-// any more, the first row gets `t: first instance` again.
+// with no first-instance row in the chapter, or the first-instance tag may sit on
+// a later row. The first parallelism row left is always the first instance: it
+// never keeps the repeat marker, and when the chapter had a first-instance tag
+// (or a demoted first row) it carries `t: first instance` itself, with any
+// other first-instance tag removed from later rows (one per chapter). A first
+// row that already asks for another template (`t: combine`) keeps it, since two
+// t: hints on one row make the template choice ambiguous; then the existing tag
+// stays where it is. Idempotent.
 function finalizeFirstInstance(outLines, sawFirstInstanceTag, summary) {
   const idx = [];
   for (let i = 0; i < outLines.length; i++) {
@@ -198,17 +202,24 @@ function finalizeFirstInstance(outLines, sawFirstInstanceTag, summary) {
   const firstCols = parseTsvLine(outLines[idx[0]]);
   const wasRepeat = hasParallelismRepeatMarker(firstCols[6]);
   if (wasRepeat) firstCols[6] = clearParallelismRepeat(firstCols[6]);
-  const anyTag = idx.some((i) => hasFirstInstanceTag(parseTsvLine(outLines[i])[6])) || hasFirstInstanceTag(firstCols[6]);
-  // A row that already asks for another template (`t: combine`) keeps it: two
-  // t: hints on one row make the template choice ambiguous.
-  const hasOtherTemplateHint = /(^|\s)t:\s*\S/i.test(firstCols[6]);
-  if (!anyTag && !hasOtherTemplateHint && (wasRepeat || sawFirstInstanceTag)) {
+  const laterWithTag = idx.slice(1).filter((i) => hasFirstInstanceTag(parseTsvLine(outLines[i])[6]));
+  let changed = wasRepeat;
+  if (!hasFirstInstanceTag(firstCols[6])
+      && (wasRepeat || sawFirstInstanceTag || laterWithTag.length)
+      && !/(^|\s)t:\s*\S/i.test(firstCols[6])) {
     firstCols[6] = [firstCols[6], 't: first instance'].filter(Boolean).join(' ');
     summary.first_instance_restored++;
-  } else if (!wasRepeat) {
-    return;
+    changed = true;
   }
-  outLines[idx[0]] = toTsvLine(firstCols);
+  if (hasFirstInstanceTag(firstCols[6])) {
+    for (const i of laterWithTag) {
+      const cols = parseTsvLine(outLines[i]);
+      cols[6] = stripFirstInstanceTag(cols[6]);
+      outLines[i] = toTsvLine(cols);
+      summary.first_instance_tags_removed++;
+    }
+  }
+  if (changed) outLines[idx[0]] = toTsvLine(firstCols);
 }
 
 function normalizeIssueRows(lines, options = {}) {

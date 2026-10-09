@@ -346,3 +346,19 @@ test('restoring the first instance does not add a second t: hint to a row that h
   assert.equal(result.summary.first_instance_restored, 0);
   assert.equal(isRepeat(cols[1]), true);
 });
+
+test('first-instance tag on a later exception row moves to the real first row; idempotent', () => {
+  // File as an earlier pass left it: first remaining row marked repeat, a later exception row still tagged.
+  const input = [
+    row({ ref: '35:4', quote: 'C; D', explanation: 'synonymous parallelism t: parallelism-repeat' }),
+    row({ ref: '35:9', quote: 'E; F; G', explanation: 'synonymous parallelism q: unique-parallelism reason: tricola t: first instance' }),
+  ];
+  const result = normalizeIssueRows(input);
+  const cols = parallelismCols(result.lines);
+  assert.equal(cols[0][6], 'synonymous parallelism t: first instance');
+  assert.equal(cols[1][6], 'synonymous parallelism q: unique-parallelism reason: tricola');
+  assert.equal(result.lines.filter((l) => /t:\s*first instance/.test(l)).length, 1);
+  assert.equal(result.lines.filter((l) => /parallelism-repeat/.test(l)).length, 0);
+  const again = normalizeIssueRows(result.lines);
+  assert.deepEqual(again.lines, result.lines);
+});
