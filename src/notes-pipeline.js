@@ -902,7 +902,7 @@ async function runSeeHowDetection({ pipeDir, contextPath, generateIdsFn = genera
     // construction at its own verse, so a repeat of the wording is not a
     // repeat of the note.
     let foldsAnySref = isSeeHowEligible(key, lead.sref) && !isContextDependentSref(lead.sref, key);
-    const corpusHere = chapterCorpusOccs(key);
+    let corpusHere = chapterCorpusOccs(key);
 
     let target = earlierNotedTarget(key);
 
@@ -925,6 +925,10 @@ async function runSeeHowDetection({ pipeDir, contextPath, generateIdsFn = genera
         if (!plain.length) continue;
         group = plain;
         lead = group[0];
+        // The exempt items keep their own notes, so no remaining note may say
+        // the phrase "also occurs" at their verses.
+        const exemptVerses = new Set(fullGroup.filter((it) => !group.includes(it)).map((it) => recurrenceVerseNumber(verseOf(it.reference))));
+        corpusHere = corpusHere.filter((o) => !exemptVerses.has(recurrenceVerseNumber(o.verse)));
         foldsAnySref = isSeeHowEligible(key, lead.sref) && !isContextDependentSref(lead.sref, key);
       }
     }

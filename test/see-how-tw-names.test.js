@@ -216,6 +216,8 @@ test('T7: in a group, only the keep-hinted item keeps its own note; the normal o
   assert.equal(v4.programmatic_note, undefined);
   assert.equal(v4.see_how_target, undefined);
   assert.ok(!items.some((it) => it.injected_see_how && it.orig_quote === AHAZ), 'no Ahaz pointer injected');
+  assert.ok(!(v1.also_occurs_verses || []).includes('4'), 'v1 does not say it also occurs at the keep-hinted verse');
+  assert.ok(!/verse 4|verses? .*\b4\b/.test(v1.programmatic_note || ''), 'nor does its note text');
   assert.match(summary, /1 skipped \(tW name\)/);
 });
 
