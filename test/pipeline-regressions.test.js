@@ -314,12 +314,17 @@ test('checkUltEdits finds flat aligned ULT outputs', async () => {
 // Issue #186: ISA 53/54 issues TSV carried pre-edit ULT wording while the
 // aligned file already matched Door43 master, so the diff gate said "no human
 // edits" and the stale GLQuotes later produced blank orig_quotes.
-async function runCheckUltEditsFixture({ masterUsfm, alignedUsfm, plainUsfm, issuesTsv }) {
+async function runCheckUltEditsFixture({ masterUsfm, alignedUsfm, plainUsfm, issuesTsv, ustMasterUsfm, aiUstUsfm, ustFetchStatus }) {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'check-ult-stale-'));
   const ultDir = path.join(tempDir, 'output', 'AI-ULT', 'ISA');
   fs.mkdirSync(ultDir, { recursive: true });
   if (alignedUsfm != null) fs.writeFileSync(path.join(ultDir, 'ISA-53-aligned.usfm'), alignedUsfm);
   if (plainUsfm != null) fs.writeFileSync(path.join(ultDir, 'ISA-53.usfm'), plainUsfm);
+  if (aiUstUsfm != null) {
+    const ustDir = path.join(tempDir, 'output', 'AI-UST', 'ISA');
+    fs.mkdirSync(ustDir, { recursive: true });
+    fs.writeFileSync(path.join(ustDir, 'ISA-53.usfm'), aiUstUsfm);
+  }
   const issuesRel = 'output/issues/ISA/ISA-53.tsv';
   fs.mkdirSync(path.join(tempDir, 'output', 'issues', 'ISA'), { recursive: true });
   fs.writeFileSync(path.join(tempDir, issuesRel), issuesTsv);
@@ -335,13 +340,15 @@ async function runCheckUltEditsFixture({ masterUsfm, alignedUsfm, plainUsfm, iss
   https.get = (url, callback) => {
     const { EventEmitter } = require('events');
     const response = new EventEmitter();
-    response.statusCode = 200;
+    const isUst = String(url).includes('/en_ust/');
+    response.statusCode = isUst && ustFetchStatus ? ustFetchStatus : 200;
     response.headers = {};
     response.setEncoding = () => {};
     response.resume = () => {};
     process.nextTick(() => {
       callback(response);
-      response.emit('data', masterUsfm);
+      if (response.statusCode !== 200) return;
+      response.emit('data', isUst ? (ustMasterUsfm != null ? ustMasterUsfm : '') : masterUsfm);
       response.emit('end');
     });
     return { on() { return this; } };
@@ -481,6 +488,95 @@ test('checkUltEdits caps the stale-quote ref list in the reason at 10 refs (#186
 
   assert.match(result.reason, /stale_issue_quotes: 12 GLQuote\(s\) not in master ULT \(53:1, 53:2, .*53:10, \+2 more\)$/);
   assert.equal(result.staleQuotes.length, 12);
+});
+
+// Issue #417: a UST-only edit must also route to post-edit-review, since
+// several issue rules depend on what the UST already makes clear.
+const ISA_53_UST_MASTER = [
+  '\\id ISA',
+  '\\c 53',
+  '\\q1',
+  '\\v 2 \\zaln-s |x-strong="c:H5927" x-content="וַ⁠יַּ֨עַל"\\*\\w The|x-occurrence="1" x-occurrences="1"\\w* \\w servant|x-occurrence="1" x-occurrences="1"\\w*\\zaln-e\\* \\w grew|x-occurrence="1" x-occurrences="1"\\w* \\w up|x-occurrence="1" x-occurrences="1"\\w*.',
+  '\\v 3 \\w People|x-occurrence="1" x-occurrences="1"\\w* \\w hated|x-occurrence="1" x-occurrences="1"\\w* \\w him|x-occurrence="1" x-occurrences="1"\\w*.',
+  '',
+].join('\n');
+
+const ISA_53_AI_UST = [
+  '\\id ISA',
+  '\\c 53',
+  '\\q1',
+  '\\v 2 The servant grew up.',
+  '\\v 3 People hated him.',
+  '',
+].join('\n');
+
+const ISA_53_ISSUES_OK = 'ISA\t53:3\tfigs-activepassive\tHe was despised\t\t\tpassive explanation\n';
+
+test('checkUltEdits routes a UST-only edit to post-edit-review with reason ust_diff (#417)', async () => {
+  const result = await runCheckUltEditsFixture({
+    masterUsfm: ISA_53_MASTER,
+    alignedUsfm: ISA_53_MASTER,
+    issuesTsv: ISA_53_ISSUES_OK,
+    ustMasterUsfm: ISA_53_UST_MASTER,
+    aiUstUsfm: ISA_53_AI_UST.replace('People hated him', 'Everyone hated him'),
+  });
+
+  assert.equal(result.hasEdits, true);
+  assert.equal(result.reason, 'ust_diff');
+  assert.deepEqual(result.staleQuotes, []);
+  assert.equal(result.masterPath, 'tmp/pipeline/ISA-53/ult_master_plain.usfm');
+});
+
+test('checkUltEdits reports no edits when both ULT and UST match master (#417)', async () => {
+  const result = await runCheckUltEditsFixture({
+    masterUsfm: ISA_53_MASTER,
+    alignedUsfm: ISA_53_MASTER,
+    issuesTsv: ISA_53_ISSUES_OK,
+    ustMasterUsfm: ISA_53_UST_MASTER,
+    aiUstUsfm: ISA_53_AI_UST,
+  });
+
+  assert.equal(result.hasEdits, false);
+  assert.equal(result.reason, null);
+  assert.equal(result.masterPath, null);
+});
+
+test('checkUltEdits reports both ult_diff and ust_diff when both texts changed (#417)', async () => {
+  const result = await runCheckUltEditsFixture({
+    masterUsfm: ISA_53_MASTER,
+    alignedUsfm: ISA_53_MASTER.replace('despised', 'rejected'),
+    issuesTsv: ISA_53_ISSUES_OK,
+    ustMasterUsfm: ISA_53_UST_MASTER,
+    aiUstUsfm: ISA_53_AI_UST.replace('People hated him', 'Everyone hated him'),
+  });
+
+  assert.equal(result.hasEdits, true);
+  assert.equal(result.reason, 'ult_diff; ust_diff');
+});
+
+test('checkUltEdits routes to post-edit-review when the master UST fetch fails (#417)', async () => {
+  const result = await runCheckUltEditsFixture({
+    masterUsfm: ISA_53_MASTER,
+    alignedUsfm: ISA_53_MASTER,
+    issuesTsv: ISA_53_ISSUES_OK,
+    aiUstUsfm: ISA_53_AI_UST,
+    ustFetchStatus: 500,
+  });
+
+  assert.equal(result.hasEdits, true);
+  assert.equal(result.reason, 'ust_fetch_failed');
+});
+
+test('checkUltEdits skips the UST comparison when the master UST lacks the chapter (#417)', async () => {
+  const result = await runCheckUltEditsFixture({
+    masterUsfm: ISA_53_MASTER,
+    alignedUsfm: ISA_53_MASTER,
+    issuesTsv: ISA_53_ISSUES_OK,
+    ustMasterUsfm: '\\id ISA\n\\c 52\n\\v 1 Wake up.\n',
+    aiUstUsfm: ISA_53_AI_UST,
+  });
+
+  assert.equal(result.hasEdits, false);
 });
 
 // Load check-ult-edits for its pure helpers without leaving it (and the

@@ -146,9 +146,10 @@ function findStaleIssueQuotes(issuesTsvText, masterChapterUsfm, chapter) {
 }
 
 /**
- * Compare the plain (pre-alignment) AI-ULT chapter with the master chapter,
- * verse by verse, ignoring USFM markers and whitespace. Used when the aligned
- * AI-ULT is unavailable; post-edit-review itself diffs the plain AI-ULT.
+ * Compare a plain (pre-alignment) AI chapter with the master chapter, verse by
+ * verse, ignoring USFM markers and whitespace. Used for the AI-ULT when the
+ * aligned file is unavailable, and always for the AI-UST (issue #417);
+ * post-edit-review itself diffs the plain AI texts.
  */
 function plainChapterDiffers(plainUsfm, masterChapterUsfm, chapter) {
   const prefix = Number(chapter) + ':';
@@ -182,7 +183,13 @@ function formatRefList(refs, max = 10) {
  *     (stale_issue_quotes). This catches issues written against older ULT
  *     wording even when the aligned file already matches master (issue #186);
  *   - neither the aligned nor the plain AI-ULT exists, so no diff is possible
- *     (aligned_missing / aligned_chapter_missing, plus plain_missing).
+ *     (aligned_missing / aligned_chapter_missing, plus plain_missing);
+ *   - the Door43 master UST chapter differs from the plain AI-UST (ust_diff).
+ *     Several issue rules depend on what the UST makes clear, so a UST-only
+ *     edit also needs review (issue #417). When the master UST cannot be
+ *     fetched the chapter is routed to review (ust_fetch_failed); when the
+ *     AI-UST file or the master UST chapter is missing, the UST is not compared.
+ *     Stale-GLQuote detection stays ULT-only (GLQuotes quote the ULT).
  *
  * @param {object} opts
  * @param {string} opts.book          - 3-letter book code (e.g. 'PSA')
@@ -202,7 +209,11 @@ async function checkUltEdits({ book, chapter, workspaceDir, pipeDir, issuesPath 
 
   const filename = num + '-' + bookUpper + '.usfm';
   const url = DOOR43_BASE + '/en_ult/raw/branch/master/' + filename;
-  const masterUsfm = await fetchText(url);
+  const ustUrl = DOOR43_BASE + '/en_ust/raw/branch/master/' + filename;
+  const [masterUsfm, ustFetch] = await Promise.all([
+    fetchText(url),
+    fetchText(ustUrl).then((text) => ({ text }), (error) => ({ error })),
+  ]);
 
   const masterChapter = extractChapter(masterUsfm, chapter);
   if (!masterChapter) {
@@ -239,6 +250,22 @@ async function checkUltEdits({ book, chapter, workspaceDir, pipeDir, issuesPath 
       const plainUsfm = fs.readFileSync(path.resolve(workspaceDir, plainRelPath), 'utf8');
       console.log('[check-ult-edits] ' + alignedProblem + ' — comparing plain AI-ULT ' + plainRelPath + ' against master instead');
       if (plainChapterDiffers(plainUsfm, masterChapter, chapter)) reasons.push('ult_diff_plain');
+    }
+  }
+
+  const ustName = 'output/AI-UST/' + bookUpper + '/' + bookUpper + '-' + chPadded + '.usfm';
+  const ustRelPath = resolveOutputFile(ustName, bookUpper);
+  if (!ustRelPath) {
+    console.log('[check-ult-edits] AI-UST not found (' + ustName + ') — skipping UST comparison');
+  } else if (ustFetch.error) {
+    console.warn('[check-ult-edits] Door43 master UST fetch failed (' + ustFetch.error.message + ') — routing to post-edit-review');
+    reasons.push('ust_fetch_failed');
+  } else {
+    const ustMasterChapter = extractChapter(ustFetch.text, chapter);
+    if (!ustMasterChapter) {
+      console.log('[check-ult-edits] Chapter ' + chapter + ' not in Door43 master UST for ' + bookUpper + ' — skipping UST comparison');
+    } else if (plainChapterDiffers(fs.readFileSync(path.resolve(workspaceDir, ustRelPath), 'utf8'), ustMasterChapter, chapter)) {
+      reasons.push('ust_diff');
     }
   }
 
