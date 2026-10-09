@@ -133,8 +133,10 @@ function isKeptRow(row, keptIds) {
 // Dedup keys for source rows against kept rows. A KEEP-tagged row claims its
 // (Reference, SupportReference); an editor-kept row claims only the same
 // (Reference, SupportReference, Quote), so a new note on a different phrase in
-// that verse still lands. Quotes compare through normalizeQuote, the same key
-// the prepared-notes pass uses.
+// that verse still lands. Quotes compare through normalizeQuote. This key stays
+// exact even though the prepared-notes pass also drops overlapping quotes
+// (#446): here it guards which en_tn rows a push deletes, not which notes get
+// written, so it must not widen.
 function getQuote(row) {
   const parts = row.split('\t');
   return parts.length > 4 ? normalizeQuote(parts[4]) : '';

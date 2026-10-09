@@ -22,7 +22,8 @@ const { fillTsvIds, generateIds, prepareNotes, fillOrigQuotes, resolveGlQuotes, 
 const { checkTnQuality, detectSelfTalk, templateFirstPhrase, resolveTemplateText } = require('./workspace-tools/quality-tools');
 const { buildBookRecurrenceIndex, deriveRecurrenceKeys, buildSeeHowSentence, isSeeHowEligible, isContextDependentSref, dedupeAlsoOccursVerses, assignAlsoOccursVerses, resolveDoor43ReposPath, hebTokens, verseNumber: recurrenceVerseNumber, SEE_HOW_NEVER_FOLD_SREFS, CROSS_BOOK_MAX_BOOKS } = require('./workspace-tools/recurrence-index');
 const { normalizeIssuesFile, buildParallelismIntroHintArgs } = require('./issue-normalizer');
-const { runIssueRulesGate, gatePrBodyForPush, refreshGateSidecarOutputHash } = require('./issue-rules-gate');
+const { runIssueRulesGate, gatePrBodyForPush, refreshGateSidecarOutputHash, readGateSidecar } = require('./issue-rules-gate');
+const { dropTwCoveredRows } = require('./tw-article-gate');
 const { curlyQuotes } = require('./workspace-tools/usfm-tools');
 const { verifyRepoPush, verifyDcsToken, verifyRemoteContent } = require('./repo-verify');
 const { recordMetrics, getCumulativeTokens, recordRunSummary, getAdaptiveSkillGuardrails } = require('./usage-tracker');
@@ -1957,6 +1958,24 @@ function mergeGapIssues({ chapterText, shardText, verses, chapter, book = '', kn
   return { text: lines.join(eol) + (trailing ? eol : ''), added: newRows.length };
 }
 
+// The --verses span runs from the first to the last empty verse, so it mostly
+// holds verses that already have issues. Without the target list the analysts
+// spend their rows there (thrown away by mergeGapIssues) and skip the empty
+// verses as "repeats": EZK 40 gap-fill over 8-47 kept 4 of 42 rows and left
+// 25-36 empty.
+function buildGapFillHint({ verses, issuesPath }) {
+  const list = verses.join(', ');
+  return DEEP_ISSUE_ID_HINT + '\n\n' +
+    `GAP-FILL RUN. Target verses: ${list}. The other verses in the --verses span are already covered (by rows ` +
+    `in ${issuesPath} or by editor-kept notes), and only rows for the target verses are kept; rows for any ` +
+    'other verse are discarded. Put the target verse list in every analyst and challenger prompt, and have ' +
+    'each analyst read every target verse closely. The skill\'s usual selectivity and challenger rules still ' +
+    `apply. The first-occurrence rule changes in one way: a phrase that already has a row in ${issuesPath} ` +
+    'with the same issue type is covered (the pipeline handles later occurrences), but a phrase with no such ' +
+    'row should be flagged in the first target verse where it occurs, even if an earlier non-target verse ' +
+    'has the same wording. A target verse may truly need no issue; do not invent one.';
+}
+
 async function fillIssueGaps({
   book, ch, issuesPath, contextPath, ctxFlag = '', ultPlainPath, pipeDir, model, status = async () => {},
   userId, runClaudeImpl = runClaude, recordMetricsImpl = recordMetrics, keptRefs = [],
@@ -2044,7 +2063,7 @@ async function fillIssueGaps({
         disableLocalSettings: true,
         timeoutMs,
         maxTurns: guardrails.maxTurns,
-        appendSystemPrompt: DEEP_ISSUE_ID_HINT,
+        appendSystemPrompt: buildGapFillHint({ verses: empty, issuesPath }),
         mcpToolSet: 'issue-id',
         guardrails,
         hooks: process.env.BP_GUARD_HOOKS === '1'
@@ -3338,6 +3357,19 @@ async function notesPipeline(route, message) {
     if (chOutputs['deep-issue-id']) issuesPath = chOutputs['deep-issue-id'];
     else if (chOutputs['post-edit-review']) issuesPath = chOutputs['post-edit-review'];
 
+    async function reportTwDrops(tw) {
+      if (!tw.ran) {
+        await status(`**${ref}**: tW article check skipped (${tw.reason}); rows left as they were`);
+        return;
+      }
+      if (!tw.dropped.length) return;
+      // A chapter the rules gate already sealed must not look edited to its next run.
+      refreshGateSidecarOutputHash({ issuesPath, book });
+      const list = tw.dropped.map((d) => `${d.ref} ${d.quote}`).join('; ');
+      console.log(`[notes] tw-article-gate ${ref}: dropped ${tw.dropped.length} translate-names/translate-unknown row(s) covered by a tW article: ${list}`);
+      await status(`**${ref}**: tW article check: dropped ${tw.dropped.length} translate-names/translate-unknown row(s) for terms with a tW article (${list})`);
+    }
+
     async function runIssueNormalizationStage() {
       if (!issuesPath || issueNormalizationDone) return;
 
@@ -3394,6 +3426,10 @@ async function notesPipeline(route, message) {
       issueNormalizationDone = true;
       let introSignal = result.introSignal;
 
+      // tW article check: translate-names / translate-unknown rows for terms that already
+      // have a tW article are dropped here, before the rules gate spends a model pass on them.
+      await reportTwDrops(dropTwCoveredRows({ issuesPath }));
+
       // Issue rules gate: once per chapter, after normalization. Skipped when
       // this chapter resumes at a downstream skill (the gate already ran, or
       // the chapter was past it).
@@ -3412,6 +3448,7 @@ async function notesPipeline(route, message) {
           verseEnd: hasVerseRange ? verseEnd : undefined,
           ctx: gateCtx,
           hints,
+          kept,
           config: config,
           env: process.env,
           dryRun: isDryRun,
@@ -3446,6 +3483,10 @@ async function notesPipeline(route, message) {
             `${c.declined ? `, declined ${c.declined}` : ''}` +
             `${gate.reportPath ? ` (${gate.reportPath})` : ''}`
           );
+          if (gate.keptDrops && gate.keptDrops.length) {
+            const lines = gate.keptDrops.map((d) => `- ${d.ref} ${d.sref} dropped: duplicates kept note ${d.kept}`);
+            await status(`**${ref}**: issue rows dropped as duplicates of kept notes:\n${lines.join('\n')}`);
+          }
         } else if (gate.reason === 'error') {
           await status(`**${ref}**: issue rules check failed (non-fatal, issues left unchanged): ${gate.error}`);
         } else {
@@ -3457,6 +3498,8 @@ async function notesPipeline(route, message) {
           }
         }
         if (gate.changed) {
+          // A relabel can produce a translate-names row; re-apply the tW article check.
+          await reportTwDrops(dropTwCoveredRows({ issuesPath }));
           const pass2 = normalizeIssuesFile({
             issuesPath,
             options: {
@@ -3607,9 +3650,16 @@ async function notesPipeline(route, message) {
                 kept,
                 chapter: ch,
               }).itemsRemoved;
+              // The gate's KEPT drops (this run's and earlier runs' still gone) happened
+              // earlier, on the issue list. When the gate did not run here (resume,
+              // already_applied, off), read the count from its sealed sidecar.
+              const gateKept = issueRulesGateResult && issueRulesGateResult.ran
+                ? (issueRulesGateResult.keptDropsTotal || 0)
+                : (readGateSidecar({ issuesPath, book })?.keptDropped || []).length;
               await status(
                 `**${ref}**: ${keptHere} kept notes from the editor will stay in place; ` +
-                `${dropped} AI notes dropped as duplicates of them`,
+                `${dropped + gateKept} AI notes dropped as duplicates of kept notes ` +
+                `(${dropped} exact/overlap, ${gateKept} judged by the rules gate)`,
               );
             } catch (keptErr) {
               console.error(`[notes] applyKeptToPreparedNotes failed: ${keptErr.message}`);
