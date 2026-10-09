@@ -3642,7 +3642,7 @@ async function notesPipeline(route, message) {
                 ? (issueRulesGateResult.keptDropsTotal || 0)
                 : (readGateSidecar({ issuesPath, book })?.keptDropped || []).length;
               // A new chapter intro (intro_rows) still has to be written and pushed.
-              allNotesKept = dropped + gateKept > 0 && keptResult.itemsRemaining === 0 && keptResult.introRows === 0;
+              allNotesKept = dropped > 0 && keptResult.itemsRemaining === 0 && keptResult.introRows === 0;
               await status(
                 `**${ref}**: ${keptHere} kept notes from the editor will stay in place; ` +
                 `${dropped + gateKept} AI notes dropped as duplicates of kept notes ` +
