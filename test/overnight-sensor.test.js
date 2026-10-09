@@ -178,6 +178,171 @@ test('enumerateUnits derives book+editor from PR files when head.ref is stripped
   assert.equal(merged[0].editor, 'pjoakes');
 });
 
+// --- bible-editor exports (closed, unmerged, squash-committed) ---------------
+function beExportGet(pr, commits) {
+  return async (p) => {
+    const repo = (p.match(/repos\/unfoldingWord\/([^/]+)\//) || [])[1];
+    if (/\/pulls\?/.test(p)) return { status: 200, data: repo === 'en_tn' && /page=1/.test(p) ? [pr] : [] };
+    if (/\/commits\?/.test(p)) return typeof commits === 'function' ? commits(p) : commits;
+    return { status: 200, data: [] };
+  };
+}
+const bePr = (over = {}) => ({
+  number: 7796, title: 'bible-editor: JER tn \u2192 master', state: 'closed', merged: false,
+  closed_at: '2026-06-23T10:00:00Z',
+  head: { ref: 'refs/pull/7796/head', sha: 'h', label: 'JER-be-justplainjane47-pjoakes-Grant_Ailie' },
+  base: { sha: 'b' }, user: { login: 'deferredreward' }, ...over,
+});
+const squash = (n) => ({ status: 200, data: [{ sha: `sq${n}`, parents: [{ sha: `p${n}` }], commit: { message: `bible-editor: JER tn \u2192 master (#${n})\n\nbody` } }] });
+const beMap = { justplainjane47: 'jane', pjoakes: 'pjoakes' };
+const beSince = '2026-06-20T00:00:00Z';
+
+test('enumerateUnits turns a closed unmerged bible-editor PR with a squash commit into a be-export unit', async () => {
+  const units = await watcher.enumerateUnits({ apiGetImpl: beExportGet(bePr(), squash(7796)), sinceIso: beSince, editorMap: beMap });
+  const be = units.filter((u) => u.kind === 'be-export');
+  assert.equal(be.length, 1);
+  assert.equal(be[0].book, 'JER');
+  assert.equal(be[0].resource, 'tn');
+  assert.equal(be[0].editor, 'Grant_Ailie,justplainjane47,pjoakes'); // every contributor, sorted case-insensitively
+  assert.deepEqual(be[0].editors, ['Grant_Ailie', 'justplainjane47', 'pjoakes']);
+  assert.equal(be[0].mergedAt, '2026-06-23T10:00:00Z');
+  // Diffed from the squash commit that landed and its parent, never pr.base/pr.head,
+  // which Gitea reports as today's branch tips.
+  assert.equal(be[0].baseSha, 'p7796');
+  assert.equal(be[0].headSha, 'sq7796');
+});
+
+test('enumerateUnits keeps a bible-editor export whose editors are missing from the editor map', async () => {
+  const pr = bePr({ head: { ref: 'refs/pull/7796/head', sha: 'h', label: 'EZK-be-bethoakes' }, title: 'bible-editor: EZK tn \u2192 master' });
+  const units = await watcher.enumerateUnits({ apiGetImpl: beExportGet(pr, squash(7796)), sinceIso: beSince, editorMap: {} });
+  const be = units.filter((u) => u.kind === 'be-export');
+  assert.equal(be.length, 1);
+  assert.equal(be[0].book, 'EZK');
+  assert.equal(be[0].editor, 'bethoakes');
+});
+
+test('enumerateUnits skips a -be-mechanical bible-editor export', async () => {
+  const pr = bePr({ head: { ref: 'refs/pull/7796/head', sha: 'h', label: 'JER-be-mechanical' } });
+  const units = await watcher.enumerateUnits({ apiGetImpl: beExportGet(pr, squash(7796)), sinceIso: beSince, editorMap: beMap });
+  assert.equal(units.filter((u) => u.kind === 'be-export').length, 0);
+});
+
+test('enumerateUnits skips a closed unmerged PR whose title is not a bible-editor export', async () => {
+  const units = await watcher.enumerateUnits({ apiGetImpl: beExportGet(bePr({ title: 'Fix typo' }), squash(7796)), sinceIso: beSince, editorMap: beMap });
+  assert.equal(units.filter((u) => u.kind === 'be-export').length, 0);
+});
+
+test('enumerateUnits skips a bible-editor export whose squash commit is not found', async () => {
+  const units = await watcher.enumerateUnits({ apiGetImpl: beExportGet(bePr(), squash(9999)), sinceIso: beSince, editorMap: beMap });
+  assert.equal(units.filter((u) => u.kind === 'be-export').length, 0);
+});
+
+test('enumerateUnits throws when the squash-commit lookup returns 500', async () => {
+  await assert.rejects(
+    () => watcher.enumerateUnits({ apiGetImpl: beExportGet(bePr(), { status: 500, data: {} }), sinceIso: beSince, editorMap: beMap }),
+    /commits query failed/,
+  );
+});
+
+test('be-export squash query is bounded by sha, path, since and until', async () => {
+  let q = null;
+  const commits = (p) => { q = p; return squash(7796); };
+  await watcher.enumerateUnits({ apiGetImpl: beExportGet(bePr(), commits), sinceIso: beSince, editorMap: beMap });
+  assert.ok(q);
+  assert.match(q, /sha=master/);
+  assert.ok(q.includes(`path=${encodeURIComponent('tn_JER.tsv')}`));
+  assert.ok(q.includes(`since=${encodeURIComponent('2026-06-23T08:00:00.000Z')}`));
+  assert.ok(q.includes(`until=${encodeURIComponent('2026-06-23T12:00:00.000Z')}`));
+});
+
+test('be-export subject match tolerates CRLF and trailing whitespace', async () => {
+  const commits = { status: 200, data: [{ sha: 'sq1', parents: [{ sha: 'p1' }], commit: { message: 'bible-editor: JER tn → master (#7796) \r\n\r\nbody' } }] };
+  const units = await watcher.enumerateUnits({ apiGetImpl: beExportGet(bePr(), commits), sinceIso: beSince, editorMap: beMap });
+  assert.equal(units.filter((u) => u.kind === 'be-export').length, 1);
+});
+
+test('enumerateUnits produces an en_ult be-export unit', async () => {
+  const pr = bePr({ title: 'bible-editor: JER ult → master', head: { ref: 'refs/pull/7796/head', sha: 'h', label: 'JER-be-pjoakes' } });
+  const get = async (p) => {
+    const repo = (p.match(/repos\/unfoldingWord\/([^/]+)\//) || [])[1];
+    if (/\/pulls\?/.test(p)) return { status: 200, data: repo === 'en_ult' && /page=1/.test(p) ? [pr] : [] };
+    if (/\/commits\?/.test(p)) return { status: 200, data: [{ sha: 'sqU', parents: [{ sha: 'pU' }], commit: { message: 'bible-editor: JER ult → master (#7796)' } }] };
+    return { status: 200, data: [] };
+  };
+  const units = await watcher.enumerateUnits({ apiGetImpl: get, sinceIso: beSince, editorMap: beMap });
+  const be = units.filter((u) => u.kind === 'be-export');
+  assert.equal(be.length, 1);
+  assert.equal(be[0].repo, 'en_ult');
+  assert.equal(be[0].resource, 'ult');
+  assert.equal(be[0].book, 'JER');
+  assert.equal(be[0].baseSha, 'pU');
+  assert.equal(be[0].headSha, 'sqU');
+});
+
+test('a closed PR older than sinceIso is skipped without any commits lookup', async () => {
+  const commits = () => { throw new Error('commits lookup must not happen'); };
+  const units = await watcher.enumerateUnits({ apiGetImpl: beExportGet(bePr({ closed_at: '2026-06-01T00:00:00Z' }), commits), sinceIso: beSince, editorMap: beMap });
+  assert.equal(units.length, 0);
+});
+
+test('a 404 on the squash-commits lookup skips the unit without throwing', async () => {
+  const units = await watcher.enumerateUnits({ apiGetImpl: beExportGet(bePr(), { status: 404, data: {} }), sinceIso: beSince, editorMap: beMap });
+  assert.equal(units.filter((u) => u.kind === 'be-export').length, 0);
+});
+
+test('a 404 on a merged PR\'s merge commit skips the unit (no fallback to live shas) without throwing', async () => {
+  const merged = { number: 5, merged: true, merged_at: '2026-06-23T10:00:00Z', merge_commit_sha: 'm5', head: { ref: 'PSA-be-pjoakes', sha: 'live-tip' }, base: { sha: 'live-master' }, user: { login: 'pjoakes' } };
+  const get = async (p) => (/\/git\/commits\//.test(p) ? { status: 404, data: {} } : beExportGet(merged, { status: 200, data: [] })(p));
+  const units = await watcher.enumerateUnits({ apiGetImpl: get, sinceIso: beSince, editorMap: beMap });
+  assert.equal(units.filter((u) => u.kind === 'merged-pr').length, 0);
+});
+
+test('a merge commit with no parents skips the merged-PR unit', async () => {
+  const merged = { number: 5, merged: true, merged_at: '2026-06-23T10:00:00Z', merge_commit_sha: 'm5', head: { ref: 'PSA-be-pjoakes', sha: 'live-tip' }, base: { sha: 'live-master' }, user: { login: 'pjoakes' } };
+  const get = async (p) => (/\/git\/commits\//.test(p) ? { status: 200, data: { sha: 'm5', parents: [] } } : beExportGet(merged, { status: 200, data: [] })(p));
+  const units = await watcher.enumerateUnits({ apiGetImpl: get, sinceIso: beSince, editorMap: beMap });
+  assert.equal(units.filter((u) => u.kind === 'merged-pr').length, 0);
+});
+
+test('unitKeyFor and reviewUnit use the landed commit pair for a be-export unit', async () => {
+  const u = { kind: 'be-export', repo: 'en_tn', resource: 'tn', book: 'JER', editor: 'a,b', editors: ['a', 'b'], prId: 7796, baseSha: 'p7796', headSha: 'sq7796' };
+  assert.equal(watcher.unitKeyFor(u), stateLib.prUnitKey('en_tn', 7796, 'sq7796'));
+  const urls = [];
+  const rows = await watcher.reviewUnit(u, { fetchTextImpl: async (url) => { urls.push(url); return TN_HEADER; } });
+  assert.deepEqual(rows, []);
+  assert.equal(urls.length, 2);
+  assert.ok(urls.some((x) => x.includes('commit/p7796')));
+  assert.ok(urls.some((x) => x.includes('commit/sq7796')));
+});
+
+test('enumerateUnits still handles merged PRs as merged-pr (not be-export)', async () => {
+  const merged = { number: 5, merged: true, merged_at: '2026-06-23T10:00:00Z', head: { ref: 'PSA-be-pjoakes', sha: 'h5' }, base: { sha: 'b5' }, user: { login: 'pjoakes' } };
+  const units = await watcher.enumerateUnits({ apiGetImpl: beExportGet(merged, () => { throw new Error('no commits lookup for merged PRs'); }), sinceIso: beSince, editorMap: beMap });
+  const prs = units.filter((u) => u.kind === 'merged-pr' || u.kind === 'be-export');
+  assert.equal(prs.length, 1);
+  assert.equal(prs[0].kind, 'merged-pr');
+  assert.equal(prs[0].editor, 'pjoakes');
+});
+
+test('enumerateUnits diffs a merged PR from its merge commit and that commit\'s parent', async () => {
+  const merged = { number: 5, merged: true, merged_at: '2026-06-23T10:00:00Z', merge_commit_sha: 'm5', head: { ref: 'PSA-be-pjoakes', sha: 'live-tip' }, base: { sha: 'live-master' }, user: { login: 'pjoakes' } };
+  const get = async (p) => {
+    if (/\/git\/commits\/m5$/.test(p)) return { status: 200, data: { sha: 'm5', parents: [{ sha: 'm5-parent' }] } };
+    return beExportGet(merged, { status: 200, data: [] })(p);
+  };
+  const units = await watcher.enumerateUnits({ apiGetImpl: get, sinceIso: beSince, editorMap: beMap });
+  const prs = units.filter((u) => u.kind === 'merged-pr');
+  assert.equal(prs.length, 1);
+  assert.equal(prs[0].baseSha, 'm5-parent');
+  assert.equal(prs[0].headSha, 'm5');
+});
+
+test('enumerateUnits throws when a merged PR\'s merge-commit lookup fails', async () => {
+  const merged = { number: 5, merged: true, merged_at: '2026-06-23T10:00:00Z', merge_commit_sha: 'm5', head: { ref: 'PSA-be-pjoakes', sha: 'h' }, base: { sha: 'b' }, user: { login: 'pjoakes' } };
+  const get = async (p) => (/\/git\/commits\//.test(p) ? { status: 502, data: {} } : beExportGet(merged, { status: 200, data: [] })(p));
+  await assert.rejects(() => watcher.enumerateUnits({ apiGetImpl: get, sinceIso: beSince, editorMap: beMap }), /commit query failed/);
+});
+
 test('runOvernightReview throws on a non-200 pulls response (does not silently advance state)', async () => {
   const badGet = async (p) => (/\/pulls\?/.test(p) ? { status: 403, data: { message: 'forbidden' } } : { status: 200, data: [] });
   await assert.rejects(
