@@ -118,6 +118,7 @@ async function runHarness({ items, introRows = [] }) {
     runIssueRulesGate: async () => ({ ran: false, reason: 'mode_off' }),
     gatePrBodyForPush: () => '',
     refreshGateSidecarOutputHash: () => {},
+    readGateSidecar: () => null,
   });
   stub('workspace-tools/tn-tools', {
     ...realTnTools,
