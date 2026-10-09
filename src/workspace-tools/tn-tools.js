@@ -1531,10 +1531,11 @@ function isVerseNoteRef(ref) {
   return !!r && !/:(intro|front)$/i.test(r) && !/^front:/i.test(r);
 }
 
-// "36:9" -> ["36:9"]; "36:9-10" -> ["36:9","36:10"]. Unparseable refs map to themselves.
+// "36:9" -> ["36:9"]; "36:9-10" -> ["36:9","36:10"]. A leading book code
+// ("JER 36:9", as the dry-run writer emits) is dropped. Unparseable refs map to themselves.
 function expandVerseRef(ref) {
   const r = String(ref || '').trim();
-  const m = r.match(/^(\d+):(\d+)(?:-(\d+))?$/);
+  const m = r.match(/^(?:[A-Za-z0-9]+\s+)?(\d+):(\d+)(?:-(\d+))?$/);
   if (!m) return [r];
   const ch = parseInt(m[1], 10);
   const a = parseInt(m[2], 10);
@@ -1553,8 +1554,15 @@ function siblingPreparedJson(generatedJson) {
   return g.replace(/generated_notes\.json$/, 'prepared_notes.json');
 }
 
-function lastRowRefusal(id, ref, where) {
-  return `remove_note: REFUSED — id "${id}" is the only note left for ${ref} in ${where}; ` +
+// Verses of `ref` that no ref in `otherRefs` covers (removing `ref`'s note would empty them).
+function versesLeftEmpty(ref, otherRefs) {
+  const covered = new Set();
+  for (const o of otherRefs) for (const v of expandVerseRef(o)) covered.add(v);
+  return expandVerseRef(ref).filter((v) => !covered.has(v));
+}
+
+function lastRowRefusal(id, ref, where, empty) {
+  return `remove_note: REFUSED — id "${id}" is the only note left for ${empty.join(', ')} (its reference is ${ref}) in ${where}; ` +
     'removing it would ship that verse with no note, which editors read as a skipped section. No change made. ' +
     'If the note is weak, improve it with update_note_text instead of removing it.';
 }
@@ -1568,6 +1576,7 @@ function removeNote({ id, generatedJson, tsvFile, preparedJson }) {
   // redundant note, never for emptying a verse.
   let gen = null;
   let genPath = null;
+  let verified = false; // did any guard actually check verse coverage?
   if (generatedJson) {
     genPath = path.resolve(CSKILLBP_DIR, generatedJson);
     gen = JSON.parse(fs.readFileSync(genPath, 'utf8'));
@@ -1579,11 +1588,11 @@ function removeNote({ id, generatedJson, tsvFile, preparedJson }) {
         try { items = JSON.parse(fs.readFileSync(prepPath, 'utf8')).items || []; } catch (_) { items = []; }
         const target = items.find((it) => it && it.id === id);
         if (target && isVerseNoteRef(target.reference)) {
-          const verses = new Set(expandVerseRef(target.reference));
+          verified = true;
           const others = items.filter((it) => it && it.id && it.id !== id
-            && String(gen[it.id] || '').trim()
-            && expandVerseRef(it.reference).some((v) => verses.has(v)));
-          if (others.length === 0) return lastRowRefusal(id, target.reference, generatedJson);
+            && String(gen[it.id] || '').trim() && isVerseNoteRef(it.reference));
+          const empty = versesLeftEmpty(target.reference, others.map((it) => it.reference));
+          if (empty.length) return lastRowRefusal(id, String(target.reference).trim(), generatedJson, empty);
         }
       }
     }
@@ -1594,20 +1603,22 @@ function removeNote({ id, generatedJson, tsvFile, preparedJson }) {
     tp = path.resolve(CSKILLBP_DIR, tsvFile);
     lines = fs.readFileSync(tp, 'utf8').split('\n');
     const rows = lines.slice(1).filter((l) => l.trim() !== '').map((l) => l.split('\t'));
+    verified = true;
     for (const cols of rows) {
       if (cols[1] !== id || !isVerseNoteRef(cols[0])) continue;
-      const verses = new Set(expandVerseRef(cols[0]));
-      const others = rows.filter((c) => c[1] !== id && isVerseNoteRef(c[0])
-        && expandVerseRef(c[0]).some((v) => verses.has(v)));
-      if (others.length === 0) return lastRowRefusal(id, cols[0].trim(), tsvFile);
+      const others = rows.filter((c) => c[1] !== id && isVerseNoteRef(c[0])).map((c) => c[0]);
+      const empty = versesLeftEmpty(cols[0], others);
+      if (empty.length) return lastRowRefusal(id, cols[0].trim(), tsvFile, empty);
     }
   }
 
   // --- Apply pass.
   const msgs = [];
+  let removedFromGen = false;
   if (gen) {
     if (Object.prototype.hasOwnProperty.call(gen, id)) {
       delete gen[id];
+      removedFromGen = true;
       fs.writeFileSync(genPath, JSON.stringify(gen, null, 2) + '\n');
       msgs.push(`removed id "${id}" from ${generatedJson}`);
     } else {
@@ -1625,12 +1636,14 @@ function removeNote({ id, generatedJson, tsvFile, preparedJson }) {
     fs.writeFileSync(tp, kept.join('\n'));
     msgs.push(`removed ${removed} row(s) with id "${id}" from ${tsvFile}`);
   }
-  return `remove_note: ${msgs.join('; ')}.`;
+  const unverified = (verified || !removedFromGen) ? '' :
+    ' WARNING: verse coverage was not checked (no prepared_notes.json entry for this id and no tsvFile given); confirm the verse still has a note.';
+  return `remove_note: ${msgs.join('; ')}.${unverified}`;
 }
 
-// Verses that have at least one prepared item but no verse row in the notes
-// TSV. Returns prepared references (sorted, de-duplicated) that ended up with
-// no note at all. Missing files yield [] (nothing to compare).
+// Verses that a prepared item names but that no verse row in the notes TSV
+// covers (a range item or row counts verse by verse). Returns the verses
+// ("36:9"), sorted and de-duplicated, that ended up with no note at all. Missing files yield [] (nothing to compare).
 function findVersesWithoutNotes({ preparedJson, notesPath }) {
   if (!preparedJson || !notesPath) return [];
   const prepPath = path.resolve(CSKILLBP_DIR, preparedJson);
@@ -1649,8 +1662,7 @@ function findVersesWithoutNotes({ preparedJson, notesPath }) {
   const lost = new Set();
   for (const it of items) {
     if (!it || !isVerseNoteRef(it.reference)) continue;
-    const ref = String(it.reference).trim();
-    if (!expandVerseRef(ref).some((v) => covered.has(v))) lost.add(ref);
+    for (const v of expandVerseRef(it.reference)) if (!covered.has(v)) lost.add(v);
   }
   const key = (r) => { const m = r.match(/^(\d+):(\d+)/); return m ? [parseInt(m[1], 10), parseInt(m[2], 10)] : [1e9, 1e9]; };
   return [...lost].sort((a, b) => { const ka = key(a); const kb = key(b); return ka[0] - kb[0] || ka[1] - kb[1] || a.localeCompare(b); });

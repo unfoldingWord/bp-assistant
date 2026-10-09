@@ -164,3 +164,47 @@ test('findVersesWithoutNotes names verses whose prepared items all lost their ro
 test('findVersesWithoutNotes returns [] when files are missing', () => {
   assert.deepEqual(findVersesWithoutNotes({ preparedJson: 'nope.json', notesPath: 'nope.tsv' }), []);
 });
+
+// --- #447 review follow-ups: coverage is per verse, not per overlapping row ---
+
+test('removeNote refuses to remove a bridge note when one of its verses would be left empty (TSV)', () => {
+  const tsv = 'bridge.tsv';
+  fs.writeFileSync(path.join(WORK, tsv), HDR +
+    '5:3\tab1c\t\t\tQ\t1\ta\n' +
+    '5:3-4\tde2f\t\t\tQ\t1\tb\n');
+  const before = fs.readFileSync(path.join(WORK, tsv), 'utf8');
+  const out = removeNote({ id: 'de2f', tsvFile: tsv });
+  assert.match(out, /REFUSED/);
+  assert.match(out, /5:4/);
+  assert.equal(fs.readFileSync(path.join(WORK, tsv), 'utf8'), before);
+});
+
+test('removeNote refuses to remove a bridge note when one of its verses would be left empty (generated JSON)', () => {
+  writeJson('bridge/prepared_notes.json', { items: [
+    { id: 'ab1c', reference: '5:3' }, { id: 'de2f', reference: '5:3-4' },
+  ] });
+  const gen = writeJson('bridge/generated_notes.json', { ab1c: 'a', de2f: 'b' });
+  assert.match(removeNote({ id: 'de2f', generatedJson: gen }), /REFUSED[\s\S]*5:4/);
+  assert.deepEqual(readJson(gen), { ab1c: 'a', de2f: 'b' });
+});
+
+test('removeNote warns when nothing could check verse coverage', () => {
+  const gen = writeJson('noprep/generated_notes.json', { ab1c: 'a', de2f: 'b' });
+  const out = removeNote({ id: 'ab1c', generatedJson: gen });
+  assert.match(out, /removed id "ab1c"/);
+  assert.match(out, /WARNING: verse coverage was not checked/);
+});
+
+test('findVersesWithoutNotes reports each lost verse of a ranged prepared item', () => {
+  const prep = writeJson('range/prepared_notes.json', { items: [{ id: 'ab1c', reference: '36:9-10' }] });
+  const tsv = 'range-cov.tsv';
+  fs.writeFileSync(path.join(WORK, tsv), HDR + '36:9\tab1c\t\t\tQ\t1\ta\n');
+  assert.deepEqual(findVersesWithoutNotes({ preparedJson: prep, notesPath: tsv }), ['36:10']);
+});
+
+test('findVersesWithoutNotes ignores a book-code prefix on TSV references (dry-run writer)', () => {
+  const prep = writeJson('dry/prepared_notes.json', { items: [{ id: 'ab1c', reference: '36:9' }] });
+  const tsv = 'dry.tsv';
+  fs.writeFileSync(path.join(WORK, tsv), HDR + 'JER 36:9\t\t\t\t\t1\t[Stub note for dry run]\n');
+  assert.deepEqual(findVersesWithoutNotes({ preparedJson: prep, notesPath: tsv }), []);
+});
