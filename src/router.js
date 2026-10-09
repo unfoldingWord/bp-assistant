@@ -558,7 +558,7 @@ function parseCurateCommand(content) {
   const t = String(content || '').trim().toLowerCase();
   const force = t.includes('force') || t.includes('setup');
   // "update data check" / "curate data fetch-door43" / "setup data"
-  const stepMatch = t.match(/\b(check|setup|fetch-door43|fetch-google|extract-english|resolve-quotes|build-indexes)\b/);
+  const stepMatch = t.match(/\b(check|setup|fetch-door43|fetch-google|fetch-tw|extract-english|resolve-quotes|build-indexes)\b/);
   return { step: stepMatch ? stepMatch[1] : null, force };
 }
 
