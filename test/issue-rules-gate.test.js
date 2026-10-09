@@ -1250,3 +1250,79 @@ test('insertRowLines places a row after its verse, or before the first data row'
     assert.deepEqual(out, [LINES[0], LINES[1], LINES[3], LINES[4], LINES[6], LINES[8], 'JER\t4:1\tfigs-idiom\tx\t\t\ty', '']);
   });
 });
+
+// --- Unknown kept list is not an empty one, and identical rows are counted (#448) ---
+
+test('kept notes (#448): no kept list (undefined or null) restores nothing and leaves the sidecar entries alone', async () => {
+  for (const unknown of [undefined, null]) {
+    await ws(async ({ run, read, dir }) => {
+      await dropRow6AsKept(run);
+      const after = read();
+      const res = await run({ runClaudeImpl: fakeRunner(), kept: unknown, config: DEFAULTS });
+      assert.equal(read(), after, 'the dropped row stays dropped');
+      assert.deepEqual(res.keptRestored, []);
+      assert.equal(res.keptDropsTotal, 1, 'the earlier drop still counts as justified');
+      assert.deepEqual(sidecarOf(dir, res).keptDropped.map((d) => [d.line, d.kept]), [[LINES[6], 'hk52']]);
+      // A later run that does supply a list lacking the note restores it.
+      const later = await run({ runClaudeImpl: fakeRunner(), kept: [KEPT[1]], config: DEFAULTS });
+      assert.deepEqual(later.keptRestored, [{ ref: '3:3', sref: 'figs-explicit', kept: 'hk52' }]);
+      assert.ok(read().includes(LINES[6]));
+    }, { rules: G_RULES });
+  }
+});
+
+test('kept notes (#448): a supplied empty list restores every dropped row; a list that still has the note restores none', async () => {
+  await ws(async ({ run, read }) => {
+    await dropRow6AsKept(run);
+    const res = await run({ runClaudeImpl: fakeRunner(), kept: [], config: DEFAULTS });
+    assert.deepEqual(res.keptRestored, [{ ref: '3:3', sref: 'figs-explicit', kept: 'hk52' }]);
+    assert.equal(read().split('\n').filter((l) => l === LINES[6]).length, 1);
+  }, { rules: G_RULES });
+  await ws(async ({ run, read, dir }) => {
+    await dropRow6AsKept(run);
+    const after = read();
+    const res = await run({ runClaudeImpl: fakeRunner(), kept: KEPT, config: DEFAULTS });
+    assert.equal(read(), after);
+    assert.deepEqual(res.keptRestored, []);
+    assert.equal(sidecarOf(dir, res).keptDropped.length, 1);
+  }, { rules: G_RULES });
+});
+
+test('kept notes (#448): identical issue rows dropped for one kept note all come back, none is lost', async () => {
+  const dup = [...LINES.slice(0, 7), LINES[6], ...LINES.slice(7)];
+  assert.equal(dup[6], dup[7]);
+  await ws(async ({ run, read, dir }) => {
+    const first = await run({
+      runClaudeImpl: fakeRunner({ overrides: { 6: { action: 'drop', rule: 'KEPT', kept: 'hk52' }, 7: { action: 'drop', rule: 'KEPT', kept: 'hk52' } } }),
+      kept: KEPT, config: DEFAULTS,
+    });
+    assert.equal(read().split('\n').filter((l) => l === LINES[6]).length, 0);
+    assert.equal(sidecarOf(dir, first).keptDropped.length, 2);
+    // Unknown list: both stay dropped and both stay listed.
+    const unknown = await run({ runClaudeImpl: fakeRunner(), config: DEFAULTS });
+    assert.equal(unknown.keptDropsTotal, 2);
+    assert.equal(sidecarOf(dir, unknown).keptDropped.length, 2);
+    const res = await run({ runClaudeImpl: fakeRunner(), kept: [KEPT[1]], config: DEFAULTS });
+    assert.equal(res.keptRestored.length, 2);
+    assert.equal(read().split('\n').filter((l) => l === LINES[6]).length, 2);
+    assert.ok(!('keptDropped' in sidecarOf(dir, res)));
+  }, { rules: G_RULES, lines: dup });
+  // One of the two identical rows was dropped; the other is still in the file.
+  await ws(async ({ run, read, dir }) => {
+    await run({ runClaudeImpl: fakeRunner({ overrides: { 7: { action: 'drop', rule: 'KEPT', kept: 'hk52' } } }), kept: KEPT, config: DEFAULTS });
+    assert.equal(read().split('\n').filter((l) => l === LINES[6]).length, 1);
+    const res = await run({ runClaudeImpl: fakeRunner(), kept: [KEPT[1]], config: DEFAULTS });
+    assert.equal(res.keptRestored.length, 1);
+    assert.equal(read().split('\n').filter((l) => l === LINES[6]).length, 2, 'the dropped copy is back');
+    assert.ok(!('keptDropped' in sidecarOf(dir, res)));
+  }, { rules: G_RULES, lines: dup });
+});
+
+test('kept notes (#448): a verse-range run does not carry an out-of-range entry whose row a producer already wrote back', async () => {
+  await ws(async ({ run, abs }) => {
+    await dropRow6AsKept(run);
+    fs.writeFileSync(abs, FILE_TEXT);
+    const res = await run({ runClaudeImpl: fakeRunner(), kept: [KEPT[1]], config: DEFAULTS, verseStart: 4, verseEnd: 5 });
+    assert.ok(!('keptDropped' in sidecarOf(path.dirname(path.dirname(path.dirname(abs))), res)));
+  }, { rules: G_RULES });
+});

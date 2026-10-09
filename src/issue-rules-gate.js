@@ -901,8 +901,13 @@ async function runIssueRulesGate({ issuesPath, book, chapter, verseStart, verseE
     }
     // A KEPT drop stays justified while its kept note is still kept and still
     // touches the dropped row's verses; removed or moved off, it is not.
+    // Only a caller that positively supplied a kept list (even an empty one) can say a
+    // kept note is gone. No list at all (a Zulip run, a resume that lost it) means the
+    // editor's notes are unknown: every earlier KEPT drop stays justified and untouched.
+    const keptKnown = Array.isArray(kept);
     const keptNow = new Map(chapterKept.map((k) => [k.rowId, k]));
     const stillCovered = (d) => {
+      if (!keptKnown) return true;
       const k = keptNow.get(d.kept);
       return !!k && dropOverlapsSpan(d, k.span);
     };
@@ -926,17 +931,29 @@ async function runIssueRulesGate({ issuesPath, book, chapter, verseStart, verseE
     // scope) and not in the current rows, so a producer rerun that wrote it back earns
     // nothing and is not restored twice.
     const preText = readIfExists(preAbs);
-    const preLines = new Set(preText ? dataRows(markOutOfScope(parseIssuesTsv(preText), chapter, range)).map(rowToLine) : []);
+    const lineCounts = (rowList) => {
+      const m = new Map();
+      for (const r of dataRows(rowList)) { const l = rowToLine(r); m.set(l, (m.get(l) || 0) + 1); }
+      return m;
+    };
+    const preCounts = lineCounts(preText ? markOutOfScope(parseIssuesTsv(preText), chapter, range) : []);
     const originalRows = markOutOfScope(parseIssuesTsv(originalText), chapter, range);
-    const originalLines = new Set(dataRows(originalRows).map(rowToLine));
-    const gone = priorKeptDropped.filter((d, i, all) => preLines.has(d.line) && !originalLines.has(d.line)
-      && all.findIndex((o) => o.line === d.line) === i);
+    const originalCounts = lineCounts(originalRows);
+    // Identical rows are counted, not collapsed: of the sidecar entries for one line,
+    // as many are gone as the file now has fewer copies than the first pre-gate list.
+    const gone = [];
+    const goneByLine = new Map();
+    for (const d of priorKeptDropped) {
+      const missing = (preCounts.get(d.line) || 0) - (originalCounts.get(d.line) || 0);
+      const taken = goneByLine.get(d.line) || 0;
+      if (taken < missing) { gone.push(d); goneByLine.set(d.line, taken + 1); }
+    }
     // #448: a row dropped as the duplicate of a kept note the editor has since removed
     // (or moved off the row's verses) goes back at its verse, so the note it duplicated is not simply lost. It is put
     // back before the model review, so this run checks it like any other row. A
     // protected row (hinted verse, protected sref) stays out and stays listed.
     const toRestore = gone.filter((d) => !stillCovered(d) && !isProtected(parseIssuesTsv(d.line)[0]));
-    const restoredLines = new Set(toRestore.map((d) => d.line));
+    const restoredEntries = new Set(toRestore);
     const workText = toRestore.length ? insertRowLines(originalText, toRestore.map((d) => d.line)) : originalText;
     const rows = markOutOfScope(parseIssuesTsv(workText), chapter, range);
     for (const r of rows) {
@@ -1084,11 +1101,17 @@ async function runIssueRulesGate({ issuesPath, book, chapter, verseStart, verseE
     // either, while their kept note still covers them (`gone` is computed above). A
     // restored row is back in `rows`, so the shrink no longer counts it.
     const stillGone = gone.filter(stillCovered);
-    const pendingGone = gone.filter((d) => !stillCovered(d) && !restoredLines.has(d.line));
+    const pendingGone = gone.filter((d) => !stillCovered(d) && !restoredEntries.has(d));
     // A verse-range run rewrites the sidecar, so entries outside its range are carried as they are.
+    // An entry whose row a producer rerun has since written back is stale and is not carried.
+    const fileCounts = lineCounts(parseIssuesTsv(originalText));
+    const carriedByLine = new Map();
     const outOfScope = priorKeptDropped.filter((d) => {
       const r = parseIssuesTsv(d.line)[0];
-      return r && !r.passthrough && markOutOfScope([r], chapter, range)[0].passthrough;
+      if (!(r && !r.passthrough && markOutOfScope([r], chapter, range)[0].passthrough)) return false;
+      const seen = (carriedByLine.get(d.line) || 0) + 1;
+      carriedByLine.set(d.line, seen);
+      return seen > (fileCounts.get(d.line) || 0);
     });
     const shrink = priorDropState(preText, rows, { chapter, range, isProtected });
     const priorDrops = Math.max(0, shrink.priorDrops - stillGone.length);
@@ -1108,6 +1131,7 @@ async function runIssueRulesGate({ issuesPath, book, chapter, verseStart, verseE
     result.keptDrops = applied.keptDrops.map((c) => ({ ref: c.ref, sref: c.sref, kept: c.kept, quote: c.before }));
     result.keptDropsTotal = stillGone.length + applied.keptDrops.length;
     notes.push(...applied.notes);
+    if (!keptKnown && stillGone.length) notes.push(`kept_list_unknown:${stillGone.length} earlier KEPT drops left as they are`);
     // A restore is a change too, but like every change it waits for a fully answered run.
     const restoring = incomplete === 0 ? toRestore : [];
     for (const d of restoring) notes.push(`kept_restored:${d.ref}:${d.sref}:kept note ${d.kept} no longer covers it`);

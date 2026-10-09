@@ -2595,8 +2595,10 @@ function buildParsedNotesRequest(route, content) {
       // Zulip-triggered runs fall through to parseWriteNotesCommand and
       // never carry hints.
       hints: Array.isArray(route._hints) && route._hints.length > 0 ? route._hints : null,
-      // Editor-kept notes (API-origin only), same reasoning as hints.
-      kept: Array.isArray(route._kept) && route._kept.length > 0 ? route._kept : null,
+      // Editor-kept notes (API-origin only), same reasoning as hints. An empty
+      // array stays an array: "the editor has no kept notes" is a different fact
+      // from null, "no list was supplied" (Zulip runs, a bare resume).
+      kept: Array.isArray(route._kept) ? route._kept : null,
     };
   }
   return parseWriteNotesCommand(content);
@@ -3187,17 +3189,19 @@ async function notesPipeline(route, message) {
   // A resume that arrives without the kept list (a bare "resume" in the topic
   // rebuilds the route from the checkpoint) reuses the list the run started
   // with; otherwise a whole-chapter replace would delete the kept rows.
-  if (!kept && resumingFromCheckpoint && Array.isArray(existingCheckpoint?.kept) && existingCheckpoint.kept.length > 0) {
+  // The checkpoint keeps an empty list as [] and "never supplied" as null, so a
+  // resume restores exactly what the run started with.
+  if (kept == null && resumingFromCheckpoint && Array.isArray(existingCheckpoint?.kept)) {
     kept = existingCheckpoint.kept;
     keptIds = kept.map((k) => k.rowId);
-    await status(`Using the ${kept.length} kept notes saved with this run's checkpoint.`);
+    if (kept.length > 0) await status(`Using the ${kept.length} kept notes saved with this run's checkpoint.`);
   }
   setCheckpoint(checkpointRef, {
     state: 'running',
     totalSuccess,
     totalFail,
     skillOutputs,
-    kept: kept || null,
+    kept: Array.isArray(kept) ? kept : null,
     resume: { chapter: resumeChapter, skill: resumeSkill, ...(resumeGatePending && resumingFromCheckpoint ? { gatePending: true } : {}) },
   });
 
