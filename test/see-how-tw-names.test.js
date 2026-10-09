@@ -44,18 +44,19 @@ const verseBoth = () => `${aligned(AHAZ_STRONG, AHAZ, 'Ahaz')} ${aligned(REZIN_S
 const ALIGNED_ISA = [
   '\\id ISA',
   '\\c 7', '\\p', `\\v 1 ${verseBoth()}`,
-  '\\c 9', '\\p', `\\v 4 ${verseBoth()}`,
+  '\\c 9', '\\p', `\\v 1 ${aligned(AHAZ_STRONG, AHAZ, 'Ahaz')}`, `\\v 4 ${verseBoth()}`,
   '',
 ].join('\n');
 const uhbWord = (w, s) => `\\w ${w}|lemma="l" strong="${s}"\\w*`;
 const UHB_ISA = [
   '\\id ISA',
   '\\c 7', `\\v 1 ${uhbWord(AHAZ, AHAZ_STRONG)} ${uhbWord(REZIN, REZIN_STRONG)}`,
-  '\\c 9', `\\v 4 ${uhbWord(AHAZ, AHAZ_STRONG)} ${uhbWord(REZIN, REZIN_STRONG)}`,
+  '\\c 9', `\\v 1 ${uhbWord(AHAZ, AHAZ_STRONG)}`, `\\v 4 ${uhbWord(AHAZ, AHAZ_STRONG)} ${uhbWord(REZIN, REZIN_STRONG)}`,
   '',
 ].join('\n');
 const ALIGNMENT_DATA = {
   '7:1': [{ heb: AHAZ, strong: AHAZ_STRONG, eng: 'Ahaz' }, { heb: REZIN, strong: REZIN_STRONG, eng: 'Rezin' }],
+  '9:1': [{ heb: AHAZ, strong: AHAZ_STRONG, eng: 'Ahaz' }],
   '9:4': [{ heb: AHAZ, strong: AHAZ_STRONG, eng: 'Ahaz' }, { heb: REZIN, strong: REZIN_STRONG, eng: 'Rezin' }],
 };
 
@@ -163,15 +164,16 @@ test('T4: a note that also names someone without an article keeps its pointer', 
   assert.equal(targets.length, 2, 'Ahaz is kept because its note also explains Rezin');
 });
 
-test('T5: a tW name whose issue hint says it is a different person keeps its pointer', async () => {
+test('T5: a tW name whose issue hint says it is a different person keeps its own full note', async () => {
   writeHeadwords();
   const { items } = await run([
     nameItem({ id: 'ahz1', explanation: 'a different person from King Ahaz' }),
   ]);
 
   const ahaz = items.find((it) => it.id === 'ahz1');
-  assert.equal(ahaz.note_type, 'see_how', 'same exception dropTwCoveredRows applies');
-  assert.equal(ahaz.see_how_target, '7:1');
+  assert.equal(ahaz.note_type, 'given_at', 'the gate kept this row for the writer, so no pointer replaces it');
+  assert.equal(ahaz.programmatic_note, undefined);
+  assert.equal(ahaz.see_how_target, undefined);
 });
 
 test('T5b: the same item without the hint is still not rewritten', async () => {
@@ -194,4 +196,36 @@ test('T6: an earlier note with no bold name is judged by this chapter\'s English
   assert.equal(targets.length, 1, 'Ahaz (tW article) skipped, Rezin (none) injected');
   assert.equal(targets[0].orig_quote, REZIN);
   assert.match(summary, /1 skipped \(tW name\)/);
+});
+
+test('T7: in a group, only the keep-hinted item keeps its own note; the normal one gets no pointer', async () => {
+  writeHeadwords();
+  const { items, summary } = await run([
+    nameItem({ id: 'ahz1', reference: '9:1', explanation: 'name of a man' }),
+    nameItem({ id: 'ahz4', index: 1, reference: '9:4', explanation: 'a different person from King Ahaz' }),
+  ]);
+
+  const v1 = items.find((it) => it.id === 'ahz1');
+  assert.ok(v1, 'the normal item stays as its own note');
+  assert.equal(v1.note_type, 'given_at', 'suppressed: no pointer for a tW-covered name');
+  assert.equal(v1.see_how_target, undefined);
+
+  const v4 = items.find((it) => it.id === 'ahz4');
+  assert.ok(v4, 'the keep-hinted item is not folded away');
+  assert.equal(v4.note_type, 'given_at', 'and is not replaced by a pointer');
+  assert.equal(v4.programmatic_note, undefined);
+  assert.equal(v4.see_how_target, undefined);
+  assert.ok(!items.some((it) => it.injected_see_how && it.orig_quote === AHAZ), 'no Ahaz pointer injected');
+  assert.match(summary, /1 skipped \(tW name\)/);
+});
+
+test('T8: a keep hint on a name without a tW article does not change its pointer', async () => {
+  writeHeadwords();
+  const { items } = await run([
+    nameItem({ id: 'rzn1', orig_quote: REZIN, gl_quote: 'Rezin', issue_span_gl_quote: 'Rezin', explanation: 'a different person from the king' }),
+  ]);
+
+  const rezin = items.find((it) => it.id === 'rzn1');
+  assert.equal(rezin.note_type, 'see_how');
+  assert.equal(rezin.see_how_target, '7:1');
 });

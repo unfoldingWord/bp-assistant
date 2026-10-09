@@ -631,10 +631,7 @@ async function runSeeHowDetection({ pipeDir, contextPath, generateIdsFn = genera
   // of the phrase (`glQuote`). If the headwords cannot be read, the pointer is kept,
   // as before this check existed.
   const twNameMemo = new Map();
-  const pointsToTwCoveredName = (target, glQuote = '') => {
-    if (!target || twRuleFor(target.sref) !== 'names') return false;
-    const bolds = [...String(target.note || '').matchAll(/\*\*([^*]+)\*\*/g)].map((m) => m[1].trim()).join(', ');
-    const english = twQuoteWords(bolds).length ? bolds : String(glQuote || '').trim();
+  const isTwCoveredEnglish = (english) => {
     if (!english) return false;
     if (!twNameMemo.has(english)) {
       let covered = false;
@@ -645,6 +642,18 @@ async function runSeeHowDetection({ pipeDir, contextPath, generateIdsFn = genera
     }
     return twNameMemo.get(english);
   };
+  const pointsToTwCoveredName = (target, glQuote = '') => {
+    if (!target || twRuleFor(target.sref) !== 'names') return false;
+    const bolds = [...String(target.note || '').matchAll(/\*\*([^*]+)\*\*/g)].map((m) => m[1].trim()).join(', ');
+    return isTwCoveredEnglish(twQuoteWords(bolds).length ? bolds : String(glQuote || '').trim());
+  };
+  // A translate-names item on a tW-covered name that the issue hint marks as a
+  // different person: the gate kept its row (hasKeepHint), so it keeps its own full
+  // note here too. It is never folded into a pointer or a group lead, and never
+  // rewritten into a pointer, even when the rest of its group is suppressed.
+  const isDistinctTwNameItem = (it) => twRuleFor(it.sref) === 'names'
+    && hasKeepHint(it.explanation)
+    && isTwCoveredEnglish(String(it.gl_quote || '').trim());
 
   // This chapter's English for a corpus occurrence, from the alignment data, for
   // the Phase 3 check below (no prepared item exists there to carry a gl_quote).
@@ -881,9 +890,10 @@ async function runSeeHowDetection({ pipeDir, contextPath, generateIdsFn = genera
   // before assigning any corpus-derived verses: which key may list which verses
   // depends on the whole set of anchors and on how much each key covers.
   const plans = [];
-  for (const [key, group] of byKeyItems.entries()) {
-    group.sort(sortByRef);
-    const lead = group[0];
+  for (const [key, fullGroup] of byKeyItems.entries()) {
+    fullGroup.sort(sortByRef);
+    let group = fullGroup;
+    let lead = group[0];
     // One word can legitimately carry two different figurative notes in a
     // chapter ("hand" as metonymy in v2, as metaphor in v8). Fold a later item
     // only when it is the same kind of note, or when the key is see-how
@@ -891,7 +901,7 @@ async function runSeeHowDetection({ pipeDir, contextPath, generateIdsFn = genera
     // A context-dependent article (a rhetorical question, say) is about the
     // construction at its own verse, so a repeat of the wording is not a
     // repeat of the note.
-    const foldsAnySref = isSeeHowEligible(key, lead.sref) && !isContextDependentSref(lead.sref, key);
+    let foldsAnySref = isSeeHowEligible(key, lead.sref) && !isContextDependentSref(lead.sref, key);
     const corpusHere = chapterCorpusOccs(key);
 
     let target = earlierNotedTarget(key);
@@ -904,11 +914,20 @@ async function runSeeHowDetection({ pipeDir, contextPath, generateIdsFn = genera
       ? recurrenceVerseNumber(corpusHere[0].verse)
       : recurrenceVerseNumber(verseOf(lead.reference));
     if (!target) target = crossBookTarget(key, prospective);
-    // The gate keeps a translate-names row whose issue hint says it is a different
-    // person (hasKeepHint); that item keeps its pointer too, so a distinct person
-    // with the same name still gets the translation-consistency pointer.
-    const keptByHint = group.some((it) => twRuleFor(it.sref) === 'names' && hasKeepHint(it.explanation));
-    if (!keptByHint && pointsToTwCoveredName(target, lead.gl_quote)) { target = null; twNameSkipped++; }
+    // No pointer back to a tW-covered name (#457). Items the gate would have kept
+    // (isDistinctTwNameItem) leave the group untouched, so only the other items in it
+    // are suppressed.
+    const plain = group.filter((it) => !isDistinctTwNameItem(it));
+    if (pointsToTwCoveredName(target, (plain[0] || lead).gl_quote)) {
+      target = null;
+      twNameSkipped++;
+      if (plain.length < group.length) {
+        if (!plain.length) continue;
+        group = plain;
+        lead = group[0];
+        foldsAnySref = isSeeHowEligible(key, lead.sref) && !isContextDependentSref(lead.sref, key);
+      }
+    }
 
     // Same reason in the other direction: a pointer back to a context-dependent
     // note only ships where the issue pass independently flagged the same
