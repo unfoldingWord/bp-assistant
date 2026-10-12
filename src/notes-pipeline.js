@@ -525,11 +525,16 @@ async function runSeeHowDetection({ pipeDir, contextPath, generateIdsFn = genera
   // Merge the two key forms into one bucket per canonical key. The corpus scan
   // files occurrences under whichever form was queried, so a key canonicalised
   // to its Strong form could otherwise resolve to an empty bucket.
+  // An occurrence whose own words resolved to a Strong's key is filed under
+  // that key, not under the text key it was found by: a text key can match a
+  // homograph (קֹרֵא "partridge" vs קָרָא "call"), whose lemma differs.
   const byCanonical = new Map();
   for (const [rawKey, occs] of Object.entries((index && index.byKey) || {})) {
-    const canon = canonicalKey(rawKey);
-    if (!byCanonical.has(canon)) byCanonical.set(canon, []);
-    byCanonical.get(canon).push(...occs);
+    for (const occ of occs) {
+      const canon = occ.strongKey || canonicalKey(rawKey);
+      if (!byCanonical.has(canon)) byCanonical.set(canon, []);
+      byCanonical.get(canon).push(occ);
+    }
   }
   for (const [canon, occs] of byCanonical.entries()) {
     const seen = new Set();
@@ -590,7 +595,12 @@ async function runSeeHowDetection({ pipeDir, contextPath, generateIdsFn = genera
     if (!canon || crossBookByKey.has(canon)) continue;
     for (const form of [derived.strongKey, derived.textKey]) {
       const entry = form && crossBookIndex.byKey ? crossBookIndex.byKey[form] : null;
-      if (entry && entry.first) { crossBookByKey.set(canon, entry); break; }
+      if (!entry || !entry.first) continue;
+      // A text-form hit on a different lemma is a homograph, not this phrase.
+      const firstStrong = entry.first.strongKey;
+      if (firstStrong && derived.strongKey && firstStrong !== derived.strongKey) continue;
+      crossBookByKey.set(canon, entry);
+      break;
     }
   }
 
