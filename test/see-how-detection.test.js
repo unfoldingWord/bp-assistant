@@ -1186,9 +1186,10 @@ test('single common word: another form of the lemma gets no pointer and no also-
   await runSeeHowDetection({ pipeDir: dirPath, generateIdsFn: stubIds });
 
   const items = readPrepared(dirPath).items;
-  assert.equal(items.length, 1);
-  assert.equal(items[0].programmatic_note, undefined, '"men of" is not "a man": no pointer to 1:1');
-  assert.equal(items[0].also_occurs_verses, undefined, '"the men" at v5 is not "men of": not listed');
+  const own = items.find((it) => it.id === 'aaaa');
+  assert.equal(own.programmatic_note, undefined, '"men of" is not "a man": no pointer to 1:1');
+  assert.equal(own.also_occurs_verses, undefined, '"the men" at v5 is not "men of": not listed');
+  assert.ok(!items.some((it) => it.reference === '3:5'), '"the men" at v5 is another form too: no row');
 });
 
 test('single common word: only occurrences in the noted form are injected', async () => {
@@ -1240,4 +1241,25 @@ test('names keep matching by lemma whatever ending the word carries', async () =
   await runSeeHowDetection({ pipeDir: dirPath, generateIdsFn: stubIds });
 
   assert.deepEqual(readPrepared(dirPath).items.map((it) => it.reference), ['3:2']);
+});
+
+test('single common word: the target is the earlier note in the occurrence\'s own form', async () => {
+  const tn = [
+    'Reference\tID\tTags\tSupportReference\tQuote\tOccurrence\tNote',
+    `1:1\tabcd\t\trc://*/ta/man/translate/figs-idiom\t${ISH}\t1\tJeremiah is using **a man** to mean “each man.”`,
+    `2:1\tefgh\t\trc://*/ta/man/translate/figs-idiom\t${HAANASHIM}\t1\tJeremiah is using **the men** to mean “those men.”`,
+    '',
+  ].join('\n');
+  const aligned = ISH_ALIGNED_BOOK.replace(/\\v 6 .*\n/, '');
+  const hebrew = ISH_HEBREW_BOOK.replace(/\\v 6 .*\n/, '');
+  const dirPath = setupPipeDir({
+    book: 'JER', items: [], alignedBook: aligned, hebrewBook: hebrew,
+    alignmentData: ISH_ALIGNMENT, tnBookTsv: tn,
+  });
+  buildRecurrenceIndexFile({ pipeDir: dirPath });
+  await runSeeHowDetection({ pipeDir: dirPath, generateIdsFn: stubIds });
+
+  const items = readPrepared(dirPath).items;
+  assert.deepEqual(items.map((it) => it.reference), ['3:5'], 'v2 "men of" has no noted form');
+  assert.match(items[0].programmatic_note, /\[2:1\]\(\.\.\/02\/01\.md\)/, 'points at the "the men" note, not the earlier "a man" one');
 });

@@ -554,7 +554,8 @@ async function runSeeHowDetection({ pipeDir, contextPath, generateIdsFn = genera
     const sameForm = formMatches(key, sref, refQuote);
     for (const occ of occurrencesFor(key)) {
       if (occ.source !== 'tn') continue;
-      if (!sameForm(occ)) continue;
+      // A name note is the target's own sref's business, not the item's.
+      if (!sameForm(occ) && !sameFormForKey(key, occ.sref, refQuote, occ.quote)) continue;
       if (!occ.note) continue;
       if (!occ.chapter || (chapter && occ.chapter >= chapter)) continue;
       // A row that is itself a "See how you translated..." pointer is never a
@@ -609,7 +610,7 @@ async function runSeeHowDetection({ pipeDir, contextPath, generateIdsFn = genera
     const entry = crossBookByKey.get(canonicalKey(key));
     const cand = entry && entry.first;
     if (!cand || !cand.ref) return null;
-    if (!sameFormForKey(key, sref, refQuote, cand.quote)) return null;
+    if (!sameFormForKey(key, sref, refQuote, cand.quote) && !sameFormForKey(key, cand.sref, refQuote, cand.quote)) return null;
     if (String(cand.book || '').toUpperCase() === book) return null;
     if ((entry.bookCount || 0) > CROSS_BOOK_MAX_BOOKS) return null;
     if (!isSeeHowEligible(key, cand.sref)) return null;
@@ -1010,8 +1011,18 @@ async function runSeeHowDetection({ pipeDir, contextPath, generateIdsFn = genera
   // groups, so it takes part in the coverage computation below instead of
   // assigning itself a list afterwards.
   for (const key of byCanonical.keys()) {
+    // A prepared item on any form of the word leaves the phrase alone: a
+    // missing pointer beats one on a literal use ("put out the eyes" is not the
+    // idiom noted for "in the eyes of").
     if (chapterKeys.has(key) || commonKeys.has(key)) continue;
-    const target = earlierNotedTarget(key);
+    // The target is the earlier note in a form this chapter actually has: the
+    // first occurrence here that has one.
+    let target = null;
+    let formQuote = '';
+    for (const cand of chapterCorpusOccs(key)) {
+      target = earlierNotedTarget(key, '', cand.quote);
+      if (target) { formQuote = cand.quote; break; }
+    }
     if (!target) continue;
     if (!isSeeHowEligible(key, target.sref)) continue;
     // Nothing was prepared for this phrase here, so no one checked whether the
@@ -1020,7 +1031,7 @@ async function runSeeHowDetection({ pipeDir, contextPath, generateIdsFn = genera
     if (isContextDependentSref(target.sref, key)) continue;
     // Only occurrences in the target's own form: the pointer says "see how you
     // translated this", which is false for another form of the same lemma.
-    const corpusHere = chapterCorpusOccs(key, target.sref, target.quote);
+    const corpusHere = chapterCorpusOccs(key, target.sref, formQuote);
     if (!corpusHere.length) continue;
     const occ = corpusHere[0];
     // No prepared item here, so no issue hint can carry the "different person" exception.
