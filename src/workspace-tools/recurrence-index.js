@@ -32,7 +32,7 @@ const SEE_HOW_SINGLE_WORD_SREFS = new Set([
 ]);
 
 // tA articles whose notes are wanted at EVERY occurrence, so they are never
-// folded into an "also occurs" list, never rewritten as a pointer, never used
+// folded into a pointer, never rewritten as a pointer, never used
 // as a pointer target, and never injected. issue-identification/SKILL.md:28
 // requires hinneh foregrounding to be noted every time it appears.
 const SEE_HOW_NEVER_FOLD_SREFS = new Set(['writing-foreground']);
@@ -42,7 +42,7 @@ const SEE_HOW_NEVER_FOLD_SREFS = new Set(['writing-foreground']);
 // and the note no longer applies. JER 8:4 asks "will they fall and not rise?"
 // (figs-rquestion); JER 25:27 repeats "fall and do not rise" as a command, and
 // used to collect a figs-rquestion pointer back to 8:4 anyway. A pointer or an
-// "also occurs" entry for these is only allowed where the issue pass
+// later-occurrence pointer for these is only allowed where the issue pass
 // independently flagged the same article -- recurrence of the words is not
 // evidence that the construction recurred.
 const SEE_HOW_CONTEXT_DEPENDENT_SREFS = new Set([
@@ -526,17 +526,17 @@ function isKeySubsequence(a, b) {
 }
 
 /**
- * Decide which "also occurs" verses each of a set of overlapping keys may list.
+ * Decide which later verses each of a set of overlapping keys may point at.
  *
  * A fixed formula and its sub-phrases match overlapping verse sets. On
  * published ZEC 8, "thus says Yahweh of hosts", its two three-word sub-phrases
- * and a five-word variant all belong to one cluster; each used to print a
- * near-identical "This also occurs in verses ..." sentence. Picking the longest
+ * and a five-word variant all belong to one cluster; each used to claim the
+ * same later verses and write a near-identical pointer there. Picking the longest
  * key instead lost the list entirely, because the five-word variant occurs once.
  *
- * So the carrier is the key that COVERS the most verses. It lists all of them;
- * every other key in the cluster lists only the verses not already listed by a
- * key processed before it. Within a cluster no verse is listed twice and none is
+ * So the carrier is the key that COVERS the most verses. It takes all of them;
+ * every other key in the cluster takes only the verses not already taken by a
+ * key processed before it. Within a cluster no verse is claimed twice and none is
  * lost: the union of the returned lists equals the union of the inputs.
  *
  * Keys related by containment form one cluster, so a chain A subset B subset C
@@ -548,7 +548,7 @@ function isKeySubsequence(a, b) {
  *   key's in-range occurrence verses; the anchor's own verse is dropped here.
  * @returns {Map<string, string[]>} key -> the verses that key may list
  */
-function assignAlsoOccursVerses(groups) {
+function assignPointerVerses(groups) {
   const list = [];
   const seenKeys = new Set();
   for (const g of groups || []) {
@@ -556,7 +556,7 @@ function assignAlsoOccursVerses(groups) {
     seenKeys.add(g.key);
     const n = parseInt(g.anchorVerse, 10);
     const anchorVerse = Number.isFinite(n) ? n : Number.MAX_SAFE_INTEGER;
-    const verses = dedupeAlsoOccursVerses(g.verses)
+    const verses = dedupeVerseList(g.verses)
       .filter((v) => verseNumber(v) !== anchorVerse);
     list.push({ key: String(g.key), tokens: keyTokens(g.key), anchorVerse, verses });
   }
@@ -605,13 +605,13 @@ function assignAlsoOccursVerses(groups) {
 }
 
 /**
- * Collapse an "also occurs" verse list on the NUMERIC first verse, not on the
+ * Collapse a verse list on the NUMERIC first verse, not on the
  * string. A folded prepared item contributes "5" while a source span for the
  * same bridge contributes "5-6"; keyed by string those survive as two entries
- * and render as "verses 5 and 5-6". The bridge form wins, because it says more.
+ * and are two rows for one verse. The bridge form wins, because it says more.
  * Returns the surviving verse strings in ascending order.
  */
-function dedupeAlsoOccursVerses(verses) {
+function dedupeVerseList(verses) {
   const isBridge = (s) => /[-–]/.test(s);
   const byNumber = new Map();
   for (const raw of verses || []) {
@@ -623,48 +623,6 @@ function dedupeAlsoOccursVerses(verses) {
     if (!isBridge(existing) && isBridge(v)) byNumber.set(n, v);
   }
   return [...byNumber.keys()].sort((a, b) => a - b).map((n) => byNumber.get(n));
-}
-
-/**
- * `This also occurs in verses 5, 7, 8, and 11.` — plain text, Oxford comma.
- * Runs of three or more consecutive verses collapse to `5–7` (en dash); a verse
- * bridge keeps its own span, rendered with an en dash.
- */
-function formatAlsoOccurs(verses) {
-  const parts = dedupeAlsoOccursVerses(verses);
-  if (parts.length === 0) return '';
-
-  // Collapse runs of 3+ consecutive plain verse numbers.
-  const rendered = [];
-  let i = 0;
-  while (i < parts.length) {
-    const isPlain = (s) => /^\d+$/.test(s);
-    if (!isPlain(parts[i])) {
-      rendered.push(parts[i].replace(/-/g, '–'));
-      i++;
-      continue;
-    }
-    let j = i;
-    while (
-      j + 1 < parts.length &&
-      isPlain(parts[j + 1]) &&
-      parseInt(parts[j + 1], 10) === parseInt(parts[j], 10) + 1
-    ) j++;
-    if (j - i >= 2) {
-      rendered.push(`${parts[i]}–${parts[j]}`);
-      i = j + 1;
-    } else {
-      rendered.push(parts[i]);
-      i++;
-    }
-  }
-
-  const noun = rendered.length === 1 && /^\d+$/.test(rendered[0]) ? 'verse' : 'verses';
-  let list;
-  if (rendered.length === 1) list = rendered[0];
-  else if (rendered.length === 2) list = `${rendered[0]} and ${rendered[1]}`;
-  else list = `${rendered.slice(0, -1).join(', ')}, and ${rendered[rendered.length - 1]}`;
-  return `This also occurs in ${noun} ${list}.`;
 }
 
 // ---------------------------------------------------------------------------
@@ -1197,9 +1155,8 @@ module.exports = {
   buildSeeHowSentence,
   seeHowSubject,
   bookDisplayName,
-  formatAlsoOccurs,
-  dedupeAlsoOccursVerses,
-  assignAlsoOccursVerses,
+  dedupeVerseList,
+  assignPointerVerses,
   isKeySubsequence,
   keyTokens,
   isSeeHowEligible,

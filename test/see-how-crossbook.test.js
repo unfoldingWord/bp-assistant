@@ -154,7 +154,8 @@ test('X1: a key first noted in GEN yields one cross-book pointer at its first oc
   assert.equal(first.see_how_target, 'GEN 10:2');
   assert.equal(first.see_how_cross_book, true);
   assert.equal(first.support_reference, 'translate-names');
-  assert.match(summary, /1 cross-book/);
+  // The later occurrence at 3:9 points at the same Genesis note.
+  assert.match(summary, /2 cross-book/);
   clearCrossBookCache();
 });
 
@@ -171,22 +172,24 @@ test('X2: no cross-book pointer at EXO 5, where the phrase already occurred in E
   clearCrossBookCache();
 });
 
-test('X3: the pointer anchors on the chapter\'s FIRST occurrence, and later ones fold into its list', async () => {
+test('X3: the pointer anchors on the chapter\'s FIRST occurrence, and later ones point at the same target', async () => {
   crossBookCache({ [SAUL_KEY]: GEN_ENTRY() });
   // Only 3:9 is flagged, but 3:4 is the book-first occurrence, so the pointer
-  // is injected there and 3:9 folds into its "also occurs" list.
+  // is injected there and the flagged 3:9 becomes a pointer to the same note.
   const dirPath = setupPipeDir({ chapter: '3', items: [item({ reference: '3:9', id: 'bbbb' })] });
   buildRecurrenceIndexFile({ pipeDir: dirPath });
   await runSeeHowDetection({ pipeDir: dirPath, generateIdsFn: stubIds });
 
   const items = readPrepared(dirPath).items;
-  const pointer = items.find((it) => it.see_how_cross_book);
+  const pointer = items.find((it) => it.see_how_cross_book && it.injected_see_how);
   assert.ok(pointer, 'a cross-book pointer was emitted');
   assert.equal(pointer.reference, '3:4', 'anchored on the book-first occurrence, not the flagged verse');
   // The injected row has no gl_quote of its own, but translate-names still
   // names the subject rather than falling back to "the similar expression".
   assert.equal(pointer.programmatic_note, 'See how you translated this name in Genesis 10:2.');
-  assert.deepEqual(pointer.also_occurs_verses, ['9']);
+  assert.equal(pointer.also_occurs_verses, undefined);
+  const later = items.find((it) => it.id === 'bbbb');
+  assert.equal(later.programmatic_note, 'See how you translated this name in Genesis 10:2.');
   clearCrossBookCache();
 });
 

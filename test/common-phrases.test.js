@@ -236,7 +236,9 @@ test('unlisted phrases keep the existing see-how behaviour', async () => {
   await run(dirPath);
   const word = readPrepared(dirPath).items.find((it) => it.id === 'dddd');
   assert.equal(word.programmatic_note, 'See how you translated **the word of Yahweh** in [1:1](../01/01.md).');
-  assert.deepEqual(word.also_occurs_verses, ['7']);
+  assert.equal(word.also_occurs_verses, undefined);
+  const later = readPrepared(dirPath).items.find((it) => it.id === 'eeee');
+  assert.equal(later.programmatic_note, 'See how you translated **the word of Yahweh** in [1:1](../01/01.md).');
 });
 
 test('no list file, or a disabled entry, means no change', async () => {
