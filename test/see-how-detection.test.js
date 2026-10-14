@@ -797,11 +797,12 @@ test('C5: within a formula cluster each later verse gets exactly one pointer', a
   assert.equal(byId.get('aaaa').programmatic_note, undefined, 'the three flagged notes are distinct keys: none is a pointer');
   assert.equal(byId.get('bbbb').programmatic_note, undefined);
   assert.equal(byId.get('cccc').programmatic_note, undefined);
-  // Coverage wins, not length: "thus says Yahweh" (8:3) reaches 4 and 6 after
-  // itself (8:2 is before it, and nothing points forward), so it takes them.
+  // Only verses after a key's own anchor count. "thus says Yahweh of hosts"
+  // (8:2) and "thus says Yahweh" (8:3) both reach 4 and 6, so the longer key
+  // takes them and they point at 8:2.
   const injected = items.filter((it) => it.injected_see_how);
   assert.deepEqual(injected.map((it) => it.reference).sort(), ['8:4', '8:6']);
-  for (const it of injected) assert.match(it.programmatic_note, /\[8:3\]\(\.\.\/08\/03\.md\)/);
+  for (const it of injected) assert.match(it.programmatic_note, /\[8:2\]\(\.\.\/08\/02\.md\)/);
   // No verse carries two pointers for the cluster.
   assert.equal(new Set(items.map((it) => `${it.reference}|${it.injected_see_how}`)).size, items.length);
 });
@@ -824,7 +825,7 @@ test('C5: a flagged sibling of the carrier becomes a pointer to it, beside the c
 
   const items = readPrepared(dirPath).items;
   const byId = new Map(items.map((it) => [it.id, it]));
-  assert.match(byId.get('dddd').programmatic_note, /\[8:3\]\(\.\.\/08\/03\.md\)/, '8:13 points at 8:3');
+  assert.match(byId.get('dddd').programmatic_note, /\[8:3\]\(\.\.\/08\/03\.md\)/, '8:13 points at its own key\'s note at 8:3');
   assert.equal(byId.get('bbbb').programmatic_note, undefined);
   assert.equal(byId.get('aaaa').programmatic_note, undefined);
   assert.deepEqual(items.filter((it) => it.injected_see_how).map((it) => it.reference).sort(), ['8:4', '8:6']);
@@ -1002,7 +1003,7 @@ test('C5: with an injected five-word variant the widest key still carries the li
   // "thus says Yahweh" reaches 2, 3, 4 and 6 - one verse more than the
   // four-word formula - so it carries. Before C5 the longest key (the
   // five-word variant, which occurs once) won and the list was lost entirely.
-  // Nothing points forward, so 8:2 gets no pointer; 8:4 and 8:6 point at 8:3.
+  // Nothing points forward; 8:4 and 8:6 point at 8:2.
   // 8:14 already holds cccc's note and the injected five-word pointer, both on
   // overlapping wording, so the carrier adds nothing there.
   const rows = prepared.items.map((it) => it.reference).sort();
@@ -1010,7 +1011,7 @@ test('C5: with an injected five-word variant the widest key still carries the li
   assert.equal(byId.get('bbbb').programmatic_note, undefined);
   for (const ref of ['8:4', '8:6']) {
     const row = prepared.items.find((it) => it.reference === ref);
-    assert.match(row.programmatic_note, /\[8:3\]\(\.\.\/08\/03\.md\)/);
+    assert.match(row.programmatic_note, /\[8:2\]\(\.\.\/08\/02\.md\)/);
   }
 });
 
@@ -1165,6 +1166,8 @@ test('kept: no pointer is synthesized at a kept note\'s verse and quote; the fla
   const items = readPrepared(flagged).items;
   assert.deepEqual(items.map((i) => i.reference), ['3:5'], 'the 3:5 item is not folded into a pointer at 3:2');
   assert.notEqual(items[0].injected_see_how, true);
+  assert.equal(items[0].programmatic_note, undefined, 'and keeps its own note text');
+  assert.equal(items[0].note_type, 'given_at');
 });
 
 // One lemma, three expressions (JER 39:4 vs 23:27 vs 39:17). H0376 is "a man"
@@ -1294,4 +1297,21 @@ test('single common word: the target is the earlier note in the occurrence\'s ow
   const items = readPrepared(dirPath).items;
   assert.deepEqual(items.map((it) => it.reference), ['3:5'], 'v2 "men of" has no noted form');
   assert.match(items[0].programmatic_note, /\[2:1\]\(\.\.\/02\/01\.md\)/, 'points at the "the men" note, not the earlier "a man" one');
+});
+
+test('a lead the issue pass wrote as a "See how" row is not a pointer target', async () => {
+  const dirPath = setupPipeDir({
+    items: [
+      item({ reference: '3:2', id: 'aaaa', note_type: 'see_how', programmatic_note: 'See how you translated this phrase in [1:9](../01/09.md).' }),
+      item({ reference: '3:5', id: 'bbbb', index: 1 }),
+    ],
+    tnBookTsv: '',
+    hebrewBook: HEBREW_BOOK,
+  });
+  buildRecurrenceIndexFile({ pipeDir: dirPath });
+  await runSeeHowDetection({ pipeDir: dirPath, generateIdsFn: stubIds });
+
+  const items = readPrepared(dirPath).items;
+  assert.deepEqual(items.map((it) => it.id), ['aaaa', 'bbbb'], 'nothing is added or rewritten: no chain through aaaa');
+  assert.equal(items[1].programmatic_note, undefined);
 });

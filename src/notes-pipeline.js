@@ -1058,7 +1058,12 @@ async function runSeeHowDetection({ pipeDir, contextPath, generateIdsFn = genera
       .map((p) => ({
         key: p.key,
         anchorVerse: p.anchorVerseNum,
-        verses: p.corpusHere.map((o) => String(o.verse)),
+        // Only verses this key can point at: after its own anchor, with a quote
+        // that can be written. A verse claimed here and then dropped would be
+        // lost to every other key in the cluster.
+        verses: p.corpusHere
+          .filter((o) => recurrenceVerseNumber(o.verse) > p.anchorVerseNum && o.quote_exact !== false)
+          .map((o) => String(o.verse)),
       }))
   );
   const corpusVersesFor = (plan) => (plan.skipped ? [] : (pointerVersesAllowed.get(plan.key) || []));
@@ -1091,6 +1096,16 @@ async function runSeeHowDetection({ pipeDir, contextPath, generateIdsFn = genera
   };
   // A note or pointer on the same article already sits on this verse and quotes
   // an overlapping phrase: another pointer beside it would repeat it.
+  // Prepared rows already turned into pointers (their `sref` is still the old
+  // article; the pointer's article is the target's).
+  const pointerRows = [];
+  const recordPointerRow = (it, target) => pointerRows.push({
+    verse: recurrenceVerseNumber(verseOf(it.reference)),
+    sref: String(target.sref || ''),
+    tokens: tokensOf(it.orig_quote),
+  });
+  const pointerRowCovers = (verse, sref, tokens) => pointerRows.some((r) => r.verse === verse
+    && r.sref === String(sref || '') && quotesOverlap(tokens, r.tokens));
   const verseAlreadyCovers = (occ, sref) => {
     const v = recurrenceVerseNumber(occ.verse);
     const want = tokensOf(occ.quote);
@@ -1098,7 +1113,8 @@ async function runSeeHowDetection({ pipeDir, contextPath, generateIdsFn = genera
       && chapterOf(ref) === chapter
       && String(otherSref || '') === String(sref || '')
       && quotesOverlap(want, tokensOf(other));
-    return items.some((it) => !removed.has(it) && here(it.reference, it.orig_quote, it.sref))
+    return items.some((it) => !removed.has(it) && !commonDropped.has(it) && here(it.reference, it.orig_quote, it.sref))
+      || pointerRowCovers(v, sref, want)
       || injections.some((inj) => inj.occ && here(inj.occ.ref, inj.occ.quote, inj.target && inj.target.sref));
   };
   // Queue one injected pointer per allowed occurrence after the anchor.
@@ -1131,8 +1147,13 @@ async function runSeeHowDetection({ pipeDir, contextPath, generateIdsFn = genera
     // phrase on a verse that already has one is simply dropped.
     const pointLater = (it) => {
       const v = recurrenceVerseNumber(verseOf(it.reference));
-      if (pointedVerses.has(v)) { fold(it); foldedCount++; return; }
+      // A second row for the phrase on this verse, or another phrase's pointer
+      // on the same article with overlapping wording, makes this one redundant.
+      if (pointedVerses.has(v) || pointerRowCovers(v, laterTarget.sref, tokensOf(it.orig_quote))) {
+        fold(it); foldedCount++; return;
+      }
       if (!applyPointer(it, key, laterTarget)) return;
+      recordPointerRow(it, laterTarget);
       pointedVerses.add(v);
       for (const dup of (combinedBy.get(it.id) || [])) removed.add(dup);
       seeHowCount++;
@@ -1145,6 +1166,7 @@ async function runSeeHowDetection({ pipeDir, contextPath, generateIdsFn = genera
         // was: pointing siblings at a note that never became a pointer would
         // leave them with nothing to point to.
         if (!applyPointer(anchorItem, key, target)) continue;
+        recordPointerRow(anchorItem, target);
         seeHowCount++;
         if (target.crossBook) crossBookCount++;
         pointedVerses.add(plan.anchorVerseNum);
@@ -1153,6 +1175,9 @@ async function runSeeHowDetection({ pipeDir, contextPath, generateIdsFn = genera
         injections.push({ key, target, occ: anchorOcc });
         pointedVerses.add(plan.anchorVerseNum);
       }
+      // The anchor slot is taken (an editor-kept note) or cannot be written:
+      // the repeats keep their own notes rather than point at a missing one.
+      if (!anchorItem && plan.skipped) continue;
       for (const it of group.filter((g) => g !== anchorItem && canFold(g))) pointLater(it);
       queueLaterPointers(plan, target, pointedVerses);
       continue;
@@ -1162,6 +1187,9 @@ async function runSeeHowDetection({ pipeDir, contextPath, generateIdsFn = genera
     // the verse the model wrote it on, so it stays put. Later occurrences point
     // at it.
     pointedVerses.add(recurrenceVerseNumber(verseOf(lead.reference)));
+    // A lead the issue pass itself wrote as a "See how" row is a pointer, not a
+    // target: pointing at it would build a chain.
+    if (/^see_how/.test(String(lead.note_type || ''))) continue;
     for (let i = 1; i < group.length; i++) {
       const later = group[i];
       if (later.reference === lead.reference) continue;
