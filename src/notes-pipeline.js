@@ -20,7 +20,7 @@ const { getDoor43Username, emailToFallbackUsername, buildBranchName, resolveOutp
 const { splitTsv, fixTrailingNewlines } = require('./workspace-tools/tsv-tools');
 const { fillTsvIds, generateIds, prepareNotes, fillOrigQuotes, resolveGlQuotes, flagNarrowQuotes, extractAlignmentData, prepareATContext, substituteAT, fixUnicodeQuotes, verifyBoldMatches, syncCanonicalHebrewQuotes, applyHintsToPreparedNotes, applyKeptToPreparedNotes, keptRefVerseSpan, parsePlainUsfmVersesFromText, detectIssuesTsvLayout, extractIssuesTsvRow, findVersesWithoutNotes, readWriterSkipped, recordWriterSkipRejected, parseWriterSkip, sanitizeSkipReason, _stripAlternateTranslation: stripAlternateTranslation } = require('./workspace-tools/tn-tools');
 const { checkTnQuality, detectSelfTalk, templateFirstPhrase, resolveTemplateText } = require('./workspace-tools/quality-tools');
-const { buildBookRecurrenceIndex, deriveRecurrenceKeys, buildSeeHowSentence, isSeeHowEligible, isContextDependentSref, dedupeAlsoOccursVerses, assignAlsoOccursVerses, resolveDoor43ReposPath, hebTokens, verseNumber: recurrenceVerseNumber, SEE_HOW_NEVER_FOLD_SREFS, CROSS_BOOK_MAX_BOOKS } = require('./workspace-tools/recurrence-index');
+const { buildBookRecurrenceIndex, deriveRecurrenceKeys, buildSeeHowSentence, isSeeHowEligible, isContextDependentSref, sameFormForKey, dedupeAlsoOccursVerses, assignAlsoOccursVerses, resolveDoor43ReposPath, hebTokens, verseNumber: recurrenceVerseNumber, SEE_HOW_NEVER_FOLD_SREFS, CROSS_BOOK_MAX_BOOKS } = require('./workspace-tools/recurrence-index');
 const { loadCommonPhrases, buildIntroPointerSentence, phraseTextKey } = require('./workspace-tools/common-phrases');
 const { normalizeIssuesFile, buildParallelismIntroHintArgs } = require('./issue-normalizer');
 const { runIssueRulesGate, gatePrBodyForPush, refreshGateSidecarOutputHash, readGateSidecar, keptDropsStillCovered } = require('./issue-rules-gate');
@@ -546,9 +546,15 @@ async function runSeeHowDetection({ pipeDir, contextPath, generateIdsFn = genera
     byCanonical.set(canon, merged);
   }
   const occurrencesFor = (key) => byCanonical.get(canonicalKey(key)) || [];
-  const earlierNotedTarget = (key) => {
+  // A single common word is the same phrase only in the same form: H0376 is "a
+  // man", "men of" and "the men" (JER 39:4 vs 23:27 vs 39:17). `sref`/`refQuote`
+  // describe the thing being matched; names and multi-word keys pass through.
+  const formMatches = (key, sref, refQuote) => (occ) => sameFormForKey(key, sref, refQuote, occ.quote);
+  const earlierNotedTarget = (key, sref = '', refQuote = '') => {
+    const sameForm = formMatches(key, sref, refQuote);
     for (const occ of occurrencesFor(key)) {
       if (occ.source !== 'tn') continue;
+      if (!sameForm(occ)) continue;
       if (!occ.note) continue;
       if (!occ.chapter || (chapter && occ.chapter >= chapter)) continue;
       // A row that is itself a "See how you translated..." pointer is never a
@@ -566,8 +572,8 @@ async function runSeeHowDetection({ pipeDir, contextPath, generateIdsFn = genera
   // must be this chapter's earliest occurrence. The second test matters for
   // partial-verse-range runs, whose in-range anchor can be preceded by an
   // out-of-range occurrence that is the real book-first one.
-  const isBookFirstOccurrence = (key, anchorVerse) => {
-    const occs = occurrencesFor(key);
+  const isBookFirstOccurrence = (key, anchorVerse, sref = '', refQuote = '') => {
+    const occs = occurrencesFor(key).filter(formMatches(key, sref, refQuote));
     // No corpus span anywhere means the full aligned ULT was unavailable, so
     // earlier chapters are invisible and book-first cannot be established.
     // Refuse rather than guess: a wrong cross-book pointer outranks a missing one.
@@ -599,14 +605,15 @@ async function runSeeHowDetection({ pipeDir, contextPath, generateIdsFn = genera
    * pointer-eligible, not a common formula, and this chapter holds the book's
    * first occurrence.
    */
-  const crossBookTarget = (key, anchorVerse) => {
+  const crossBookTarget = (key, anchorVerse, sref = '', refQuote = '') => {
     const entry = crossBookByKey.get(canonicalKey(key));
     const cand = entry && entry.first;
     if (!cand || !cand.ref) return null;
+    if (!sameFormForKey(key, sref, refQuote, cand.quote)) return null;
     if (String(cand.book || '').toUpperCase() === book) return null;
     if ((entry.bookCount || 0) > CROSS_BOOK_MAX_BOOKS) return null;
     if (!isSeeHowEligible(key, cand.sref)) return null;
-    if (!isBookFirstOccurrence(key, anchorVerse)) return null;
+    if (!isBookFirstOccurrence(key, anchorVerse, sref, refQuote)) return null;
     return {
       ref: cand.ref,
       chapter: cand.chapter,
@@ -852,8 +859,9 @@ async function runSeeHowDetection({ pipeDir, contextPath, generateIdsFn = genera
     byKeyItems.get(key).push(item);
   }
 
-  const chapterCorpusOccs = (key) => occurrencesFor(key)
+  const chapterCorpusOccs = (key, sref = '', refQuote = '') => occurrencesFor(key)
     .filter((o) => o.source === 'corpus' && o.chapter === chapter && inRange(o.verse))
+    .filter(formMatches(key, sref, refQuote))
     .sort((a, b) => recurrenceVerseNumber(a.verse) - recurrenceVerseNumber(b.verse));
 
   const removed = new Set();
@@ -905,9 +913,9 @@ async function runSeeHowDetection({ pipeDir, contextPath, generateIdsFn = genera
     // construction at its own verse, so a repeat of the wording is not a
     // repeat of the note.
     let foldsAnySref = isSeeHowEligible(key, lead.sref) && !isContextDependentSref(lead.sref, key);
-    let corpusHere = chapterCorpusOccs(key);
+    let corpusHere = chapterCorpusOccs(key, lead.sref, lead.orig_quote);
 
-    let target = earlierNotedTarget(key);
+    let target = earlierNotedTarget(key, lead.sref, lead.orig_quote);
 
     // Rule 3. Only once rule 2 has found nothing: a same-book target always
     // wins, so a book's later occurrences never reach here. The prospective
@@ -916,7 +924,7 @@ async function runSeeHowDetection({ pipeDir, contextPath, generateIdsFn = genera
     const prospective = corpusHere[0]
       ? recurrenceVerseNumber(corpusHere[0].verse)
       : recurrenceVerseNumber(verseOf(lead.reference));
-    if (!target) target = crossBookTarget(key, prospective);
+    if (!target) target = crossBookTarget(key, prospective, lead.sref, lead.orig_quote);
     // No pointer back to a tW-covered name (#457). Items the gate would have kept
     // (isDistinctTwNameItem) leave the group untouched, so only the other items in it
     // are suppressed.
@@ -954,7 +962,7 @@ async function runSeeHowDetection({ pipeDir, contextPath, generateIdsFn = genera
     // Under a context-dependent pointer only the items the issue pass gave the
     // same article may fold into it, and unflagged corpus verses are never
     // listed: no one checked that the construction is there.
-    const canFold = (it) => (ctxPointer
+    const canFold = (it) => sameFormForKey(key, it.sref || lead.sref, it.orig_quote, lead.orig_quote) && (ctxPointer
       ? String(it.sref || '') === String(target.sref || '')
       : (foldsAnySref || String(it.sref || '') === String(lead.sref || '')));
 
@@ -1010,7 +1018,9 @@ async function runSeeHowDetection({ pipeDir, contextPath, generateIdsFn = genera
     // construction the target's note describes is present. Never synthesize a
     // pointer to a context-dependent article.
     if (isContextDependentSref(target.sref, key)) continue;
-    const corpusHere = chapterCorpusOccs(key);
+    // Only occurrences in the target's own form: the pointer says "see how you
+    // translated this", which is false for another form of the same lemma.
+    const corpusHere = chapterCorpusOccs(key, target.sref, target.quote);
     if (!corpusHere.length) continue;
     const occ = corpusHere[0];
     // No prepared item here, so no issue hint can carry the "different person" exception.

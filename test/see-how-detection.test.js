@@ -1134,3 +1134,110 @@ test('kept: no pointer is synthesized at a kept note\'s verse and quote; the fla
   assert.deepEqual(items.map((i) => i.reference), ['3:5'], 'the 3:5 item is not folded into a pointer at 3:2');
   assert.notEqual(items[0].injected_see_how, true);
 });
+
+// One lemma, three expressions (JER 39:4 vs 23:27 vs 39:17). H0376 is "a man"
+// (אִישׁ, each man), "men of" (אַנְשֵׁי, men of war) and "the men"
+// (הָאֲנָשִׁים). A figs-idiom note on the first must not become a pointer, or an
+// "also occurs" list, on the others.
+const ISH = 'אִ֣ישׁ';
+const ANSHEI = 'אַנְשֵׁ֣י';
+const HAANASHIM = 'הָֽ⁠אֲנָשִׁ֔ים';
+const ISH_ALIGNED_BOOK = [
+  '\\id JER',
+  '\\c 1',
+  '\\p',
+  `\\v 1 ${alignedWord('H0376', ISH, ['a', 'man'])}`,
+  '\\c 3',
+  '\\p',
+  `\\v 2 ${alignedWord('H0376', ANSHEI, ['men', 'of'])}`,
+  `\\v 5 ${alignedWord('H0376', HAANASHIM, ['the', 'men'])}`,
+  `\\v 6 ${alignedWord('H0376', ISH, ['a', 'man'])}`,
+  '',
+].join('\n');
+const ISH_HEBREW_BOOK = [
+  '\\id JER',
+  '\\c 3',
+  `\\v 2 \\w ${ANSHEI}|lemma="אִישׁ" strong="H0376"\\w*`,
+  `\\v 5 \\w ${HAANASHIM}|lemma="אִישׁ" strong="H0376"\\w*`,
+  `\\v 6 \\w ${ISH}|lemma="אִישׁ" strong="H0376"\\w*`,
+  '',
+].join('\n');
+const ISH_TN = [
+  'Reference\tID\tTags\tSupportReference\tQuote\tOccurrence\tNote',
+  `1:1\tabcd\t\trc://*/ta/man/translate/figs-idiom\t${ISH}\t1\tJeremiah is using **a man** to mean “each man.”`,
+  '',
+].join('\n');
+const ISH_ALIGNMENT = {
+  '3:2': [{ heb: ANSHEI, strong: 'H0376' }],
+  '3:5': [{ heb: HAANASHIM, strong: 'H0376' }],
+  '3:6': [{ heb: ISH, strong: 'H0376' }],
+};
+const ishItem = (overrides) => item(Object.assign({
+  sref: 'figs-idiom', gl_quote: 'men of', issue_span_gl_quote: 'men of', orig_quote: ANSHEI,
+}, overrides));
+
+test('single common word: another form of the lemma gets no pointer and no also-occurs list', async () => {
+  const dirPath = setupPipeDir({
+    book: 'JER', items: [ishItem({ reference: '3:2', id: 'aaaa' })],
+    alignedBook: ISH_ALIGNED_BOOK, hebrewBook: ISH_HEBREW_BOOK,
+    alignmentData: ISH_ALIGNMENT, tnBookTsv: ISH_TN,
+  });
+  buildRecurrenceIndexFile({ pipeDir: dirPath });
+  await runSeeHowDetection({ pipeDir: dirPath, generateIdsFn: stubIds });
+
+  const items = readPrepared(dirPath).items;
+  assert.equal(items.length, 1);
+  assert.equal(items[0].programmatic_note, undefined, '"men of" is not "a man": no pointer to 1:1');
+  assert.equal(items[0].also_occurs_verses, undefined, '"the men" at v5 is not "men of": not listed');
+});
+
+test('single common word: only occurrences in the noted form are injected', async () => {
+  const dirPath = setupPipeDir({
+    book: 'JER', items: [],
+    alignedBook: ISH_ALIGNED_BOOK, hebrewBook: ISH_HEBREW_BOOK,
+    alignmentData: ISH_ALIGNMENT, tnBookTsv: ISH_TN,
+  });
+  buildRecurrenceIndexFile({ pipeDir: dirPath });
+  await runSeeHowDetection({ pipeDir: dirPath, generateIdsFn: stubIds });
+
+  const items = readPrepared(dirPath).items;
+  assert.deepEqual(items.map((it) => it.reference), ['3:6'], 'v2 "men of" and v5 "the men" are other forms');
+  assert.match(items[0].programmatic_note, /\[1:1\]\(\.\.\/01\/01\.md\)/);
+  assert.equal(items[0].also_occurs_verses, undefined);
+});
+
+test('single common word: the same form with an attached prefix still gets its pointer', async () => {
+  const aligned = ISH_ALIGNED_BOOK.replace(`\\v 6 ${alignedWord('H0376', ISH, ['a', 'man'])}`,
+    `\\v 6 ${alignedWord('H0376', 'לְ⁠אִ֣ישׁ', ['to', 'a', 'man'])}`);
+  const hebrew = ISH_HEBREW_BOOK.replace(`\\v 6 \\w ${ISH}|`, '\\v 6 \\w לְ⁠אִ֣ישׁ|');
+  const dirPath = setupPipeDir({
+    book: 'JER', items: [], alignedBook: aligned, hebrewBook: hebrew,
+    alignmentData: ISH_ALIGNMENT, tnBookTsv: ISH_TN,
+  });
+  buildRecurrenceIndexFile({ pipeDir: dirPath });
+  await runSeeHowDetection({ pipeDir: dirPath, generateIdsFn: stubIds });
+
+  assert.deepEqual(readPrepared(dirPath).items.map((it) => it.reference), ['3:6']);
+});
+
+test('names keep matching by lemma whatever ending the word carries', async () => {
+  const BABEL = 'בָּבֶ֣ל';
+  const BABELAH = 'בָּבֶ֣לָה';
+  const aligned = [
+    '\\id JER', '\\c 1', '\\p', `\\v 1 ${alignedWord('H0894', BABEL, ['Babylon'])}`,
+    '\\c 3', '\\p', `\\v 2 ${alignedWord('H0894', BABELAH, ['to', 'Babylon'])}`, '',
+  ].join('\n');
+  const hebrew = ['\\id JER', '\\c 3', `\\v 2 \\w ${BABELAH}|lemma="בָּבֶל" strong="H0894"\\w*`, ''].join('\n');
+  const tn = [
+    'Reference\tID\tTags\tSupportReference\tQuote\tOccurrence\tNote',
+    `1:1\tabcd\t\trc://*/ta/man/translate/translate-names\t${BABEL}\t1\t**Babylon** is the name of a city.`,
+    '',
+  ].join('\n');
+  const dirPath = setupPipeDir({
+    book: 'JER', items: [], alignedBook: aligned, hebrewBook: hebrew, alignmentData: {}, tnBookTsv: tn,
+  });
+  buildRecurrenceIndexFile({ pipeDir: dirPath });
+  await runSeeHowDetection({ pipeDir: dirPath, generateIdsFn: stubIds });
+
+  assert.deepEqual(readPrepared(dirPath).items.map((it) => it.reference), ['3:2']);
+});
