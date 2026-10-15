@@ -9,7 +9,6 @@ const {
   deriveRecurrenceKeys,
   formatTnLink,
   buildSeeHowSentence,
-  formatAlsoOccurs,
   isSeeHowEligible,
   hebTokens,
   SEE_HOW_SINGLE_WORD_SREFS,
@@ -114,15 +113,6 @@ test('buildSeeHowSentence follows the corpus phrasing table', () => {
     buildSeeHowSentence({ book: 'ZEC', targetRef: '1:1', sameSref: true, glQuote: 'a b c d e f g', sref: 'figs-possession' }),
     /this expression/
   );
-});
-
-test('formatAlsoOccurs uses the Oxford comma, collapses 3+ runs, and handles bridges', () => {
-  assert.equal(formatAlsoOccurs(['5', '7', '8', '11']), 'This also occurs in verses 5, 7, 8, and 11.');
-  assert.equal(formatAlsoOccurs(['5', '7']), 'This also occurs in verses 5 and 7.');
-  assert.equal(formatAlsoOccurs(['5']), 'This also occurs in verse 5.');
-  assert.equal(formatAlsoOccurs(['3', '4', '5', '9']), 'This also occurs in verses 3–5 and 9.');
-  assert.equal(formatAlsoOccurs(['5-6', '9']), 'This also occurs in verses 5–6 and 9.');
-  assert.equal(formatAlsoOccurs([]), '');
 });
 
 test('eligibility guard: multi-word always, single word needs a listed sref and a non-stoplisted lemma', () => {
@@ -260,23 +250,19 @@ test('F3: corpus occurrences carry the exact UHB span when the UHB is available'
   assert.ok(index.counts.inexactSpans >= 1);
 });
 
-const { dedupeAlsoOccursVerses } = require('../src/workspace-tools/recurrence-index');
+const { dedupeVerseList } = require('../src/workspace-tools/recurrence-index');
 
-test('G3: also-occurs verses dedupe on the numeric first verse and keep the bridge form', () => {
+test('G3: pointer verses dedupe on the numeric first verse and keep the bridge form', () => {
   // A folded prepared item contributes "5"; the source span for the same bridge
   // contributes "5-6". Keyed by string those survive as two entries.
-  assert.deepEqual(dedupeAlsoOccursVerses(['5', '5-6']), ['5-6']);
-  assert.deepEqual(dedupeAlsoOccursVerses(['5-6', '5']), ['5-6']);
-  assert.deepEqual(dedupeAlsoOccursVerses(['9', '5', '7']), ['5', '7', '9'], 'ascending');
-  assert.deepEqual(dedupeAlsoOccursVerses(['5', '5']), ['5']);
-  assert.deepEqual(dedupeAlsoOccursVerses(['', null, undefined]), []);
+  assert.deepEqual(dedupeVerseList(['5', '5-6']), ['5-6']);
+  assert.deepEqual(dedupeVerseList(['5-6', '5']), ['5-6']);
+  assert.deepEqual(dedupeVerseList(['9', '5', '7']), ['5', '7', '9'], 'ascending');
+  assert.deepEqual(dedupeVerseList(['5', '5']), ['5']);
+  assert.deepEqual(dedupeVerseList(['', null, undefined]), []);
 });
 
-test('G3: formatAlsoOccurs renders a de-duplicated bridge once', () => {
-  assert.equal(formatAlsoOccurs(['5', '5-6', '9']), 'This also occurs in verses 5–6 and 9.');
-});
-
-const { assignAlsoOccursVerses, isKeySubsequence } = require('../src/workspace-tools/recurrence-index');
+const { assignPointerVerses, isKeySubsequence } = require('../src/workspace-tools/recurrence-index');
 
 test('C4: isKeySubsequence matches only contiguous runs', () => {
   assert.equal(isKeySubsequence('H0559+H3068', 'H3541+H0559+H3068+H6635b'), true);
@@ -301,7 +287,7 @@ const ZEC8_CLUSTER = [
 ];
 
 test('C5: the key covering the most verses carries the list, not the longest one', () => {
-  const allowed = assignAlsoOccursVerses(ZEC8_CLUSTER);
+  const allowed = assignPointerVerses(ZEC8_CLUSTER);
   // Coverage: 8 for the four-word key, 9 for "thus says Yahweh", 8 for the
   // other three-word key, 0 for the five-word variant (its only occurrence is
   // its own anchor). Picking the longest key used to hand the role to the
@@ -316,7 +302,7 @@ test('C5: the key covering the most verses carries the list, not the longest one
 });
 
 test('C5: within a cluster no verse is listed twice and none is lost', () => {
-  const allowed = assignAlsoOccursVerses(ZEC8_CLUSTER);
+  const allowed = assignPointerVerses(ZEC8_CLUSTER);
   const listed = [];
   for (const verses of allowed.values()) listed.push(...verses.map(Number));
   assert.equal(new Set(listed).size, listed.length, 'no verse listed twice');
@@ -331,7 +317,7 @@ test('C5: within a cluster no verse is listed twice and none is lost', () => {
 });
 
 test('C5: an unrelated key keeps its own list', () => {
-  const allowed = assignAlsoOccursVerses([
+  const allowed = assignPointerVerses([
     { key: 'H3541+H0559+H3068', anchorVerse: 3, verses: ['3', '5'] },
     { key: 'H3541+H0559', anchorVerse: 5, verses: ['3', '5'] },
     { key: 'H4325', anchorVerse: 9, verses: ['9', '12'] },
@@ -344,7 +330,7 @@ test('C5: an unrelated key keeps its own list', () => {
 });
 
 test('C5: a chain A subset B subset C is resolved as one cluster', () => {
-  const allowed = assignAlsoOccursVerses([
+  const allowed = assignPointerVerses([
     { key: 'B', anchorVerse: 4, verses: ['4', '7'] },
     { key: 'A+B', anchorVerse: 2, verses: ['2', '7'] },
     { key: 'A+B+C', anchorVerse: 7, verses: ['7', '4', '2'] },
@@ -356,14 +342,14 @@ test('C5: a chain A subset B subset C is resolved as one cluster', () => {
 });
 
 test('C5: an equal-coverage tie falls to the longer key, then the earlier anchor', () => {
-  const byLength = assignAlsoOccursVerses([
+  const byLength = assignPointerVerses([
     { key: 'B', anchorVerse: 9, verses: ['9', '11'] },
     { key: 'A+B', anchorVerse: 4, verses: ['4', '11'] },
   ]);
   assert.deepEqual(byLength.get('A+B'), ['11'], 'same coverage, longer key wins');
   assert.deepEqual(byLength.get('B'), []);
 
-  const byAnchor = assignAlsoOccursVerses([
+  const byAnchor = assignPointerVerses([
     { key: 'A+B', anchorVerse: 9, verses: ['9', '11'] },
     { key: 'B+C', anchorVerse: 4, verses: ['4', '11'] },
     { key: 'B', anchorVerse: 2, verses: ['2'] },
@@ -374,8 +360,8 @@ test('C5: an equal-coverage tie falls to the longer key, then the earlier anchor
 });
 
 test('C5: an empty or single-key set is unchanged', () => {
-  assert.equal(assignAlsoOccursVerses([]).size, 0);
-  const one = assignAlsoOccursVerses([{ key: 'H3068', anchorVerse: 1, verses: ['1', '5'] }]);
+  assert.equal(assignPointerVerses([]).size, 0);
+  const one = assignPointerVerses([{ key: 'H3068', anchorVerse: 1, verses: ['1', '5'] }]);
   assert.deepEqual(one.get('H3068'), ['5'], 'the anchor verse is never listed');
 });
 

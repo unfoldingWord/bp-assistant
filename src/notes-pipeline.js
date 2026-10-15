@@ -20,7 +20,7 @@ const { getDoor43Username, emailToFallbackUsername, buildBranchName, resolveOutp
 const { splitTsv, fixTrailingNewlines } = require('./workspace-tools/tsv-tools');
 const { fillTsvIds, generateIds, prepareNotes, fillOrigQuotes, resolveGlQuotes, flagNarrowQuotes, extractAlignmentData, prepareATContext, substituteAT, fixUnicodeQuotes, verifyBoldMatches, syncCanonicalHebrewQuotes, applyHintsToPreparedNotes, applyKeptToPreparedNotes, keptRefVerseSpan, parsePlainUsfmVersesFromText, detectIssuesTsvLayout, extractIssuesTsvRow, findVersesWithoutNotes, readWriterSkipped, recordWriterSkipRejected, parseWriterSkip, sanitizeSkipReason, _stripAlternateTranslation: stripAlternateTranslation } = require('./workspace-tools/tn-tools');
 const { checkTnQuality, detectSelfTalk, templateFirstPhrase, resolveTemplateText } = require('./workspace-tools/quality-tools');
-const { buildBookRecurrenceIndex, deriveRecurrenceKeys, buildSeeHowSentence, isSeeHowEligible, isContextDependentSref, sameFormForKey, dedupeAlsoOccursVerses, assignAlsoOccursVerses, resolveDoor43ReposPath, hebTokens, verseNumber: recurrenceVerseNumber, SEE_HOW_NEVER_FOLD_SREFS, CROSS_BOOK_MAX_BOOKS } = require('./workspace-tools/recurrence-index');
+const { buildBookRecurrenceIndex, deriveRecurrenceKeys, buildSeeHowSentence, isSeeHowEligible, isContextDependentSref, sameFormForKey, assignPointerVerses, resolveDoor43ReposPath, hebTokens, verseNumber: recurrenceVerseNumber, SEE_HOW_NEVER_FOLD_SREFS, CROSS_BOOK_MAX_BOOKS } = require('./workspace-tools/recurrence-index');
 const { loadCommonPhrases, buildIntroPointerSentence, phraseTextKey } = require('./workspace-tools/common-phrases');
 const { normalizeIssuesFile, buildParallelismIntroHintArgs } = require('./issue-normalizer');
 const { runIssueRulesGate, gatePrBodyForPush, refreshGateSidecarOutputHash, readGateSidecar, keptDropsStillCovered } = require('./issue-rules-gate');
@@ -398,7 +398,7 @@ function buildRecurrenceIndexFile({ pipeDir, contextPath }) {
  * runtime paths, so the chapter's detection result never reaches the file the
  * shard's writer session reads. Running it here means the shard's
  * prepared_notes.json is already the post-detection one, with the shard's
- * verseStart/verseEnd bounding injection and also-occurs lists.
+ * verseStart/verseEnd bounding injection and pointers.
  *
  * @returns {Promise<string|null>} the detection summary, or null on failure
  */
@@ -435,7 +435,7 @@ async function runShardSeeHowDetection({ contextPath, issuesPath, status, genera
   }
 }
 
-const SEE_HOW_ZERO_SUMMARY = '0 see-how back-refs, 0 folded, 0 injected, 0 also-occurs lists, 0 skipped (inexact quote), 0 same-verse combinations, 0 cross-book, 0 skipped (tW name)';
+const SEE_HOW_ZERO_SUMMARY = '0 see-how back-refs, 0 folded, 0 injected, 0 skipped (inexact quote), 0 same-verse combinations, 0 cross-book, 0 skipped (tW name)';
 
 // Corpus-wide index behind rule 3, rebuilt by build_crossbook_seehow_index.
 const CROSS_BOOK_INDEX_REL = 'data/cache/crossbook_seehow_index.json';
@@ -443,10 +443,12 @@ const CROSS_BOOK_INDEX_REL = 'data/cache/crossbook_seehow_index.json';
 /**
  * "See how" detection pass.
  *
- * Rule 1 (same chapter): later occurrences of a phrase that already carries a
- *   note in this chapter are removed from the prepared list; their verses are
- *   collected onto the first item as `also_occurs_verses`, rendered as
- *   "This also occurs in verses …" when the TSV is assembled.
+ * Rule 1 (same chapter): every later occurrence of a phrase that already
+ *   carries a note in this chapter becomes its own "See how you translated ..."
+ *   pointer to that note, whether the issue pass flagged it or not (an unflagged
+ *   one is synthesized, as in phase 3). Nothing is written onto the earlier
+ *   note, and nothing points forward. Decision 2026-10-14; it replaced the
+ *   "This also occurs in verses ..." sentence.
  * Rule 2 (earlier chapter): the chapter's first occurrence of a phrase already
  *   noted in an earlier chapter becomes a pointer to the FIRST occurrence in the
  *   book that carries a note. Never the nearest, never a chain, never forward,
@@ -683,7 +685,8 @@ async function runSeeHowDetection({ pipeDir, contextPath, generateIdsFn = genera
 
   const applyPointer = (item, key, target) => {
     const targetSref = target.sref || '';
-    const bold = targetBoldQuote(target);
+    // A same-chapter target's note is not written yet, so its gloss stands in for the bold text.
+    const bold = targetBoldQuote(target) || String(target.glQuote || '').trim();
     const glQuote = String(item.gl_quote || '').trim();
     const sameSref = !!(targetSref && item.sref && targetSref === item.sref);
     const sameWording = !!(bold && glQuote && bold.toLowerCase() === glQuote.toLowerCase());
@@ -711,18 +714,10 @@ async function runSeeHowDetection({ pipeDir, contextPath, generateIdsFn = genera
     return true;
   };
 
-  const setAlsoOccurs = (item, verses) => {
-    const list = dedupeAlsoOccursVerses(verses);
-    if (!list.length) return false;
-    item.also_occurs_verses = list;
-    return true;
-  };
-
   let seeHowCount = 0;
   let combinedCount = 0;
   let foldedCount = 0;
   let injectedCount = 0;
-  let alsoOccursCount = 0;
   let inexactSkipped = 0;
   let crossBookCount = 0;
   let twNameSkipped = 0;
@@ -761,7 +756,6 @@ async function runSeeHowDetection({ pipeDir, contextPath, generateIdsFn = genera
     // The tA link goes on this note, not in the intro.
     item.support_reference = entry.sref || item.sref || '';
     item.common_phrase = entry.id;
-    delete item.also_occurs_verses;
     item.writer_packet = Object.assign({}, item.writer_packet || {}, { programmatic_note: note });
     item.prompt = `Return only this note exactly as written:\n${note}`;
   };
@@ -801,7 +795,7 @@ async function runSeeHowDetection({ pipeDir, contextPath, generateIdsFn = genera
         if (occ && entry.sref && occ.quote_exact !== false) {
           commonSlots.push(`${occ.ref}|${hebTokens(occ.quote).join('+')}`);
           commonInjections.push({
-            key: entry.keys[0], target: { sref: entry.sref }, occ, alsoVerses: [], foldItems: [],
+            key: entry.keys[0], target: { sref: entry.sref }, occ,
             intro: entry, fallback: aiMatches[0] || null,
           });
         } else {
@@ -868,8 +862,8 @@ async function runSeeHowDetection({ pipeDir, contextPath, generateIdsFn = genera
   const removed = new Set();
   // A same-verse duplicate is attached to its primary by _combine_with and is
   // not itself grouped. If the primary is folded away, the duplicate must go
-  // with it -- otherwise it writes a full note on a verse the anchor's
-  // "also occurs" list has already declared folded.
+  // with it -- otherwise it writes a full note on a verse that already has a
+  // pointer.
   const combinedBy = new Map();
   for (const it of items) {
     if (!it._combine_with) continue;
@@ -937,8 +931,8 @@ async function runSeeHowDetection({ pipeDir, contextPath, generateIdsFn = genera
         if (!plain.length) continue;
         group = plain;
         lead = group[0];
-        // The exempt items keep their own notes, so no remaining note may say
-        // the phrase "also occurs" at their verses.
+        // The exempt items keep their own notes, so no pointer may be added at
+        // their verses.
         const exemptVerses = new Set(fullGroup.filter((it) => !group.includes(it)).map((it) => recurrenceVerseNumber(verseOf(it.reference))));
         corpusHere = corpusHere.filter((o) => !exemptVerses.has(recurrenceVerseNumber(o.verse)));
         foldsAnySref = isSeeHowEligible(key, lead.sref) && !isContextDependentSref(lead.sref, key);
@@ -1054,74 +1048,155 @@ async function runSeeHowDetection({ pipeDir, contextPath, generateIdsFn = genera
   }
 
   // A fixed formula and its sub-phrases match overlapping verse sets, so each
-  // would otherwise print a near-identical "This also occurs in verses ..."
-  // sentence (published ZEC 8). Within a containment cluster the key covering
-  // the most verses lists them all and every other key lists only what is left
-  // over, so no verse is listed twice and none is lost.
-  const alsoOccursAllowed = assignAlsoOccursVerses(
+  // would otherwise write a near-identical pointer at the same later verses
+  // (published ZEC 8). Within a containment cluster the key covering the most
+  // verses takes them all and every other key gets only what is left over, so
+  // no verse is claimed twice and none is lost.
+  const pointerVersesAllowed = assignPointerVerses(
     plans
       .filter((p) => !p.skipped && (p.kind === 'injection' || (p.foldsAnySref && !p.ctxPointer)))
       .map((p) => ({
         key: p.key,
         anchorVerse: p.anchorVerseNum,
-        verses: p.corpusHere.map((o) => String(o.verse)),
+        // Only verses this key can point at: after its own anchor, with a quote
+        // that can be written. A verse claimed here and then dropped would be
+        // lost to every other key in the cluster.
+        verses: p.corpusHere
+          .filter((o) => recurrenceVerseNumber(o.verse) > p.anchorVerseNum && o.quote_exact !== false)
+          .map((o) => String(o.verse)),
       }))
   );
-  const corpusVersesFor = (plan) => (plan.skipped ? [] : (alsoOccursAllowed.get(plan.key) || []));
+  const corpusVersesFor = (plan) => (plan.skipped ? [] : (pointerVersesAllowed.get(plan.key) || []));
+
+  // Every later occurrence of a phrase in the chapter gets its own "See how you
+  // translated ..." pointer, never an "also occurs" sentence on the earlier
+  // note. The target is the book-first note when there is one, otherwise the
+  // chapter's first note, never a pointer row (no chains). Nothing points
+  // forward: only verses after the anchor are touched.
+  const pointerTargetFor = (lead) => ({
+    ref: lead.reference,
+    chapter: chapterOf(lead.reference),
+    verse: verseOf(lead.reference),
+    sref: lead.sref || '',
+    quote: lead.orig_quote || '',
+    glQuote: lead.gl_quote || '',
+    note: '',
+    isPointer: false,
+    source: 'chapter',
+    id: lead.id || '',
+  });
+  const tokensOf = (quote) => String(quote || '').split('&').flatMap(hebTokens);
+  // Two quotes overlap when they share two words (or the one word, for a
+  // one-word quote). "thus says Yahweh" and "says Yahweh of hosts" overlap.
+  const quotesOverlap = (a, b) => {
+    if (!a.length || !b.length) return false;
+    const inB = new Set(b);
+    const shared = new Set(a.filter((t) => inB.has(t))).size;
+    return shared >= Math.min(2, a.length, b.length);
+  };
+  // A note or pointer on the same article already sits on this verse and quotes
+  // an overlapping phrase: another pointer beside it would repeat it.
+  // Prepared rows already turned into pointers (their `sref` is still the old
+  // article; the pointer's article is the target's).
+  const pointerRows = [];
+  const recordPointerRow = (it, target) => pointerRows.push({
+    verse: recurrenceVerseNumber(verseOf(it.reference)),
+    sref: String(target.sref || ''),
+    tokens: tokensOf(it.orig_quote),
+  });
+  const pointerRowCovers = (verse, sref, tokens) => pointerRows.some((r) => r.verse === verse
+    && r.sref === String(sref || '') && quotesOverlap(tokens, r.tokens));
+  const verseAlreadyCovers = (occ, sref) => {
+    const v = recurrenceVerseNumber(occ.verse);
+    const want = tokensOf(occ.quote);
+    const here = (ref, other, otherSref) => recurrenceVerseNumber(verseOf(ref)) === v
+      && chapterOf(ref) === chapter
+      && String(otherSref || '') === String(sref || '')
+      && quotesOverlap(want, tokensOf(other));
+    return items.some((it) => !removed.has(it) && !commonDropped.has(it) && here(it.reference, it.orig_quote, it.sref))
+      || pointerRowCovers(v, sref, want)
+      || injections.some((inj) => inj.occ && here(inj.occ.ref, inj.occ.quote, inj.target && inj.target.sref));
+  };
+  // Queue one injected pointer per allowed occurrence after the anchor.
+  const queueLaterPointers = (plan, laterTarget, pointedVerses) => {
+    const allowed = new Set(corpusVersesFor(plan).map((v) => recurrenceVerseNumber(v)));
+    for (const occ of plan.corpusHere) {
+      const v = recurrenceVerseNumber(occ.verse);
+      if (!allowed.has(v) || v <= plan.anchorVerseNum || pointedVerses.has(v)) continue;
+      const slot = `${occ.ref}|${hebTokens(occ.quote).join('+')}`;
+      if (injectedAt.has(slot)) continue;
+      if (occ.quote_exact === false) { inexactSkipped++; continue; }
+      if (verseAlreadyCovers(occ, laterTarget.sref)) continue;
+      injectedAt.add(slot);
+      pointedVerses.add(v);
+      injections.push({ key: plan.key, target: laterTarget, occ });
+    }
+  };
 
   for (const plan of plans) {
-    if (plan.kind !== 'group') continue;
+    if (plan.kind === 'injection') {
+      if (plan.skipped) continue;
+      injections.push({ key: plan.key, target: plan.target, occ: plan.anchorOcc });
+      queueLaterPointers(plan, plan.target, new Set([plan.anchorVerseNum]));
+      continue;
+    }
     const { key, group, lead, canFold, target, pointerCase, anchorOcc, anchorItem } = plan;
-    const alsoVerses = [];
+    const laterTarget = pointerCase ? target : pointerTargetFor(lead);
+    const pointedVerses = new Set();
+    // A flagged later occurrence becomes a pointer; a second row for the same
+    // phrase on a verse that already has one is simply dropped.
+    const pointLater = (it) => {
+      const v = recurrenceVerseNumber(verseOf(it.reference));
+      // A second row for the phrase on this verse, or another phrase's pointer
+      // on the same article with overlapping wording, makes this one redundant.
+      if (pointedVerses.has(v) || pointerRowCovers(v, laterTarget.sref, tokensOf(it.orig_quote))) {
+        fold(it); foldedCount++; return;
+      }
+      if (!applyPointer(it, key, laterTarget)) return;
+      recordPointerRow(it, laterTarget);
+      pointedVerses.add(v);
+      for (const dup of (combinedBy.get(it.id) || [])) removed.add(dup);
+      seeHowCount++;
+      if (laterTarget.crossBook) crossBookCount++;
+    };
 
     if (pointerCase) {
-      const foldItems = group.filter((it) => it !== anchorItem && canFold(it));
-      // A folded sibling always contributes its own verse; the corpus-derived
-      // verses are whatever this key was allowed to keep.
-      alsoVerses.push(...foldItems.map((it) => verseOf(it.reference)));
-      alsoVerses.push(...corpusVersesFor(plan));
-
       if (anchorItem) {
         // If the sentence could not be built, leave the group exactly as it
-        // was: folding siblings into a note that never became a pointer would
-        // delete real notes and point at nothing.
+        // was: pointing siblings at a note that never became a pointer would
+        // leave them with nothing to point to.
         if (!applyPointer(anchorItem, key, target)) continue;
+        recordPointerRow(anchorItem, target);
         seeHowCount++;
         if (target.crossBook) crossBookCount++;
-        if (setAlsoOccurs(anchorItem, alsoVerses)) alsoOccursCount++;
-        for (const it of foldItems) { fold(it); foldedCount++; }
+        pointedVerses.add(plan.anchorVerseNum);
       } else if (anchorOcc && !plan.skipped) {
-        // Nothing was flagged at the anchor verse -- synthesize the pointer
-        // there. The folds only happen if that injection actually materializes.
-        injections.push({ key, target, occ: anchorOcc, alsoVerses, foldItems });
+        // Nothing was flagged at the anchor verse -- synthesize the pointer there.
+        injections.push({ key, target, occ: anchorOcc });
+        pointedVerses.add(plan.anchorVerseNum);
       }
+      // The anchor slot is taken (an editor-kept note) or cannot be written:
+      // the repeats keep their own notes rather than point at a missing one.
+      if (!anchorItem && plan.skipped) continue;
+      for (const it of group.filter((g) => g !== anchorItem && canFold(g))) pointLater(it);
+      queueLaterPointers(plan, target, pointedVerses);
       continue;
     }
 
-    // (b) Book-first case: this IS the explanatory note and its prose is about
-    // the verse the model wrote it on, so it stays put. Every other in-range
-    // occurrence in the chapter -- earlier as well as later -- is merely listed.
+    // Book-first case: the lead IS the explanatory note and its prose is about
+    // the verse the model wrote it on, so it stays put. Later occurrences point
+    // at it.
+    pointedVerses.add(recurrenceVerseNumber(verseOf(lead.reference)));
+    // A lead the issue pass itself wrote as a "See how" row is a pointer, not a
+    // target: pointing at it would build a chain.
+    if (/^see_how/.test(String(lead.note_type || ''))) continue;
     for (let i = 1; i < group.length; i++) {
       const later = group[i];
       if (later.reference === lead.reference) continue;
       if (!canFold(later)) continue;
-      fold(later);
-      alsoVerses.push(verseOf(later.reference));
-      foldedCount++;
+      pointLater(later);
     }
-    alsoVerses.push(...corpusVersesFor(plan));
-    if (setAlsoOccurs(lead, alsoVerses)) alsoOccursCount++;
-  }
-
-  for (const plan of plans) {
-    if (plan.kind !== 'injection' || plan.skipped) continue;
-    injections.push({
-      key: plan.key,
-      target: plan.target,
-      occ: plan.anchorOcc,
-      alsoVerses: corpusVersesFor(plan),
-      foldItems: [],
-    });
+    queueLaterPointers(plan, laterTarget, pointedVerses);
   }
 
   injections.push(...commonInjections);
@@ -1146,7 +1221,7 @@ async function runSeeHowDetection({ pipeDir, contextPath, generateIdsFn = genera
   }
 
   for (let i = 0; i < injections.length; i++) {
-    const { key, target, occ, alsoVerses, foldItems, intro, fallback } = injections[i];
+    const { key, target, occ, intro, fallback } = injections[i];
     const id = newIds[i] || '';
     if (!id) {
       // The phrase's other rows are already dropped; without an id for the
@@ -1190,8 +1265,6 @@ async function runSeeHowDetection({ pipeDir, contextPath, generateIdsFn = genera
     }
     if (!applyPointer(item, key, target)) continue;
     if (target.crossBook) crossBookCount++;
-    if (setAlsoOccurs(item, alsoVerses)) alsoOccursCount++;
-    for (const it of (foldItems || [])) { fold(it); foldedCount++; }
     items.push(item);
     injectedCount++;
     seeHowCount++;
@@ -1204,14 +1277,12 @@ async function runSeeHowDetection({ pipeDir, contextPath, generateIdsFn = genera
   }
   prepared.item_count = prepared.items.length;
 
-  // alsoOccursCount matters here: a chapter can gain nothing but an "also
-  // occurs" list, and that change still has to reach prepared_notes.json.
-  if (seeHowCount > 0 || combinedCount > 0 || foldedCount > 0 || injectedCount > 0 || alsoOccursCount > 0
+  if (seeHowCount > 0 || combinedCount > 0 || foldedCount > 0 || injectedCount > 0
     || commonPointerCount > 0 || commonDropped.size > 0) {
     fs.writeFileSync(prepPath, JSON.stringify(prepared, null, 2));
   }
 
-  let summary = `${seeHowCount} see-how back-refs, ${foldedCount} folded, ${injectedCount} injected, ${alsoOccursCount} also-occurs lists, ${inexactSkipped} skipped (inexact quote), ${combinedCount} same-verse combinations, ${crossBookCount} cross-book, ${twNameSkipped} skipped (tW name)`;
+  let summary = `${seeHowCount} see-how back-refs, ${foldedCount} folded, ${injectedCount} injected, ${inexactSkipped} skipped (inexact quote), ${combinedCount} same-verse combinations, ${crossBookCount} cross-book, ${twNameSkipped} skipped (tW name)`;
   // Only when the list applied, so a chapter without listed phrases keeps the
   // zero summary the caller compares against.
   if (commonPointerCount > 0 || commonDropped.size > 0) {
@@ -4029,7 +4100,7 @@ async function notesPipeline(route, message) {
           // Apply editor-marked TN hints (API-origin only) BEFORE see-how
           // detection. Applied after, a hint on a verse whose only item had
           // been folded away was dropped as "outside chapter scope", and a
-          // hint suppressing an anchor took its also-occurs list with it.
+          // hint suppressing an anchor took its pointers with it.
           // Hint items carry fromHint, so detection skips them as anchors and
           // as fold candidates and the editor's own note is preserved.
           //

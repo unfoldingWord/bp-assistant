@@ -36,17 +36,23 @@ session log — what you just did belongs in the commit message and PR body.
 
 ## Lessons learned
 
-- **See-how pointers are deterministic (decision 2026-09-02).** The recurrence
-  index (`src/workspace-tools/recurrence-index.js`) and `runSeeHowDetection`
-  in `src/notes-pipeline.js` implement the rule: same-chapter repeats fold into
-  the first note's "This also occurs in verses …" sentence; the first
-  occurrence in a chapter of a phrase noted in an earlier chapter points to the
-  phrase's **first** occurrence in the book (never the nearest, never a chain);
-  never forward, never at nothing. The LLM must never write pointers. Cross-book
-  pointers are unfoldingWord/bp-assistant#367.
+- **See-how pointers are deterministic; every repeat gets its own pointer
+  (decision 2026-10-14, replacing the 2026-09-02 "also occurs" rule).** The
+  recurrence index (`src/workspace-tools/recurrence-index.js`) and
+  `runSeeHowDetection` in `src/notes-pipeline.js` implement it. The first note
+  for a phrase is written in full. Each later occurrence in the chapter, flagged
+  by the issue pass or not, becomes "See how you translated ..." pointing at
+  the phrase's **first** noted occurrence in the book (never the nearest, never
+  a chain, never a pointer row); when the book-first note is in this chapter,
+  the chapter's first note is the target. Nothing points forward, and no note
+  ever carries a "This also occurs in verses ..." sentence (the sentence is
+  still stripped from old text in quality-tools). The LLM must never write
+  pointers. Cross-book pointers are unfoldingWord/bp-assistant#367. A single
+  common word matches only in the same form (H0376 is "a man", "men of" and
+  "the men"); names and multi-word phrases match by Strong's number.
 - **Published corpus reference points for see-how share:** 9.1% of all notes;
   JOS 13%, GEN 16%, 2KI/PRO ~25%. Zechariah's 13 published pointers are all
-  same-chapter, so under the rule they become "also occurs" lists, not pointers.
+  same-chapter, which is the shape the 2026-10-14 rule now produces.
 - **UHB span reconstruction is not always exact.** ~1–1.5% of aligned spans
   cannot be located in the UHB verse and fall back to a space-join (counted in
   `counts.inexactSpans`). Those quotes may fail `syncCanonicalHebrewQuotes`.

@@ -11,7 +11,7 @@ const crypto = require('crypto');
 const { normalizeIntroRow } = require('../lib/insert-tn-rows');
 const { HEBREW_QUOTE_STRIP_RE, stripHebrewQuoteMarks, normalizeQuote } = require('../lib/quote-normalize');
 const { keptRefVerseSpan } = require('../lib/kept-notes');
-const { buildSeeHowSentence, formatAlsoOccurs } = require('./recurrence-index');
+const { buildSeeHowSentence } = require('./recurrence-index');
 const { BOOK_NAMES } = require('../api-runner/verse-data');
 
 const CSKILLBP_DIR = process.env.CSKILLBP_DIR || '/srv/bot/workspace';
@@ -1276,22 +1276,6 @@ function normalizeAssembledNoteText(noteText) {
     .trim();
 }
 
-/**
- * Append the deterministic "This also occurs in verses …" sentence produced by
- * the see-how detector. It goes BEFORE any trailing " Alternate translation: ["
- * so the AT clause stays last, and it is idempotent across the two assembly
- * passes (pre- and post-AT generation).
- */
-function appendAlsoOccurs(note, alsoOccursVerses) {
-  const sentence = formatAlsoOccurs(alsoOccursVerses || []);
-  if (!sentence) return note;
-  const text = String(note || '');
-  if (text.includes(sentence)) return text;
-  const atIdx = text.indexOf(' Alternate translation: [');
-  if (atIdx < 0) return `${text} ${sentence}`.trim();
-  return `${text.slice(0, atIdx)} ${sentence}${text.slice(atIdx)}`.trim();
-}
-
 function cleanPlainUsfmVerseText(rawText) {
   return String(rawText || '')
     .replace(/\\zaln-[se][^*]*\*/g, '')
@@ -1629,7 +1613,7 @@ function assembleNotes({ preparedJson, generatedJson, output }) {
     if (!noteText && item.reference && item.sref) noteText = generated[`${item.reference}:${item.sref}`] || generated[`${item.reference}_${item.sref}`];
     if (!noteText) { missing.push(item.id || `index:${item.index}`); continue; }
     const quote = item.orig_quote || '';
-    const note = appendAlsoOccurs(normalizeAssembledNoteText(noteText), item.also_occurs_verses);
+    const note = normalizeAssembledNoteText(noteText);
     // A see-how pointer inherits the target row's SupportReference; an empty
     // string set by the detector means "leave the column blank".
     const srefBase = String(
@@ -3808,7 +3792,6 @@ module.exports = {
   _buildWriterPrompt: buildWriterPrompt,
   _maybeBuildProgrammaticNote: maybeBuildProgrammaticNote,
   _normalizeAssembledNoteText: normalizeAssembledNoteText,
-  _appendAlsoOccurs: appendAlsoOccurs,
   _buildSeeHowReference: buildSeeHowReference,
   _inspectOpeningBold: inspectOpeningBold,
   _resolveGlQuotes: resolveGlQuotes,

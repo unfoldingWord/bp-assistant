@@ -15,7 +15,6 @@ const {
   _buildRecurrenceIndexFile: buildRecurrenceIndexFile,
   _SEE_HOW_ZERO_SUMMARY: SEE_HOW_ZERO_SUMMARY,
 } = require('../src/notes-pipeline');
-const { assembleNotes } = require('../src/workspace-tools/tn-tools');
 
 const WORD_OF_YAHWEH = 'דְּבַר־יְהוָ֖ה';
 
@@ -153,7 +152,7 @@ function item(overrides) {
   }, overrides);
 }
 
-test('rule 1: later same-chapter items fold into the first item\'s also-occurs list', async () => {
+test('rule 1: later same-chapter items become pointers to the first item, which gets no sentence', async () => {
   const dirPath = setupPipeDir({
     items: [
       item({ reference: '3:2', id: 'aaaa', index: 0 }),
@@ -166,15 +165,23 @@ test('rule 1: later same-chapter items fold into the first item\'s also-occurs l
   const summary = await runSeeHowDetection({ pipeDir: dirPath, generateIdsFn: stubIds });
 
   const prepared = readPrepared(dirPath);
-  assert.deepEqual(prepared.items.map((it) => it.id), ['aaaa'], 'later occurrences are removed');
-  assert.deepEqual(prepared.items[0].also_occurs_verses, ['5', '7']);
-  assert.equal(prepared.item_count, 1);
-  assert.match(summary, /2 folded/);
+  assert.deepEqual(prepared.items.map((it) => it.id), ['aaaa', 'bbbb', 'cccc'], 'later occurrences are kept');
+  const [first, ...later] = prepared.items;
+  assert.equal(first.programmatic_note, undefined, 'the first note is written normally');
+  assert.equal(first.also_occurs_verses, undefined);
+  assert.deepEqual(later.map((it) => it.programmatic_note), [
+    'See how you translated **the word of Yahweh** in [3:2](../03/02.md).',
+    'See how you translated **the word of Yahweh** in [3:2](../03/02.md).',
+  ]);
+  assert.deepEqual(later.map((it) => it.note_type), ['see_how', 'see_how']);
+  assert.equal(prepared.item_count, 3);
+  assert.match(summary, /^2 see-how back-refs, 0 folded/);
 });
 
 test('rule 2: the chapter\'s first occurrence points at the FIRST noted occurrence in the book, not the nearest', async () => {
   const dirPath = setupPipeDir({
     items: [item({ reference: '3:2', id: 'aaaa' }), item({ reference: '3:5', id: 'bbbb', index: 1 })],
+    hebrewBook: HEBREW_BOOK,
   });
   buildRecurrenceIndexFile({ pipeDir: dirPath });
   await runSeeHowDetection({ pipeDir: dirPath, generateIdsFn: stubIds });
@@ -188,7 +195,14 @@ test('rule 2: the chapter\'s first occurrence points at the FIRST noted occurren
   );
   assert.equal(first.tags, '');
   assert.equal(first.support_reference, 'figs-possession', 'SupportReference inherited from the target row');
-  assert.deepEqual(first.also_occurs_verses, ['5', '7']);
+  assert.equal(first.also_occurs_verses, undefined);
+
+  const items = readPrepared(dirPath).items;
+  const v5 = items.find((it) => it.id === 'bbbb');
+  assert.equal(v5.programmatic_note, first.programmatic_note, 'a flagged later occurrence points at the same target, not at 3:2');
+  const v7 = items.find((it) => it.reference === '3:7');
+  assert.equal(v7.injected_see_how, true, 'an unflagged later occurrence gets its own pointer');
+  assert.match(v7.programmatic_note, /\[1:1\]\(\.\.\/01\/01\.md\)/);
 });
 
 test('no pointer is emitted when no earlier chapter has a note for the key', async () => {
@@ -228,16 +242,17 @@ test('phase 3: a pointer is injected when the chapter flagged nothing for an alr
   const summary = await runSeeHowDetection({ pipeDir: dirPath, generateIdsFn: stubIds });
 
   const prepared = readPrepared(dirPath);
-  assert.equal(prepared.items.length, 1, 'exactly one injected item per key per chapter');
-  const injected = prepared.items[0];
+  assert.deepEqual(prepared.items.map((it) => it.reference).sort(), ['3:2', '3:5', '3:7'], 'one injected pointer per occurrence');
+  const injected = prepared.items.find((it) => it.reference === '3:2');
   assert.equal(injected.reference, '3:2', 'injected on the chapter\'s first occurrence');
   assert.equal(injected.note_type, 'see_how');
   assert.equal(injected.injected_see_how, true);
   assert.equal(injected.at_policy, 'not_needed');
   assert.equal(injected.id, 'z000');
   assert.match(injected.programmatic_note, /\[1:1\]\(\.\.\/01\/01\.md\)/);
-  assert.deepEqual(injected.also_occurs_verses, ['5', '7']);
-  assert.match(summary, /1 injected/);
+  assert.equal(injected.also_occurs_verses, undefined);
+  for (const it of prepared.items) assert.match(it.programmatic_note, /\[1:1\]\(\.\.\/01\/01\.md\)/);
+  assert.match(summary, /3 injected/);
 });
 
 test('at_provided is appended to the pointer note', async () => {
@@ -284,7 +299,7 @@ test('same-verse duplicates keep the _combine_with behaviour', async () => {
   assert.match(summary, /1 same-verse combinations/);
 });
 
-test('a missing TN clone and a missing aligned book degrade gracefully; folding still works', async () => {
+test('a missing TN clone and a missing aligned book degrade gracefully; same-chapter pointers still work', async () => {
   const dirPath = setupPipeDir({
     items: [item({ reference: '3:2', id: 'aaaa' }), item({ reference: '3:5', id: 'bbbb', index: 1 })],
     tnBookTsv: '',
@@ -294,9 +309,10 @@ test('a missing TN clone and a missing aligned book degrade gracefully; folding 
   const summary = await runSeeHowDetection({ pipeDir: dirPath, generateIdsFn: stubIds });
 
   const prepared = readPrepared(dirPath);
-  assert.equal(prepared.items.length, 1);
-  assert.deepEqual(prepared.items[0].also_occurs_verses, ['5']);
-  assert.match(summary, /0 see-how back-refs/);
+  assert.equal(prepared.items.length, 2);
+  assert.equal(prepared.items[0].also_occurs_verses, undefined);
+  assert.equal(prepared.items[1].programmatic_note, 'See how you translated **the word of Yahweh** in [3:2](../03/02.md).');
+  assert.match(summary, /^1 see-how back-refs/);
 });
 
 test('detection is a no-op on an empty chapter with no index', async () => {
@@ -331,32 +347,7 @@ test('PSA pointers pad chapter and verse to three digits', async () => {
   assert.match(first.programmatic_note, /\[78:1\]\(\.\.\/078\/001\.md\)/);
 });
 
-test('the also-occurs sentence lands before the Alternate translation clause at TSV assembly', async () => {
-  const dirPath = setupPipeDir({
-    items: [item({ reference: '3:2', id: 'aaaa' }), item({ reference: '3:5', id: 'bbbb', index: 1 })],
-    tnBookTsv: '',
-  });
-  buildRecurrenceIndexFile({ pipeDir: dirPath });
-  await runSeeHowDetection({ pipeDir: dirPath, generateIdsFn: stubIds });
-
-  fs.writeFileSync(
-    path.join(WORKSPACE, dirPath, 'generated_notes.json'),
-    JSON.stringify({ aaaa: 'The possessive form describes a message. Alternate translation: [a message from Yahweh]' })
-  );
-  assembleNotes({
-    preparedJson: `${dirPath}/prepared_notes.json`,
-    generatedJson: `${dirPath}/generated_notes.json`,
-    output: `${dirPath}/out.tsv`,
-  });
-  const tsv = fs.readFileSync(path.join(WORKSPACE, dirPath, 'out.tsv'), 'utf8');
-  const noteCol = tsv.split('\n')[1].split('\t')[6];
-  assert.equal(
-    noteCol,
-    'The possessive form describes a message. This also occurs in verses 5 and 7. Alternate translation: [a message from Yahweh]'
-  );
-});
-
-test('shard prepared files carry note_type and also_occurs_verses through detection', async () => {
+test('shard prepared files carry note_type and the pointer note through detection', async () => {
   // Parallel tn-writer shards get their own runtime paths and re-run mechanical
   // prep + detection; the see-how fields must survive into the shard file.
   const dirPath = setupPipeDir({
@@ -368,7 +359,8 @@ test('shard prepared files carry note_type and also_occurs_verses through detect
 
   const prepared = readPrepared(dirPath, 'ZEC-03-v1-9.prepared_notes.json');
   assert.equal(prepared.items[0].note_type, 'see_how');
-  assert.deepEqual(prepared.items[0].also_occurs_verses, ['5', '7']);
+  assert.equal(prepared.items[1].note_type, 'see_how');
+  assert.equal(prepared.items[0].also_occurs_verses, undefined);
 });
 
 // --- F1: fold gating -------------------------------------------------------
@@ -408,7 +400,7 @@ test('F1: one single word carrying two different figurative notes is NOT folded'
   assert.match(summary, /0 folded/);
 });
 
-test('F1: the same single word with the same sref still folds', async () => {
+test('F1: the same single word with the same sref still gets a pointer', async () => {
   const dirPath = setupPipeDir({
     items: [
       handItem({ reference: '3:2', id: 'aaaa' }),
@@ -421,13 +413,14 @@ test('F1: the same single word with the same sref still folds', async () => {
   await runSeeHowDetection({ pipeDir: dirPath, generateIdsFn: stubIds });
 
   const prepared = readPrepared(dirPath);
-  assert.deepEqual(prepared.items.map((it) => it.id), ['aaaa']);
   // F2: an ineligible key must not pull in corpus spans, so verse 12 (a literal
-  // "hand" the issue finder never flagged) is absent.
-  assert.deepEqual(prepared.items[0].also_occurs_verses, ['8']);
+  // "hand" the issue finder never flagged) gets no row.
+  assert.deepEqual(prepared.items.map((it) => it.id), ['aaaa', 'bbbb']);
+  assert.equal(prepared.items[0].programmatic_note, undefined);
+  assert.equal(prepared.items[1].programmatic_note, 'See how you translated **hand** in [3:2](../03/02.md).');
 });
 
-test('F1: a multi-word key folds across different srefs', async () => {
+test('F1: a multi-word key points across different srefs', async () => {
   const dirPath = setupPipeDir({
     items: [
       item({ reference: '3:2', id: 'aaaa', sref: 'figs-possession' }),
@@ -439,8 +432,9 @@ test('F1: a multi-word key folds across different srefs', async () => {
   await runSeeHowDetection({ pipeDir: dirPath, generateIdsFn: stubIds });
 
   const prepared = readPrepared(dirPath);
-  assert.deepEqual(prepared.items.map((it) => it.id), ['aaaa']);
-  assert.deepEqual(prepared.items[0].also_occurs_verses, ['5', '7']);
+  assert.deepEqual(prepared.items.map((it) => it.id), ['aaaa', 'bbbb'], 'v7 has no UHB slice, so it is not synthesized');
+  assert.equal(prepared.items[0].programmatic_note, undefined);
+  assert.match(prepared.items[1].programmatic_note, /\[3:2\]\(\.\.\/03\/02\.md\)/);
 });
 
 test('F1: writing-foreground is never folded, never pointed, never injected', async () => {
@@ -495,19 +489,25 @@ test('F1: a writing-foreground row in an earlier chapter is never a pointer targ
 
 // --- F2: corpus spans only for eligible keys --------------------------------
 
-test('F2: corpus spans ARE appended for an eligible (multi-word) key', async () => {
+test('F2: corpus spans get a pointer for an eligible (multi-word) key', async () => {
   const dirPath = setupPipeDir({
     items: [item({ reference: '3:2', id: 'aaaa' })],
     tnBookTsv: '',
+    hebrewBook: HEBREW_BOOK,
   });
   buildRecurrenceIndexFile({ pipeDir: dirPath });
   await runSeeHowDetection({ pipeDir: dirPath, generateIdsFn: stubIds });
 
-  const first = readPrepared(dirPath).items[0];
-  assert.deepEqual(first.also_occurs_verses, ['5', '7'], 'unflagged repeats the index found');
+  const items = readPrepared(dirPath).items;
+  assert.deepEqual(items.map((it) => it.reference).sort(), ['3:2', '3:5', '3:7'], 'unflagged repeats the index found');
+  assert.equal(items.find((it) => it.id === 'aaaa').programmatic_note, undefined);
+  for (const it of items.filter((i) => i.id !== 'aaaa')) {
+    assert.equal(it.injected_see_how, true);
+    assert.match(it.programmatic_note, /\[3:2\]\(\.\.\/03\/02\.md\)/, 'points back at the first note, never forward');
+  }
 });
 
-test('F2: corpus spans are NOT appended for an ineligible single-word key', async () => {
+test('F2: corpus spans get no pointer for an ineligible single-word key', async () => {
   const dirPath = setupPipeDir({
     items: [handItem({ reference: '3:2', id: 'aaaa' })],
     tnBookTsv: '',
@@ -516,8 +516,8 @@ test('F2: corpus spans are NOT appended for an ineligible single-word key', asyn
   buildRecurrenceIndexFile({ pipeDir: dirPath });
   await runSeeHowDetection({ pipeDir: dirPath, generateIdsFn: stubIds });
 
-  const first = readPrepared(dirPath).items[0];
-  assert.equal(first.also_occurs_verses, undefined, 'literal "hand" in 3:8 and 3:12 is not listed');
+  const items = readPrepared(dirPath).items;
+  assert.deepEqual(items.map((it) => it.id), ['aaaa'], 'literal "hand" in 3:8 and 3:12 gets no row');
 });
 
 // --- F3: injected quotes are the exact source span --------------------------
@@ -558,14 +558,15 @@ test('C1a: a cross-chapter pointer is injected at the chapter\'s first occurrenc
   const summary = await runSeeHowDetection({ pipeDir: dirPath, generateIdsFn: stubIds });
 
   const prepared = readPrepared(dirPath);
-  assert.equal(prepared.items.length, 1, 'the flagged 3:5 item is folded away');
-  const anchor = prepared.items[0];
-  assert.equal(anchor.reference, '3:2', 'pointer sits on the first occurrence');
-  assert.equal(anchor.injected_see_how, true);
+  assert.deepEqual(prepared.items.map((it) => it.reference).sort(), ['3:2', '3:5', '3:7']);
+  const anchor = prepared.items.find((it) => it.reference === '3:2');
+  assert.equal(anchor.injected_see_how, true, 'pointer sits on the first occurrence');
   assert.match(anchor.programmatic_note, /\[1:1\]\(\.\.\/01\/01\.md\)/);
-  assert.deepEqual(anchor.also_occurs_verses, ['5', '7']);
-  assert.match(summary, /1 injected/);
-  assert.match(summary, /1 folded/);
+  assert.equal(anchor.also_occurs_verses, undefined);
+  const flagged = prepared.items.find((it) => it.id === 'bbbb');
+  assert.match(flagged.programmatic_note, /\[1:1\]\(\.\.\/01\/01\.md\)/, 'the flagged 3:5 item is kept as a pointer');
+  assert.match(summary, /2 injected/);
+  assert.match(summary, /0 folded/);
 });
 
 test('C1a: a prepared item already sitting on the first occurrence is converted in place', async () => {
@@ -576,28 +577,30 @@ test('C1a: a prepared item already sitting on the first occurrence is converted 
   const summary = await runSeeHowDetection({ pipeDir: dirPath, generateIdsFn: stubIds });
 
   const prepared = readPrepared(dirPath);
-  assert.deepEqual(prepared.items.map((it) => it.id), ['aaaa'], 'no injection, no relocation');
-  assert.equal(prepared.items[0].note_type, 'see_how');
+  assert.deepEqual(prepared.items.map((it) => it.id), ['aaaa', 'bbbb'], 'no injection, no relocation');
+  assert.deepEqual(prepared.items.map((it) => it.note_type), ['see_how', 'see_how']);
   assert.match(summary, /0 injected/);
 });
 
-test('C1b: a book-first explanatory note stays where the model wrote it and lists the others', async () => {
+test('C1b: a book-first explanatory note stays where the model wrote it; only later occurrences point at it', async () => {
   // No earlier-chapter note, so the 3:5 item IS the explanatory note.
   const dirPath = setupPipeDir({
     items: [item({ reference: '3:5', id: 'bbbb' })],
     tnBookTsv: '',
     alignmentData: { '3:5': ALIGNMENT_DATA['3:5'] },
+    hebrewBook: HEBREW_BOOK,
   });
   buildRecurrenceIndexFile({ pipeDir: dirPath });
   const summary = await runSeeHowDetection({ pipeDir: dirPath, generateIdsFn: stubIds });
 
   const prepared = readPrepared(dirPath);
-  assert.equal(prepared.items.length, 1);
-  const kept = prepared.items[0];
-  assert.equal(kept.reference, '3:5', 'not relocated');
+  assert.deepEqual(prepared.items.map((it) => it.reference).sort(), ['3:5', '3:7'], 'nothing is added at 3:2: no pointer looks forward');
+  const kept = prepared.items.find((it) => it.reference === '3:5');
   assert.equal(kept.programmatic_note, undefined, 'still the explanatory note');
-  assert.deepEqual(kept.also_occurs_verses, ['2', '7'], 'earlier AND later occurrences are listed');
-  assert.match(summary, /0 injected/);
+  assert.equal(kept.also_occurs_verses, undefined);
+  const later = prepared.items.find((it) => it.reference === '3:7');
+  assert.match(later.programmatic_note, /\[3:5\]\(\.\.\/03\/05\.md\)/);
+  assert.match(summary, /1 injected/);
 });
 
 // --- C2: a pointer row is never a pointer target ----------------------------
@@ -727,6 +730,22 @@ const ZEC8_BOOK = [
   '',
 ].join('\n');
 
+const uhbWord = (heb, strong) => `\\w ${heb}|lemma="x" strong="${strong}"\\w*`;
+const uhbFormula = (words) => words.map(([h, st]) => uhbWord(h, st)).join(' ');
+const F_FULL = [[KOH, 'H3541'], [AMAR, 'H0559'], [YHWH, 'H3068'], [TSEVAOT, 'H6635b']];
+const F_KAY = [[KOH, 'H3541'], [AMAR, 'H0559'], [YHWH, 'H3068']];
+const F_AYT = [[AMAR, 'H0559'], [YHWH, 'H3068'], [TSEVAOT, 'H6635b']];
+const ZEC8_UHB_FULL = [
+  '\\id ZEC',
+  '\\c 8',
+  `\\v 2 ${uhbFormula(F_FULL)}`,
+  `\\v 3 ${uhbFormula(F_KAY)}`,
+  `\\v 4 ${uhbFormula(F_FULL)}`,
+  `\\v 6 ${uhbFormula(F_FULL)}`,
+  `\\v 14 ${uhbFormula(F_AYT)}`,
+  '',
+].join('\n');
+
 const ZEC8_ALIGNMENT = {
   '8:2': [
     { heb: KOH, strong: 'H3541' }, { heb: AMAR, strong: 'H0559' },
@@ -757,7 +776,7 @@ function formulaItem(reference, id, origQuote, glQuote) {
   };
 }
 
-test('C5: within a formula cluster exactly one key carries the verse list', async () => {
+test('C5: within a formula cluster each later verse gets exactly one pointer', async () => {
   const dirPath = setupPipeDir({
     chapter: '8',
     items: [
@@ -767,21 +786,28 @@ test('C5: within a formula cluster exactly one key carries the verse list', asyn
     ],
     tnBookTsv: '',
     alignedBook: ZEC8_BOOK,
+    hebrewBook: ZEC8_UHB_FULL,
     alignmentData: ZEC8_ALIGNMENT,
   });
   buildRecurrenceIndexFile({ pipeDir: dirPath });
   await runSeeHowDetection({ pipeDir: dirPath, generateIdsFn: stubIds });
 
-  const byId = new Map(readPrepared(dirPath).items.map((it) => [it.id, it]));
-  assert.equal(byId.size, 3, 'distinct keys, so nothing folds');
-  // Coverage wins, not length: "thus says Yahweh" (8:3) reaches 2, 4 and 6,
-  // one more than the four-word formula, which only reaches 4 and 6.
-  assert.deepEqual(byId.get('bbbb').also_occurs_verses, ['2', '4', '6']);
-  assert.equal(byId.get('aaaa').also_occurs_verses, undefined, 'already listed by the carrier');
-  assert.equal(byId.get('cccc').also_occurs_verses, undefined, 'already listed by the carrier');
+  const items = readPrepared(dirPath).items;
+  const byId = new Map(items.map((it) => [it.id, it]));
+  assert.equal(byId.get('aaaa').programmatic_note, undefined, 'the three flagged notes are distinct keys: none is a pointer');
+  assert.equal(byId.get('bbbb').programmatic_note, undefined);
+  assert.equal(byId.get('cccc').programmatic_note, undefined);
+  // Only verses after a key's own anchor count. "thus says Yahweh of hosts"
+  // (8:2) and "thus says Yahweh" (8:3) both reach 4 and 6, so the longer key
+  // takes them and they point at 8:2.
+  const injected = items.filter((it) => it.injected_see_how);
+  assert.deepEqual(injected.map((it) => it.reference).sort(), ['8:4', '8:6']);
+  for (const it of injected) assert.match(it.programmatic_note, /\[8:2\]\(\.\.\/08\/02\.md\)/);
+  // No verse carries two pointers for the cluster.
+  assert.equal(new Set(items.map((it) => `${it.reference}|${it.injected_see_how}`)).size, items.length);
 });
 
-test('C5: a non-carrier still lists the verses of its own folded siblings', async () => {
+test('C5: a flagged sibling of the carrier becomes a pointer to it, beside the carrier\'s own pointers', async () => {
   const dirPath = setupPipeDir({
     chapter: '8',
     items: [
@@ -791,16 +817,18 @@ test('C5: a non-carrier still lists the verses of its own folded siblings', asyn
     ],
     tnBookTsv: '',
     alignedBook: ZEC8_BOOK,
+    hebrewBook: ZEC8_UHB_FULL,
     alignmentData: Object.assign({}, ZEC8_ALIGNMENT, { '8:13': ZEC8_ALIGNMENT['8:3'] }),
   });
   buildRecurrenceIndexFile({ pipeDir: dirPath });
   await runSeeHowDetection({ pipeDir: dirPath, generateIdsFn: stubIds });
 
-  const byId = new Map(readPrepared(dirPath).items.map((it) => [it.id, it]));
-  assert.equal(byId.has('dddd'), false, '8:13 folds into 8:3');
-  // 8:3 covers 2, 4 and 6 so it carries them, plus its own folded sibling 13.
-  assert.deepEqual(byId.get('bbbb').also_occurs_verses, ['2', '4', '6', '13']);
-  assert.equal(byId.get('aaaa').also_occurs_verses, undefined, 'nothing left to list');
+  const items = readPrepared(dirPath).items;
+  const byId = new Map(items.map((it) => [it.id, it]));
+  assert.match(byId.get('dddd').programmatic_note, /\[8:3\]\(\.\.\/08\/03\.md\)/, '8:13 points at its own key\'s note at 8:3');
+  assert.equal(byId.get('bbbb').programmatic_note, undefined);
+  assert.equal(byId.get('aaaa').programmatic_note, undefined);
+  assert.deepEqual(items.filter((it) => it.injected_see_how).map((it) => it.reference).sort(), ['8:4', '8:6']);
 });
 
 // --- Round 3: B1 / B2 / S8 / S9 ---------------------------------------------
@@ -821,7 +849,7 @@ test('B1: an item that resolves only its text key gets ONE row, not a duplicate 
   const atVerse2 = prepared.items.filter((it) => it.reference === '3:2');
   assert.equal(atVerse2.length, 1, 'exactly one row on the verse');
   assert.equal(atVerse2[0].id, 'aaaa', 'the model\'s own item, converted in place');
-  assert.match(summary, /0 injected/);
+  assert.match(summary, /2 injected/, 'only the later occurrences at 3:5 and 3:7 are synthesized');
 });
 
 test('B1: two items on one phrase group together even when only one resolves its Strong key', async () => {
@@ -838,11 +866,12 @@ test('B1: two items on one phrase group together even when only one resolves its
   await runSeeHowDetection({ pipeDir: dirPath, generateIdsFn: stubIds });
 
   const prepared = readPrepared(dirPath);
-  assert.deepEqual(prepared.items.map((it) => it.id), ['aaaa'], 'one group, one surviving note');
-  assert.deepEqual(prepared.items[0].also_occurs_verses, ['5', '7']);
+  assert.deepEqual(prepared.items.map((it) => it.id), ['aaaa', 'bbbb'], 'one group: a note and a pointer to it');
+  assert.equal(prepared.items[0].programmatic_note, undefined);
+  assert.match(prepared.items[1].programmatic_note, /\[3:2\]\(\.\.\/03\/02\.md\)/);
 });
 
-test('B2: a same-verse duplicate is removed together with the primary it folds into', async () => {
+test('B2: a same-verse duplicate is removed when its primary becomes a pointer', async () => {
   const dirPath = setupPipeDir({
     items: [
       item({ reference: '3:2', id: 'aaaa' }),
@@ -857,10 +886,10 @@ test('B2: a same-verse duplicate is removed together with the primary it folds i
   const prepared = readPrepared(dirPath);
   assert.deepEqual(
     prepared.items.map((it) => it.id),
-    ['aaaa'],
-    'the duplicate does not survive its primary being folded'
+    ['aaaa', 'bbbb'],
+    'the duplicate does not survive its primary becoming a pointer'
   );
-  assert.deepEqual(prepared.items[0].also_occurs_verses, ['5', '7']);
+  assert.match(prepared.items[1].programmatic_note, /\[3:2\]\(\.\.\/03\/02\.md\)/);
 });
 
 test('S9: a required alternate translation keeps the see_how_at note type', async () => {
@@ -941,6 +970,10 @@ const ZEC8_TN_TSV = [
 const ZEC8_UHB = [
   '\\id ZEC',
   '\\c 8',
+  `\\v 2 ${uhbFormula(F_FULL)}`,
+  `\\v 3 ${uhbFormula(F_KAY)}`,
+  `\\v 4 ${uhbFormula(F_FULL)}`,
+  `\\v 6 ${uhbFormula(F_FULL)}`,
   `\\v 14 \\w ${KI}|lemma="a" strong="H3588a"\\w* \\w ${KOH}|lemma="b" strong="H3541"\\w* \\w ${AMAR}|lemma="c" strong="H0559"\\w* \\w ${YHWH}|lemma="d" strong="H3068"\\w* \\w ${TSEVAOT}|lemma="e" strong="H6635b"\\w*`,
   '',
 ].join('\n');
@@ -963,22 +996,23 @@ test('C5: with an injected five-word variant the widest key still carries the li
 
   const prepared = readPrepared(dirPath);
   const byId = new Map(prepared.items.map((it) => [it.id, it]));
-  const injected = prepared.items.find((it) => it.injected_see_how);
+  const injected = prepared.items.find((it) => it.injected_see_how && it.reference === '8:14');
   assert.ok(injected, 'the five-word variant is injected at 8:14');
   assert.equal(injected.reference, '8:14');
 
   // "thus says Yahweh" reaches 2, 3, 4 and 6 - one verse more than the
   // four-word formula - so it carries. Before C5 the longest key (the
   // five-word variant, which occurs once) won and the list was lost entirely.
-  assert.deepEqual(byId.get('bbbb').also_occurs_verses, ['2', '4', '6', '14']);
-  assert.equal(byId.get('aaaa').also_occurs_verses, undefined);
-  assert.equal(byId.get('cccc').also_occurs_verses, undefined);
-  assert.equal(injected.also_occurs_verses, undefined);
-
-  // Nothing is listed twice, and every verse the cluster covers is listed once.
-  const listed = prepared.items.flatMap((it) => it.also_occurs_verses || []);
-  assert.equal(new Set(listed).size, listed.length);
-  assert.deepEqual(listed.slice().sort((a, b) => Number(a) - Number(b)), ['2', '4', '6', '14']);
+  // Nothing points forward; 8:4 and 8:6 point at 8:2.
+  // 8:14 already holds cccc's note and the injected five-word pointer, both on
+  // overlapping wording, so the carrier adds nothing there.
+  const rows = prepared.items.map((it) => it.reference).sort();
+  assert.deepEqual(rows, ['8:14', '8:14', '8:2', '8:3', '8:4', '8:6']);
+  assert.equal(byId.get('bbbb').programmatic_note, undefined);
+  for (const ref of ['8:4', '8:6']) {
+    const row = prepared.items.find((it) => it.reference === ref);
+    assert.match(row.programmatic_note, /\[8:2\]\(\.\.\/08\/02\.md\)/);
+  }
 });
 
 // Context-dependent articles (JER 8:4 -> 25:27). The same lexemes recur as a
@@ -1104,10 +1138,9 @@ test('multi-word euphemism: a fixed phrase is still injected at its next occurre
   const summary = await runSeeHowDetection({ pipeDir: dirPath, generateIdsFn: stubIds });
 
   const prepared = readPrepared(dirPath);
-  assert.equal(prepared.items.length, 1);
-  assert.equal(prepared.items[0].reference, '3:2');
-  assert.equal(prepared.items[0].support_reference, 'figs-euphemism');
-  assert.match(summary, /1 injected/);
+  assert.deepEqual(prepared.items.map((it) => it.reference).sort(), ['3:2', '3:5', '3:7']);
+  assert.ok(prepared.items.every((it) => it.support_reference === 'figs-euphemism'));
+  assert.match(summary, /3 injected/);
 });
 
 test('kept: no pointer is synthesized at a kept note\'s verse and quote; the flagged repeat keeps its own note', async () => {
@@ -1133,6 +1166,8 @@ test('kept: no pointer is synthesized at a kept note\'s verse and quote; the fla
   const items = readPrepared(flagged).items;
   assert.deepEqual(items.map((i) => i.reference), ['3:5'], 'the 3:5 item is not folded into a pointer at 3:2');
   assert.notEqual(items[0].injected_see_how, true);
+  assert.equal(items[0].programmatic_note, undefined, 'and keeps its own note text');
+  assert.equal(items[0].note_type, 'given_at');
 });
 
 // One lemma, three expressions (JER 39:4 vs 23:27 vs 39:17). H0376 is "a man"
@@ -1262,4 +1297,21 @@ test('single common word: the target is the earlier note in the occurrence\'s ow
   const items = readPrepared(dirPath).items;
   assert.deepEqual(items.map((it) => it.reference), ['3:5'], 'v2 "men of" has no noted form');
   assert.match(items[0].programmatic_note, /\[2:1\]\(\.\.\/02\/01\.md\)/, 'points at the "the men" note, not the earlier "a man" one');
+});
+
+test('a lead the issue pass wrote as a "See how" row is not a pointer target', async () => {
+  const dirPath = setupPipeDir({
+    items: [
+      item({ reference: '3:2', id: 'aaaa', note_type: 'see_how', programmatic_note: 'See how you translated this phrase in [1:9](../01/09.md).' }),
+      item({ reference: '3:5', id: 'bbbb', index: 1 }),
+    ],
+    tnBookTsv: '',
+    hebrewBook: HEBREW_BOOK,
+  });
+  buildRecurrenceIndexFile({ pipeDir: dirPath });
+  await runSeeHowDetection({ pipeDir: dirPath, generateIdsFn: stubIds });
+
+  const items = readPrepared(dirPath).items;
+  assert.deepEqual(items.map((it) => it.id), ['aaaa', 'bbbb'], 'nothing is added or rewritten: no chain through aaaa');
+  assert.equal(items[1].programmatic_note, undefined);
 });

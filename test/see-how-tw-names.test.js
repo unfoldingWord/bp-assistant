@@ -151,7 +151,8 @@ test('T3: without the tW headwords file, pointers are kept as before', async () 
   const { items, summary } = await run([]);
 
   const targets = items.filter((it) => it.see_how_target === '7:1');
-  assert.equal(targets.length, 2, 'both names injected when the check cannot run');
+  // Ahaz at 9:1 and 9:4, Rezin at 9:4: every occurrence gets its own pointer.
+  assert.equal(targets.length, 3, 'both names injected when the check cannot run');
   assert.match(summary, /0 skipped \(tW name\)/);
 });
 
@@ -161,7 +162,7 @@ test('T4: a note that also names someone without an article keeps its pointer', 
   const { items } = await run([], tn);
 
   const targets = items.filter((it) => it.see_how_target === '7:1');
-  assert.equal(targets.length, 2, 'Ahaz is kept because its note also explains Rezin');
+  assert.equal(targets.length, 3, 'Ahaz (9:1 and 9:4) is kept because its note also explains Rezin');
 });
 
 test('T5: a tW name whose issue hint says it is a different person keeps its own full note', async () => {
