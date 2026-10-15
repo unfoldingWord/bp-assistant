@@ -77,6 +77,16 @@ const SEE_HOW_STOPLIST = new Set([
   'בית', 'כי',
 ]);
 
+// Articles keyed on a proper name. A name's Strong's number is as specific as
+// its spelling, so a recurrence is a recurrence whatever prefix or ending the
+// word carries. Every other single-word key is a common word, and a lemma
+// number alone says nothing about which form of it a note was written for.
+const SEE_HOW_NAME_SREFS = new Set([
+  'translate-names',
+  'translate-transliterate',
+  'translate-hebrewmonths',
+]);
+
 // A phrase whose source text turns up in more than this many books of the
 // corpus is a common formula, not a distinctive rendering worth a cross-book
 // pointer. Without it every "the word of Yahweh" would earn one.
@@ -375,6 +385,48 @@ function isSeeHowEligible(key, sref) {
   if (!SEE_HOW_SINGLE_WORD_SREFS.has(String(sref || ''))) return false;
   if (SEE_HOW_STOPLIST.has(normalizeStrong(parts[0]) || parts[0])) return false;
   return true;
+}
+
+// Inseparable prefixes (and, the, in, like, to, from, that). Ignored when
+// comparing two forms of one word, so "the man" still matches "man".
+const PREFIX_LETTERS = new Set(['ו', 'ה', 'ב', 'כ', 'ל', 'מ', 'ש']);
+
+function stripPrefixLetters(token) {
+  let t = token;
+  for (let i = 0; i < 2 && t.length > 2 && PREFIX_LETTERS.has(t[0]); i++) t = t.slice(1);
+  return t;
+}
+
+/**
+ * True when two single-word quotes are the same form of the word, ignoring
+ * attached prefix particles and vowel points. A Strong's number names the
+ * lemma, so H0376 covers "a man" (אִישׁ, each man), "men of" (אַנְשֵׁי, men of
+ * war) and "the men" (הָאֲנָשִׁים): three different expressions. JER 39:4 "men
+ * of war" was pointed back to JER 23:27 "each man" and told it also occurred at
+ * 39:17 "the men whom you fear" for exactly that reason.
+ */
+function sameSingleWordForm(a, b) {
+  const ta = hebTokens(a);
+  const tb = hebTokens(b);
+  if (ta.length !== 1 || tb.length !== 1) return false;
+  const [x, y] = [ta[0], tb[0]];
+  if (x === y) return true;
+  const [sx, sy] = [stripPrefixLetters(x), stripPrefixLetters(y)];
+  return sx === sy || sx === y || x === sy;
+}
+
+/**
+ * Whether two occurrences of `key` count as the same phrase. Multi-word keys
+ * and name keys always do (their Strong's sequence is specific enough); a
+ * single common word has to match in form as well. A quote that is missing or
+ * is not exactly one word cannot be compared, so it is allowed through, as
+ * before this check.
+ */
+function sameFormForKey(key, sref, quoteA, quoteB) {
+  if (keyWordCount(key) !== 1) return true;
+  if (SEE_HOW_NAME_SREFS.has(String(sref || ''))) return true;
+  if (hebTokens(quoteA).length !== 1 || hebTokens(quoteB).length !== 1) return true;
+  return sameSingleWordForm(quoteA, quoteB);
 }
 
 // ---------------------------------------------------------------------------
@@ -1152,6 +1204,8 @@ module.exports = {
   keyTokens,
   isSeeHowEligible,
   isContextDependentSref,
+  sameSingleWordForm,
+  sameFormForKey,
   keyWordCount,
   hebTokens,
   stripCant,
@@ -1164,6 +1218,7 @@ module.exports = {
   SEE_HOW_SINGLE_WORD_SREFS,
   SEE_HOW_STOPLIST,
   SEE_HOW_NEVER_FOLD_SREFS,
+  SEE_HOW_NAME_SREFS,
   CROSS_BOOK_MAX_BOOKS,
   SEE_HOW_CONTEXT_DEPENDENT_SREFS,
   SEE_HOW_SINGLE_WORD_CONTEXT_DEPENDENT_SREFS,
