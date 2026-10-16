@@ -36,7 +36,9 @@ const DRY = argv.includes('--dry');
 const MODEL = flag('--model', 'claude-sonnet-5-5');
 const HAIKU = flag('--haiku', 'claude-haiku-5-5');
 const JUDGE = flag('--judge', 'both');
-const PRIMARY = flag('--primary', JUDGE === 'jev' ? 'jev' : 'haiku');
+// D6 (2026-10-16 pilot, judge-eval.mjs): jev caught 79% of seeded losses at 0.8, Haiku 49%.
+const PRIMARY = flag('--primary', JUDGE === 'haiku' ? 'haiku' : 'jev');
+const REVERDICT = argv.includes('--reverdict');
 const THRESHOLD = Number(flag('--threshold', '0.8'));
 const BATCH = Number(flag('--batch', '20'));
 const LIMIT = Number(flag('--limit', '0'));
@@ -141,6 +143,31 @@ async function claimCheck(passed, files) {
     // No claims means nothing was checked: ship it, but at the top of the review.
     if (v.pass && !r.claims.length) r.warnings.push('no_claims_checked');
   }
+}
+
+// --reverdict: recompute claim verdicts in results.jsonl from the judge scores
+// already stored (e.g. after switching --primary), without any model call.
+// Only rows that passed every mechanical gate are touched.
+if (REVERDICT) {
+  for (const book of books) {
+    const f = path.join(lib.WORK_DIR, 'output/modernize', book, 'results.jsonl');
+    let moved = 0;
+    const rows = readJsonl(f).map((r) => {
+      if (!r.claims || !r.judges || !(PRIMARY in r.judges)) return r;
+      const mech = r.reasons.filter((x) => x !== 'claim_missing');
+      if (mech.length) return r;
+      const v = claimVerdict(r.claims, r.judges[PRIMARY], THRESHOLD);
+      const note = r.new || r.new_rejected;
+      const was = r.status;
+      Object.assign(r, { status: v.pass ? 'changed' : 'unchanged', claim_missing: v.missing, reasons: v.pass ? [] : ['claim_missing'],
+        new: v.pass ? note : null, new_rejected: v.pass ? undefined : note, primary_judge: PRIMARY, threshold: THRESHOLD });
+      if (was !== r.status) moved++;
+      return r;
+    });
+    fs.writeFileSync(f, rows.map((r) => JSON.stringify(r)).join('\n') + '\n');
+    console.log(`${book}: re-verdicted with ${PRIMARY} at ${THRESHOLD}; ${moved} rows changed status`);
+  }
+  process.exit(0);
 }
 
 for (const book of books) {
