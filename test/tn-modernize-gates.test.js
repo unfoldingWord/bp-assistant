@@ -134,3 +134,39 @@ test('a name from the template wording is flagged, not failed', () => {
   assert.ok(!r.failures.includes('name_added'));
   assert.ok(r.warnings.includes('name_from_template'));
 });
+
+test('template example text counts as a placeholder: a filled template passes, a kept example fails (#480)', () => {
+  const { followsTemplate } = require('../scripts/tn-modernize/lib');
+  const blessing = 'SPEAKER is asking God to bless Person. In your translation, use a form that people would recognize as a blessing in your language. You might express this as a prayer, if that would be more natural in your language. Alternate translation: [text]';
+  const blessed = 'Boaz is asking God to bless the reapers when he says **Yahweh be with you**. This was a customary greeting. In your translation, use a form that people would recognize as a blessing in your language. You might express this as a prayer, if that would be more natural in your language.';
+  assert.equal(followsTemplate(blessed, blessing).ok, false, 'without the sheet id the example word is literal, as in check #25');
+  assert.equal(followsTemplate(blessed, blessing, 'translate-blessing-01').ok, true);
+
+  const plural = 'The word **you** is plural here because Ehud is addressing the Israelites, so use the plural form in your translation if your language marks that distinction.';
+  assert.equal(followsTemplate('The word **you** is plural here because Naomi is speaking to both of her daughters-in-law, so use the plural form.', plural, 'figs-yousingular-01').ok, true);
+  const turn = 'SPEAKER is speaking as if the Israelites had been walking behind God but then **turned** away to walk in a different direction from him. He means that they stopped living in the manner in which God wants people to live. If it would be helpful in your language, you could state the meaning plainly. Alternate translation: [text]';
+  assert.equal(followsTemplate('Naomi is speaking as if Orpah had been walking with her but then **turned back**.', turn, 'figs-metaphor-09').ok, true);
+  const rock = 'David is speaking of Yahweh as if he were a high **rock** that he could climb up to reach safety from danger. If this image communicates well in your language, please use it. If not, you could express this as a comparison. Alternate translation: [Yahweh is like a rock to me]';
+  assert.equal(followsTemplate('Boaz is speaking of Yahweh as if he were a bird that protects its young under its **wings**. If this image communicates well in your language, please use it. If not, you could express this as a comparison.', rock, 'figs-metaphor-02').ok, true);
+  // Underscored ALL-CAPS placeholders need no sheet id.
+  const symaction = 'ACTION_DESCRIPTION_NOT_QUOTE was a symbolic action by which PERSON showed SIGNIFICANCE. If it would be helpful to your readers, you could explain the significance of this action in the text of your translation or in a footnote. Alternate translation: [text]';
+  assert.equal(followsTemplate('Taking off a sandal was a symbolic action by which a man showed that he gave up his right to redeem.', symaction).ok, true);
+
+  const ruth = {
+    ID: 'ab12', Reference: '2:4', links: [],
+    prose: 'Boaz greets the reapers with the words **Yahweh be with you**. This was a customary greeting.',
+    ult: 'And behold, Boaz came from Bethlehem, and he said to the reapers, “Yahweh be with you!” And they said to him, “May Yahweh bless you!”',
+    templates: [
+      { id: 'translate-blessing-01', type: '', template: blessing },
+      { id: 'translate-symaction-01', type: '', template: symaction },
+    ],
+  };
+  const good = checkRewrite(ruth, { template_id: 'translate-blessing-01', note: blessed });
+  assert.ok(!good.failures.includes('template_phrase_missing') && !good.failures.includes('placeholder_left'), JSON.stringify(good));
+  const kept = checkRewrite(ruth, { template_id: 'translate-blessing-01', note: blessed.replace('the reapers when', 'Person when') });
+  assert.ok(kept.failures.includes('placeholder_left'));
+  assert.deepEqual(kept.detail.placeholder_left, ['Person']);
+  const keptCaps = checkRewrite(ruth, { template_id: 'translate-symaction-01', note: 'ACTION_DESCRIPTION_NOT_QUOTE was a symbolic action by which Boaz greeted **the reapers**.' });
+  assert.ok(keptCaps.failures.includes('placeholder_left'));
+  assert.deepEqual(keptCaps.detail.placeholder_left, ['ACTION_DESCRIPTION_NOT_QUOTE']);
+});

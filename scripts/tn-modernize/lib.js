@@ -60,6 +60,61 @@ function templatesFor(slug) {
     .map((t) => ({ ...t, id: templateId(slug, t.template) }));
 }
 
+// Example text in sheet templates. templateFirstPhrase blanks only ALL-CAPS
+// words and **bold** spans, so a template that shows a filled-in example
+// ("asking God to bless Person", "Ehud is addressing the Israelites") yields a
+// fixed phrase that a correct rewrite replaces, and the row could never pass.
+// Here these spans count as placeholders: they are blanked before the phrase
+// is taken, and gates.js fails a note that keeps one the old note and verse
+// lack. Keyed by sheet id; a span the sheet no longer carries is not found.
+// Check #25 is unchanged. Spans are case-sensitive and match whole words.
+const TEMPLATE_EXAMPLES = {
+  'figs-extrainfo-02': ['in the next verse', 'Saul wanted this'],
+  'figs-metaphor-02': ['David', 'Yahweh', 'he were a high', 'that he could climb up to reach safety from danger'],
+  'figs-metaphor-08': ['the people of the tribes of Ephraim and Manasseh', 'of Joseph'],
+  'figs-metaphor-09': ['the Israelites'],
+  'figs-quotemarks-03': ['from Psalm 2', 'since God is addressing the Messiah directly in it'],
+  'figs-synecdoche-03': ['Name'],
+  'figs-yousingular-01': ['Ehud is addressing the Israelites'],
+  'figs-yousingular-02': ['it refers to the Messiah'],
+  'grammar-connect-condition-hypothetical-03': ['Moses', 'that Yahweh will only consider the Israelites to be righteous if they obey Yahweh’s commandments'],
+  'grammar-connect-exceptions-03': ['Joshua', 'the Israelites should worship no God', 'they do', 'worship Yahweh'],
+  'grammar-connect-time-sequential-01': ['Esther became queen'],
+  'This could mean-01': ['Yahweh is the only God that Israel worships'],
+  'translate-blessing-01': ['Person'],
+  'translate-plural-01': ['Jonah', 'the greatness or complexity of the sea'],
+  'writing-poetry-04': ['Moses', 'four', 'God\'s commandments'],
+  'writing-politeness-02': ['Person'],
+};
+
+/** Example spans of one sheet template (by id), as listed above. */
+function templateExamples(id) {
+  return TEMPLATE_EXAMPLES[id] || [];
+}
+
+/** A whole-word, case-sensitive matcher for one example span; straight and curly apostrophes compare equal. */
+function exampleRe(span) {
+  return new RegExp(`(?<!\\w)${escapeRe(span).replace(/['’]/g, "['’]")}(?!\\w)`, 'g');
+}
+
+/**
+ * The template with every placeholder in a form templateFirstPhrase blanks:
+ * its example spans, underscore placeholders (ACTION_DESCRIPTION_NOT_QUOTE,
+ * "_______", which defeat \b[A-Z]{2,}\b) and numbered ones (TEXT1).
+ */
+function placeholderTemplate(templateText, id) {
+  let t = String(templateText || '')
+    .replace(/\b[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+\b|_{2,}/g, 'EXAMPLE')
+    .replace(/\b[A-Z]{2,}\d+\b/g, 'EXAMPLE');
+  for (const span of templateExamples(id)) t = t.replace(exampleRe(span), 'EXAMPLE');
+  return t;
+}
+
+/** First fixed phrase of a template, with its example text treated as placeholders. */
+function fixedPhrase(templateText, id) {
+  return templateFirstPhrase(placeholderTemplate(templateText, id));
+}
+
 /** Fold curly quotes and apostrophes to straight ones. */
 function foldQuotes(s) {
   return String(s || '').replace(/[‘’]/g, "'").replace(/[“”]/g, '"');
@@ -139,16 +194,16 @@ function classifyRow(row) {
   if (!slug) return { status: 'no_sref' };
   const tpls = templatesFor(slug);
   if (!tpls.length) return { status: 'no_template', slug };
-  const phrases = tpls.map((t) => templateFirstPhrase(t.template)).filter(Boolean);
+  const phrases = tpls.map((t) => fixedPhrase(t.template, t.id)).filter(Boolean);
   if (!phrases.length) return { status: 'no_phrase', slug };
   const note = strippedNote(row.Note);
   const hit = phrases.find((p) => phraseMatches(p, note));
   return hit ? { status: 'conforms', slug, phrase: hit } : { status: 'old', slug };
 }
 
-/** True when this note follows the given template's first fixed phrase (check #25 rule). */
-function followsTemplate(note, templateText) {
-  const phrase = templateFirstPhrase(templateText);
+/** True when this note follows the given template's first fixed phrase (check #25 rule, example text blanked). */
+function followsTemplate(note, templateText, id = null) {
+  const phrase = fixedPhrase(templateText, id);
   if (!phrase) return { ok: true, phrase: null };
   return { ok: phraseMatches(phrase, strippedNote(note)), phrase };
 }
@@ -201,6 +256,6 @@ module.exports = {
   WORK_DIR, TEMPLATES_PATH, templatesSnapshotDate,
   parseTnTsv, serializeTnTsv,
   isIntroReference, srefSlug, templatesFor, foldQuotes, strippedNote, phraseMatches, classifyRow, followsTemplate,
-  templateFirstPhrase,
+  templateFirstPhrase, templateExamples, exampleRe, placeholderTemplate, fixedPhrase,
   ultVerseText, referenceVerses, ultTextForRow,
 };

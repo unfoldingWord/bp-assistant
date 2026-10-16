@@ -10,7 +10,7 @@
 'use strict';
 
 const path = require('path');
-const { followsTemplate } = require('./lib.js');
+const { followsTemplate, templateExamples, exampleRe } = require('./lib.js');
 const { detectSelfTalk } = require(path.join(__dirname, '../../src/workspace-tools/quality-tools'));
 
 const ws = (s) => String(s || '').replace(/\s+/g, ' ').trim();
@@ -74,11 +74,22 @@ function references(note) {
   return [...links, ...bare, ...urls];
 }
 
-/** ALL-CAPS template placeholders (SPEAKER, THING, POINT OF COMPARISON) and bracket stubs left unfilled. */
-function leftoverPlaceholders(note, template, candidate) {
-  const known = new Set((template.match(/\b[A-Z][A-Z0-9]+\b/g) || []));
+/**
+ * Template placeholders left unfilled: ALL-CAPS ones (SPEAKER, POINT OF
+ * COMPARISON, ACTION_DESCRIPTION_NOT_QUOTE), "_______" blanks, bracket stubs,
+ * and the template's example text (lib.js TEMPLATE_EXAMPLES) that neither the
+ * old note nor the verse carries.
+ */
+function leftoverPlaceholders(note, tpl, candidate) {
+  const caps = /\b[A-Z][A-Z0-9_]*[A-Z0-9]\b/g;
+  const known = new Set((tpl.template.match(caps) || []));
   const context = `${candidate.prose} ${candidate.ult}`;
-  const left = (proseOnly(note).match(/\b[A-Z][A-Z0-9]+\b/g) || []).filter((w) => known.has(w) && !context.includes(w));
+  const prose = proseOnly(note);
+  const left = (prose.match(caps) || []).filter((w) => known.has(w) && !context.includes(w));
+  if (/_{2,}/.test(tpl.template) && /_{2,}/.test(prose)) left.push('_____');
+  for (const span of templateExamples(tpl.id)) {
+    if (exampleRe(span).test(prose) && !exampleRe(span).test(context)) left.push(span);
+  }
   if (/\[(text|other_metaphor|non-metaphor|ALT|AT)\]/i.test(note)) left.push('[stub]');
   return left;
 }
@@ -162,10 +173,10 @@ function checkRewrite(candidate, proposal, { names = new Set() } = {}) {
 
   // G6 the note now follows the template it names.
   if (tpl) {
-    const f = followsTemplate(note, tpl.template);
+    const f = followsTemplate(note, tpl.template, tpl.id);
     if (!f.phrase) failures.push('template_untestable'); // no fixed phrase to prove the note follows it
     else if (!f.ok) { failures.push('template_phrase_missing'); detail.template_phrase = f.phrase; }
-    const left = leftoverPlaceholders(note, tpl.template, candidate);
+    const left = leftoverPlaceholders(note, tpl, candidate);
     if (left.length) { failures.push('placeholder_left'); detail.placeholder_left = left; }
   }
   const selfTalk = detectSelfTalk(note);
