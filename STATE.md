@@ -53,6 +53,10 @@ session log — what you just did belongs in the commit message and PR body.
 - **Published corpus reference points for see-how share:** 9.1% of all notes;
   JOS 13%, GEN 16%, 2KI/PRO ~25%. Zechariah's 13 published pointers are all
   same-chapter, which is the shape the 2026-10-14 rule now produces.
+- **Two en_tn files have no trailing newline** (tn_1JN, tn_2JN, checked
+  2026-10-16), so `serializeTnTsv(parseTnTsv(x)) !== x` for them. Anything that
+  must change only some cells (tn-modernize) splices the original lines
+  instead of re-serializing.
 - **UHB span reconstruction is not always exact.** ~1–1.5% of aligned spans
   cannot be located in the UHB verse and fall back to a space-join (counted in
   `counts.inexactSpans`). Those quotes may fail `syncCanonicalHebrewQuotes`.

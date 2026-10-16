@@ -692,13 +692,14 @@ function capPrBody(body) {
 }
 
 // ---------------------------------------------------------------------------
-// createAndMergePR — Gitea API: create PR, merge, delete branch
+// createPR — Gitea API: open a PR and stop. Never merges, never deletes the
+// branch (tn-modernize delivers a PR that a human reviews and merges).
 //
 // `body` is the PR description (capped at PR_BODY_MAX); defaults to ''.
 // `apiImpl` is injectable for tests.
 // ---------------------------------------------------------------------------
 
-async function createAndMergePR(token, repo, branch, title, baseBranch = 'master', org = ORG, { body = '', apiImpl = apiRequest } = {}) {
+async function createPR(token, repo, branch, title, baseBranch = 'master', org = ORG, { body = '', apiImpl = apiRequest } = {}) {
   const api = apiImpl;
   // Validate token
   const tokenCheck = await api('GET', `/repos/${org}/${repo}`, token);
@@ -713,7 +714,6 @@ async function createAndMergePR(token, repo, branch, title, baseBranch = 'master
   }
 
   // Create PR (handle 409 = already exists)
-  let prNumber;
   const createResult = await withRetry(
     async () => {
       const res = await api('POST', `/repos/${org}/${repo}/pulls`, token, {
@@ -756,8 +756,19 @@ async function createAndMergePR(token, repo, branch, title, baseBranch = 'master
     return { success: false, details: `Failed to create PR: HTTP ${createResult.status} — ${JSON.stringify(createResult.data)}` };
   }
 
-  prNumber = createResult.prNumber;
-  console.log(`${LOG_PREFIX} PR #${prNumber} created for ${repo}/${branch}`);
+  console.log(`${LOG_PREFIX} PR #${createResult.prNumber} created for ${repo}/${branch}`);
+  return { success: true, prNumber: createResult.prNumber, url: createResult.url, details: `PR #${createResult.prNumber} open for ${branch} into ${baseBranch} on ${repo}` };
+}
+
+// ---------------------------------------------------------------------------
+// createAndMergePR — createPR, then merge and delete the branch
+// ---------------------------------------------------------------------------
+
+async function createAndMergePR(token, repo, branch, title, baseBranch = 'master', org = ORG, { body = '', apiImpl = apiRequest } = {}) {
+  const api = apiImpl;
+  const created = await createPR(token, repo, branch, title, baseBranch, org, { body, apiImpl });
+  if (!created.success) return created;
+  const prNumber = created.prNumber;
 
   // Merge PR
   await withRetry(
@@ -1072,4 +1083,4 @@ async function door43Push(opts) {
   }
 }
 
-module.exports = { door43Push, checkConflictingBranches, createAndMergePR, capPrBody, PR_BODY_MAX, BOOK_NUMBERS, REPO_MAP, getRepoFilename };
+module.exports = { door43Push, checkConflictingBranches, createPR, createAndMergePR, syncRepo, commitAndPush, getConfig, capPrBody, PR_BODY_MAX, BOOK_NUMBERS, REPO_MAP, getRepoFilename };
