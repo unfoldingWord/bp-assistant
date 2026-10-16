@@ -92,7 +92,7 @@ async function runBatch(book, batch, files) {
     const dropped = c.links.map((l) => ({ kind: l.kind, targets: l.targets, covered: l.covered }));
     if (!p) continue; // not recorded, so a rerun retries it
     if (p.action !== 'rewrite') { out.push(result(c, { reasons: [`model_declined: ${String(p.reason || '').slice(0, 200)}`] })); continue; }
-    const g = checkRewrite(c, p);
+    const g = checkRewrite(c, p, { names: files.names });
     const r = result(c, { new: p.note, template_id: p.template_id, reasons: g.failures, warnings: g.warnings, gate_detail: g.detail, dropped_links: dropped });
     out.push(r);
     if (!g.failures.length) passed.push({ c, r });
@@ -147,6 +147,7 @@ for (const book of books) {
   const dir = path.join(lib.WORK_DIR, 'output/modernize', book);
   const files = { results: path.join(dir, 'results.jsonl'), calls: path.join(dir, 'calls.jsonl'), raw: path.join(dir, 'unusable-replies.txt') };
   const candidates = readJsonl(path.join(dir, 'candidates.jsonl'));
+  files.names = new Set(JSON.parse(fs.readFileSync(path.join(dir, 'extract.json'), 'utf8')).names || []);
   const done = new Set(readJsonl(files.results).map((r) => r.ID));
   // Rows extract.mjs already skipped become unchanged results once.
   const skips = candidates.filter((c) => c.status === 'skip' && !done.has(c.ID));

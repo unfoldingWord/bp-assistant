@@ -111,3 +111,19 @@ test('a dropped See link passes only when its information is carried elsewhere',
   assert.ok(checkRewrite(linked(false), { template_id: 'figs-metonymy-01', note: GOOD }).failures.includes('link_not_covered'));
   assert.ok(checkRewrite(linked(null), { template_id: 'figs-metonymy-01', note: GOOD }).failures.includes('link_not_covered'), 'no twl data means not covered');
 });
+
+test('a name the old note lacks fails unless the verse has it, which only flags the row', () => {
+  const inferred = run(GOOD.replace('Here, **Edom** represents', 'Here Isaiah says **Edom** represents'));
+  assert.ok(inferred.failures.includes('name_added'));
+  assert.deepEqual(inferred.detail.name_added, ['Isaiah']);
+  const fromVerse = run(GOOD.replace('This message is about', 'This message from Yahweh is about'));
+  assert.deepEqual(fromVerse.failures, []);
+  assert.ok(fromVerse.warnings.includes('name_from_verse'));
+});
+
+test('a book name that opens a sentence is caught as added', () => {
+  const r = checkRewrite(candidate, { template_id: 'figs-metonymy-01', note: 'Obadiah says this. ' + GOOD }, { names: new Set(['Obadiah', 'Edom', 'Yahweh']) });
+  assert.ok(r.warnings.includes('name_from_verse'), 'Obadiah is in this verse, so it is flagged, not failed');
+  const r2 = checkRewrite(candidate, { template_id: 'figs-metonymy-01', note: 'Esau says this. ' + GOOD }, { names: new Set(['Esau']) });
+  assert.ok(r2.failures.includes('name_added'));
+});

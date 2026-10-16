@@ -51,7 +51,7 @@ function diff(a, b) {
 const REASON_TEXT = {
   bold_not_in_ult: 'bold text is not in the ULT verse', at_lost_or_changed: 'an alternate translation was lost or reworded',
   at_invented: 'an alternate translation was invented', at_not_bracketed: 'an alternate translation is not in [brackets]',
-  link_in_note: 'a link was left in the note', link_not_covered: 'a dropped link whose information is not carried anywhere else (D5)', proper_noun_dropped: 'a name was dropped', reference_dropped: 'a scripture reference was dropped',
+  link_in_note: 'a link was left in the note', name_added: 'a name the old note and the verse do not have (the model inferred it)', name_from_verse: 'a name the old note lacks, taken from the verse text', link_not_covered: 'a dropped link whose information is not carried anywhere else (D5)', proper_noun_dropped: 'a name was dropped', reference_dropped: 'a scripture reference was dropped',
   template_phrase_missing: 'the note does not follow its template', placeholder_left: 'a template placeholder was left unfilled',
   unknown_template: 'the model named a template that does not exist', self_talk: 'the model left its own reasoning in the note',
   raw_newline_or_tab: 'a raw line break or tab', claim_missing: 'the claim check found information missing', model_no_result: 'the model returned nothing for this row',

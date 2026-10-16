@@ -15,6 +15,7 @@ import path from 'path';
 const require = createRequire(import.meta.url);
 const lib = require('./lib.js');
 const { splitLinks } = require('./rows.js');
+const { bookNames } = require('./gates.js');
 const { BOOK_NUMBERS } = require('../../src/door43-push.js');
 
 const argv = process.argv.slice(2);
@@ -81,6 +82,7 @@ for (const book of books) {
   fs.writeFileSync(path.join(dir, 'candidates.jsonl'), out.map((o) => JSON.stringify(o)).join('\n') + '\n');
   fs.writeFileSync(path.join(dir, 'extract.json'), JSON.stringify({
     book, counts, templates_snapshot: lib.templatesSnapshotDate(),
+    names: bookNames(usfm.split(/\\c\s+/).slice(1).map((ch) => ch.replace(/^\d+/, '').split(/\\v\s+/).slice(1).map((v) => lib.ultVerseText(`\\c 1\n\\v ${v}`, 1, parseInt(v, 10)) || '').join(' ')).join(' ')),
     sources: { en_tn: head(TN), en_ult: head(ULT), en_twl: TWL ? head(TWL) : null },
     extracted_at: new Date().toISOString(),
   }, null, 1) + '\n');

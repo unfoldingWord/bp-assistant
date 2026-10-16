@@ -47,7 +47,8 @@ const curlyQuoted = (note) => [...proseOnly(note).matchAll(/“([^“”]+)”/g
 // structure template sentences rather than carry content.
 const CAP_EXEMPT = new Set(['I', 'Hebrew', 'Greek', 'Aramaic', 'ULT', 'UST', 'Alternate', 'If', 'Here', 'This', 'The', 'These',
   'It', 'In', 'You', 'Your', 'See', 'Use', 'A', 'An', 'So', 'Or', 'And', 'But', 'For', 'When', 'As', 'There', 'That', 'They',
-  'He', 'She', 'We', 'His', 'Her', 'Their', 'Some', 'Many', 'Other', 'Translate', 'Consider']);
+  'He', 'She', 'We', 'His', 'Her', 'Their', 'Some', 'Many', 'Other', 'Translate', 'Consider',
+  'Therefore', 'Now', 'Then', 'Will', 'On', 'Having', 'Behold', 'Look', 'Let', 'May', 'Do', 'Who', 'What', 'Why', 'How']);
 
 const midSentenceCaps = (text) => [...text.matchAll(/(?<=[^.!?:\s]\s+|[,;(]\s*)([A-Z][a-z]+)\b/g)].map((m) => m[1]);
 
@@ -91,7 +92,11 @@ function quotePairProblem(atText, boldText) {
   return both(boldText, '“', '”') && one(atText, '“', '”');
 }
 
-function checkRewrite(candidate, proposal) {
+/**
+ * checkRewrite(candidate, proposal, { names }) — names: the book's proper nouns
+ * (bookNames over the whole-book ULT), so a name opening a sentence is caught.
+ */
+function checkRewrite(candidate, proposal, { names = new Set() } = {}) {
   const failures = [];
   const warnings = [];
   const detail = {};
@@ -139,6 +144,15 @@ function checkRewrite(candidate, proposal) {
   // G4 names and references survive.
   const lostNames = properNouns(candidate.prose, candidate.ult).filter((w) => !new RegExp(`\\b${w}\\b`).test(note));
   if (lostNames.length) { failures.push('proper_noun_dropped'); detail.proper_noun_dropped = lostNames; }
+  // ...and none is added. A name in neither the old note nor the verse was
+  // worked out by the model (a speaker it inferred), so the row keeps its text;
+  // one taken from the verse ships flagged for a human look.
+  const has = (text, w) => new RegExp(`\\b${w}\\b`).test(text);
+  const atAnyPosition = (proseOnly(note).match(/\b[A-Z][a-z]+\b/g) || []).filter((w) => names.has(w) && !CAP_EXEMPT.has(w));
+  const added = [...new Set([...properNouns(note, candidate.ult), ...atAnyPosition])].filter((w) => !has(candidate.prose, w));
+  const invented = added.filter((w) => !has(candidate.ult, w));
+  if (invented.length) { failures.push('name_added'); detail.name_added = invented; }
+  if (added.length > invented.length) { warnings.push('name_from_verse'); detail.name_from_verse = added.filter((w) => !invented.includes(w)); }
   const lostRefs = references(candidate.prose).filter((r) => !note.includes(r));
   if (lostRefs.length) { failures.push('reference_dropped'); detail.reference_dropped = lostRefs; }
 
@@ -156,4 +170,11 @@ function checkRewrite(candidate, proposal) {
   return { failures, warnings, detail };
 }
 
-module.exports = { checkRewrite, ats, bolds, properNouns, references };
+/** Words the ULT capitalizes mid-sentence anywhere in the book: its names. */
+function bookNames(ultText) {
+  const text = String(ultText);
+  const lower = new Set(text.match(/\b[a-z]+\b/g) || []);
+  return [...new Set(midSentenceCaps(text))].filter((w) => !CAP_EXEMPT.has(w) && !lower.has(w.toLowerCase())).sort();
+}
+
+module.exports = { checkRewrite, ats, bolds, properNouns, references, bookNames };
