@@ -13,10 +13,19 @@
 
 const { claude, jev, parseJson } = require('./models');
 
+// Haiku occasionally returns malformed JSON here (2 of ~30 pilot calls);
+// one retry is cheaper than holding back a whole batch of good rewrites.
+async function claudeJson(opts, tries = 2) {
+  for (let i = 1; ; i++) {
+    const res = await claude(opts);
+    try { return { res, json: parseJson(res.text) }; } catch (e) { if (i >= tries) throw e; }
+  }
+}
+
 async function extractClaims(rows, { model, system, guard }) {
   const input = rows.map((r) => ({ ID: r.ID, issue: r.slug, note: r.prose }));
-  const res = await claude({ model, system, prompt: JSON.stringify(input), effort: 'low', guard });
-  const claims = parseJson(res.text).claims || {};
+  const { res, json } = await claudeJson({ model, system, prompt: JSON.stringify(input), effort: 'low', guard });
+  const claims = json.claims || {};
   for (const r of rows) {
     if (!Array.isArray(claims[r.ID])) throw new Error(`claims: no list for ${r.ID}`);
   }
@@ -25,8 +34,8 @@ async function extractClaims(rows, { model, system, guard }) {
 
 async function judgeHaiku(items, { model, system, guard }) {
   const input = items.map((i) => ({ ID: i.ID, note: i.note, claims: i.claims }));
-  const res = await claude({ model, system, prompt: JSON.stringify(input), effort: 'low', guard });
-  const present = parseJson(res.text).present || {};
+  const { res, json } = await claudeJson({ model, system, prompt: JSON.stringify(input), effort: 'low', guard });
+  const present = json.present || {};
   const out = {};
   for (const i of items) {
     const p = present[i.ID];
