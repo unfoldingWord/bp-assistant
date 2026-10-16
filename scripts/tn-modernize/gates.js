@@ -150,7 +150,11 @@ function checkRewrite(candidate, proposal, { names = new Set() } = {}) {
   const has = (text, w) => new RegExp(`\\b${w}\\b`).test(text);
   const atAnyPosition = (proseOnly(note).match(/\b[A-Z][a-z]+\b/g) || []).filter((w) => names.has(w) && !CAP_EXEMPT.has(w));
   const added = [...new Set([...properNouns(note, candidate.ult), ...atAnyPosition])].filter((w) => !has(candidate.prose, w));
-  const invented = added.filter((w) => !has(candidate.ult, w));
+  // A name in the template's own wording ("asking God to bless") is not the
+  // model's inference, but it may be example text left unreplaced: flag it.
+  const fromTemplate = added.filter((w) => !has(candidate.ult, w) && tpl && has(tpl.template, w));
+  if (fromTemplate.length) { warnings.push('name_from_template'); detail.name_from_template = fromTemplate; }
+  const invented = added.filter((w) => !has(candidate.ult, w) && !fromTemplate.includes(w));
   if (invented.length) { failures.push('name_added'); detail.name_added = invented; }
   if (added.length > invented.length) { warnings.push('name_from_verse'); detail.name_from_verse = added.filter((w) => !invented.includes(w)); }
   const lostRefs = references(candidate.prose).filter((r) => !note.includes(r));

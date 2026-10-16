@@ -95,14 +95,17 @@ for (const j of JUDGES) {
   }
 }
 
-const below = (p, k) => !(Array.isArray(p) && Number(p[k]) >= THRESHOLD);
+// A judge that returned no score for an item is left out of its counts, not counted as a catch.
+const scored = (p, n) => Array.isArray(p) && p.length === n && p.every((x) => x != null);
+const below = (p, k) => Number(p[k]) < THRESHOLD;
 const lines = [`# Claim judge comparison (D6)`, '', `Books: ${books.join(', ')} · threshold ${THRESHOLD} · ${items.length} rewritten notes with claims, ${items.filter((i) => i.seed).length} with a seeded deletion`, '',
   '| Judge | Seeded losses caught | Unseeded notes flagged | Time | Cost |', '| --- | --- | --- | --- | --- |'];
 for (const j of JUDGES) {
-  const seeded = items.filter((i) => i.seed);
+  const seeded = items.filter((i) => i.seed && scored(scores[j].seeded[i.ID], i.claims.length));
+  const unseeded = items.filter((i) => scored(scores[j].unseeded[i.ID], i.claims.length));
   const caught = seeded.filter((i) => below(scores[j].seeded[i.ID], i.seed.target)).length;
-  const flagged = items.filter((i) => i.claims.some((_, k) => below(scores[j].unseeded[i.ID], k))).length;
-  lines.push(`| ${j} | ${caught}/${seeded.length} | ${flagged}/${items.length} | ${(scores[j].ms / 1000).toFixed(0)} s | $${scores[j].costUsd.toFixed(4)} |`);
+  const flagged = unseeded.filter((i) => i.claims.some((_, k) => below(scores[j].unseeded[i.ID], k))).length;
+  lines.push(`| ${j} | ${caught}/${seeded.length} | ${flagged}/${unseeded.length} | ${(scores[j].ms / 1000).toFixed(0)} s | $${scores[j].costUsd.toFixed(4)} |`);
 }
 lines.push('', 'Unseeded flags are not all errors: some rewrites really did lose information. Compare the rows in judge-eval.json.');
 const out = path.join(lib.WORK_DIR, 'output/modernize');

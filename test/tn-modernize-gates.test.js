@@ -127,3 +127,10 @@ test('a book name that opens a sentence is caught as added', () => {
   const r2 = checkRewrite(candidate, { template_id: 'figs-metonymy-01', note: 'Esau says this. ' + GOOD }, { names: new Set(['Esau']) });
   assert.ok(r2.failures.includes('name_added'));
 });
+
+test('a name from the template wording is flagged, not failed', () => {
+  const withGod = { ...candidate, templates: [{ ...candidate.templates[0], template: candidate.templates[0].template.replace('If it would', 'God is named here. If it would') }] };
+  const r = checkRewrite(withGod, { template_id: 'figs-metonymy-01', note: GOOD.replace('If it would', 'God is named here. If it would') }, { names: new Set(['God']) });
+  assert.ok(!r.failures.includes('name_added'));
+  assert.ok(r.warnings.includes('name_from_template'));
+});
