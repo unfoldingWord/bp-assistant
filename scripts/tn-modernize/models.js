@@ -31,7 +31,7 @@ function makeGuard({ limitsFile, stopPct }) {
   const read = () => {
     const j = JSON.parse(fs.readFileSync(limitsFile, 'utf8'));
     const w = j.rate_limits && j.rate_limits.seven_day;
-    if (!w) throw new Error('no seven_day block');
+    if (!w || typeof w.used_percentage !== 'number') throw new Error('no seven_day used_percentage');
     return { used: w.used_percentage, ageS: Math.round(Date.now() / 1000 - j.captured_at_epoch) };
   };
   return async () => {

@@ -65,7 +65,7 @@ function bucket(r) {
   if (r.status === 'changed') return r.warnings.length ? 'flagged' : 'changed';
   if (r.reasons.some((x) => x.startsWith('model_declined'))) return 'declined';
   if (r.new_rejected) return 'held';
-  return 'skipped';
+  return r.model ? 'held' : 'skipped';
 }
 const BUCKETS = [
   ['flagged', 'Changed, check these', 'Every gate passed, but something needs a human look.'],

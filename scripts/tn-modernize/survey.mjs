@@ -34,10 +34,10 @@ if (!TN || !fs.existsSync(path.join(TN, '.git'))) {
 }
 
 // ---- age: one pass over the whole history -------------------------------
-const log = execFileSync('git', ['-C', TN, 'log', '--no-merges', '--name-only', '--date=format:%Y', '--format=@@%ad\t%an\t%s'],
+const log = execFileSync('git', ['-C', TN, 'log', '--no-merges', '--name-only', '--date=format:%Y', '--format=%x1e%ad\t%an\t%s'],
   { maxBuffer: 1 << 30, encoding: 'utf8' });
 const age = {}; // book -> { last, lastAi, byYear: {year: n}, ai: n, maint: n }
-for (const block of log.split('@@').slice(1)) {
+for (const block of log.split('\x1e').slice(1)) {
   const [head, ...files] = block.split('\n').filter(Boolean);
   const [year, author, subject] = head.split('\t');
   const books = files.map((f) => (f.match(/^tn_([0-9A-Z]{3})\.tsv$/) || [])[1]).filter(Boolean);

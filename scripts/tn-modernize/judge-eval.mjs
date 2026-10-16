@@ -63,9 +63,10 @@ for (const book of books) {
     const note = r.new || r.new_rejected;
     if (!note || !r.claims || !r.claims.length) continue;
     const c = cands.get(r.ID);
+    if (!c) continue; // re-extracted since this result was written
     const tpl = (c.templates.find((t) => t.id === r.template_id) || {}).template || '';
     const s = seed(note, r.claims, tpl);
-    items.push({ book, ID: r.ID, claims: r.claims, ult: c.ult, note, seed: s });
+    items.push({ book, ID: `${book}-${r.ID}`, claims: r.claims, ult: c.ult, note, seed: s });
   }
 }
 console.log(`${items.length} notes with claims; ${items.filter((i) => i.seed).length} seedable`);

@@ -7,8 +7,9 @@
 //
 // Per book: reads output/modernize/<BOOK>/candidates.jsonl, appends one Result
 // per row (shape in rows.js) to results.jsonl and one line per model call to
-// calls.jsonl. Resumable: rows already in results.jsonl are skipped, and a
-// batch whose model reply cannot be used is not recorded, so a rerun retries it.
+// calls.jsonl. Resumable: rows already in results.jsonl are skipped; a batch
+// whose model reply cannot be used, and any row the reply leaves out, is not
+// recorded, so a rerun retries it.
 //
 // A row is 'changed' only when the model rewrote it, every mechanical gate
 // (gates.js) passed, and the primary claim judge found every claim of the old
@@ -40,7 +41,8 @@ const THRESHOLD = Number(flag('--threshold', '0.8'));
 const BATCH = Number(flag('--batch', '20'));
 const LIMIT = Number(flag('--limit', '0'));
 const guard = makeGuard({ limitsFile: flag('--limits'), stopPct: Number(flag('--stop-pct', '60')) });
-if (!SKILL || !books.length || !['haiku', 'jev', 'both'].includes(JUDGE)) {
+const judgeOk = ['haiku', 'jev', 'both'].includes(JUDGE) && ['haiku', 'jev'].includes(PRIMARY) && (JUDGE === 'both' || JUDGE === PRIMARY);
+if (!SKILL || !books.length || !judgeOk) {
   console.error('usage: rewrite.mjs --skill <skill dir> [--limits file] [--judge haiku|jev|both] [--dry] BOOK [BOOK...]');
   process.exit(2);
 }
@@ -88,7 +90,7 @@ async function runBatch(book, batch, files) {
   for (const c of batch) {
     const p = byId.get(c.ID);
     const dropped = c.links.map((l) => ({ kind: l.kind, targets: l.targets, covered: l.covered }));
-    if (!p) { out.push(result(c, { reasons: ['model_no_result'], dropped_links: [] })); continue; }
+    if (!p) continue; // not recorded, so a rerun retries it
     if (p.action !== 'rewrite') { out.push(result(c, { reasons: [`model_declined: ${String(p.reason || '').slice(0, 200)}`] })); continue; }
     const g = checkRewrite(c, p);
     const r = result(c, { new: p.note, template_id: p.template_id, reasons: g.failures, warnings: g.warnings, gate_detail: g.detail, dropped_links: dropped });
@@ -96,33 +98,49 @@ async function runBatch(book, batch, files) {
     if (!g.failures.length) passed.push({ c, r });
   }
 
-  // Gate 5: claim check on the rows every mechanical gate passed.
+  // Gate 5: claim check on the rows every mechanical gate passed. A failure in
+  // this step keeps those rows unchanged (recorded with the reason) instead of
+  // ending the run; an advisory judge's failure only loses its scores.
   if (passed.length) {
-    const ex = await extractClaims(passed.map((x) => x.c), { model: HAIKU, system: PROMPTS.claims, guard });
-    append(files.calls, [{ at: ts(), step: 'claims', ...ex.call, rows: passed.length }]);
-    const items = passed.map(({ c, r }) => ({ ID: c.ID, note: r.new, ult: c.ult, claims: ex.claims[c.ID] }));
-    for (const { r } of passed) r.claims = ex.claims[r.ID];
-    if (JUDGE !== 'jev') {
-      const h = await judgeHaiku(items, { model: HAIKU, system: PROMPTS.judge, guard });
-      append(files.calls, [{ at: ts(), step: 'judge-haiku', ...h.call, rows: items.length }]);
-      for (const { r } of passed) r.judges.haiku = h.p[r.ID];
-    }
-    if (JUDGE !== 'haiku') {
-      for (const item of items) {
-        const j = await judgeJev(item);
-        if (j.call) append(files.calls, [{ at: ts(), step: 'judge-jev', ...j.call, rows: 1 }]);
-        passed.find((x) => x.r.ID === item.ID).r.judges.jev = j.p;
-      }
-    }
-    for (const { r } of passed) {
-      const v = claimVerdict(r.claims, r.judges[PRIMARY], THRESHOLD);
-      r.claim_missing = v.missing;
-      if (v.pass) { r.status = 'changed'; } else { r.reasons.push('claim_missing'); r.new_rejected = r.new; r.new = null; }
+    try { await claimCheck(passed, files); } catch (e) {
+      console.error(`[${ts()}] ${book}: claim check failed (${e.message}); ${passed.length} rows kept unchanged`);
+      for (const { r } of passed) { r.reasons.push('claim_check_error'); r.status = 'unchanged'; }
     }
   }
   for (const r of out) if (r.status !== 'changed' && r.new) { r.new_rejected = r.new; r.new = null; }
   append(files.results, out);
   return true;
+}
+
+async function claimCheck(passed, files) {
+  const ex = await extractClaims(passed.map((x) => x.c), { model: HAIKU, system: PROMPTS.claims, guard });
+  append(files.calls, [{ at: ts(), step: 'claims', ...ex.call, rows: passed.length }]);
+  const items = passed.map(({ c, r }) => ({ ID: c.ID, note: r.new, ult: c.ult, claims: ex.claims[c.ID] }));
+  for (const { r } of passed) r.claims = ex.claims[r.ID];
+  const advisory = (name, fn) => (PRIMARY === name ? fn() : fn().catch((e) => console.error(`[${ts()}] advisory ${name} judge failed: ${e.message}`)));
+  if (JUDGE !== 'jev') {
+    await advisory('haiku', async () => {
+      const h = await judgeHaiku(items, { model: HAIKU, system: PROMPTS.judge, guard });
+      append(files.calls, [{ at: ts(), step: 'judge-haiku', ...h.call, rows: items.length }]);
+      for (const { r } of passed) r.judges.haiku = h.p[r.ID];
+    });
+  }
+  if (JUDGE !== 'haiku') {
+    await advisory('jev', async () => {
+      for (const item of items) {
+        const j = await judgeJev(item);
+        if (j.call) append(files.calls, [{ at: ts(), step: 'judge-jev', ...j.call, rows: 1 }]);
+        passed.find((x) => x.r.ID === item.ID).r.judges.jev = j.p;
+      }
+    });
+  }
+  for (const { r } of passed) {
+    const v = claimVerdict(r.claims, r.judges[PRIMARY], THRESHOLD);
+    r.claim_missing = v.missing;
+    if (v.pass) r.status = 'changed'; else r.reasons.push('claim_missing');
+    // No claims means nothing was checked: ship it, but at the top of the review.
+    if (v.pass && !r.claims.length) r.warnings.push('no_claims_checked');
+  }
 }
 
 for (const book of books) {

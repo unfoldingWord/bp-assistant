@@ -14,20 +14,29 @@ const { followsTemplate } = require('./lib.js');
 const { detectSelfTalk } = require(path.join(__dirname, '../../src/workspace-tools/quality-tools'));
 
 const ws = (s) => String(s || '').replace(/\s+/g, ' ').trim();
-const AT_LINE_RE = /Alternate translation:\s*(.*?)(?=\\n|$)/g;
+// One "Alternate translation:" with its [bracket] options, each optionally
+// labelled ("(1) [...]"), joined by "or". Only this span is AT text: prose after
+// it on the same line stays visible to the bold, name and reference checks.
+const AT_SPAN_RE = /Alternate translation:\s*(?:\([^)]*\)\s*)?\[[^\]]*\](?:\s*,?\s*or\s+(?:\([^)]*\)\s*)?\[[^\]]*\])*/g;
 
-/** [text] contents after each "Alternate translation:" (a line ends at a literal \n). */
+/** [text] contents of every alternate translation, in order. */
 function ats(note) {
   const out = [];
-  for (const m of String(note).matchAll(AT_LINE_RE)) {
-    for (const b of m[1].matchAll(/\[([^\]]+)\]/g)) out.push(b[1]);
+  for (const m of String(note).matchAll(AT_SPAN_RE)) {
+    for (const b of m[0].matchAll(/\[([^\]]*)\]/g)) out.push(b[1]);
   }
   return out;
 }
 
-/** The note with every AT line removed, so prose checks never see AT text. */
+/** "Alternate translation:" markers not followed by a [bracket] option. */
+function unbracketedAts(note) {
+  const markers = (String(note).match(/Alternate translation:/g) || []).length;
+  return markers - (String(note).match(AT_SPAN_RE) || []).length;
+}
+
+/** The note with every AT span removed, so prose checks never see AT text. */
 function proseOnly(note) {
-  return String(note).replace(AT_LINE_RE, ' ');
+  return String(note).replace(AT_SPAN_RE, ' ');
 }
 
 const bolds = (note) => [...proseOnly(note).matchAll(/\*\*([^*]+)\*\*/g)].map((m) => m[1]);
@@ -90,6 +99,7 @@ function checkRewrite(candidate, proposal) {
   const tpl = candidate.templates.find((t) => t.id === (proposal && proposal.template_id));
 
   if (!note.trim()) return { failures: ['empty_note'], warnings, detail };
+  if (note === candidate.Note) return { failures: ['no_change'], warnings, detail };
   if (/[\t\r\n]/.test(note)) failures.push('raw_newline_or_tab');
   if (!tpl) failures.push('unknown_template');
 
@@ -111,9 +121,9 @@ function checkRewrite(candidate, proposal) {
   if (lostAts.length) { failures.push('at_lost_or_changed'); detail.at_lost_or_changed = lostAts; }
   if (inventedAts.length) { failures.push('at_invented'); detail.at_invented = inventedAts; }
   // Each AT opens with "[", optionally after a label such as "(1)" or "(adding a period after “spirit”)".
-  if ([...note.matchAll(/Alternate translation:\s*(\([^)]*\)\s*)?(.?)/g)].some((m) => m[2] !== '[')) {
-    failures.push('at_not_bracketed');
-  }
+  if (unbracketedAts(note)) failures.push('at_not_bracketed');
+  // An old AT the bracket parser cannot see could be dropped unnoticed.
+  if (unbracketedAts(candidate.prose)) failures.push('old_at_unbracketed');
   if (tpl && /Alternate translation:/.test(tpl.template) && !oldAts.length) warnings.push('template_at_omitted');
   const boldText = bolds(note).join(' ');
   if (newAts.some((a) => quotePairProblem(a, boldText))) warnings.push('at_quote_pair');
@@ -130,7 +140,8 @@ function checkRewrite(candidate, proposal) {
   // G6 the note now follows the template it names.
   if (tpl) {
     const f = followsTemplate(note, tpl.template);
-    if (!f.ok) { failures.push('template_phrase_missing'); detail.template_phrase = f.phrase; }
+    if (!f.phrase) failures.push('template_untestable'); // no fixed phrase to prove the note follows it
+    else if (!f.ok) { failures.push('template_phrase_missing'); detail.template_phrase = f.phrase; }
     const left = leftoverPlaceholders(note, tpl.template, candidate);
     if (left.length) { failures.push('placeholder_left'); detail.placeholder_left = left; }
   }

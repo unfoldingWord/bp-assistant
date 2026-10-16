@@ -3,7 +3,7 @@
 // Two steps, run separately from the rewrite so the rewriting model never
 // grades itself:
 //   extractClaims  Haiku lists the atomic claims of each OLD note (prompt:
-//                  skill claims-prompt.md). Cached per row ID and old-note text.
+//                  skill claims-prompt.md). Not cached: a rerun extracts again.
 //   judge*         for each claim, the probability the NEW note still makes it:
 //                  judgeHaiku (prompt: judge-prompt.md, one call per batch) or
 //                  judgeJev (one typed call per row, one yes/no per claim).

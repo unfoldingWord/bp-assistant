@@ -89,3 +89,18 @@ test('template matching resolves choice lists and allows extra sentences between
   const names = '**text** is the name of a (man, people group, city, town, place, river).';
   assert.equal(followsTemplate('The word **Esau** is the name of a man who was the ancestor of the people of Edom.', names).ok, true);
 });
+
+test('review fixes: prose after an AT is still checked; unbracketed old ATs, no-op rewrites and untestable templates fail', () => {
+  const tail = { ...candidate, prose: candidate.prose + ' This judgment came through Obadiah.' };
+  const dropped = checkRewrite(tail, { template_id: 'figs-metonymy-01', note: GOOD + ' This judgment came through the prophet.' });
+  assert.ok(dropped.failures.includes('proper_noun_dropped'), 'a name after the AT on the same line is checked');
+
+  const quotedAt = { ...candidate, prose: candidate.prose.replace('[concerning the people of Edom.]', '“concerning the people of Edom.”') };
+  assert.ok(checkRewrite(quotedAt, { template_id: 'figs-metonymy-01', note: GOOD }).failures.includes('old_at_unbracketed'));
+
+  const same = { ...candidate, Note: GOOD };
+  assert.deepEqual(checkRewrite(same, { template_id: 'figs-metonymy-01', note: GOOD }).failures, ['no_change']);
+
+  const short = { ...candidate, templates: [{ id: 'x-01', type: '', template: 'SPEAKER says **text**. Alternate translation: [text]' }] };
+  assert.ok(checkRewrite(short, { template_id: 'x-01', note: GOOD }).failures.includes('template_untestable'));
+});
