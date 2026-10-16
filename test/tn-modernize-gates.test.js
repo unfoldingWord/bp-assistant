@@ -104,3 +104,10 @@ test('review fixes: prose after an AT is still checked; unbracketed old ATs, no-
   const short = { ...candidate, templates: [{ id: 'x-01', type: '', template: 'SPEAKER says **text**. Alternate translation: [text]' }] };
   assert.ok(checkRewrite(short, { template_id: 'x-01', note: GOOD }).failures.includes('template_untestable'));
 });
+
+test('a dropped See link passes only when its information is carried elsewhere', () => {
+  const linked = (covered) => ({ ...candidate, links: [{ kind: 'see-also-ta', targets: ['rc://*/ta/man/translate/figs-synecdoche'], covered }] });
+  assert.deepEqual(checkRewrite(linked(true), { template_id: 'figs-metonymy-01', note: GOOD }).failures, []);
+  assert.ok(checkRewrite(linked(false), { template_id: 'figs-metonymy-01', note: GOOD }).failures.includes('link_not_covered'));
+  assert.ok(checkRewrite(linked(null), { template_id: 'figs-metonymy-01', note: GOOD }).failures.includes('link_not_covered'), 'no twl data means not covered');
+});

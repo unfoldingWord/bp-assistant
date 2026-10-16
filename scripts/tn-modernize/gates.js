@@ -128,8 +128,13 @@ function checkRewrite(candidate, proposal) {
   const boldText = bolds(note).join(' ');
   if (newAts.some((a) => quotePairProblem(a, boldText))) warnings.push('at_quote_pair');
 
-  // G3 links: none in the new note (D5 drops are logged from candidate.links).
+  // G3 links: none in the new note. D5 is still open, so a dropped link is only
+  // allowed when its information verifiably lives elsewhere (extract sets
+  // covered: a sibling note with that SupportReference, or a twl entry);
+  // otherwise the row keeps its current text and the report lists the link.
   if (/rc:\/\/|\[\[/.test(note)) failures.push('link_in_note');
+  const uncovered = (candidate.links || []).filter((l) => l.covered !== true);
+  if (uncovered.length) { failures.push('link_not_covered'); detail.link_not_covered = uncovered.flatMap((l) => l.targets); }
 
   // G4 names and references survive.
   const lostNames = properNouns(candidate.prose, candidate.ult).filter((w) => !new RegExp(`\\b${w}\\b`).test(note));

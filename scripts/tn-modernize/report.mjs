@@ -51,7 +51,7 @@ function diff(a, b) {
 const REASON_TEXT = {
   bold_not_in_ult: 'bold text is not in the ULT verse', at_lost_or_changed: 'an alternate translation was lost or reworded',
   at_invented: 'an alternate translation was invented', at_not_bracketed: 'an alternate translation is not in [brackets]',
-  link_in_note: 'a link was left in the note', proper_noun_dropped: 'a name was dropped', reference_dropped: 'a scripture reference was dropped',
+  link_in_note: 'a link was left in the note', link_not_covered: 'a dropped link whose information is not carried anywhere else (D5)', proper_noun_dropped: 'a name was dropped', reference_dropped: 'a scripture reference was dropped',
   template_phrase_missing: 'the note does not follow its template', placeholder_left: 'a template placeholder was left unfilled',
   unknown_template: 'the model named a template that does not exist', self_talk: 'the model left its own reasoning in the note',
   raw_newline_or_tab: 'a raw line break or tab', claim_missing: 'the claim check found information missing', model_no_result: 'the model returned nothing for this row',
@@ -97,7 +97,7 @@ for (const book of books) {
     `<td>$${cost.toFixed(2)}${rewritten ? ` <span class="dim">($${(cost / rewritten).toFixed(3)}/note)</span>` : ''}</td></tr>`);
 
   for (const r of results) for (const l of r.dropped_links || []) {
-    if (r.status !== 'changed' || l.covered) continue;
+    if (l.covered) continue;
     linkRows.push(`<tr><td>${book} ${esc(r.Reference)}</td><td>${esc(r.ID)}</td><td>${l.kind === 'see-tw' ? 'tW link not in the twl file' : 'second issue with no note of its own'}</td><td><code>${l.targets.map((t) => esc(t.replace(/^rc:\/\/\*\//, ''))).join('<br>')}</code></td></tr>`);
   }
 
@@ -186,7 +186,7 @@ thead th { font-weight: 500; color: var(--muted); font-size: .78rem; letter-spac
 <thead><tr><th>Book</th><th>Rows</th><th>Already conform</th><th>Not testable</th><th>Looked at</th>${BUCKETS.map(([, l]) => `<th>${l}</th>`).join('')}<th>Cost</th></tr></thead>
 <tbody>${summaryRows.join('')}</tbody></table></div>
 </section>
-${linkRows.length ? `<section><h2>Dropped links to decide</h2><p class="help">These notes lost a link under the D5 policy and nothing else in the book carries that information yet.</p><div class="scroll"><table><thead><tr><th>Where</th><th>ID</th><th>Gap</th><th>Link</th></tr></thead><tbody>${linkRows.join('')}</tbody></table></div></section>` : ''}
+${linkRows.length ? `<section><h2>Dropped links to decide</h2><p class="help">These notes have a See or See also link whose information nothing else in the book carries. They keep their current text until D5 is decided.</p><div class="scroll"><table><thead><tr><th>Where</th><th>ID</th><th>Gap</th><th>Link</th></tr></thead><tbody>${linkRows.join('')}</tbody></table></div></section>` : ''}
 <nav class="filters" aria-label="Show rows">
 <button type="button" id="f-all" data-f="all" aria-pressed="true">All</button>
 ${BUCKETS.map(([k, l]) => `<button type="button" id="f-${k}" data-f="${k}" aria-pressed="false">${l}</button>`).join('\n')}
