@@ -14,7 +14,7 @@
 const { claude, jev, parseJson } = require('./models');
 
 async function extractClaims(rows, { model, system, guard }) {
-  const input = rows.map((r) => ({ ID: r.ID, note: r.prose }));
+  const input = rows.map((r) => ({ ID: r.ID, issue: r.slug, note: r.prose }));
   const res = await claude({ model, system, prompt: JSON.stringify(input), effort: 'low', guard });
   const claims = parseJson(res.text).claims || {};
   for (const r of rows) {

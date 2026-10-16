@@ -78,3 +78,14 @@ test('a template with an AT the old note lacks is flagged, not filled', () => {
   assert.deepEqual(r.failures, []);
   assert.deepEqual(r.warnings, ['template_at_omitted']);
 });
+
+test('template matching resolves choice lists and allows extra sentences between fixed ones, in order', () => {
+  const { followsTemplate } = require('../scripts/tn-modernize/lib');
+  const heart = 'Here the **heart** represents where a person\'s thoughts/feelings/motives/intentions/desires exist. You may have a comparable expression in your language, or you could state the meaning plainly. Alternate translation: [text]';
+  assert.equal(followsTemplate('Here the **heart** represents where a person’s thoughts and feelings exist. You may have a comparable expression in your language, or you could state the meaning plainly.', heart).ok, true);
+  const par = 'These two clauses mean basically the same thing. The second emphasizes the meaning of the first by repeating the same idea with different words. If it would be helpful to your readers, you could combine them and express the emphasis in another way. Alternate translation: [text]';
+  assert.equal(followsTemplate('These two clauses mean basically the same thing. The second emphasizes the meaning of the first by repeating the same idea with different words. They stress that Edom will lose its status. If it would be helpful to your readers, you could combine them and express the emphasis in another way, as in the UST.', par).ok, true);
+  assert.equal(followsTemplate('The second emphasizes the meaning of the first by repeating the same idea with different words. These two clauses mean basically the same thing. If it would be helpful to your readers, you could combine them and express the emphasis in another way.', par).ok, false);
+  const names = '**text** is the name of a (man, people group, city, town, place, river).';
+  assert.equal(followsTemplate('The word **Esau** is the name of a man who was the ancestor of the people of Edom.', names).ok, true);
+});

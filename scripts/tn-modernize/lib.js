@@ -78,30 +78,48 @@ function strippedNote(note) {
 const escapeRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
 /**
- * A template first phrase as a matcher over strippedNote() text. Check #25
- * compares literally; here a few template conventions are honoured so a
- * correctly filled template is not reported as old:
- *   "(man, people group, city)" -> any one of the choices
- *   "thoughts/feelings/motives" -> any one of the words
- *   leading punctuation left over from a placeholder (". You could") is dropped
+ * A template first phrase as matchers over strippedNote() text, one per
+ * sentence of the phrase. Check #25 compares the whole phrase literally; here
+ * the template conventions the style guide itself asks writers to apply are
+ * honoured, so a correctly filled template is not reported as old:
+ *   "(man, people group, city)" or "thoughts/feelings/motives" -> one or more
+ *     of the choices, joined by commas, "and" or "or"
+ *   the fixed sentences must all appear, in order, but the old note's extra
+ *     sentences may sit between them (the rewrite prompt puts them there)
+ *   leading and trailing punctuation left over from a placeholder is dropped
  *   curly and straight quotes compare equal
  */
-function phraseRegex(phrase) {
+function phraseMatchers(phrase) {
   const p = foldQuotes(phrase).toLowerCase()
-    .replace(/\[[^\]]*\]\([^)]*\)/g, ' ').replace(/\[[^\]]*\]/g, ' ').replace(/\s+/g, ' ')
-    .replace(/^[^a-z0-9(]+/, '').trim();
-  const parts = [];
-  let last = 0;
-  const altRe = /\(([^()]*,[^()]*)\)|([a-z]+(?:\/[a-z]+)+)/g;
-  let m;
-  while ((m = altRe.exec(p))) {
-    parts.push(escapeRe(p.slice(last, m.index)));
-    const choices = m[1] ? m[1].split(',').map((c) => c.trim()) : m[2].split('/');
-    parts.push(`(?:${choices.map(escapeRe).join('|')})`);
-    last = m.index + m[0].length;
+    .replace(/\[[^\]]*\]\([^)]*\)/g, ' ').replace(/\[[^\]]*\]/g, ' ').replace(/\s+/g, ' ').trim();
+  return p.split(/(?<=[.!?]"?)\s+/).map((sentence) => {
+    const t = sentence.replace(/^[^a-z0-9(]+/, '').replace(/[.,;:!?"' ]+$/, '');
+    const parts = [];
+    let last = 0;
+    const altRe = /\(([^()]*,[^()]*)\)|([a-z]+(?:\/[a-z]+)+)/g;
+    let m;
+    while ((m = altRe.exec(t))) {
+      parts.push(escapeRe(t.slice(last, m.index)));
+      const choices = (m[1] ? m[1].split(',') : m[2].split('/')).map((c) => escapeRe(c.trim()));
+      const one = `(?:${choices.join('|')})`;
+      parts.push(`${one}(?:(?:\\s*,\\s*|\\s+)(?:(?:and|or)\\s+)?${one})*`);
+      last = m.index + m[0].length;
+    }
+    parts.push(escapeRe(t.slice(last)));
+    return new RegExp(parts.join(''), 'g');
+  }).filter((re) => re.source.length > 0);
+}
+
+/** True when every sentence of the phrase appears in the stripped note, in order. */
+function phraseMatches(phrase, stripped) {
+  let from = 0;
+  for (const re of phraseMatchers(phrase)) {
+    re.lastIndex = from;
+    const m = re.exec(stripped);
+    if (!m) return false;
+    from = m.index + m[0].length;
   }
-  parts.push(escapeRe(p.slice(last)));
-  return new RegExp(parts.join(''));
+  return true;
 }
 
 /**
@@ -124,7 +142,7 @@ function classifyRow(row) {
   const phrases = tpls.map((t) => templateFirstPhrase(t.template)).filter(Boolean);
   if (!phrases.length) return { status: 'no_phrase', slug };
   const note = strippedNote(row.Note);
-  const hit = phrases.find((p) => phraseRegex(p).test(note));
+  const hit = phrases.find((p) => phraseMatches(p, note));
   return hit ? { status: 'conforms', slug, phrase: hit } : { status: 'old', slug };
 }
 
@@ -132,7 +150,7 @@ function classifyRow(row) {
 function followsTemplate(note, templateText) {
   const phrase = templateFirstPhrase(templateText);
   if (!phrase) return { ok: true, phrase: null };
-  return { ok: phraseRegex(phrase).test(strippedNote(note)), phrase };
+  return { ok: phraseMatches(phrase, strippedNote(note)), phrase };
 }
 
 // ---------------------------------------------------------------------------
@@ -182,7 +200,7 @@ function ultTextForRow(usfm, ref) {
 module.exports = {
   WORK_DIR, TEMPLATES_PATH, templatesSnapshotDate,
   parseTnTsv, serializeTnTsv,
-  isIntroReference, srefSlug, templatesFor, foldQuotes, strippedNote, phraseRegex, classifyRow, followsTemplate,
+  isIntroReference, srefSlug, templatesFor, foldQuotes, strippedNote, phraseMatches, classifyRow, followsTemplate,
   templateFirstPhrase,
   ultVerseText, referenceVerses, ultTextForRow,
 };
