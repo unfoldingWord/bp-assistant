@@ -92,6 +92,7 @@ test('capPrBody coerces non-strings to the empty string', () => {
 test('the 409 already-exists path does not attempt to edit the existing PR body', async () => {
   const { impl, calls } = stubApi({
     'POST /repos/unfoldingWord/en_tn/pulls': { status: 409, data: { message: 'issue_id: 42' } },
+    'GET /repos/unfoldingWord/en_tn/pulls': { status: 200, data: [{ number: 42, html_url: 'https://git.door43.org/x/pulls/42' }] },
   });
 
   const res = await createAndMergePR('tok', 'en_tn', 'b', 't', 'master', 'unfoldingWord', { body: 'a summary', apiImpl: impl });
@@ -99,4 +100,29 @@ test('the 409 already-exists path does not attempt to edit the existing PR body'
   assert.equal(res.success, true);
   // No PATCH/edit of the existing PR.
   assert.equal(calls.filter((c) => c.method === 'PATCH').length, 0);
+});
+
+// ---- #478: the 409 path uses the open PR's number, not issue_id ---------
+
+test('on 409, createAndMergePR merges the open PR by its number, not the issue_id in the message', async () => {
+  const { impl, calls } = stubApi({
+    'POST /repos/unfoldingWord/en_tn/pulls': {
+      status: 409,
+      data: { message: 'pull request already exists for these targets [id: 99, issue_id: 7900, head_repo_id: 1, base_repo_id: 1, head_branch: b, base_branch: master]' },
+    },
+    'GET /repos/unfoldingWord/en_tn/pulls': {
+      status: 200,
+      data: [{ number: 812, html_url: 'https://git.door43.org/unfoldingWord/en_tn/pulls/812' }],
+    },
+  });
+
+  const res = await createAndMergePR('tok', 'en_tn', 'b', 't', 'master', 'unfoldingWord', { apiImpl: impl });
+
+  assert.equal(res.success, true);
+  assert.equal(res.prNumber, 812);
+  const search = calls.find((c) => c.method === 'GET' && /\/pulls\?/.test(c.apiPath));
+  assert.ok(search, 'looked the PR up by head branch');
+  assert.match(search.apiPath, /head=unfoldingWord:b/);
+  const merges = calls.filter((c) => /\/merge$/.test(c.apiPath)).map((c) => c.apiPath);
+  assert.deepEqual(merges, ['/repos/unfoldingWord/en_tn/pulls/812/merge']);
 });
