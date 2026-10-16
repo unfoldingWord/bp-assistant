@@ -1083,4 +1083,4 @@ async function door43Push(opts) {
   }
 }
 
-module.exports = { door43Push, checkConflictingBranches, createPR, createAndMergePR, capPrBody, PR_BODY_MAX, BOOK_NUMBERS, REPO_MAP, getRepoFilename };
+module.exports = { door43Push, checkConflictingBranches, createPR, createAndMergePR, syncRepo, commitAndPush, getConfig, capPrBody, PR_BODY_MAX, BOOK_NUMBERS, REPO_MAP, getRepoFilename };
