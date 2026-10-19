@@ -99,10 +99,14 @@ const TEMPLATE_EXAMPLES = {
 const AGREEMENT = {
   is: 'is|are', was: 'was|were', himself: 'himself|herself|themselves|itself',
   his: 'his|her|their|its', he: 'he|she|they|it', him: 'him|her|them|it',
+  word: 'word|phrase', // "the phrase translated as **Now it happened**" (RUT-sb2j)
 };
 const EXAMPLE = '\x01';
 const WILD = '[^.]{1,80}?';
 const KEEP_CAPS = /^(God|Yahweh|Lord|I|Alternate|Christ|Jesus)$/;
+// One qualifier the old note carried may sit inside the fixed wording: "a strong
+// contrast", "was probably a symbolic action" (Benjamin, 2026-10-19: RUT-ln1m, RUT-hilu).
+const QUALIFIER = ' (?:(?:probably|likely|possibly|perhaps|strong|sharp|very) )?';
 
 /** The phrase with example content replaced by EXAMPLE markers (case kept). */
 function exampleMarked(phrase, examples = []) {
@@ -121,9 +125,16 @@ function exampleMarked(phrase, examples = []) {
 function phraseMatchers(phrase, examples) {
   const p = exampleMarked(phrase, examples).toLowerCase()
     .replace(/\[[^\]]*\]\([^)]*\)/g, ' ').replace(/\[[^\]]*\]/g, ' ').replace(/[[\]]/g, ' ').replace(/\s+/g, ' ').trim();
-  const literal = (s) => escapeRe(s).replace(/\b(is|was|himself|his|he|him)\b/g, (w) => `(?:${AGREEMENT[w]})`)
-    .split(EXAMPLE).join(`(?:(?:the|a|an) )?${WILD}`);
-  return p.split(/(?<=[.!?]"?)\s+/).map((sentence) => {
+  // "is a passive verbal form" covers two words as "are passive verbal forms" (ROM-pyb6).
+  const literal = (s) => escapeRe(s).replace(/\bis a ((?:[a-z]+ ){0,3}(?:form|word|expression|term|phrase))\b/g, (m, n) => `(?:is a ${n}|are ${n}s)`)
+    .replace(/\b(is|was|himself|his|he|him|word)\b(?![|)])/g, (w) => `(?:${AGREEMENT[w]})`)
+    .split(' ').join(QUALIFIER).split(EXAMPLE).join(`(?:(?:the|a|an) )?${WILD}`);
+  // Measurement templates open with a worked example ("22 liters or nearly two
+  // thirds of a bushel"): a sentence with a number is example content, not fixed
+  // wording (Benjamin, 2026-10-19: RUT-mq6b), unless nothing testable would be left.
+  const sentences = p.split(/(?<=[.!?]"?)\s+/);
+  const fixed = sentences.filter((x) => !/\d/.test(x));
+  return (fixed.some((x) => x.split(' ').length >= 4) ? fixed : sentences).map((sentence) => {
     const t = sentence.replace(/^[^a-z0-9(\x01]+/, '').replace(/[.,;:!?"' ]+$/, '');
     const parts = [];
     let last = 0;

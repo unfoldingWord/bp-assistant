@@ -73,10 +73,14 @@ async function judgeJev(item) {
 }
 
 /** { pass, missing: [claim...] }; a missing probability counts as a failure. */
-function claimVerdict(claims, p, threshold) {
+function claimVerdict(claims, p, threshold, second) {
   if (!Array.isArray(p)) return { pass: false, missing: claims, error: 'no judgement' };
   const missing = claims.filter((_, k) => !(Number(p[k]) >= threshold));
-  return { pass: missing.length === 0, missing };
+  // With a second judge, a claim is missing only when both say so; a claim only
+  // one judge doubts ships for a person to check (Benjamin, 2026-10-19: RUT-f9ha, RUT-n9zc).
+  if (!missing.length || !Array.isArray(second)) return { pass: missing.length === 0, missing, split: [] };
+  const both = claims.filter((c, k) => missing.includes(c) && !(Number(second[k]) >= threshold));
+  return { pass: both.length === 0, missing: both, split: missing.filter((c) => !both.includes(c)) };
 }
 
 module.exports = { withoutAts, extractClaims, judgeHaiku, judgeJev, claimVerdict };

@@ -3,7 +3,11 @@
 //
 //   node scripts/tn-modernize/rewrite.mjs --skill <bp-assistant-skills>/.claude/skills/tn-modernize \
 //     [--limits ~/.claude/rate-limits.<uuid8>.json] [--stop-pct 60] [--judge haiku|jev|both] [--primary haiku|jev] \
-//     [--threshold 0.8] [--batch 20] [--limit N] [--model claude-sonnet-5-5] [--dry] BOOK [BOOK...]
+//     [--threshold 0.8] [--batch 20] [--limit N] [--model claude-sonnet-5-5] [--edits edits.jsonl] [--dry] BOOK [BOOK...]
+//
+// --edits: lines of {"ID", "template_id", "note"} with the exact text a reviewer
+// wants (a "ship, but tweak" verdict). Those rows replace any earlier result and
+// skip the model, but still pass every gate and the claim check.
 //
 // Per book: reads output/modernize/<BOOK>/candidates.jsonl, appends one Result
 // per row (shape in rows.js) to results.jsonl and one line per model call to
@@ -27,7 +31,7 @@ const { claude, parseJson, makeGuard } = require('./models.js');
 const { extractClaims, judgeHaiku, judgeJev, claimVerdict } = require('./claims.js');
 
 const argv = process.argv.slice(2);
-const valueFlags = ['--skill', '--limits', '--stop-pct', '--judge', '--primary', '--threshold', '--batch', '--limit', '--model', '--haiku'];
+const valueFlags = ['--edits', '--skill', '--limits', '--stop-pct', '--judge', '--primary', '--threshold', '--batch', '--limit', '--model', '--haiku'];
 const flag = (n, d) => { const i = argv.indexOf(n); return i >= 0 ? argv[i + 1] : d; };
 const skipIdx = new Set(valueFlags.flatMap((f) => { const i = argv.indexOf(f); return i >= 0 ? [i, i + 1] : []; }));
 const books = argv.filter((a, i) => !skipIdx.has(i) && /^[0-9A-Z]{3}$/.test(a));
@@ -40,6 +44,14 @@ const JUDGE = flag('--judge', 'both');
 const PRIMARY = flag('--primary', JUDGE === 'haiku' ? 'haiku' : 'jev');
 const REVERDICT = argv.includes('--reverdict');
 const THRESHOLD = Number(flag('--threshold', '0.8'));
+// The advisory judge, when both run: a claim is held back only when both doubt it.
+const SECOND = JUDGE === 'both' ? (PRIMARY === 'jev' ? 'haiku' : 'jev') : null;
+function splitFlag(r, split) {
+  r.claim_split = split;
+  r.warnings = r.warnings || []; r.tags_add = r.tags_add || [];
+  if (!r.warnings.includes('judges_split')) r.warnings.push('judges_split');
+  if (!r.tags_add.includes(lib.REVIEW_TAGS.human)) r.tags_add.push(lib.REVIEW_TAGS.human);
+}
 const BATCH = Number(flag('--batch', '20'));
 const LIMIT = Number(flag('--limit', '0'));
 const guard = makeGuard({ limitsFile: flag('--limits'), stopPct: Number(flag('--stop-pct', '60')) });
@@ -56,6 +68,7 @@ const promptHash = crypto.createHash('sha256').update(Object.values(PROMPTS).joi
 const ts = () => new Date().toISOString();
 const readJsonl = (f) => (fs.existsSync(f) ? fs.readFileSync(f, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l)) : []);
 const append = (f, recs) => recs.length && fs.appendFileSync(f, recs.map((r) => JSON.stringify(r)).join('\n') + '\n');
+const EDITS = new Map(readJsonl(flag('--edits', '') || '/nonexistent').map((e) => [e.ID, { action: 'rewrite', ...e }]));
 
 function result(c, fields) {
   return {
@@ -67,24 +80,27 @@ function result(c, fields) {
 
 async function runBatch(book, batch, files) {
   // Each issue's template variants go once per batch, not once per row.
+  const ask = batch.filter((c) => !EDITS.has(c.ID));
   const input = {
-    templates: Object.fromEntries(batch.map((c) => [c.slug, c.templates])),
-    rows: batch.map((c) => ({ ID: c.ID, Reference: c.Reference, issue: c.slug, old_note: c.prose, ult: c.ult })),
+    templates: Object.fromEntries(ask.map((c) => [c.slug, c.templates])),
+    rows: ask.map((c) => ({ ID: c.ID, Reference: c.Reference, issue: c.slug, old_note: c.prose, ult: c.ult })),
   };
   if (DRY) {
     console.log(`--- DRY ${book}: would send ${batch.length} rows to ${MODEL}; system ${PROMPTS.rewrite.length} chars, user ${JSON.stringify(input).length} chars`);
     console.log(JSON.stringify(input.rows.slice(0, 2), null, 1).slice(0, 1500));
     return false;
   }
-  const res = await claude({ model: MODEL, system: PROMPTS.rewrite, prompt: JSON.stringify(input), effort: 'medium', guard });
-  append(files.calls, [{ at: ts(), step: 'rewrite', model: MODEL, rows: batch.length, ms: res.ms, usage: res.usage, costUsd: res.costUsd, subtype: res.subtype }]);
-  let byId;
-  try {
-    byId = new Map((parseJson(res.text).results || []).map((r) => [r.ID, r]));
-  } catch (e) {
-    console.error(`[${ts()}] ${book}: unusable rewrite reply (${e.message}); batch not recorded`);
-    fs.appendFileSync(files.raw, `=== ${ts()} unusable ===\n${res.text}\n`);
-    return false;
+  const byId = new Map(batch.filter((c) => EDITS.has(c.ID)).map((c) => [c.ID, EDITS.get(c.ID)]));
+  if (ask.length) {
+    const res = await claude({ model: MODEL, system: PROMPTS.rewrite, prompt: JSON.stringify(input), effort: 'medium', guard });
+    append(files.calls, [{ at: ts(), step: 'rewrite', model: MODEL, rows: ask.length, ms: res.ms, usage: res.usage, costUsd: res.costUsd, subtype: res.subtype }]);
+    try {
+      for (const r of parseJson(res.text).results || []) if (!EDITS.has(r.ID)) byId.set(r.ID, r);
+    } catch (e) {
+      console.error(`[${ts()}] ${book}: unusable rewrite reply (${e.message}); batch not recorded`);
+      fs.appendFileSync(files.raw, `=== ${ts()} unusable ===\n${res.text}\n`);
+      return false;
+    }
   }
 
   const out = [];
@@ -102,7 +118,7 @@ async function runBatch(book, batch, files) {
     const g = checkRewrite(c, p, { names: files.names });
     // Benjamin, 2026-10-19: no invented alternate translations; tag the row instead.
     const tags = [...(review ? [lib.REVIEW_TAGS.human] : []), ...(g.warnings.includes('template_at_omitted') ? [lib.REVIEW_TAGS.at] : [])];
-    const r = result(c, { new: p.note, template_id: p.template_id, reasons: g.failures, warnings: g.warnings, gate_detail: g.detail, dropped_links: dropped, review, tags_add: tags });
+    const r = result(c, { ...(EDITS.has(c.ID) ? { model: 'reviewer edit' } : {}), new: p.note, template_id: p.template_id, reasons: g.failures, warnings: g.warnings, gate_detail: g.detail, dropped_links: dropped, review, tags_add: tags });
     out.push(r);
     if (!g.failures.length) passed.push({ c, r });
   }
@@ -149,9 +165,10 @@ async function claimCheck(passed, files) {
     });
   }
   for (const { r } of passed) {
-    const v = claimVerdict(r.claims, r.judges[PRIMARY], THRESHOLD);
+    const v = claimVerdict(r.claims, r.judges[PRIMARY], THRESHOLD, r.judges[SECOND]);
     r.claim_missing = v.missing;
     if (v.pass) r.status = 'changed'; else r.reasons.push('claim_missing');
+    if (v.pass && v.split.length) splitFlag(r, v.split);
     // No claims means nothing was checked: ship it, but at the top of the review.
     if (v.pass && !r.claims.length) r.warnings.push('no_claims_checked');
   }
@@ -168,11 +185,12 @@ if (REVERDICT) {
       if (!r.claims || !r.judges || !(PRIMARY in r.judges)) return r;
       const mech = r.reasons.filter((x) => x !== 'claim_missing');
       if (mech.length) return r;
-      const v = claimVerdict(r.claims, r.judges[PRIMARY], THRESHOLD);
+      const v = claimVerdict(r.claims, r.judges[PRIMARY], THRESHOLD, r.judges[SECOND]);
       const note = r.new || r.new_rejected;
       const was = r.status;
       Object.assign(r, { status: v.pass ? 'changed' : 'unchanged', claim_missing: v.missing, reasons: v.pass ? [] : ['claim_missing'],
         new: v.pass ? note : null, new_rejected: v.pass ? undefined : note, primary_judge: PRIMARY, threshold: THRESHOLD });
+      if (v.pass && v.split.length) splitFlag(r, v.split);
       if (was !== r.status) moved++;
       return r;
     });
@@ -187,6 +205,11 @@ for (const book of books) {
   const files = { results: path.join(dir, 'results.jsonl'), calls: path.join(dir, 'calls.jsonl'), raw: path.join(dir, 'unusable-replies.txt') };
   const candidates = readJsonl(path.join(dir, 'candidates.jsonl'));
   files.names = new Set(JSON.parse(fs.readFileSync(path.join(dir, 'extract.json'), 'utf8')).names || []);
+  // Reviewer edits replace the rows' earlier results.
+  if (EDITS.size && !DRY) {
+    const kept = readJsonl(files.results).filter((r) => !EDITS.has(r.ID));
+    fs.writeFileSync(files.results, kept.map((r) => JSON.stringify(r)).join('\n') + (kept.length ? '\n' : ''));
+  }
   const done = new Set(readJsonl(files.results).map((r) => r.ID));
   // Rows extract.mjs already skipped become unchanged results once.
   const skips = candidates.filter((c) => c.status === 'skip' && !done.has(c.ID));

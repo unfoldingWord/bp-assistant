@@ -95,6 +95,7 @@ const CHECKS = {
   name_from_verse: (d) => ({ d: 'D8', text: `The new note names ${list(d.name_from_verse)}, which the old note did not. The name is in the verse text. <strong>Check:</strong> is that really who is speaking or acting here?` }),
   name_from_template: (d) => ({ d: 'D8', text: `${list(d.name_from_template)} comes from the template's fixed wording, not from the old note. <strong>Check:</strong> is it right for this verse, or example text the model should have replaced?` }),
   old_span_dropped: (d) => ({ text: `The old note pointed at ${list(d.old_span_dropped)} in the verse. The new note no longer mentions those words. <strong>Check:</strong> nothing the old note said about them was lost.` }),
+  judges_split: (d, r) => ({ d: 'D6', text: `One of the two information judges doubted ${(r.claim_split || []).length > 1 ? 'these facts' : 'this fact'} and the other found it: ${(r.claim_split || []).map((c) => `“${esc(c)}”`).join(', ')}. It ships tagged for human review. <strong>Check:</strong> that the fact is still in the new note.` }),
   no_claims_checked: () => ({ d: 'D6', text: 'The information check found nothing specific in the old note to test, so only the mechanical checks ran. <strong>Check:</strong> read old and new side by side.' }),
   at_quote_pair: () => ({ text: 'An alternate translation carries one quotation mark of a pair that the verse has both of. <strong>Check:</strong> the quotation marks in the alternate translation.' }),
   generic_speaker: (d) => ({ d: 'D8', text: `The new note says ${list(d)} where the old note named no speaker. The template needed one, and the tool may not take a name from outside the old note or the verse. <strong>Check:</strong> does the wording read naturally, or should an editor name the speaker?` }),
@@ -182,7 +183,7 @@ for (const book of books) {
     r.tags_add = r.tags_add || [];
     if (r.status === 'changed') {
       if (r.review) r.checks.push({ code: 'review', ...CHECKS.review(r.review) });
-      for (const w of r.warnings) if (CHECKS[w]) r.checks.push({ code: w, ...CHECKS[w](det) });
+      for (const w of r.warnings) if (CHECKS[w]) r.checks.push({ code: w, ...CHECKS[w](det, r) });
       const g = genericSpeakerAdded(r);
       if (g.length) r.checks.push({ code: 'generic_speaker', ...CHECKS.generic_speaker(g) });
     }

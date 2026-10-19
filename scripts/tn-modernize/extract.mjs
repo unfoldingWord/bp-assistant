@@ -21,10 +21,12 @@ const { BOOK_NUMBERS } = require('../../src/door43-push.js');
 const argv = process.argv.slice(2);
 const flag = (n) => { const i = argv.indexOf(n); return i >= 0 ? argv[i + 1] : null; };
 const TN = flag('--tn'), ULT = flag('--ult'), TWL = flag('--twl');
-const flagVals = new Set([TN, ULT, TWL]);
+// --chapter N: look only at that chapter's rows (a trial run on part of a book).
+const CHAPTER = flag('--chapter');
+const flagVals = new Set([TN, ULT, TWL, CHAPTER]);
 const books = argv.filter((a) => /^[0-9A-Z]{3}$/.test(a) && !flagVals.has(a));
 if (!TN || !ULT || !books.length) {
-  console.error('usage: extract.mjs --tn <en_tn> --ult <en_ult> [--twl <en_twl>] BOOK [BOOK...]');
+  console.error('usage: extract.mjs --tn <en_tn> --ult <en_ult> [--twl <en_twl>] [--chapter N] BOOK [BOOK...]');
   process.exit(2);
 }
 // Anything left once the pointer sentences and the alternate translation are removed.
@@ -55,9 +57,10 @@ for (const book of books) {
     }
   }
 
-  const counts = { rows: rows.length, candidate: 0 };
+  const counts = { rows: CHAPTER ? rows.filter((r) => String(r.Reference).startsWith(`${CHAPTER}:`)).length : rows.length, candidate: 0 };
   const out = [];
   for (const r of rows) {
+    if (CHAPTER && !String(r.Reference).startsWith(`${CHAPTER}:`)) continue;
     const cls = lib.classifyRow(r);
     if (cls.status !== 'old') { counts[cls.status] = (counts[cls.status] || 0) + 1; continue; }
     const { prose, links, otherLinks } = splitLinks(r.Note);
@@ -92,7 +95,7 @@ for (const book of books) {
   fs.mkdirSync(dir, { recursive: true });
   fs.writeFileSync(path.join(dir, 'candidates.jsonl'), out.map((o) => JSON.stringify(o)).join('\n') + '\n');
   fs.writeFileSync(path.join(dir, 'extract.json'), JSON.stringify({
-    book, counts, templates_snapshot: lib.templatesSnapshotDate(),
+    book, chapter: CHAPTER ? Number(CHAPTER) : null, counts, templates_snapshot: lib.templatesSnapshotDate(),
     names: bookNames(usfm.split(/\\c\s+/).slice(1).map((ch) => ch.replace(/^\d+/, '').split(/\\v\s+/).slice(1).map((v) => lib.ultVerseText(`\\c 1\n\\v ${v}`, 1, parseInt(v, 10)) || '').join(' ')).join(' ')),
     sources: { en_tn: head(TN), en_ult: head(ULT), en_twl: TWL ? head(TWL) : null },
     extracted_at: new Date().toISOString(),

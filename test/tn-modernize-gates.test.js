@@ -156,3 +156,26 @@ test('#480: template example words match any filling, and copying one unreplaced
   const left = checkRewrite(c, { template_id: tpl.id, note: 'Naomi is asking God to bless Person. In your translation, use a form that people would recognize as a blessing in your language. You might express this as a prayer, if that would be more natural in your language.' });
   assert.ok(left.failures.includes('placeholder_left'), left.failures.join(','));
 });
+
+test('Benjamin 2026-10-19: a qualifier inside the fixed wording, "phrase" for "word", and measurement figures pass', () => {
+  const lib = require('../scripts/tn-modernize/lib.js');
+  const follows = (id, note) => {
+    const t = lib.templatesFor(id.replace(/-\d+$/, '')).find((x) => x.id === id);
+    return lib.followsTemplate(note, t.template, id).ok;
+  };
+  assert.ok(follows('grammar-connect-logic-contrast-01', 'The author uses the word **But** here to indicate a strong contrast between what Naomi said and what they say.'));
+  assert.ok(follows('translate-symaction-01', 'To **uncover his feet** means x. This action by a woman was probably a symbolic action by which she proposed marriage.'));
+  assert.ok(!follows('grammar-connect-logic-contrast-01', 'The author uses the word **But** here to indicate a very strong and sharp contrast between them.'));
+  assert.ok(follows('writing-newevent-01', 'The author is using the phrase translated as **Now it happened** to introduce a new event in the story. Use a word, phrase, or other method in your language that is natural for introducing a new event.'));
+  assert.ok(follows('translate-bvolume-01', 'An **ephah** is about 22 liters. If it would be helpful to your readers, you could express this in terms of modern measurements, either in the text or in a footnote.'));
+  assert.ok(!follows('translate-bvolume-01', 'An **ephah** is about 22 liters. Use the normal measurement for grain in your language.'));
+  assert.ok(follows('figs-activepassive-01', 'The expressions **be conformed** and **be transformed** are passive verbal forms. If it would be unnatural to use that form, you could express the idea in active form or in another way that is natural in your language.'));
+});
+
+test('a claim only one judge doubts ships for review; one both doubt is held', () => {
+  const { claimVerdict } = require('../scripts/tn-modernize/claims.js');
+  const claims = ['a', 'b'];
+  assert.deepStrictEqual(claimVerdict(claims, [0.9, 0.5], 0.8, [0.9, 0.85]), { pass: true, missing: [], split: ['b'] });
+  assert.deepStrictEqual(claimVerdict(claims, [0.9, 0.5], 0.8, [0.9, 0.6]), { pass: false, missing: ['b'], split: [] });
+  assert.strictEqual(claimVerdict(claims, [0.9, 0.5], 0.8).pass, false);
+});
