@@ -177,7 +177,7 @@ for (const book of books) {
   const counts = Object.fromEntries(BUCKETS.map(([k]) => [k, 0]));
   for (const r of results) {
     const c = cands.get(r.ID) || {};
-    model = r.model || model;
+    if (r.model && r.model !== 'reviewer edit') model = r.model;
     const det = r.gate_detail || {};
     r.checks = [];
     r.tags_add = r.tags_add || [];
