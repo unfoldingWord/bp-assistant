@@ -43,20 +43,32 @@ function splitLinks(note) {
   return { prose, links, otherLinks };
 }
 
+/** Tags a result adds, merged into a row's existing Tags cell ("; " between tags, none repeated). */
+function mergeTags(cell, add) {
+  const have = String(cell || '').split(';').map((t) => t.trim()).filter(Boolean);
+  for (const t of add || []) if (!have.includes(t)) have.push(t);
+  return have.join('; ');
+}
+
+/** Results that write to the TSV: a new Note, and/or review tags on an unchanged Note. */
+const writes = (r) => r.status === 'changed' || (r.tags_add && r.tags_add.length > 0);
+
 /**
- * Splice new Note cells into an en_tn TSV text, touching nothing else.
+ * Splice new Note cells, and the Tags a result adds, into an en_tn TSV text,
+ * touching nothing else.
  *
  * Works line by line on the original bytes (two en_tn books have no trailing
  * newline, so a parse/serialize round trip would change them elsewhere).
  * A result applies only when its row (matched by ID) still holds exactly the
  * old Note; otherwise it is reported stale, never forced.
  *
- * @returns {{ text, applied: string[], stale: string[], missing: string[] }}
+ * @returns {{ text, applied: string[], tagged: string[], stale: string[], missing: string[] }}
  */
 function applyResults(tsvText, results) {
-  const changed = new Map(results.filter((r) => r.status === 'changed').map((r) => [r.ID, r]));
+  const changed = new Map(results.filter(writes).map((r) => [r.ID, r]));
   const lines = String(tsvText).split('\n');
   const applied = [];
+  const tagged = [];
   const stale = [];
   for (let i = 1; i < lines.length; i++) {
     const cr = lines[i].endsWith('\r') ? '\r' : '';
@@ -66,27 +78,33 @@ function applyResults(tsvText, results) {
     if (!r) continue;
     changed.delete(cells[1]);
     if (cells[6] !== r.old) { stale.push(r.ID); continue; }
-    if (/[\t\r\n]/.test(r.new)) throw new Error(`${r.ID}: new note contains a raw tab or newline`);
-    cells[6] = r.new;
+    if (r.status === 'changed') {
+      if (/[\t\r\n]/.test(r.new)) throw new Error(`${r.ID}: new note contains a raw tab or newline`);
+      cells[6] = r.new;
+      applied.push(r.ID);
+    }
+    if (r.tags_add && r.tags_add.length) { cells[2] = mergeTags(cells[2], r.tags_add); tagged.push(r.ID); }
     lines[i] = cells.join('\t') + cr;
-    applied.push(r.ID);
   }
-  return { text: lines.join('\n'), applied, stale, missing: [...changed.keys()] };
+  return { text: lines.join('\n'), applied, tagged, stale, missing: [...changed.keys()] };
 }
 
 /**
- * Prove a before/after pair differs only in the Note cells of `ids`.
- * Returns a list of problems; empty means the change is exactly what was intended.
+ * Prove a before/after pair differs only in the Note cells of `ids` and the
+ * Tags cells of `tagIds`. Returns a list of problems; empty means the change
+ * is exactly what was intended.
  */
-function diffOnlyNotes(beforeText, afterText, ids, parse) {
+function diffOnlyNotes(beforeText, afterText, ids, parse, tagIds = []) {
   const problems = [];
   const a = parse(beforeText);
   const b = parse(afterText);
   if (a.length !== b.length) return [`row count ${a.length} -> ${b.length}`];
   const want = new Set(ids);
+  const tagWant = new Set(tagIds);
   const seen = new Set();
   for (let i = 0; i < a.length; i++) {
     for (const col of ['Reference', 'ID', 'Tags', 'SupportReference', 'Quote', 'Occurrence']) {
+      if (col === 'Tags' && tagWant.has(a[i].ID)) continue;
       if (a[i][col] !== b[i][col]) problems.push(`row ${i + 2} ${col} changed`);
     }
     if (a[i].Note !== b[i].Note) {
@@ -100,9 +118,9 @@ function diffOnlyNotes(beforeText, afterText, ids, parse) {
   const lb = afterText.split('\n');
   if (la.length !== lb.length) problems.push(`line count ${la.length} -> ${lb.length}`);
   for (let i = 0; i < Math.min(la.length, lb.length); i++) {
-    if (la[i] !== lb[i] && !want.has(la[i].split('\t')[1])) problems.push(`line ${i + 1} bytes changed`);
+    if (la[i] !== lb[i] && !want.has(la[i].split('\t')[1]) && !tagWant.has(la[i].split('\t')[1])) problems.push(`line ${i + 1} bytes changed`);
   }
   return problems;
 }
 
-module.exports = { splitLinks, applyResults, diffOnlyNotes };
+module.exports = { splitLinks, applyResults, diffOnlyNotes, mergeTags, writes };

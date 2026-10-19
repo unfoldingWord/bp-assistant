@@ -22,8 +22,16 @@ async function claudeJson(opts, tries = 2) {
   }
 }
 
+/** The note with its "Alternate translation: [...]" spans removed. */
+function withoutAts(note) {
+  return String(note).replace(/Alternate translation:\s*(?:\([^)]*\)\s*)?\[[^\]]*\](?:\s*,?\s*or\s+(?:\([^)]*\)\s*)?\[[^\]]*\])*/g, ' ').replace(/\s+/g, ' ').trim();
+}
+
 async function extractClaims(rows, { model, system, guard }) {
-  const input = rows.map((r) => ({ ID: r.ID, issue: r.slug, note: r.prose }));
+  // The alternate translations are checked word for word by gate 2; left in,
+  // the extractor turns them into claims the new note's prose cannot carry
+  // (8 of 9 claim holds in the Ruth pilot).
+  const input = rows.map((r) => ({ ID: r.ID, issue: r.slug, note: withoutAts(r.prose) }));
   const { res, json } = await claudeJson({ model, system, prompt: JSON.stringify(input), effort: 'low', guard });
   const claims = json.claims || {};
   for (const r of rows) {
@@ -71,4 +79,4 @@ function claimVerdict(claims, p, threshold) {
   return { pass: missing.length === 0, missing };
 }
 
-module.exports = { extractClaims, judgeHaiku, judgeJev, claimVerdict };
+module.exports = { withoutAts, extractClaims, judgeHaiku, judgeJev, claimVerdict };

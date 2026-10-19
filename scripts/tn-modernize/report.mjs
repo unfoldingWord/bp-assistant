@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // report.mjs — the review page for a modernize run.
 //
-//   node scripts/tn-modernize/report.mjs [--out <file.html>] BOOK [BOOK...]
+//   node scripts/tn-modernize/report.mjs [--out <file.html>] [--prev results-v2.jsonl] BOOK [BOOK...]
 //
 // Reads output/modernize/<BOOK>/{extract.json,candidates.jsonl,results.jsonl,calls.jsonl}
 // and writes one self-contained HTML page (default output/modernize/report.html):
@@ -13,6 +13,10 @@
 // Feedback is saved through the artifact `db` capability (collection
 // "feedback", one doc per row per reviewer) when the page is published with
 // capabilities {db: {}, user: {}}; elsewhere the form says it cannot save.
+// Each saved doc records the hash of the note it judged (h). --prev names an
+// archived results file in each book's folder: feedback saved before hashes
+// existed is matched against that run's notes, so a review of a note that has
+// since been rewritten shows as "earlier version", with the old verdict.
 
 import { createRequire } from 'module';
 import fs from 'fs';
@@ -22,14 +26,19 @@ const require = createRequire(import.meta.url);
 const lib = require('./lib.js');
 
 const argv = process.argv.slice(2);
-const outIdx = argv.indexOf('--out');
+const flagAt = (n) => argv.indexOf(n);
+const outIdx = flagAt('--out'), prevIdx = flagAt('--prev');
 const OUT = outIdx >= 0 ? argv[outIdx + 1] : path.join(lib.WORK_DIR, 'output/modernize/report.html');
-const books = argv.filter((a, i) => /^[0-9A-Z]{3}$/.test(a) && (outIdx < 0 || i !== outIdx + 1));
+const PREV = prevIdx >= 0 ? argv[prevIdx + 1] : null;
+const books = argv.filter((a, i) => /^[0-9A-Z]{3}$/.test(a) && !(outIdx >= 0 && i === outIdx + 1) && !(prevIdx >= 0 && i === prevIdx + 1));
 if (!books.length) { console.error('usage: report.mjs [--out file.html] BOOK [BOOK...]'); process.exit(2); }
 
 const readJsonl = (f) => (fs.existsSync(f) ? fs.readFileSync(f, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l)) : []);
 const esc = (s) => String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 const THRESHOLD = 0.8;
+// Short stable hash of the note a reviewer judged (the proposal, or the old note when there is none).
+const hash = (s) => { let h = 5381; for (const ch of String(s)) h = ((h * 33) ^ ch.codePointAt(0)) >>> 0; return h.toString(36); };
+const judged = (r) => (r ? r.new || r.new_rejected || r.old : '');
 
 // ---------------------------------------------------------------------------
 // Note rendering and word diff. Tokens carry their own bold flag, so a diff
@@ -81,7 +90,8 @@ const md = (s) => renderTokens(tokens(s));
 const list = (v) => [].concat(v || []).map((x) => `<q>${esc(x)}</q>`).join(', ');
 
 const CHECKS = {
-  template_at_omitted: () => ({ text: 'The template ends with an alternate translation, but the old note had none. The rewrite leaves it out, because the tool never writes a new one. <strong>Check:</strong> does this note need an editor to add one?' }),
+  template_at_omitted: () => ({ text: `The template ends with an alternate translation, but the old note had none. The rewrite leaves it out (the tool never writes one) and the row gets the Tags value <q>${lib.REVIEW_TAGS.at}</q> so an editor can add one later.` }),
+  review: (reason) => ({ text: `The model asked for a person to look: <q>${esc(reason)}</q> The row gets the Tags value <q>${lib.REVIEW_TAGS.human}</q>.` }),
   name_from_verse: (d) => ({ d: 'D8', text: `The new note names ${list(d.name_from_verse)}, which the old note did not. The name is in the verse text. <strong>Check:</strong> is that really who is speaking or acting here?` }),
   name_from_template: (d) => ({ d: 'D8', text: `${list(d.name_from_template)} comes from the template's fixed wording, not from the old note. <strong>Check:</strong> is it right for this verse, or example text the model should have replaced?` }),
   old_span_dropped: (d) => ({ text: `The old note pointed at ${list(d.old_span_dropped)} in the verse. The new note no longer mentions those words. <strong>Check:</strong> nothing the old note said about them was lost.` }),
@@ -113,6 +123,7 @@ const WHY = {
   other_link: () => 'The note has a kind of link with no policy yet.',
   no_ult_text: () => 'No ULT text was found for this reference.',
   empty_note: () => 'The note is empty.',
+  see_how: (d, r) => `A "See how you translated…" note. These are never rewritten.${(r.tags_add || []).length ? ` It also carries information of its own, so the row gets the Tags value <q>${lib.REVIEW_TAGS.human}</q> and the note stays as it is.` : ''}`,
 };
 
 // Declines in the model's own words, grouped so patterns show.
@@ -158,6 +169,7 @@ for (const book of books) {
   snapshot = ex.templates_snapshot;
   const cands = new Map(readJsonl(path.join(dir, 'candidates.jsonl')).map((c) => [c.ID, c]));
   const results = readJsonl(path.join(dir, 'results.jsonl'));
+  const prev = new Map(PREV ? readJsonl(path.join(dir, PREV)).map((r) => [r.ID, r]) : []);
   const calls = readJsonl(path.join(dir, 'calls.jsonl'));
   const cost = calls.reduce((s, c) => s + (c.costUsd || 0), 0);
   totalCost += cost; totalCalls += calls.length;
@@ -167,11 +179,16 @@ for (const book of books) {
     model = r.model || model;
     const det = r.gate_detail || {};
     r.checks = [];
+    r.tags_add = r.tags_add || [];
     if (r.status === 'changed') {
+      if (r.review) r.checks.push({ code: 'review', ...CHECKS.review(r.review) });
       for (const w of r.warnings) if (CHECKS[w]) r.checks.push({ code: w, ...CHECKS[w](det) });
       const g = genericSpeakerAdded(r);
       if (g.length) r.checks.push({ code: 'generic_speaker', ...CHECKS.generic_speaker(g) });
     }
+    r.h = hash(judged(r));
+    const p = prev.get(r.ID);
+    if (p) { r.ph = hash(judged(p)); r.prevText = judged(p) !== judged(r) ? judged(p) : null; }
     r.book = book;
     r.key = `${book}-${r.ID}`;
     r.bucket = bucket(r);
@@ -232,7 +249,7 @@ function card(r) {
   const box = r.bucket === 'flagged'
     ? `<div class="box check"><h4>What to check</h4><ul>${r.checks.map((x) => `<li>${x.d ? `<span class="chip d">${x.d}</span> ` : ''}${x.text}</li>`).join('')}</ul></div>`
     : r.bucket === 'declined'
-      ? `<div class="box why"><h4>Why it stayed</h4><p>${r.declineGroup.d ? `<span class="chip d">${r.declineGroup.d}</span> ` : ''}<strong>${esc(r.declineGroup.label)}.</strong> The model said: <q>${esc(r.decline)}</q></p></div>`
+      ? `<div class="box why"><h4>Why it stayed</h4><p>${r.declineGroup.d ? `<span class="chip d">${r.declineGroup.d}</span> ` : ''}<strong>${esc(r.declineGroup.label)}.</strong> The model said: <q>${esc(r.decline)}</q>${r.review ? ` It asked for a person: <q>${esc(r.review)}</q>, so the row gets the Tags value <q>${lib.REVIEW_TAGS.human}</q>.` : ''}</p></div>`
       : (r.bucket === 'held' || r.bucket === 'skipped') && r.why.length
         ? `<div class="box why"><h4>Why it stayed</h4><ul>${r.why.map((w) => `<li>${w}</li>`).join('')}</ul></div>` : '';
   const kind = r.bucket === 'flagged' || r.bucket === 'changed' ? 'ship' : 'stay';
@@ -242,9 +259,13 @@ function card(r) {
 <label class="cm" for="c-${esc(r.key)}">Comment (what should change, or a rule we should learn)</label>
 <textarea id="c-${esc(r.key)}" rows="2"></textarea>
 <div class="act"><button type="submit">Save</button><span class="st" aria-live="polite"></span></div></fieldset></form>`;
-  return `<article class="row k-${r.bucket}" data-k="${r.bucket}" data-d="${r.ds.join(' ')}" id="${esc(r.key)}">
+  const tagLine = r.tags_add.length ? `<p class="tagline">Tags column gets: ${r.tags_add.map((t) => `<span class="chip t">${esc(t)}</span>`).join(' ')}</p>` : '';
+  const prevBox = `<div class="box prev" hidden><h4>Your review was of an earlier version</h4><p class="pv"></p>${r.prevText ? `<p class="pt"><span class="lbl">Earlier proposal</span> ${md(r.prevText)}</p>` : ''}</div>`;
+  return `<article class="row k-${r.bucket}" data-k="${r.bucket}" data-d="${r.ds.join(' ')}" data-h="${r.h}"${r.ph ? ` data-ph="${r.ph}"` : ''} id="${esc(r.key)}">
 <header><span class="pill p-${r.bucket}">${pill}</span><span class="ref">${esc(r.book)} ${esc(r.Reference)}</span><span class="slug">${esc(r.slug)}</span><span class="id">${esc(r.ID)}</span>${r.ds.map((d) => `<span class="chip d">${d}</span>`).join('')}<span class="mine" hidden></span></header>
+${prevBox}
 ${box}
+${tagLine}
 <div class="pair"><div><h4>Current note</h4><p>${o}</p></div>${proposed ? `<div><h4>${r.status === 'changed' ? 'New note (will ship)' : 'Proposed, not applied'}</h4><p>${nw}</p></div>` : ''}</div>
 <details class="ctx"><summary>Verse and template</summary><p><span class="lbl">ULT</span> ${esc(r.ult)}</p>${r.tpl ? `<p><span class="lbl">${esc(r.tpl.id)}${r.tpl.type ? ` (${esc(r.tpl.type)})` : ''}</span> ${md(r.tpl.template)}</p>` : ''}</details>
 ${claimTable(r)}
@@ -294,17 +315,17 @@ const html = `<title>en_tn Modernize Review</title>
   --bg: #f6f7f8; --surface: #ffffff; --ink: #1d2733; --muted: #5b6878; --rule: #d9dee4; --accent: #1f5f73;
   --ins: #d9efe1; --ins-ink: #14532d; --del: #f6dcdc; --del-ink: #7f1d1d;
   --flag: #8a4f00; --flag-bg: #fff4dc; --held: #9b2c2c; --held-bg: #fbeaea; --ok: #2f6b3f; --decl: #4f5a73; --decl-bg: #eef0f5;
-  --d: #5a3e8c; --d-bg: #efe9f8;
+  --d: #5a3e8c; --d-bg: #efe9f8; --rev-bg: #f1f8f3;
   --serif: "Literata", Georgia, "Times New Roman", serif; --sans: "IBM Plex Sans", system-ui, sans-serif; --mono: "IBM Plex Mono", ui-monospace, monospace;
 }
 @media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) {
   --bg: #12171d; --surface: #1a2129; --ink: #e3e8ee; --muted: #9aa7b6; --rule: #2c3540; --accent: #7cc0d4;
   --ins: #183a26; --ins-ink: #b7ebc8; --del: #47201f; --del-ink: #f5c2c2; --flag: #f0b45c; --flag-bg: #3a2c12; --held: #f08b8b; --held-bg: #3a1c1c;
-  --ok: #8fd19e; --decl: #aab4cc; --decl-bg: #232a38; --d: #c7b2ef; --d-bg: #2d2540; color-scheme: dark } }
+  --ok: #8fd19e; --decl: #aab4cc; --decl-bg: #232a38; --d: #c7b2ef; --d-bg: #2d2540; --rev-bg: #18241c; color-scheme: dark } }
 :root[data-theme="dark"] {
   --bg: #12171d; --surface: #1a2129; --ink: #e3e8ee; --muted: #9aa7b6; --rule: #2c3540; --accent: #7cc0d4;
   --ins: #183a26; --ins-ink: #b7ebc8; --del: #47201f; --del-ink: #f5c2c2; --flag: #f0b45c; --flag-bg: #3a2c12; --held: #f08b8b; --held-bg: #3a1c1c;
-  --ok: #8fd19e; --decl: #aab4cc; --decl-bg: #232a38; --d: #c7b2ef; --d-bg: #2d2540; color-scheme: dark }
+  --ok: #8fd19e; --decl: #aab4cc; --decl-bg: #232a38; --d: #c7b2ef; --d-bg: #2d2540; --rev-bg: #18241c; color-scheme: dark }
 body { background: var(--bg); color: var(--ink); font: 15px/1.55 var(--sans); padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px)); padding-block: 24px 64px; }
 main { max-width: 72rem; margin: 0 auto; display: grid; gap: 28px; }
 h1, h2, h3 { text-wrap: balance; line-height: 1.2; margin: 0; }
@@ -341,7 +362,14 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, summary:focus
 .pill { font: 600 .74rem var(--sans); padding: 2px 8px; border-radius: 999px; }
 .p-flagged { background: var(--flag-bg); color: var(--flag); } .p-held { background: var(--held-bg); color: var(--held); }
 .p-declined, .p-skipped { background: var(--decl-bg); color: var(--decl); } .p-changed { background: var(--ins); color: var(--ins-ink); }
-.mine { font-weight: 600; color: var(--accent); }
+.mine { font: 600 .78rem var(--sans); padding: 2px 8px; border-radius: 999px; background: var(--ok); color: var(--surface); }
+.row.reviewed { border-left: 10px solid var(--ok); background: var(--rev-bg); }
+.row.stale { border-left: 10px dashed var(--flag); }
+.row.stale .mine { background: var(--flag); }
+.prev { background: var(--flag-bg); } .prev h4 { color: var(--flag); } .prev p + p { margin-top: 6px; }
+.prev .pt { font: .95rem/1.55 var(--serif); }
+.chip.t { background: var(--flag-bg); color: var(--flag); }
+.tagline { margin: 0; font-size: .86rem; color: var(--muted); }
 .box { border-radius: 6px; padding: 10px 12px; }
 .box ul { margin: 0; padding-left: 18px; display: grid; gap: 4px; }
 .box p { margin: 0; }
@@ -375,7 +403,7 @@ details summary { cursor: pointer; font-size: .88rem; color: var(--accent); }
 <main>
 <header>
 <h1>en_tn Modernize Review</h1>
-<p class="meta">${books.join(', ')}: old-style translation notes rewritten into the current templates (snapshot ${esc(snapshot)}). Only the Note column changes. A new note ships only when every check passes; otherwise the current note stays. Leave feedback on any row: it is saved for the next tuning pass and does not change the notes by itself.</p>
+<p class="meta">${books.join(', ')}: old-style translation notes rewritten into the current templates (snapshot ${esc(snapshot)}). Only the Note column changes, plus a review tag in the Tags column where a person must look. A new note ships only when every check passes; otherwise the current note stays. Leave feedback on any row: it is saved for the next tuning pass and does not change the notes by itself.</p>
 </header>
 ${decisions}
 <section><h2>Counts</h2>
@@ -389,6 +417,7 @@ ${declineSummary ? `<p class="help">Why the model declined: </p><ul class="help"
 <button type="button" id="f-all" data-f="all" aria-pressed="true">All ${all.length}</button>
 ${BUCKETS.filter(([k]) => count(k)).map(([k, l]) => `<button type="button" id="f-${k}" data-f="${k}" aria-pressed="false">${l} ${count(k)}</button>`).join('\n')}
 <button type="button" id="f-todo" data-f="todo" aria-pressed="false">No feedback yet</button>
+<button type="button" id="f-stale" data-f="stale" aria-pressed="false">Changed since your review</button>
 <span class="progress" id="progress"></span>
 </nav>
 ${all.map(card).join('\n')}
@@ -403,6 +432,7 @@ function show(kind, value) {
   rows.forEach((r) => {
     let on = true;
     if (kind === 'f' && value === 'todo') on = !mine.has(r.id);
+    else if (kind === 'f' && value === 'stale') on = r.classList.contains('stale');
     else if (kind === 'f' && value !== 'all') on = r.dataset.k === value;
     else if (kind === 'd') on = r.dataset.d.split(' ').includes(value);
     r.hidden = !on;
@@ -414,15 +444,25 @@ document.querySelectorAll('.dbtn').forEach((b) => b.addEventListener('click', ()
 
 function progress() {
   const el = document.getElementById('progress');
-  el.textContent = mine.size ? mine.size + ' of ' + rows.length + ' rows have your feedback' : '';
+  const stale = rows.filter((r) => r.classList.contains('stale')).length;
+  el.textContent = mine.size ? mine.size + ' of ' + rows.length + ' rows have your feedback' + (stale ? ', ' + stale + ' of them on an earlier version' : '') : '';
 }
+const VERDICT_LABEL = { good: 'Good, ship it', tweak: 'Ship, but tweak', wrong: 'Wrong, keep the old note', agree: 'Right to leave it', should: 'Should have been rewritten', other: 'Something else' };
 function fill(form, fb) {
-  if (form.dataset.dirty) return;
+  const row = form.closest('.row');
+  // Feedback saved before hashes existed judged the previous run's note.
+  const fresh = (fb.h || row.dataset.ph || row.dataset.h) === row.dataset.h;
+  row.classList.toggle('reviewed', fresh);
+  row.classList.toggle('stale', !fresh);
+  const tag = row.querySelector('.mine');
+  tag.hidden = false; tag.textContent = fresh ? 'Reviewed' : 'Reviewed earlier version';
+  const pb = row.querySelector('.prev');
+  pb.hidden = fresh;
+  if (!fresh) pb.querySelector('.pv').textContent = 'You said: ' + (VERDICT_LABEL[fb.verdict] || 'no verdict') + ((fb.tags || []).length ? ' [' + fb.tags.join(', ') + ']' : '') + (fb.comment ? '. "' + fb.comment + '"' : '') + '. The note has been rewritten since. Save again to review this version.';
+  if (form.dataset.dirty || !fresh) return;
   form.querySelectorAll('input[type=radio]').forEach((i) => { i.checked = i.value === fb.verdict; });
   form.querySelectorAll('input[type=checkbox]').forEach((i) => { i.checked = (fb.tags || []).includes(i.value); });
   form.querySelector('textarea').value = fb.comment || '';
-  const tag = form.closest('.row').querySelector('.mine');
-  tag.hidden = false; tag.textContent = 'Reviewed';
 }
 const forms = [...document.querySelectorAll('form.fb')];
 forms.forEach((f) => {
@@ -455,7 +495,7 @@ forms.forEach((f) => {
     const row = f.closest('.row');
     st.textContent = 'Saving…';
     try {
-      await col.doc(f.dataset.key + '__' + safe).set({ row: f.dataset.key, uid, verdict, tags, comment, bucket: row.dataset.k, decisions: row.dataset.d, at: new Date().toISOString() });
+      await col.doc(f.dataset.key + '__' + safe).set({ row: f.dataset.key, uid, verdict, tags, comment, h: row.dataset.h, bucket: row.dataset.k, decisions: row.dataset.d, at: new Date().toISOString() });
       delete f.dataset.dirty;
       st.textContent = 'Saved';
     } catch (e) {

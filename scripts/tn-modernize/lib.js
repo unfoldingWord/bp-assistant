@@ -89,31 +89,80 @@ const escapeRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
  *   leading and trailing punctuation left over from a placeholder is dropped
  *   curly and straight quotes compare equal
  */
-function phraseMatchers(phrase) {
-  const p = foldQuotes(phrase).toLowerCase()
-    .replace(/\[[^\]]*\]\([^)]*\)/g, ' ').replace(/\[[^\]]*\]/g, ' ').replace(/\s+/g, ' ').trim();
+// Example content a template carries where a placeholder belongs (#480): a
+// filled note replaces it, so it matches anything. Capitalized words are found
+// by rule (exampleMarked); these lowercase spans are listed per template.
+const TEMPLATE_EXAMPLES = {
+  'figs-metonymy-04': ['a person'],
+};
+// Fixed words that still bend to the subject: "is speaking of himself" fits Ruth as "herself".
+const AGREEMENT = {
+  is: 'is|are', was: 'was|were', himself: 'himself|herself|themselves|itself',
+  his: 'his|her|their|its', he: 'he|she|they|it', him: 'him|her|them|it',
+};
+const EXAMPLE = '\x01';
+const WILD = '[^.]{1,80}?';
+const KEEP_CAPS = /^(God|Yahweh|Lord|I|Alternate|Christ|Jesus)$/;
+
+/** The phrase with example content replaced by EXAMPLE markers (case kept). */
+function exampleMarked(phrase, examples = []) {
+  let p = foldQuotes(phrase);
+  for (const e of examples) p = p.split(e).join(EXAMPLE);
+  return p
+    .replace(/\b[A-Z][A-Z0-9]*_[A-Z0-9_]+\b/g, EXAMPLE)          // ACTION_DESCRIPTION_NOT_QUOTE
+    .replace(/\b[XY]\b/g, EXAMPLE)                               // "the information about X ... Y"
+    .replace(/(?<=[a-z,] )[A-Z][a-z]+(?: [A-Z][a-z]+)*\b/g, (w) => (KEEP_CAPS.test(w) ? w : EXAMPLE)) // "bless Person", "the Messiah"
+    // A name opening the sentence as its subject: "John is using", "David is speaking".
+    .replace(/(^|[.!?]"? )([A-Z][a-z]+)(?= (?:is|are|was|were) )/g, (m, pre, w) =>
+      (KEEP_CAPS.test(w) || /^(Here|This|These|That|The|If|It|In|You|Your|A|An|There)$/.test(w) ? m : pre + EXAMPLE))
+    .replace(/\b(?:the|a|an) \x01/gi, EXAMPLE);                  // the marker absorbs its own article
+}
+
+function phraseMatchers(phrase, examples) {
+  const p = exampleMarked(phrase, examples).toLowerCase()
+    .replace(/\[[^\]]*\]\([^)]*\)/g, ' ').replace(/\[[^\]]*\]/g, ' ').replace(/[[\]]/g, ' ').replace(/\s+/g, ' ').trim();
+  const literal = (s) => escapeRe(s).replace(/\b(is|was|himself|his|he|him)\b/g, (w) => `(?:${AGREEMENT[w]})`)
+    .split(EXAMPLE).join(`(?:(?:the|a|an) )?${WILD}`);
   return p.split(/(?<=[.!?]"?)\s+/).map((sentence) => {
-    const t = sentence.replace(/^[^a-z0-9(]+/, '').replace(/[.,;:!?"' ]+$/, '');
+    const t = sentence.replace(/^[^a-z0-9(\x01]+/, '').replace(/[.,;:!?"' ]+$/, '');
     const parts = [];
     let last = 0;
     const altRe = /\(([^()]*,[^()]*)\)|([a-z]+(?:\/[a-z]+)+)/g;
     let m;
     while ((m = altRe.exec(t))) {
-      parts.push(escapeRe(t.slice(last, m.index)));
+      parts.push(literal(t.slice(last, m.index)));
       const choices = (m[1] ? m[1].split(',') : m[2].split('/')).map((c) => escapeRe(c.trim()));
       const one = `(?:${choices.join('|')})`;
       parts.push(`${one}(?:(?:\\s*,\\s*|\\s+)(?:(?:and|or)\\s+)?${one})*`);
       last = m.index + m[0].length;
     }
-    parts.push(escapeRe(t.slice(last)));
+    parts.push(literal(t.slice(last)));
     return new RegExp(parts.join(''), 'g');
   }).filter((re) => re.source.length > 0);
 }
 
+/** Example words of a template phrase (for the placeholder_left gate): the capitalized ones, as written. */
+function templateExamples(phrase, templateId) {
+  const listed = TEMPLATE_EXAMPLES[templateId] || [];
+  const marked = exampleMarked(phrase, []);
+  const orig = foldQuotes(phrase);
+  // Recover what each marker replaced by aligning the text between markers.
+  const pieces = marked.split(EXAMPLE);
+  const found = [];
+  let at = 0;
+  for (let i = 0; i < pieces.length - 1; i++) {
+    at = orig.indexOf(pieces[i], at) + pieces[i].length;
+    const end = pieces[i + 1] ? orig.indexOf(pieces[i + 1], at) : orig.length;
+    found.push(orig.slice(at, end).replace(/^(?:the|a|an) /i, '').trim());
+    at = end;
+  }
+  return [...new Set([...found.filter((w) => w.length > 1), ...listed])];
+}
+
 /** True when every sentence of the phrase appears in the stripped note, in order. */
-function phraseMatches(phrase, stripped) {
+function phraseMatches(phrase, stripped, examples) {
   let from = 0;
-  for (const re of phraseMatchers(phrase)) {
+  for (const re of phraseMatchers(phrase, examples)) {
     re.lastIndex = from;
     const m = re.exec(stripped);
     if (!m) return false;
@@ -139,19 +188,25 @@ function classifyRow(row) {
   if (!slug) return { status: 'no_sref' };
   const tpls = templatesFor(slug);
   if (!tpls.length) return { status: 'no_template', slug };
-  const phrases = tpls.map((t) => templateFirstPhrase(t.template)).filter(Boolean);
+  const phrases = tpls.map((t) => ({ p: templateFirstPhrase(t.template), ex: TEMPLATE_EXAMPLES[t.id] })).filter((x) => x.p);
   if (!phrases.length) return { status: 'no_phrase', slug };
   const note = strippedNote(row.Note);
-  const hit = phrases.find((p) => phraseMatches(p, note));
-  return hit ? { status: 'conforms', slug, phrase: hit } : { status: 'old', slug };
+  const hit = phrases.find((x) => phraseMatches(x.p, note, x.ex));
+  return hit ? { status: 'conforms', slug, phrase: hit.p } : { status: 'old', slug };
 }
 
 /** True when this note follows the given template's first fixed phrase (check #25 rule). */
-function followsTemplate(note, templateText) {
+function followsTemplate(note, templateText, templateId) {
   const phrase = templateFirstPhrase(templateText);
   if (!phrase) return { ok: true, phrase: null };
-  return { ok: phraseMatches(phrase, strippedNote(note)), phrase };
+  return { ok: phraseMatches(phrase, strippedNote(note), TEMPLATE_EXAMPLES[templateId]), phrase };
 }
+
+/** Tags column values for rows a person must look at (Benjamin's wording, 2026-10-19). */
+const REVIEW_TAGS = { human: 'human review', at: 'needs alternate translation' };
+
+/** Old notes that only send the reader to an earlier note: never rewritten (Benjamin, 2026-10-19). */
+const SEE_HOW_RE = /\bSee how you\b/;
 
 // ---------------------------------------------------------------------------
 // ULT verse text
@@ -201,6 +256,7 @@ module.exports = {
   WORK_DIR, TEMPLATES_PATH, templatesSnapshotDate,
   parseTnTsv, serializeTnTsv,
   isIntroReference, srefSlug, templatesFor, foldQuotes, strippedNote, phraseMatches, classifyRow, followsTemplate,
+  templateExamples, SEE_HOW_RE, REVIEW_TAGS,
   templateFirstPhrase,
   ultVerseText, referenceVerses, ultTextForRow,
 };

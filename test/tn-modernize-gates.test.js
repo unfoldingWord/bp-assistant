@@ -134,3 +134,25 @@ test('a name from the template wording is flagged, not failed', () => {
   assert.ok(!r.failures.includes('name_added'));
   assert.ok(r.warnings.includes('name_from_template'));
 });
+
+test('#480: template example words match any filling, and copying one unreplaced fails', () => {
+  const { followsTemplate } = require('../scripts/tn-modernize/lib');
+  const blessing = 'SPEAKER is asking God to bless Person. In your translation, use a form that people would recognize as a blessing in your language. You might express this as a prayer, if that would be more natural in your language. Alternate translation: [text]';
+  assert.equal(followsTemplate('Naomi is asking God to bless Orpah and Ruth. In your translation, use a form that people would recognize as a blessing in your language. You might express this as a prayer, if that would be more natural in your language.', blessing).ok, true);
+  const pronoun = 'John is using the pronoun **himself** to emphasize THING. Use a way that is natural in your language to indicate this emphasis. Alternate translation: [text]';
+  assert.equal(followsTemplate('Boaz is using the pronoun **myself** to emphasize that he was committed. Use a way that is natural in your language to indicate this emphasis.', pronoun).ok, true);
+  const order = 'If it would be more natural in your language, you may want to put the information about X with/before the information about Y. Alternate translation: [text]';
+  assert.equal(followsTemplate('If it would be more natural in your language, you may want to put the information about dipping the bread before the information about eating it.', order).ok, true);
+  const third = 'SPEAKER is speaking of himself in the third person as **text**. If it would be helpful, you could use the first person.';
+  assert.equal(followsTemplate('Ruth is speaking of herself in the third person as **your female servant**. If it would be helpful, you could use the first person.', third).ok, true);
+  const sym = 'ACTION_DESCRIPTION_NOT_QUOTE was a symbolic action by which SPEAKER showed MEANING. If it would be helpful to your readers, you could explain the significance of this action.';
+  assert.equal(followsTemplate('Falling **on her face** was a symbolic action by which she showed respect. If it would be helpful to your readers, you could explain the significance of this action.', sym).ok, true);
+  // Fixed wording around an example still has to be there: "to convince" is not "for".
+  const rq = 'SPEAKER is using the question form for PURPOSE. If a speaker of your language would not use the question form for that purpose, you could translate this as a statement.';
+  assert.equal(followsTemplate('Naomi is using the question form to convince them. If a speaker of your language would not use the question form for that purpose, you could translate this as a statement.', rq).ok, false);
+
+  const tpl = { id: 'translate-blessing-01', type: '', template: blessing };
+  const c = { ...candidate, prose: 'Naomi is asking God to bless Orpah and Ruth. Use a natural form for a blessing.', ult: 'May Yahweh do covenant faithfulness with you', links: [], templates: [tpl] };
+  const left = checkRewrite(c, { template_id: tpl.id, note: 'Naomi is asking God to bless Person. In your translation, use a form that people would recognize as a blessing in your language. You might express this as a prayer, if that would be more natural in your language.' });
+  assert.ok(left.failures.includes('placeholder_left'), left.failures.join(','));
+});

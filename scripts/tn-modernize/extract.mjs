@@ -27,6 +27,13 @@ if (!TN || !ULT || !books.length) {
   console.error('usage: extract.mjs --tn <en_tn> --ult <en_ult> [--twl <en_twl>] BOOK [BOOK...]');
   process.exit(2);
 }
+// Anything left once the pointer sentences and the alternate translation are removed.
+function seeHowHasMore(prose) {
+  const rest = prose.replace(/Alternate translation:.*$/, '')
+    .split(/(?<=[.!?])\s+/).filter((sentence) => !lib.SEE_HOW_RE.test(sentence)).join(' ');
+  return (rest.match(/[A-Za-z]+/g) || []).length > 3;
+}
+
 const head = (dir) => execFileSync('git', ['-C', dir, 'log', '-1', '--format=%H %cI'], { encoding: 'utf8' }).trim();
 
 for (const book of books) {
@@ -71,9 +78,13 @@ for (const book of books) {
       }
     }
     if (otherLinks) Object.assign(rec, { status: 'skip', reason: 'other_link' });
+    // "See how you translated ..." notes are never rewritten (Benjamin, 2026-10-19);
+    // one that also carries information of its own is tagged for a person.
+    else if (lib.SEE_HOW_RE.test(prose)) Object.assign(rec, { status: 'skip', reason: 'see_how', tags_add: seeHowHasMore(prose) ? [lib.REVIEW_TAGS.human] : [] });
     else if (!ult) Object.assign(rec, { status: 'skip', reason: 'no_ult_text' });
     else if (!prose) Object.assign(rec, { status: 'skip', reason: 'empty_note' });
-    counts[rec.status === 'skip' ? `skip_${rec.reason}` : 'candidate']++;
+    const key = rec.status === 'skip' ? `skip_${rec.reason}` : 'candidate';
+    counts[key] = (counts[key] || 0) + 1;
     out.push(rec);
   }
 

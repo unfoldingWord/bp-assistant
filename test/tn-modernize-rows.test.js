@@ -73,3 +73,20 @@ test('splitLinks drops See also tA and See tW groups and counts any other link',
   const other = splitLinks('Compare [1 Samuel 15:10](rc://*/tn/help/1sa/15/10).');
   assert.equal(other.otherLinks, 1);
 });
+
+test('review tags go into Tags, merged, and the diff proof allows exactly those rows', () => {
+  const { mergeTags } = require('../scripts/tn-modernize/rows');
+  assert.equal(mergeTags('', ['human review']), 'human review');
+  assert.equal(mergeTags('ISSUE:MATCH_FAIL', ['human review', 'human review']), 'ISSUE:MATCH_FAIL; human review');
+  const tagOnly = { ID: 'ef56', old: 'Untouched.', new: null, status: 'unchanged', tags_add: ['human review'] };
+  const both = { ...changed('ab12', 'Old note one.', 'N.'), tags_add: ['needs alternate translation'] };
+  const res = applyResults(TSV, [tagOnly, both]);
+  assert.deepEqual(res.applied, ['ab12']);
+  assert.deepEqual(res.tagged.sort(), ['ab12', 'ef56']);
+  const rows = parseTnTsv(res.text);
+  assert.equal(rows.find((r) => r.ID === 'ef56').Tags, 'human review');
+  assert.equal(rows.find((r) => r.ID === 'ef56').Note, 'Untouched.');
+  assert.deepEqual(diffOnlyNotes(TSV, res.text, res.applied, parseTnTsv, res.tagged), []);
+  // Without the tagged list, the Tags change is caught.
+  assert.ok(diffOnlyNotes(TSV, res.text, res.applied, parseTnTsv).some((p) => /Tags changed/.test(p)));
+});

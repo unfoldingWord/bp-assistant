@@ -10,7 +10,7 @@
 'use strict';
 
 const path = require('path');
-const { followsTemplate } = require('./lib.js');
+const { followsTemplate, templateExamples } = require('./lib.js');
 const { detectSelfTalk } = require(path.join(__dirname, '../../src/workspace-tools/quality-tools'));
 
 const ws = (s) => String(s || '').replace(/\s+/g, ' ').trim();
@@ -162,10 +162,14 @@ function checkRewrite(candidate, proposal, { names = new Set() } = {}) {
 
   // G6 the note now follows the template it names.
   if (tpl) {
-    const f = followsTemplate(note, tpl.template);
+    const f = followsTemplate(note, tpl.template, tpl.id);
     if (!f.phrase) failures.push('template_untestable'); // no fixed phrase to prove the note follows it
     else if (!f.ok) { failures.push('template_phrase_missing'); detail.template_phrase = f.phrase; }
     const left = leftoverPlaceholders(note, tpl.template, candidate);
+    // The matcher lets example words ("bless Person") stand for anything, so
+    // one copied into the note unreplaced must be caught here.
+    const context = `${candidate.prose} ${candidate.ult}`;
+    if (f.phrase) for (const e of templateExamples(f.phrase, tpl.id)) if (note.includes(e) && !context.includes(e)) left.push(e);
     if (left.length) { failures.push('placeholder_left'); detail.placeholder_left = left; }
   }
   const selfTalk = detectSelfTalk(note);

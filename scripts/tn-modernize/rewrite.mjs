@@ -60,7 +60,7 @@ const append = (f, recs) => recs.length && fs.appendFileSync(f, recs.map((r) => 
 function result(c, fields) {
   return {
     ID: c.ID, Reference: c.Reference, slug: c.slug, old: c.Note, new: null, template_id: null,
-    status: 'unchanged', reasons: [], warnings: [], dropped_links: [], claims: null, judges: {},
+    status: 'unchanged', reasons: [], warnings: [], dropped_links: [], claims: null, judges: {}, tags_add: [], review: null,
     model: MODEL, prompts: promptHash, templates_snapshot: lib.templatesSnapshotDate(), ...fields,
   };
 }
@@ -93,9 +93,16 @@ async function runBatch(book, batch, files) {
     const p = byId.get(c.ID);
     const dropped = c.links.map((l) => ({ kind: l.kind, targets: l.targets, covered: l.covered }));
     if (!p) continue; // not recorded, so a rerun retries it
-    if (p.action !== 'rewrite') { out.push(result(c, { reasons: [`model_declined: ${String(p.reason || '').slice(0, 200)}`] })); continue; }
+    // The model may ask for a person to look ("review"), with or without a rewrite.
+    const review = p.review ? String(p.review).slice(0, 300) : null;
+    if (p.action !== 'rewrite') {
+      out.push(result(c, { reasons: [`model_declined: ${String(p.reason || '').slice(0, 200)}`], review, tags_add: review ? [lib.REVIEW_TAGS.human] : [] }));
+      continue;
+    }
     const g = checkRewrite(c, p, { names: files.names });
-    const r = result(c, { new: p.note, template_id: p.template_id, reasons: g.failures, warnings: g.warnings, gate_detail: g.detail, dropped_links: dropped });
+    // Benjamin, 2026-10-19: no invented alternate translations; tag the row instead.
+    const tags = [...(review ? [lib.REVIEW_TAGS.human] : []), ...(g.warnings.includes('template_at_omitted') ? [lib.REVIEW_TAGS.at] : [])];
+    const r = result(c, { new: p.note, template_id: p.template_id, reasons: g.failures, warnings: g.warnings, gate_detail: g.detail, dropped_links: dropped, review, tags_add: tags });
     out.push(r);
     if (!g.failures.length) passed.push({ c, r });
   }
@@ -109,7 +116,12 @@ async function runBatch(book, batch, files) {
       for (const { r } of passed) { r.reasons.push('claim_check_error'); r.status = 'unchanged'; }
     }
   }
-  for (const r of out) if (r.status !== 'changed' && r.new) { r.new_rejected = r.new; r.new = null; }
+  for (const r of out) {
+    if (r.status === 'changed' || !r.new) continue;
+    r.new_rejected = r.new; r.new = null;
+    // The AT tag belongs to the rewrite that did not ship; a request for review still stands.
+    r.tags_add = r.tags_add.filter((t) => t !== lib.REVIEW_TAGS.at);
+  }
   append(files.results, out);
   return true;
 }
@@ -178,7 +190,7 @@ for (const book of books) {
   const done = new Set(readJsonl(files.results).map((r) => r.ID));
   // Rows extract.mjs already skipped become unchanged results once.
   const skips = candidates.filter((c) => c.status === 'skip' && !done.has(c.ID));
-  if (!DRY) append(files.results, skips.map((c) => result(c, { reasons: [c.reason], model: null })));
+  if (!DRY) append(files.results, skips.map((c) => result(c, { reasons: [c.reason], model: null, tags_add: c.tags_add || [] })));
   let todo = candidates.filter((c) => c.status === 'candidate' && !done.has(c.ID));
   const doneCandidates = candidates.filter((c) => c.status === 'candidate' && done.has(c.ID)).length;
   if (LIMIT) todo = todo.slice(0, Math.max(0, LIMIT - doneCandidates));
