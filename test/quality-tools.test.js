@@ -1031,3 +1031,49 @@ test('checkTnQuality flags over-long quotes whose AT mostly copies the quote, ex
   const flagged = findings.filter((f) => f.category === 'overlong_quote').map((f) => f.id);
   assert.deepEqual(flagged, ['ol01']);
 });
+
+test('checkTnQuality flags quote marks that do not match the template (25d)', async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'quality-tplquotes-'));
+  const relRoot = path.join('tmp', path.basename(tempDir));
+  fs.mkdirSync(path.join('/srv/bot/workspace', relRoot), { recursive: true });
+  const tsvRel = path.join(relRoot, 'tn.tsv');
+  const prepRel = path.join(relRoot, 'prepared_notes.json');
+  const findingsRel = path.join(relRoot, 'findings.json');
+
+  const explicitTpl = 'By **PHRASE**, SPEAKER means EXPLANATION. You could indicate this explicitly in your translation if that would be helpful to your readers. Alternate translation: [text]';
+  const idiomTpl = 'SPEAKER is using **text** as a common expression of the culture to mean “MEANING.” If this phrase does not have that meaning for your readers, you could state the meaning plainly. Alternate translation: [text]';
+  const goTpl = 'In a context such as this, your language might say “went” instead of **came**. Alternate translation: [text]';
+  const tail = 'You could indicate this explicitly in your translation if that would be helpful to your readers. Alternate translation: [in the land of Israel]';
+  const rows = [
+    ['x1a1', 'figs-explicit', explicitTpl, `By **in the land**, the author means “in the land of Israel.” ${tail}`],
+    ['x1a2', 'figs-explicit', explicitTpl, `By **the land**, the author means the land of Israel. ${tail}`],
+    ['x1a3', 'figs-idiom', idiomTpl, 'Moses is using **in the eyes of** as a common expression of the culture to mean in the judgment of. Alternate translation: [in the judgment of]'],
+    ['x1a4', 'figs-idiom', idiomTpl, 'Moses is using **in the eyes of** as a common expression of the culture to mean “in the judgment of.” Alternate translation: [in the judgment of]'],
+    ['x1a5', 'figs-idiom', idiomTpl, 'Moses is using **return his blood** as a common expression of the culture to mean that Yahweh will punish him. Alternate translation: [Yahweh will punish him]'],
+    ['x1a6', 'figs-go', goTpl, 'In a context such as this, your language might say went instead of **came**. Alternate translation: [went]'],
+    ['x1a7', 'figs-go', goTpl, 'In a context such as this, your language might say “went” instead of **came**. Alternate translation: [went]'],
+    // The anchor "means" inside the bold verse quote is not the slot (review F1).
+    ['x1a9', 'figs-explicit', explicitTpl, `By **by this means**, the author means “through this event.” ${tail}`],
+    // "to meaning" is not the anchor "to mean" (review F2).
+    ['x1b1', 'figs-idiom', idiomTpl, 'This leads to meaning. Moses is using **in the eyes of** as a common expression of the culture to mean “in the judgment of.” Alternate translation: [in the judgment of]'],
+    // No resolvable template: nothing to compare against.
+    ['x1a8', 'figs-explicit', '', 'By **in the land**, the author means “in the land of Israel.”'],
+  ];
+  fs.writeFileSync(path.join('/srv/bot/workspace', tsvRel), [
+    'Reference\tID\tTags\tSupportReference\tQuote\tOccurrence\tNote',
+    ...rows.map(([id, sref, , note], i) => `1:${i + 1}\t${id}\t\trc://*/ta/man/translate/${sref}\tמֶלֶךְ\t1\t${note}`),
+  ].join('\n'));
+  fs.writeFileSync(path.join('/srv/bot/workspace', prepRel), JSON.stringify({
+    items: rows.map(([id, sref, tpl], i) => ({
+      id, reference: `1:${i + 1}`, sref, gl_quote: 'land', issue_span_gl_quote: 'land', ult_verse: 'in the land',
+      ...(tpl ? { template_text: tpl } : {}),
+    })),
+  }, null, 2));
+
+  await checkTnQuality({ tsvPath: tsvRel, preparedJson: prepRel, output: findingsRel });
+
+  const findings = readFindings(findingsRel);
+  const ids = (cat) => findings.filter((f) => f.category === cat).map((f) => f.id).sort();
+  assert.deepEqual(ids('template_quotes_extra'), ['x1a1', 'x1a9']);
+  assert.deepEqual(ids('template_quotes_missing'), ['x1a3', 'x1a6']);
+});

@@ -593,6 +593,67 @@ function resolveTemplateText(prepItem, sref) {
   return tpls.length === 1 ? tpls[0].template : '';
 }
 
+/**
+ * Find the template slots whose quote marks a note must copy (check 25d).
+ * A slot is an ALL-CAPS placeholder (SPEAKER means EXPLANATION — no quotes)
+ * or a quoted span (to mean “MEANING.” / might say “went” — quotes). Each slot
+ * carries the last few literal words before it as an anchor, so the note
+ * position that fills it can be found without matching the whole template.
+ * The Alternate translation tail is dropped: its brackets have their own rules.
+ *
+ * Returns [{ anchor, quoted }]. Slots whose anchor is too short to locate
+ * reliably, or that start a new sentence, are left out.
+ */
+function templateQuoteSlots(templateText) {
+  const body = String(templateText || '').replace(/Alternate translation:.*$/i, '');
+  const slots = [];
+  const re = /\*\*[^*]+\*\*|“[^”]*”|"[^"]*"|\b[A-Z]{2,}\d?\b/g;
+  let last = 0;
+  let m;
+  while ((m = re.exec(body))) {
+    const literal = body.slice(last, m.index);
+    last = m.index + m[0].length;
+    if (m[0].startsWith('**')) continue;
+    if (/^(ULT|UST)$/.test(m[0])) continue;
+    const trimmed = literal.trim();
+    if (!trimmed || /[.?!]$/.test(trimmed)) continue;
+    const anchor = trimmed.split(/\s+/).slice(-3).join(' ');
+    if (!/[A-Za-z]{4,}/.test(anchor)) continue;
+    slots.push({ anchor, quoted: /^[“"]/.test(m[0]) });
+  }
+  return slots;
+}
+
+/**
+ * Compare a note's quote marks with its template's (check 25d). Returns
+ * { quoted, anchor } for the first slot where they disagree, or null.
+ * `quoted: true` means the template quotes the slot and the note does not.
+ *
+ * A slot filled with a "that" clause is never required to be quoted — "to mean
+ * that Yahweh will punish him" is a paraphrase, not a gloss (224 of the 312
+ * unquoted published figs-idiom notes take that form).
+ */
+function findTemplateQuoteMismatch(noteText, templateText) {
+  // Bold spans are blanked (same length, so indexes still line up) — an anchor
+  // like "means" inside **by this means** is verse text, not the slot.
+  const note = String(noteText || '').replace(/Alternate translation:.*$/i, '');
+  const searchable = note.replace(/\*\*[^*]+\*\*/g, (b) => ' '.repeat(b.length));
+  for (const { anchor, quoted } of templateQuoteSlots(templateText)) {
+    const pattern = anchor.split(/\s+/).map(w => w.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('\\s+');
+    const re = new RegExp((/^\w/.test(anchor) ? '\\b' : '') + pattern + (/\w$/.test(anchor) ? '\\b' : ''), 'gi');
+    const fillers = [];
+    let hit;
+    while ((hit = re.exec(searchable))) fillers.push(note.slice(hit.index + hit[0].length).replace(/^\s+/, ''));
+    if (!fillers.length) continue;
+    // A quoted slot passes if any occurrence of its anchor is quoted (the
+    // anchor words can also appear in another sentence); an unquoted slot is
+    // judged at the first occurrence, which is where the template puts it.
+    if (quoted && !fillers.some(r => /^[“"]/.test(r) || /^that\b/i.test(r))) return { quoted: true, anchor };
+    if (!quoted && /^[“"]/.test(fillers[0])) return { quoted: false, anchor };
+  }
+  return null;
+}
+
 function detectSelfTalk(noteText) {
   const prose = String(noteText || '')
     .replace(/\*\*[^*]+\*\*/g, ' ')   // bolded verse quotes
@@ -1307,6 +1368,26 @@ async function checkTnQuality({ tsvPath, preparedJson, ultUsfm, ustUsfm, book, h
     if (/(?<![A-Za-z0-9])SKIP[_-]NOTE(?![A-Za-z0-9])/i.test(n.note)) {
       addFinding(n.row, n.ref, n.id, 'error', 'skip_marker_leak',
         'Note contains the writer skip marker SKIP_NOTE; a skipped note must be removed, not published');
+    }
+
+    // 25d. Quote marks follow the template. figs-explicit's "By **PHRASE**,
+    // SPEAKER means EXPLANATION." has no quotes, yet the writer often adds them
+    // ("the author means “in the land of Israel.”"); the reverse happens when a
+    // template quotes its slot (figs-idiom "to mean “MEANING.”"). Only the
+    // position right after the slot's anchor words is checked, so quotes
+    // elsewhere in the note are left alone.
+    //
+    // WARNING, not error: published notes are not uniform. Of 343 published
+    // "By **X**, ... means" figs-explicit notes, 20 quote the explanation.
+    {
+      const mismatch = findTemplateQuoteMismatch(n.note, resolveTemplateText(prepItem, n.sref));
+      if (mismatch && mismatch.quoted) {
+        addFinding(n.row, n.ref, n.id, 'warning', 'template_quotes_missing',
+          `Template puts quote marks after "${mismatch.anchor}" but the note does not`);
+      } else if (mismatch) {
+        addFinding(n.row, n.ref, n.id, 'warning', 'template_quotes_extra',
+          `Template has no quote marks after "${mismatch.anchor}" but the note adds them`);
+      }
     }
 
     // 25b. Contamination phrase detection
