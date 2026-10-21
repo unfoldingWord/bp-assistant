@@ -607,7 +607,7 @@ function resolveTemplateText(prepItem, sref) {
 function templateQuoteSlots(templateText) {
   const body = String(templateText || '').replace(/Alternate translation:.*$/i, '');
   const slots = [];
-  const re = /\*\*[^*]+\*\*|“[^”]*”|"[^"]*"|\b[A-Z]{2,}\b/g;
+  const re = /\*\*[^*]+\*\*|“[^”]*”|"[^"]*"|\b[A-Z]{2,}\d?\b/g;
   let last = 0;
   let m;
   while ((m = re.exec(body))) {
@@ -634,15 +634,22 @@ function templateQuoteSlots(templateText) {
  * unquoted published figs-idiom notes take that form).
  */
 function findTemplateQuoteMismatch(noteText, templateText) {
+  // Bold spans are blanked (same length, so indexes still line up) — an anchor
+  // like "means" inside **by this means** is verse text, not the slot.
   const note = String(noteText || '').replace(/Alternate translation:.*$/i, '');
+  const searchable = note.replace(/\*\*[^*]+\*\*/g, (b) => ' '.repeat(b.length));
   for (const { anchor, quoted } of templateQuoteSlots(templateText)) {
     const pattern = anchor.split(/\s+/).map(w => w.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('\\s+');
-    const hit = new RegExp((/^\w/.test(anchor) ? '\\b' : '') + pattern, 'i').exec(note);
-    if (!hit) continue;
-    const rest = note.slice(hit.index + hit[0].length).replace(/^\s+/, '');
-    const noteQuoted = /^[“"]/.test(rest);
-    if (quoted && !noteQuoted && !/^that\b/i.test(rest)) return { quoted: true, anchor };
-    if (!quoted && noteQuoted) return { quoted: false, anchor };
+    const re = new RegExp((/^\w/.test(anchor) ? '\\b' : '') + pattern + (/\w$/.test(anchor) ? '\\b' : ''), 'gi');
+    const fillers = [];
+    let hit;
+    while ((hit = re.exec(searchable))) fillers.push(note.slice(hit.index + hit[0].length).replace(/^\s+/, ''));
+    if (!fillers.length) continue;
+    // A quoted slot passes if any occurrence of its anchor is quoted (the
+    // anchor words can also appear in another sentence); an unquoted slot is
+    // judged at the first occurrence, which is where the template puts it.
+    if (quoted && !fillers.some(r => /^[“"]/.test(r) || /^that\b/i.test(r))) return { quoted: true, anchor };
+    if (!quoted && /^[“"]/.test(fillers[0])) return { quoted: false, anchor };
   }
   return null;
 }

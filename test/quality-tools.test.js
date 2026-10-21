@@ -1052,6 +1052,10 @@ test('checkTnQuality flags quote marks that do not match the template (25d)', as
     ['x1a5', 'figs-idiom', idiomTpl, 'Moses is using **return his blood** as a common expression of the culture to mean that Yahweh will punish him. Alternate translation: [Yahweh will punish him]'],
     ['x1a6', 'figs-go', goTpl, 'In a context such as this, your language might say went instead of **came**. Alternate translation: [went]'],
     ['x1a7', 'figs-go', goTpl, 'In a context such as this, your language might say “went” instead of **came**. Alternate translation: [went]'],
+    // The anchor "means" inside the bold verse quote is not the slot (review F1).
+    ['x1a9', 'figs-explicit', explicitTpl, `By **by this means**, the author means “through this event.” ${tail}`],
+    // "to meaning" is not the anchor "to mean" (review F2).
+    ['x1b1', 'figs-idiom', idiomTpl, 'This leads to meaning. Moses is using **in the eyes of** as a common expression of the culture to mean “in the judgment of.” Alternate translation: [in the judgment of]'],
     // No resolvable template: nothing to compare against.
     ['x1a8', 'figs-explicit', '', 'By **in the land**, the author means “in the land of Israel.”'],
   ];
@@ -1070,6 +1074,6 @@ test('checkTnQuality flags quote marks that do not match the template (25d)', as
 
   const findings = readFindings(findingsRel);
   const ids = (cat) => findings.filter((f) => f.category === cat).map((f) => f.id).sort();
-  assert.deepEqual(ids('template_quotes_extra'), ['x1a1']);
+  assert.deepEqual(ids('template_quotes_extra'), ['x1a1', 'x1a9']);
   assert.deepEqual(ids('template_quotes_missing'), ['x1a3', 'x1a6']);
 });
