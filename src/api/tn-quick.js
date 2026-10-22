@@ -18,7 +18,7 @@ const {
   parseHebrewVerseWords,
   normalizeHebrewQuote,
 } = require('../workspace-tools/quality-tools');
-const { substituteAT } = require('../workspace-tools/tn-tools');
+const { substituteAT, stripNoteBraces } = require('../workspace-tools/tn-tools');
 const { loadQuickPack, renderQuickPackText, langName } = require('../lib/quick-context');
 let _agentSdkQuery = null;
 async function getAgentSdkQuery() {
@@ -686,6 +686,8 @@ async function handleTnQuickRequest(req, res) {
         userMessage,
         modelTier: body.model,
       });
+      // No {supplied-word} braces in TNs; keep the words, drop the braces.
+      noteText = stripNoteBraces(noteText);
     } catch (err) {
       if (err && err.code === 'MODEL_TIMEOUT') {
         console.error(`[tn-quick] model timeout: ${err.message}`);
