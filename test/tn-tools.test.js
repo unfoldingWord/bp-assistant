@@ -1285,6 +1285,39 @@ test('normalizeAssembledNoteText decodes visible unicode escapes and brackets ba
   assert.doesNotMatch(normalized, /\\u2019/);
 });
 
+test('normalizeAssembledNoteText drops supplied-word braces but keeps the words', () => {
+  const normalized = _normalizeAssembledNoteText(
+    'Here, **{I} {am} poor and needy** means that David is in great need. Alternate translation: [{I} {am} very poor]'
+  );
+
+  assert.equal(normalized, 'Here, **I am poor and needy** means that David is in great need. Alternate translation: [I am very poor]');
+});
+
+test('verifyBoldMatches keeps a brace-free bold phrase against a ULT verse with braces and drops stray braces', () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tn-tools-bold-braces-'));
+  const relRoot = path.join('tmp', path.basename(tempDir));
+  const absRoot = path.join('/srv/bot/workspace', relRoot);
+  fs.mkdirSync(absRoot, { recursive: true });
+
+  const tsvRel = path.join(relRoot, 'notes.tsv');
+  const ultRel = path.join(relRoot, 'ult.usfm');
+
+  fs.writeFileSync(path.join('/srv/bot/workspace', tsvRel), [
+    'Reference\tID\tTags\tSupportReference\tQuote\tOccurrence\tNote',
+    '1:1\ta1b2\t\trc://*/ta/man/translate/figs-doublet\tעָנִי\t1\t**I am poor and needy** means David is in great need.',
+    '1:1\tc3d4\t\trc://*/ta/man/translate/figs-doublet\tעָנִי\t1\t**{am} poor** means David is in great need.',
+  ].join('\n'));
+  fs.writeFileSync(path.join('/srv/bot/workspace', ultRel), '\\c 1\n\\v 1 But I {am} poor and needy, O Yahweh.\n');
+
+  const summary = verifyBoldMatches({ tsvFile: tsvRel, ultUsfm: ultRel });
+  const content = fs.readFileSync(path.join('/srv/bot/workspace', tsvRel), 'utf8');
+
+  assert.match(summary, /stripped 0 non-matching bold/);
+  assert.match(content, /\*\*I am poor and needy\*\* means/);
+  assert.match(content, /\*\*am poor\*\* means/);
+  assert.doesNotMatch(content, /[{}]/);
+});
+
 test('substituteAT matches normalized apostrophes and discontinuous ampersand spans', () => {
   const apostropheResult = substituteAT(
     'This is the wicked person’s place.',

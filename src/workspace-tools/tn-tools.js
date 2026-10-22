@@ -1266,8 +1266,14 @@ function verifyAtFit({ preparedJson, generatedJson }) {
   return lines.join('\n');
 }
 
+// TNs never carry the ULT's {supplied-word} braces: bold quotes and ATs keep
+// the supplied words as plain text, so only the brace characters are dropped.
+function stripNoteBraces(text) {
+  return String(text || '').replace(/[{}]/g, '');
+}
+
 function normalizeAssembledNoteText(noteText) {
-  return decodeVisibleUnicodeEscapes(String(noteText || ''))
+  return stripNoteBraces(decodeVisibleUnicodeEscapes(String(noteText || '')))
     .replace(/\.\.\./g, '\u2026')
     .replace(/<br\s*\/?>/gi, '')
     .replace(/Alternate translation:\s*["\u201C]([^"\u201D]*)["\u201D]/g, 'Alternate translation: [$1]')
@@ -1350,7 +1356,9 @@ function flattenBraceSupplies(text) {
 }
 
 function normalizeMatchText(text) {
-  return String(text || '')
+  // Brace-blind, so a brace-free bold phrase still matches a ULT verse that
+  // keeps its {supplied-word} braces.
+  return stripNoteBraces(text)
     .replace(/[\u2018\u2019]/g, "'")
     .replace(/[\u201C\u201D]/g, '"')
     .replace(/\s+/g, ' ')
@@ -1638,7 +1646,7 @@ function assembleNotes({ preparedJson, generatedJson, output }) {
     introRowObjs.push({
       ref: cols[0], id: cols[1], tags: cols[2] || '',
       sref: cols[3] || '', quote: cols[4] || '',
-      occurrence: cols[5] || '', note: cols[6] || '',
+      occurrence: cols[5] || '', note: stripNoteBraces(cols[6]),
       _rk: refKey(cols[0]), _ik: [-1, 0],
     });
   }
@@ -2731,17 +2739,20 @@ function verifyBoldMatches({ tsvFile, ultUsfm, preparedJson, output }) {
     const ref = cols[refIdx];
     const id = idIdx >= 0 ? (cols[idIdx] || '') : '';
     const ult = ultVerses[ref] || '';
+    let note = stripNoteBraces(cols[noteIdx]);
+    let changed = note !== cols[noteIdx];
     // A real Bible verse is never 1-2 words; fewer means the ULT text was
     // parsed incorrectly (or missing), and trusting it here would strip
     // legitimate bold. Skip rather than treat an unusable parse as ground truth.
     if (!ult || ult.trim().split(/\s+/).filter(Boolean).length < 3) {
       skippedRefs.add(ref);
+      if (changed) {
+        cols[noteIdx] = note;
+        lines[i] = cols.join('\t');
+      }
       continue;
     }
     const prepItem = id ? preparedItems.get(id) : null;
-
-    let note = cols[noteIdx];
-    let changed = false;
 
     note = note.replace(/\*\*([^*]+)\*\*/g, (match, boldText) => {
       examined++;
@@ -3792,6 +3803,7 @@ module.exports = {
   _buildWriterPrompt: buildWriterPrompt,
   _maybeBuildProgrammaticNote: maybeBuildProgrammaticNote,
   _normalizeAssembledNoteText: normalizeAssembledNoteText,
+  stripNoteBraces,
   _buildSeeHowReference: buildSeeHowReference,
   _inspectOpeningBold: inspectOpeningBold,
   _resolveGlQuotes: resolveGlQuotes,
