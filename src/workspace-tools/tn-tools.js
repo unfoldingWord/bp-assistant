@@ -3774,6 +3774,7 @@ module.exports = {
   fillTsvIds,
   fillOrigQuotes,
   loadTemplateMap,
+  parseCSV,
   prepareATContext,
   readPreparedNotes,
   substituteAT,
