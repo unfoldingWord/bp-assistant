@@ -477,7 +477,7 @@ function parseExplanationDirectives(explanation) {
   // A leading "TCM" marks a This Could Mean note: the writer presents numbered
   // interpretations, each closed by its own alternate translation.
   const tcmMode = /^TCM\b/i.test(raw);
-  if (tcmMode) raw = raw.slice(3).trim();
+  if (tcmMode) raw = raw.replace(/^TCM\b[:\s]*/i, '');
 
   const parts = raw.split(/\s+(?=[it]:)/);
   const mustInclude = [];
@@ -3701,7 +3701,6 @@ function prepareATContext({ preparedJson, generatedJson, output }) {
   for (const item of (prepared.items || [])) {
     if (!resolveAtRequirement(item).at_required) continue;
     if (item.programmatic_note) continue; // "see how" notes already have ATs
-    if (item.tcm_mode) continue; // TCM notes carry their per-option ATs from the writer
 
     const noteText = generatedNotes[item.id] || '';
     // Idempotency: if this item's stored note already has an AT clause, skip it.

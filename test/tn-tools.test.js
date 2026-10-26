@@ -45,6 +45,13 @@ test('parseExplanationDirectives detects a leading TCM marker and keeps the numb
   assert.deepEqual(parsed.must_include, ['(1) God (2) a person who wanted to contend with God']);
   assert.equal(parsed.clean_explanation, '');
   assert.equal(_parseExplanationDirectives('This imperative is soft').tcm_mode, false);
+
+  for (const variant of ['TCM: i:(1) God (2) a person', 'TCM:i:(1) God (2) a person']) {
+    const colon = _parseExplanationDirectives(variant);
+    assert.equal(colon.tcm_mode, true);
+    assert.deepEqual(colon.must_include, ['(1) God (2) a person']);
+    assert.equal(colon.clean_explanation, '');
+  }
 });
 
 test('buildWriterPrompt asks a TCM note for one AT per option instead of forbidding ATs', () => {
@@ -439,7 +446,7 @@ test('prepareATContext skips items whose generated note already contains an AT (
   assert.equal(atCtx.packets[0].id, 'no_at');
 });
 
-test('prepareATContext leaves TCM items to the writer, which authors one AT per option', () => {
+test('prepareATContext leaves TCM notes with per-option ATs alone but backfills one that has none', () => {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tn-tools-atctx-tcm-'));
   const preparedRel = path.join('tmp', path.basename(tempDir), 'prepared_notes.json');
   const generatedRel = path.join('tmp', path.basename(tempDir), 'generated_notes.json');
@@ -450,16 +457,18 @@ test('prepareATContext leaves TCM items to the writer, which authors one AT per 
     chapter: '9',
     items: [
       { id: 'tcm1', reference: '9:3', sref: 'writing-pronouns', at_required: true, tcm_mode: true, gl_quote: 'he', issue_span_gl_quote: 'he', ult_verse: 'If he wished', ust_verse: 'ust', scope_mode: 'focused_span' },
+      { id: 'tcm2', reference: '9:5', sref: 'writing-pronouns', at_required: true, tcm_mode: true, gl_quote: 'he', issue_span_gl_quote: 'he', ult_verse: 'If he wished', ust_verse: 'ust', scope_mode: 'focused_span' },
       { id: 'plain', reference: '9:4', sref: 'figs-metaphor', at_required: true, gl_quote: 'baz', issue_span_gl_quote: 'baz', ult_verse: 'baz qux', ust_verse: 'ust', scope_mode: 'focused_span' },
     ],
   }, null, 2));
   fs.writeFileSync(path.join('/srv/bot/workspace', generatedRel), JSON.stringify({
-    tcm1: 'This could mean: (1) God. or (2) a person.',
+    tcm1: 'This could mean: (1) God. Alternate translation: [If God wished] or (2) a person. Alternate translation: [If someone wished]',
+    tcm2: 'This could mean: (1) God or (2) a person.',
     plain: 'Note text.',
   }, null, 2));
 
   const atCtx = JSON.parse(prepareATContext({ preparedJson: preparedRel, generatedJson: generatedRel }));
-  assert.deepEqual(atCtx.packets.map((p) => p.id), ['plain']);
+  assert.deepEqual(atCtx.packets.map((p) => p.id), ['tcm2', 'plain']);
 });
 
 test('resolveGlQuotes preserves contiguous aligned spans instead of unioning repeated Hebrew tokens', () => {
