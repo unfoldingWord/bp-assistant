@@ -260,6 +260,21 @@ function extractAts(noteText) {
 }
 
 /**
+ * For a "could mean" note with numbered options, count the options and the
+ * "Alternate translation:" labels. Returns null for any other note.
+ */
+function countTcmOptionsAndAts(noteText) {
+  const note = String(noteText || '');
+  if (!/could mean/i.test(note)) return null;
+  const prose = maskAtBracketContent(note);
+  const options = new Set();
+  for (const m of prose.matchAll(/\((\d+)\)/g)) options.add(m[1]);
+  if (options.size < 2) return null;
+  const ats = (note.match(/Alternate translation:/gi) || []).length;
+  return { options: options.size, ats };
+}
+
+/**
  * Blank the contents of AT [...] brackets, preserving the string's length and
  * every character outside those ranges.
  *
@@ -1261,6 +1276,15 @@ async function checkTnQuality({ tsvPath, preparedJson, ultUsfm, ustUsfm, book, h
       }
     }
 
+    // 22b. This Could Mean notes need one AT per numbered option.
+    {
+      const tcm = countTcmOptionsAndAts(n.note);
+      if (tcm && tcm.ats < tcm.options) {
+        addFinding(n.row, n.ref, n.id, 'error', 'tcm_at_count',
+          `"This could mean" note has ${tcm.options} options but ${tcm.ats} alternate translation(s); each option needs its own`);
+      }
+    }
+
     // 23. Single quotes used as quotation marks
     {
       const stripped23 = n.note.replace(/\*\*[^*]*\*\*/g, '').replace(/\[[^\]]*\]/g, '');
@@ -1638,4 +1662,5 @@ module.exports = {
   parseReferenceRanges,
   referencesCoverVerse,
   _crossBookTargetsIn: crossBookTargetsIn,
+  _countTcmOptionsAndAts: countTcmOptionsAndAts,
 };

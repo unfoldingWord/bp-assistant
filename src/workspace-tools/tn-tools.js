@@ -471,8 +471,13 @@ function templateHasAlternateTranslation(templateText) {
 }
 
 function parseExplanationDirectives(explanation) {
-  const raw = String(explanation || '').trim();
-  if (!raw) return { clean_explanation: '', must_include: [], template_hints: [] };
+  let raw = String(explanation || '').trim();
+  if (!raw) return { clean_explanation: '', must_include: [], template_hints: [], tcm_mode: false };
+
+  // A leading "TCM" marks a This Could Mean note: the writer presents numbered
+  // interpretations, each closed by its own alternate translation.
+  const tcmMode = /^TCM\b/i.test(raw);
+  if (tcmMode) raw = raw.slice(3).trim();
 
   const parts = raw.split(/\s+(?=[it]:)/);
   const mustInclude = [];
@@ -505,6 +510,7 @@ function parseExplanationDirectives(explanation) {
     clean_explanation: cleanExplanation,
     must_include: mustInclude,
     template_hints: templateHints,
+    tcm_mode: tcmMode,
   };
 }
 
@@ -921,8 +927,18 @@ function buildWriterPacket(item) {
     skip_allowed: !!item.skip_allowed,
     skip_marker: item.skip_allowed ? WRITER_SKIP_MARKER : '',
     skip_instruction: item.skip_allowed ? WRITER_SKIP_INSTRUCTION : '',
+    tcm_mode: !!item.tcm_mode,
+    tcm_instruction: item.tcm_mode ? TCM_WRITER_INSTRUCTION : '',
   };
 }
+
+// TCM notes carry one AT per option, interleaved with the options, so the
+// writer authors them and the later AT stage leaves these notes alone.
+const TCM_WRITER_INSTRUCTION = [
+  'This is a This Could Mean note. Present the interpretations as numbered options, keeping the order given in Must include (option (1) is the preferred reading).',
+  'Give every option its own alternate translation, tuned to that option, at the end of that option before the next one begins. Two options means two alternate translations.',
+  'Format: This could mean: (1) [first interpretation]. Alternate translation: [AT for option 1] or (2) [second interpretation]. Alternate translation: [AT for option 2]',
+].join(' ');
 
 function buildWriterPrompt(item) {
   if (item.programmatic_note) {
@@ -951,7 +967,8 @@ function buildWriterPrompt(item) {
   if (packet.must_include.length) lines.push(`Must include: ${packet.must_include.join(' | ')}`);
   if (packet.style_rules.length) lines.push(`Style rules: ${packet.style_rules.join(', ')}`);
   if (packet.rule_overrides.length) lines.push(`Overrides: ${packet.rule_overrides.join(', ')}`);
-  if (packet.at_required) lines.push('Do NOT include an alternate translation. The AT will be generated separately by the pipeline. Write only the explanatory note text.');
+  if (packet.tcm_mode) lines.push(packet.tcm_instruction);
+  else if (packet.at_required) lines.push('Do NOT include an alternate translation. The AT will be generated separately by the pipeline. Write only the explanatory note text.');
   else lines.push('Do not add an alternate translation unless the provided note text already includes one programmatically.');
   if (packet.at_policy === 'provided' && packet.at_provided) lines.push(`Provided AT context: ${packet.at_provided}`);
   if (packet.ult_verse) lines.push(`ULT verse: ${packet.ult_verse}`);
@@ -2587,6 +2604,7 @@ function prepareNotes({ inputTsv, ultUsfm, ustUsfm, output, alignedUsfm, alignme
 
     item.clean_explanation = directives.clean_explanation;
     item.must_include = directives.must_include;
+    item.tcm_mode = directives.tcm_mode;
     item.template_locked = templateSelection.template_locked;
     item.chosen_template_id = templateSelection.selected_template_id || '';
     item.chosen_template_has_at_slot = !!templateSelection.selected_template_has_at_slot;
@@ -3683,6 +3701,7 @@ function prepareATContext({ preparedJson, generatedJson, output }) {
   for (const item of (prepared.items || [])) {
     if (!resolveAtRequirement(item).at_required) continue;
     if (item.programmatic_note) continue; // "see how" notes already have ATs
+    if (item.tcm_mode) continue; // TCM notes carry their per-option ATs from the writer
 
     const noteText = generatedNotes[item.id] || '';
     // Idempotency: if this item's stored note already has an AT clause, skip it.

@@ -1077,3 +1077,13 @@ test('checkTnQuality flags quote marks that do not match the template (25d)', as
   assert.deepEqual(ids('template_quotes_extra'), ['x1a1', 'x1a9']);
   assert.deepEqual(ids('template_quotes_missing'), ['x1a3', 'x1a6']);
 });
+
+test('countTcmOptionsAndAts counts options and AT labels in a "could mean" note', () => {
+  const { _countTcmOptionsAndAts } = require('../src/workspace-tools/quality-tools');
+  const full = 'This could mean: (1) God. Alternate translation: [If God wished] or (2) a person. Alternate translation: [If someone wished]';
+  const pooled = 'This could mean: (1) God or (2) a person. Alternate translation: [If God wished]';
+
+  assert.deepEqual(_countTcmOptionsAndAts(full), { options: 2, ats: 2 });
+  assert.deepEqual(_countTcmOptionsAndAts(pooled), { options: 2, ats: 1 });
+  assert.equal(_countTcmOptionsAndAts('Here **he** refers to God. Alternate translation: [God]'), null);
+});
