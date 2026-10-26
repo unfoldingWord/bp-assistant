@@ -1338,6 +1338,7 @@ async function runPerNoteGeneration({ pipeDir, outputPath, status, book }) {
     'Follow the template exactly. Fill in only the variable parts.',
     'Output ONLY the note text, nothing else. Do not use any tools.',
     'Do NOT include an alternate translation — that is handled separately.',
+    'Exception: when the item includes a THIS COULD MEAN instruction, write one alternate translation per option, as that instruction says.',
     'Exception: when the item includes a SKIP RULE, follow it and output the skip line instead of a note when the rule says to.',
     '',
     '--- NOTE STYLE GUIDE ---',
@@ -1371,9 +1372,10 @@ async function runPerNoteGeneration({ pipeDir, outputPath, status, book }) {
       (packet.style_rules || []).length ? `STYLE RULES: ${packet.style_rules.join(', ')}` : '',
       (packet.rule_overrides || []).length ? `OVERRIDES: ${packet.rule_overrides.join(', ')}` : '',
       packet.skip_allowed && packet.skip_instruction ? packet.skip_instruction : '',
+      packet.tcm_mode ? `THIS COULD MEAN: ${packet.tcm_instruction}` : '',
       '',
       'Write the note text. Output ONLY the note text, nothing else.',
-      'Do NOT include an alternate translation.',
+      packet.tcm_mode ? '' : 'Do NOT include an alternate translation.',
     ].filter(Boolean).join('\n');
 
     try {
@@ -1396,8 +1398,8 @@ async function runPerNoteGeneration({ pipeDir, outputPath, status, book }) {
       } else if (typeof result?.result === 'string') {
         noteText = result.result.trim();
       }
-      // Strip any accidentally included AT
-      noteText = noteText.replace(/\s*Alternate translation:.*$/i, '').trim();
+      // Strip any accidentally included AT. TCM notes keep theirs: one per option.
+      if (!packet.tcm_mode) noteText = noteText.replace(/\s*Alternate translation:.*$/i, '').trim();
 
       if (!noteText) {
         return { id: item.id, success: false, reason: 'empty response' };

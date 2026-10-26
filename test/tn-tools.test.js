@@ -38,6 +38,41 @@ test('parseExplanationDirectives separates t: and i: instructions deterministica
   assert.equal(parsed.clean_explanation, 'This imperative is soft');
 });
 
+test('parseExplanationDirectives detects a leading TCM marker and keeps the numbered options', () => {
+  const parsed = _parseExplanationDirectives('TCM i:(1) God (2) a person who wanted to contend with God');
+
+  assert.equal(parsed.tcm_mode, true);
+  assert.deepEqual(parsed.must_include, ['(1) God (2) a person who wanted to contend with God']);
+  assert.equal(parsed.clean_explanation, '');
+  assert.equal(_parseExplanationDirectives('This imperative is soft').tcm_mode, false);
+
+  for (const variant of ['TCM: i:(1) God (2) a person', 'TCM:i:(1) God (2) a person']) {
+    const colon = _parseExplanationDirectives(variant);
+    assert.equal(colon.tcm_mode, true);
+    assert.deepEqual(colon.must_include, ['(1) God (2) a person']);
+    assert.equal(colon.clean_explanation, '');
+  }
+});
+
+test('buildWriterPrompt asks a TCM note for one AT per option instead of forbidding ATs', () => {
+  const prompt = _buildWriterPrompt({
+    reference: '9:3',
+    id: 'tcm1',
+    sref: 'writing-pronouns',
+    note_type: 'writes_at',
+    at_policy: 'required',
+    at_required: true,
+    tcm_mode: true,
+    template_text: 'Here the pronoun **he** refers to someone.',
+    must_include: ['(1) God (2) a person who wanted to contend with God'],
+    gl_quote: 'he wished to contend',
+    ult_verse: 'If he wished to contend with him',
+  });
+
+  assert.match(prompt, /its own alternate translation/);
+  assert.doesNotMatch(prompt, /Do NOT include an alternate translation/);
+});
+
 test('resolveTemplateSelection locks a single exact template hint match', () => {
   const templateMap = new Map([
     ['figs-imperative', [
@@ -409,6 +444,31 @@ test('prepareATContext skips items whose generated note already contains an AT (
   const atCtx = JSON.parse(prepareATContext({ preparedJson: preparedRel, generatedJson: generatedRel }));
   assert.equal(atCtx.item_count, 1);
   assert.equal(atCtx.packets[0].id, 'no_at');
+});
+
+test('prepareATContext leaves TCM notes with per-option ATs alone but backfills one that has none', () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tn-tools-atctx-tcm-'));
+  const preparedRel = path.join('tmp', path.basename(tempDir), 'prepared_notes.json');
+  const generatedRel = path.join('tmp', path.basename(tempDir), 'generated_notes.json');
+  fs.mkdirSync(path.join('/srv/bot/workspace', 'tmp', path.basename(tempDir)), { recursive: true });
+
+  fs.writeFileSync(path.join('/srv/bot/workspace', preparedRel), JSON.stringify({
+    book: 'JOB',
+    chapter: '9',
+    items: [
+      { id: 'tcm1', reference: '9:3', sref: 'writing-pronouns', at_required: true, tcm_mode: true, gl_quote: 'he', issue_span_gl_quote: 'he', ult_verse: 'If he wished', ust_verse: 'ust', scope_mode: 'focused_span' },
+      { id: 'tcm2', reference: '9:5', sref: 'writing-pronouns', at_required: true, tcm_mode: true, gl_quote: 'he', issue_span_gl_quote: 'he', ult_verse: 'If he wished', ust_verse: 'ust', scope_mode: 'focused_span' },
+      { id: 'plain', reference: '9:4', sref: 'figs-metaphor', at_required: true, gl_quote: 'baz', issue_span_gl_quote: 'baz', ult_verse: 'baz qux', ust_verse: 'ust', scope_mode: 'focused_span' },
+    ],
+  }, null, 2));
+  fs.writeFileSync(path.join('/srv/bot/workspace', generatedRel), JSON.stringify({
+    tcm1: 'This could mean: (1) God. Alternate translation: [If God wished] or (2) a person. Alternate translation: [If someone wished]',
+    tcm2: 'This could mean: (1) God or (2) a person.',
+    plain: 'Note text.',
+  }, null, 2));
+
+  const atCtx = JSON.parse(prepareATContext({ preparedJson: preparedRel, generatedJson: generatedRel }));
+  assert.deepEqual(atCtx.packets.map((p) => p.id), ['tcm2', 'plain']);
 });
 
 test('resolveGlQuotes preserves contiguous aligned spans instead of unioning repeated Hebrew tokens', () => {
