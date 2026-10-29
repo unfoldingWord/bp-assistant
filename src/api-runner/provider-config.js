@@ -81,6 +81,8 @@ const DEFAULT_PROVIDER_CONFIGS = {
       'gemini-2.5-pro': { label: 'Gemini 2.5 Pro', inputPer1M: 1.25, outputPer1M: 10.0 },
       'gemini-2.5-flash': { label: 'Gemini 2.5 Flash', inputPer1M: 0.15, outputPer1M: 0.6 },
       'gemini-3.6-flash': { label: 'Gemini 3.6 Flash', inputPer1M: 1.5, outputPer1M: 7.5 },
+      'gemini-3.7-flash': { label: 'Gemini 3.7 Flash', inputPer1M: 0.75, outputPer1M: 3.75 },
+      'gemini-3.8-flash': { label: 'Gemini 3.8 Flash', inputPer1M: 0.75, outputPer1M: 3.75 },
     },
     fallbackModels: {
       'gemini-3.1-pro-preview': ['gemini-3-pro-preview', 'gemini-2.5-pro'],

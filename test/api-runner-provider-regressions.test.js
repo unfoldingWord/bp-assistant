@@ -748,7 +748,9 @@ test('2026 model catalog additions resolve as configured models', () => {
   for (const model of ['grok-4.5', 'grok-4.3']) {
     assert.equal(assertProviderModel('xai', model), model);
   }
-  assert.equal(assertProviderModel('gemini', 'gemini-3.6-flash'), 'gemini-3.6-flash');
+  for (const model of ['gemini-3.6-flash', 'gemini-3.7-flash', 'gemini-3.8-flash']) {
+    assert.equal(assertProviderModel('gemini', model), model);
+  }
 
   // New alias resolves to the existing dated model entry, without a duplicate row.
   assert.equal(resolveProviderModel('claude', 'claude-haiku-4-5'), 'claude-haiku-4-5-20251001');
