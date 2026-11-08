@@ -249,7 +249,10 @@ test('validated.jsonl over the 2MB general cap loads, up to the examples cap', a
   const ref = 'BSOJ/translation-context@notahex';
   const line = JSON.stringify({ resource: 'tn', rowId: 'x', source: 's', target: 'ن'.repeat(400) });
   const lines = [];
-  for (let i = 0; Buffer.byteLength(lines.join('\n'), 'utf8') < 2_413_747; i++) lines.push(line.replace('"x"', `"r${i}"`));
+  for (let size = 0; size < 2_413_747;) {
+    lines.push(line.replace('"x"', `"r${lines.length}"`));
+    size += Buffer.byteLength(lines[lines.length - 1], 'utf8') + 1;
+  }
   const body = lines.join('\n');
   const bytes = Buffer.byteLength(body, 'utf8');
   assert.ok(bytes > MAX_PACK_FILE_BYTES && bytes < MAX_EXAMPLES_FILE_BYTES);
