@@ -103,7 +103,8 @@ function selectExamples(examples, slugs, max = MAX_EXAMPLES_PER_BATCH) {
     (a, b) => (b.validated_at - a.validated_at) || ((b._seq || 0) - (a._seq || 0)));
   const slugSet = new Set(slugs || []);
   const bySlug = live.filter((e) => slugSet.has(slugFromSupportReference(e.supportReference)));
-  const general = live.filter((e) => !bySlug.includes(e));
+  const picked = new Set(bySlug); // a Set: the examples file can hold ~20k rows
+  const general = live.filter((e) => !picked.has(e));
   return [...bySlug, ...general].slice(0, max);
 }
 
