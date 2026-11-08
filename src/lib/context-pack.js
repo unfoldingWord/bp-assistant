@@ -21,11 +21,15 @@ const path = require('path');
 
 const DCS_BASE = 'https://git.door43.org';
 const SUPPORTED_MANIFEST_FORMAT = 1;
-// Real pack files (manifest.yaml, brief.md, templates.tsv, terms.csv,
-// validated.jsonl) are KBs. This cap is a hardening bound, not a realistic
-// size — it protects both the quick endpoints and the translate pipeline
-// from an oversized/misconfigured or malicious pack file.
+// Hardening bounds that protect the quick endpoints and the translate
+// pipeline from an oversized, misconfigured or malicious pack file. The
+// hand-authored files (manifest, brief, instructions, templates, terms) are
+// KBs, so they keep a 2 MB cap. examples/validated.jsonl is different:
+// BPtranslate's daily context export writes one line per human-validated row
+// and the file only grows (BSOJ Arabic reached 2.4 MB at 3,240 rows on
+// 2026-11-07, which failed every translate run). 16 MB is ~21k rows.
 const MAX_PACK_FILE_BYTES = 2_000_000;
+const MAX_EXAMPLES_FILE_BYTES = 16_000_000;
 
 const PACK_FILES = {
   manifest: 'manifest.yaml',
@@ -56,20 +60,20 @@ function rawUrl({ org, repo, ref }, filePath) {
   return `${DCS_BASE}/${org}/${repo}/raw/${kind}/${encodeURIComponent(ref)}/${filePath}`;
 }
 
-async function fetchText(url, fetchImpl) {
+async function fetchText(url, fetchImpl, maxBytes = MAX_PACK_FILE_BYTES) {
   const res = await (fetchImpl || fetch)(url);
   if (res.status === 404) return null;
   if (!res.ok) throw new Error(`fetch ${url} → HTTP ${res.status}`);
   const contentLength = Number(res.headers && res.headers.get ? res.headers.get('content-length') : null);
-  if (Number.isFinite(contentLength) && contentLength > MAX_PACK_FILE_BYTES) {
-    throw new Error(`file too large (>${MAX_PACK_FILE_BYTES} bytes): ${url}`);
+  if (Number.isFinite(contentLength) && contentLength > maxBytes) {
+    throw new Error(`file too large (>${maxBytes} bytes): ${url}`);
   }
   const text = await res.text();
   // Byte length, not string length: pack files are often Arabic/Hebrew, where
   // one character is 2-3 bytes, so a character count would let a file through
   // at several times the intended cap.
-  if (Buffer.byteLength(text, 'utf8') > MAX_PACK_FILE_BYTES) {
-    throw new Error(`file too large (>${MAX_PACK_FILE_BYTES} bytes): ${url}`);
+  if (Buffer.byteLength(text, 'utf8') > maxBytes) {
+    throw new Error(`file too large (>${maxBytes} bytes): ${url}`);
   }
   return text;
 }
@@ -302,7 +306,8 @@ async function loadContextPack(contextRef, { fetchImpl, allowEmpty = false } = {
       const p = path.join(contextRef, rel);
       return fs.existsSync(p) ? fs.readFileSync(p, 'utf8') : null;
     }
-    return fetchText(rawUrl(parsed, rel), fetchImpl);
+    const maxBytes = rel === PACK_FILES.examples ? MAX_EXAMPLES_FILE_BYTES : MAX_PACK_FILE_BYTES;
+    return fetchText(rawUrl(parsed, rel), fetchImpl, maxBytes);
   }
 
   const entries = Object.entries(PACK_FILES);
@@ -370,4 +375,5 @@ module.exports = {
   PACK_FILES,
   SUPPORTED_MANIFEST_FORMAT,
   MAX_PACK_FILE_BYTES,
+  MAX_EXAMPLES_FILE_BYTES,
 };

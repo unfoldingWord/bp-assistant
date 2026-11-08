@@ -11,7 +11,7 @@ const path = require('path');
 const {
   getContextPackCached, loadQuickPack, _resetForTests, BRANCH_SHA_TTL_MS, MAX_ENTRIES, _cacheSizesForTests,
 } = require('../src/lib/quick-context');
-const { MAX_PACK_FILE_BYTES } = require('../src/lib/context-pack');
+const { MAX_PACK_FILE_BYTES, MAX_EXAMPLES_FILE_BYTES, loadContextPack } = require('../src/lib/context-pack');
 
 function writeFixturePack(dir) {
   fs.mkdirSync(path.join(dir, 'templates'), { recursive: true });
@@ -241,4 +241,26 @@ test('the size cap counts bytes, not characters (multibyte pack text)', async ()
   const { pack, warning } = await loadQuickPack(ref, { fetchImpl });
   assert.equal(pack, null);
   assert.match(warning, /file too large/);
+});
+
+// 2026-11-07: BSOJ's exported validated.jsonl reached 2,413,747 bytes and the
+// shared 2 MB cap failed every Arabic translate run. Examples get their own cap.
+test('validated.jsonl over the 2MB general cap loads, up to the examples cap', async () => {
+  const ref = 'BSOJ/translation-context@notahex';
+  const line = JSON.stringify({ resource: 'tn', rowId: 'x', source: 's', target: 'ن'.repeat(400) });
+  const lines = [];
+  for (let i = 0; Buffer.byteLength(lines.join('\n'), 'utf8') < 2_413_747; i++) lines.push(line.replace('"x"', `"r${i}"`));
+  const body = lines.join('\n');
+  const bytes = Buffer.byteLength(body, 'utf8');
+  assert.ok(bytes > MAX_PACK_FILE_BYTES && bytes < MAX_EXAMPLES_FILE_BYTES);
+  const make = (len) => async (url) => {
+    if (/brief\.md$/.test(url)) return { ok: true, status: 200, headers: null, text: async () => 'Brief.' };
+    if (/validated\.jsonl$/.test(url)) {
+      return { ok: true, status: 200, headers: { get: (h) => (h.toLowerCase() === 'content-length' ? String(len) : null) }, text: async () => body };
+    }
+    return { ok: false, status: 404, text: async () => '' };
+  };
+  const pack = await loadContextPack(ref, { fetchImpl: make(bytes) });
+  assert.equal(pack.examples.length, lines.length);
+  await assert.rejects(loadContextPack(ref, { fetchImpl: make(MAX_EXAMPLES_FILE_BYTES + 1) }), /file too large \(>16000000 bytes\)/);
 });
