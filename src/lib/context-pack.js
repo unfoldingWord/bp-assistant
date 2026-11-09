@@ -248,7 +248,9 @@ function parseTermsCsv(text) {
 }
 
 /**
- * Parse validated.jsonl with tombstone last-line-wins on (resource, rowId).
+ * Parse validated.jsonl with tombstone last-line-wins on (resource, book, rowId).
+ * Row ids are only unique per book, so the book is part of the key. A line
+ * without `book` keys on an empty book, so old packs dedupe as before.
  */
 function parseExamplesJsonl(text) {
   const byKey = new Map();
@@ -266,7 +268,8 @@ function parseExamplesJsonl(text) {
     seq += 1;
     const resource = obj.resource || 'tn';
     const rowId = obj.rowId != null ? String(obj.rowId) : `anon-${seq}`;
-    const key = `${resource}\0${rowId}`;
+    const book = obj.book != null ? String(obj.book) : '';
+    const key = `${resource}\0${book}\0${rowId}`;
     if (obj.tombstone) {
       byKey.delete(key);
       continue;

@@ -127,6 +127,26 @@ test('parseExamplesJsonl applies tombstones last-line-wins', () => {
   assert.strictEqual(examples[0].rowId, 'y');
 });
 
+test('parseExamplesJsonl keys on (resource, book, rowId)', () => {
+  const line = (o) => JSON.stringify({ resource: 'tn', ...o }) + '\n';
+  const examples = parseExamplesJsonl(
+    line({ book: 'GEN', rowId: 'abcd', source: 'gen1', target: 'g1', validated_at: 1 })
+    + line({ book: 'EXO', rowId: 'abcd', source: 'exo1', target: 'e1', validated_at: 2 })
+    + line({ book: 'GEN', rowId: 'abcd', source: 'gen2', target: 'g2', validated_at: 3 })
+    + line({ book: 'LEV', rowId: 'abcd', source: 'lev1', target: 'l1', validated_at: 4 })
+    + line({ book: 'LEV', rowId: 'abcd', tombstone: true, validated_at: 5 }));
+  // Same rowId in two books: both load; a later GEN line replaces the earlier one;
+  // the LEV tombstone removes only LEV's example.
+  assert.deepStrictEqual(examples.map((e) => [e.book, e.source]), [['EXO', 'exo1'], ['GEN', 'gen2']]);
+
+  // A tombstone for a different book does not touch this book's example.
+  const kept = parseExamplesJsonl(
+    line({ book: 'GEN', rowId: 'abcd', source: 's', target: 't', validated_at: 1 })
+    + line({ book: 'EXO', rowId: 'abcd', tombstone: true, validated_at: 2 }));
+  assert.strictEqual(kept.length, 1);
+  assert.strictEqual(kept[0].book, 'GEN');
+});
+
 test('loadContextPack loads a local fixture pack', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ctx-pack-'));
   try {
