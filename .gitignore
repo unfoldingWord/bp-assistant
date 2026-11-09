@@ -7,3 +7,7 @@ data/
 
 # graft's local graph cache — regenerable, not committed (run `graft build`).
 /graft/
+
+# Claude Code per-machine permission list: "don't ask again" can save
+# approved commands verbatim, secrets included. Never commit it.
+**/.claude/settings.local.json
