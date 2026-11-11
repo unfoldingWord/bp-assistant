@@ -55,8 +55,7 @@ function getExpectedOutputs(skill, prompt) {
 
 // --- System prompt appendage for post-edit-review ---
 const POST_EDIT_REVIEW_HINT =
-  'Use Agent teams (TeamCreate + SendMessage) for the Diff Analyzer and Issue Reconciler if available. ' +
-  'If Agent teams are not available, fall back to Task subagents and poll with TaskGet until all complete. ' +
+  'Use Task subagents for the Diff Analyzer and Issue Reconciler, and poll with TaskGet until all complete. ' +
   'Do NOT output text without a tool call or the session will end prematurely.';
 
 // --- SDK mode ---

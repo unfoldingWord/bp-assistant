@@ -7,8 +7,10 @@ const fs = require('fs');
 const CLAUDE_JSON_PATH = `${process.env.CLAUDE_CONFIG_DIR || '/claude-config'}/.claude.json`;
 const NEEDED_TOOLS = [
   'Read', 'Write', 'Edit', 'Glob', 'Grep',
+  // TeamCreate/TeamDelete dropped: gone from the CLI before 2.1.251 (#410).
+  // TaskOutput stays until the 2.1.282 bump (#409) - still live on the pinned SDK.
   'Task', 'TaskOutput', 'Skill', 'SendMessage',
-  'Agent', 'TeamCreate', 'TeamDelete',
+  'Agent',
   'TaskCreate', 'TaskUpdate', 'TaskList', 'TaskGet',
   'NotebookEdit', 'WebFetch', 'WebSearch',
   // Pipeline agents run workspace tools via the Bash CLI wrapper; per-run
