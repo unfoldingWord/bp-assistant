@@ -35,7 +35,17 @@ const SEE_HOW_SINGLE_WORD_SREFS = new Set([
 // folded into a pointer, never rewritten as a pointer, never used
 // as a pointer target, and never injected. issue-identification/SKILL.md:28
 // requires hinneh foregrounding to be noted every time it appears.
-const SEE_HOW_NEVER_FOLD_SREFS = new Set(['writing-foreground']);
+//
+// Pronoun and "you" notes name the referent at their own verse, which changes
+// from one occurrence to the next. In JER 13-51 and EZK 1-41 editors deleted or
+// rewrote 24 of 33 writing-pronouns pointers and 8 of 10 figs-you/yousingular
+// pointers, replacing each with a note naming who the pronoun refers to there.
+const SEE_HOW_NEVER_FOLD_SREFS = new Set([
+  'writing-foreground',
+  'writing-pronouns',
+  'figs-you',
+  'figs-yousingular',
+]);
 
 // tA articles whose note is about the CONSTRUCTION at that occurrence, not
 // about the wording: the same lexemes recur as a plain statement or command
@@ -306,11 +316,33 @@ function parseHebrewUsfmWords(content) {
 // Key derivation
 // ---------------------------------------------------------------------------
 
+// יוֹם means "day", "days", "lifetime" or "time" depending on its form, so a
+// phrase built from it and other stoplisted lemmas only is told apart by its
+// wording: H3605+H3117 covers כָּל־הַיּוֹם "all day long" (JER 20:7),
+// כָּל־הַיָּמִים "always" (JER 31:36) and כָּל יְמֵיכֶם "all your life"
+// (JER 35:7). Editors rewrote all four pointers that joined them.
+const FORM_SENSITIVE_STRONGS = new Set(['H3117']);
+
+/**
+ * The Strong's key for a lemma sequence, or '' when it is not a usable key.
+ * A multi-word sequence of stoplisted lemmas that includes a form-sensitive one
+ * (see FORM_SENSITIVE_STRONGS) gets no Strong's key, so it is keyed by its
+ * consonantal text. Other stoplist-only formulas ("the word of Yahweh") keep
+ * their Strong's key: editors kept those pointers across דבר / דברי / כדבר.
+ */
+function strongKeyFor(strongs) {
+  if (!strongs.length || !strongs.every(Boolean)) return '';
+  if (strongs.length > 1
+    && strongs.some((s) => FORM_SENSITIVE_STRONGS.has(s))
+    && strongs.every((s) => SEE_HOW_STOPLIST.has(s))) return '';
+  return strongs.join('+');
+}
+
 function keysFromWordRun(run) {
   const strongs = run.map((w) => normalizeStrong(w.strong));
   const textTokens = run.flatMap((w) => hebTokens(w.heb));
   return {
-    strongKey: strongs.every(Boolean) && strongs.length ? strongs.join('+') : '',
+    strongKey: strongKeyFor(strongs),
     textKey: textTokens.length ? textTokens.join('+') : '',
   };
 }
@@ -343,7 +375,7 @@ function deriveRecurrenceKeys({ origQuote = '', alignmentEntries = [] } = {}) {
   }
 
   return {
-    strongKey: allResolved && strongs.length ? strongs.join('+') : '',
+    strongKey: allResolved ? strongKeyFor(strongs) : '',
     textKey: allTokens.length ? allTokens.join('+') : '',
   };
 }
@@ -789,11 +821,20 @@ function buildBookRecurrenceIndex({
   // A phrase is registered under both key forms. `canonical` maps either form
   // to the Strong's form when it is known, so an item that could only resolve
   // its text key still lands in the same group as one that resolved both.
+  //
+  // A spelling shared by two lemmas is a homograph, not an alias: קֹרֵא
+  // "partridge" (H7124, JER 17:11) and קָרָא "call" (H7121) are both קרא. Such
+  // a text key maps to itself, so it never pulls one lemma's note into the
+  // other's group.
   const canonical = {};
+  const strongsByText = new Map();
   const registerAlias = (strongKey, textKey) => {
     if (strongKey) canonical[strongKey] = strongKey;
-    if (textKey && !canonical[textKey]) canonical[textKey] = strongKey || textKey;
-    if (textKey && strongKey) canonical[textKey] = strongKey;
+    if (!textKey) return;
+    if (!strongsByText.has(textKey)) strongsByText.set(textKey, new Set());
+    const seen = strongsByText.get(textKey);
+    if (strongKey) seen.add(strongKey);
+    canonical[textKey] = seen.size === 1 ? [...seen][0] : textKey;
   };
 
   const registerQuery = (strongKey, textKey) => {
@@ -828,6 +869,7 @@ function buildBookRecurrenceIndex({
       isPointer: /^\s*See how you translated/i.test(row.note),
       source: 'tn',
       id: row.id,
+      strongKey,
     });
   }
 
@@ -855,6 +897,7 @@ function buildBookRecurrenceIndex({
       isPointer: false,
       source: 'prepared',
       id: item.id || '',
+      strongKey,
     });
   }
 
@@ -900,7 +943,8 @@ function buildBookRecurrenceIndex({
       // an injected row's Quote is later matched against the source verbatim.
       const runTokens = run.flatMap((w) => hebTokens(w.heb));
       // The matched run knows both forms, so a text-only key learns its alias.
-      registerAlias(keysFromWordRun(run).strongKey, runTokens.join('+'));
+      const runStrongKey = keysFromWordRun(run).strongKey;
+      registerAlias(runStrongKey, runTokens.join('+'));
       const exact = exactSourceSpan(ref, runTokens);
       if (!exact) inexactSpans++;
       if (!byKey[key]) byKey[key] = [];
@@ -915,6 +959,7 @@ function buildBookRecurrenceIndex({
         isPointer: false,
         source: 'corpus',
         id: '',
+        strongKey: runStrongKey,
       });
     }
   }
@@ -1074,6 +1119,7 @@ function buildCrossBookIndex({ bookCodes = [], readBook = null, maxBooks = CROSS
             sref: row.sref || '',
             quote: row.quote || '',
             id: row.id || '',
+            strongKey,
           };
         }
       }
