@@ -728,17 +728,13 @@ async function createAndMergePR(token, repo, branch, title, baseBranch = 'master
       }
 
       if (res.status === 409) {
-        // PR already exists — extract PR number from message
-        const msg = typeof res.data === 'object' ? (res.data.message || '') : String(res.data);
-        const m = msg.match(/issue_id:\s*(\d+)/);
-        if (m) {
-          return { prNumber: parseInt(m[1], 10), url: `https://git.door43.org/${org}/${repo}/pulls/${m[1]}` };
-        }
-        // If we can't parse the existing PR number, search for it
+        // PR already exists. Look it up by head branch. Gitea's 409 message
+        // ("[id: 99, issue_id: 7900, ...]") carries database ids, not the PR
+        // index used in URLs and the merge endpoint, so it is not parsed (#478).
         const searchRes = await api('GET', `/repos/${org}/${repo}/pulls?state=open&head=${org}:${branch}&limit=5`, token);
         if (searchRes.status === 200 && Array.isArray(searchRes.data) && searchRes.data.length > 0) {
           const pr = searchRes.data[0];
-          return { prNumber: pr.number, url: pr.html_url || '' };
+          return { prNumber: pr.number, url: pr.html_url || `https://git.door43.org/${org}/${repo}/pulls/${pr.number}` };
         }
         throw new Error(`PR already exists but could not find PR number (409 response)`);
       }
