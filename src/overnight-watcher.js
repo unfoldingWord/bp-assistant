@@ -227,10 +227,20 @@ function bookFromFilename(name, resource) {
 // Changed files of a PR — reliable even after the source branch is deleted
 // (Gitea strips head.ref but the files endpoint still resolves). Mirrors
 // door43-push.checkConflictingBranches.
+// Pages until a short or empty page: Gitea may cap `limit` below what we ask
+// for, so the first page's length is the real page size (#466).
+const PR_FILES_MAX_PAGES = 20;
 async function fetchPrFiles(get, repo, prNumber, token) {
-  const res = await get(`/repos/${ORG}/${repo}/pulls/${prNumber}/files?limit=100`, token);
-  if (!res || res.status !== 200 || !Array.isArray(res.data)) return [];
-  return res.data.map((f) => f && f.filename).filter(Boolean);
+  const names = [];
+  let pageSize = 0;
+  for (let page = 1; page <= PR_FILES_MAX_PAGES; page++) {
+    const res = await get(`/repos/${ORG}/${repo}/pulls/${prNumber}/files?limit=100&page=${page}`, token);
+    if (!res || res.status !== 200 || !Array.isArray(res.data)) break;
+    for (const f of res.data) if (f && f.filename) names.push(f.filename);
+    if (page === 1) pageSize = res.data.length;
+    if (res.data.length === 0 || res.data.length < pageSize) break;
+  }
+  return names;
 }
 
 // --- enumeration -------------------------------------------------------------
@@ -263,7 +273,13 @@ async function enumerateUnits({ apiGetImpl, token, sinceIso, editorMap = {} }) {
         const be = parseBeRef(pr.head && pr.head.ref);
         let books = be && be.book ? [be.book] : [];
         let editor = be && be.editor;
-        if (books.length === 0) {
+        if (books.length) {
+          // A `<BOOK>-be-` branch can still touch other books' files; review
+          // each one, not just the book its name carries (#466).
+          const files = await fetchPrFiles(get, repo, pr.number, token);
+          const touched = files.map((f) => bookFromFilename(f, resource)).filter(Boolean);
+          books = [...new Set(books.concat(touched))];
+        } else {
           // Fallback path (deleted branch): require a known editor + a touched resource file.
           const known = attributeKnownEditor(editorMap, author);
           if (!known || isBotAuthor(author)) continue;

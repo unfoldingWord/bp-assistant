@@ -498,6 +498,56 @@ test('a merged PR touching two tn files (stripped head.ref) yields one unit per 
   assert.ok(keys.every((k) => k in saved.reviewed));
 });
 
+// #466 item 2: a `<BOOK>-be-` PR that also touched another book's file was
+// reviewed for the branch's book only, and only the first 100 files were read.
+test('a merged -be- PR that touches another book yields a unit for each book', async () => {
+  const get = async (p) => {
+    const repo = (p.match(/repos\/unfoldingWord\/([^/]+)\//) || [])[1];
+    if (/\/pulls\/31\/files/.test(p)) {
+      return { status: 200, data: /page=1\b/.test(p) ? [{ filename: 'tn_1CO.tsv' }, { filename: 'tn_GAL.tsv' }] : [] };
+    }
+    if (/\/pulls\?/.test(p)) {
+      const data = (repo === 'en_tn' && /page=1\b/.test(p))
+        ? [{ number: 31, merged: true, merged_at: '2026-06-23T10:00:00Z', head: { ref: '1CO-be-pjoakes', sha: 'h' }, base: { sha: 'b' }, user: { login: 'pjoakes' } }]
+        : [];
+      return { status: 200, data };
+    }
+    return { status: 200, data: [] };
+  };
+  const units = (await watcher.enumerateUnits({ apiGetImpl: get, sinceIso: '2026-06-20T00:00:00Z' }))
+    .filter((u) => u.kind === 'merged-pr');
+  assert.deepEqual(units.map((u) => u.book), ['1CO', 'GAL']);
+  assert.ok(units.every((u) => u.editor === 'pjoakes'));
+});
+
+test('PR files are read past the first page', async () => {
+  const pageOf = (n, start) => Array.from({ length: n }, (_, i) => ({ filename: `README-${start + i}.md` }));
+  const requested = [];
+  const get = async (p) => {
+    const repo = (p.match(/repos\/unfoldingWord\/([^/]+)\//) || [])[1];
+    const m = p.match(/\/pulls\/32\/files\?.*page=(\d+)/);
+    if (m) {
+      requested.push(Number(m[1]));
+      // Server caps pages at 50 regardless of the requested limit.
+      if (m[1] === '1') return { status: 200, data: pageOf(50, 0) };
+      if (m[1] === '2') return { status: 200, data: pageOf(49, 50).concat([{ filename: 'tn_GAL.tsv' }]) };
+      if (m[1] === '3') return { status: 200, data: [{ filename: 'tn_JUD.tsv' }] };
+      return { status: 200, data: [] };
+    }
+    if (/\/pulls\?/.test(p)) {
+      const data = (repo === 'en_tn' && /page=1\b/.test(p))
+        ? [{ number: 32, merged: true, merged_at: '2026-06-23T10:00:00Z', head: {}, base: { sha: 'b' }, user: { login: 'pjoakes' } }]
+        : [];
+      return { status: 200, data };
+    }
+    return { status: 200, data: [] };
+  };
+  const units = (await watcher.enumerateUnits({ apiGetImpl: get, sinceIso: '2026-06-20T00:00:00Z', editorMap: { pjoakes: 'pjoakes' } }))
+    .filter((u) => u.kind === 'merged-pr');
+  assert.deepEqual(units.map((u) => u.book), ['GAL', 'JUD']);
+  assert.deepEqual(requested, [1, 2, 3]);
+});
+
 test('a merged PR reviewed under the pre-#421 key (no book suffix) is not re-reviewed', async () => {
   const legacyKey = stateLib.prUnitKey('en_tn', 9, 'newhead');
   const initState = JSON.stringify({ version: 1, initialized: true, lastRun: '2026-06-20T00:00:00Z', reviewed: { [legacyKey]: '2026-06-21T00:00:00Z' }, branchTips: {} });

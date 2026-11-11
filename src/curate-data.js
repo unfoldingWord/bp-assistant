@@ -279,15 +279,40 @@ function readFetchStatus() {
   catch (e) { return { lastRun: null, lastSuccess: null, errors: [] }; }
 }
 
-function writeFetchStatus(fetchErrors) {
-  ensureDir(DATA_DIR);
-  var prev = readFetchStatus();
-  var now = new Date().toISOString();
+// The tW refresh records its failure under this file name.
+var TW_STATUS_FILE = 'tw_headwords.json';
+
+/**
+ * Next .fetch-status.json contents after a run. lastRun/lastSuccess track the
+ * Google sources, so they only move when fetch-google ran. The error list is
+ * merged per source: a source that did not run keeps its previous errors, and
+ * one that ran replaces them, so a fetch-tw-only run still surfaces (or clears)
+ * its own failure on /health/data-freshness.
+ * @param {object} prev         previous status
+ * @param {Array} fetchErrors   errors from this run
+ * @param {{google: boolean, tw: boolean}} ran  which fetch steps ran
+ * @param {string} now          ISO timestamp
+ */
+function nextFetchStatus(prev, fetchErrors, ran, now) {
+  var isTw = function (e) { return !!e && e.file === TW_STATUS_FILE; };
+  var kept = (prev.errors || []).filter(function (e) {
+    return isTw(e) ? !ran.tw : !ran.google;
+  });
   var status = {
-    lastRun: now,
-    lastSuccess: fetchErrors.length === 0 ? now : (prev.lastSuccess || null),
-    errors: fetchErrors,
+    lastRun: prev.lastRun || null,
+    lastSuccess: prev.lastSuccess || null,
+    errors: kept.concat(fetchErrors),
   };
+  if (ran.google) {
+    status.lastRun = now;
+    if (fetchErrors.length === 0) status.lastSuccess = now;
+  }
+  return status;
+}
+
+function writeFetchStatus(fetchErrors, ran) {
+  ensureDir(DATA_DIR);
+  var status = nextFetchStatus(readFetchStatus(), fetchErrors, ran, new Date().toISOString());
   fs.writeFileSync(FETCH_STATUS_PATH, JSON.stringify(status, null, 2));
 }
 
@@ -304,7 +329,7 @@ async function fetchTranslationWords(force, log, fetchErrors) {
     });
     if (result.skipped) log('Translation Words: fresh, skipped');
   } catch (err) {
-    fetchErrors.push({ file: 'tw_headwords.json', message: err.message, attemptedAt: new Date().toISOString() });
+    fetchErrors.push({ file: TW_STATUS_FILE, message: err.message, attemptedAt: new Date().toISOString() });
     log('Warning: tw_headwords.json: ' + err.message + ' (kept previous en_tw and tw_headwords.json)');
   }
 }
@@ -694,10 +719,8 @@ async function curatePublishedData(opts) {
   if (runStep('fetch-tw')) {
     await fetchTranslationWords(force, log, fetchErrors);
   }
-  // .fetch-status.json tracks the Google sources' lastSuccess, so only a run
-  // that fetched them may write it; a full run carries the tW error too.
-  if (runStep('fetch-google')) {
-    writeFetchStatus(fetchErrors);
+  if (runStep('fetch-google') || runStep('fetch-tw')) {
+    writeFetchStatus(fetchErrors, { google: runStep('fetch-google'), tw: runStep('fetch-tw') });
   }
 
   var ultAlignments = new Map();
@@ -730,6 +753,8 @@ async function curatePublishedData(opts) {
 // curatePublishedData, which sequences them.
 module.exports = {
   curatePublishedData, readFetchStatus, FETCH_STATUS_PATH, CURATE_STEPS,
+  // nextFetchStatus is exported for test/tw-headwords.test.js.
+  nextFetchStatus,
   extractUnalignedEnglish, resolveGlQuotes,
   // shouldRefreshWeekly is exported for test/weekly-refresh.test.js, which
   // pins the age-based cache boundary the Door43 fetch now shares with the

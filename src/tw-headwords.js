@@ -22,6 +22,13 @@ const FETCHED_MARKER = '.fetched';
 // Refuse a rebuild that loses more than this share of the current entries. Upstream
 // rarely deletes articles; a large drop means a bad archive, not an editorial change.
 const MIN_KEEP_RATIO = 0.9;
+// en_tw master is a few MB of markdown. These caps refuse a runaway download or a
+// decompression bomb before it can exhaust the bot's memory.
+const MAX_ARCHIVE_BYTES = 64 * 1024 * 1024;
+const MAX_TAR_BYTES = 256 * 1024 * 1024;
+// Scratch names carry a per-call sequence as well as the PID, so a full refresh
+// and an operator fetch-tw that overlap in one process never share a path.
+let scratchSeq = 0;
 
 // ── tar ────────────────────────────────────────────────────────────────────
 
@@ -161,6 +168,8 @@ function lastFetched(twDir) {
  * @param {boolean} [opts.force]          ignore the weekly freshness check
  * @param {(date: string|null) => boolean} [opts.isStale]  freshness predicate
  * @param {(msg: string) => void} [opts.log]
+ * @param {number} [opts.maxArchiveBytes] download size cap (tests lower it)
+ * @param {number} [opts.maxTarBytes]     unpacked size cap (tests lower it)
  * @returns {Promise<{skipped?: boolean, entries?: number, previous?: number}>}
  */
 async function refreshTranslationWords(opts) {
@@ -174,21 +183,35 @@ async function refreshTranslationWords(opts) {
   }
 
   log('Fetching Translation Words (en_tw master)...');
-  const archive = zlib.gunzipSync(await fetchBuffer(TW_ARCHIVE_URL));
+  const maxArchive = opts.maxArchiveBytes || MAX_ARCHIVE_BYTES;
+  const maxTar = opts.maxTarBytes || MAX_TAR_BYTES;
+  const gz = await fetchBuffer(TW_ARCHIVE_URL);
+  if (gz.length > maxArchive) {
+    throw new Error(`en_tw archive is ${gz.length} bytes, over the ${maxArchive}-byte cap`);
+  }
+  let archive;
+  try {
+    archive = zlib.gunzipSync(gz, { maxOutputLength: maxTar });
+  } catch (err) {
+    if (err.code === 'ERR_BUFFER_TOO_LARGE') {
+      throw new Error(`en_tw archive unpacks to more than ${maxTar} bytes`);
+    }
+    throw err;
+  }
   const articles = extractArticles(parseTar(archive));
   const entries = buildHeadwords(articles);
   const previous = countExisting(hwPath);
   validate(entries, previous);
 
   const stamp = new Date().toISOString().slice(0, 10);
-  const tmpDir = path.join(dataDir, `.en_tw.tmp-${process.pid}`);
-  const oldDir = path.join(dataDir, `.en_tw.old-${process.pid}`);
-  const tmpHw = `${hwPath}.tmp-${process.pid}`;
+  const tag = `${process.pid}-${++scratchSeq}`;
+  const tmpDir = path.join(dataDir, `.en_tw.tmp-${tag}`);
+  const oldDir = path.join(dataDir, `.en_tw.old-${tag}`);
+  const tmpHw = `${hwPath}.tmp-${tag}`;
   fs.rmSync(tmpDir, { recursive: true, force: true });
   try {
     for (const c of CATEGORIES) fs.mkdirSync(path.join(tmpDir, c), { recursive: true });
     for (const a of articles) fs.writeFileSync(path.join(tmpDir, a.category, a.twarticle + '.md'), a.text);
-    fs.writeFileSync(path.join(tmpDir, FETCHED_MARKER), stamp + '\n');
     fs.writeFileSync(tmpHw, JSON.stringify(entries, null, 2) + '\n');
 
     fs.rmSync(oldDir, { recursive: true, force: true });
@@ -196,11 +219,17 @@ async function refreshTranslationWords(opts) {
     if (hadOld) fs.renameSync(twDir, oldDir);
     try {
       fs.renameSync(tmpDir, twDir);
+      fs.renameSync(tmpHw, hwPath);
     } catch (err) {
+      // Put the previous articles back so they stay paired with the previous index.
+      if (!fs.existsSync(tmpDir)) fs.rmSync(twDir, { recursive: true, force: true });
       if (hadOld) fs.renameSync(oldDir, twDir);
       throw err;
     }
-    fs.renameSync(tmpHw, hwPath);
+    // The freshness marker goes in last. A crash anywhere before this line leaves
+    // en_tw without a marker, so the next weekly run refetches instead of trusting
+    // a tree whose index may be the old one.
+    fs.writeFileSync(path.join(twDir, FETCHED_MARKER), stamp + '\n');
     fs.rmSync(oldDir, { recursive: true, force: true });
   } finally {
     fs.rmSync(tmpDir, { recursive: true, force: true });
@@ -215,5 +244,5 @@ async function refreshTranslationWords(opts) {
 
 module.exports = {
   refreshTranslationWords, parseTar, extractArticles, buildHeadwords, headwordsFromTitle,
-  TW_ARCHIVE_URL,
+  TW_ARCHIVE_URL, FETCHED_MARKER,
 };
