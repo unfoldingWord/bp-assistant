@@ -19,7 +19,7 @@ const { resolveAutoModel } = require('./api-runner/provider-config');
 const { getDoor43Username, emailToFallbackUsername, buildBranchName, resolveOutputFile, discoverFreshOutput, checkPrerequisites, calcSkillTimeout, calcVerseSpanTimeout, normalizeBookName, resolveConflictMention, parsePartialTsv, truncatePartialTsv, parseChunkRange, isUsageLimitError, CSKILLBP_DIR } = require('./pipeline-utils');
 const { splitTsv, fixTrailingNewlines } = require('./workspace-tools/tsv-tools');
 const { fillTsvIds, generateIds, prepareNotes, fillOrigQuotes, resolveGlQuotes, flagNarrowQuotes, extractAlignmentData, prepareATContext, substituteAT, fixUnicodeQuotes, verifyBoldMatches, syncCanonicalHebrewQuotes, applyHintsToPreparedNotes, applyKeptToPreparedNotes, keptRefVerseSpan, parsePlainUsfmVersesFromText, detectIssuesTsvLayout, extractIssuesTsvRow, findVersesWithoutNotes, readWriterSkipped, recordWriterSkipRejected, parseWriterSkip, sanitizeSkipReason, _stripAlternateTranslation: stripAlternateTranslation } = require('./workspace-tools/tn-tools');
-const { checkTnQuality, detectSelfTalk, templateFirstPhrase, resolveTemplateText } = require('./workspace-tools/quality-tools');
+const { checkTnQuality, detectSelfTalk, templateFirstPhrase, resolveTemplateText, _countTcmOptionsAndAts: countTcmOptionsAndAts } = require('./workspace-tools/quality-tools');
 const { buildBookRecurrenceIndex, deriveRecurrenceKeys, buildSeeHowSentence, isSeeHowEligible, isContextDependentSref, sameFormForKey, assignPointerVerses, resolveDoor43ReposPath, hebTokens, verseNumber: recurrenceVerseNumber, SEE_HOW_NEVER_FOLD_SREFS, CROSS_BOOK_MAX_BOOKS } = require('./workspace-tools/recurrence-index');
 const { loadCommonPhrases, buildIntroPointerSentence, phraseTextKey } = require('./workspace-tools/common-phrases');
 const { normalizeIssuesFile, buildParallelismIntroHintArgs } = require('./issue-normalizer');
@@ -1292,6 +1292,151 @@ async function runSeeHowDetection({ pipeDir, contextPath, generateIdsFn = genera
   return summary;
 }
 
+const WRITER_DISALLOWED_TOOLS = ['Bash', 'Read', 'Write', 'Edit', 'Glob', 'Grep', 'Agent', 'Task', 'Skill'];
+
+// System prompt shared by the per-note writer and the TCM repair retry.
+function buildNoteWriterSystemPrompt() {
+  let styleGuide = '';
+  try {
+    styleGuide = fs.readFileSync(path.resolve(CSKILLBP_DIR, '.claude/skills/tn-writer/reference/note-style-guide.md'), 'utf8');
+  } catch (_) {
+    styleGuide = 'Follow template exactly. Fill in only the variable parts.';
+  }
+  let canonicalRefs = '';
+  try {
+    canonicalRefs = fs.readFileSync(path.resolve(CSKILLBP_DIR, '.claude/skills/reference/gl_guidelines.md'), 'utf8');
+  } catch (_) { /* optional */ }
+  return [
+    'You are writing a single translation note for Bible translators.',
+    'Follow the template exactly. Fill in only the variable parts.',
+    'Output ONLY the note text, nothing else. Do not use any tools.',
+    'Do NOT include an alternate translation — that is handled separately.',
+    'Exception: when the item includes a THIS COULD MEAN instruction, write one alternate translation per option, as that instruction says.',
+    'Exception: when the item includes a SKIP RULE, follow it and output the skip line instead of a note when the rule says to.',
+    '',
+    '--- NOTE STYLE GUIDE ---',
+    styleGuide,
+    canonicalRefs ? '\n--- GL GUIDELINES ---\n' + canonicalRefs : '',
+  ].join('\n');
+}
+
+function buildNoteWriterPrompt(item) {
+  const packet = item.writer_packet || {};
+  return [
+    `TEMPLATE: "${packet.template_text || '(no template)'}"`,
+    `VERSE (ULT): ${packet.ult_verse || item.ult_verse || ''}`,
+    `VERSE (UST): ${packet.ust_verse || item.ust_verse || ''}`,
+    `GL_QUOTE: ${packet.gl_quote || item.gl_quote || ''}`,
+    `ISSUE TYPE: ${packet.sref || item.sref || ''}`,
+    `REFERENCE: ${item.reference || ''}`,
+    packet.clean_explanation ? `EXPLANATION: ${packet.clean_explanation}` : '',
+    (packet.must_include || []).length ? `MUST INCLUDE: ${packet.must_include.join(' | ')}` : '',
+    (packet.style_rules || []).length ? `STYLE RULES: ${packet.style_rules.join(', ')}` : '',
+    (packet.rule_overrides || []).length ? `OVERRIDES: ${packet.rule_overrides.join(', ')}` : '',
+    packet.skip_allowed && packet.skip_instruction ? packet.skip_instruction : '',
+    packet.tcm_mode ? `THIS COULD MEAN: ${packet.tcm_instruction}` : '',
+    '',
+    'Write the note text. Output ONLY the note text, nothing else.',
+    packet.tcm_mode ? '' : 'Do NOT include an alternate translation.',
+  ].filter(Boolean).join('\n');
+}
+
+function writerResultText(result) {
+  if (result?.result?.text) return result.result.text.trim();
+  if (typeof result?.result === 'string') return result.result.trim();
+  return '';
+}
+
+// A TCM note is short of ATs when it has numbered options but fewer
+// "Alternate translation:" labels than options (#485).
+function tcmAtShortfall(noteText) {
+  const counts = countTcmOptionsAndAts(noteText);
+  return counts && counts.ats < counts.options ? counts : null;
+}
+
+/**
+ * Re-run the per-note writer once for each TCM item whose note has fewer ATs
+ * than options (#485). The AT stage can only append a single AT, which matches
+ * no option in particular, and it skips notes that already carry some AT. A
+ * retry is kept only when it gives every option its AT; otherwise the original
+ * note stays and the AT stage's single-AT append remains the last resort.
+ *
+ * Runs on every AT stage, so a resumed run revisits notes an earlier run left
+ * short.
+ *
+ * @returns {Promise<{attempted: number, repaired: number}>}
+ */
+async function repairTcmNotes({ preparedJson, generatedJson, status }) {
+  const prepared = JSON.parse(fs.readFileSync(path.resolve(CSKILLBP_DIR, preparedJson), 'utf8'));
+  const genPath = path.resolve(CSKILLBP_DIR, generatedJson);
+  const generatedNotes = JSON.parse(fs.readFileSync(genPath, 'utf8'));
+
+  const targets = [];
+  for (const item of (prepared.items || [])) {
+    if (!item.tcm_mode || item.programmatic_note) continue;
+    const note = generatedNotes[item.id];
+    if (!note || parseWriterSkip(note) !== null) continue;
+    const shortfall = tcmAtShortfall(note);
+    if (shortfall) targets.push({ item, note, shortfall });
+  }
+  if (targets.length === 0) return { attempted: 0, repaired: 0 };
+
+  await status(`Re-writing **${targets.length} "This could mean" notes** that lack one alternate translation per option...`);
+  console.log(`[notes] TCM repair: ${targets.length} notes short of per-option ATs`);
+  const systemPromptAppend = buildNoteWriterSystemPrompt();
+
+  async function retryOne({ item, note, shortfall }) {
+    const prompt = [
+      buildNoteWriterPrompt(item),
+      '',
+      `PREVIOUS ATTEMPT: ${note}`,
+      `PROBLEM: it has ${shortfall.options} numbered options but ${shortfall.ats} alternate translation(s).`,
+      'Rewrite the whole note so that each numbered option is followed by its own "Alternate translation: [...]".',
+    ].join('\n');
+    try {
+      const result = await runClaude({
+        prompt,
+        label: `${item.reference || 'TCM'} note TCM-retry`,
+        cwd: CSKILLBP_DIR,
+        model: 'medium',
+        maxTurns: 2,
+        timeoutMs: 60 * 1000,
+        appendSystemPrompt: systemPromptAppend,
+        mcpToolSet: 'none',
+        tools: [],
+        disallowedTools: WRITER_DISALLOWED_TOOLS,
+      });
+      const text = writerResultText(result);
+      if (!text || parseWriterSkip(text) !== null) return { id: item.id, note: null };
+      // Keep only a retry that is still a TCM note with every option covered.
+      if (!countTcmOptionsAndAts(text) || tcmAtShortfall(text)) return { id: item.id, note: null };
+      return { id: item.id, note: text };
+    } catch (err) {
+      console.warn(`[notes] TCM repair failed for ${item.id}: ${err.message}`);
+      return { id: item.id, note: null };
+    }
+  }
+
+  const CONCURRENCY = 10;
+  const outcomes = [];
+  for (let i = 0; i < targets.length; i += CONCURRENCY) {
+    outcomes.push(...await Promise.all(targets.slice(i, i + CONCURRENCY).map(retryOne)));
+  }
+
+  let repaired = 0;
+  for (const o of outcomes) {
+    if (!o.note) {
+      console.warn(`[notes] TCM repair kept original note for ${o.id}; retry did not give each option an AT`);
+      continue;
+    }
+    generatedNotes[o.id] = o.note;
+    repaired++;
+  }
+  if (repaired > 0) fs.writeFileSync(genPath, JSON.stringify(generatedNotes, null, 2));
+  console.log(`[notes] TCM repair: ${repaired}/${targets.length} notes repaired`);
+  return { attempted: targets.length, repaired };
+}
+
 /**
  * Run per-note generation using the Claude Agent SDK.
  * Replaces the sharded Claude Code agent approach with parallel focused SDK calls.
@@ -1316,35 +1461,7 @@ async function runPerNoteGeneration({ pipeDir, outputPath, status, book }) {
     return { success: true, notesPath: outputPath, summary: '0 items' };
   }
 
-  // Load the note style guide for the system prompt
-  const styleGuidePath = path.resolve(CSKILLBP_DIR, '.claude/skills/tn-writer/reference/note-style-guide.md');
-  let styleGuide = '';
-  try {
-    styleGuide = fs.readFileSync(styleGuidePath, 'utf8');
-  } catch (_) {
-    styleGuide = 'Follow template exactly. Fill in only the variable parts.';
-  }
-
-  // Load canonical references if available
-  let canonicalRefs = '';
-  const glGuidelinesPath = path.resolve(CSKILLBP_DIR, '.claude/skills/reference/gl_guidelines.md');
-  try {
-    canonicalRefs = fs.readFileSync(glGuidelinesPath, 'utf8');
-  } catch (_) { /* optional */ }
-
-  // System prompt appended to each SDK call
-  const systemPromptAppend = [
-    'You are writing a single translation note for Bible translators.',
-    'Follow the template exactly. Fill in only the variable parts.',
-    'Output ONLY the note text, nothing else. Do not use any tools.',
-    'Do NOT include an alternate translation — that is handled separately.',
-    'Exception: when the item includes a THIS COULD MEAN instruction, write one alternate translation per option, as that instruction says.',
-    'Exception: when the item includes a SKIP RULE, follow it and output the skip line instead of a note when the rule says to.',
-    '',
-    '--- NOTE STYLE GUIDE ---',
-    styleGuide,
-    canonicalRefs ? '\n--- GL GUIDELINES ---\n' + canonicalRefs : '',
-  ].join('\n');
+  const systemPromptAppend = buildNoteWriterSystemPrompt();
 
   await status(`Generating **${items.length} notes** via per-note SDK calls...`);
   console.log(`[notes] Per-note generation: ${items.length} items`);
@@ -1360,23 +1477,7 @@ async function runPerNoteGeneration({ pipeDir, outputPath, status, book }) {
     }
 
     const packet = item.writer_packet || {};
-    const prompt = [
-      `TEMPLATE: "${packet.template_text || '(no template)'}"`,
-      `VERSE (ULT): ${packet.ult_verse || item.ult_verse || ''}`,
-      `VERSE (UST): ${packet.ust_verse || item.ust_verse || ''}`,
-      `GL_QUOTE: ${packet.gl_quote || item.gl_quote || ''}`,
-      `ISSUE TYPE: ${packet.sref || item.sref || ''}`,
-      `REFERENCE: ${item.reference || ''}`,
-      packet.clean_explanation ? `EXPLANATION: ${packet.clean_explanation}` : '',
-      (packet.must_include || []).length ? `MUST INCLUDE: ${packet.must_include.join(' | ')}` : '',
-      (packet.style_rules || []).length ? `STYLE RULES: ${packet.style_rules.join(', ')}` : '',
-      (packet.rule_overrides || []).length ? `OVERRIDES: ${packet.rule_overrides.join(', ')}` : '',
-      packet.skip_allowed && packet.skip_instruction ? packet.skip_instruction : '',
-      packet.tcm_mode ? `THIS COULD MEAN: ${packet.tcm_instruction}` : '',
-      '',
-      'Write the note text. Output ONLY the note text, nothing else.',
-      packet.tcm_mode ? '' : 'Do NOT include an alternate translation.',
-    ].filter(Boolean).join('\n');
+    const prompt = buildNoteWriterPrompt(item);
 
     try {
       const result = await runClaude({
@@ -1389,15 +1490,9 @@ async function runPerNoteGeneration({ pipeDir, outputPath, status, book }) {
         appendSystemPrompt: systemPromptAppend,
         mcpToolSet: 'none',
         tools: [],
-        disallowedTools: ['Bash', 'Read', 'Write', 'Edit', 'Glob', 'Grep', 'Agent', 'Task', 'Skill'],
+        disallowedTools: WRITER_DISALLOWED_TOOLS,
       });
-      // Extract text from the result
-      let noteText = '';
-      if (result?.result?.text) {
-        noteText = result.result.text.trim();
-      } else if (typeof result?.result === 'string') {
-        noteText = result.result.trim();
-      }
+      let noteText = writerResultText(result);
       // Strip any accidentally included AT. TCM notes keep theirs: one per option.
       if (!packet.tcm_mode) noteText = noteText.replace(/\s*Alternate translation:.*$/i, '').trim();
 
@@ -1544,6 +1639,17 @@ async function runATGeneration({ notesPath, pipeDir, status }) {
     return '0 ATs needed (no generated notes JSON)';
   }
 
+  // TCM notes short of per-option ATs get a writer retry before the AT stage
+  // falls back to appending a single AT (#485).
+  const tcmRepair = await repairTcmNotes({
+    preparedJson: ctx.runtime.preparedNotes,
+    generatedJson: ctx.runtime.generatedNotes,
+    status,
+  });
+  const tcmSummary = tcmRepair.attempted
+    ? `; ${tcmRepair.repaired}/${tcmRepair.attempted} TCM notes re-written with per-option ATs`
+    : '';
+
   // Build AT context packets
   const atCtxResult = prepareATContext({
     preparedJson: ctx.runtime.preparedNotes,
@@ -1553,7 +1659,8 @@ async function runATGeneration({ notesPath, pipeDir, status }) {
 
   if (!atCtx.packets || atCtx.packets.length === 0) {
     console.log('[notes] AT generation: no items need ATs');
-    return '0 ATs needed';
+    if (tcmRepair.repaired > 0) reassembleNotesAfterAT({ ctx, notesPath });
+    return `0 ATs needed${tcmSummary}`;
   }
 
   await status(`Generating **${atCtx.packets.length} alternate translations** via SDK...`);
@@ -1811,50 +1918,55 @@ async function runATGeneration({ notesPath, pipeDir, status }) {
   fs.writeFileSync(genPath, JSON.stringify(generatedNotes, null, 2));
 
   // Re-assemble the TSV with the updated notes (includes ATs now)
-  if (notesPath) {
-    const { assembleNotes } = require('./workspace-tools/tn-tools');
-    assembleNotes({
-      preparedJson: ctx.runtime.preparedNotes,
-      generatedJson: ctx.runtime.generatedNotes,
-      output: notesPath,
-    });
-    console.log(`[notes] Re-assembled notes with ATs to ${notesPath}`);
-
-    // Apply tags to flagged rows
-    if (tagsToApply.size > 0) {
-      const absNotes = path.resolve(CSKILLBP_DIR, notesPath);
-      if (fs.existsSync(absNotes)) {
-        const lines = fs.readFileSync(absNotes, 'utf8').split('\n');
-        for (let i = 1; i < lines.length; i++) {
-          if (!lines[i].trim()) continue;
-          const cols = lines[i].split('\t');
-          const id = cols[1] || '';
-          const tag = tagsToApply.get(id);
-          if (tag) {
-            cols[2] = cols[2] ? `${cols[2]}, ${tag}` : tag;
-            lines[i] = cols.join('\t');
-          }
-        }
-        fs.writeFileSync(absNotes, lines.join('\n'));
-      }
-    }
-
-    const postSummary = postProcessNotesTsv({
-      notesPath,
-      ultUsfm: ctx.sources.ultPlain || ctx.sources.ult,
-      hebrewUsfm: ctx.sources.hebrew,
-      preparedJson: ctx.runtime.preparedNotes,
-    });
-    console.log(`[notes] Final post-processing after AT generation: ${postSummary}`);
-  }
+  reassembleNotesAfterAT({ ctx, notesPath, tagsToApply });
 
   const reasonEntries = Object.entries(results.reasons)
     .sort((a, b) => b[1] - a[1])
     .map(([k, v]) => `${k}: ${v}`);
   const reasonBreakdown = reasonEntries.length ? ` [reasons — ${reasonEntries.join(', ')}]` : '';
-  const summary = `${results.success}/${atCtx.packets.length} ATs generated (${results.validated} validated, ${results.retried} retried, ${results.failed} failed)${reasonBreakdown}`;
+  const summary = `${results.success}/${atCtx.packets.length} ATs generated (${results.validated} validated, ${results.retried} retried, ${results.failed} failed)${reasonBreakdown}${tcmSummary}`;
   console.log(`[notes] AT generation complete: ${summary}`);
   return summary;
+}
+
+// Re-assemble the TSV from the generated notes JSON, tag flagged rows and
+// run the final post-processing. Shared by both exits of runATGeneration.
+function reassembleNotesAfterAT({ ctx, notesPath, tagsToApply = new Map() }) {
+  if (!notesPath) return;
+  const { assembleNotes } = require('./workspace-tools/tn-tools');
+  assembleNotes({
+    preparedJson: ctx.runtime.preparedNotes,
+    generatedJson: ctx.runtime.generatedNotes,
+    output: notesPath,
+  });
+  console.log(`[notes] Re-assembled notes with ATs to ${notesPath}`);
+
+  // Apply tags to flagged rows
+  if (tagsToApply.size > 0) {
+    const absNotes = path.resolve(CSKILLBP_DIR, notesPath);
+    if (fs.existsSync(absNotes)) {
+      const lines = fs.readFileSync(absNotes, 'utf8').split('\n');
+      for (let i = 1; i < lines.length; i++) {
+        if (!lines[i].trim()) continue;
+        const cols = lines[i].split('\t');
+        const id = cols[1] || '';
+        const tag = tagsToApply.get(id);
+        if (tag) {
+          cols[2] = cols[2] ? `${cols[2]}, ${tag}` : tag;
+          lines[i] = cols.join('\t');
+        }
+      }
+      fs.writeFileSync(absNotes, lines.join('\n'));
+    }
+  }
+
+  const postSummary = postProcessNotesTsv({
+    notesPath,
+    ultUsfm: ctx.sources.ultPlain || ctx.sources.ult,
+    hebrewUsfm: ctx.sources.hebrew,
+    preparedJson: ctx.runtime.preparedNotes,
+  });
+  console.log(`[notes] Final post-processing after AT generation: ${postSummary}`);
 }
 
 function postProcessNotesTsv({ notesPath, ultUsfm, hebrewUsfm, preparedJson }) {

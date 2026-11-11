@@ -3705,6 +3705,7 @@ function prepareATContext({ preparedJson, generatedJson, output }) {
     const noteText = generatedNotes[item.id] || '';
     // Idempotency: if this item's stored note already has an AT clause, skip it.
     // Lets resume-to-fill-missing-ATs runs avoid double-appending (ZEC 3 incident).
+    // TCM notes short of per-option ATs are re-written earlier, by repairTcmNotes (#485).
     if (/Alternate translation:/i.test(noteText)) continue;
     const verseCtx = getVerseContext(item.reference);
     const scopedQuote = item.issue_span_gl_quote || item.gl_quote || '';
