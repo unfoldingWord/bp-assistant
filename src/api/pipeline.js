@@ -171,6 +171,12 @@ const OptionsSchema = z.object({
   // and UPDATE them by ID into the existing target book (verse scoping uses
   // the top-level verseStart/verseEnd instead).
   rowIds: z.array(z.string().regex(HINT_ROW_ID_RE)).min(1).max(50).optional(),
+  // Whole-chapter runs only: published rows to leave out (e.g. rows the editor
+  // already approved). They are never sent to the model and are absent from
+  // the merged output; the report lists them as retained so the caller's merge
+  // keeps them. Range merge only, so it cannot combine with rowIds or a verse
+  // range, and editor delivery only, so a Door43 push never drops them.
+  excludeRowIds: z.array(z.string().regex(HINT_ROW_ID_RE)).max(3000).optional(),
   // Editor-marked TN row "hints" — each entry seeds one specific note the
   // pipeline must produce, and suppresses competing notes for the same
   // (verse, supportReference, fuzzy-quote). hint.rowId is preserved as the
@@ -304,7 +310,7 @@ const StartBodySchema = z.object({
           message: 'article resources require exactly one of options.articleId or options.articleUrl',
         });
       }
-      for (const k of ['rowIds']) {
+      for (const k of ['rowIds', 'excludeRowIds']) {
         if (o[k] !== undefined) {
           ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['options', k], message: `options.${k} is not valid for article resources (tw/ta)` });
         }
@@ -340,9 +346,20 @@ const StartBodySchema = z.object({
           message: 'verseEnd requires verseStart',
         });
       }
+      if (o.excludeRowIds !== undefined) {
+        if (o.rowIds !== undefined) {
+          ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['options', 'excludeRowIds'], message: 'options.excludeRowIds cannot be combined with options.rowIds' });
+        }
+        if (body.verseStart != null || body.verseEnd != null) {
+          ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['options', 'excludeRowIds'], message: 'options.excludeRowIds is only valid for whole-chapter runs (no verseStart/verseEnd)' });
+        }
+        if (o.delivery !== undefined && o.delivery !== 'editor') {
+          ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['options', 'excludeRowIds'], message: 'options.excludeRowIds requires editor delivery (a Door43 push would drop the excluded rows)' });
+        }
+      }
     }
   } else {
-    for (const k of ['resourceType', 'targetLang', 'targetOrg', 'repoName', 'sourceRef', 'sourceLang', 'contextRef', 'writeContextBack', 'branchOnly', 'delivery', 'direction', 'rowIds', 'articleId', 'articleUrl']) {
+    for (const k of ['resourceType', 'targetLang', 'targetOrg', 'repoName', 'sourceRef', 'sourceLang', 'contextRef', 'writeContextBack', 'branchOnly', 'delivery', 'direction', 'rowIds', 'excludeRowIds', 'articleId', 'articleUrl']) {
       if (o[k] !== undefined) {
         ctx.addIssue({
           code: z.ZodIssueCode.custom,

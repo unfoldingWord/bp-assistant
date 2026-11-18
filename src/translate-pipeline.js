@@ -88,7 +88,7 @@ function resolveParams(route, message) {
   const family = rt.family;
 
   let book = null; let startChapter = null; let endChapter = null;
-  let verseStart = null; let verseEnd = null; let rowIds = null;
+  let verseStart = null; let verseEnd = null; let rowIds = null; let excludeRowIds = null;
   let articleId = null; let articleUrl = null;
   let zulipLang = null;
 
@@ -110,6 +110,8 @@ function resolveParams(route, message) {
     verseStart = route._verseStart ?? null;
     verseEnd = route._verseEnd ?? null;
     rowIds = Array.isArray(opts.rowIds) && opts.rowIds.length ? opts.rowIds : null;
+    excludeRowIds = Array.isArray(opts.excludeRowIds) && opts.excludeRowIds.length
+      ? [...new Set(opts.excludeRowIds)] : null;
   } else {
     const m = TSV_COMMAND_RE.exec(String(message.content || ''));
     if (!m) throw new Error('Could not parse translate command. Usage: translate notes OBA 1 to ar (or OBA 1:5 / OBA 1:5-7 / OBA 1-2); questions likewise');
@@ -135,6 +137,13 @@ function resolveParams(route, message) {
   // pulled by bible-editor via GET /api/pipeline/{jobId}/output — unapproved AI
   // output never touches Door43. 'branch' remains an explicit expert override.
   const delivery = opts.delivery || (route._synthetic ? 'editor' : 'path');
+  // excludeRowIds narrows a whole-chapter range run; the API schema enforces
+  // this too, but a by-id merge or a Door43 push would mishandle the left-out
+  // rows, so refuse here as well rather than trust every caller.
+  if (excludeRowIds) {
+    if (hasSubset) throw new Error('translate: excludeRowIds is only valid for whole-chapter runs (no rowIds or verse range)');
+    if (delivery !== 'editor') throw new Error('translate: excludeRowIds requires editor delivery');
+  }
 
   const cfg = TRANSLATE_TARGETS[targetLang] || {};
   const targetOrg = opts.targetOrg || cfg.targetOrg || `${targetLang}_gl`;
@@ -166,6 +175,7 @@ function resolveParams(route, message) {
     verseStart,
     verseEnd,
     rowIds,
+    excludeRowIds,
     mergeMode,
     // article scope
     articleId,
@@ -388,16 +398,25 @@ async function translateChapters(params, { workDir, onProgress, runBatchImpl, ma
   const sourceText = await core.fetchResourceFile(params.sourceRef, resource.file(params.book));
   if (!sourceText) throw new Error(`source not found: ${params.sourceRef} ${resource.file(params.book)}`);
   const allRows = resource._codec.parse(sourceText);
-  let rows = core.sliceChapterRows(allRows, params.startChapter, params.endChapter);
-  rows = core.selectRows(rows, { rowIds: params.rowIds, verseStart: params.verseStart, verseEnd: params.verseEnd });
+  const chapterRows = core.sliceChapterRows(allRows, params.startChapter, params.endChapter);
+  let rows = core.selectRows(chapterRows, {
+    rowIds: params.rowIds, verseStart: params.verseStart, verseEnd: params.verseEnd, excludeRowIds: params.excludeRowIds,
+  });
+  // Excluded rows the caller keeps (e.g. editor-approved). They are not sent to
+  // the model and not emitted in the merged book; the report lists the ones
+  // found in scope so the caller's merge counts them as retained.
+  const excludeSet = params.excludeRowIds ? new Set(params.excludeRowIds) : null;
+  const retainedRowIds = excludeSet ? chapterRows.filter((r) => excludeSet.has(r.ID)).map((r) => r.ID) : [];
   if (!rows.length) {
     const sel = params.rowIds ? `rowIds ${params.rowIds.join(',')}`
       : params.verseStart != null ? `${params.startChapter}:${params.verseStart}${params.verseEnd !== params.verseStart ? `-${params.verseEnd}` : ''}`
         : `${params.startChapter}-${params.endChapter}`;
-    throw new Error(`no source rows for ${params.book} ${sel}`);
+    const why = retainedRowIds.length ? ` (all ${retainedRowIds.length} row(s) in scope are in excludeRowIds)` : '';
+    throw new Error(`no source rows for ${params.book} ${sel}${why}`);
   }
   if (maxRows && rows.length > maxRows) rows = rows.slice(0, maxRows);
-  progress(`source: ${rows.length} row(s) from ${params.sourceRef}${params.mergeMode === 'by-id' ? ' (by-id subset)' : ''}`);
+  progress(`source: ${rows.length} row(s) from ${params.sourceRef}${params.mergeMode === 'by-id' ? ' (by-id subset)' : ''}`
+    + (retainedRowIds.length ? `, ${retainedRowIds.length} excluded row(s) left out` : ''));
 
   // 2. Context pack.
   const pack = await loadContextPack(params.contextRef, { allowEmpty: !params.contextRefExplicit });
@@ -508,7 +527,11 @@ async function translateChapters(params, { workDir, onProgress, runBatchImpl, ma
     targetOrg: params.targetOrg, targetRepo: params.repoName,
     jobId: params.jobId || null,
     batches: batchMeta, checks, llm,
-    selection: { mergeMode: params.mergeMode, verseStart: params.verseStart ?? null, verseEnd: params.verseEnd ?? null, rowIds: params.rowIds ?? null },
+    selection: {
+      mergeMode: params.mergeMode, verseStart: params.verseStart ?? null, verseEnd: params.verseEnd ?? null, rowIds: params.rowIds ?? null,
+      // Only present on exclude runs so other reports stay byte-identical.
+      ...(params.excludeRowIds ? { excludeRowIds: params.excludeRowIds, retainedRowIds } : {}),
+    },
   });
 
   return { sourceRows: rows, targetRows, checks, report, bookText, existingBookText, pack };
@@ -871,7 +894,9 @@ async function runTsvDelivery({ params, ckptId, scope, workDir, runHash, label, 
     donePatch.output = output;
   }
   setCheckpoint(ckptId, donePatch);
-  const summary = `${targetRows.length} rows, ${report.checks.warningCount} warning(s), 0 blocking violations`;
+  const retained = report.selection?.retainedRowIds?.length || 0;
+  const summary = `${targetRows.length} rows${retained ? ` (${retained} excluded row(s) left out)` : ''}, `
+    + `${report.checks.warningCount} warning(s), 0 blocking violations`;
 
   if (params.delivery === 'path') {
     await post(`:check: Translated **${label}** — ${summary}.\nFile: \`${bookFile}\`\nReport: \`${reportFile}\``);
