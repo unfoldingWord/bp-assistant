@@ -1540,6 +1540,7 @@ function buildApiSyntheticRoute(pipelineType, scope, options, ai) {
       delivery: options.delivery,
       direction: options.direction,
       rowIds: options.rowIds,
+      excludeRowIds: options.excludeRowIds,
       articleId: options.articleId,
       articleUrl: options.articleUrl,
     }

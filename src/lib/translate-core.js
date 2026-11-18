@@ -477,10 +477,11 @@ function mergeChapterIntoBook(existingBookText, newRows, { startChapter, endChap
 
 /**
  * Narrow a chapter-sliced row set to a subset by explicit row IDs and/or a
- * verse range (individual-note / single-verse translation). No criteria →
+ * verse range (individual-note / single-verse translation), then drop any
+ * excludeRowIds (rows the caller keeps, e.g. editor-approved). No criteria →
  * input unchanged.
  */
-function selectRows(rows, { rowIds, verseStart, verseEnd } = {}) {
+function selectRows(rows, { rowIds, verseStart, verseEnd, excludeRowIds } = {}) {
   let out = rows;
   if (Array.isArray(rowIds) && rowIds.length) {
     const want = new Set(rowIds);
@@ -492,6 +493,10 @@ function selectRows(rows, { rowIds, verseStart, verseEnd } = {}) {
       const vr = refVerseRange(r.Reference);
       return vr && vr.start <= vEnd && vr.end >= verseStart;
     });
+  }
+  if (Array.isArray(excludeRowIds) && excludeRowIds.length) {
+    const skip = new Set(excludeRowIds);
+    out = out.filter((r) => !skip.has(r.ID));
   }
   return out;
 }
