@@ -154,8 +154,9 @@ test('X1: a key first noted in GEN yields one cross-book pointer at its first oc
   assert.equal(first.see_how_target, 'GEN 10:2');
   assert.equal(first.see_how_cross_book, true);
   assert.equal(first.support_reference, 'translate-names');
-  // The later occurrence at 3:9 points at the same Genesis note.
-  assert.match(summary, /2 cross-book/);
+  // The later occurrence at 3:9 is over the per-chapter cap (#494).
+  assert.match(summary, /1 cross-book/);
+  assert.match(summary, /1 dropped \(per-chapter pointer cap\)/);
   clearCrossBookCache();
 });
 
@@ -172,10 +173,10 @@ test('X2: no cross-book pointer at EXO 5, where the phrase already occurred in E
   clearCrossBookCache();
 });
 
-test('X3: the pointer anchors on the chapter\'s FIRST occurrence, and later ones point at the same target', async () => {
+test('X3: the pointer anchors on the chapter\'s FIRST occurrence, and later ones are dropped', async () => {
   crossBookCache({ [SAUL_KEY]: GEN_ENTRY() });
   // Only 3:9 is flagged, but 3:4 is the book-first occurrence, so the pointer
-  // is injected there and the flagged 3:9 becomes a pointer to the same note.
+  // is injected there and the flagged 3:9 is over the per-chapter cap (#494).
   const dirPath = setupPipeDir({ chapter: '3', items: [item({ reference: '3:9', id: 'bbbb' })] });
   buildRecurrenceIndexFile({ pipeDir: dirPath });
   await runSeeHowDetection({ pipeDir: dirPath, generateIdsFn: stubIds });
@@ -188,8 +189,7 @@ test('X3: the pointer anchors on the chapter\'s FIRST occurrence, and later ones
   // names the subject rather than falling back to "the similar expression".
   assert.equal(pointer.programmatic_note, 'See how you translated this name in Genesis 10:2.');
   assert.equal(pointer.also_occurs_verses, undefined);
-  const later = items.find((it) => it.id === 'bbbb');
-  assert.equal(later.programmatic_note, 'See how you translated this name in Genesis 10:2.');
+  assert.deepEqual(items.map((it) => it.reference), ['3:4']);
   clearCrossBookCache();
 });
 
