@@ -20,7 +20,7 @@ const { getDoor43Username, emailToFallbackUsername, buildBranchName, resolveOutp
 const { splitTsv, fixTrailingNewlines } = require('./workspace-tools/tsv-tools');
 const { fillTsvIds, generateIds, prepareNotes, fillOrigQuotes, resolveGlQuotes, flagNarrowQuotes, extractAlignmentData, prepareATContext, substituteAT, fixUnicodeQuotes, verifyBoldMatches, syncCanonicalHebrewQuotes, applyHintsToPreparedNotes, applyKeptToPreparedNotes, keptRefVerseSpan, parsePlainUsfmVersesFromText, detectIssuesTsvLayout, extractIssuesTsvRow, findVersesWithoutNotes, readWriterSkipped, recordWriterSkipRejected, parseWriterSkip, sanitizeSkipReason, _stripAlternateTranslation: stripAlternateTranslation } = require('./workspace-tools/tn-tools');
 const { checkTnQuality, detectSelfTalk, templateFirstPhrase, resolveTemplateText } = require('./workspace-tools/quality-tools');
-const { buildBookRecurrenceIndex, deriveRecurrenceKeys, buildSeeHowSentence, isSeeHowEligible, isContextDependentSref, sameFormForKey, assignPointerVerses, resolveDoor43ReposPath, hebTokens, verseNumber: recurrenceVerseNumber, SEE_HOW_NEVER_FOLD_SREFS, CROSS_BOOK_MAX_BOOKS } = require('./workspace-tools/recurrence-index');
+const { buildBookRecurrenceIndex, deriveRecurrenceKeys, buildSeeHowSentence, isSeeHowEligible, isContextDependentSref, sameFormForKey, assignPointerVerses, resolveDoor43ReposPath, hebTokens, verseNumber: recurrenceVerseNumber, SEE_HOW_NEVER_FOLD_SREFS, CROSS_BOOK_MAX_BOOKS, SEE_HOW_MAX_POINTERS_PER_CHAPTER } = require('./workspace-tools/recurrence-index');
 const { loadCommonPhrases, buildIntroPointerSentence, phraseTextKey } = require('./workspace-tools/common-phrases');
 const { normalizeIssuesFile, buildParallelismIntroHintArgs } = require('./issue-normalizer');
 const { runIssueRulesGate, gatePrBodyForPush, refreshGateSidecarOutputHash, readGateSidecar, keptDropsStillCovered } = require('./issue-rules-gate');
@@ -443,12 +443,15 @@ const CROSS_BOOK_INDEX_REL = 'data/cache/crossbook_seehow_index.json';
 /**
  * "See how" detection pass.
  *
- * Rule 1 (same chapter): every later occurrence of a phrase that already
- *   carries a note in this chapter becomes its own "See how you translated ..."
+ * Rule 1 (same chapter): the next occurrence of a phrase that already
+ *   carries a note in this chapter becomes a "See how you translated ..."
  *   pointer to that note, whether the issue pass flagged it or not (an unflagged
  *   one is synthesized, as in phase 3). Nothing is written onto the earlier
  *   note, and nothing points forward. Decision 2026-10-14; it replaced the
  *   "This also occurs in verses ..." sentence.
+ * Cap (#494, option C): whatever rule produced them, a phrase gets at most
+ *   SEE_HOW_MAX_POINTERS_PER_CHAPTER pointers in a chapter. The earliest ships;
+ *   later pointer rows, flagged or synthesized, are dropped.
  * Rule 2 (earlier chapter): the chapter's first occurrence of a phrase already
  *   noted in an earlier chapter becomes a pointer to the FIRST occurrence in the
  *   book that carries a note. Never the nearest, never a chain, never forward,
@@ -1068,9 +1071,9 @@ async function runSeeHowDetection({ pipeDir, contextPath, generateIdsFn = genera
   );
   const corpusVersesFor = (plan) => (plan.skipped ? [] : (pointerVersesAllowed.get(plan.key) || []));
 
-  // Every later occurrence of a phrase in the chapter gets its own "See how you
-  // translated ..." pointer, never an "also occurs" sentence on the earlier
-  // note. The target is the book-first note when there is one, otherwise the
+  // Later occurrences of a phrase in the chapter get "See how you translated
+  // ..." pointers (trimmed to the per-chapter cap below), never an "also
+  // occurs" sentence on the earlier note. The target is the book-first note when there is one, otherwise the
   // chapter's first note, never a pointer row (no chains). Nothing points
   // forward: only verses after the anchor are touched.
   const pointerTargetFor = (lead) => ({
@@ -1133,12 +1136,14 @@ async function runSeeHowDetection({ pipeDir, contextPath, generateIdsFn = genera
     }
   };
 
-  for (const plan of plans) {
+  // Places one plan's pointers: flagged rows rewritten in place (recorded in
+  // `converted`) and synthesized ones pushed onto `injections`.
+  const placePlanPointers = (plan, converted) => {
     if (plan.kind === 'injection') {
-      if (plan.skipped) continue;
+      if (plan.skipped) return;
       injections.push({ key: plan.key, target: plan.target, occ: plan.anchorOcc });
       queueLaterPointers(plan, plan.target, new Set([plan.anchorVerseNum]));
-      continue;
+      return;
     }
     const { key, group, lead, canFold, target, pointerCase, anchorOcc, anchorItem } = plan;
     const laterTarget = pointerCase ? target : pointerTargetFor(lead);
@@ -1154,6 +1159,7 @@ async function runSeeHowDetection({ pipeDir, contextPath, generateIdsFn = genera
       }
       if (!applyPointer(it, key, laterTarget)) return;
       recordPointerRow(it, laterTarget);
+      converted.push({ item: it, crossBook: !!laterTarget.crossBook });
       pointedVerses.add(v);
       for (const dup of (combinedBy.get(it.id) || [])) removed.add(dup);
       seeHowCount++;
@@ -1165,8 +1171,9 @@ async function runSeeHowDetection({ pipeDir, contextPath, generateIdsFn = genera
         // If the sentence could not be built, leave the group exactly as it
         // was: pointing siblings at a note that never became a pointer would
         // leave them with nothing to point to.
-        if (!applyPointer(anchorItem, key, target)) continue;
+        if (!applyPointer(anchorItem, key, target)) return;
         recordPointerRow(anchorItem, target);
+        converted.push({ item: anchorItem, crossBook: !!target.crossBook });
         seeHowCount++;
         if (target.crossBook) crossBookCount++;
         pointedVerses.add(plan.anchorVerseNum);
@@ -1177,10 +1184,10 @@ async function runSeeHowDetection({ pipeDir, contextPath, generateIdsFn = genera
       }
       // The anchor slot is taken (an editor-kept note) or cannot be written:
       // the repeats keep their own notes rather than point at a missing one.
-      if (!anchorItem && plan.skipped) continue;
+      if (!anchorItem && plan.skipped) return;
       for (const it of group.filter((g) => g !== anchorItem && canFold(g))) pointLater(it);
       queueLaterPointers(plan, target, pointedVerses);
-      continue;
+      return;
     }
 
     // Book-first case: the lead IS the explanatory note and its prose is about
@@ -1189,7 +1196,7 @@ async function runSeeHowDetection({ pipeDir, contextPath, generateIdsFn = genera
     pointedVerses.add(recurrenceVerseNumber(verseOf(lead.reference)));
     // A lead the issue pass itself wrote as a "See how" row is a pointer, not a
     // target: pointing at it would build a chain.
-    if (/^see_how/.test(String(lead.note_type || ''))) continue;
+    if (/^see_how/.test(String(lead.note_type || ''))) return;
     for (let i = 1; i < group.length; i++) {
       const later = group[i];
       if (later.reference === lead.reference) continue;
@@ -1197,6 +1204,37 @@ async function runSeeHowDetection({ pipeDir, contextPath, generateIdsFn = genera
       pointLater(later);
     }
     queueLaterPointers(plan, laterTarget, pointedVerses);
+  };
+
+  // Option C of #494: at most SEE_HOW_MAX_POINTERS_PER_CHAPTER pointers per
+  // phrase in a chapter. Applied after the plan's pointers are placed, so the
+  // one kept is the earliest whichever route produced it. A dropped row's
+  // verse stays claimed (injectedAt, pointerRows), so an overlapping sub-phrase
+  // cannot put a pointer back there.
+  let cappedCount = 0;
+  const capPlanPointers = (converted, injStart) => {
+    const rows = [
+      ...converted.map((c) => ({ verse: recurrenceVerseNumber(verseOf(c.item.reference)), conv: c })),
+      ...injections.slice(injStart).map((inj) => ({ verse: recurrenceVerseNumber(inj.occ.verse), inj })),
+    ].sort((a, b) => a.verse - b.verse);
+    if (rows.length <= SEE_HOW_MAX_POINTERS_PER_CHAPTER) return;
+    const keep = rows.slice(0, SEE_HOW_MAX_POINTERS_PER_CHAPTER);
+    for (const r of rows.slice(SEE_HOW_MAX_POINTERS_PER_CHAPTER)) {
+      cappedCount++;
+      if (!r.conv) continue;
+      fold(r.conv.item);
+      seeHowCount--;
+      if (r.conv.crossBook) crossBookCount--;
+    }
+    injections.length = injStart;
+    injections.push(...keep.filter((r) => r.inj).map((r) => r.inj));
+  };
+
+  for (const plan of plans) {
+    const injStart = injections.length;
+    const converted = [];
+    placePlanPointers(plan, converted);
+    capPlanPointers(converted, injStart);
   }
 
   injections.push(...commonInjections);
@@ -1278,7 +1316,7 @@ async function runSeeHowDetection({ pipeDir, contextPath, generateIdsFn = genera
   prepared.item_count = prepared.items.length;
 
   if (seeHowCount > 0 || combinedCount > 0 || foldedCount > 0 || injectedCount > 0
-    || commonPointerCount > 0 || commonDropped.size > 0) {
+    || commonPointerCount > 0 || commonDropped.size > 0 || cappedCount > 0) {
     fs.writeFileSync(prepPath, JSON.stringify(prepared, null, 2));
   }
 
@@ -1288,6 +1326,7 @@ async function runSeeHowDetection({ pipeDir, contextPath, generateIdsFn = genera
   if (commonPointerCount > 0 || commonDropped.size > 0) {
     summary += `, ${commonPointerCount} common-phrase intro pointers (${commonDropped.size} dropped)`;
   }
+  if (cappedCount > 0) summary += `, ${cappedCount} dropped (per-chapter pointer cap)`;
   console.log(`[notes] See-how detection: ${summary}`);
   return summary;
 }

@@ -92,6 +92,11 @@ const SEE_HOW_NAME_SREFS = new Set([
 // pointer. Without it every "the word of Yahweh" would earn one.
 const CROSS_BOOK_MAX_BOOKS = 8;
 
+// "See how you translated ..." pointers a phrase may get in one chapter (#494).
+// The chapter's earliest pointer for a phrase ships; every later one is dropped,
+// whether it was a flagged row turned into a pointer or a synthesized one.
+const SEE_HOW_MAX_POINTERS_PER_CHAPTER = 1;
+
 /** English book name for a USFM code, for prose cross-book pointers. */
 function bookDisplayName(book) {
   const code = String(book || '').toUpperCase();
@@ -1177,6 +1182,7 @@ module.exports = {
   SEE_HOW_NEVER_FOLD_SREFS,
   SEE_HOW_NAME_SREFS,
   CROSS_BOOK_MAX_BOOKS,
+  SEE_HOW_MAX_POINTERS_PER_CHAPTER,
   SEE_HOW_CONTEXT_DEPENDENT_SREFS,
   SEE_HOW_SINGLE_WORD_CONTEXT_DEPENDENT_SREFS,
 };
