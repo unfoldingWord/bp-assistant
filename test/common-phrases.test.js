@@ -237,8 +237,8 @@ test('unlisted phrases keep the existing see-how behaviour', async () => {
   const word = readPrepared(dirPath).items.find((it) => it.id === 'dddd');
   assert.equal(word.programmatic_note, 'See how you translated **the word of Yahweh** in [1:1](../01/01.md).');
   assert.equal(word.also_occurs_verses, undefined);
-  const later = readPrepared(dirPath).items.find((it) => it.id === 'eeee');
-  assert.equal(later.programmatic_note, 'See how you translated **the word of Yahweh** in [1:1](../01/01.md).');
+  // The see-how per-chapter cap (#494) still applies: 3:7 is dropped.
+  assert.equal(readPrepared(dirPath).items.find((it) => it.id === 'eeee'), undefined);
 });
 
 test('no list file, or a disabled entry, means no change', async () => {

@@ -152,7 +152,7 @@ function item(overrides) {
   }, overrides);
 }
 
-test('rule 1: later same-chapter items become pointers to the first item, which gets no sentence', async () => {
+test('rule 1: the next same-chapter item becomes a pointer to the first item; the rest are dropped (#494)', async () => {
   const dirPath = setupPipeDir({
     items: [
       item({ reference: '3:2', id: 'aaaa', index: 0 }),
@@ -165,17 +165,41 @@ test('rule 1: later same-chapter items become pointers to the first item, which 
   const summary = await runSeeHowDetection({ pipeDir: dirPath, generateIdsFn: stubIds });
 
   const prepared = readPrepared(dirPath);
-  assert.deepEqual(prepared.items.map((it) => it.id), ['aaaa', 'bbbb', 'cccc'], 'later occurrences are kept');
-  const [first, ...later] = prepared.items;
+  assert.deepEqual(prepared.items.map((it) => it.id), ['aaaa', 'bbbb'], 'only one pointer per phrase per chapter');
+  const [first, pointer] = prepared.items;
   assert.equal(first.programmatic_note, undefined, 'the first note is written normally');
   assert.equal(first.also_occurs_verses, undefined);
-  assert.deepEqual(later.map((it) => it.programmatic_note), [
-    'See how you translated **the word of Yahweh** in [3:2](../03/02.md).',
-    'See how you translated **the word of Yahweh** in [3:2](../03/02.md).',
-  ]);
-  assert.deepEqual(later.map((it) => it.note_type), ['see_how', 'see_how']);
-  assert.equal(prepared.item_count, 3);
-  assert.match(summary, /^2 see-how back-refs, 0 folded/);
+  assert.equal(pointer.programmatic_note, 'See how you translated **the word of Yahweh** in [3:2](../03/02.md).');
+  assert.equal(pointer.note_type, 'see_how');
+  assert.equal(prepared.item_count, 2);
+  assert.match(summary, /^1 see-how back-refs, 0 folded/);
+  assert.match(summary, /, 1 dropped \(per-chapter pointer cap\)$/);
+});
+
+test('per-chapter cap (#494): the earliest pointer wins whether flagged or synthesized; a later flagged row is dropped', async () => {
+  // Book-first note at 3:2, an unflagged repeat at 3:5, and a flagged repeat at
+  // 3:7 under a different article (the deleted JER 22-23 rows were this shape).
+  const dirPath = setupPipeDir({
+    items: [
+      item({ reference: '3:2', id: 'aaaa', index: 0 }),
+      item({ reference: '3:7', id: 'cccc', index: 1, sref: 'figs-metonymy' }),
+    ],
+    alignmentData: { '3:2': ALIGNMENT_DATA['3:2'], '3:7': ALIGNMENT_DATA['3:7'] },
+    tnBookTsv: '',
+    hebrewBook: HEBREW_BOOK,
+  });
+  buildRecurrenceIndexFile({ pipeDir: dirPath });
+  const summary = await runSeeHowDetection({ pipeDir: dirPath, generateIdsFn: stubIds });
+
+  const items = readPrepared(dirPath).items;
+  assert.deepEqual(items.map((it) => it.reference).sort(), ['3:2', '3:5']);
+  assert.equal(items.find((it) => it.id === 'aaaa').programmatic_note, undefined, 'the explanatory note is untouched');
+  const pointer = items.find((it) => it.reference === '3:5');
+  assert.equal(pointer.injected_see_how, true);
+  assert.match(pointer.programmatic_note, /\[3:2\]\(\.\.\/03\/02\.md\)/);
+  assert.equal(items.find((it) => it.id === 'cccc'), undefined, 'the flagged 3:7 pointer is dropped');
+  assert.match(summary, /^1 see-how back-refs, 0 folded, 1 injected/, 'counts reflect what ships');
+  assert.match(summary, /, 1 dropped \(per-chapter pointer cap\)$/);
 });
 
 test('rule 2: the chapter\'s first occurrence points at the FIRST noted occurrence in the book, not the nearest', async () => {
@@ -197,12 +221,10 @@ test('rule 2: the chapter\'s first occurrence points at the FIRST noted occurren
   assert.equal(first.support_reference, 'figs-possession', 'SupportReference inherited from the target row');
   assert.equal(first.also_occurs_verses, undefined);
 
+  // #494: the chapter keeps that one pointer; later occurrences, flagged or
+  // not, get none.
   const items = readPrepared(dirPath).items;
-  const v5 = items.find((it) => it.id === 'bbbb');
-  assert.equal(v5.programmatic_note, first.programmatic_note, 'a flagged later occurrence points at the same target, not at 3:2');
-  const v7 = items.find((it) => it.reference === '3:7');
-  assert.equal(v7.injected_see_how, true, 'an unflagged later occurrence gets its own pointer');
-  assert.match(v7.programmatic_note, /\[1:1\]\(\.\.\/01\/01\.md\)/);
+  assert.deepEqual(items.map((it) => it.reference), ['3:2']);
 });
 
 test('no pointer is emitted when no earlier chapter has a note for the key', async () => {
@@ -242,7 +264,7 @@ test('phase 3: a pointer is injected when the chapter flagged nothing for an alr
   const summary = await runSeeHowDetection({ pipeDir: dirPath, generateIdsFn: stubIds });
 
   const prepared = readPrepared(dirPath);
-  assert.deepEqual(prepared.items.map((it) => it.reference).sort(), ['3:2', '3:5', '3:7'], 'one injected pointer per occurrence');
+  assert.deepEqual(prepared.items.map((it) => it.reference), ['3:2'], 'one injected pointer for the chapter (#494)');
   const injected = prepared.items.find((it) => it.reference === '3:2');
   assert.equal(injected.reference, '3:2', 'injected on the chapter\'s first occurrence');
   assert.equal(injected.note_type, 'see_how');
@@ -251,8 +273,8 @@ test('phase 3: a pointer is injected when the chapter flagged nothing for an alr
   assert.equal(injected.id, 'z000');
   assert.match(injected.programmatic_note, /\[1:1\]\(\.\.\/01\/01\.md\)/);
   assert.equal(injected.also_occurs_verses, undefined);
-  for (const it of prepared.items) assert.match(it.programmatic_note, /\[1:1\]\(\.\.\/01\/01\.md\)/);
-  assert.match(summary, /3 injected/);
+  assert.match(summary, /1 injected/);
+  assert.match(summary, /2 dropped \(per-chapter pointer cap\)/);
 });
 
 test('at_provided is appended to the pointer note', async () => {
@@ -359,7 +381,8 @@ test('shard prepared files carry note_type and the pointer note through detectio
 
   const prepared = readPrepared(dirPath, 'ZEC-03-v1-9.prepared_notes.json');
   assert.equal(prepared.items[0].note_type, 'see_how');
-  assert.equal(prepared.items[1].note_type, 'see_how');
+  assert.match(prepared.items[0].programmatic_note, /\[1:1\]\(\.\.\/01\/01\.md\)/);
+  assert.deepEqual(prepared.items.map((it) => it.id), ['aaaa'], 'the later pointer is dropped from the shard file too (#494)');
   assert.equal(prepared.items[0].also_occurs_verses, undefined);
 });
 
@@ -499,12 +522,11 @@ test('F2: corpus spans get a pointer for an eligible (multi-word) key', async ()
   await runSeeHowDetection({ pipeDir: dirPath, generateIdsFn: stubIds });
 
   const items = readPrepared(dirPath).items;
-  assert.deepEqual(items.map((it) => it.reference).sort(), ['3:2', '3:5', '3:7'], 'unflagged repeats the index found');
+  assert.deepEqual(items.map((it) => it.reference).sort(), ['3:2', '3:5'], 'the next unflagged repeat the index found; 3:7 is over the cap (#494)');
   assert.equal(items.find((it) => it.id === 'aaaa').programmatic_note, undefined);
-  for (const it of items.filter((i) => i.id !== 'aaaa')) {
-    assert.equal(it.injected_see_how, true);
-    assert.match(it.programmatic_note, /\[3:2\]\(\.\.\/03\/02\.md\)/, 'points back at the first note, never forward');
-  }
+  const pointer = items.find((i) => i.id !== 'aaaa');
+  assert.equal(pointer.injected_see_how, true);
+  assert.match(pointer.programmatic_note, /\[3:2\]\(\.\.\/03\/02\.md\)/, 'points back at the first note, never forward');
 });
 
 test('F2: corpus spans get no pointer for an ineligible single-word key', async () => {
@@ -558,15 +580,15 @@ test('C1a: a cross-chapter pointer is injected at the chapter\'s first occurrenc
   const summary = await runSeeHowDetection({ pipeDir: dirPath, generateIdsFn: stubIds });
 
   const prepared = readPrepared(dirPath);
-  assert.deepEqual(prepared.items.map((it) => it.reference).sort(), ['3:2', '3:5', '3:7']);
-  const anchor = prepared.items.find((it) => it.reference === '3:2');
+  // #494: only the chapter's first pointer ships, so the flagged 3:5 item goes.
+  assert.deepEqual(prepared.items.map((it) => it.reference), ['3:2']);
+  const anchor = prepared.items[0];
   assert.equal(anchor.injected_see_how, true, 'pointer sits on the first occurrence');
   assert.match(anchor.programmatic_note, /\[1:1\]\(\.\.\/01\/01\.md\)/);
   assert.equal(anchor.also_occurs_verses, undefined);
-  const flagged = prepared.items.find((it) => it.id === 'bbbb');
-  assert.match(flagged.programmatic_note, /\[1:1\]\(\.\.\/01\/01\.md\)/, 'the flagged 3:5 item is kept as a pointer');
-  assert.match(summary, /2 injected/);
+  assert.match(summary, /1 injected/);
   assert.match(summary, /0 folded/);
+  assert.match(summary, /2 dropped \(per-chapter pointer cap\)/);
 });
 
 test('C1a: a prepared item already sitting on the first occurrence is converted in place', async () => {
@@ -577,8 +599,8 @@ test('C1a: a prepared item already sitting on the first occurrence is converted 
   const summary = await runSeeHowDetection({ pipeDir: dirPath, generateIdsFn: stubIds });
 
   const prepared = readPrepared(dirPath);
-  assert.deepEqual(prepared.items.map((it) => it.id), ['aaaa', 'bbbb'], 'no injection, no relocation');
-  assert.deepEqual(prepared.items.map((it) => it.note_type), ['see_how', 'see_how']);
+  assert.deepEqual(prepared.items.map((it) => it.id), ['aaaa'], 'no injection, no relocation; 3:5 is over the cap (#494)');
+  assert.deepEqual(prepared.items.map((it) => it.note_type), ['see_how']);
   assert.match(summary, /0 injected/);
 });
 
@@ -799,9 +821,11 @@ test('C5: within a formula cluster each later verse gets exactly one pointer', a
   assert.equal(byId.get('cccc').programmatic_note, undefined);
   // Only verses after a key's own anchor count. "thus says Yahweh of hosts"
   // (8:2) and "thus says Yahweh" (8:3) both reach 4 and 6, so the longer key
-  // takes them and they point at 8:2.
+  // takes them and they point at 8:2. The per-chapter cap (#494) then keeps
+  // only its first pointer, and 8:6 stays claimed: the shorter key cannot
+  // put a pointer back there.
   const injected = items.filter((it) => it.injected_see_how);
-  assert.deepEqual(injected.map((it) => it.reference).sort(), ['8:4', '8:6']);
+  assert.deepEqual(injected.map((it) => it.reference).sort(), ['8:4']);
   for (const it of injected) assert.match(it.programmatic_note, /\[8:2\]\(\.\.\/08\/02\.md\)/);
   // No verse carries two pointers for the cluster.
   assert.equal(new Set(items.map((it) => `${it.reference}|${it.injected_see_how}`)).size, items.length);
@@ -828,7 +852,8 @@ test('C5: a flagged sibling of the carrier becomes a pointer to it, beside the c
   assert.match(byId.get('dddd').programmatic_note, /\[8:3\]\(\.\.\/08\/03\.md\)/, '8:13 points at its own key\'s note at 8:3');
   assert.equal(byId.get('bbbb').programmatic_note, undefined);
   assert.equal(byId.get('aaaa').programmatic_note, undefined);
-  assert.deepEqual(items.filter((it) => it.injected_see_how).map((it) => it.reference).sort(), ['8:4', '8:6']);
+  // The carrier keeps one pointer (#494); 8:6 is over the cap.
+  assert.deepEqual(items.filter((it) => it.injected_see_how).map((it) => it.reference).sort(), ['8:4']);
 });
 
 // --- Round 3: B1 / B2 / S8 / S9 ---------------------------------------------
@@ -849,7 +874,8 @@ test('B1: an item that resolves only its text key gets ONE row, not a duplicate 
   const atVerse2 = prepared.items.filter((it) => it.reference === '3:2');
   assert.equal(atVerse2.length, 1, 'exactly one row on the verse');
   assert.equal(atVerse2[0].id, 'aaaa', 'the model\'s own item, converted in place');
-  assert.match(summary, /2 injected/, 'only the later occurrences at 3:5 and 3:7 are synthesized');
+  assert.match(summary, /0 injected/, 'the later occurrences at 3:5 and 3:7 are over the cap (#494)');
+  assert.match(summary, /2 dropped \(per-chapter pointer cap\)/);
 });
 
 test('B1: two items on one phrase group together even when only one resolves its Strong key', async () => {
@@ -1006,10 +1032,12 @@ test('C5: with an injected five-word variant the widest key still carries the li
   // Nothing points forward; 8:4 and 8:6 point at 8:2.
   // 8:14 already holds cccc's note and the injected five-word pointer, both on
   // overlapping wording, so the carrier adds nothing there.
+  // The per-chapter cap (#494) keeps the carrier's first pointer, 8:4, and
+  // drops 8:6.
   const rows = prepared.items.map((it) => it.reference).sort();
-  assert.deepEqual(rows, ['8:14', '8:14', '8:2', '8:3', '8:4', '8:6']);
+  assert.deepEqual(rows, ['8:14', '8:14', '8:2', '8:3', '8:4']);
   assert.equal(byId.get('bbbb').programmatic_note, undefined);
-  for (const ref of ['8:4', '8:6']) {
+  for (const ref of ['8:4']) {
     const row = prepared.items.find((it) => it.reference === ref);
     assert.match(row.programmatic_note, /\[8:2\]\(\.\.\/08\/02\.md\)/);
   }
@@ -1138,9 +1166,9 @@ test('multi-word euphemism: a fixed phrase is still injected at its next occurre
   const summary = await runSeeHowDetection({ pipeDir: dirPath, generateIdsFn: stubIds });
 
   const prepared = readPrepared(dirPath);
-  assert.deepEqual(prepared.items.map((it) => it.reference).sort(), ['3:2', '3:5', '3:7']);
+  assert.deepEqual(prepared.items.map((it) => it.reference), ['3:2'], 'one pointer per chapter (#494)');
   assert.ok(prepared.items.every((it) => it.support_reference === 'figs-euphemism'));
-  assert.match(summary, /3 injected/);
+  assert.match(summary, /1 injected/);
 });
 
 test('kept: no pointer is synthesized at a kept note\'s verse and quote; the flagged repeat keeps its own note', async () => {
